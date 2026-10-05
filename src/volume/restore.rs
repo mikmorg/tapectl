@@ -32,25 +32,17 @@ use crate::volume::restore_record::{self, RestoreRecord};
 pub(crate) enum RestoreTarget<'a> {
     /// The whole unit, extracted straight into `dest_dir`.
     Unit { dest_dir: &'a str },
-    /// One entry: the unit is extracted into `extract_dir` (a temp
-    /// directory the caller owns) and `file_path` is placed into
-    /// `dest_dir`, the directory the operator named.
+    /// One entry: `dar -x -g file_path` extracts just it into the scratch
+    /// directory (issue #406; it used to be the whole unit, in $TMPDIR),
+    /// and it is then placed into `dest_dir`, the directory the operator
+    /// named.
     File {
         file_path: &'a str,
         dest_dir: &'a str,
-        extract_dir: &'a str,
     },
 }
 
 impl<'a> RestoreTarget<'a> {
-    /// Where dar extracts to.
-    fn extract_dir(&self) -> &'a str {
-        match *self {
-            RestoreTarget::Unit { dest_dir } => dest_dir,
-            RestoreTarget::File { extract_dir, .. } => extract_dir,
-        }
-    }
-
     /// The directory the operator named — what `restores.destination`
     /// records and what the report prints.
     fn destination(&self) -> &'a str {
@@ -73,6 +65,36 @@ impl<'a> RestoreTarget<'a> {
             RestoreTarget::File { .. } => restore_record::KIND_FILE,
         }
     }
+}
+
+/// How `restore unit` and `restore file` may use the disk (issue #406) —
+/// their `--scratch`, `--overwrite` and `--no-space-check` flags.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreOptions {
+    /// Where the decrypted slices wait for dar: a `.tapectl-restore-tmp`
+    /// directory made inside this one. `None`: inside the destination.
+    /// Never `$TMPDIR` — a unit's slices can be hundreds of GiB, and a
+    /// system temp directory is often RAM or the small root filesystem.
+    pub scratch: Option<PathBuf>,
+    /// Restore into a destination that already holds files: `restore unit`
+    /// replaces any that collide (dar `-w`), `restore file` replaces the
+    /// one file. Without it either refuses before the tape is touched.
+    pub overwrite: bool,
+    /// Skip the free-space check, for a filesystem that holds more than
+    /// `statvfs` reports (a compressed or thin-provisioned one) — the same
+    /// escape RESTORE.sh's `--no-space-check` is.
+    pub no_space_check: bool,
+}
+
+/// The scratch directory's name, inside the destination or `--scratch`.
+pub(crate) const SCRATCH_NAME: &str = ".tapectl-restore-tmp";
+
+/// Where a restore keeps its decrypted slices (issue #406):
+/// [`SCRATCH_NAME`] inside `--scratch DIR` when given, else inside the
+/// destination — never `$TMPDIR`. The directory is the restore's own: it is
+/// refused if it already exists, and removed when the restore ends.
+pub(crate) fn scratch_dir(destination: &Path, scratch: Option<&Path>) -> PathBuf {
+    scratch.unwrap_or(destination).join(SCRATCH_NAME)
 }
 
 /// What the contacted half of a restore measured on the way, whether or not
@@ -107,13 +129,19 @@ struct RestoreTrace {
 /// only transiently inside staging; this was the one place it could be left
 /// behind outside it, and it was on the failure path.
 ///
-/// The directory deliberately lives *under the destination* rather than in
-/// `std::env::temp_dir()`: dar extracts from it into the destination, and a
-/// slice set can be hundreds of gigabytes, so a system temp dir on a small
-/// tmpfs (or a different filesystem) is the wrong home for it. That is why
-/// this is a hand-written guard and not `tempfile::tempdir()` — `restore_file`
-/// uses `tempfile` correctly for a *different* directory, one it wants placed
-/// by the system.
+/// The directory deliberately lives *under the destination* (or under
+/// `--scratch DIR`, [`scratch_dir`]) rather than in `std::env::temp_dir()`:
+/// dar extracts from it into the destination, and a slice set can be
+/// hundreds of gigabytes, so a system temp dir on a small tmpfs (or the small
+/// root filesystem) is the wrong home for it. That is why this is a
+/// hand-written guard and not `tempfile::tempdir()`. `restore file` used to
+/// extract the whole unit into a `tempfile` directory in `$TMPDIR`; since
+/// issue #406 it uses this scratch directory too.
+///
+/// A guard runs only if the process does: a SIGKILL or a power loss leaves
+/// the directory behind. So the next restore refuses to start while it
+/// exists, naming it, rather than mixing its slices with a new set
+/// ([`preflight`]).
 ///
 /// A removal failure is reported at `warn!` naming the path, never swallowed
 /// and never escalated: the operator needs to know plaintext remains, but a
@@ -138,8 +166,8 @@ impl Drop for RestoreScratch {
 }
 
 /// Restore a unit from a volume to a destination directory.
-// 10 args reflects the CLI's flat shape (unit/volume/dest/device/block_size/
-// version/dry_run alongside conn/paths/config); interim allow. This used to carry a
+// 11 args reflects the CLI's flat shape (unit/volume/dest/device/block_size/
+// version/dry_run/options alongside conn/paths/config); interim allow. This used to carry a
 // comment blaming the count on "the store read seam in #71 (epic #20)" —
 // wrong: #71 was closed and scoped only to the write-side execute/confirm
 // seam. The read seam migrated here directly (issue #85): per-slice tape
@@ -157,6 +185,7 @@ pub fn restore_unit(
     block_size: usize,
     version: Option<i64>,
     dry_run: bool,
+    options: &RestoreOptions,
 ) -> Result<RestoreReport> {
     restore_through_drive(
         conn,
@@ -165,6 +194,7 @@ pub fn restore_unit(
         unit_name,
         volume_label,
         RestoreTarget::Unit { dest_dir },
+        options,
         device,
         block_size,
         version,
@@ -173,8 +203,9 @@ pub fn restore_unit(
 }
 
 /// [`restore_unit`] and [`restore_file`]'s one path to the drive: resolve
-/// the version, take the two MAM reads, open the store, and hand off to the
-/// store seam with the [`RestoreTarget`] that says which of the two this is.
+/// the version, run the [`preflight`] that may refuse with no tape contact,
+/// take the two MAM reads, open the store, and hand off to the store seam
+/// with the [`RestoreTarget`] that says which of the two this is.
 #[allow(clippy::too_many_arguments)]
 fn restore_through_drive(
     conn: &Connection,
@@ -183,6 +214,7 @@ fn restore_through_drive(
     unit_name: &str,
     volume_label: &str,
     target: RestoreTarget<'_>,
+    options: &RestoreOptions,
     device: &str,
     block_size: usize,
     version: Option<i64>,
@@ -202,6 +234,15 @@ fn restore_through_drive(
     // not carry is refused with no tape I/O, and a dry run counts only the
     // selected version's slices.
     let selection = select_write_positions(conn, unit_name, volume_label, version)?;
+
+    // Issue #406: everything that can be refused without the tape is refused
+    // here, before the first contact — a typo in `--file`, a destination
+    // that is not empty, a leftover scratch directory, a disk too small.
+    // Each of these used to surface only after every slice was read (~5 h
+    // for a large unit), or never. A dry run takes the same checks, so a
+    // dry run that says "would restore" means it.
+    let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
+    preflight(conn, unit_name, &selection, target, &scratch, options)?;
 
     if dry_run {
         return Ok(RestoreReport {
@@ -242,6 +283,7 @@ fn restore_through_drive(
         volume_label,
         selection.version,
         target,
+        options,
         &mut store,
         ContactSite::new(
             config,
@@ -251,6 +293,294 @@ fn restore_through_drive(
         )
         .with_mam_reads(&reads),
     )
+}
+
+/// The restore's checks that need no tape (issue #406), in the order an
+/// operator would want them named: the requested file, a scratch directory
+/// a killed restore left behind, the destination, then the space.
+fn preflight(
+    conn: &Connection,
+    unit_name: &str,
+    selection: &RestoreSelection,
+    target: RestoreTarget<'_>,
+    scratch: &Path,
+    options: &RestoreOptions,
+) -> Result<()> {
+    let destination = Path::new(target.destination());
+
+    // `restore file`: the path must be one this version archived. The
+    // catalog's `files` table is the record of what went into the archive;
+    // a typo used to read every slice off the tape and then fail.
+    let file_size = match target {
+        RestoreTarget::File { file_path, .. } => {
+            Some(catalog_file_size(conn, unit_name, selection, file_path)?)
+        }
+        RestoreTarget::Unit { .. } => None,
+    };
+
+    // A scratch directory that already exists is a killed restore's: its
+    // guard never ran, and it may hold decrypted slices. Never mixed with a
+    // new set, never silently removed.
+    if fs::symlink_metadata(scratch).is_ok() {
+        return Err(TapectlError::Other(format!(
+            "refusing to restore: the scratch directory {} already exists. A restore that was \
+             killed (or lost power) leaves it behind, and it may hold DECRYPTED archive slices. \
+             Remove it (`rm -rf {}`) and run the restore again. Nothing was read from tape.",
+            scratch.display(),
+            scratch.display()
+        )));
+    }
+
+    // The destination. `restore unit` wants an empty (or new) directory: dar
+    // keeps an existing file rather than overwrite it, which used to be found
+    // only after the whole unit was read and extracted. `restore file`
+    // places one file, so only that one name matters.
+    if !options.overwrite {
+        match target {
+            RestoreTarget::Unit { .. } => {
+                if let Some(entry) = first_entry(destination)? {
+                    return Err(TapectlError::Other(format!(
+                        "refusing to restore into {}: it is not empty (it holds \"{entry}\", \
+                         and maybe more). dar would keep every existing file that collides with \
+                         one from the tape, so the result would not be what is on tape. Restore \
+                         into an empty or new directory, or pass --overwrite to replace what \
+                         collides. Nothing was read from tape.",
+                        destination.display()
+                    )));
+                }
+            }
+            RestoreTarget::File { file_path, .. } => {
+                let placed = placed_path(destination, file_path);
+                if fs::symlink_metadata(&placed).is_ok() {
+                    return Err(TapectlError::Other(format!(
+                        "refusing to restore \"{file_path}\": {} already exists. Choose another \
+                         --to, move that file away, or pass --overwrite to replace it. Nothing \
+                         was read from tape.",
+                        placed.display()
+                    )));
+                }
+            }
+        }
+    }
+
+    if options.no_space_check {
+        info!("disk space not checked (--no-space-check)");
+        return Ok(());
+    }
+    check_restore_space(destination, scratch, selection, file_size)
+}
+
+/// The size `files` records for `file_path` in the selected version, after
+/// refusing a path that version did not archive, or a directory — `restore
+/// file` places one file (`restore unit` restores a tree). `Ok(0)` when the
+/// catalog holds no file list for the version at all (a catalog that never
+/// had one): then nothing can be checked, and the restore says so and goes
+/// on, as it always did.
+fn catalog_file_size(
+    conn: &Connection,
+    unit_name: &str,
+    selection: &RestoreSelection,
+    file_path: &str,
+) -> Result<i64> {
+    let snapshot_id: i64 = conn.query_row(
+        "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+        params![selection.stage_set_id],
+        |r| r.get(0),
+    )?;
+    let known: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1",
+        params![snapshot_id],
+        |r| r.get(0),
+    )?;
+    if known == 0 {
+        warn!(
+            unit = unit_name,
+            version = selection.version,
+            "the catalog holds no file list for this version, so --file cannot be checked \
+             before the tape is read"
+        );
+        return Ok(0);
+    }
+    let row: Option<(bool, Option<i64>)> = conn
+        .query_row(
+            "SELECT is_directory, size_bytes FROM files WHERE snapshot_id = ?1 AND path = ?2",
+            params![snapshot_id, file_path],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Err(TapectlError::Other(format!(
+            "unit \"{unit_name}\" version {} has no file \"{file_path}\" in the catalog's record \
+             of what it archived, so the tape was not touched. A path is relative to the unit's \
+             root and matched exactly; `tapectl catalog search <words of the name>` finds one, \
+             and `tapectl catalog ls {unit_name}` lists the newest version's files.",
+            selection.version
+        ))),
+        Some((true, _)) => Err(TapectlError::Other(format!(
+            "\"{file_path}\" is a directory in unit \"{unit_name}\" version {}; `restore file` \
+             restores one file. Restore the unit (`tapectl restore unit`) and take the \
+             directory from it. Nothing was read from tape.",
+            selection.version
+        ))),
+        Some((false, size)) => Ok(size.unwrap_or(0).max(0)),
+    }
+}
+
+/// The first entry of `dir`, or `None` when it is empty or does not exist
+/// yet. A path that exists and is not a directory is refused.
+fn first_entry(dir: &Path) -> Result<Option<String>> {
+    match fs::read_dir(dir) {
+        Ok(mut entries) => Ok(entries
+            .next()
+            .transpose()?
+            .map(|e| e.file_name().to_string_lossy().into_owned())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Err(TapectlError::Other(
+            format!("--to {} exists and is not a directory", dir.display()),
+        )),
+        Err(e) => Err(TapectlError::Other(format!(
+            "cannot read the destination {}: {e}",
+            dir.display()
+        ))),
+    }
+}
+
+/// Where `restore file` puts `file_path`: its last component, directly in
+/// the destination (the directory the operator named).
+fn placed_path(destination: &Path, file_path: &str) -> PathBuf {
+    destination.join(
+        Path::new(file_path)
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new(file_path)),
+    )
+}
+
+/// Refuse a restore the disk cannot hold, before the first slice is read
+/// (issue #406) — the same arithmetic as RESTORE.sh's `check_space`, so the
+/// two restore paths agree. This design decrypts every slice of the version
+/// into scratch before dar extracts them (until the streaming restore
+/// lands), so scratch needs every slice (a decrypted slice is no larger
+/// than its ciphertext) plus the one being read; the destination receives
+/// about the archive's size again. On one filesystem they add up: about
+/// twice the unit, plus one slice. `restore file` extracts only its one file
+/// (into scratch, then moved into place), so its second term is that file.
+fn check_restore_space(
+    destination: &Path,
+    scratch: &Path,
+    selection: &RestoreSelection,
+    file_size: Option<i64>,
+) -> Result<()> {
+    let sizes = selection
+        .positions
+        .iter()
+        .map(|wp| wp.encrypted_bytes.max(0));
+    let total: i64 = sizes.clone().sum();
+    let largest: i64 = sizes.max().unwrap_or(0);
+    let scratch_root = scratch.parent().unwrap_or(scratch);
+    let (scratch_need, dest_need) = match file_size {
+        // Extracted into scratch, then renamed into place (or copied, when
+        // the two are on different filesystems).
+        Some(file) => (total + largest + file, file),
+        None => (total + largest, total),
+    };
+    let (Some(scratch_fs), Some(dest_fs)) = (existing(scratch_root), existing(destination)) else {
+        return Ok(());
+    };
+    let same_fs = match (fs::metadata(&scratch_fs), fs::metadata(&dest_fs)) {
+        (Ok(a), Ok(b)) => {
+            std::os::unix::fs::MetadataExt::dev(&a) == std::os::unix::fs::MetadataExt::dev(&b)
+        }
+        // One filesystem unless proven otherwise: over-ask, never under-ask.
+        _ => true,
+    };
+    let need = |dir: &Path, bytes: i64| -> Result<()> {
+        let Some(free) = restore_free_bytes(dir) else {
+            warn!(
+                path = %dir.display(),
+                "cannot measure free disk space; continuing without the check"
+            );
+            return Ok(());
+        };
+        info!(
+            path = %dir.display(),
+            needs = %crate::util::format_bytes_binary(bytes),
+            free = %crate::util::format_bytes_binary(free),
+            "restore disk space"
+        );
+        if free >= bytes {
+            return Ok(());
+        }
+        Err(TapectlError::Other(format!(
+            "not enough disk space in {} for this restore: it needs about {}, and {} is free. \
+             Nothing was read from tape. A restore decrypts every slice of the unit to disk \
+             before dar extracts them, so with the scratch space and --to on one disk it needs \
+             the unit's size about twice over, plus one slice. Free space there, choose a \
+             larger disk with --to, or put the decrypted slices on another disk with --scratch \
+             DIR. (--no-space-check skips this check, for a filesystem that holds more than it \
+             reports free, such as a compressed or thin-provisioned one.)",
+            dir.display(),
+            crate::util::format_bytes_binary(bytes),
+            crate::util::format_bytes_binary(free),
+        )))
+    };
+    if same_fs {
+        let combined = match file_size {
+            // The rename into place costs nothing on one filesystem.
+            Some(_) => scratch_need,
+            None => scratch_need + dest_need,
+        };
+        need(&dest_fs, combined)
+    } else {
+        need(&scratch_fs, scratch_need)?;
+        need(&dest_fs, dest_need)
+    }
+}
+
+/// `path` itself if it exists, else its nearest existing ancestor — where
+/// a directory the restore will create gets its space from.
+fn existing(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|p| !p.as_os_str().is_empty() && p.exists())
+        .map(Path::to_path_buf)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the free space [`restore_free_bytes`] reports on this
+    /// thread, so the space refusal can be driven without filling a disk.
+    static RESTORE_FREE_OVERRIDE: std::cell::Cell<Option<i64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: pretend every filesystem a restore checks has `bytes` free, on
+/// this test's thread, until dropped.
+#[cfg(test)]
+pub(crate) struct RestoreFreeOverride;
+#[cfg(test)]
+impl RestoreFreeOverride {
+    pub(crate) fn set(bytes: i64) -> Self {
+        RESTORE_FREE_OVERRIDE.with(|c| c.set(Some(bytes)));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for RestoreFreeOverride {
+    fn drop(&mut self) {
+        RESTORE_FREE_OVERRIDE.with(|c| c.set(None));
+    }
+}
+
+/// Bytes an unprivileged process can still write under `dir` (`f_bavail` x
+/// `f_frsize`, the same arithmetic as `stage create`'s space check), or
+/// `None` when `statvfs` cannot say.
+fn restore_free_bytes(dir: &Path) -> Option<i64> {
+    #[cfg(test)]
+    if let Some(free) = RESTORE_FREE_OVERRIDE.with(|c| c.get()) {
+        return Some(free);
+    }
+    let stat = nix::sys::statvfs::statvfs(dir).ok()?;
+    let free = (stat.blocks_available() as u64).saturating_mul(stat.fragment_size());
+    Some(i64::try_from(free).unwrap_or(i64::MAX))
 }
 
 /// `restore raw-volume` over an already-open store — the heir/DR dump
@@ -388,6 +718,7 @@ pub(crate) fn restore_unit_from_store(
     volume_label: &str,
     version: i64,
     target: RestoreTarget<'_>,
+    options: &RestoreOptions,
     store: &mut dyn Store,
     site: ContactSite<'_>,
 ) -> Result<RestoreReport> {
@@ -416,6 +747,7 @@ pub(crate) fn restore_unit_from_store(
         volume_label,
         version,
         target,
+        options,
         store,
         site.medium_serial(),
         &mut trace,
@@ -487,11 +819,11 @@ fn restore_unit_contacted(
     volume_label: &str,
     version: i64,
     target: RestoreTarget<'_>,
+    options: &RestoreOptions,
     store: &mut dyn Store,
     medium_serial: Option<&str>,
     trace: &mut RestoreTrace,
 ) -> Result<RestoreReport> {
-    let dest_dir = target.extract_dir();
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
@@ -520,11 +852,20 @@ fn restore_unit_contacted(
     crate::volume::binding::corroborate_volume(conn, volume_id, volume_label, &medium)?;
     phase.done();
 
-    // Scratch dir for decrypted slices. The guard removes it on EVERY path
-    // out of this function, not just the happy one — see `RestoreScratch`.
-    let restore_tmp = Path::new(dest_dir).join(".tapectl-restore-tmp");
-    fs::create_dir_all(&restore_tmp)?;
+    // Scratch dir for decrypted slices: inside the destination or
+    // `--scratch`, never $TMPDIR ([`scratch_dir`], issue #406). The guard
+    // removes it on EVERY path out of this function, not just the happy one
+    // — see `RestoreScratch`. Named in the log first: if this process is
+    // killed, that line says where decrypted data was left.
+    let restore_tmp = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
+    fs::create_dir_all(&restore_tmp).map_err(|e| {
+        TapectlError::Other(format!(
+            "cannot create the restore scratch directory {}: {e}",
+            restore_tmp.display()
+        ))
+    })?;
     let _scratch = RestoreScratch(restore_tmp.clone());
+    info!(scratch = %restore_tmp.display(), "decrypted slices wait for dar here");
 
     // Load every secret key the tenant owns, and the operator's, for trial
     // decryption. Ownership comes from the catalog's key rows, so tenant
@@ -608,11 +949,32 @@ fn restore_unit_contacted(
     phase.done();
 
     let archive_base = restore_tmp.join("restore");
-    info!("extracting dar archive to {dest_dir}");
     let phase = progress::phase("extract", None);
     phase.item(unit_name.to_string());
-    let (report, verdict) =
-        dar::restore::extract_reported(&config.dar.binary, &archive_base, Path::new(dest_dir));
+    // `restore unit` extracts the whole archive into the destination;
+    // `restore file` asks dar for its one entry (`-g`, issue #406) into
+    // scratch, and places it below.
+    let extracted = restore_tmp.join("extract");
+    let (report, verdict) = match target {
+        RestoreTarget::Unit { dest_dir } => {
+            info!("extracting dar archive to {dest_dir}");
+            dar::restore::extract_reported(
+                &config.dar.binary,
+                &archive_base,
+                Path::new(dest_dir),
+                options.overwrite,
+            )
+        }
+        RestoreTarget::File { file_path, .. } => {
+            info!("extracting \"{file_path}\" from the dar archive");
+            dar::restore::extract_file_reported(
+                &config.dar.binary,
+                &archive_base,
+                file_path,
+                &extracted,
+            )
+        }
+    };
     if report.is_some() {
         trace.dar_version = dar::version::check(&config.dar.binary)
             .ok()
@@ -633,10 +995,9 @@ fn restore_unit_contacted(
     if let RestoreTarget::File {
         file_path,
         dest_dir: file_dest,
-        ..
     } = target
     {
-        place_one_entry(Path::new(dest_dir), file_path, Path::new(file_dest))?;
+        place_one_entry(&extracted, file_path, Path::new(file_dest))?;
         trace.placed = true;
     }
 
@@ -825,14 +1186,14 @@ pub fn restore_file(
     device: &str,
     block_size: usize,
     version: Option<i64>,
+    options: &RestoreOptions,
 ) -> Result<()> {
-    // A full restore into a temp dir, with the one requested entry placed
-    // into `dest_dir` inside the same recorded span (`RestoreTarget::File`,
-    // issue #306) — through the one drive path `restore unit` uses, so this
-    // is one contact and one reading, never two.
-    let tmp = tempfile::tempdir().map_err(|e| TapectlError::Other(e.to_string()))?;
-    let tmp_path = tmp.path().to_string_lossy().to_string();
-
+    // `dar -x -g` of the one entry into the restore's scratch directory, then
+    // placed into `dest_dir`, inside the same recorded span
+    // (`RestoreTarget::File`, issue #306) — through the one drive path
+    // `restore unit` uses, so this is one contact and one reading, never two.
+    // It used to extract the WHOLE unit into a `tempfile` directory in
+    // $TMPDIR (issue #406).
     restore_through_drive(
         conn,
         paths,
@@ -842,8 +1203,8 @@ pub fn restore_file(
         RestoreTarget::File {
             file_path,
             dest_dir,
-            extract_dir: &tmp_path,
         },
+        options,
         device,
         block_size,
         version,
@@ -852,26 +1213,28 @@ pub fn restore_file(
     Ok(())
 }
 
-/// Copy the one entry `file_path` out of the extracted unit at `extracted`
-/// into `dest_dir` — `restore file`'s placing step.
+/// Move the one entry `file_path` out of the extract at `extracted` into
+/// `dest_dir` — `restore file`'s placing step.
 ///
 /// `symlink_metadata`, not `exists()`: a unit may legitimately contain a
 /// symlink pointing outside itself, and `exists()` follows the link, so a
 /// dangling one was reported as "not found in restored unit" when it had in
 /// fact been restored correctly by dar.
+///
+/// A rename when the scratch directory and `dest_dir` share a filesystem —
+/// the default, scratch inside `--to` — so a large file is never written
+/// twice (issue #406's space check counts on it); a copy otherwise.
 fn place_one_entry(extracted: &Path, file_path: &str, dest_dir: &Path) -> Result<()> {
     let source_file = extracted.join(file_path);
     let meta = fs::symlink_metadata(&source_file).map_err(|_| {
         TapectlError::Other(format!("file \"{file_path}\" not found in restored unit"))
     })?;
 
-    let dest = dest_dir.join(
-        Path::new(file_path)
-            .file_name()
-            .unwrap_or(std::ffi::OsStr::new(file_path)),
-    );
+    let dest = placed_path(dest_dir, file_path);
     fs::create_dir_all(dest_dir)?;
-    place_restored_entry(&source_file, &meta, &dest)?;
+    if meta.is_dir() || fs::rename(&source_file, &dest).is_err() {
+        place_restored_entry(&source_file, &meta, &dest)?;
+    }
 
     info!(file = file_path, dest = %dest.display(), "file restored");
     Ok(())
@@ -1314,6 +1677,7 @@ mod tests {
             524288,
             None,
             false,
+            &RestoreOptions::default(),
         );
 
         assert!(
@@ -1741,6 +2105,7 @@ mod tests {
                     524288,
                     v,
                     true,
+                    &RestoreOptions::default(),
                 )
             };
             let newest = run(None).unwrap();
@@ -1866,6 +2231,7 @@ mod tests {
                 RestoreTarget::Unit {
                     dest_dir: &dest.path().to_string_lossy(),
                 },
+                &RestoreOptions::default(),
                 &mut store,
                 site(Operation::RestoreUnit),
             )
@@ -1902,6 +2268,7 @@ mod tests {
                 RestoreTarget::Unit {
                     dest_dir: &dest.path().to_string_lossy(),
                 },
+                &RestoreOptions::default(),
                 &mut store,
                 site(Operation::RestoreUnit),
             )
@@ -1938,6 +2305,7 @@ mod tests {
                 RestoreTarget::Unit {
                     dest_dir: &dest.path().to_string_lossy(),
                 },
+                &RestoreOptions::default(),
                 &mut store,
                 site(Operation::RestoreUnit),
             )
@@ -1986,6 +2354,7 @@ mod tests {
                 RestoreTarget::Unit {
                     dest_dir: &dest.path().to_string_lossy(),
                 },
+                &RestoreOptions::default(),
                 &mut store,
                 site(Operation::RestoreUnit),
             )
@@ -2172,6 +2541,7 @@ mod tests {
                 RestoreTarget::Unit {
                     dest_dir: &dest.path().to_string_lossy(),
                 },
+                &RestoreOptions::default(),
                 &mut store,
                 ContactSite::new(&config, Operation::RestoreUnit, "/dev/null", medium)
                     .with_drive_identity(identity),
@@ -2302,6 +2672,7 @@ mod tests {
                 RestoreTarget::Unit {
                     dest_dir: &dest.path().to_string_lossy(),
                 },
+                &RestoreOptions::default(),
                 &mut store,
                 ContactSite::new(
                     config,
@@ -2619,7 +2990,7 @@ mod tests {
             /// runs end to end: tape read, sha256, decrypt, `dar -x`.
             ///
             /// Returns the store and the plaintext slice length.
-            fn real_fixture(
+            pub(super) fn real_fixture(
                 conn: &Connection,
                 paths: &TapectlPaths,
                 label: &str,
@@ -2683,7 +3054,7 @@ mod tests {
                 (store, plain.len() as u64)
             }
 
-            fn only_row(conn: &Connection) -> RestoreRow {
+            pub(super) fn only_row(conn: &Connection) -> RestoreRow {
                 let mut all = rows(conn).unwrap();
                 assert_eq!(all.len(), 1, "one restore is one row: {all:?}");
                 all.remove(0)
@@ -2717,6 +3088,7 @@ mod tests {
                     RestoreTarget::Unit {
                         dest_dir: &dest_str,
                     },
+                    &RestoreOptions::default(),
                     &mut store,
                     site(Operation::RestoreUnit),
                 )
@@ -2798,6 +3170,7 @@ mod tests {
                         RestoreTarget::Unit {
                             dest_dir: &dest_str,
                         },
+                        &RestoreOptions::default(),
                         store,
                         site(Operation::RestoreUnit),
                     )
@@ -2844,14 +3217,13 @@ mod tests {
 
             /// `restore file` is ONE row of kind `file` under `restore
             /// unit`'s one contact, naming the directory the operator gave
-            /// — never the temp directory the unit was extracted into.
+            /// — never the scratch directory the file was extracted into.
             #[test]
             fn a_restore_file_records_one_file_row_naming_the_operators_destination() {
                 let conn = crate::db::open_memory().unwrap();
                 let home = TempDir::new().unwrap();
                 let paths = TapectlPaths::new(home.path().join(".tapectl"));
                 let (mut store, _) = real_fixture(&conn, &paths, "RF-OK", "rf-unit");
-                let extract = TempDir::new().unwrap();
                 let dest = TempDir::new().unwrap();
                 let dest_str = dest.path().to_string_lossy().to_string();
 
@@ -2865,8 +3237,8 @@ mod tests {
                     RestoreTarget::File {
                         file_path: "b.txt",
                         dest_dir: &dest_str,
-                        extract_dir: &extract.path().to_string_lossy(),
                     },
+                    &RestoreOptions::default(),
                     &mut store,
                     site(Operation::RestoreUnit),
                 )
@@ -2900,7 +3272,6 @@ mod tests {
                 let home = TempDir::new().unwrap();
                 let paths = TapectlPaths::new(home.path().join(".tapectl"));
                 let (mut store, _) = real_fixture(&conn, &paths, "RF-MISS", "rf-unit");
-                let extract = TempDir::new().unwrap();
                 let dest = TempDir::new().unwrap();
 
                 let err = restore_unit_from_store(
@@ -2913,8 +3284,8 @@ mod tests {
                     RestoreTarget::File {
                         file_path: "nope.txt",
                         dest_dir: &dest.path().to_string_lossy(),
-                        extract_dir: &extract.path().to_string_lossy(),
                     },
+                    &RestoreOptions::default(),
                     &mut store,
                     site(Operation::RestoreUnit),
                 )
@@ -2960,6 +3331,7 @@ mod tests {
                     RestoreTarget::Unit {
                         dest_dir: &dest.path().to_string_lossy(),
                     },
+                    &RestoreOptions::default(),
                     &mut store,
                     site(Operation::RestoreUnit),
                 )
@@ -3002,6 +3374,7 @@ mod tests {
                     RestoreTarget::Unit {
                         dest_dir: &dest.path().to_string_lossy(),
                     },
+                    &RestoreOptions::default(),
                     &mut store,
                     site(Operation::RestoreUnit),
                 );
@@ -3031,6 +3404,7 @@ mod tests {
                     4096,
                     None,
                     true,
+                    &RestoreOptions::default(),
                 )
                 .unwrap();
                 assert!(rows(&conn).unwrap().is_empty());
@@ -3088,6 +3462,403 @@ mod tests {
                 assert!(r.error.is_some());
                 assert_eq!(r.files_restored, None, "not known: the dump never finished");
                 assert_eq!(r.bytes_restored, None);
+            }
+        }
+
+        // ── issue #406: restore checks before it touches the tape ──
+
+        mod preflight {
+            use super::record::{only_row, real_fixture};
+            use super::*;
+            use crate::store::{injected::InjectedDrive, OpenMode};
+            use crate::tape::fake::FakeTape;
+
+            const DEVICE: &str = "/nonexistent/tapectl-restore-preflight-nst";
+
+            /// `real_fixture`'s catalog and tape (a real dar archive of
+            /// `a.txt` and `b.txt`), the version's `files` rows as `snapshot
+            /// create` writes them, and the tape behind an injected drive —
+            /// so the REAL `restore_unit`/`restore_file` run end to end, and
+            /// the fake says whether, and how, the drive was opened.
+            struct Rig {
+                conn: Connection,
+                paths: TapectlPaths,
+                fake: FakeTape,
+                _home: TempDir,
+                _drive: InjectedDrive,
+            }
+
+            fn rig(label: &str) -> Rig {
+                let conn = crate::db::open_memory().unwrap();
+                let home = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(home.path().join(".tapectl"));
+                let (store, _) = real_fixture(&conn, &paths, label, "pf-unit");
+                let snapshot_id: i64 = conn
+                    .query_row("SELECT id FROM snapshots", [], |r| r.get(0))
+                    .unwrap();
+                for (path, size, dir) in [("a.txt", 5, 0), ("b.txt", 5, 0), ("docs", 0, 1)] {
+                    conn.execute(
+                        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![snapshot_id, path, size, dir],
+                    )
+                    .unwrap();
+                }
+                let fake = FakeTape::with_files(store.files.clone(), 4096);
+                let drive = InjectedDrive::install(&fake);
+                Rig {
+                    conn,
+                    paths,
+                    fake,
+                    _home: home,
+                    _drive: drive,
+                }
+            }
+
+            fn unit(r: &Rig, label: &str, dest: &Path, options: &RestoreOptions) -> Result<()> {
+                restore_unit(
+                    &r.conn,
+                    &r.paths,
+                    &Config::default(),
+                    "pf-unit",
+                    label,
+                    &dest.to_string_lossy(),
+                    DEVICE,
+                    4096,
+                    None,
+                    false,
+                    options,
+                )
+                .map(|_| ())
+            }
+
+            fn file(
+                r: &Rig,
+                label: &str,
+                path: &str,
+                dest: &Path,
+                options: &RestoreOptions,
+            ) -> Result<()> {
+                restore_file(
+                    &r.conn,
+                    &r.paths,
+                    &Config::default(),
+                    "pf-unit",
+                    path,
+                    label,
+                    &dest.to_string_lossy(),
+                    DEVICE,
+                    4096,
+                    None,
+                    options,
+                )
+            }
+
+            /// A refusal before contact: the drive never opened, and so no
+            /// contact, MAM journal or `restores` row exists.
+            fn assert_no_tape_contact(r: &Rig) {
+                assert_eq!(r.fake.opens(), vec![], "the drive was opened");
+                let count = |sql: &str| -> i64 { r.conn.query_row(sql, [], |x| x.get(0)).unwrap() };
+                assert_eq!(count("SELECT COUNT(*) FROM cartridge_contacts"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM mam_journal"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM restores"), 0);
+            }
+
+            fn names_in(dir: &Path) -> Vec<String> {
+                let mut names: Vec<String> = fs::read_dir(dir)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                names
+            }
+
+            /// The positive control for every refusal below: the same rig,
+            /// a clean destination, and the restore runs — read-only, with
+            /// its decrypted slices in a scratch directory inside `--to`
+            /// WHILE the tape is read, and nothing of it left after.
+            #[test]
+            fn a_restore_unit_into_an_empty_destination_runs_with_scratch_inside_it() {
+                let r = rig("PF-OK");
+                let dest = TempDir::new().unwrap();
+                r.fake.watch(&dest.path().join(SCRATCH_NAME));
+                unit(&r, "PF-OK", dest.path(), &RestoreOptions::default()).unwrap();
+
+                assert_eq!(names_in(dest.path()), ["a.txt", "b.txt"]);
+                assert_eq!(r.fake.opens(), vec![OpenMode::ReadOnly]);
+                assert!(
+                    r.fake.watched().contains(&(1, true)),
+                    "the scratch directory was inside --to while the slice was read: {:?}",
+                    r.fake.watched()
+                );
+            }
+
+            /// Issue #406: `restore file` used to extract the WHOLE unit into
+            /// `tempfile::tempdir()` — $TMPDIR, the small root filesystem on
+            /// home2 — slices and all. Now its scratch is inside `--to` while
+            /// the tape is read, dar is asked for the one entry (`-g`), and
+            /// only that file lands.
+            #[test]
+            fn restore_file_extracts_only_its_file_with_dar_g_and_scratch_inside_to() {
+                let r = rig("PF-FILE");
+                let dest = TempDir::new().unwrap();
+                r.fake.watch(&dest.path().join(SCRATCH_NAME));
+                file(
+                    &r,
+                    "PF-FILE",
+                    "b.txt",
+                    dest.path(),
+                    &RestoreOptions::default(),
+                )
+                .unwrap();
+
+                assert_eq!(fs::read(dest.path().join("b.txt")).unwrap(), b"bravo");
+                assert_eq!(names_in(dest.path()), ["b.txt"], "no scratch left behind");
+                assert!(
+                    r.fake.watched().contains(&(1, true)),
+                    "the scratch directory was inside --to while the slice was read, not in \
+                     $TMPDIR: {:?}",
+                    r.fake.watched()
+                );
+                let row = only_row(&r.conn);
+                let argv = row.dar_argv.expect("dar ran");
+                assert!(argv.contains(r#""-g","b.txt""#), "{argv}");
+            }
+
+            /// The production half never asks the system for a temp
+            /// directory — the deterministic form of "never touches $TMPDIR".
+            #[test]
+            fn the_restore_code_never_uses_a_system_temp_directory() {
+                const SRC: &str = include_str!("restore.rs");
+                let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+                assert!(prod.len() < SRC.len(), "positive control: tests split off");
+                assert!(prod.contains("fn restore_file("), "positive control");
+                for needle in ["tempfile::", "temp_dir(", "TMPDIR"] {
+                    assert!(
+                        !prod
+                            .lines()
+                            .filter(|l| !l.trim_start().starts_with("//"))
+                            .any(|l| l.contains(needle)),
+                        "production restore code uses {needle}"
+                    );
+                }
+            }
+
+            #[test]
+            fn the_scratch_directory_is_inside_the_destination_or_scratch() {
+                assert_eq!(
+                    scratch_dir(Path::new("/restore/here"), None),
+                    Path::new("/restore/here/.tapectl-restore-tmp")
+                );
+                assert_eq!(
+                    scratch_dir(Path::new("/restore/here"), Some(Path::new("/big/disk"))),
+                    Path::new("/big/disk/.tapectl-restore-tmp")
+                );
+            }
+
+            /// Too little space is refused before the drive is opened —
+            /// it used to fill the disk hours in.
+            #[test]
+            fn a_short_space_destination_is_refused_before_the_drive_is_opened() {
+                let r = rig("PF-SPACE");
+                let dest = TempDir::new().unwrap();
+                let _free = RestoreFreeOverride::set(10);
+                let err = unit(&r, "PF-SPACE", dest.path(), &RestoreOptions::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("not enough disk space"), "{err}");
+                assert!(err.contains("Nothing was read from tape"), "{err}");
+                assert!(err.contains("--scratch DIR"), "{err}");
+                assert_no_tape_contact(&r);
+
+                // --no-space-check is the escape, as in RESTORE.sh.
+                let options = RestoreOptions {
+                    no_space_check: true,
+                    ..RestoreOptions::default()
+                };
+                unit(&r, "PF-SPACE", dest.path(), &options).unwrap();
+                assert_eq!(names_in(dest.path()), ["a.txt", "b.txt"]);
+            }
+
+            /// The arithmetic is RESTORE.sh's: about twice the unit plus one
+            /// slice on one filesystem — refused one byte short of it,
+            /// accepted at it.
+            #[test]
+            fn the_space_needed_is_twice_the_unit_plus_one_slice() {
+                let r = rig("PF-MATH");
+                let slice: i64 = r
+                    .conn
+                    .query_row("SELECT encrypted_bytes FROM stage_slices", [], |x| x.get(0))
+                    .unwrap();
+                let dest = TempDir::new().unwrap();
+                {
+                    let _free = RestoreFreeOverride::set(3 * slice - 1);
+                    let err = unit(&r, "PF-MATH", dest.path(), &RestoreOptions::default())
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("not enough disk space"), "{err}");
+                }
+                let _free = RestoreFreeOverride::set(3 * slice);
+                unit(&r, "PF-MATH", dest.path(), &RestoreOptions::default()).unwrap();
+            }
+
+            /// A destination that is not empty is refused before the drive
+            /// is opened (dar would keep each colliding file, found only
+            /// after the whole unit was read); `--overwrite` replaces them.
+            #[test]
+            fn a_non_empty_destination_is_refused_unless_overwrite() {
+                let r = rig("PF-FULL");
+                let dest = TempDir::new().unwrap();
+                fs::write(dest.path().join("a.txt"), b"STALE").unwrap();
+                let err = unit(&r, "PF-FULL", dest.path(), &RestoreOptions::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("is not empty"), "{err}");
+                assert!(err.contains("--overwrite"), "{err}");
+                assert_no_tape_contact(&r);
+
+                // A dry run that says "would restore" means it.
+                let dry = restore_unit(
+                    &r.conn,
+                    &r.paths,
+                    &Config::default(),
+                    "pf-unit",
+                    "PF-FULL",
+                    &dest.path().to_string_lossy(),
+                    DEVICE,
+                    4096,
+                    None,
+                    true,
+                    &RestoreOptions::default(),
+                );
+                assert!(dry.is_err(), "a dry run takes the same refusal");
+
+                let options = RestoreOptions {
+                    overwrite: true,
+                    ..RestoreOptions::default()
+                };
+                unit(&r, "PF-FULL", dest.path(), &options).unwrap();
+                assert_eq!(fs::read(dest.path().join("a.txt")).unwrap(), b"alpha");
+                let argv = only_row(&r.conn).dar_argv.expect("dar ran");
+                assert!(argv.contains(r#""-w""#), "{argv}");
+            }
+
+            /// `restore file` places one name, so only that name collides.
+            #[test]
+            fn restore_file_refuses_an_existing_file_of_that_name_unless_overwrite() {
+                let r = rig("PF-FCOL");
+                let dest = TempDir::new().unwrap();
+                fs::write(dest.path().join("unrelated.txt"), b"mine").unwrap();
+                fs::write(dest.path().join("b.txt"), b"STALE").unwrap();
+                let err = file(
+                    &r,
+                    "PF-FCOL",
+                    "b.txt",
+                    dest.path(),
+                    &RestoreOptions::default(),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("already exists"), "{err}");
+                assert_no_tape_contact(&r);
+
+                let options = RestoreOptions {
+                    overwrite: true,
+                    ..RestoreOptions::default()
+                };
+                file(&r, "PF-FCOL", "b.txt", dest.path(), &options).unwrap();
+                assert_eq!(fs::read(dest.path().join("b.txt")).unwrap(), b"bravo");
+                assert_eq!(
+                    fs::read(dest.path().join("unrelated.txt")).unwrap(),
+                    b"mine"
+                );
+            }
+
+            /// `--file` is checked against the version's `files` rows before
+            /// the drive is opened: a typo used to read every slice (~5 h on
+            /// a large unit) and then fail. A directory is refused too.
+            #[test]
+            fn an_unknown_or_directory_file_is_refused_before_the_drive_is_opened() {
+                let r = rig("PF-NOFILE");
+                let dest = TempDir::new().unwrap();
+                let err = file(
+                    &r,
+                    "PF-NOFILE",
+                    "nope.txt",
+                    dest.path(),
+                    &RestoreOptions::default(),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("has no file \"nope.txt\""), "{err}");
+                assert!(err.contains("tape was not touched"), "{err}");
+                assert!(err.contains("tapectl catalog search"), "{err}");
+
+                let err = file(
+                    &r,
+                    "PF-NOFILE",
+                    "docs",
+                    dest.path(),
+                    &RestoreOptions::default(),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(err.contains("is a directory"), "{err}");
+                assert_no_tape_contact(&r);
+            }
+
+            /// A scratch directory a killed restore left (its guard never
+            /// ran) may hold decrypted slices: refused, named, never reused —
+            /// inside `--to`, and inside `--scratch`.
+            #[test]
+            fn a_leftover_scratch_directory_is_refused_before_the_drive_is_opened() {
+                let r = rig("PF-LEFT");
+                let dest = TempDir::new().unwrap();
+                fs::create_dir(dest.path().join(SCRATCH_NAME)).unwrap();
+                let err = unit(&r, "PF-LEFT", dest.path(), &RestoreOptions::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("already exists"), "{err}");
+                assert!(err.contains("DECRYPTED"), "{err}");
+                assert!(err.contains(SCRATCH_NAME), "{err}");
+
+                let other = TempDir::new().unwrap();
+                fs::create_dir(other.path().join(SCRATCH_NAME)).unwrap();
+                let fresh = TempDir::new().unwrap();
+                let options = RestoreOptions {
+                    scratch: Some(other.path().to_path_buf()),
+                    ..RestoreOptions::default()
+                };
+                let err = unit(&r, "PF-LEFT", fresh.path(), &options)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(&other.path().join(SCRATCH_NAME).display().to_string()),
+                    "{err}"
+                );
+                assert_no_tape_contact(&r);
+            }
+
+            /// `--scratch DIR`: the decrypted slices wait there while the
+            /// tape is read, not in `--to`, and nothing is left in either.
+            #[test]
+            fn scratch_dir_puts_the_decrypted_slices_on_another_disk() {
+                let r = rig("PF-SCR");
+                let dest = TempDir::new().unwrap();
+                let other = TempDir::new().unwrap();
+                r.fake.watch(&other.path().join(SCRATCH_NAME));
+                let options = RestoreOptions {
+                    scratch: Some(other.path().to_path_buf()),
+                    ..RestoreOptions::default()
+                };
+                unit(&r, "PF-SCR", dest.path(), &options).unwrap();
+                assert!(
+                    r.fake.watched().contains(&(1, true)),
+                    "{:?}",
+                    r.fake.watched()
+                );
+                assert_eq!(names_in(dest.path()), ["a.txt", "b.txt"]);
+                assert!(names_in(other.path()).is_empty(), "scratch removed");
             }
         }
 
@@ -3232,6 +4003,7 @@ mod tests {
                     RestoreTarget::Unit {
                         dest_dir: &dest_str,
                     },
+                    &RestoreOptions::default(),
                     &mut store,
                     site(Operation::RestoreUnit),
                 )

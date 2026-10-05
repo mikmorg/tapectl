@@ -153,15 +153,21 @@ fn run_extract(
 /// Fails if dar skipped any file rather than overwriting it — see
 /// [`skipped_paths`] for why that is not detectable the obvious way.
 pub fn extract(dar_binary: &str, archive_base: &Path, dest: &Path) -> Result<()> {
-    extract_reported(dar_binary, archive_base, dest).1
+    extract_reported(dar_binary, archive_base, dest, false).1
 }
 
 /// [`extract`], also handing back dar's [`DarReport`] whenever dar ran —
 /// on success and on failure alike — for the `restores` row (issue #306).
+///
+/// `overwrite` (`restore unit --overwrite`, issue #406) adds dar's `-w`:
+/// replace a file that already exists at the destination without asking.
+/// Without it dar, having no terminal under `-Q`, keeps the old file and
+/// [`fail_on_skipped`] turns that into a failure.
 pub fn extract_reported(
     dar_binary: &str,
     archive_base: &Path,
     dest: &Path,
+    overwrite: bool,
 ) -> (Option<DarReport>, Result<()>) {
     if let Some(parent) = dest.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -173,7 +179,7 @@ pub fn extract_reported(
     }
     warn_if_non_root();
 
-    let args: Vec<std::ffi::OsString> = vec![
+    let mut args: Vec<std::ffi::OsString> = vec![
         "-x".into(),
         archive_base.into(),
         "-R".into(),
@@ -186,6 +192,12 @@ pub fn extract_reported(
         "-O".into(),
         "-Q".into(),
     ];
+    if overwrite {
+        // `-w` (`--no-warn`): overwrite without asking — the real overwrite
+        // flag. Verified against dar 2.7.13: an existing file is replaced
+        // and no "not restored (user choice)" line is printed.
+        args.push("-w".into());
+    }
     run_extract(dar_binary, "dar -x", &args, dest)
 }
 
@@ -200,7 +212,22 @@ pub fn extract_file(
     file_path: &str,
     dest: &Path,
 ) -> Result<()> {
-    std::fs::create_dir_all(dest)?;
+    extract_file_reported(dar_binary, archive_base, file_path, dest).1
+}
+
+/// [`extract_file`], also handing back dar's [`DarReport`] whenever dar ran
+/// — `restore file`'s extract (issue #406), recorded on its `restores` row
+/// like `restore unit`'s. `dar -x -g <file_path>` reads the archive but
+/// writes only that entry (and the directories above it) under `dest`.
+pub fn extract_file_reported(
+    dar_binary: &str,
+    archive_base: &Path,
+    file_path: &str,
+    dest: &Path,
+) -> (Option<DarReport>, Result<()>) {
+    if let Err(e) = std::fs::create_dir_all(dest) {
+        return (None, Err(e.into()));
+    }
     warn_if_non_root();
 
     let args: Vec<std::ffi::OsString> = vec![
@@ -214,7 +241,7 @@ pub fn extract_file(
         "-O".into(),
         "-Q".into(),
     ];
-    run_extract(dar_binary, "dar -x -g", &args, dest).1
+    run_extract(dar_binary, "dar -x -g", &args, dest)
 }
 
 /// Test a dar archive integrity.
@@ -373,7 +400,7 @@ mod tests {
             .unwrap();
         assert!(created.status.success(), "dar -c failed in test setup");
 
-        let (report, verdict) = extract_reported(dar, &archive_base, &dest);
+        let (report, verdict) = extract_reported(dar, &archive_base, &dest, false);
         verdict.expect("a clean extract");
         let report = report.expect("dar ran, so there is a report");
         assert_eq!(report.exit_code, Some(0));
@@ -413,7 +440,7 @@ mod tests {
             .success());
         std::fs::write(dest.join("collide.txt"), b"STALE").unwrap();
 
-        let (report, verdict) = extract_reported(dar, &archive_base, &dest);
+        let (report, verdict) = extract_reported(dar, &archive_base, &dest, false);
         assert!(verdict.is_err(), "a collision is a failed restore");
         let report = report.expect("dar ran");
         assert_eq!(
@@ -424,6 +451,42 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&report.stdout).contains(SKIPPED_MARKER),
             "the evidence is in the verbatim stdout"
+        );
+    }
+
+    /// `restore unit --overwrite` (issue #406): the same collision, with
+    /// `overwrite`, replaces the stale file with the archived one — dar's
+    /// `-w` — and is a clean restore. The test above is its control.
+    #[test]
+    fn real_dar_overwrite_replaces_a_colliding_file() {
+        let dar = "dar";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(src.join("collide.txt"), b"ARCHIVED").unwrap();
+        let archive_base = tmp.path().join("arch");
+        assert!(Command::new(dar)
+            .arg("-c")
+            .arg(&archive_base)
+            .arg("-R")
+            .arg(&src)
+            .arg("-Q")
+            .output()
+            .unwrap()
+            .status
+            .success());
+        std::fs::write(dest.join("collide.txt"), b"STALE").unwrap();
+
+        let (report, verdict) = extract_reported(dar, &archive_base, &dest, true);
+        verdict.expect("an overwriting restore of a collision is clean");
+        let report = report.expect("dar ran");
+        assert!(report.argv.iter().any(|a| a == "-w"), "{:?}", report.argv);
+        assert!(!String::from_utf8_lossy(&report.stdout).contains(SKIPPED_MARKER));
+        assert_eq!(
+            std::fs::read(dest.join("collide.txt")).unwrap(),
+            b"ARCHIVED"
         );
     }
 

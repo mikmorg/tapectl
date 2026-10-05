@@ -4,13 +4,13 @@
 .SH NAME
 tapectl\-restore\-file \- Restore a single file from a unit
 .SH SYNOPSIS
-\fBtapectl restore file\fR <\fB\-\-file\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> <\fB\-\-from\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] <\fB\-\-to\fR> [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-version\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl restore file\fR <\fB\-\-file\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> <\fB\-\-from\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] <\fB\-\-to\fR> [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-version\fR] [\fB\-\-home\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Restore a single file from a unit
 .SH OPTIONS
 .TP
 \fB\-\-file\fR \fI<FILE>\fR
-File path within the unit
+File path within the unit, relative to its root, as `catalog ls` prints it. Checked against the catalog\*(Aqs file list for the version before the tape is touched; a directory is refused
 .TP
 \fB\-\-json\fR
 Output in JSON format
@@ -51,6 +51,15 @@ Snapshot version to restore. Defaults to the newest version of the unit on this 
 tapectl home directory: database, keys, catalogs, stage\-reports, logs.
 
 Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-\-scratch\fR \fI<DIR>\fR
+Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside \-\-to. Never the system temp directory: a unit\*(Aqs slices can be as large as the unit
+.TP
+\fB\-\-overwrite\fR
+Replace a file of the same name already in \-\-to. Without it one is refused before the tape is touched
+.TP
+\fB\-\-no\-space\-check\fR
+Skip the free\-space check (the unit\*(Aqs decrypted slices, plus one slice and the file, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

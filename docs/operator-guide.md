@@ -745,6 +745,14 @@ tapectl restore file --file 1998-letter-to-mum.txt --unit family/letters \
 
 # Dry run
 tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE" --dry-run
+
+# A large unit: the decrypted slices wait on another disk
+tapectl restore unit --unit family/letters --from L8-0002 --to /srv/restore/letters \
+  --scratch /mnt/big --device "$TAPE"
+
+# Into a directory that already holds an older copy, replacing what collides
+tapectl restore unit --unit family/letters --from L8-0002 --to /srv/restore/letters \
+  --overwrite --device "$TAPE"
 ```
 
 ```text
@@ -764,6 +772,31 @@ service user): the files come back, but owned by the restoring user rather
 than their archived owners. `--version N` restores an older snapshot; by default the newest version
 of the unit on that volume is used. `catalog locate` (below) tells you which
 volumes to restore `--from`.
+
+Before it opens the drive, a restore checks everything it can without the
+tape, and refuses with nothing read
+([troubleshooting](troubleshooting.md#restoring)):
+
+- **Space.** A restore decrypts every slice of the unit to disk before dar
+  extracts them. The slices wait in a `.tapectl-restore-tmp` directory inside
+  `--to`, or inside `--scratch DIR` when you name one, and never in the system
+  temp directory. With both on one disk a unit needs about twice its size
+  free, plus one slice; `restore file` needs the unit's slices plus the one
+  file. Pick a `--to` with room: `/tmp`, used in these small examples, is often
+  RAM or the root filesystem. `--no-space-check` skips the check, for a
+  compressed or thin-provisioned filesystem that holds more than it reports
+  free.
+- **The destination.** `restore unit` wants an empty or new `--to`, and
+  `restore file` refuses when a file of the same name is already there.
+  `--overwrite` restores anyway and replaces what collides.
+- **The file.** `restore file --file` must be a path the catalog recorded for
+  that version, relative to the unit's root, as `catalog ls` and
+  `catalog search` print it. A directory is refused: restore the unit. dar is
+  asked for that one entry, but every slice of the unit is still read off the
+  tape.
+- **A leftover scratch directory.** A restore that was killed, or lost power,
+  leaves its `.tapectl-restore-tmp` behind, and it may hold decrypted data. The
+  next restore refuses and names it; remove it by hand.
 
 ### Search the catalog
 

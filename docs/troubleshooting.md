@@ -1613,6 +1613,24 @@ serial disagrees. `volume identify` shows what is loaded, and needs no key:
 tapectl volume identify --device "$TAPE"
 ```
 
+### The destination is not empty
+
+```text
+error: refusing to restore into <dest>: it is not empty (it holds "<entry>", and maybe more). dar would keep every
+existing file that collides with one from the tape, so the result would not be what is on tape. Restore into an
+empty or new directory, or pass --overwrite to replace what collides. Nothing was read from tape.
+```
+
+`restore unit` checks `--to` before it opens the drive. Restore into an empty
+or new directory, or add `--overwrite` to replace every file that collides
+(the files in `--to` that the unit does not have are left alone). For
+`restore file` only the one name matters:
+
+```text
+error: refusing to restore "<file>": <dest>/<name> already exists. Choose another --to, move that file away, or
+pass --overwrite to replace it. Nothing was read from tape.
+```
+
 ### The restore is INCOMPLETE: the destination was not empty
 
 ```text
@@ -1621,8 +1639,60 @@ otherwise have reported success. The stale copies are still in place — the res
 Skipped: <paths>. Restore into an empty directory, or remove those files first.
 ```
 
-When dar meets a file that already exists, it keeps the old one. Restore into
-an empty directory.
+When dar meets a file that already exists, it keeps the old one. A
+destination that is not empty is refused before the tape is read (above), so
+this now means a file appeared in `--to` while the restore ran. Restore into an
+empty directory, or pass `--overwrite`.
+
+### `restore file`: the file is not in the catalog
+
+```text
+error: unit "<unit>" version <n> has no file "<file>" in the catalog's record of what it archived, so the tape was
+not touched. A path is relative to the unit's root and matched exactly; `tapectl catalog search <words of the name>`
+finds one, and `tapectl catalog ls <unit>` lists the newest version's files.
+```
+
+`--file` is checked against the version's file list before the drive is
+opened. Give the path relative to the unit's root, with no leading `/` or
+`./`, exactly as `catalog ls` prints it:
+
+```bash
+tapectl catalog search letter mum
+tapectl catalog ls family/letters
+```
+
+A directory is refused the same way (`"<path>" is a directory …`):
+`restore file` restores one file. Restore the unit and take the directory
+from it.
+
+### Not enough disk space for the restore
+
+```text
+error: not enough disk space in <dir> for this restore: it needs about <size>, and <size> is free. Nothing was read
+from tape. A restore decrypts every slice of the unit to disk before dar extracts them, so with the scratch space
+and --to on one disk it needs the unit's size about twice over, plus one slice. Free space there, choose a larger
+disk with --to, or put the decrypted slices on another disk with --scratch DIR. (--no-space-check skips this
+check, for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one.)
+```
+
+The decrypted slices wait in a `.tapectl-restore-tmp` directory inside `--to`,
+never in the system temp directory. With `--scratch DIR` they wait in `DIR`
+instead, and each disk is checked for its own share: the slices plus one more
+in `DIR`, the restored files in `--to`. `restore file` needs room for the
+unit's slices and the one file. The arithmetic is the same as RESTORE.sh's.
+
+### A scratch directory already exists
+
+```text
+error: refusing to restore: the scratch directory <dir>/.tapectl-restore-tmp already exists. A restore that was
+killed (or lost power) leaves it behind, and it may hold DECRYPTED archive slices. Remove it
+(`rm -rf <dir>/.tapectl-restore-tmp`) and run the restore again. Nothing was read from tape.
+```
+
+A restore removes its scratch directory on every way out it controls,
+including an error. A `kill -9` or a power cut skips that. The directory can
+hold decrypted data, so treat it as you would the restored files, remove it,
+and restore again.
 
 ### Restoring as a non-root user
 

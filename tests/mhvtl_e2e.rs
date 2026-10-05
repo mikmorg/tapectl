@@ -423,6 +423,7 @@ fn restore_to(h: &Harness, unit_name: &str, label: &str, dest: &Path) {
         BLOCK_SIZE,
         None,
         false,
+        &volume::restore::RestoreOptions::default(),
     )
     .unwrap();
 }
@@ -632,6 +633,7 @@ fn mhvtl_tenant_isolation() {
         BLOCK_SIZE,
         None,
         false,
+        &volume::restore::RestoreOptions::default(),
     )
     .expect("operator key must still recover bob-u — operator is a recipient on every slice");
 
@@ -651,6 +653,7 @@ fn mhvtl_tenant_isolation() {
         BLOCK_SIZE,
         None,
         false,
+        &volume::restore::RestoreOptions::default(),
     );
     assert!(
         res.is_err(),

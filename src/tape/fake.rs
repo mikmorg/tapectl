@@ -58,6 +58,12 @@ pub(crate) struct State {
     pub write_protected: bool,
     /// Every open, in order, as `TapeStore::open`/`open_read` asked for it.
     pub opens: Vec<OpenMode>,
+    /// A path whose existence every read records in `watched` — how a test
+    /// sees what is on disk WHILE the tape is being read (issue #406: where
+    /// a restore's decrypted slices are).
+    pub watch: Option<std::path::PathBuf>,
+    /// `(file read, whether `watch` existed then)`, one per read.
+    pub watched: Vec<(u32, bool)>,
 }
 
 /// A cloneable handle: the test keeps one, `TapeStore` owns the other.
@@ -115,6 +121,23 @@ impl FakeTape {
     /// Every open so far, in order.
     pub(crate) fn opens(&self) -> Vec<OpenMode> {
         self.state().opens.clone()
+    }
+
+    /// Record, at every read from now on, whether `path` exists.
+    pub(crate) fn watch(&self, path: &std::path::Path) {
+        self.state().watch = Some(path.to_path_buf());
+    }
+
+    /// What every read since [`Self::watch`] saw: `(file, path existed)`.
+    pub(crate) fn watched(&self) -> Vec<(u32, bool)> {
+        self.state().watched.clone()
+    }
+
+    fn note_read(s: &mut State, file: usize) {
+        if let Some(path) = &s.watch {
+            let seen = path.exists();
+            s.watched.push((file as u32, seen));
+        }
     }
 
     /// Open the fake as `mode` — what `TapeStore::open`/`open_read` do to a
@@ -197,6 +220,7 @@ impl TapeOps for FakeTape {
         let mut s = self.state();
         let (file, start) = s.head;
         s.ops.push(Op::Read(file as u32));
+        FakeTape::note_read(&mut s, file);
         if file >= s.files.len() {
             return Ok((0, ReadEnd::Filemark)); // end of data: st returns 0
         }
@@ -225,6 +249,7 @@ impl TapeOps for FakeTape {
         let mut s = self.state();
         let (file, start) = s.head;
         s.ops.push(Op::ReadHead(file as u32));
+        FakeTape::note_read(&mut s, file);
         if file >= s.files.len() {
             return Ok((0, ReadEnd::Filemark));
         }

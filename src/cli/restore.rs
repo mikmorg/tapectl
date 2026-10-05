@@ -31,6 +31,23 @@ pub enum RestoreCommands {
         /// does
         #[arg(long)]
         version: Option<i64>,
+        /// Where the decrypted slices wait for dar: a scratch directory is
+        /// made inside DIR and removed when the restore ends. Defaults to
+        /// inside --to. Never the system temp directory: a unit's slices
+        /// can be as large as the unit
+        #[arg(long, value_name = "DIR")]
+        scratch: Option<String>,
+        /// Restore into a destination that already holds files, replacing
+        /// any that collide. Without it a destination that is not empty is
+        /// refused before the tape is touched
+        #[arg(long)]
+        overwrite: bool,
+        /// Skip the free-space check (about twice the unit's size, plus one
+        /// slice, with the scratch directory and --to on one disk), for a
+        /// filesystem that holds more than it reports free, such as a
+        /// compressed or thin-provisioned one
+        #[arg(long)]
+        no_space_check: bool,
         /// Show what would be restored without restoring
         #[arg(long)]
         dry_run: bool,
@@ -38,7 +55,9 @@ pub enum RestoreCommands {
 
     /// Restore a single file from a unit
     File {
-        /// File path within the unit
+        /// File path within the unit, relative to its root, as `catalog ls`
+        /// prints it. Checked against the catalog's file list for the
+        /// version before the tape is touched; a directory is refused
         #[arg(long)]
         file: String,
         /// Unit name
@@ -60,6 +79,22 @@ pub enum RestoreCommands {
         /// does
         #[arg(long)]
         version: Option<i64>,
+        /// Where the decrypted slices wait for dar: a scratch directory is
+        /// made inside DIR and removed when the restore ends. Defaults to
+        /// inside --to. Never the system temp directory: a unit's slices
+        /// can be as large as the unit
+        #[arg(long, value_name = "DIR")]
+        scratch: Option<String>,
+        /// Replace a file of the same name already in --to. Without it one
+        /// is refused before the tape is touched
+        #[arg(long)]
+        overwrite: bool,
+        /// Skip the free-space check (the unit's decrypted slices, plus one
+        /// slice and the file, with the scratch directory and --to on one
+        /// disk), for a filesystem that holds more than it reports free,
+        /// such as a compressed or thin-provisioned one
+        #[arg(long)]
+        no_space_check: bool,
     },
 
     /// Dump every file off a tape verbatim, using only what is on the tape
@@ -100,9 +135,17 @@ pub fn run(
             to,
             device,
             version,
+            scratch,
+            overwrite,
+            no_space_check,
             dry_run,
         } => {
             let device = crate::cli::read_device(config, device.as_deref())?;
+            let options = volume::restore::RestoreOptions {
+                scratch: scratch.as_ref().map(std::path::PathBuf::from),
+                overwrite: *overwrite,
+                no_space_check: *no_space_check,
+            };
             let report = volume::restore::restore_unit(
                 conn,
                 paths,
@@ -114,6 +157,7 @@ pub fn run(
                 DEFAULT_BLOCK_SIZE,
                 *version,
                 *dry_run,
+                &options,
             )?;
 
             if json_output {
@@ -156,21 +200,29 @@ pub fn run(
             to,
             device,
             version,
+            scratch,
+            overwrite,
+            no_space_check,
         } => {
-            // Issue #241: unlike `restore unit`, this has no cheap
-            // preview yet — a faithful one would need to confirm the
-            // specific file exists inside the unit's archived contents,
-            // which `restore_file` currently does by restoring to a temp
-            // dir first (see its own doc comment).
+            // Issue #241: unlike `restore unit`, this has no preview. The
+            // catalog check of `--file` runs before any tape contact (issue
+            // #406), but proving the entry is really in the archive still
+            // means reading every slice of the unit off the tape.
             if dry_run {
                 return Err(crate::cli::refuse_dry_run(
                     "restore file",
-                    "there is no cheap preview yet — confirming the file exists means \
-                     restoring the whole unit to a temp directory first. `restore unit \
-                     --dry-run` previews the containing unit at no cost.",
+                    "there is no cheap preview — the file is checked against the catalog \
+                     before the tape is touched, but proving it is in the archive means \
+                     reading every slice of the unit. `restore unit --dry-run` previews the \
+                     containing unit at no cost.",
                 ));
             }
             let device = crate::cli::read_device(config, device.as_deref())?;
+            let options = volume::restore::RestoreOptions {
+                scratch: scratch.as_ref().map(std::path::PathBuf::from),
+                overwrite: *overwrite,
+                no_space_check: *no_space_check,
+            };
             volume::restore::restore_file(
                 conn,
                 paths,
@@ -182,6 +234,7 @@ pub fn run(
                 &device,
                 DEFAULT_BLOCK_SIZE,
                 *version,
+                &options,
             )?;
 
             if json_output {

@@ -30,6 +30,9 @@ tapectl restore unit [OPTIONS] --unit <UNIT> --from <FROM> --to <TO>
 - `--from <FROM>` *(required)* — Volume label
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--scratch <DIR>` — Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside --to. Never the system temp directory: a unit's slices can be as large as the unit
+- `--overwrite` — Restore into a destination that already holds files, replacing any that collide. Without it a destination that is not empty is refused before the tape is touched
+- `--no-space-check` — Skip the free-space check (about twice the unit's size, plus one slice, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
 - `--dry-run` — Show what would be restored without restoring
 
 ### tapectl restore file
@@ -42,11 +45,14 @@ tapectl restore file [OPTIONS] --file <FILE> --unit <UNIT> --from <FROM> --to <T
 
 **Options**
 
-- `--file <FILE>` *(required)* — File path within the unit
+- `--file <FILE>` *(required)* — File path within the unit, relative to its root, as `catalog ls` prints it. Checked against the catalog's file list for the version before the tape is touched; a directory is refused
 - `--unit <UNIT>` *(required)* — Unit name
 - `--from <FROM>` *(required)* — Volume label
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--scratch <DIR>` — Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside --to. Never the system temp directory: a unit's slices can be as large as the unit
+- `--overwrite` — Replace a file of the same name already in --to. Without it one is refused before the tape is touched
+- `--no-space-check` — Skip the free-space check (the unit's decrypted slices, plus one slice and the file, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
 
 ### tapectl restore raw-volume
 
