@@ -15,12 +15,17 @@
 //! of the next one; a read at end of data returns nothing; a write replaces
 //! everything from the head onward. A read can be made to fail partway
 //! through a file, and the head moved behind the store's back.
+//!
+//! Opening it (issue #407) is the st driver's too: a read-write open of a
+//! write-protected cartridge fails with EROFS, and a write through a
+//! read-only open fails with EBADF. A fake that is never opened — a store
+//! built with `TapeStore::from_ops` — writes freely, as before.
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{Result, TapectlError};
-use crate::store::TapeOps;
+use crate::store::{OpenMode, TapeOps};
 use crate::tape::ioctl::{ReadEnd, TapePosition};
 
 /// One operation the store issued, in order.
@@ -49,6 +54,10 @@ pub(crate) struct State {
     /// A read starting in one of these files delivers one block, then
     /// fails, leaving the head inside the file.
     pub fail_reads_at: Vec<u32>,
+    /// The cartridge's write-protect tab is set.
+    pub write_protected: bool,
+    /// Every open, in order, as `TapeStore::open`/`open_read` asked for it.
+    pub opens: Vec<OpenMode>,
 }
 
 /// A cloneable handle: the test keeps one, `TapeStore` owns the other.
@@ -97,6 +106,30 @@ impl FakeTape {
     pub(crate) fn boxed(&self) -> Box<dyn TapeOps> {
         Box::new(self.clone())
     }
+
+    /// Set the cartridge's write-protect tab.
+    pub(crate) fn write_protect(&self) {
+        self.state().write_protected = true;
+    }
+
+    /// Every open so far, in order.
+    pub(crate) fn opens(&self) -> Vec<OpenMode> {
+        self.state().opens.clone()
+    }
+
+    /// Open the fake as `mode` — what `TapeStore::open`/`open_read` do to a
+    /// device. Linux `st.c`'s `check_tape`: a read-write open of a
+    /// write-protected cartridge is refused with EROFS.
+    pub(crate) fn open_as(&self, mode: OpenMode) -> Result<()> {
+        let mut s = self.state();
+        s.opens.push(mode);
+        if mode == OpenMode::ReadWrite && s.write_protected {
+            return Err(TapectlError::TapeIo(
+                "open fake tape: Read-only file system (os error 30)".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn io_error(what: &str) -> TapectlError {
@@ -139,6 +172,11 @@ impl TapeOps for FakeTape {
 
     fn write_stream(&mut self, src: &mut dyn Read, len: u64, _sync: bool) -> Result<u64> {
         let mut s = self.state();
+        if s.opens.last() == Some(&OpenMode::ReadOnly) {
+            return Err(TapectlError::TapeIo(
+                "write: Bad file descriptor (os error 9)".to_string(),
+            ));
+        }
         let (file, block) = s.head;
         assert_eq!(block, 0, "the fake only writes at a file boundary");
         s.ops.push(Op::Write(file as u32));

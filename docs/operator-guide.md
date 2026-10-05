@@ -1506,6 +1506,10 @@ The exit status says which of three things happened, so a script needs no
 An empty drive is refused at once with `no cartridge loaded in <device>`, by
 `volume verify` and by every other command that reads or writes a tape.
 
+`volume verify` opens the drive read-only, so leave a sealed cartridge's
+write-protect tab set: it verifies without sliding the tab. So does a
+`volume resume` that only re-confirms a recorded seal.
+
 ### Annually — the heir-path restore drill
 
 The drill that matters is not "can tapectl restore this" — it is **can someone

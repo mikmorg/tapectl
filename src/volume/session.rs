@@ -888,6 +888,20 @@ impl InterruptedSession {
         &self.built.layout
     }
 
+    /// Whether resuming this session can only READ the tape: its volume's
+    /// seal is recorded (`volumes.sealed_at`, [`seal_recorded`]), so
+    /// [`Self::resume_checking`] ends in `Confirming` or `Quarantined` on
+    /// every arm and never reaches the write phase — the `Blank | Matches`
+    /// arm returns `Confirming` on a recorded seal, the other two arms
+    /// return before writing, and an adopted `aborted` session is refused
+    /// outright past them. `volume resume` opens the drive read-only on this
+    /// answer (issue #407), so a sealed tape shelved write-protected can be
+    /// re-confirmed without sliding the tab. A write the answer missed would
+    /// fail on the read-only descriptor rather than reach the tape.
+    pub fn confirm_only(&self, conn: &Connection) -> Result<bool> {
+        seal_recorded(conn, self.volume_id)
+    }
+
     /// Reconstruct an interrupted session for `volume_id` from durable state
     /// alone — the `writes`/`write_positions` rows and the frozen session
     /// staging directory they point at — so `tapectl volume resume` can pick
@@ -4508,6 +4522,140 @@ mod tests {
             )
             .unwrap();
         assert_eq!(volume_status, "sealed");
+    }
+
+    /// The tape a session left, on the in-memory tape that has the st
+    /// driver's open semantics, write-protected and opened `mode` — what
+    /// `volume resume` gets from `TapeStore::open_as` on a sealed tape
+    /// shelved with its tab set (issue #407).
+    fn protected_drive(
+        files: &[Vec<u8>],
+        mode: crate::store::OpenMode,
+    ) -> (
+        crate::store::TapeStore,
+        crate::tape::fake::FakeTape,
+        crate::store::injected::InjectedDrive,
+    ) {
+        let fake = crate::tape::fake::FakeTape::with_files(files.to_vec(), BS as usize);
+        fake.write_protect();
+        let drive = crate::store::injected::InjectedDrive::install(&fake);
+        let store = crate::store::TapeStore::open_as(
+            "/nonexistent/tapectl-resume-nst",
+            BS as usize,
+            mode,
+            0,
+        )
+        .expect("a read-only open of a protected tape succeeds");
+        (store, fake, drive)
+    }
+
+    /// Issue #407: a session whose seal is RECORDED is `confirm_only`, and
+    /// `volume resume` opens the drive read-only on that answer. Its resume
+    /// really does run on a read-only drive: over a write-protected tape
+    /// opened read-only, it re-enters confirm and the confirm passes —
+    /// nothing tried to write (the fake refuses a write through a read-only
+    /// open with EBADF, as st does).
+    #[test]
+    fn a_resume_whose_seal_is_recorded_is_confirm_only_and_runs_read_only() {
+        use crate::store::OpenMode;
+
+        let f = make_fixture();
+        let mut inner = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut inner)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned
+            .execute_checking(&f.conn, &mut inner, || false)
+            .unwrap()
+        {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let sealed_pending = ready.seal(&mut inner).expect("seal should succeed");
+        // `write::finish_session`'s record of the seal, then the crash.
+        f.conn
+            .execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        mark_writes(&f.conn, &sealed_pending.write_ids, "interrupted").unwrap();
+
+        let interrupted = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("resumable");
+        assert!(interrupted.confirm_only(&f.conn).unwrap());
+
+        let (mut store, fake, _drive) = protected_drive(&inner.files, OpenMode::ReadOnly);
+        let pending = match interrupted
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+            .expect("a confirm-only resume runs on a read-only drive")
+        {
+            ResumeOutcome::Confirming(p) => p,
+            ResumeOutcome::Ready(_) => panic!("expected Confirming, got Ready"),
+            ResumeOutcome::Quarantined(q) => panic!("expected Confirming: {:?}", q.reason),
+            ResumeOutcome::Interrupted(_) => panic!("expected Confirming, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Confirming, got Aborted: {}", a.reason),
+        };
+        match pending
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .expect("confirm should not error")
+        {
+            ConfirmOutcome::Sealed(s) => assert_eq!(s.label, "SESSTEST"),
+            ConfirmOutcome::Quarantined(q) => panic!("expected Sealed: {:?}", q.reason),
+            ConfirmOutcome::Inconclusive(inc) => {
+                panic!("expected Sealed: {:?}", inc.evidence.mismatches)
+            }
+        }
+        assert_eq!(fake.opens(), vec![OpenMode::ReadOnly]);
+    }
+
+    /// The control for the test above: a session that still OWES its seal
+    /// is not `confirm_only` — its resume goes on to `seal()`, which writes —
+    /// and on a read-only drive that write is refused. So the open mode
+    /// `volume resume` picks from `confirm_only` is load-bearing, and the
+    /// fake's read-only refusal is real.
+    #[test]
+    fn a_resume_that_still_owes_its_seal_is_not_confirm_only() {
+        use crate::store::OpenMode;
+
+        let f = make_fixture();
+        let mut inner = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut inner)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned
+            .execute_checking(&f.conn, &mut inner, || false)
+            .unwrap()
+        {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        mark_writes(&f.conn, &ready.write_ids, "interrupted").unwrap();
+
+        let interrupted = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("resumable");
+        assert!(!interrupted.confirm_only(&f.conn).unwrap());
+
+        let (mut store, _fake, _drive) = protected_drive(&inner.files, OpenMode::ReadOnly);
+        let ready_again = match interrupted
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+            .expect("resume reaches the seal it owes")
+        {
+            ResumeOutcome::Ready(r) => r,
+            _ => panic!("expected Ready: the seal is still owed"),
+        };
+        let err = ready_again
+            .seal(&mut store)
+            .err()
+            .expect("a seal through a read-only open must fail")
+            .to_string();
+        assert!(err.contains("Bad file descriptor"), "{err}");
     }
 
     /// `sealed_at` is write-once and must NEVER be cleared by any confirm

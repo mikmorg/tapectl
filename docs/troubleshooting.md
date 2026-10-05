@@ -482,7 +482,7 @@ follows the prefix:
 | `Device or resource busy (os error 16)` | another process has the drive open | find it (`fuser -v "$TAPE"`) and wait for it |
 | `No medium found (os error 123)` or `Input/output error (os error 5)` | the drive never became ready: still loading, or a fault. An empty drive is caught before this, by name ([No cartridge loaded](#no-cartridge-loaded)) | wait for the drive to settle, reseat the cartridge, check `mt -f "$TAPE" status` |
 | `No such file or directory (os error 2)` | `--device` names a path that does not exist (a typo, or a by-id link for a drive that is not attached) | `ls -l /dev/tape/by-id/` and use the path it lists |
-| `Read-only file system (os error 30)` | the cartridge's write-protect tab is set (on a write path) | slide the tab, or use another cartridge |
+| `Read-only file system (os error 30)` | the cartridge's write-protect tab is set, and the command writes: `volume init`, `volume write`, or a `volume resume` whose seal is not yet recorded | slide the tab, or use another cartridge. Commands that only read open the drive read-only and work with the tab set: `volume verify`, `restore`, `volume identify`, `catalog rebuild`, and a `volume resume` that only re-confirms a recorded seal |
 
 When the path cannot be opened at all, the error follows a logged warning,
 `non-blocking open failed during no-medium probe (continuing)`, from the

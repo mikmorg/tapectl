@@ -1005,6 +1005,19 @@ pub struct TapeStore {
 /// `read_file_streaming`'s own figure, so a pipeline buffer is one read.
 const VARIABLE_BLOCK_READ: usize = 1024 * 1024;
 
+/// How a command opens the drive (issue #407).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// `O_RDONLY`, and nothing set on the drive: every path that only reads —
+    /// restore, identify, rebuild, `volume verify`, and a `volume resume`
+    /// whose seal is recorded. A cartridge with its write-protect tab set,
+    /// the right way to shelve a sealed tape, opens this way.
+    ReadOnly,
+    /// `O_RDWR`, then hardware compression off: the paths that write. The st
+    /// driver refuses this open on a write-protected cartridge (EROFS).
+    ReadWrite,
+}
+
 impl TapeStore {
     /// Open the drive and rewind to BOT, ready to write File 0. Hardware
     /// compression is disabled best-effort (encrypted data is incompressible;
@@ -1013,6 +1026,10 @@ impl TapeStore {
     /// capacity × the configured usable-capacity factor); the caller
     /// computes it, since only the caller has the config in scope.
     pub fn open(device: &str, block_size: usize, usable_bytes: u64) -> Result<Self> {
+        #[cfg(test)]
+        if let Some(store) = injected::open(OpenMode::ReadWrite, usable_bytes) {
+            return store;
+        }
         let dev = TapeDevice::open(device, block_size)?;
         dev.rewind()?;
         if let Err(e) = dev.disable_compression() {
@@ -1029,9 +1046,29 @@ impl TapeStore {
     /// usable capacity, since nothing on a read path ever calls
     /// `capacity()`.
     pub fn open_read(device: &str, block_size: usize) -> Result<Self> {
+        #[cfg(test)]
+        if let Some(store) = injected::open(OpenMode::ReadOnly, 0) {
+            return store;
+        }
         let dev = TapeDevice::open_read(device, block_size)?;
         dev.rewind()?;
         Ok(Self::at_bot(Box::new(dev), 0))
+    }
+
+    /// [`Self::open_read`] or [`Self::open`], by `mode` — for the one path
+    /// that decides at run time (`volume resume`: read-only when the volume's
+    /// seal is recorded, so resuming can only re-enter `confirm`, issue
+    /// #407). `usable_bytes` is used only by a [`OpenMode::ReadWrite`] open.
+    pub fn open_as(
+        device: &str,
+        block_size: usize,
+        mode: OpenMode,
+        usable_bytes: u64,
+    ) -> Result<Self> {
+        match mode {
+            OpenMode::ReadOnly => Self::open_read(device, block_size),
+            OpenMode::ReadWrite => Self::open(device, block_size, usable_bytes),
+        }
     }
 
     /// A store over a device the caller has just rewound.
@@ -1288,6 +1325,51 @@ impl Store for MemStore {
         self.files.truncate(file_index as usize);
         self.syncs.truncate(file_index as usize);
         Ok(())
+    }
+}
+
+/// Test-only: a [`FakeTape`](crate::tape::fake::FakeTape) standing in for the
+/// drive, so a test can run a command's real `TapeStore::open` /
+/// `open_read` and see HOW it opened the drive (issue #407) — and, for a
+/// refusal that must come before any tape contact, that it never opened it
+/// at all (issue #406).
+#[cfg(test)]
+pub(crate) mod injected {
+    use std::cell::RefCell;
+
+    use super::{OpenMode, TapeStore};
+    use crate::error::Result;
+    use crate::tape::fake::FakeTape;
+
+    thread_local! {
+        static DRIVE: RefCell<Option<FakeTape>> = const { RefCell::new(None) };
+    }
+
+    /// While this lives, every `TapeStore::open`/`open_read` on this test's
+    /// thread opens the installed fake instead of a device.
+    pub(crate) struct InjectedDrive;
+
+    impl InjectedDrive {
+        pub(crate) fn install(fake: &FakeTape) -> Self {
+            DRIVE.with(|d| *d.borrow_mut() = Some(fake.clone()));
+            Self
+        }
+    }
+
+    impl Drop for InjectedDrive {
+        fn drop(&mut self) {
+            DRIVE.with(|d| *d.borrow_mut() = None);
+        }
+    }
+
+    /// The store over the installed fake, opened `mode` — `None` when no
+    /// fake is installed, and the caller opens its device as in production.
+    pub(super) fn open(mode: OpenMode, usable_bytes: u64) -> Option<Result<TapeStore>> {
+        let fake = DRIVE.with(|d| d.borrow().clone())?;
+        Some(
+            fake.open_as(mode)
+                .and_then(|()| TapeStore::from_ops(fake.boxed(), usable_bytes)),
+        )
     }
 }
 

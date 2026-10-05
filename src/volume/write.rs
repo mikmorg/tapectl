@@ -20,7 +20,7 @@ use crate::tape::log_pages;
 use crate::tape::mam_journal::{Hook, MamReads};
 use crate::util::{HashingWriter, TruncatingWriter};
 
-use crate::store::{Store, TapeStore, Tier};
+use crate::store::{OpenMode, Store, TapeStore, Tier};
 
 use super::binding;
 use super::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
@@ -2003,7 +2003,7 @@ fn volume_resume_contacted<'c>(
 /// function can take the post-command sweep after this one returns,
 /// whichever way it returned. The body is unchanged by the split. No store
 /// seam: nothing ungated can rehydrate an interrupted session, so the
-/// production `TapeStore::open` stays inline and the once-per-contact
+/// production `TapeStore::open_as` stays inline and the once-per-contact
 /// shape is pinned by source scan.
 #[allow(clippy::too_many_arguments)]
 fn volume_resume_in_contact(
@@ -2042,8 +2042,18 @@ fn volume_resume_in_contact(
         crate::tape::media_detect::check_drive_can_write(backend, m)?;
     }
 
+    // Issue #407: a session whose seal is recorded can only re-enter
+    // `confirm` — every arm of `resume_checking` then ends without writing
+    // — so it opens the drive READ-ONLY, like `volume verify`: a sealed tape
+    // shelved write-protected is re-confirmed without sliding the tab, and
+    // a write nothing expects would fail on the descriptor, not reach tape.
+    let mode = if session.confirm_only(conn)? {
+        OpenMode::ReadOnly
+    } else {
+        OpenMode::ReadWrite
+    };
     let phase = progress::phase("drive-open", None);
-    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
+    let mut store = TapeStore::open_as(device, block_size, mode, usable_bytes)?;
     phase.done();
 
     info!(label, volume_id, "resuming interrupted volume write");
@@ -3841,29 +3851,11 @@ pub fn volume_verify(
     // volume under it, and refused while a write or confirm holds it.
     let _volume_lock = crate::staging::lock::acquire_volume(conn, volume_id, label)?;
 
-    // Capacity comes from the volume's own row (ADR-0010 decision 3) — the
-    // figure decided at init from the medium actually loaded. Only the
-    // usable-capacity FACTOR is a property of the drive.
-    //
     // LENIENT (ADR-0010): verify is a read path and must keep working with
-    // no backend configured for this device (`crate::config::resolve_device`
-    // never errors when `device` is given) — the same `None => 0` fallback
-    // as before covers that case, and costs nothing, since verify only reads.
-    //
-    // Canonicalising resolver (issue #187): a raw-string lookup used to
-    // find the sg node for `sg_logs` health collection, and a by-id
-    // `--device` — the RECOMMENDED form, per the device-numbering hazard —
-    // matched the canonicalising resolver here but missed that one, so
-    // health collection was silently skipped with no word said. The sweep
-    // now resolves its backend inside the seam through `health_backend`,
-    // the same `device_matches` this uses (issue #342), so the two cannot
-    // disagree on a spelling.
-    let (nominal_capacity, _) = volume_media(conn, volume_id, label)?;
-    let (_, backend) = crate::config::resolve_device(config, Some(device))?;
-    let usable_bytes = match backend {
-        Some(b) => (nominal_capacity as f64 * b.usable_capacity_factor) as u64,
-        None => 0,
-    };
+    // no backend configured for this device. It no longer reads a capacity
+    // at all (issue #407): it opens the drive read-only, and a read-only
+    // store is never asked for one. The post-command sweep resolves its own
+    // backend inside the seam through `health_backend` (issues #187, #342).
 
     // Issue #166: refuse before the store is opened if this drive cannot
     // read the loaded medium — the same fact check every other read path
@@ -3877,13 +3869,17 @@ pub fn volume_verify(
     let reads = MamReads::new(conn, Operation::VolumeVerify);
     reads.check_read_contact(config, device)?;
 
-    // Before `TapeStore::open`: reading the MAM opens the device read-only
-    // and drops the fd, and the st driver refuses a second concurrent open.
-    // LENIENT — an unconfigured backend yields `None`, which is an absence
-    // and proceeds (ADR-0010's read-path leniency).
+    // Before `TapeStore::open_read`: reading the MAM opens the device
+    // read-only and drops the fd, and the st driver refuses a second
+    // concurrent open. LENIENT — an unconfigured backend yields `None`,
+    // which is an absence and proceeds (ADR-0010's read-path leniency).
     let observed = binding::loaded_medium(config, device, &reads);
+    // READ-ONLY (issue #407), like every other read path. Verify only ever
+    // reads, and a sealed tape is rightly shelved with its write-protect tab
+    // set: the read-write open this used (plus a compression MODE SELECT)
+    // was refused by st with EROFS on exactly such a tape.
     let phase = progress::phase("drive-open", None);
-    let mut store = TapeStore::open(device, block_size, usable_bytes)?;
+    let mut store = TapeStore::open_read(device, block_size)?;
     phase.done();
 
     // The post-command sweep is INSIDE the seam since issue #342 — see
@@ -6169,6 +6165,61 @@ mod tests {
                 Op::Read(4),
             ]
         );
+    }
+
+    /// Issue #407: `volume verify` opens the drive READ-ONLY, so a sealed
+    /// tape shelved with its write-protect tab set — the right way to shelve
+    /// one — verifies without sliding the tab. It used to open read-write,
+    /// which the st driver refuses on a protected cartridge (EROFS).
+    ///
+    /// Driven through the real `volume_verify` — its MAM reads, its store
+    /// open, the contact and the chain walk — over a write-protected
+    /// in-memory tape that refuses a read-write open as st does.
+    #[test]
+    fn volume_verify_opens_the_drive_read_only_so_a_write_protected_tape_verifies() {
+        use crate::store::{injected::InjectedDrive, OpenMode};
+        use crate::tape::fake::FakeTape;
+
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"intact slice bytes, repeated a few times. ".repeat(4);
+        seed_one_slice_fixture(&conn, "VR-WP", "wp-unit", 4, &good, "completed", "staged");
+        let mem = mem_store_v2_tape("VR-WP", &good, &good);
+        let fake = FakeTape::with_files(mem.files.clone(), 4096);
+        fake.write_protect();
+        let _drive = InjectedDrive::install(&fake);
+
+        let report = volume_verify(
+            &conn,
+            &Config::default(),
+            "VR-WP",
+            "/nonexistent/tapectl-verify-write-protected-nst",
+            4096,
+            Tier::Integrity,
+        )
+        .expect("a write-protected sealed tape verifies");
+        assert_eq!(report.failed, 0, "mismatches: {:?}", report.mismatches);
+        assert!(report.checked > 0, "positive control: the tape was read");
+        assert_eq!(fake.opens(), vec![OpenMode::ReadOnly]);
+    }
+
+    /// The fake's write protection is real: a read-write open of the same
+    /// protected tape is refused the way st refuses it — the control that
+    /// makes the test above mean something.
+    #[test]
+    fn a_read_write_open_of_a_write_protected_fake_is_refused_with_erofs() {
+        use crate::store::{injected::InjectedDrive, OpenMode};
+        use crate::tape::fake::FakeTape;
+
+        let fake = FakeTape::with_files(vec![vec![0u8; 4096]], 4096);
+        fake.write_protect();
+        let _drive = InjectedDrive::install(&fake);
+        let err = crate::store::TapeStore::open("/nonexistent/tapectl-wp-nst", 4096, 0)
+            .err()
+            .expect("a read-write open of a protected tape must fail")
+            .to_string();
+        assert!(err.contains("Read-only file system"), "{err}");
+        assert!(crate::store::TapeStore::open_read("/nonexistent/tapectl-wp-nst", 4096).is_ok());
+        assert_eq!(fake.opens(), vec![OpenMode::ReadWrite, OpenMode::ReadOnly]);
     }
 
     /// A clean tape writes a passing session and NO result rows — the table
@@ -12828,10 +12879,13 @@ mod tests {
             /// `::loaded_medium(` — the pre-store MAM read, which opens the
             /// st node.
             Medium,
-            /// `TapeStore::open_read(` — a read path's store.
+            /// `TapeStore::open_read(` — a read path's store, `volume
+            /// verify`'s included since issue #407.
             OpenRead,
-            /// `TapeStore::open(` — a write path's store, and `volume
-            /// verify`'s.
+            /// `TapeStore::open(` — a write path's store; and
+            /// `TapeStore::open_as(` — `volume resume`'s, read-only when
+            /// its seal is recorded (issue #407) but still a write path's
+            /// store, whose probe runs in its `_contacted` function.
             Open,
             /// `::rebuild_from_volume(` — the catalog rebuild, whose callee
             /// takes its own `Medium` and `OpenRead`.
@@ -12842,11 +12896,12 @@ mod tests {
         /// Comment lines are dropped, so a doc naming `TapeStore::open_read`
         /// is not a call.
         fn drive_steps(prod: &str) -> Vec<DriveStep> {
-            const PATTERNS: [(&str, DriveStep); 5] = [
+            const PATTERNS: [(&str, DriveStep); 6] = [
                 ("reads.check_read_contact(", DriveStep::Check),
                 ("::loaded_medium(", DriveStep::Medium),
                 ("TapeStore::open_read(", DriveStep::OpenRead),
                 ("TapeStore::open(", DriveStep::Open),
+                ("TapeStore::open_as(", DriveStep::Open),
                 ("::rebuild_from_volume(", DriveStep::Rebuild),
             ];
             let code: String = prod
@@ -13925,6 +13980,53 @@ mod tests {
                      delete it."
                 );
             }
+        }
+
+        /// Issue #407: `volume resume` opens the drive by its recorded seal —
+        /// read-only when `confirm_only` says resuming can only re-enter
+        /// confirm. `volume_resume_in_contact` cannot be driven ungated (see
+        /// above), so the CALL is pinned here, the same shape as the
+        /// corroboration guard: the mode comes from `session.confirm_only`,
+        /// the store from `TapeStore::open_as` with that mode, and no plain
+        /// read-write `TapeStore::open(` is left in the function. What the
+        /// mode does is driven in `session`'s tests
+        /// (`a_resume_whose_seal_is_recorded_is_confirm_only_and_runs_read_only`
+        /// and its control). Calibrated on `volume_verify`, whose read-only
+        /// open IS driven, by
+        /// `volume_verify_opens_the_drive_read_only_so_a_write_protected_tape_verifies`.
+        #[test]
+        fn volume_resume_opens_the_drive_by_its_recorded_seal() {
+            const SRC: &str = include_str!("write.rs");
+            let code_of = |f: &str| -> String {
+                let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
+                let end = SRC[start..].find("\n}\n").unwrap() + start;
+                let body = &SRC[start..end];
+                assert!(!body[f.len()..].contains("\npub fn "), "{f}: scan overran");
+                body.lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+
+            let resume = code_of("fn volume_resume_in_contact(");
+            let decide = resume
+                .find("session.confirm_only(conn)?")
+                .expect("resume decides its open mode from the recorded seal");
+            let open = resume
+                .find("TapeStore::open_as(device, block_size, mode, usable_bytes)?")
+                .expect("resume opens the drive with that mode");
+            assert!(decide < open, "the mode is decided before the drive opens");
+            assert!(
+                !resume.contains("TapeStore::open("),
+                "a read-write open that ignores the recorded seal is back in resume"
+            );
+
+            let verify = code_of("pub fn volume_verify(");
+            assert!(verify.contains("TapeStore::open_read(device, block_size)?"));
+            assert!(
+                !verify.contains("TapeStore::open("),
+                "volume verify opens the drive read-write again (issue #407)"
+            );
         }
 
         /// Issue #220. The three tape-side refusals -- corroboration,
