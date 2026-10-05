@@ -230,6 +230,14 @@ struct StagingRow {
     #[tabled(rename = "Staged", display_with = "display_opt_string")]
     #[serde(rename = "staged_at")]
     staged: Option<String>,
+    /// Issue #402: what is wrong with a 'staged' set's files on disk —
+    /// empty when it is whole. Printed below the table, not in it.
+    #[tabled(skip)]
+    #[serde(rename = "on_disk_problems")]
+    problems: Vec<String>,
+    /// The command that makes the set whole again; `null` when it is.
+    #[tabled(skip)]
+    remedy: Option<String>,
 }
 
 fn display_opt_string(v: &Option<String>) -> String {
@@ -283,6 +291,8 @@ pub fn run(
                     encrypted_bytes: i.total_encrypted_size,
                     writes: i.write_count,
                     staged: i.staged_at,
+                    problems: i.on_disk_problems,
+                    remedy: i.remedy,
                 })
                 .collect();
             if json_output {
@@ -293,7 +303,31 @@ pub fn run(
             } else if rows.is_empty() {
                 println!("no staged data");
             } else {
+                // Issue #402: a staged set that is not whole on disk cannot
+                // be written (`volume write` refuses it) — say so here,
+                // where the operator looks before a write.
+                let broken: Vec<String> = rows
+                    .iter()
+                    .filter(|r| !r.problems.is_empty())
+                    .map(|r| {
+                        let mut s = format!(
+                            "stage set {} ({} v{}) is NOT whole on disk — `volume write` \
+                             will refuse it:",
+                            r.id, r.unit, r.version
+                        );
+                        for p in &r.problems {
+                            s.push_str(&format!("\n  - {p}"));
+                        }
+                        if let Some(remedy) = &r.remedy {
+                            s.push_str(&format!("\n  remedy: {remedy}"));
+                        }
+                        s
+                    })
+                    .collect();
                 println!("{}", Table::new(rows));
+                for b in broken {
+                    println!("{b}");
+                }
             }
         }
 
@@ -432,6 +466,9 @@ pub fn run(
                         "session_dirs_reclaimed": report.session_dirs_reclaimed,
                         "session_dirs_retained": report.session_dirs_retained,
                         "session_dirs_orphaned": report.session_dirs_orphaned,
+                        // Issue #402: kept for a sealed, aborted session
+                        // `volume resume` can still re-confirm.
+                        "session_dirs_awaiting_reconfirm": report.session_dirs_awaiting_reconfirm,
                         "lockfiles_reclaimed": report.lockfiles_reclaimed,
                         // Issue #108: nothing will ever rediscover these,
                         // so a scripted consumer needs the paths, not a count.
@@ -470,6 +507,15 @@ pub fn run(
                 );
                 if report.errors > 0 {
                     println!("  {} errors", report.errors);
+                }
+                // Issue #402: a sealed tape whose aborted session can still
+                // be counted — its frozen layout stays until then.
+                for label in &report.session_dirs_awaiting_reconfirm {
+                    println!(
+                        "  session of volume \"{label}\" kept: its tape is sealed and `tapectl \
+                         volume resume {label}` can re-confirm it after a clean `tapectl volume \
+                         verify {label} --full` (`--force` removes it, forfeiting that)"
+                    );
                 }
                 // Issue #376: a live session's slices are never released —
                 // a fact, not a judgement, so `--force` does not reach it.
@@ -1272,6 +1318,10 @@ mod tests {
                 encrypted_bytes: Some(5_242_881),
                 writes: 1,
                 staged: Some("2026-07-01T00:00:00Z".to_string()),
+                problems: vec!["slice 2: no staged file recorded".to_string()],
+                remedy: Some(
+                    "tapectl volume read-slices --from L6-0001 --unit backups".to_string(),
+                ),
             },
             StagingRow {
                 id: 2,
@@ -1282,12 +1332,14 @@ mod tests {
                 encrypted_bytes: None,
                 writes: 0,
                 staged: None,
+                problems: Vec::new(),
+                remedy: None,
             },
         ];
         let value = staging_rows_to_json(&rows);
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
-            r#"[{"num_slices":3,"stage_set_id":1,"staged_at":"2026-07-01T00:00:00Z","status":"staged","total_encrypted_size":5242881,"unit":"backups","version":2,"write_count":1},{"num_slices":null,"stage_set_id":2,"staged_at":null,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1,"write_count":0}]"#
+            r#"[{"num_slices":3,"on_disk_problems":["slice 2: no staged file recorded"],"remedy":"tapectl volume read-slices --from L6-0001 --unit backups","stage_set_id":1,"staged_at":"2026-07-01T00:00:00Z","status":"staged","total_encrypted_size":5242881,"unit":"backups","version":2,"write_count":1},{"num_slices":null,"on_disk_problems":[],"remedy":null,"stage_set_id":2,"staged_at":null,"status":"staging","total_encrypted_size":null,"unit":"photos","version":1,"write_count":0}]"#
         );
     }
 }

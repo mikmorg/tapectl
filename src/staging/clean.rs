@@ -234,13 +234,14 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
 ///
 /// - `.age` files: strictly by `stage_slices.stage_set_id` DB rows — never a
 ///   prefix glob.
-/// - Plaintext `.dar`/`.sha512` orphans of a `'failed'` set (dar writes all
-///   slices up front, so most such orphans have no `stage_slices` row at
-///   all — the crash typically happens before any slice is encrypted): by
-///   dot-terminated filesystem prefix, via `staging::archive_base_prefix`,
-///   scanned under `config.staging.directory`. `'staged'` sets need no such
-///   scan — their plaintext slices were already deleted, one by one, as
-///   each was encrypted.
+/// - Files named for the set that no `staging_path` names, by
+///   dot-terminated filesystem prefix (`staging::archive_base_prefix`,
+///   scanned under `config.staging.directory`): a `'failed'` set's
+///   plaintext `.dar`/`.sha512` (dar writes all slices up front, so most
+///   have no `stage_slices` row at all) and its half-written `.dar.age`
+///   (issue #402: the crash came before the row); and, for any released
+///   set, a `.dar.age` an older, interrupted clean nulled the path of
+///   without unlinking (issue #402).
 ///
 /// Ordering is load-bearing: `stage_slices.staging_path` is the ONLY handle
 /// on a staged `.age` file, so every DB change (nulling `staging_path`,
@@ -254,10 +255,10 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
 /// orphaned file behind for a later `staging clean` to pick up". That was
 /// false, and the falsehood mattered: a later clean **cannot** pick it up.
 /// `.age` discovery is strictly `staging_path IS NOT NULL`, which is the
-/// column this function has just nulled, and `find_plaintext_orphans` runs
-/// only for `'failed'` sets and only matches `.dar`/`.sha512`. So a file
-/// whose unlink fails is invisible to every future cleanup path, **forever**,
-/// and only a human can remove it.
+/// column this function has just nulled, and `find_prefix_orphans` runs
+/// only for the sets this call releases — once a set is `'cleaned'`, no
+/// later clean selects it. So a file whose unlink fails is invisible to
+/// every future cleanup path, **forever**, and only a human can remove it.
 ///
 /// The ordering is still right — a row pointing at a file that is gone is
 /// worse than a file no row points at — so the fix is not to reorder but to
@@ -424,7 +425,7 @@ pub fn clean_staging(
     let staging_dir = Path::new(&config.staging.directory);
     let mut plans = Vec::with_capacity(candidates.len());
 
-    for (stage_set_id, status) in &candidates {
+    for (stage_set_id, _status) in &candidates {
         let age_files: Vec<(i64, String)> = {
             let mut stmt = conn.prepare(
                 "SELECT id, staging_path FROM stage_slices
@@ -436,14 +437,18 @@ pub fn clean_staging(
             rows
         };
 
-        // Only a 'failed' set can have plaintext .dar/.sha512 orphans left
-        // behind — a 'staged' set's dar output was already removed slice by
-        // slice during encryption (see stage_create_inner).
-        let plaintext_orphans = if status == "failed" {
-            find_plaintext_orphans(conn, staging_dir, *stage_set_id)?
-        } else {
-            Vec::new()
-        };
+        // Files named for this set that no `staging_path` names (issue
+        // #402): a 'failed' set's plaintext `.dar`/`.sha512` (dar writes
+        // every slice up front) and a half-written `.dar.age` (the crash
+        // came before its row); and, for either status, a `.age` whose path
+        // an older, interrupted clean nulled without unlinking it. The
+        // prefix carries the stage set id, so nothing live can match it,
+        // and the set is released below either way.
+        let plaintext_orphans: Vec<PathBuf> =
+            find_prefix_orphans(conn, staging_dir, *stage_set_id)?
+                .into_iter()
+                .filter(|p| !age_files.iter().any(|(_, a)| Path::new(a) == p))
+                .collect();
 
         plans.push(SetPlan {
             stage_set_id: *stage_set_id,
@@ -454,39 +459,56 @@ pub fn clean_staging(
 
     // Commit the DB change FIRST — null every collected staging_path and
     // move the stage_set to 'cleaned' — before any file is unlinked below.
-    for plan in &plans {
-        for (slice_id, _) in &plan.age_files {
-            conn.execute(
-                "UPDATE stage_slices SET staging_path = NULL WHERE id = ?1",
-                params![slice_id],
-            )?;
-        }
+    //
+    // Issue #402: as ONE immediate transaction, retried on a busy catalog.
+    // Statement by statement, a crash or a SQLITE_BUSY past the 5 s
+    // timeout left a set 'staged' with only some of its paths nulled, and
+    // the next `volume write` sealed that partial unit as a full copy. Now
+    // a set is either wholly released or untouched. (A catalog half-cleaned
+    // by an older build is refused by `volume write` — see
+    // `volume::write::check_staged_slices`.)
+    crate::db::busy::retry(
+        crate::db::busy::BusyPolicy::DEFAULT,
+        "the staging release",
+        || {
+            let tx = crate::db::busy::immediate_tx(conn)?;
+            for plan in &plans {
+                for (slice_id, _) in &plan.age_files {
+                    tx.execute(
+                        "UPDATE stage_slices SET staging_path = NULL WHERE id = ?1",
+                        params![slice_id],
+                    )?;
+                }
 
-        let old_status: Option<String> = conn
-            .query_row(
-                "SELECT status FROM stage_sets WHERE id = ?1",
-                params![plan.stage_set_id],
-                |row| row.get(0),
-            )
-            .ok();
-        conn.execute(
-            "UPDATE stage_sets SET status = 'cleaned', cleaned_at = datetime('now')
-             WHERE id = ?1",
-            params![plan.stage_set_id],
-        )?;
-        events::log_field_change(
-            conn,
-            "stage_set",
-            plan.stage_set_id,
-            &format!("stage_set_{}", plan.stage_set_id),
-            "status_change",
-            "status",
-            old_status.as_deref(),
-            "cleaned",
-            None,
-        )?;
-        report.sets_cleaned += 1;
-    }
+                let old_status: Option<String> = tx
+                    .query_row(
+                        "SELECT status FROM stage_sets WHERE id = ?1",
+                        params![plan.stage_set_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                tx.execute(
+                    "UPDATE stage_sets SET status = 'cleaned', cleaned_at = datetime('now')
+                     WHERE id = ?1",
+                    params![plan.stage_set_id],
+                )?;
+                events::log_field_change(
+                    &tx,
+                    "stage_set",
+                    plan.stage_set_id,
+                    &format!("stage_set_{}", plan.stage_set_id),
+                    "status_change",
+                    "status",
+                    old_status.as_deref(),
+                    "cleaned",
+                    None,
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        },
+    )?;
+    report.sets_cleaned += plans.len();
 
     // THEN unlink — the DB no longer points at any of these paths.
     for plan in &plans {
@@ -528,13 +550,15 @@ fn remove_and_account(path: &Path, report: &mut CleanReport) {
     }
 }
 
-/// Plaintext `.dar`/`.sha512` files left in `staging_dir` by a crashed dar
-/// run for `stage_set_id` — same dot-terminated prefix rule as
-/// `staging::cleanup_failed_stage_set`'s `archive_base_prefix` (issue #54):
-/// dar names every slice `{base}.{N}.dar`, so `{base}.` (not the bare base)
-/// is the real filesystem prefix, keeping `_s1` from prefix-matching
-/// `_s10.1.dar`.
-fn find_plaintext_orphans(
+/// Files named for `stage_set_id` in `staging_dir` — plaintext
+/// `.dar`/`.sha512` left by a crashed dar run, and `.dar.age` ciphertext
+/// (issue #402: a half-written one has no `stage_slices` row; one an older
+/// interrupted clean nulled has no `staging_path`) — by the same
+/// dot-terminated prefix rule as `staging::cleanup_failed_stage_set`'s
+/// `archive_base_prefix` (issue #54): dar names every slice
+/// `{base}.{N}.dar`, so `{base}.` (not the bare base) is the real
+/// filesystem prefix, keeping `_s1` from prefix-matching `_s10.1.dar`.
+fn find_prefix_orphans(
     conn: &Connection,
     staging_dir: &Path,
     stage_set_id: i64,
@@ -560,7 +584,11 @@ fn find_plaintext_orphans(
     if let Ok(entries) = fs::read_dir(staging_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&prefix) && (name.ends_with(".dar") || name.ends_with(".sha512")) {
+            if name.starts_with(&prefix)
+                && (name.ends_with(".dar")
+                    || name.ends_with(".sha512")
+                    || name.ends_with(".dar.age"))
+            {
                 found.push(entry.path());
             }
         }
@@ -594,9 +622,35 @@ pub fn staging_status(conn: &Connection) -> Result<Vec<StagingInfo>> {
                 total_encrypted_size: row.get(5)?,
                 staged_at: row.get(6)?,
                 write_count: row.get(7)?,
+                on_disk_problems: Vec::new(),
+                remedy: None,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Issue #402: 'staged' says the slices were staged, not that they are
+    // still there — look. ('staging' is mid-write; its files are growing.)
+    let mut rows = rows;
+    for info in rows.iter_mut().filter(|i| i.status == "staged") {
+        info.on_disk_problems = crate::staging::staged_slice_problems(conn, info.stage_set_id)?;
+        if !info.on_disk_problems.is_empty() {
+            let (unit_id, unit_status): (i64, String) = conn.query_row(
+                "SELECT u.id, u.status FROM stage_sets ss
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN units u ON u.id = s.unit_id
+                 WHERE ss.id = ?1",
+                params![info.stage_set_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            info.remedy = Some(crate::staging::incomplete_set_remedy(
+                conn,
+                unit_id,
+                &info.unit_name,
+                info.version,
+                &unit_status,
+            )?);
+        }
+    }
 
     Ok(rows)
 }
@@ -626,6 +680,11 @@ pub struct CleanReport {
     /// or a concurrent write's session dir created moments ago. Never
     /// removed unless `force` is set.
     pub session_dirs_orphaned: usize,
+    /// Volumes whose `aborted` session `volume resume` can still
+    /// re-confirm once a clean full verify is recorded (issue #402): their
+    /// session directories are kept (and counted in
+    /// `session_dirs_retained`) unless `force`.
+    pub session_dirs_awaiting_reconfirm: Vec<String>,
     /// `locks/stage-<id>.lock` files removed because their stage_set
     /// reached a terminal state (`staged`, `failed`, `cleaned`).
     pub lockfiles_reclaimed: usize,
@@ -664,7 +723,11 @@ pub struct CleanReport {
 /// - **RECLAIM** (remove recursively, size added to `bytes_freed`) once at
 ///   least one row references the dir and every one of them is
 ///   `completed`, `failed`, or `aborted` — none of those states leave a
-///   resumable session behind.
+///   resumable session behind — EXCEPT (issue #402) an `aborted` session
+///   on a sealed volume that `volume resume` would re-confirm after a clean
+///   full verify (`session::aborted_session_reconfirmable_after_verify`):
+///   adoption loads its frozen Layout from this directory, so it is kept
+///   unless `force`, and named in `session_dirs_awaiting_reconfirm`.
 /// - **ORPHAN** (report only, `session_dirs_orphaned`) when no `writes` row
 ///   references the dir at all. This is indistinguishable from a
 ///   concurrent `volume write` whose `build()` has created the directory
@@ -720,13 +783,15 @@ fn reclaim_session_dirs(
         }
         let path_str = path.to_string_lossy().to_string();
 
-        let statuses: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT status FROM writes WHERE session_dir = ?1")?;
+        let rows: Vec<(String, i64)> = {
+            let mut stmt =
+                conn.prepare("SELECT status, volume_id FROM writes WHERE session_dir = ?1")?;
             let rows = stmt
-                .query_map(params![path_str], |row| row.get(0))?
+                .query_map(params![path_str], |row| Ok((row.get(0)?, row.get(1)?)))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };
+        let statuses: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
 
         if statuses.is_empty() {
             report.session_dirs_orphaned += 1;
@@ -736,10 +801,42 @@ fn reclaim_session_dirs(
             continue;
         }
 
-        let any_non_terminal = statuses.iter().any(|s| NON_TERMINAL.contains(&s.as_str()));
+        let any_non_terminal = statuses.iter().any(|s| NON_TERMINAL.contains(s));
         if any_non_terminal {
             report.session_dirs_retained += 1;
             continue;
+        }
+
+        // Issue #402: an `aborted` session on a sealed volume is not
+        // finished with its directory — `volume resume` re-confirms it once
+        // a clean full verify is recorded (ADR-0012's 2026-09-23 amendment,
+        // issue #280), and adoption loads the frozen `layout.json` from
+        // here. Removing it turns a good sealed tape into one that can
+        // never be counted. Kept unless `force`, as a bare clean keeps
+        // that session's staged slices (`ReleaseBlocker::Abandoned`).
+        if !force {
+            let mut reconfirmable = Vec::new();
+            for (status, volume_id) in &rows {
+                if status == "aborted"
+                    && crate::volume::session::aborted_session_reconfirmable_after_verify(
+                        conn, *volume_id,
+                    )?
+                {
+                    let label: String = conn.query_row(
+                        "SELECT label FROM volumes WHERE id = ?1",
+                        params![volume_id],
+                        |row| row.get(0),
+                    )?;
+                    if !reconfirmable.contains(&label) {
+                        reconfirmable.push(label);
+                    }
+                }
+            }
+            if !reconfirmable.is_empty() {
+                report.session_dirs_retained += 1;
+                report.session_dirs_awaiting_reconfirm.extend(reconfirmable);
+                continue;
+            }
         }
 
         // Every referencing row is completed/failed/aborted — reclaim.
@@ -815,6 +912,12 @@ pub struct StagingInfo {
     pub total_encrypted_size: Option<i64>,
     pub staged_at: Option<String>,
     pub write_count: i64,
+    /// What is wrong with a `'staged'` set's slices on disk
+    /// ([`crate::staging::staged_slice_problems`], issue #402); empty when
+    /// it is whole, and always empty for a `'staging'` set.
+    pub on_disk_problems: Vec<String>,
+    /// The command that makes the set whole again, when it is not.
+    pub remedy: Option<String>,
 }
 
 #[cfg(test)]
@@ -1817,6 +1920,226 @@ mod tests {
         let mut report = CleanReport::default();
         reclaim_session_dirs(&conn, &config_for(dir.path()), true, &mut report).unwrap();
         assert!(!session_dir.exists(), "orphan must be removed with force");
+    }
+
+    /// Issue #402: a sealed volume whose session was `aborted` can still be
+    /// counted — `volume resume` re-confirms it after a clean full verify
+    /// (ADR-0012's 2026-09-23 amendment), loading its frozen `layout.json`
+    /// from this directory. A bare clean must keep the directory and name
+    /// the volume; `--force` removes it.
+    #[test]
+    fn a_sealed_aborted_sessions_dir_is_kept_until_force() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = seed_session_dir_with_write(&conn, dir.path(), "aborted");
+        conn.execute(
+            "UPDATE volumes SET status = 'initialized', sealed_at = datetime('now'),
+                                observed_condition = 'ok'
+             WHERE label = 'V-SESS'",
+            [],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'V-SESS'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        events::log_event(
+            &conn,
+            "volume",
+            volume_id,
+            Some("V-SESS"),
+            "write_aborted",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            crate::volume::session::aborted_session_reconfirmable_after_verify(&conn, volume_id)
+                .unwrap(),
+            "positive control: resume would re-confirm this session after a verify"
+        );
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs(&conn, &config_for(dir.path()), false, &mut report).unwrap();
+        assert!(
+            session_dir.exists(),
+            "the frozen layout a re-confirm needs must survive a bare clean"
+        );
+        assert_eq!(report.session_dirs_reclaimed, 0);
+        assert_eq!(report.session_dirs_retained, 1);
+        assert_eq!(report.session_dirs_awaiting_reconfirm, vec!["V-SESS"]);
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs(&conn, &config_for(dir.path()), true, &mut report).unwrap();
+        assert!(!session_dir.exists(), "--force removes it");
+        assert_eq!(report.session_dirs_reclaimed, 1);
+    }
+
+    /// The counterpart: an `aborted` session on a volume whose seal was
+    /// never recorded can never be re-confirmed, so its directory is still
+    /// reclaimed by a bare clean, exactly as before issue #402.
+    #[test]
+    fn an_unsealed_aborted_sessions_dir_is_still_reclaimed() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = seed_session_dir_with_write(&conn, dir.path(), "aborted");
+        conn.execute(
+            "UPDATE volumes SET status = 'initialized' WHERE label = 'V-SESS'",
+            [],
+        )
+        .unwrap();
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs(&conn, &config_for(dir.path()), false, &mut report).unwrap();
+        assert!(!session_dir.exists());
+        assert_eq!(report.session_dirs_reclaimed, 1);
+        assert!(report.session_dirs_awaiting_reconfirm.is_empty());
+    }
+
+    /// Issue #402: the release's catalog half is ONE transaction. Statement
+    /// by statement, a crash or a busy timeout between the per-slice
+    /// updates left a set 'staged' with some paths nulled — a partial unit
+    /// the next write sealed as a full copy. Counted with a commit hook:
+    /// two slices, a status change and its event are one commit.
+    #[test]
+    fn the_catalog_release_commits_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let (conn, stage_set_id, path, dir) = seed_stage_set();
+        let second = dir.path().join("slice_2.age");
+        std::fs::write(&second, b"second staged slice").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 2, 19, 19, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_id, second.to_string_lossy()],
+        )
+        .unwrap();
+
+        let commits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&commits);
+        conn.commit_hook(Some(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            false
+        }))
+        .unwrap();
+
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), true, CleanScope::Whole).unwrap();
+        conn.commit_hook(None::<fn() -> bool>).unwrap();
+
+        assert_eq!(
+            report.sets_cleaned, 1,
+            "positive control: the set was released"
+        );
+        assert!(!path.exists() && !second.exists());
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            1,
+            "nulling the paths, the status change and its event must be one commit"
+        );
+        let nulled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stage_slices WHERE staging_path IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulled, 2);
+    }
+
+    /// Issue #402: a half-written `{prefix}N.dar.age` — the crash came
+    /// after the encryption started and before its `stage_slices` row —
+    /// has no row, so discovery by row never saw it. The prefix scan now
+    /// includes `.dar.age`.
+    #[test]
+    fn a_failed_sets_rowless_age_file_is_removed_by_prefix() {
+        let (conn, stage_set_id, _path, dir) = seed_stage_set_with_status("failed");
+        let prefix = crate::staging::archive_base_prefix("u-uuid", 1, stage_set_id);
+        let half_written = dir.path().join(format!("{prefix}2.dar.age"));
+        std::fs::write(&half_written, b"half an encryption").unwrap();
+        // A sibling stage set's file must not match (the trailing dot).
+        let sibling = dir.path().join(format!(
+            "{}1.dar.age",
+            crate::staging::archive_base_prefix("u-uuid", 1, stage_set_id * 10)
+        ));
+        std::fs::write(&sibling, b"not ours").unwrap();
+
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), false, CleanScope::Whole).unwrap();
+        assert!(
+            !half_written.exists(),
+            "the row-less .dar.age must be removed"
+        );
+        assert!(
+            sibling.exists(),
+            "another stage set's file is never touched"
+        );
+        assert_eq!(report.files_removed, 2, "the recorded slice and the orphan");
+    }
+
+    /// Issue #402: an older build's interrupted clean nulled a slice's
+    /// path and never unlinked the file. Releasing that set now finds the
+    /// file by its stage-set prefix and removes it, instead of stranding
+    /// up to a slice's size of ciphertext forever.
+    #[test]
+    fn releasing_a_half_cleaned_set_removes_its_nulled_age_files() {
+        let (conn, stage_set_id, path, dir) = seed_stage_set();
+        let prefix = crate::staging::archive_base_prefix("u-uuid", 1, stage_set_id);
+        let stranded = dir.path().join(format!("{prefix}2.dar.age"));
+        std::fs::write(&stranded, b"nulled but not unlinked").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 2, 23, 23, 'deadbeef', 'deadbeef', NULL)",
+            params![stage_set_id],
+        )
+        .unwrap();
+
+        let report =
+            clean_staging(&conn, &config_for(dir.path()), true, CleanScope::Whole).unwrap();
+        assert!(!path.exists());
+        assert!(
+            !stranded.exists(),
+            "the stranded ciphertext is found by prefix"
+        );
+        assert_eq!(report.files_removed, 2);
+    }
+
+    /// Issue #402: `staging status` looks at the files, not only the
+    /// status column, and names the remedy.
+    #[test]
+    fn staging_status_reports_a_staged_set_whose_file_is_gone() {
+        let (conn, _stage_set_id, path, _dir) = seed_stage_set();
+        // The fixture records 19 bytes for an 18-byte file; make it true.
+        conn.execute(
+            "UPDATE stage_slices SET encrypted_bytes = ?1",
+            params![fs::metadata(&path).unwrap().len() as i64],
+        )
+        .unwrap();
+        let whole = staging_status(&conn).unwrap();
+        assert!(
+            whole[0].on_disk_problems.is_empty() && whole[0].remedy.is_none(),
+            "positive control: a whole set reports nothing: {whole:?}"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let info = staging_status(&conn).unwrap();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].on_disk_problems.len(), 1, "{info:?}");
+        assert!(info[0].on_disk_problems[0].starts_with("slice 1:"));
+        assert_eq!(
+            info[0].remedy.as_deref(),
+            Some(
+                "tapectl staging clean --unit u --version 1 --force && \
+                 tapectl stage create u --version 1"
+            )
+        );
     }
 
     // --- Change 2: lockfile reclamation (issue #95) ---

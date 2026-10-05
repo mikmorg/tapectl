@@ -2041,11 +2041,19 @@ fn test_volume_write_refuses_over_capacity() {
     // number). That total does not depend on which capacity figure the code
     // reads, only on the entries themselves, so it stays a stable boundary
     // even though this test never asserts it directly.
+    // A real slice file at its recorded size (sparse): `volume write`
+    // refuses a staged set whose files are not on disk before anything
+    // this test is about.
+    let slice = tmp.path().join("slice.dar.age");
+    std::fs::File::create(&slice)
+        .unwrap()
+        .set_len(5242880)
+        .unwrap();
     conn.execute(
         "INSERT INTO stage_slices
             (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
-         VALUES (?1, 1, 5000000, 5242880, 'p', 'e', '/nonexistent/slice.dar.age')",
-        [ss],
+         VALUES (?1, 1, 5000000, 5242880, 'p', 'e', ?2)",
+        rusqlite::params![ss, slice.to_string_lossy()],
     )
     .unwrap();
 
@@ -2278,11 +2286,16 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
     )
     .unwrap();
     let ss = conn.last_insert_rowid();
+    // A real slice file at its recorded size (sparse): `volume write`
+    // refuses a staged set whose files are not on disk before anything
+    // this test is about.
+    let slice = tmp.path().join("slice.dar.age");
+    std::fs::File::create(&slice).unwrap().set_len(110).unwrap();
     conn.execute(
         "INSERT INTO stage_slices
             (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
-         VALUES (?1, 1, 100, 110, 'p', 'e', '/nonexistent/slice.dar.age')",
-        [ss],
+         VALUES (?1, 1, 100, 110, 'p', 'e', ?2)",
+        rusqlite::params![ss, slice.to_string_lossy()],
     )
     .unwrap();
 

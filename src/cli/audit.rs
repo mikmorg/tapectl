@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 
 use crate::config::Config;
 use crate::db::models::Unit;
@@ -507,32 +507,6 @@ fn current_versions_live(conn: &Connection, unit_id: i64) -> Result<Vec<(i64, bo
     Ok(live_by_version.into_iter().collect())
 }
 
-/// An in-service ([`policy::coverage::in_service`]) volume already holding
-/// a completed write of `unit_id`'s snapshot `version`, if any — the
-/// source `volume read-slices --from` can pull the identical ciphertext
-/// back from without touching the unit's source directory.
-fn in_service_copy_of_version(
-    conn: &Connection,
-    unit_id: i64,
-    version: i64,
-) -> Result<Option<String>> {
-    conn.query_row(
-        &format!(
-            "SELECT v.label FROM writes w
-             JOIN stage_sets ss ON ss.id = w.stage_set_id
-             JOIN snapshots s ON s.id = ss.snapshot_id
-             JOIN volumes v ON v.id = w.volume_id
-             WHERE s.unit_id = ?1 AND s.version = ?2 AND w.status = 'completed' AND {}
-             ORDER BY w.id DESC LIMIT 1",
-            policy::coverage::in_service("v")
-        ),
-        params![unit_id, version],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
 /// The remedy for "this unit needs another copy of its CURRENT-snapshot
 /// content" — `copy_count` and `location_presence`. The content itself is
 /// not in question, so a live stage set can be written as-is and a
@@ -565,7 +539,7 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
             any_ready = true;
             continue;
         }
-        match in_service_copy_of_version(conn, unit.id, *version)? {
+        match policy::coverage::in_service_copy_of_version(conn, unit.id, *version)? {
             Some(label) => {
                 steps.push(format!(
                     "tapectl volume read-slices --from {label} --unit {}",

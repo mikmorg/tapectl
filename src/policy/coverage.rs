@@ -225,6 +225,34 @@ pub fn has_completed_write(conn: &Connection, volume_id: i64) -> crate::error::R
     )?)
 }
 
+/// An in-service ([`in_service`]) volume already holding a completed write
+/// of `unit_id`'s snapshot `version`, if any — the source `volume
+/// read-slices --from` can pull the identical ciphertext back from without
+/// touching the unit's source directory. Asked by `audit`'s copy remedies
+/// and by `volume write`'s refusal of an incomplete stage set (issue #402).
+pub fn in_service_copy_of_version(
+    conn: &Connection,
+    unit_id: i64,
+    version: i64,
+) -> crate::error::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        &format!(
+            "SELECT v.label FROM writes w
+             JOIN stage_sets ss ON ss.id = w.stage_set_id
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN volumes v ON v.id = w.volume_id
+             WHERE s.unit_id = ?1 AND s.version = ?2 AND w.status = 'completed' AND {}
+             ORDER BY w.id DESC LIMIT 1",
+            in_service("v")
+        ),
+        params![unit_id, version],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 // ── The retire family's zero-copy floor sees a sealed tape (issue #276) ──
 
 /// A THIRD question, distinct from both [`eligible`] ("is this a copy

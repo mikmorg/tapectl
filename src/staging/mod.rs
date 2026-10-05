@@ -257,6 +257,93 @@ pub(crate) fn stage_set_has_live_slices(status: &str) -> bool {
     matches!(status, "staging" | "staged")
 }
 
+/// What is wrong with a `'staged'` stage set's slices ON DISK — empty when
+/// every one is there (issue #402).
+///
+/// `status = 'staged'` says the slices were staged; it does not say they
+/// are still there. Three things can make a staged set incomplete:
+///
+/// - a slice row whose `staging_path` is NULL — a `staging clean` that an
+///   older build interrupted between its per-slice updates, or a
+///   `compact-read` that skipped a slice and still promoted the set;
+/// - fewer slice rows than the set's recorded `num_slices`;
+/// - a recorded file that is missing, or not the size `encrypted_bytes`
+///   recorded (the staging disk failed, or someone removed it by hand).
+///
+/// `volume write` used to keep the slices that still had a path and write
+/// them as the whole unit, and coverage counts writes, not slices — a
+/// partial unit sealed as a full copy. One description per problem, each
+/// naming the slice; the caller names the set.
+pub(crate) fn staged_slice_problems(conn: &Connection, stage_set_id: i64) -> Result<Vec<String>> {
+    let num_slices: Option<i64> = conn.query_row(
+        "SELECT num_slices FROM stage_sets WHERE id = ?1",
+        params![stage_set_id],
+        |row| row.get(0),
+    )?;
+    let rows: Vec<(i64, i64, Option<String>)> = conn
+        .prepare(
+            "SELECT slice_number, encrypted_bytes, staging_path FROM stage_slices
+             WHERE stage_set_id = ?1 ORDER BY slice_number",
+        )?
+        .query_map(params![stage_set_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut problems = Vec::new();
+    if let Some(n) = num_slices {
+        if n != rows.len() as i64 {
+            problems.push(format!(
+                "{} slice row(s) recorded, {n} expected",
+                rows.len()
+            ));
+        }
+    }
+    for (number, expected, path) in rows {
+        let Some(path) = path else {
+            problems.push(format!("slice {number}: no staged file recorded"));
+            continue;
+        };
+        match fs::metadata(&path) {
+            Ok(m) if m.is_file() && m.len() as i64 == expected => {}
+            Ok(m) if m.is_file() => problems.push(format!(
+                "slice {number}: {path} is {} bytes, {expected} recorded",
+                m.len()
+            )),
+            Ok(_) => problems.push(format!("slice {number}: {path} is not a file")),
+            Err(e) => problems.push(format!("slice {number}: {path}: {e}")),
+        }
+    }
+    Ok(problems)
+}
+
+/// The command that makes an incomplete staged set whole again (issue
+/// #402) — `volume write` refuses such a set and `staging status` reports
+/// it, and both name this. The identical ciphertext pulled back from an
+/// in-service sealed copy when there is one (`read-slices` records every
+/// slice's path again); otherwise, for an active unit, the set released and
+/// the version staged again from source.
+pub(crate) fn incomplete_set_remedy(
+    conn: &Connection,
+    unit_id: i64,
+    unit_name: &str,
+    version: i64,
+    unit_status: &str,
+) -> Result<String> {
+    let from = crate::policy::coverage::in_service_copy_of_version(conn, unit_id, version)?;
+    Ok(match from {
+        Some(from) => format!("tapectl volume read-slices --from {from} --unit {unit_name}"),
+        None if unit_status == "active" => format!(
+            "tapectl staging clean --unit {unit_name} --version {version} --force && \
+             tapectl stage create {unit_name} --version {version}"
+        ),
+        None => format!(
+            "no sealed copy to read back, and unit \"{unit_name}\" is not active so it cannot \
+             be staged again — investigate with `tapectl catalog locate {unit_name}`"
+        ),
+    })
+}
+
 /// Full stage pipeline: validate → dar → encrypt → checksums.
 ///
 /// Everything that can refuse without touching the source runs first,

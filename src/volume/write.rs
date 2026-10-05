@@ -1146,6 +1146,9 @@ fn volume_write_contacted<'c>(
     }
 
     let units = find_staged_data(conn)?;
+    // Issue #402: every staged set whole, on disk, before anything below
+    // touches a backend, a MAM or the drive.
+    check_staged_slices(conn)?;
     if units.is_empty() {
         return Err(TapectlError::Other(
             "no staged data to write — run `tapectl stage create` first".into(),
@@ -5231,6 +5234,69 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
     Ok(units)
 }
 
+/// Refuse the write when any `'staged'` set — the selection
+/// [`find_staged_data`] makes — is not whole on disk (issue #402).
+///
+/// `find_staged_data` keeps the slices that still have a `staging_path`, so
+/// a set an older `staging clean` half-released (or a `compact-read` that
+/// skipped a slice and still promoted its set) reached `build` as a unit
+/// with fewer slices than it has. The seal then recorded a `completed`
+/// write, coverage counts writes rather than slices, and the unit counted
+/// one more copy than exists. `validate` checks each slice it is GIVEN; it
+/// cannot see the one that was never given. This compares the set with
+/// what it recorded ([`staging::staged_slice_problems`]), and checks every
+/// file is present at its recorded size, before contact.
+///
+/// It refuses the whole write rather than skipping the set: write-once
+/// media, and the operator chooses the remedy — pulling the identical
+/// ciphertext back from a sealed copy, or releasing the set and staging the
+/// version again.
+fn check_staged_slices(conn: &Connection) -> Result<()> {
+    let sets: Vec<(i64, i64, String, i64, String)> = conn
+        .prepare(
+            "SELECT ss.id, u.id, u.name, s.version, u.status
+             FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE ss.status = 'staged'
+             ORDER BY u.name, s.version, ss.id",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut report = String::new();
+    for (stage_set_id, unit_id, name, version, unit_status) in sets {
+        let problems = staging::staged_slice_problems(conn, stage_set_id)?;
+        if problems.is_empty() {
+            continue;
+        }
+        report.push_str(&format!(
+            "\n  {name} v{version} (stage set {stage_set_id}):"
+        ));
+        for p in &problems {
+            report.push_str(&format!("\n    - {p}"));
+        }
+        let remedy = staging::incomplete_set_remedy(conn, unit_id, &name, version, &unit_status)?;
+        report.push_str(&format!("\n    remedy: {remedy}"));
+    }
+    if report.is_empty() {
+        return Ok(());
+    }
+    Err(TapectlError::Other(format!(
+        "refusing to write: these staged sets are not whole on disk, and writing one \
+         would seal a partial unit as a full copy. Nothing was written and \
+         the drive was not touched.{report}"
+    )))
+}
+
 /// Render the selection `volume write` is about to put on tape (issue #201):
 /// one line per unit and version, plus a total. This is write-once media, so
 /// an operator who did not mean to write everything still `stage create`-d
@@ -8793,6 +8859,148 @@ mod tests {
         assert_eq!(writes, 0, "a refused write must plan nothing");
     }
 
+    /// Issue #402: a staged set an interrupted `staging clean` left with
+    /// one slice's path nulled — `find_staged_data` keeps the slice that
+    /// still has a path, and before this the write sealed that one slice
+    /// as the whole unit. Seeds a two-slice 'staged' set (`num_slices = 2`)
+    /// whose second slice has no `staging_path`. `volume write` must refuse
+    /// it by name, before the device is reached, with no `writes` row.
+    #[test]
+    fn volume_write_refuses_a_partially_cleaned_stage_set_before_touching_the_device() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let dir = tempfile::TempDir::new().unwrap();
+        let present = dir.path().join("photos.1.dar.age");
+        std::fs::write(&present, b"ciphertext one").unwrap();
+        conn.execute(
+            "UPDATE stage_sets SET num_slices = 2 WHERE id = ?1",
+            params![stage_set_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 10, 14, 'p1', 'e1', ?2), (?1, 2, 10, 14, 'p2', 'e2', NULL)",
+            params![stage_set_id, present.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-GATE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+
+        // Positive control: the selection really does hand `build` a
+        // one-slice unit — the defect this gate exists for.
+        let units = find_staged_data(&conn).unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].slices.len(), 1, "only the path-bearing slice");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let err = volume_write(
+            &conn,
+            &paths,
+            &Config::default(),
+            "L6-GATE",
+            "/nonexistent/tapectl-partial-stage-set-test-nst",
+            512 * 1024,
+            false, // force
+            false, // allow_missing_escrow
+            false, // --prewrite-hash
+            true,  // --yes
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not whole on disk"), "{msg}");
+        assert!(
+            msg.contains("photos v1"),
+            "names the unit and version: {msg}"
+        );
+        assert!(
+            msg.contains("slice 2: no staged file recorded"),
+            "names the slice: {msg}"
+        );
+        assert!(
+            msg.contains("tapectl staging clean --unit photos --version 1 --force"),
+            "no sealed copy exists, so the remedy is to release and re-stage: {msg}"
+        );
+        assert!(
+            !msg.contains("tapectl-partial-stage-set-test-nst"),
+            "the device must never be reached: {msg}"
+        );
+        let writes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(writes, 0, "a refused write plans nothing");
+    }
+
+    /// Issue #402: every path-bearing slice must be on disk at its
+    /// recorded size. One slice file is gone (the staging disk failed
+    /// between copy 1 and copy 2) and another is short; both are named.
+    #[test]
+    fn volume_write_refuses_a_stage_set_whose_slice_files_are_missing_or_short() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let dir = tempfile::TempDir::new().unwrap();
+        let gone = dir.path().join("photos.1.dar.age");
+        let short = dir.path().join("photos.2.dar.age");
+        std::fs::write(&short, b"short").unwrap();
+        conn.execute(
+            "UPDATE stage_sets SET num_slices = 2 WHERE id = ?1",
+            params![stage_set_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 10, 14, 'p1', 'e1', ?2), (?1, 2, 10, 14, 'p2', 'e2', ?3)",
+            params![
+                stage_set_id,
+                gone.to_string_lossy(),
+                short.to_string_lossy()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-GATE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+        let err = volume_write(
+            &conn,
+            &paths,
+            &Config::default(),
+            "L6-GATE",
+            "/nonexistent/tapectl-missing-slice-test-nst",
+            512 * 1024,
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not whole on disk"), "{msg}");
+        assert!(
+            msg.contains("slice 1:") && msg.contains("photos.1.dar.age"),
+            "names the missing file: {msg}"
+        );
+        assert!(
+            msg.contains("slice 2:") && msg.contains("is 5 bytes, 14 recorded"),
+            "names the short file and both sizes: {msg}"
+        );
+        assert!(
+            !msg.contains("tapectl-missing-slice-test-nst"),
+            "the device must never be reached: {msg}"
+        );
+    }
+
     /// ADR-0012 amendment, issue #199: the rebuild scenario the issue was
     /// filed about. `catalog rebuild --from-volume` can attach a rebuilt
     /// row's contents to a pre-existing `initialized` volume without ever
@@ -9209,15 +9417,19 @@ mod tests {
         )
         .unwrap();
         let ss_id = conn.last_insert_rowid();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A real slice file at its recorded size: issue #402's on-disk
+        // check runs before backend resolution.
+        let slice = tmp.path().join("x.dar.age");
+        std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
                 (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
-             VALUES (?1, 1, 10, 10, 'a', 'b', '/tmp/x')",
-            params![ss_id],
+             VALUES (?1, 1, 10, 10, 'a', 'b', ?2)",
+            params![ss_id, slice.to_string_lossy()],
         )
         .unwrap();
 
-        let tmp = tempfile::TempDir::new().unwrap();
         let paths = TapectlPaths::new(tmp.path().join("home"));
         // No `[[backends.lto]]` configured, so `resolve_lto_backend` is the
         // very next thing that can fail — and it fails without ever naming
@@ -9851,12 +10063,17 @@ mod tests {
     #[test]
     fn volume_write_refuses_a_drive_that_cannot_write_the_recorded_generation_before_bind_late() {
         let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A real 10-byte slice file: issue #402's on-disk check runs before
+        // the generation check this test is about.
+        let slice = tmp.path().join("tapectl-gencheck-slice.dar.age");
+        std::fs::write(&slice, b"0123456789").unwrap();
         conn.execute(
             "INSERT INTO stage_slices
                 (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
                  sha256_encrypted, staging_path)
-             VALUES (?1, 1, 10, 10, 'p', 'e', '/nonexistent/tapectl-gencheck-slice.dar.age')",
-            params![stage_set_id],
+             VALUES (?1, 1, 10, 10, 'p', 'e', ?2)",
+            params![stage_set_id, slice.to_string_lossy()],
         )
         .unwrap();
 
@@ -9868,7 +10085,6 @@ mod tests {
         )
         .unwrap();
 
-        let tmp = tempfile::TempDir::new().unwrap();
         let mut config = Config::default();
         config.staging.directory = tmp.path().join("staging").to_string_lossy().into_owned();
         config.backends.lto.push(crate::config::LtoBackendConfig {
@@ -12429,12 +12645,17 @@ mod tests {
         /// to the generation refusal.
         fn genchk_fixture(label: &str) -> Connection {
             let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+            // A real 10-byte slice file (issue #402's on-disk check runs
+            // before the generation refusal), kept past this function: the
+            // connection outlives any guard returned here.
+            let (mut file, slice) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
+            std::io::Write::write_all(&mut file, b"0123456789").unwrap();
             conn.execute(
                 "INSERT INTO stage_slices
                     (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
                      sha256_encrypted, staging_path)
-                 VALUES (?1, 1, 10, 10, 'p', 'e', '/nonexistent/tapectl-contact-slice.dar.age')",
-                params![stage_set_id],
+                 VALUES (?1, 1, 10, 10, 'p', 'e', ?2)",
+                params![stage_set_id, slice.to_string_lossy()],
             )
             .unwrap();
             conn.execute(
