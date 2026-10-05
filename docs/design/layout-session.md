@@ -229,7 +229,16 @@ Rules that hold in every path:
   not the tail — no seek-back). Read the seal marker and verify it binds File 3;
   diff the front index against the Layout (navigable tier); hash each file
   against the front index's `sha256_encrypted` (integrity tier). The exact
-  cryptographic chain is fixed in `volume-format-v2.md` §4–5. Record a
+  cryptographic chain is fixed in `volume-format-v2.md` §4–5. On tape that is
+  one locate to the seal marker, one rewind, then Files 0, 1, 2, 3 and every
+  content file in position order (#389): Files 0–2 are held in memory until
+  File 3 says what they hash to, and judged in its order, so the verdict is
+  the one a file-by-file walk gives. `TapeStore` tracks which file the head
+  is at and only spaces forward to a file ahead of it, rewinding only for one
+  behind it or after anything that leaves the position uncertain (an error, a
+  write, a read that returns nothing, or st's own count disagreeing). Before
+  1.0.5 every read rewound to BOT, which cost a full-tape confirm about five
+  hours of rewinds on LTO-6. Record a
   `verification_sessions` row stating **which tier** ran (ADR-0001). Match →
   mark `sealed`. Mismatch → **three outcomes, not two** (ADR-0012's 2026-09-18
   amendment, issues #260/#267): a mismatch that `MismatchKind::proves_medium_bad`

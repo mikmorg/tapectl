@@ -1037,7 +1037,16 @@ pub fn select_write_positions(
     })
 }
 
-/// The written slices of ONE stage set on one volume, in slice order.
+/// The written slices of ONE stage set on one volume, in tape order.
+///
+/// Tape order is slice order on every tape tapectl writes (a unit's slices
+/// are laid out contiguously, in `slice_number` order), so this is the order
+/// restore always read them in. It is spelled as tape order anyway, with
+/// `CAST` because `position` is TEXT, because that is what keeps restore
+/// one forward pass over the tape (issue #389): `TapeStore` spaces forward
+/// to a file ahead of the head and rewinds for one behind it. dar does not
+/// care — each slice is named `restore.{slice_number}.dar` whatever order
+/// it arrives in.
 fn get_write_positions(
     conn: &Connection,
     stage_set_id: i64,
@@ -1051,7 +1060,7 @@ fn get_write_positions(
          JOIN stage_slices sl ON sl.id = wp.stage_slice_id
          JOIN volumes v ON v.id = w.volume_id
          WHERE sl.stage_set_id = ?1 AND v.label = ?2 AND w.status = 'completed' AND wp.status = 'written'
-         ORDER BY sl.slice_number",
+         ORDER BY CAST(wp.position AS INTEGER), sl.slice_number",
     )?;
 
     let rows = stmt
@@ -3077,6 +3086,162 @@ mod tests {
                 assert!(r.error.is_some());
                 assert_eq!(r.files_restored, None, "not known: the dump never finished");
                 assert_eq!(r.bytes_restored, None);
+            }
+        }
+
+        // ── issue #389: restore reads the tape forward ──
+
+        mod forward_reads {
+            use super::*;
+            use crate::tape::fake::{FakeTape, Op};
+
+            /// THE acceptance test for restore: a unit of K contiguous slices
+            /// comes off a tape with ONE rewind — the open's — then File 0
+            /// (the contact check), one forward space to the first slice and
+            /// every slice in turn. Before #389 it was a rewind and a locate
+            /// per slice.
+            ///
+            /// Driven through the real `restore_unit_from_store` over a
+            /// `TapeStore` on the in-memory tape, with a real multi-slice dar
+            /// archive, so the extract proves the slices that came back were
+            /// the right ones.
+            #[test]
+            fn a_multi_slice_restore_is_one_rewind_and_one_forward_pass() {
+                const FIRST: u32 = 4;
+                let conn = crate::db::open_memory().unwrap();
+                let home = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(home.path().join(".tapectl"));
+                seed(&conn, "FWD-1", "fwd-unit");
+                paths.ensure_dirs().unwrap();
+                let kp = keys::generate_and_save(&paths.keys_dir, "t1", "primary").unwrap();
+
+                // A real dar archive, cut into several slices.
+                let work = TempDir::new().unwrap();
+                let src = work.path().join("src");
+                fs::create_dir_all(&src).unwrap();
+                let blob: Vec<u8> = (0..200_000u32)
+                    .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+                    .collect();
+                fs::write(src.join("big.bin"), &blob).unwrap();
+                fs::write(src.join("small.txt"), b"small").unwrap();
+                let base = work.path().join("arch");
+                let created = std::process::Command::new("dar")
+                    .arg("-c")
+                    .arg(&base)
+                    .arg("-R")
+                    .arg(&src)
+                    .arg("-s")
+                    .arg("64k")
+                    .arg("-Q")
+                    .output()
+                    .unwrap();
+                assert!(
+                    created.status.success(),
+                    "dar -c failed in test setup: {}",
+                    String::from_utf8_lossy(&created.stderr)
+                );
+                let plains: Vec<Vec<u8>> = (1..)
+                    .map(|n| work.path().join(format!("arch.{n}.dar")))
+                    .take_while(|p| p.exists())
+                    .map(|p| fs::read(p).unwrap())
+                    .collect();
+                assert!(
+                    plains.len() >= 3,
+                    "want a multi-slice archive, got {} slice(s)",
+                    plains.len()
+                );
+
+                // The tape: File 0 names the volume, Files 1..3 stand in for
+                // the rest of the front zone, then the slices from File 4.
+                let mut mem = tape_labelled("FWD-1");
+                for filler in 1..FIRST {
+                    mem.execute(&mut Cursor::new(vec![filler as u8; 100]), 100, false)
+                        .unwrap();
+                }
+                // The catalog: `seed` made slice 1 at position 4; give it
+                // its real values and add the rest after it.
+                let ss_id: i64 = conn
+                    .query_row("SELECT id FROM stage_sets", [], |r| r.get(0))
+                    .unwrap();
+                let write_id: i64 = conn
+                    .query_row("SELECT id FROM writes", [], |r| r.get(0))
+                    .unwrap();
+                for (i, plain) in plains.iter().enumerate() {
+                    let cipher = encrypt_to(plain, std::slice::from_ref(&kp.public_key));
+                    mem.execute(&mut Cursor::new(cipher.clone()), cipher.len() as u64, false)
+                        .unwrap();
+                    let number = i as i64 + 1;
+                    let position = (FIRST + i as u32).to_string();
+                    if number == 1 {
+                        conn.execute(
+                            "UPDATE stage_slices SET size_bytes = ?1, encrypted_bytes = ?2,
+                                    sha256_plain = ?3, sha256_encrypted = ?4",
+                            params![
+                                plain.len() as i64,
+                                cipher.len() as i64,
+                                direct_hash(plain),
+                                direct_hash(&cipher)
+                            ],
+                        )
+                        .unwrap();
+                        conn.execute(
+                            "UPDATE write_positions SET position = ?1, sha256_on_volume = ?2",
+                            params![position, direct_hash(&cipher)],
+                        )
+                        .unwrap();
+                    } else {
+                        conn.execute(
+                            "INSERT INTO stage_slices
+                                (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                 sha256_plain, sha256_encrypted)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                ss_id,
+                                number,
+                                plain.len() as i64,
+                                cipher.len() as i64,
+                                direct_hash(plain),
+                                direct_hash(&cipher)
+                            ],
+                        )
+                        .unwrap();
+                        let slice_id = conn.last_insert_rowid();
+                        conn.execute(
+                            "INSERT INTO write_positions
+                                (write_id, stage_slice_id, position, status, sha256_on_volume)
+                             VALUES (?1, ?2, ?3, 'written', ?4)",
+                            params![write_id, slice_id, position, direct_hash(&cipher)],
+                        )
+                        .unwrap();
+                    }
+                }
+
+                let fake = FakeTape::with_files(mem.files.clone(), 4096);
+                let mut store = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+                let dest = TempDir::new().unwrap();
+                let dest_str = dest.path().to_string_lossy().to_string();
+                let report = restore_unit_from_store(
+                    &conn,
+                    &paths,
+                    &Config::default(),
+                    "fwd-unit",
+                    "FWD-1",
+                    1,
+                    RestoreTarget::Unit {
+                        dest_dir: &dest_str,
+                    },
+                    &mut store,
+                    site(Operation::RestoreUnit),
+                )
+                .expect("a clean multi-slice restore");
+                assert_eq!(report.slices, plains.len());
+                assert_eq!(fs::read(dest.path().join("big.bin")).unwrap(), blob);
+                assert_eq!(fs::read(dest.path().join("small.txt")).unwrap(), b"small");
+
+                let mut expected = vec![Op::Rewind, Op::Read(0), Op::Space(FIRST - 1)];
+                expected.extend((0..plains.len() as u32).map(|i| Op::Read(FIRST + i)));
+                assert_eq!(fake.ops(), expected);
+                assert_eq!(fake.rewinds(), 1);
             }
         }
     }

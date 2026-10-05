@@ -13,12 +13,13 @@
 //! the real algorithm — not a description of it — that the unit tests below
 //! (and later, the T7 synthetic-heir harness) exercise with no tape anywhere.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, TapectlError};
-use crate::tape::ioctl::TapeDevice;
+use crate::tape::ioctl::{ReadEnd, TapeDevice, TapePosition};
 use crate::util::{HashingWriter, TruncatingWriter};
 use crate::volume::format;
 use crate::volume::layout_model::{pad_to_blocks, Layout, ZoneKind};
@@ -461,6 +462,22 @@ pub trait Store {
 /// `io::sink()`) that never materializes the file, trimming block padding
 /// to the front index's claimed `size_bytes` as the bytes arrive exactly
 /// like `restore.rs::restore_one_slice_inner`'s ciphertext pass does.
+///
+/// **Read order (issue #389).** The seal marker is read first and alone — it
+/// is the precedence gate (§2.5: absent or unparseable means unsealed, and
+/// the walk stops there) — and everything after it is read in ascending
+/// position order: at the Integrity tier the files ahead of File 3 (0, 1, 2:
+/// the ID thunk, system guide and RESTORE.sh), then File 3, then every
+/// content file after it. On a tape that is one locate to the seal, one
+/// rewind, and the single forward pass from BOP `volume-format-v2.md` §5
+/// describes, where it used to be a rewind and locate per file. The files
+/// ahead of File 3 cannot be checked until File 3 says what they should
+/// hash to, so they are HELD — they are the small generated front-zone
+/// files, bounded by [`AHEAD_OF_INDEX_CAP`] — and checked in step 4 in the
+/// front index's own order, so every mismatch, its kind, its order and
+/// `files_checked` are exactly what reading them in step 4 would give. A
+/// file the Layout does not list ahead of File 3, or one too large to hold,
+/// is simply read in step 4 as before.
 fn chain_walk<F>(layout: &Layout, tier: Tier, mut read: F) -> Result<Evidence>
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
@@ -523,6 +540,16 @@ where
                     mismatches,
                 };
             }
+        };
+
+        // Integrity only: read the files ahead of File 3 now, from BOT, so
+        // the rest of the walk is one forward pass (issue #389). Held, not
+        // judged — nothing here touches `mismatches` or `files_checked`;
+        // step 4 judges them in the front index's order.
+        let held = if tier == Tier::Integrity {
+            hold_files_ahead_of_index(layout, fi_pos, &mut read)
+        } else {
+            HashMap::new()
         };
 
         // Step 2 (§5.2): hash File 3's TRUE bytes; compare to the seal's
@@ -672,7 +699,16 @@ where
             // uses for its ciphertext pass, just with a sink that has no use
             // for the bytes themselves (issue #86).
             let mut sink = TruncatingWriter::new(HashingWriter::new(io::sink()), want_size);
-            let read_result = read(position, &mut sink);
+            // A file held from the pass ahead of File 3 is fed through the
+            // identical sink, as `MemStore::read_file` would feed it.
+            let read_result = match held.get(&position) {
+                Some(Held::Bytes { bytes, read }) => sink
+                    .write_all(bytes)
+                    .map(|()| *read)
+                    .map_err(|e| TapectlError::Other(format!("sink write: {e}")).to_string()),
+                Some(Held::Failed(e)) => Err(e.clone()),
+                None => read(position, &mut sink).map_err(|e| e.to_string()),
+            };
             let hashing = sink.into_inner();
 
             let n_read = match read_result {
@@ -727,16 +763,231 @@ where
     Ok(evidence)
 }
 
+/// The most on-tape bytes `chain_walk` will hold for one file ahead of
+/// File 3. Those are the generated front-zone files (ID thunk, system
+/// guide, RESTORE.sh): a few kilobytes each, one 512 KiB block apiece on
+/// tape. The cap only bounds memory against a Layout or tape that claims
+/// otherwise; a file over it is read in step 4 instead, which costs a
+/// rewind and changes no verdict.
+const AHEAD_OF_INDEX_CAP: u64 = 16 * 1024 * 1024;
+
+/// One file read ahead of File 3, kept for step 4 of the chain walk.
+enum Held {
+    /// Its on-tape (padded) bytes, as `read` delivered them, and the byte
+    /// count `read` returned.
+    Bytes { bytes: Vec<u8>, read: u64 },
+    /// The read failed; the error, as step 4 would have reported it.
+    Failed(String),
+}
+
+/// Read the Layout's files ahead of File 3, in position order, into memory
+/// for [`chain_walk`]'s step 4 (issue #389). A file the Layout gives no size
+/// for, or one over [`AHEAD_OF_INDEX_CAP`], is skipped (step 4 reads it); so
+/// is one that turns out larger on tape than the cap.
+fn hold_files_ahead_of_index<F>(layout: &Layout, fi_pos: u32, read: &mut F) -> HashMap<u32, Held>
+where
+    F: FnMut(u32, &mut dyn Write) -> Result<u64>,
+{
+    let block = layout.block_size.max(1);
+    let mut ahead: Vec<u32> = layout
+        .entries
+        .iter()
+        .filter(|e| (e.position as u32) < fi_pos)
+        .filter(|e| !matches!(e.kind, ZoneKind::FrontIndex | ZoneKind::SealMarker))
+        .filter(|e| {
+            e.size_bytes
+                .is_some_and(|n| pad_to_blocks(n, block) <= AHEAD_OF_INDEX_CAP)
+        })
+        .map(|e| e.position as u32)
+        .collect();
+    ahead.sort_unstable();
+    ahead.dedup();
+
+    let mut held = HashMap::new();
+    for position in ahead {
+        let mut buf = CappedBuffer::default();
+        match read(position, &mut buf) {
+            Ok(_) if buf.overflowed => {}
+            Ok(n) => {
+                held.insert(
+                    position,
+                    Held::Bytes {
+                        bytes: buf.bytes,
+                        read: n,
+                    },
+                );
+            }
+            Err(e) => {
+                held.insert(position, Held::Failed(e.to_string()));
+            }
+        }
+    }
+    held
+}
+
+/// A `Write` that keeps up to [`AHEAD_OF_INDEX_CAP`] bytes and, past that,
+/// drops everything and says so — while still accepting every write, so the
+/// read under it runs to its filemark and leaves the head where a whole
+/// read would.
+#[derive(Default)]
+struct CappedBuffer {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+impl Write for CappedBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !self.overflowed {
+            if (self.bytes.len() + buf.len()) as u64 > AHEAD_OF_INDEX_CAP {
+                self.overflowed = true;
+                self.bytes = Vec::new();
+            } else {
+                self.bytes.extend_from_slice(buf);
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     format!("{:x}", h.finalize())
 }
 
+/// The st operations [`TapeStore`] issues — the seam its file cursor is
+/// tested through (issue #389). [`TapeDevice`] in production; the unit tests'
+/// in-memory tape (`crate::tape::fake`) otherwise, so the repositioning code
+/// under test is the real one, not a description of it. Nothing here moves
+/// the tape backwards except `rewind`.
+pub(crate) trait TapeOps: Send {
+    fn rewind(&self) -> Result<()>;
+    fn forward_space_file(&self, count: i32) -> Result<()>;
+    /// st's own count of where the head is (`MTIOCGET`). Moves no tape.
+    fn position(&self) -> Result<TapePosition>;
+    fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64>;
+    fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<(u64, ReadEnd)>;
+    fn read_file_head(&mut self, max_bytes: u64, sink: &mut dyn Write) -> Result<(u64, ReadEnd)>;
+}
+
+impl TapeOps for TapeDevice {
+    fn rewind(&self) -> Result<()> {
+        TapeDevice::rewind(self)
+    }
+    fn forward_space_file(&self, count: i32) -> Result<()> {
+        TapeDevice::forward_space_file(self, count)
+    }
+    fn position(&self) -> Result<TapePosition> {
+        TapeDevice::get_position(self)
+    }
+    fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        TapeDevice::write_stream(self, src, len, sync)
+    }
+    fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
+        TapeDevice::read_file_streaming(self, sink)
+    }
+    fn read_file_head(&mut self, max_bytes: u64, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
+        TapeDevice::read_file_head(self, max_bytes, sink)
+    }
+}
+
+/// Where [`TapeStore`] believes the head is, counted in tape files
+/// (issue #389).
+///
+/// Until 1.0.5 every read rewound to BOT and spaced forward `position`
+/// filemarks, so a full-tape confirm or verify paid one rewind and one
+/// locate per file — about 154 on a full LTO-6, roughly five hours of
+/// L6-0001's ten-hour confirm. The cursor lets a read that is already at its
+/// file, or ahead of the head, move only forward.
+///
+/// It is only ever an optimisation over that old rewind: anything that
+/// leaves the head somewhere not known for certain sets [`Self::Unknown`],
+/// and the next read rewinds exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileCursor {
+    /// Not known — after any error, a write, or a read whose end is
+    /// ambiguous. The next read rewinds.
+    Unknown,
+    /// At the start of tape file `n`: nothing of it read yet.
+    AtStart(u32),
+    /// Inside tape file `n`, before its filemark — where a
+    /// [`Store::read_file_head`] that stopped early leaves it. Spacing
+    /// forward `k` filemarks from anywhere inside `n` lands at the start of
+    /// `n + k`, just as from its start; only re-reading `n` needs a rewind.
+    Within(u32),
+}
+
+/// The motion a read at some position needs, given the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Move {
+    /// Already at the start of the file.
+    Stay,
+    /// Space forward this many filemarks.
+    Forward(u32),
+    /// Rewind, then space forward this many filemarks.
+    FromBot(u32),
+}
+
+impl FileCursor {
+    fn plan(self, target: u32) -> Move {
+        match self {
+            FileCursor::AtStart(n) if n == target => Move::Stay,
+            FileCursor::AtStart(n) | FileCursor::Within(n) if target > n => {
+                Move::Forward(target - n)
+            }
+            _ => Move::FromBot(target),
+        }
+    }
+
+    /// Whether st's own count agrees with this cursor. `mt_fileno` is
+    /// maintained by the st driver from what the drive reports, independently
+    /// of tapectl's arithmetic, and `-1` when st has lost track.
+    fn agrees_with(self, st: TapePosition) -> bool {
+        match self {
+            FileCursor::Unknown => false,
+            FileCursor::AtStart(n) => st.file_number == n as i32 && st.block_number == 0,
+            FileCursor::Within(n) => st.file_number == n as i32,
+        }
+    }
+
+    /// The cursor in words, for the session log.
+    fn describe(self) -> String {
+        match self {
+            FileCursor::Unknown => "unknown".to_string(),
+            FileCursor::AtStart(n) => format!("start of file {n}"),
+            FileCursor::Within(n) => format!("inside file {n}"),
+        }
+    }
+
+    /// Where a read of the file at `position` left the head. Only a read
+    /// that delivered bytes and then crossed the filemark is certain to be
+    /// at the next file: a read that returns nothing at all is either a
+    /// filemark-only file or end of data (issue #327: st returns 0 for
+    /// both), and the two leave the head in different places.
+    fn after_read(position: u32, read: &Result<(u64, ReadEnd)>) -> Self {
+        match read {
+            Ok((n, ReadEnd::Filemark)) if *n > 0 => FileCursor::AtStart(position.saturating_add(1)),
+            Ok((_, ReadEnd::Stopped)) => FileCursor::Within(position),
+            _ => FileCursor::Unknown,
+        }
+    }
+}
+
 /// LTO tape via the kernel st driver (fixed 512KB blocks).
+///
+/// Tracks which tape file the head is at ([`FileCursor`], issue #389) and
+/// repositions only when a read needs it: not at all when the head is
+/// already at the file, a relative forward space when the file is ahead,
+/// and the old rewind-plus-space when it is behind or the position is not
+/// known. Before trusting the cursor it checks st's own count (`MTIOCGET`),
+/// and repositions from BOT if the two disagree.
 pub struct TapeStore {
-    dev: TapeDevice,
+    dev: Box<dyn TapeOps>,
     usable_bytes: u64,
+    cursor: FileCursor,
 }
 
 impl TapeStore {
@@ -752,24 +1003,95 @@ impl TapeStore {
         if let Err(e) = dev.disable_compression() {
             tracing::warn!(err = %e, "could not disable hardware compression (continuing)");
         }
-        Ok(Self { dev, usable_bytes })
+        Ok(Self::at_bot(Box::new(dev), usable_bytes))
     }
 
-    /// Open the drive read-only, rewound to BOT — for restore, which only
-    /// ever calls `read_file` (issue #85 migrated the restore read seam onto
-    /// this trait: `TapeStore::read_file` already does exactly the
-    /// rewind + forward-space-file + streaming-read sequence restore used
-    /// to inline by hand). Unlike [`Self::open`], this does not touch
+    /// Open the drive read-only, rewound to BOT — for the read paths
+    /// (restore, verify, read-slices, rebuild), which only ever call
+    /// `read_file`/`read_file_head` (issue #85 migrated the restore read
+    /// seam onto this trait). Unlike [`Self::open`], this does not touch
     /// hardware compression (a write-time-only concern) and reports zero
-    /// usable capacity, since nothing on the restore path ever calls
+    /// usable capacity, since nothing on a read path ever calls
     /// `capacity()`.
     pub fn open_read(device: &str, block_size: usize) -> Result<Self> {
         let dev = TapeDevice::open_read(device, block_size)?;
         dev.rewind()?;
-        Ok(Self {
+        Ok(Self::at_bot(Box::new(dev), 0))
+    }
+
+    /// A store over a device the caller has just rewound.
+    fn at_bot(dev: Box<dyn TapeOps>, usable_bytes: u64) -> Self {
+        Self {
             dev,
-            usable_bytes: 0,
-        })
+            usable_bytes,
+            cursor: FileCursor::AtStart(0),
+        }
+    }
+
+    /// A store over any [`TapeOps`], rewound to BOT as `open_read` does —
+    /// how the tests put the real cursor code over the in-memory tape.
+    #[cfg(test)]
+    pub(crate) fn from_ops(dev: Box<dyn TapeOps>, usable_bytes: u64) -> Result<Self> {
+        dev.rewind()?;
+        Ok(Self::at_bot(dev, usable_bytes))
+    }
+
+    /// The cursor, if st's own count agrees with it; otherwise
+    /// [`FileCursor::Unknown`], so the read repositions from BOT.
+    ///
+    /// Why ask st at all, when tapectl is the only thing moving this tape
+    /// (the st driver refuses a second open, and the SG commands tapectl
+    /// issues — MAM, log pages, inquiry — never move it): because a cursor
+    /// that is wrong by one reads file N+1 as file N, and in the chain walk
+    /// that is a `ContentHashMismatch` or `NavigationDisagreement` — both
+    /// `proves_medium_bad`, so a sound cartridge would be quarantined
+    /// (ADR-0012's asymmetric cost). `MTIOCGET` moves no tape and costs
+    /// microseconds; a disagreement can only cost a rewind, never a read of
+    /// the wrong file.
+    fn trusted_cursor(&self) -> FileCursor {
+        if self.cursor == FileCursor::Unknown {
+            return FileCursor::Unknown;
+        }
+        match self.dev.position() {
+            Ok(st) if self.cursor.agrees_with(st) => self.cursor,
+            Ok(st) => {
+                tracing::warn!(
+                    cursor = %self.cursor.describe(),
+                    st_file = st.file_number,
+                    st_block = st.block_number,
+                    "tape position disagrees with the st driver's count; repositioning from BOT"
+                );
+                FileCursor::Unknown
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cursor = %self.cursor.describe(),
+                    err = %e,
+                    "could not read the st driver's position; repositioning from BOT"
+                );
+                FileCursor::Unknown
+            }
+        }
+    }
+
+    /// Put the head at the start of tape file `target`, moving it as little
+    /// as the cursor allows. The cursor is `Unknown` while the tape moves, so
+    /// an error anywhere leaves it there and the next read rewinds.
+    fn locate(&mut self, target: u32) -> Result<()> {
+        let from = self.trusted_cursor();
+        self.cursor = FileCursor::Unknown;
+        match from.plan(target) {
+            Move::Stay => {}
+            Move::Forward(k) => self.dev.forward_space_file(k as i32)?,
+            Move::FromBot(k) => {
+                self.dev.rewind()?;
+                if k > 0 {
+                    self.dev.forward_space_file(k as i32)?;
+                }
+            }
+        }
+        self.cursor = FileCursor::AtStart(target);
+        Ok(())
     }
 }
 
@@ -780,41 +1102,49 @@ impl Store for TapeStore {
         })
     }
 
+    /// The write path does not use the cursor: a write leaves it `Unknown`,
+    /// so the first read after any write rewinds, exactly as before #389.
     fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        self.cursor = FileCursor::Unknown;
         self.dev.write_stream(src, len, sync)
     }
 
     // confirm: default trait method (T6 finding #1) — identical to what this
-    // impl used to define directly.
+    // impl used to define directly. Its chain walk reads in ascending
+    // position order after the seal marker, which is what lets the cursor
+    // below make it one forward pass (issue #389).
 
     fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
-        self.dev.rewind()?;
-        if position > 0 {
-            self.dev.forward_space_file(position as i32)?;
-        }
-        self.dev.read_file_streaming(sink)
+        self.locate(position)?;
+        let read = self.dev.read_file_streaming(sink);
+        self.cursor = FileCursor::after_read(position, &read);
+        read.map(|(n, _)| n)
     }
 
     /// Overrides the default so a tape stops after the first block(s)
-    /// instead of streaming a whole slice to a sink that discards it.
+    /// instead of streaming a whole slice to a sink that discards it. That
+    /// usually leaves the head inside the file ([`FileCursor::Within`]).
     fn read_file_head(
         &mut self,
         position: u32,
         max_bytes: u64,
         sink: &mut dyn Write,
     ) -> Result<u64> {
-        self.dev.rewind()?;
-        if position > 0 {
-            self.dev.forward_space_file(position as i32)?;
-        }
-        self.dev.read_file_head(max_bytes, sink)
+        self.locate(position)?;
+        let read = self.dev.read_file_head(max_bytes, sink);
+        self.cursor = FileCursor::after_read(position, &read);
+        read.map(|(n, _)| n)
     }
 
+    /// Always rewind + space, whatever the cursor says: this positions the
+    /// next WRITE, and is kept exactly as it was before #389.
     fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+        self.cursor = FileCursor::Unknown;
         self.dev.rewind()?;
         if file_index > 0 {
             self.dev.forward_space_file(file_index as i32)?;
         }
+        self.cursor = FileCursor::AtStart(file_index);
         Ok(())
     }
 }
@@ -1106,20 +1436,34 @@ mod tests {
     /// bytes. `seal_hash_override` lets a test bind the seal marker to a
     /// deliberately wrong front-index hash.
     fn build_confirm_fixture(seal_hash_override: Option<&str>) -> (Layout, MemStore) {
+        build_confirm_fixture_with(seal_hash_override, 1)
+    }
+
+    /// [`build_confirm_fixture`] with `n_slices` data slices at positions
+    /// 4.., each a different byte pattern, and the seal marker after them.
+    fn build_confirm_fixture_with(
+        seal_hash_override: Option<&str>,
+        n_slices: usize,
+    ) -> (Layout, MemStore) {
         let id_thunk = b"ID THUNK CONTENT".to_vec();
         let guide = b"SYSTEM GUIDE CONTENT".to_vec();
         let restore_sh = b"#!/bin/sh\n# RESTORE.sh CONTENT\n".to_vec();
-        let slice = vec![0xABu8; 300_000]; // deliberately not block-aligned
+        // Deliberately not block-aligned.
+        let slices: Vec<Vec<u8>> = (0..n_slices)
+            .map(|i| vec![0xABu8.wrapping_add(i as u8); 300_000])
+            .collect();
+        let seal_pos = 4 + n_slices as u32;
+        let total_files = seal_pos + 1;
 
         let id_hash = sha256_hex(&id_thunk);
         let guide_hash = sha256_hex(&guide);
         let restore_hash = sha256_hex(&restore_sh);
-        let slice_hash = sha256_hex(&slice);
+        let slice_hashes: Vec<String> = slices.iter().map(|s| sha256_hex(s)).collect();
 
         // File 3's own content: the front-index and seal-marker entries
         // stay size/hash-less (self-reference / not-yet-written); every
         // other entry carries its real size + on-tape hash.
-        let fi_files = vec![
+        let mut fi_files = vec![
             FrontIndexFile {
                 position: 0,
                 type_label: "id_thunk",
@@ -1144,19 +1488,21 @@ mod tests {
                 size_bytes: None,
                 sha256_encrypted: None,
             },
-            FrontIndexFile {
-                position: 4,
+        ];
+        for (i, slice) in slices.iter().enumerate() {
+            fi_files.push(FrontIndexFile {
+                position: 4 + i as i32,
                 type_label: "data_slice",
                 size_bytes: Some(slice.len() as u64),
-                sha256_encrypted: Some(slice_hash.clone()),
-            },
-            FrontIndexFile {
-                position: 5,
-                type_label: "seal_marker",
-                size_bytes: None,
-                sha256_encrypted: None,
-            },
-        ];
+                sha256_encrypted: Some(slice_hashes[i].clone()),
+            });
+        }
+        fi_files.push(FrontIndexFile {
+            position: seal_pos as i32,
+            type_label: "seal_marker",
+            size_bytes: None,
+            sha256_encrypted: None,
+        });
 
         let fi_bytes = generate_front_index("FIXT01", &fi_files).into_bytes();
         let fi_hash = sha256_hex(&fi_bytes);
@@ -1169,7 +1515,9 @@ mod tests {
             e.size_bytes = Some(fi_bytes.len() as u64);
             e.sha256_encrypted = Some(fi_hash.clone());
         }
-        let seal_bytes = generate_seal_marker("FIXT01", 6, bound_hash, &seal_files).into_bytes();
+        let seal_bytes =
+            generate_seal_marker("FIXT01", total_files as i32, bound_hash, &seal_files)
+                .into_bytes();
 
         let mut store = MemStore::new(BS as usize);
         store
@@ -1196,9 +1544,11 @@ mod tests {
                 false,
             )
             .unwrap();
-        store
-            .execute(&mut Cursor::new(slice.clone()), slice.len() as u64, false)
-            .unwrap();
+        for slice in &slices {
+            store
+                .execute(&mut Cursor::new(slice.clone()), slice.len() as u64, false)
+                .unwrap();
+        }
         store
             .execute(
                 &mut Cursor::new(seal_bytes.clone()),
@@ -1206,6 +1556,55 @@ mod tests {
                 true,
             )
             .unwrap();
+
+        let mut entries = vec![
+            LayoutEntry {
+                position: 0,
+                kind: ZoneKind::IdThunk,
+                size_bytes: Some(id_thunk.len() as u64),
+                sha256: Some(id_hash),
+                source: ContentSource::Generated,
+            },
+            LayoutEntry {
+                position: 1,
+                kind: ZoneKind::SystemGuide,
+                size_bytes: Some(guide.len() as u64),
+                sha256: Some(guide_hash),
+                source: ContentSource::Generated,
+            },
+            LayoutEntry {
+                position: 2,
+                kind: ZoneKind::RestoreSh,
+                size_bytes: Some(restore_sh.len() as u64),
+                sha256: Some(restore_hash),
+                source: ContentSource::Generated,
+            },
+            LayoutEntry {
+                position: 3,
+                kind: ZoneKind::FrontIndex,
+                size_bytes: Some(fi_bytes.len() as u64),
+                sha256: Some(fi_hash),
+                source: ContentSource::Generated,
+            },
+        ];
+        for (i, slice) in slices.iter().enumerate() {
+            entries.push(LayoutEntry {
+                position: 4 + i as i32,
+                kind: ZoneKind::Slice {
+                    stage_slice_id: 1 + i as i64,
+                },
+                size_bytes: Some(slice.len() as u64),
+                sha256: Some(slice_hashes[i].clone()),
+                source: ContentSource::Staged(PathBuf::from(format!("/fixture/slice{i}.age"))),
+            });
+        }
+        entries.push(LayoutEntry {
+            position: seal_pos as i32,
+            kind: ZoneKind::SealMarker,
+            size_bytes: Some(seal_bytes.len() as u64),
+            sha256: None,
+            source: ContentSource::Generated,
+        });
 
         let layout = Layout {
             label: "FIXT01".into(),
@@ -1216,50 +1615,7 @@ mod tests {
                 available_bytes: 1000 * BS,
                 reserve_bytes: BS,
             },
-            entries: vec![
-                LayoutEntry {
-                    position: 0,
-                    kind: ZoneKind::IdThunk,
-                    size_bytes: Some(id_thunk.len() as u64),
-                    sha256: Some(id_hash),
-                    source: ContentSource::Generated,
-                },
-                LayoutEntry {
-                    position: 1,
-                    kind: ZoneKind::SystemGuide,
-                    size_bytes: Some(guide.len() as u64),
-                    sha256: Some(guide_hash),
-                    source: ContentSource::Generated,
-                },
-                LayoutEntry {
-                    position: 2,
-                    kind: ZoneKind::RestoreSh,
-                    size_bytes: Some(restore_sh.len() as u64),
-                    sha256: Some(restore_hash),
-                    source: ContentSource::Generated,
-                },
-                LayoutEntry {
-                    position: 3,
-                    kind: ZoneKind::FrontIndex,
-                    size_bytes: Some(fi_bytes.len() as u64),
-                    sha256: Some(fi_hash),
-                    source: ContentSource::Generated,
-                },
-                LayoutEntry {
-                    position: 4,
-                    kind: ZoneKind::Slice { stage_slice_id: 1 },
-                    size_bytes: Some(slice.len() as u64),
-                    sha256: Some(slice_hash),
-                    source: ContentSource::Staged(PathBuf::from("/fixture/slice.age")),
-                },
-                LayoutEntry {
-                    position: 5,
-                    kind: ZoneKind::SealMarker,
-                    size_bytes: Some(seal_bytes.len() as u64),
-                    sha256: None,
-                    source: ContentSource::Generated,
-                },
-            ],
+            entries,
         };
 
         (layout, store)
@@ -1825,5 +2181,458 @@ mod tests {
             }],
         };
         assert!(store.confirm(&layout, Tier::Navigable).is_err());
+    }
+
+    // ── issue #389: TapeStore reads forward instead of rewinding per file ──
+    //
+    // Each test drives the REAL `TapeStore` (cursor, cross-check, confirm's
+    // chain walk) over `tape::fake::FakeTape`, which logs every motion. The
+    // open's own rewind is in the log, because `open_read` issues it: "one
+    // rewind" for a restore means that one.
+
+    use crate::tape::fake::{FakeTape, Op};
+
+    /// A `TapeStore` over a fake tape holding `files`, as `open_read` leaves
+    /// it: rewound, with that rewind logged.
+    fn tape_over(files: Vec<Vec<u8>>) -> (TapeStore, FakeTape) {
+        let fake = FakeTape::with_files(files, BS as usize);
+        let store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        (store, fake)
+    }
+
+    /// `n` one-block files, file `i` filled with byte `i`.
+    fn simple_tape(n: usize) -> (TapeStore, FakeTape) {
+        tape_over((0..n).map(|i| vec![i as u8; BS as usize]).collect())
+    }
+
+    fn read_at(store: &mut TapeStore, position: u32) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        store.read_file(position, &mut out).map(|_| out)
+    }
+
+    #[test]
+    fn the_cursor_plans_the_least_motion_and_rewinds_when_it_must() {
+        use FileCursor::*;
+        assert_eq!(AtStart(4).plan(4), Move::Stay);
+        assert_eq!(AtStart(4).plan(7), Move::Forward(3));
+        assert_eq!(AtStart(4).plan(2), Move::FromBot(2));
+        assert_eq!(Within(4).plan(5), Move::Forward(1));
+        assert_eq!(
+            Within(4).plan(4),
+            Move::FromBot(4),
+            "a file half-read cannot be re-read without going back"
+        );
+        assert_eq!(Unknown.plan(0), Move::FromBot(0));
+        assert_eq!(Unknown.plan(9), Move::FromBot(9));
+    }
+
+    #[test]
+    fn only_a_read_that_delivered_bytes_and_crossed_the_filemark_is_trusted() {
+        use FileCursor::*;
+        assert_eq!(
+            FileCursor::after_read(3, &Ok((BS, ReadEnd::Filemark))),
+            AtStart(4)
+        );
+        assert_eq!(
+            FileCursor::after_read(3, &Ok((10, ReadEnd::Stopped))),
+            Within(3)
+        );
+        // Issue #327: zero bytes is a filemark-only file OR end of data.
+        assert_eq!(
+            FileCursor::after_read(3, &Ok((0, ReadEnd::Filemark))),
+            Unknown
+        );
+        assert_eq!(
+            FileCursor::after_read(3, &Ok((BS, ReadEnd::EndOfMedium))),
+            Unknown
+        );
+        assert_eq!(
+            FileCursor::after_read(3, &Err(TapectlError::TapeIo("read: EIO".into()))),
+            Unknown
+        );
+    }
+
+    #[test]
+    fn ascending_reads_space_forward_and_never_rewind() {
+        let (mut store, fake) = simple_tape(8);
+        for position in [4, 5, 6] {
+            let bytes = read_at(&mut store, position).unwrap();
+            assert_eq!(bytes, vec![position as u8; BS as usize]);
+        }
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(4),
+                Op::Read(4),
+                Op::Read(5),
+                Op::Read(6)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_read_ahead_of_the_head_spaces_only_the_difference() {
+        let (mut store, fake) = simple_tape(8);
+        read_at(&mut store, 1).unwrap();
+        assert_eq!(read_at(&mut store, 6).unwrap(), vec![6u8; BS as usize]);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(1),
+                Op::Read(1),
+                Op::Space(4),
+                Op::Read(6)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_read_behind_the_head_or_of_the_same_file_rewinds() {
+        let (mut store, fake) = simple_tape(8);
+        read_at(&mut store, 5).unwrap();
+        assert_eq!(read_at(&mut store, 2).unwrap(), vec![2u8; BS as usize]);
+        assert_eq!(read_at(&mut store, 2).unwrap(), vec![2u8; BS as usize]);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(5),
+                Op::Read(5),
+                Op::Rewind,
+                Op::Space(2),
+                Op::Read(2),
+                Op::Rewind,
+                Op::Space(2),
+                Op::Read(2),
+            ]
+        );
+    }
+
+    /// The acceptance criterion: after any read error the next read
+    /// repositions from BOT. The failed read leaves the fake's head INSIDE
+    /// file 4, so a store that trusted its cursor would hand back the rest
+    /// of file 4 as file 5.
+    #[test]
+    fn after_a_read_error_the_next_read_repositions_from_bot() {
+        let fake = FakeTape::with_files(
+            (0..8).map(|i| vec![i as u8; 2 * BS as usize]).collect(),
+            BS as usize,
+        );
+        fake.state().fail_reads_at = vec![4];
+        let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+
+        assert!(read_at(&mut store, 4).is_err());
+        assert_eq!(read_at(&mut store, 5).unwrap(), vec![5u8; 2 * BS as usize]);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(4),
+                Op::Read(4),
+                Op::Rewind,
+                Op::Space(5),
+                Op::Read(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn after_a_failed_space_the_next_read_repositions_from_bot() {
+        let (mut store, fake) = simple_tape(4);
+        assert!(
+            read_at(&mut store, 9).is_err(),
+            "no file 9 on a 4-file tape"
+        );
+        assert_eq!(read_at(&mut store, 1).unwrap(), vec![1u8; BS as usize]);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(9),
+                Op::Rewind,
+                Op::Space(1),
+                Op::Read(1)
+            ]
+        );
+    }
+
+    /// A read that returns nothing is a filemark-only file or end of data,
+    /// and only a rewind tells them apart (issue #327). Reading one past the
+    /// end then must fail exactly as it did before #389 — a space past end
+    /// of data — not return "nothing" again from a guessed position.
+    #[test]
+    fn a_read_that_returns_nothing_forgets_the_position() {
+        let (mut store, fake) = simple_tape(3);
+        assert_eq!(read_at(&mut store, 3).unwrap(), Vec::<u8>::new());
+        assert!(read_at(&mut store, 4).is_err());
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(3),
+                Op::Read(3),
+                Op::Rewind,
+                Op::Space(4)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_head_read_leaves_the_head_inside_the_file() {
+        let (mut store, fake) = tape_over(
+            (0..8)
+                .map(|i| vec![i as u8; 3 * BS as usize])
+                .collect::<Vec<_>>(),
+        );
+        let mut head = Vec::new();
+        assert_eq!(store.read_file_head(2, 10, &mut head).unwrap(), 10);
+        // Forward from inside file 2: one filemark, not a rewind.
+        assert_eq!(read_at(&mut store, 3).unwrap(), vec![3u8; 3 * BS as usize]);
+        // A second head read of the same file cannot be served from inside it.
+        store.read_file_head(5, 10, &mut Vec::new()).unwrap();
+        store.read_file_head(5, 10, &mut Vec::new()).unwrap();
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(2),
+                Op::ReadHead(2),
+                Op::Space(1),
+                Op::Read(3),
+                Op::Space(1),
+                Op::ReadHead(5),
+                Op::Rewind,
+                Op::Space(5),
+                Op::ReadHead(5),
+            ]
+        );
+    }
+
+    /// The other half of the `read_file_head` edge: a file shorter than the
+    /// budget is read to its filemark, so the head is already at the next
+    /// file and spacing one more would skip it.
+    #[test]
+    fn a_head_read_that_crosses_the_filemark_is_at_the_next_file() {
+        let (mut store, fake) = simple_tape(6);
+        let n = store.read_file_head(2, 4 * BS, &mut Vec::new()).unwrap();
+        assert_eq!(n, BS);
+        assert_eq!(read_at(&mut store, 3).unwrap(), vec![3u8; BS as usize]);
+        assert_eq!(
+            fake.ops(),
+            vec![Op::Rewind, Op::Space(2), Op::ReadHead(2), Op::Read(3)]
+        );
+    }
+
+    /// Something other than this store moved the tape: st's count no longer
+    /// matches the cursor, so the cursor is not trusted.
+    #[test]
+    fn a_cursor_the_st_driver_disagrees_with_is_not_trusted() {
+        let (mut store, fake) = simple_tape(8);
+        read_at(&mut store, 2).unwrap();
+        fake.state().head = (6, 0);
+        assert_eq!(read_at(&mut store, 3).unwrap(), vec![3u8; BS as usize]);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(2),
+                Op::Read(2),
+                Op::Rewind,
+                Op::Space(3),
+                Op::Read(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_write_forgets_the_position_and_resume_positioning_always_rewinds() {
+        let (mut store, fake) = simple_tape(3);
+        read_at(&mut store, 2).unwrap();
+        // Already at file 3 by the cursor, and still a rewind + space: this
+        // positions a WRITE and is kept exactly as before.
+        store.reposition_for_resume(3).unwrap();
+        store
+            .execute(&mut Cursor::new(vec![9u8; 10]), 10, false)
+            .unwrap();
+        assert_eq!(read_at(&mut store, 3).unwrap()[..10], [9u8; 10]);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(2),
+                Op::Read(2),
+                Op::Rewind,
+                Op::Space(3),
+                Op::Write(3),
+                Op::Rewind,
+                Op::Space(3),
+                Op::Read(3),
+            ]
+        );
+    }
+
+    /// THE acceptance test for confirm: a full Integrity confirm of an
+    /// N-file layout on a freshly opened tape is the open's rewind, one
+    /// space to the seal marker, one rewind, and a single forward pass —
+    /// two rewinds, no other motion — and it reaches the verdict the
+    /// position-addressed `MemStore` reaches on the same bytes.
+    #[test]
+    fn an_integrity_confirm_is_one_locate_to_the_seal_then_one_forward_pass() {
+        const SLICES: usize = 12;
+        let (layout, mut mem) = build_confirm_fixture_with(None, SLICES);
+        let seal = 4 + SLICES as u32;
+        let want = mem.confirm(&layout, Tier::Integrity).unwrap();
+        assert!(want.mismatches.is_empty(), "{:?}", want.mismatches);
+        assert_eq!(want.files_checked, seal + 1);
+
+        let (mut store, fake) = tape_over(mem.files.clone());
+        let got = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(got, want, "the cursor must not change the verdict");
+
+        let mut expected = vec![Op::Rewind, Op::Space(seal), Op::Read(seal), Op::Rewind];
+        expected.extend((0..seal).map(Op::Read));
+        assert_eq!(fake.ops(), expected);
+        assert_eq!(fake.rewinds(), 2);
+        assert_eq!(fake.spaces(), 1);
+    }
+
+    /// The write session's confirm: the writes leave the cursor unknown, so
+    /// the seal read rewinds too — still two rewinds for the whole confirm.
+    #[test]
+    fn a_confirm_straight_after_the_writes_rewinds_twice() {
+        let (layout, mem) = build_confirm_fixture_with(None, 8);
+        let seal = 4 + 8;
+        let (mut store, fake) = tape_over(Vec::new());
+        for file in &mem.files {
+            store
+                .execute(&mut Cursor::new(file.clone()), file.len() as u64, false)
+                .unwrap();
+        }
+        fake.clear_ops();
+
+        let evidence = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
+        let mut expected = vec![Op::Rewind, Op::Space(seal), Op::Read(seal), Op::Rewind];
+        expected.extend((0..seal).map(Op::Read));
+        assert_eq!(fake.ops(), expected);
+    }
+
+    #[test]
+    fn a_navigable_confirm_reads_the_seal_then_file_3() {
+        let (layout, mem) = build_confirm_fixture_with(None, 5);
+        let seal = 4 + 5;
+        let (mut store, fake) = tape_over(mem.files);
+        let evidence = store.confirm(&layout, Tier::Navigable).unwrap();
+        assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
+        assert_eq!(evidence.files_checked, 2);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(seal),
+                Op::Read(seal),
+                Op::Rewind,
+                Op::Space(3),
+                Op::Read(3),
+            ]
+        );
+    }
+
+    /// The files held ahead of File 3 are judged in step 4, in the front
+    /// index's order, exactly as reading them there would: a corrupt system
+    /// guide and a corrupt slice give the two mismatches in position order,
+    /// both counted as checked, on `MemStore` and on a tape alike.
+    #[test]
+    fn files_held_ahead_of_the_index_are_judged_as_if_read_in_step_4() {
+        let (layout, mut mem) = build_confirm_fixture_with(None, 3);
+        mem.files[1][3] ^= 0xFF; // the system guide, inside its true bytes
+        mem.files[5][100] ^= 0xFF; // the second slice
+        let evidence = mem.confirm(&layout, Tier::Integrity).unwrap();
+        let found: Vec<(u32, MismatchKind)> = evidence
+            .mismatches
+            .iter()
+            .map(|m| (m.position, m.kind))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (1, MismatchKind::ContentHashMismatch),
+                (5, MismatchKind::ContentHashMismatch),
+            ]
+        );
+        // Seal + File 3 + Files 0..2 + three slices: a mismatch was read.
+        assert_eq!(evidence.files_checked, 8);
+
+        let (mut store, _fake) = tape_over(mem.files.clone());
+        assert_eq!(store.confirm(&layout, Tier::Integrity).unwrap(), evidence);
+    }
+
+    /// A drive fault on a file held ahead of File 3 is `ContentUnreadable`
+    /// at that file — the same evidence a position-addressed store reports
+    /// — and the read after the fault (File 3) repositions from BOT.
+    #[test]
+    fn a_fault_ahead_of_the_index_is_content_unreadable_and_the_next_read_rewinds() {
+        let (layout, mem) = build_confirm_fixture_with(None, 2);
+        let seal = 4 + 2;
+        let want = ReadFaultStore {
+            inner: MemStore {
+                files: mem.files.clone(),
+                syncs: mem.syncs.clone(),
+                block_size: BS as usize,
+                usable_bytes: u64::MAX,
+                enospc_after_bytes: None,
+            },
+            fault_at: 2,
+        }
+        .confirm(&layout, Tier::Integrity)
+        .unwrap();
+        assert_eq!(want.mismatches.len(), 1, "{:?}", want.mismatches);
+        assert_eq!(want.mismatches[0].position, 2);
+        assert_eq!(want.mismatches[0].kind, MismatchKind::ContentUnreadable);
+
+        let (mut store, fake) = tape_over(mem.files);
+        fake.state().fail_reads_at = vec![2];
+        let got = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(got, want);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(seal),
+                Op::Read(seal),
+                Op::Rewind,
+                Op::Read(0),
+                Op::Read(1),
+                Op::Read(2),
+                Op::Rewind,
+                Op::Space(3),
+                Op::Read(3),
+                Op::Read(4),
+                Op::Read(5),
+            ]
+        );
+    }
+
+    /// An unsealed tape still stops at the seal, before anything else is
+    /// read: the precedence gate comes first, as it always did.
+    #[test]
+    fn an_unsealed_tape_is_reported_from_the_seal_read_alone() {
+        let (layout, mut mem) = build_confirm_fixture_with(None, 2);
+        let seal = 4 + 2;
+        mem.files.pop();
+        let (mut store, fake) = tape_over(mem.files);
+        let evidence = store.confirm(&layout, Tier::Integrity).unwrap();
+        // The seal position is end of data here, and a read at end of data
+        // returns nothing rather than failing — so the seal "read", and
+        // fails to parse, as it does on a real drive.
+        assert_eq!(evidence.files_checked, 1);
+        assert_eq!(evidence.mismatches.len(), 1);
+        assert_eq!(evidence.mismatches[0].kind, MismatchKind::SealUnreadable);
+        assert_eq!(
+            fake.ops(),
+            vec![Op::Rewind, Op::Space(seal), Op::Read(seal)]
+        );
     }
 }

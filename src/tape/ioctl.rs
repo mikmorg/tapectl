@@ -45,12 +45,28 @@ pub(crate) struct MtGet {
     pub(crate) mt_blkno: i32,
 }
 
-/// Tape position info.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
+/// Tape position info: the st driver's own count (`MTIOCGET`'s `mt_fileno`
+/// and `mt_blkno`), `-1` where st has lost track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TapePosition {
     pub file_number: i32,
     pub block_number: i32,
+}
+
+/// How a read of one tape file ended: what `TapeStore`'s file cursor needs to
+/// know about where the read left the head (issue #389).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadEnd {
+    /// The read crossed the file's filemark (st returned 0), so the head is
+    /// at the start of the next file.
+    Filemark,
+    /// The read stopped on `ENOSPC`, which these readers treat as the end of
+    /// the file. Where that leaves the head relative to file boundaries is
+    /// not known.
+    EndOfMedium,
+    /// The read stopped before the filemark because its byte budget ran out
+    /// ([`TapeDevice::read_file_head`]): the head is inside the file.
+    Stopped,
 }
 
 /// What an `MTIOCTOP` op does, for the session log's wait lines.
@@ -302,9 +318,11 @@ impl TapeDevice {
     /// accumulating in memory (unlike `read_file`, kept intact for the v1
     /// paths). Returns the total bytes read — the on-tape (padded) length;
     /// trimming to the true size is the caller's job, since only the front
-    /// index knows it. Same block-mode / ENOSPC-as-filemark reading
-    /// convention as `read_file`.
-    pub fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<u64> {
+    /// index knows it — and how the read ended. Same block-mode /
+    /// ENOSPC-as-filemark reading convention as `read_file`; the [`ReadEnd`]
+    /// says which of the two it was, because they leave the head in
+    /// different places (issue #389).
+    pub fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
         let mut total = 0u64;
         let read_size = if self.block_size > 0 {
             self.block_size
@@ -317,17 +335,18 @@ impl TapeDevice {
             let got = self.file.read(&mut buf);
             crate::progress::note_if_slow("one tape block read", started.elapsed());
             match got {
-                Ok(0) => break, // file mark
+                Ok(0) => return Ok((total, ReadEnd::Filemark)),
                 Ok(n) => {
                     sink.write_all(&buf[..n])
                         .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
                     total += n as u64;
                 }
-                Err(e) if e.raw_os_error() == Some(28) => break, // ENOSPC
+                Err(e) if e.raw_os_error() == Some(28) => {
+                    return Ok((total, ReadEnd::EndOfMedium));
+                }
                 Err(e) => return Err(TapectlError::TapeIo(format!("read: {e}"))),
             }
         }
-        Ok(total)
     }
 
     /// Read at most `max_bytes` from the start of the current file, then
@@ -336,10 +355,17 @@ impl TapeDevice {
     /// For attesting escrow coverage (#137): an age header is a few hundred
     /// bytes, and a data slice can be tens of gigabytes. Reading one block
     /// and stopping is the difference between "attest a shelf of tapes over
-    /// lunch" and "over a week". Leaves the head mid-file; every
-    /// `Store::read_file` rewinds before positioning, so no caller depends
-    /// on where this left the tape.
-    pub fn read_file_head(&mut self, max_bytes: u64, sink: &mut dyn Write) -> Result<u64> {
+    /// lunch" and "over a week". Usually leaves the head mid-file, and the
+    /// [`ReadEnd`] says whether it did: [`ReadEnd::Stopped`] is inside the
+    /// file; [`ReadEnd::Filemark`] means the file was shorter than asked and
+    /// the head is already at the next one. `TapeStore`'s file cursor needs
+    /// the difference (issue #389): a forward space after a crossed filemark
+    /// would skip a whole file.
+    pub fn read_file_head(
+        &mut self,
+        max_bytes: u64,
+        sink: &mut dyn Write,
+    ) -> Result<(u64, ReadEnd)> {
         let mut total = 0u64;
         let read_size = if self.block_size > 0 {
             self.block_size
@@ -349,18 +375,21 @@ impl TapeDevice {
         let mut buf = vec![0u8; read_size];
         while total < max_bytes {
             match self.file.read(&mut buf) {
-                Ok(0) => break, // file mark: the file is shorter than asked
+                // File mark: the file is shorter than asked.
+                Ok(0) => return Ok((total, ReadEnd::Filemark)),
                 Ok(n) => {
                     let take = (n as u64).min(max_bytes - total) as usize;
                     sink.write_all(&buf[..take])
                         .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
                     total += take as u64;
                 }
-                Err(e) if e.raw_os_error() == Some(28) => break, // ENOSPC
+                Err(e) if e.raw_os_error() == Some(28) => {
+                    return Ok((total, ReadEnd::EndOfMedium));
+                }
                 Err(e) => return Err(TapectlError::TapeIo(format!("read: {e}"))),
             }
         }
-        Ok(total)
+        Ok((total, ReadEnd::Stopped))
     }
 }
 

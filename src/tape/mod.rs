@@ -1,5 +1,7 @@
 pub mod contact;
 pub mod drive_identity;
+#[cfg(test)]
+pub(crate) mod fake;
 pub mod feed_ratio;
 pub mod health;
 pub mod ioctl;

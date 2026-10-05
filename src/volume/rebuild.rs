@@ -649,10 +649,23 @@ fn attest_escrow(
     let receipt = serde_json::to_string(&[registered.as_str()])
         .map_err(|e| TapectlError::Other(format!("receipt json: {e}")))?;
 
-    for unit in &manifest.units {
-        let Some(first) = unit.slices.iter().min_by_key(|s| s.number) else {
-            continue;
-        };
+    // Each unit's first slice, in tape order, so the head reads move only
+    // forward (issue #389: `TapeStore` spaces forward to a file ahead of the
+    // head and rewinds for one behind it). The manifest lists units in the
+    // order they were laid out, so this is normally that order already.
+    let mut firsts: Vec<(&envelope::ManifestUnit, &envelope::ManifestSlice)> = manifest
+        .units
+        .iter()
+        .filter_map(|unit| {
+            unit.slices
+                .iter()
+                .min_by_key(|s| s.number)
+                .map(|first| (unit, first))
+        })
+        .collect();
+    firsts.sort_by_key(|(_, first)| first.tape_position);
+
+    for (unit, first) in firsts {
         let stage_set_id: Option<i64> = tx
             .query_row(
                 "SELECT ss.id FROM stage_sets ss

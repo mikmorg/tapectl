@@ -1621,8 +1621,8 @@ fn volume_write_in_contact<'c>(
         force,
     )?;
     // Undo the position change the read-based check above made (TapeStore's
-    // read_file rewinds+forward-spaces internally) — the write below must
-    // start at BOT exactly like an untouched fresh session would.
+    // read_file leaves the head after the file it read) — the write below
+    // must start at BOT exactly like an untouched fresh session would.
     store.reposition_for_resume(0)?;
 
     // Size-only here even under `--prewrite-hash`: the full hash, when asked
@@ -6115,6 +6115,60 @@ mod tests {
             })
             .unwrap();
         assert_eq!(failed, 1);
+    }
+
+    /// Issue #389: a full `volume verify` is two rewinds — the open's, and
+    /// one after the seal marker — whatever the file count. File 0 (the
+    /// contact check) and File 3 (the map verify reconstructs its Layout
+    /// from) are read forward from the open, the seal marker forward from
+    /// there, and the integrity pass is one forward sweep from BOT. Driven
+    /// through the real `volume_verify_with_store` over a `TapeStore` on the
+    /// in-memory tape.
+    #[test]
+    fn a_full_verify_rewinds_twice_and_reads_forward() {
+        use crate::tape::fake::{FakeTape, Op};
+
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"intact slice bytes, repeated a few times. ".repeat(4);
+        seed_one_slice_fixture(&conn, "VR-FWD", "vf-unit", 4, &good, "completed", "staged");
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'VR-FWD'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mem = mem_store_v2_tape("VR-FWD", &good, &good);
+        let fake = FakeTape::with_files(mem.files.clone(), 4096);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "VR-FWD",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap();
+        assert_eq!(report.failed, 0, "mismatches: {:?}", report.mismatches);
+
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,   // the open
+                Op::Read(0),  // the contact check
+                Op::Space(2), // forward to File 3
+                Op::Read(3),
+                Op::Space(1), // forward to the seal marker
+                Op::Read(5),
+                Op::Rewind, // the one rewind of the integrity pass
+                Op::Read(0),
+                Op::Read(1),
+                Op::Read(2),
+                Op::Read(3),
+                Op::Read(4),
+            ]
+        );
     }
 
     /// A clean tape writes a passing session and NO result rows — the table
