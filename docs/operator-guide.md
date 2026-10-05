@@ -443,10 +443,17 @@ A write logs one line per file, with where its time went:
 2026-10-06T03:12:40.118Z wrote file 7 (data_slice): 9.77 GiB in 1m 05s; tape waited 0.3 s for data, queue full 58.1 s
 ```
 
-`tape waited` is time the drive's writer spent waiting for the staged-file
-read and the hash to catch up — the host is the bottleneck; `queue full` is
-time the reader spent waiting for the drive — the drive is. A write that keeps
-the drive streaming shows almost all of a file's time as `queue full`. Nothing prunes `logs/`; a session log is a few kilobytes plus about one
+`tape waited` is time the tape writer spent with nothing to write — the host
+was behind the drive. `queue full` is time the staged-file reader spent with
+all 256 MiB of buffers in use, waiting on whatever is downstream of it: the
+hash or the drive. Read them together:
+
+- `tape waited` near zero: the drive set the pace — the write streamed. Most
+  of the file's time then shows as `queue full`.
+- `tape waited` high and `queue full` high: the hash set the pace (the
+  reader is ahead of it, the drive behind it) — the CPU is the limit.
+- `tape waited` high and `queue full` near zero: reading the staged file set
+  the pace — the staging disk is the limit. Nothing prunes `logs/`; a session log is a few kilobytes plus about one
 line per interval.
 
 The durations are kept in the catalog too. `volume info` ends with the phase

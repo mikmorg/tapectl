@@ -1982,8 +1982,10 @@ fn run_entries(
         // Issue #386: one session-log line per file written, so a log
         // always says which file a long write was on, and how fast each went.
         // Issue #390 adds where the time went: the tape writer waiting for
-        // data (the disk read or the hash behind), or the reader waiting for
-        // queue space (the tape behind).
+        // data (the disk read or the hash behind it), and the reader waiting
+        // for queue space (the hash or the tape behind it). Together they
+        // name the slowest stage: tape waited ~0 = the drive; both high =
+        // the hash; only tape waited high = the staged-file read.
         let took = entry_started.elapsed();
         crate::progress::log(&format!(
             "wrote file {} ({}): {} in {}{}{}",

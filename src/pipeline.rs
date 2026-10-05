@@ -191,7 +191,10 @@ pub struct Stats {
     /// sink) waiting for the next block: the host behind the drive on a
     /// write, the drive behind the host on a read.
     pub consumer_waited: Duration,
-    /// The producer waiting for a free buffer: the queue full.
+    /// The producer waiting for a free buffer: the queue full, so something
+    /// downstream of it — on a write, the hash OR the tape — is the slower.
+    /// Only with `consumer_waited` does it name which: on a write, both high
+    /// means the hash, `consumer_waited` near zero the tape.
     pub producer_waited: Duration,
 }
 
