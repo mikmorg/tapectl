@@ -20,7 +20,7 @@ only the byte counts, file counts and behaviours carry over.
 
 **Recommendation.** Run dar with its archive on **standard output**
 (`dar -c - … --retry-on-change 0 -@ <catalogue>`), and let tapectl cut that stream into
-dar slices itself, writing each slice's 50-byte dar slice header and 1-byte trailer
+dar slices itself, writing each slice's dar slice header (50 bytes at 4 MiB, 54 at 10 GiB) and 1-byte trailer
 around the payload, and encrypting each slice in-process straight into its `.age`
 file. Measured here: the cut slices are byte-for-byte what `dar_xform` produces from
 the same stream, apart from the random 10-byte internal name. `dar -t` and `dar -x`
@@ -133,7 +133,7 @@ arch.8.dar: open(O_RDWR|O_CREAT|O_EXCL) ; write x39 total=2168689 ; lseek(0, SEE
 In the normal case the writes are strictly sequential: every seek lands on the current
 position, and dar never reads, stats, fsyncs or reopens a finished slice. dar does
 seek, though, and opens with `O_EXCL`. The last byte of every slice is a flag: `N` for
-non-terminal, `T` for the last slice. The 50-byte header is identical in every slice of
+non-terminal, `T` for the last slice. The header (50 bytes at this size) is identical in every slice of
 a set (§3.4).
 
 ### 3.2 Candidates, measured
@@ -190,10 +190,13 @@ Consequences:
   file archive of the same tree. `cmp` shows 9 differing bytes, all in the random label
   and its repeats.
 - The stream's header is 38 bytes: magic `0000007b`, a 10-byte internal name, flag
-  `T`, `T` (no extension), a TLV list holding the data name. A multi-slice header is 50
-  bytes: magic, internal name, **`E` ("flag at the end")**, `T`, and a TLV list holding
-  the slice size and the data name. Every slice of a set carries the **same** 50 bytes;
-  the per-slice difference is only the trailing `N`/`T` byte.
+  `T`, `T` (no extension), a TLV list holding the data name. A multi-slice header is:
+  magic, internal name, **`E` ("flag at the end")**, `T`, and a TLV list holding the
+  slice size and the data name. **Its length follows the slice size**, which is stored
+  as a variable-width infinint (E15, MEASURED): **50 bytes at `-s 1M` and `-s 4M`, 54
+  bytes at `-s 10G` (the production default) and at `-s 1T`**. Every slice of a set
+  carries the **same** header; the per-slice difference is only the trailing `N`/`T`
+  byte. (The 50-byte figures elsewhere in this section are the 4 MiB measurements.)
 - Payload equivalence: concatenating slices 1–8 minus their 50-byte headers and 1-byte
   trailers gives 31,528,419 bytes. The stream minus its 38-byte header and trailer gives
   31,528,419 bytes. They differ only in **10 bytes, all label positions**. dar's
@@ -211,7 +214,10 @@ Consequences:
 
 **How tapectl would get the header right without hand-encoding dar's format.**
 Before each stage, run dar on an **empty directory** with the same `-s` string and read
-the 50-byte header from that slice (E13 used exactly this). This gives tapectl:
+the header from that slice (E13 used exactly this). tapectl must find the two labels
+by **parsing the TLV list**, never by fixed offset: the lab prototypes hardcode the
+4 MiB offsets (`[4:14]`, `[40:50]`), which are wrong at 10G, where the data name sits
+at `[44:54]`. This gives tapectl:
 
 - the header layout of the installed dar version;
 - the slice size **as dar parses the operator's string**, as an infinint in the TLV.
@@ -253,7 +259,7 @@ dar -c - -R <src> -an -D -Q --fsa-scope … [-u "*"] [-X/-P masks] -N --retry-on
    │ stdout (a pipe; nothing on disk)
    ▼
 tapectl slicer thread: check the 38-byte stream header; per slice N:
-   header(50, from dar's own empty-dir template, labels swapped) + payload chunk + 'N'/'T'
+   header (from dar's own empty-dir template, TLV parsed, labels swapped) + payload chunk + 'N'/'T'
    │ bounded in-RAM queue (no plaintext on disk; RAM = queue bound)
    ▼
 per-slice encryptor: tee → sha256_plain hasher thread
@@ -324,7 +330,7 @@ What we lose by reversing it:
 | (c) FUSE read-only passthrough of the source that hashes as dar reads | exactly one read | exact | rejected: FUSE does not pass `FS_IOC_GETFLAGS` (extX FSA, `preserve_fsa`); inode/hard-link fidelity, sparse holes, xattrs and throughput at 160+ MB/s all at risk |
 | (d) LD_PRELOAD on dar's `read()` | exactly one read | exact | rejected: fragile, as in §3.2 E |
 | (e) Drop the sha256 and rely on dar's per-file CRC | yes | CRC only, not a cryptographic hash; dar's XML shows a 32-bit `crc="0d33b6b7"` for 5 MiB files (MEASURED) | rejected: loses BITROT detection across re-stages, `checksum_mode = "sha256"` (`content_match.rs`), and `files.sha256` on tape |
-| (f) Parse dar's stream to hash file data | yes | exact | rejected: tapectl would own dar's archive format, not just its 50-byte slice frame |
+| (f) Parse dar's stream to hash file data | yes | exact | rejected: tapectl would own dar's archive format, not just its slice frame |
 
 **dar's read order (MEASURED, E6).** dar opens source files in **readdir order,
 depth-first pre-order**: identical to `find -type f` order, and different from sorted
@@ -409,6 +415,23 @@ So for every volume **today**:
   even with `-A`, because dar asks for the last slice. With `--sequential-read`, dar
   extracted a slice-1 file from slices 1–3 alone and then stopped. A truncated tape
   needs sequential mode, which is #412 item 1's streaming restore.
+
+**A latent defect in today's catalogues (CODE + MEASURED).**
+
+- What tapectl does: it extracts the isolated catalogue **once per snapshot** and
+  reuses it for every later stage set of that snapshot (`mod.rs:637-670`,
+  `existing_catalogs == 0`; `catalog_base` is deliberately per-snapshot).
+- Why that breaks: every dar run draws a fresh random data-name label. dar refuses a
+  catalogue whose label differs from the archive's ("do not correspond to the same
+  data", MEASURED in E13).
+- The consequence: for a **re-staged** snapshot (a second stage set after
+  `staging clean`), the catalogue in every envelope belongs to the *first* run's
+  archive. `dar -l` on it still lists the right files, but the `-A` rescue against the
+  tape's slices is void. Its `-T slicing` locations are also only probably right (the
+  same content, walked in the same order).
+- The fix: under option F, `-@` produces each run's own catalogue for free, so the
+  natural fix is **one catalogue per stage set** (`stage_sets.catalog_path` is already
+  per stage set). It costs ~20 MiB per 181k-file re-stage on the home device (§9 D13).
 
 **Sizes at production scale.** Calibrated on `/scratch/audit-db/srcunit`: 49,797
 entries with production-shaped paths, the shape of the largest L6-0001 unit. MEASURED:
@@ -679,6 +702,10 @@ refusal).
 12. **Retention of `<home>/catalogs`.** Keep each catalogue for the life of its version,
     as the detail store behind `catalog ls --long`/`restore --file`, rather than
     treating it as disposable after the last copy is written.
+13. **Catalogue per stage set, not per snapshot.** Today a re-staged snapshot ships the
+    first run's catalogue, whose label does not match its own slices, so `dar -A`
+    rescue is void for it (§5). Rule: one catalogue per stage set, produced by `-@` in
+    each run.
 
 ---
 
@@ -697,6 +724,7 @@ refusal).
 | E12 | `e12_rescue.sh` | what an isolated catalogue does and does not rescue |
 | E13 | `e13_markerscan.sh`, `stream_slicer.py` | raw-image scan, old vs F; restore round-trip; method finding on async mounts |
 | E14 | `e14_tapectl_positive.sh` | tapectl 1.0.7 positive control: 215 hits on the staging image |
+| E15 | `e15_hdr.sh` | slice header length by `-s`: 50 bytes at 1M/4M, 54 at 10G/1T |
 
 The core of option F, as run in E13 (a lab prototype in Python, not product code):
 
@@ -705,4 +733,97 @@ dar -c t -R empty_dir -s 4M -an -D -Q          # header template from dar itself
 dar -c - -R src -an -D -Q --fsa-scope extX --retry-on-change 0 -@ home/catalogs/u \
   | python3 stream_slicer.py staging/u 4194304 t.1.dar "$AGE_RECIPIENT"
 # restore check: age -d each slice → dar -t staging/u → dar -x → diff -r src x
+```
+
+## Appendix B — the lab slicer (`stream_slicer.py`, as run in E13)
+
+`/scratch` is not backed up, so the prototype E13 ran is reproduced here. It is lab
+code, not product code: it hardcodes the 4 MiB label offsets (`[4:14]`, `[40:50]`),
+which are wrong at 10 GiB (§3.4). `reslice.py` (E9) is the same framing, file to file.
+
+```python
+#!/usr/bin/env python3
+"""Lab prototype (NOT product code): cut `dar -c -` into dar slices and age-encrypt
+each one on the fly, so only ciphertext reaches the output directory.
+
+stdin  : a single-slice dar stream (`dar -c - ... --retry-on-change 0`)
+args   : OUTBASE SLICE_SIZE HEADER_TEMPLATE RECIPIENT [RECIPIENT...]
+
+HEADER_TEMPLATE is slice 1 of any archive dar itself wrote with the same -s
+(e.g. a dummy archive of an empty directory) -- its first 50 bytes are the
+multi-slice sar header; the two 10-byte labels are replaced by the stream's.
+For each slice N the plaintext (header + chunk + 'N'/'T') is written ONLY into
+a pipe to `age -r ... -o OUTBASE.N.dar.age`; sha256 of the plaintext slice
+(sha256_plain) and of the ciphertext (sha256_encrypted) are computed in RAM.
+"""
+import hashlib
+import subprocess
+import sys
+
+out, size, tmpl_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+recipients = sys.argv[4:]
+inp = sys.stdin.buffer
+
+tmpl = open(tmpl_path, 'rb').read(50)
+assert tmpl[:4] == b'\x00\x00\x00\x7b' and tmpl[14:15] == b'E', 'template is not a multi-slice dar header'
+head = inp.read(38)
+assert head[:4] == b'\x00\x00\x00\x7b' and head[14:16] == b'TT', 'stdin is not a single-slice dar stream'
+hdr = bytearray(tmpl)
+hdr[4:14] = head[4:14]      # internal name
+hdr[40:50] = head[28:38]    # data name
+per = size - len(hdr) - 1   # payload bytes per slice
+
+# The stream's last byte is its own trailing flag ('T'); hold one byte back so we
+# never emit it as payload.
+BUF = 1 << 20
+pending = b''
+eof = False
+
+def fill(n):
+    global pending, eof
+    while len(pending) < n + 1 and not eof:
+        b = inp.read(BUF)
+        if not b:
+            eof = True
+        else:
+            pending += b
+
+def open_slice(n):
+    cmd = ['age', '-o', f'{out}.{n}.dar.age']
+    for r in recipients:
+        cmd += ['-r', r]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+n = 0
+while True:
+    n += 1
+    p = open_slice(n)
+    h = hashlib.sha256()
+    def put(b):
+        h.update(b)
+        p.stdin.write(b)
+    put(bytes(hdr))
+    left = per
+    while left > 0:
+        fill(min(left, BUF))
+        avail = len(pending) - 1 if not eof else len(pending) - 1
+        take = min(left, max(avail, 0), BUF)
+        if take <= 0:
+            break
+        put(pending[:take])
+        pending = pending[take:]
+        left -= take
+    fill(1)
+    last = eof and len(pending) <= 1
+    if last:
+        assert pending == b'T', f'unexpected stream trailer {pending!r}'
+    put(b'T' if last else b'N')
+    p.stdin.close()
+    if p.wait() != 0:
+        sys.exit(f'age failed on slice {n}')
+    ch = hashlib.sha256(open(f'{out}.{n}.dar.age', 'rb').read()).hexdigest()
+    print(f'slice {n}: sha256_plain={h.hexdigest()} sha256_encrypted={ch}', file=sys.stderr)
+    if last:
+        break
+print(f'{n} slices', file=sys.stderr)
 ```
