@@ -1001,3 +1001,119 @@ fn a_failed_tape_read_keeps_dds_message() {
     );
     assert!(text.contains("RUNG-2"), "{text}");
 }
+
+// ---- #405 part 1: a re-run must not report success over stale files ----
+
+/// A destination that already holds files is refused BEFORE the tape is
+/// read: dar under -Q answers "no" to every overwrite and exits 0, so a
+/// re-run over a half-finished restore used to print RESTORE COMPLETE over
+/// truncated files.
+#[test]
+fn a_non_empty_destination_is_refused_before_the_tape_is_read() {
+    let h = Heir::new();
+    let dest = h.dir.join("restored");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("file0.bin"), vec![7u8; 100]).unwrap();
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("is not empty"), "{text}");
+    assert!(
+        text.contains("--overwrite"),
+        "the way out is named:\n{text}"
+    );
+    assert!(text.contains("Nothing has been read from tape"), "{text}");
+    assert!(
+        !h.ops().iter().any(|l| l.starts_with("dd ")),
+        "refused before any tape read:\n{:#?}",
+        h.ops()
+    );
+    assert_eq!(
+        std::fs::read(dest.join("file0.bin")).unwrap().len(),
+        100,
+        "nothing was touched"
+    );
+}
+
+/// --overwrite restores over a partial destination: the truncated file is
+/// replaced with the archived one (dar's -w).
+#[test]
+fn overwrite_replaces_a_truncated_file_from_an_earlier_run() {
+    let h = Heir::new();
+    let photos = unit("photos/2019");
+    let dest = h.dir.join("restored");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("file0.bin"), vec![7u8; 100]).unwrap();
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        dest.to_str().unwrap(),
+        "--overwrite",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(same_tree(&photos.src, &dest), "{text}");
+}
+
+/// The backstop: if dar still declines to overwrite something (a file that
+/// appeared in --to during the restore), its "not restored (user choice)"
+/// line fails the restore instead of being reported as complete.
+#[test]
+fn a_file_dar_declined_to_overwrite_fails_the_restore() {
+    // The real dar, then the line dar prints for a file it kept.
+    let dar = "#!/bin/sh\n\"$FAKE_TAPE/hostbin/dar\" \"$@\" || exit $?\n\
+               echo \"$FAKE_TAPE/restored/file0.bin not restored (user choice)\"\n";
+    let h = Heir::with_stubs(&[("dar", dar)]);
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("INCOMPLETE"), "{text}");
+    assert!(text.contains("file0.bin"), "the casualty is named:\n{text}");
+    assert!(!text.contains("RESTORE COMPLETE"), "{text}");
+}
+
+/// A scratch directory left by a killed restore may hold decrypted data: it
+/// is named and refused, even with --overwrite, before the tape is read.
+#[test]
+fn a_leftover_scratch_directory_is_refused_by_name() {
+    let h = Heir::new();
+    let dest = h.dir.join("restored");
+    let stale = dest.join(".tapectl-restore.AbC123");
+    std::fs::create_dir_all(&stale).unwrap();
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        dest.to_str().unwrap(),
+        "--overwrite",
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains(".tapectl-restore.AbC123"), "{text}");
+    assert!(text.contains("DECRYPTED"), "{text}");
+    assert!(
+        !h.ops().iter().any(|l| l.starts_with("dd ")),
+        "{:#?}",
+        h.ops()
+    );
+}

@@ -269,7 +269,10 @@ If RESTORE.sh is not available, follow these steps:
    against File 3's `sha256_encrypted`, decrypt with age. Work on a
    disk with room for all of the unit's decrypted slices at once
    (about the unit's size), not in /tmp, which is RAM on many systems
-8. Reassemble dar slices: `dar -x restore -R /destination -O -Q`
+8. Reassemble dar slices into an EMPTY directory:
+   `dar -x restore -R /destination -O -Q`. dar keeps any file already
+   there and still reports success, so to finish an earlier restore that
+   stopped part way, add `-w` (overwrite) instead
 
 ## Important: Block Padding
 
@@ -330,15 +333,26 @@ giving up — a three-rung degradation ladder:
 Envelopes are among the first files after the front index. Block
 padding can be defeated without knowing the exact size:
 
-1. Space forward file by file from the start of the tape
-   (`mt -f /dev/nst0 fsf 1`, repeated) and read each candidate file
-   with `dd`.
-2. Strip ALL trailing zero bytes from the file you read (true
-   ciphertext essentially never ends in a run of zero bytes; block
-   padding always does).
-3. Try `age -d -i YOUR_KEY.age.key` on the stripped file. If it fails,
-   re-append a single zero byte and retry. A handful of retries
-   suffices — the padding tail is at most one 512KB block.
+1. Rewind and space to File 4 (`mt -f /dev/nst0 rewind`, then
+   `mt -f /dev/nst0 fsf 4`), then read candidate files one by one with
+   `dd if=/dev/nst0 bs=512k of=candidate.raw`. Each read leaves the tape
+   at the start of the next file, so read again without spacing; an
+   extra `fsf 1` between reads would skip a file.
+2. Strip only the TRAILING zero bytes from the file you read — the
+   block padding. Never delete every zero byte (`tr -d '\0'`): zero
+   bytes inside the ciphertext are part of it, and age will reject what
+   is left. These four lines keep everything up to the last non-zero
+   byte:
+
+       size=$(stat -c %s candidate.raw)
+       tail_len=$(tail -c 524288 candidate.raw | wc -c)
+       keep=$(tail -c 524288 candidate.raw | od -An -v -tu1 | awk '{{ for (i = 1; i <= NF; i++) {{ n++; if ($i != 0) last = n }} }} END {{ print last + 0 }}')
+       head -c $((size - tail_len + keep)) candidate.raw > candidate.stripped
+
+3. Try `age -d -i YOUR_KEY.age.key` on the stripped file. "no identity
+   matched" means the file is not sealed to your key: try the next one.
+   Any other error: real ciphertext can end in a zero byte, so re-append
+   a single zero byte and retry, up to four times.
 4. Once your envelope decrypts, its MANIFEST.toml gives the exact tape
    position and byte size for every slice belonging to your unit(s).
    Apply the same read/trim/decrypt procedure to each slice using
@@ -432,7 +446,11 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #   ./RESTORE.sh --verify                                     Keyless integrity check (no key needed)
 #   ./RESTORE.sh --find-envelope --key KEYFILE [--key K2 ...] Decrypt your envelope
 #   ./RESTORE.sh --restore --key KEYFILE [--key K2 ...] --to DIR [--unit U] [--version N]
-#                [--scratch DIR] [--no-space-check]
+#                [--scratch DIR] [--no-space-check] [--overwrite]
+#
+# --to must be empty or new: dar keeps a file that is already there and
+# reports success, so a restore over an earlier one cannot be trusted.
+# --overwrite replaces such files instead, to finish a restore that stopped.
 #
 # --key may be repeated. An envelope and the slices it describes can need
 # different keys after a key rotation, so every key is tried independently.
@@ -470,6 +488,7 @@ KEYS=()
 # --to (or --scratch) once it knows how much room they need.
 SCRATCH=""
 SKIP_SPACE_CHECK=0
+OVERWRITE=0
 
 umask 077 # decrypted plaintext and temp files must not be world-readable
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tapectl-restore.XXXXXX")" ||
@@ -645,6 +664,58 @@ check_space() { # <destination> <scratch parent> <archive bytes> <largest slice 
     [ "$scr_free" -ge "$need_scr" ] || die_space "$scr" "$need_scr" "$scr_free"
     [ "$dest_free" -ge "$need_dest" ] || die_space "$dest" "$need_dest" "$dest_free"
   fi
+}
+
+# Refuse, BEFORE the first tape read, a destination this restore could not
+# be trusted to fill (#405). dar under -Q answers "no" to every overwrite
+# question and exits 0, so a re-run over a restore that stopped part way (a
+# full disk, a power cut, Ctrl-C) used to report RESTORE COMPLETE over the
+# truncated files it left. And a scratch directory left by a killed restore
+# may hold decrypted data, so it is named and never silently reused.
+check_destination() { # <destination> <scratch parent>
+  local dest=$1 scr=$2 d stale
+  if [ -e "$dest" ] && [ ! -d "$dest" ]; then
+    die "--to $dest exists and is not a directory. Nothing has been read from tape."
+  fi
+  for d in "$dest" "$scr"; do
+    [ -d "$d" ] || continue
+    for stale in "$d"/.tapectl-restore.*; do
+      [ -e "$stale" ] || continue
+      die "refusing to restore: $stale is the scratch directory of an earlier
+       restore that was killed or lost power, and it may hold DECRYPTED archive
+       data. Remove it (rm -rf \"$stale\") and run the same command again.
+       Nothing has been read from tape."
+    done
+  done
+  [ -d "$dest" ] || return 0
+  [ -n "$(ls -A "$dest")" ] || return 0
+  if [ "$OVERWRITE" = 1 ]; then
+    info "--to $dest is not empty; --overwrite replaces every file this unit restores"
+    return 0
+  fi
+  die "--to $dest is not empty.
+       dar keeps a file that is already there and still reports success, so a
+       restore into a directory that holds files cannot be trusted: after an
+       earlier restore that stopped part way, the truncated files would stay.
+       Restore into an empty or new directory, or, to finish an earlier restore
+       of the same unit, run the same command again with --overwrite, which
+       replaces every file the unit restores.
+       Nothing has been read from tape."
+}
+
+# The backstop behind check_destination: a file that appeared in --to while
+# the restore ran is still kept by dar, which says so only in this line on
+# its stdout, and exits 0.
+die_if_dar_skipped() { # <dar output> <destination>
+  local skipped
+  skipped=$(grep 'not restored (user choice)$' "$1" 2>/dev/null |
+    sed 's/ not restored (user choice)$//' | head -n 20 || true)
+  [ -z "$skipped" ] && return 0
+  die "the restore into $2 is INCOMPLETE: dar declined to overwrite file(s)
+       that already existed there, and reported success anyway. The old copies
+       are still in place, so they are NOT what is on tape. Skipped:
+$skipped
+       Restore into an empty directory, or run again with --overwrite."
 }
 
 # ---- prerequisite check ----
@@ -1022,20 +1093,29 @@ first files after the front index, and block padding can be defeated
 without knowing exact sizes:
 
   1. mt -f "$DEVICE" setblk 524288
-  2. Starting a few files past the front index, for each candidate position N:
-       mt -f "$DEVICE" rewind && mt -f "$DEVICE" fsf N
+     mt -f "$DEVICE" rewind && mt -f "$DEVICE" fsf 4
+  2. Read one candidate file. Each read leaves the tape at the start of the
+     next file, so repeat this step for each file in turn, moving forward:
        dd if="$DEVICE" bs=524288 of=candidate.raw
-  3. Strip ALL trailing zero bytes (true ciphertext essentially never ends
-     in a run of zero bytes; block padding always does):
-       tr -d '\0' < candidate.raw > candidate.stripped
-  4. Try: age -d -i YOUR_KEY.age.key < candidate.stripped > candidate.dec
-     If it fails, re-append one zero byte to candidate.stripped and retry.
-     A handful of retries suffices (padding is at most one 524288-byte block).
+  3. Strip only the TRAILING zero bytes, which are block padding. Zero bytes
+     inside the ciphertext are part of it: deleting every zero byte (as
+     tr -d does) destroys the file. These four lines keep everything up to
+     the last non-zero byte:
+       size=$(stat -c %s candidate.raw)
+       tail_len=$(tail -c 524288 candidate.raw | wc -c)
+       keep=$(tail -c 524288 candidate.raw | od -An -v -tu1 | awk '{ for (i = 1; i <= NF; i++) { n++; if ($i != 0) last = n } } END { print last + 0 }')
+       head -c $((size - tail_len + keep)) candidate.raw > candidate.stripped
+  4. Try: age -d -i YOUR_KEY.age.key candidate.stripped > candidate.dec
+     "no identity matched" means this file is not sealed to your key: go
+     back to step 2 for the next file. Any other error: real ciphertext can
+     end in a zero byte, so put one back and retry, up to four times:
+       printf '\0' >> candidate.stripped
   5. Once a candidate decrypts, it is your tenant (or operator) envelope:
      untar it and read MANIFEST.toml for the exact tape position and byte
-     size of every slice belonging to your unit(s); repeat steps 2-4
-     (trimming to that exact size instead of zero-stripping) for each slice,
-     then `dar -x restore -R /destination -O -Q`.
+     size of every slice belonging to your unit(s); read each slice (steps
+     1-2, with fsf to its position), trim it to that exact size with
+     truncate -s SIZE instead of zero-stripping, decrypt it to restore.N.dar,
+     then, in an empty directory: dar -x restore -R /destination -O -Q
 
 See the system guide (File 1), "If All Else Fails", for the full narrative.
 ZSEOF
@@ -1356,8 +1436,9 @@ decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number>
 do_restore() {
   local destdir=$1 target_unit=$2 want_version=${3:-} scratch_parent=${4:-}
 
-  mkdir -p "$destdir"
   [ -n "$scratch_parent" ] || scratch_parent=$destdir
+  check_destination "$destdir" "$scratch_parent"
+  mkdir -p "$destdir"
   mkdir -p "$scratch_parent"
 
   establish_files
@@ -1519,8 +1600,11 @@ do_restore() {
 
   # Step 6: extract with dar
   info "Extracting archive to $destdir ..."
-  dar -x "$dar_dir/restore" -R "$destdir" -O -Q ||
+  local -a dar_opts=(-O -Q)
+  [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
+  dar -x "$dar_dir/restore" -R "$destdir" "${dar_opts[@]}" 2>&1 | tee "$WORK/extract.log" ||
     die "dar extraction failed — dar's own message is above (No space left on device means $destdir is full)"
+  die_if_dar_skipped "$WORK/extract.log" "$destdir"
 
   rm -rf "$SCRATCH"
   SCRATCH=""
@@ -1583,6 +1667,10 @@ case "${1:-}" in
       SKIP_SPACE_CHECK=1
       shift
       ;;
+    --overwrite)
+      OVERWRITE=1
+      shift
+      ;;
     *) die "unknown option: $1" ;;
     esac
   done
@@ -1600,7 +1688,7 @@ case "${1:-}" in
   echo "  $0 --verify                                     Keyless integrity check"
   echo "  $0 --find-envelope --key KEYFILE [--key K2 ...]  Decrypt your envelope"
   echo "  $0 --restore --key KEYFILE [--key K2 ...] --to DIR [--unit U] [--version N]"
-  echo "               [--scratch DIR] [--no-space-check]"
+  echo "               [--scratch DIR] [--no-space-check] [--overwrite]"
   echo "      Full restore. Without --version the NEWEST version of the unit on"
   echo "      this volume is restored. To see which versions this tape holds,"
   echo "      run --find-envelope --key KEYFILE: snapshot_version lives in the"
@@ -1618,6 +1706,9 @@ case "${1:-}" in
   echo "      plus one slice. The script checks before it reads any slice."
   echo "  --no-space-check   Skip that check (a compressed or thin-provisioned"
   echo "      filesystem can hold more than df reports)."
+  echo "  --overwrite   --to must otherwise be empty or new: dar keeps a file"
+  echo "      that is already there and reports success. --overwrite replaces"
+  echo "      such files, to finish a restore of the same unit that stopped."
   echo ""
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
@@ -4227,6 +4318,148 @@ sha256_encrypted = \"bbb\"
         assert!(
             guide.contains("not in /tmp"),
             "the manual steps warn off /tmp"
+        );
+    }
+
+    // ---- #405 part 2: the rung-3 zero-strip recipe ----
+
+    /// The recipe's shell lines, exactly as an heir reads them: every line
+    /// from `size=$(stat` through `> candidate.stripped` of `text`.
+    fn zero_strip_recipe(text: &str) -> String {
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("size=$(stat"))
+            .expect("the recipe starts with size=$(stat ...)");
+        let end = lines[start..]
+            .iter()
+            .position(|l| l.ends_with("> candidate.stripped"))
+            .expect("the recipe ends writing candidate.stripped")
+            + start;
+        lines[start..=end].join("\n") + "\n"
+    }
+
+    /// Issue #405: the rung-3 recipe used to be `tr -d '\0'`, which deletes
+    /// EVERY zero byte, and real age ciphertext has hundreds of them inside
+    /// it; age then fails to authenticate. The recipe now strips only the
+    /// trailing block padding. Run here, as printed, on real age ciphertext
+    /// with interior zero bytes, padded the way the tape pads it — including
+    /// a ciphertext that itself ends in a zero byte, which the "put one back
+    /// and retry" step exists for — and an envelope-sized file smaller than
+    /// one block. Both the script's text and the guide's are run.
+    #[test]
+    fn the_zero_strip_recipe_keeps_interior_zero_bytes_and_decrypts() {
+        use std::io::{Read, Write};
+
+        let kp = crate::crypto::keys::generate_keypair();
+        let identity: age::x25519::Identity = kp.secret_key.parse().unwrap();
+        let encrypt = |plain: &[u8]| -> Vec<u8> {
+            let enc =
+                crate::staging::build_encryptor(std::slice::from_ref(&kp.public_key)).unwrap();
+            let mut out = Vec::new();
+            let mut w = enc.wrap_output(&mut out).unwrap();
+            w.write_all(plain).unwrap();
+            w.finish().unwrap();
+            out
+        };
+        let decrypt = |ct: &[u8]| -> Option<Vec<u8>> {
+            let d = age::Decryptor::new(ct).ok()?;
+            let mut r = d
+                .decrypt(std::iter::once(&identity as &dyn age::Identity))
+                .ok()?;
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).ok()?;
+            Some(out)
+        };
+
+        // Large: hundreds of interior zero bytes. Small: under one block.
+        let big: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let small = b"MANIFEST.toml and friends".to_vec();
+        let mut cases = vec![
+            (big.clone(), encrypt(&big)),
+            (small.clone(), encrypt(&small)),
+        ];
+        // And one whose ciphertext ends in a zero byte (1 in 256 do).
+        let ends_in_zero = (0..20_000)
+            .map(|_| encrypt(&small))
+            .find(|ct| ct.last() == Some(&0))
+            .expect("one ciphertext in 20000 ends in a zero byte");
+        cases.push((small.clone(), ends_in_zero));
+        let interior = cases[0].1[..cases[0].1.len() - 1]
+            .iter()
+            .filter(|b| **b == 0)
+            .count();
+        assert!(
+            interior > 100,
+            "the big case must carry interior zeros: {interior}"
+        );
+        // Why: the recipe before 1.1.0, `tr -d '\0'`, cannot decrypt it.
+        let all_zeros_deleted: Vec<u8> = cases[0].1.iter().copied().filter(|b| *b != 0).collect();
+        assert!(
+            decrypt(&all_zeros_deleted).is_none(),
+            "tr -d destroys the ciphertext"
+        );
+
+        let (dir, path) = heir_harness("zerostrip", &[]);
+        let (_, script_text) = heir_run(&dir, &path, "zero_strip_instructions");
+        let guide = generate_system_guide_v2("ZS01", 20);
+        for (source, text) in [
+            ("RESTORE.sh", script_text.as_str()),
+            ("guide", guide.as_str()),
+        ] {
+            let recipe = zero_strip_recipe(text);
+            assert!(!recipe.contains("tr -d"), "{source}: {recipe}");
+            for (i, (plain, ct)) in cases.iter().enumerate() {
+                let work = dir.join(format!("case-{source}-{i}"));
+                std::fs::create_dir_all(&work).unwrap();
+                let mut padded = ct.clone();
+                padded.resize(ct.len().div_ceil(524_288) * 524_288, 0);
+                std::fs::write(work.join("candidate.raw"), &padded).unwrap();
+                let o = std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(&recipe)
+                    .current_dir(&work)
+                    .output()
+                    .unwrap();
+                assert!(o.status.success(), "{source} case {i}: {o:?}");
+                let mut stripped = std::fs::read(work.join("candidate.stripped")).unwrap();
+                assert!(
+                    stripped.len() <= ct.len() && ct.starts_with(&stripped),
+                    "{source} case {i}: the strip must only cut the tail"
+                );
+                // Step 4: decrypt; on failure put one zero back, up to four times.
+                let mut got = decrypt(&stripped);
+                for _ in 0..4 {
+                    if got.is_some() {
+                        break;
+                    }
+                    stripped.push(0);
+                    got = decrypt(&stripped);
+                }
+                assert_eq!(got.as_deref(), Some(plain.as_slice()), "{source} case {i}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// File 1's manual dar step and RESTORE.sh's last instruction say to
+    /// extract into an EMPTY directory, and how to finish a stopped restore
+    /// (#405): dar under -Q keeps an existing file and reports success.
+    #[test]
+    fn the_manual_dar_step_says_empty_directory_and_w() {
+        let guide = generate_system_guide_v2("DAR01", 20);
+        let step8 = guide
+            .split_once("8. Reassemble dar slices")
+            .map(|(_, r)| r.split_once("\n\n").map_or(r, |(a, _)| a))
+            .expect("manual step 8");
+        assert!(step8.contains("EMPTY directory"), "{step8}");
+        assert!(step8.contains("`-w`"), "{step8}");
+        let s = generate_restore_script_v2("DAR01", 20);
+        assert!(
+            s.contains("in an empty directory: dar -x restore"),
+            "rung-3 text"
         );
     }
 }
