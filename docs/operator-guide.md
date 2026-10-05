@@ -435,7 +435,18 @@ seconds and when it ended — naming what was waited on:
 
 A phase that counts bytes and moves none for a minute, with no named wait in
 progress, logs a `stall:` line, so a gap nothing thought to name still shows
-up. Nothing prunes `logs/`; a session log is a few kilobytes plus about one
+up.
+
+A write logs one line per file, with where its time went:
+
+```text
+2026-10-06T03:12:40.118Z wrote file 7 (data_slice): 9.77 GiB in 1m 05s; tape waited 0.3 s for data, queue full 58.1 s
+```
+
+`tape waited` is time the drive's writer spent waiting for the staged-file
+read and the hash to catch up — the host is the bottleneck; `queue full` is
+time the reader spent waiting for the drive — the drive is. A write that keeps
+the drive streaming shows almost all of a file's time as `queue full`. Nothing prunes `logs/`; a session log is a few kilobytes plus about one
 line per interval.
 
 The durations are kept in the catalog too. `volume info` ends with the phase
@@ -582,7 +593,11 @@ still ask one question — the quiet-host check below — which `--yes` answers.
 **Integrity while writing.** Every staged slice is hashed as it streams to the
 drive, and a slice whose bytes no longer match what `stage create` recorded
 stops the write before anything is sealed — the tape is left unsealed and
-nothing counts as a copy. Before the tape moves, `volume write` checks only that
+nothing counts as a copy. The check finishes before the slice's last block
+reaches the drive, so a slice that fails it never gets its last block or its
+end-of-file mark written. Reading the staged file, hashing it and writing the
+tape run side by side on separate threads, with up to 256 MiB queued between
+them, so the drive is not left waiting on the disk or the hash. Before the tape moves, `volume write` checks only that
 each staged slice exists at its recorded size. `--prewrite-hash` adds a full
 hash of every staged slice from disk first, so a rotted slice is refused before
 any tape I/O, at the cost of one extra full read of the batch (hours for a
@@ -621,7 +636,8 @@ So, before a write or a verify, make the host quiet:
   hand does not check it.
 - Memory matters too: a process killed for memory pressure mid-write costs the
   cartridge its session (a clean abort to an unsealed tape, but the time is
-  gone). Keep a few GB free.
+  gone). Keep a few GB free. tapectl itself holds up to 256 MiB of tape blocks
+  in flight while it writes or reads a tape, whatever the size of the data.
 
 The rule is checked, not only stated (ADR-0012). `tapectl host check` reports
 the load average, available memory, memory and I/O pressure

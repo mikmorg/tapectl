@@ -721,12 +721,14 @@ fn restore_one_slice(
 /// STREAM body byte is read, so this never needs a per-identity retry loop
 /// that would have to re-open an already-consumed reader.
 ///
-/// Peak RAM: pass 1 is bounded by `Store::read_file`'s own block-sized
-/// buffer (`block_size`, 512 KiB by default for `TapeStore`); pass 2 is
-/// bounded by `RESTORE_STREAM_BUFFER` (128 KiB) plus age's own constant
-/// ~64 KiB STREAM chunk buffer. The passes never overlap, so peak RAM for
-/// the whole function is `max(block_size, ~192 KiB)` — independent of slice
-/// size, where the buffered predecessor was ~2x slice size (issue #85).
+/// Peak RAM: pass 1 is bounded by `TapeStore::read_file`'s read queue
+/// (`pipeline::QUEUE_BYTES`, 256 MiB of tape blocks: since issue #390 the
+/// tape read runs on its own thread, up to that far ahead of this pass's
+/// hash and file write); pass 2 is bounded by `RESTORE_STREAM_BUFFER`
+/// (128 KiB) plus age's own constant ~64 KiB STREAM chunk buffer. The passes
+/// never overlap, so peak RAM for the whole function is that fixed queue —
+/// independent of slice size, where the buffered predecessor was ~2x slice
+/// size (issue #85).
 fn restore_one_slice_inner(
     store: &mut dyn Store,
     position: u32,

@@ -952,6 +952,53 @@ pub fn session_id() -> Option<String> {
     current().map(|r| r.session_id.clone())
 }
 
+// --- worker threads ----------------------------------------------------------
+
+/// This thread's session, to carry onto a worker thread (issue #390).
+///
+/// The recorder is per thread, so a thread the session's own thread spawns
+/// starts with none, and everything it calls here — [`log`],
+/// [`note_if_slow`], [`wait`] — would be a silent no-op. The overlapped I/O
+/// pipeline (`crate::pipeline`) reads the staged file, hashes it and reads
+/// the tape on worker threads; each takes one of these and [`Handle::enter`]s
+/// it, so a slow disk read or tape block on a worker lands in the same
+/// session log as it did when the work ran on the session's thread.
+///
+/// Byte counts are deliberately NOT routed this way: the pipeline counts
+/// bytes once, on the session's thread, where they reach the store or the
+/// sink — a worker running ahead by a queue's worth would make the phase
+/// claim bytes the tape has not yet taken.
+#[derive(Clone, Default)]
+pub struct Handle(Option<Arc<Recorder>>);
+
+/// The calling thread's session, as a [`Handle`] (empty with no session).
+pub fn handle() -> Handle {
+    Handle(current())
+}
+
+impl Handle {
+    /// Install this session on the calling thread until the returned guard
+    /// drops. A no-op for an empty handle.
+    pub fn enter(&self) -> Entered {
+        let previous = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), self.0.clone()));
+        Entered { previous }
+    }
+}
+
+/// A [`Handle`] installed on a worker thread; dropping it restores what the
+/// thread had before.
+#[must_use = "the session is installed only while this guard lives"]
+pub struct Entered {
+    previous: Option<Arc<Recorder>>,
+}
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CURRENT.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
 // --- waits -------------------------------------------------------------------
 
 /// An open wait. See [`wait`].
@@ -1254,6 +1301,37 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// Issue #390: a worker that enters the session's handle logs into it,
+    /// a plain spawned thread still does not, and leaving restores the
+    /// worker's own (empty) state.
+    #[test]
+    fn a_worker_that_enters_the_handle_logs_into_the_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = start_session(Some(dir.path()), "t", Display::Off, false);
+        let path = s.log_path().unwrap().to_path_buf();
+        let h = handle();
+        std::thread::spawn(move || {
+            {
+                let _in = h.enter();
+                note_if_slow("one staged-file read", Duration::from_secs(6));
+            }
+            log("after leaving: not in the session");
+            assert_eq!(session_id(), None);
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(|| log("never entered: not in the session"))
+            .join()
+            .unwrap();
+        drop(s);
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(
+            text.contains("slow: one staged-file read took 6.0 s"),
+            "{text}"
+        );
+        assert!(!text.contains("not in the session"), "{text}");
     }
 
     #[test]

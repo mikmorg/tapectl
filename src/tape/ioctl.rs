@@ -118,6 +118,11 @@ impl TapeDevice {
         Ok(dev)
     }
 
+    /// The block size reads and writes use (0: variable-block mode).
+    pub fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     fn raw_fd(&self) -> i32 {
         self.file.as_raw_fd()
     }

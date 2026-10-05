@@ -18,6 +18,7 @@ pub mod volume;
 
 pub mod media;
 pub mod naming;
+pub mod pipeline;
 pub mod policy;
 pub mod progress;
 pub mod store;

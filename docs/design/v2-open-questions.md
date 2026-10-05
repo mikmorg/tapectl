@@ -115,7 +115,9 @@ Round 1 asked "buffer generated zones or stream them?" The answer is neither:
 **write every generated zone to the session's staging directory at build time**,
 then make every Layout entry — generated and staged alike — a disk path + size +
 hash. Execute then streams *uniformly* from disk in position order; peak RAM is
-block-sized for everything, with no special cases. Three robustness dividends:
+block-sized for everything, with no special cases (since 1.0.6, #390: a fixed
+queue of at most 256 MiB of blocks, the same for every entry — still never the
+entry's size). Three robustness dividends:
 1. **Frozen bytes fix resume.** The ID thunk embeds `created_at`; regenerating
    it on resume would produce different bytes than what File 0 already holds,
    breaking the cursor contract. Materialization generates each zone exactly
@@ -183,7 +185,13 @@ layers, each covering a window the others can't (now committed in
 2. **execute** re-hashes inline on the *same* streaming read that feeds the
    tape (hash is free once streaming lands) and **cleanly aborts to unsealed**
    on mismatch — closes the validate→write TOCTOU window. A tape can't unwrite,
-   but an unsealed abort beats sealing known-bad bytes.
+   but an unsealed abort beats sealing known-bad bytes. *Since 1.0.6 (#390)*
+   the read, the hash and the tape write run on three threads joined by a
+   bounded queue (`layout-session.md`, "Execute's data path"), still one read
+   serving both, and the verdict comes **before** the file's last block is
+   handed to the store: a mismatched file never gets its last block or its
+   filemark written by tapectl, where before 1.0.6 the comparison ran after
+   both. Same abort, same reason, same rows.
 3. **confirm** (#23) hashes the tape readback against the front index — the
    only end-to-end (host→medium) check, per §1.2.
 Finding ③'s "no double read" survives *only* as: front-index generation reuses
@@ -572,7 +580,9 @@ ValidatedLayout::plan(conn)             -> PlannedSession
     writes rows 'planned' + write_positions 'pending' (slices only — schema).
 PlannedSession::execute(store)          -> Executing… -> ReadyToSeal
     rewind; per entry: SIGINT check (between entries only; mid-file kill =
-    crash = startup sweep); stream from disk via a hashing tee reader;
+    crash = startup sweep); stream from disk via a hashing tee reader
+    (since 1.0.6, #390: reader thread -> hasher thread -> store, bounded
+    queue, the L2 verdict before the file's last block);
     store.execute(src, len, sync); slice entries update their cursor row
     ('written' + sha256_on_volume). Inline-hash mismatch (tri-layer L2) or
     ENOSPC  =>  Abort: tape stays UNSEALED, writes 'aborted', staging kept.
@@ -619,6 +629,10 @@ Micro-decisions (resolved here so the build doesn't discover them):
 - **Hashing tee reader:** a small `Read` adapter (sha256 of bytes as they
   stream) — one disk read serves hash + tape write; lives in `staging` or a
   util module. Also reused by restore-side streaming later (#35's substance).
+  *Since 1.0.6 (#390)* the write path's tee is a pipeline stage instead
+  (`src/pipeline.rs`): the hash runs on its own thread between the staged-file
+  reader and the store, still over the one read; `util::HashingReader`
+  remains for anything that hashes in line.
 - **DB timing:** `planned` at plan; `in_progress` + `started_at` at first
   execute; per-slice cursor rows as written; terminal states only via the
   confirm/abort transactions. Resume reuses rows (the UNIQUE stays

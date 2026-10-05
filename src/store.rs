@@ -19,6 +19,7 @@ use std::io::{self, Read, Write};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, TapectlError};
+use crate::pipeline::{self, BufferPool};
 use crate::tape::ioctl::{ReadEnd, TapeDevice, TapePosition};
 use crate::util::{HashingWriter, TruncatingWriter};
 use crate::volume::format;
@@ -864,6 +865,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// under test is the real one, not a description of it. Nothing here moves
 /// the tape backwards except `rewind`.
 pub(crate) trait TapeOps: Send {
+    /// The block size the device reads and writes (0: variable-block mode)
+    /// — the size of one buffer in [`TapeStore`]'s read pipeline (#390).
+    fn block_size(&self) -> usize;
     fn rewind(&self) -> Result<()>;
     fn forward_space_file(&self, count: i32) -> Result<()>;
     /// st's own count of where the head is (`MTIOCGET`). Moves no tape.
@@ -874,6 +878,9 @@ pub(crate) trait TapeOps: Send {
 }
 
 impl TapeOps for TapeDevice {
+    fn block_size(&self) -> usize {
+        TapeDevice::block_size(self)
+    }
     fn rewind(&self) -> Result<()> {
         TapeDevice::rewind(self)
     }
@@ -988,7 +995,15 @@ pub struct TapeStore {
     dev: Box<dyn TapeOps>,
     usable_bytes: u64,
     cursor: FileCursor,
+    /// The read pipeline's buffers (issue #390): [`pipeline::QUEUE_BYTES`]
+    /// of tape blocks, allocated as a read first fills the queue and reused
+    /// by every read after it.
+    pool: BufferPool,
 }
+
+/// How much `TapeDevice` reads at a time in variable-block mode — its
+/// `read_file_streaming`'s own figure, so a pipeline buffer is one read.
+const VARIABLE_BLOCK_READ: usize = 1024 * 1024;
 
 impl TapeStore {
     /// Open the drive and rewind to BOT, ready to write File 0. Hardware
@@ -1021,10 +1036,15 @@ impl TapeStore {
 
     /// A store over a device the caller has just rewound.
     fn at_bot(dev: Box<dyn TapeOps>, usable_bytes: u64) -> Self {
+        let chunk = match dev.block_size() {
+            0 => VARIABLE_BLOCK_READ,
+            n => n,
+        };
         Self {
             dev,
             usable_bytes,
             cursor: FileCursor::AtStart(0),
+            pool: BufferPool::with_queue_bytes(chunk, pipeline::QUEUE_BYTES),
         }
     }
 
@@ -1114,11 +1134,23 @@ impl Store for TapeStore {
     // position order after the seal marker, which is what lets the cursor
     // below make it one forward pass (issue #389).
 
+    /// The tape read runs on its own thread, ahead of `sink` by up to the
+    /// pool's capacity (issue #390), so the drive keeps streaming while the
+    /// sink hashes or writes to disk. The cursor follows how the TAPE read
+    /// ended, whatever the sink did: a sink that fails stops the read at its
+    /// next block (an error, so `Unknown`); one that fails after the read
+    /// already crossed the filemark leaves the head, truthfully, at the
+    /// next file.
     fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
         self.locate(position)?;
-        let read = self.dev.read_file_streaming(sink);
-        self.cursor = FileCursor::after_read(position, &read);
-        read.map(|(n, _)| n)
+        let dev = &mut *self.dev;
+        let delivered =
+            pipeline::read_through(&mut self.pool, |pipe| dev.read_file_streaming(pipe), sink);
+        self.cursor = FileCursor::after_read(position, &delivered.produced);
+        delivered
+            .sink
+            .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
+        delivered.produced.map(|(n, _)| n)
     }
 
     /// Overrides the default so a tape stops after the first block(s)
@@ -2634,5 +2666,144 @@ mod tests {
             fake.ops(),
             vec![Op::Rewind, Op::Space(seal), Op::Read(seal)]
         );
+    }
+
+    // ── issue #390: TapeStore's reads run on their own thread ──
+
+    /// Corruption is still found through the pipelined tape read: a flipped
+    /// byte deep inside a slice is a `ContentHashMismatch` at its position —
+    /// the verdict the position-addressed MemStore reaches on the same bytes
+    /// — and the motion is still the single forward pass. The fake tape's
+    /// blocks are 64 KiB here, so each slice crosses several of the read
+    /// queue's buffers and the hash must see every one, in order.
+    #[test]
+    fn a_pipelined_confirm_still_finds_a_corrupted_slice() {
+        const SLICES: usize = 3;
+        const SMALL_BLOCK: usize = 64 * 1024;
+        let (layout, mut mem) = build_confirm_fixture_with(None, SLICES);
+        let seal = 4 + SLICES as u32;
+        let tape = |files: Vec<Vec<u8>>| {
+            let fake = FakeTape::with_files(files, SMALL_BLOCK);
+            let store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+            (store, fake)
+        };
+
+        let (mut store, _) = tape(mem.files.clone());
+        assert_eq!(store.pool.chunk(), SMALL_BLOCK);
+        let clean = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert!(clean.mismatches.is_empty(), "{:?}", clean.mismatches);
+
+        // 300,000-byte slices: this byte is in the slice's fourth block.
+        mem.files[5][200_000] ^= 0xFF;
+        let want = mem.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(want.mismatches.len(), 1, "{:?}", want.mismatches);
+        assert_eq!(want.mismatches[0].kind, MismatchKind::ContentHashMismatch);
+        assert_eq!(want.mismatches[0].position, 5);
+
+        let (mut store, fake) = tape(mem.files.clone());
+        let got = store.confirm(&layout, Tier::Integrity).unwrap();
+        assert_eq!(got, want);
+        let mut expected = vec![Op::Rewind, Op::Space(seal), Op::Read(seal), Op::Rewind];
+        expected.extend((0..seal).map(Op::Read));
+        assert_eq!(fake.ops(), expected);
+    }
+
+    /// A sink that fails partway through a multi-block file stops the
+    /// read, reports the sink's own error as before, and leaves the cursor
+    /// unknown — the tape read stopped inside the file — so the next read
+    /// rewinds rather than trusting a head the read thread moved.
+    #[test]
+    fn a_sink_that_fails_mid_read_leaves_the_position_unknown() {
+        struct FailsAfter(usize);
+        impl Write for FailsAfter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::from_raw_os_error(28));
+                }
+                self.0 -= 1;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        // A two-buffer queue and an eight-block file: the read cannot finish
+        // before the sink fails (the production queue is 512 blocks; the
+        // mechanism is the same).
+        let (mut store, fake) = tape_over(vec![
+            vec![0u8; BS as usize],
+            vec![1u8; 8 * BS as usize],
+            vec![2u8; BS as usize],
+        ]);
+        store.pool = BufferPool::new(BS as usize, 2);
+        let err = store
+            .read_file(1, &mut FailsAfter(1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sink write: ") && err.contains("os error 28"),
+            "the sink's own error, as before: {err}"
+        );
+        assert_eq!(
+            store.cursor,
+            FileCursor::Unknown,
+            "the tape read stopped inside the file"
+        );
+        assert_eq!(read_at(&mut store, 2).unwrap(), vec![2u8; BS as usize]);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(1),
+                Op::Read(1),
+                Op::Rewind,
+                Op::Space(2),
+                Op::Read(2)
+            ]
+        );
+    }
+
+    /// The other order: the tape read crosses the filemark before the sink
+    /// fails on the last block. The read still fails, with the sink's error
+    /// — but the head is truthfully at the next file, so the next read there
+    /// moves nothing. (Before #390 the sink failing stopped the tape read
+    /// itself short of the filemark, so the position was always lost.)
+    #[test]
+    fn a_sink_that_fails_after_the_filemark_leaves_the_head_known() {
+        struct Fails;
+        impl Write for Fails {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(28))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (mut store, fake) = simple_tape(3);
+        // A one-block file: the tape read hands its only block to the queue
+        // and reaches the filemark before the sink can refuse that block.
+        assert!(store.read_file(1, &mut Fails).is_err());
+        assert_eq!(store.cursor, FileCursor::AtStart(2));
+        assert_eq!(read_at(&mut store, 2).unwrap(), vec![2u8; BS as usize]);
+        assert_eq!(
+            fake.ops(),
+            vec![Op::Rewind, Op::Space(1), Op::Read(1), Op::Read(2)]
+        );
+    }
+
+    /// The read queue is the bound, in tape blocks, allocated only as reads
+    /// need it — and a whole read, however long, passes through it.
+    #[test]
+    fn the_tape_stores_read_queue_is_the_pipeline_bound() {
+        let blocks = 6;
+        let (mut store, _fake) = tape_over(vec![vec![9u8; blocks * BS as usize]]);
+        assert_eq!(store.pool.chunk(), BS as usize);
+        assert_eq!(store.pool.capacity_bytes(), pipeline::QUEUE_BYTES);
+        assert_eq!(store.pool.allocated(), 0);
+        assert_eq!(
+            read_at(&mut store, 0).unwrap(),
+            vec![9u8; blocks * BS as usize]
+        );
+        assert!(store.pool.allocated() <= blocks);
     }
 }

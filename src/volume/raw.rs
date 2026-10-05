@@ -71,7 +71,8 @@ impl RawRestoreReport {
 /// Streams every content file straight from tape to disk through a
 /// `TruncatingWriter<HashingWriter<BufWriter<File>>>` — never buffers a whole
 /// slice in memory (the H9 whole-object OOM class, issues #32/#35/#87). Peak
-/// memory tracks the block size, not the file size.
+/// memory is a fixed number of blocks — `TapeStore`'s read queue
+/// (`pipeline::QUEUE_BYTES`, issue #390) — never the file size.
 ///
 /// Takes an already-open `store` (ADR-0006) rather than a device path — the
 /// caller opens `TapeStore::open_read` (or, in tests, hands in a `MemStore`

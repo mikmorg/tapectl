@@ -125,6 +125,10 @@ impl TapeOps for FakeTape {
         Ok(())
     }
 
+    fn block_size(&self) -> usize {
+        self.state().block_size
+    }
+
     fn position(&self) -> Result<TapePosition> {
         let s = self.state();
         Ok(TapePosition {

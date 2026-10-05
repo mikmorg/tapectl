@@ -18,9 +18,11 @@
 //!     writes rows 'planned' + write_positions 'pending' (slices only — schema).
 //! PlannedSession::execute(store)          -> Executing… -> ReadyToSeal
 //!     rewind; per entry: SIGINT check (between entries only; mid-file kill =
-//!     crash = startup sweep); stream from disk via a hashing tee reader;
-//!     store.execute(src, len, sync); slice entries update their cursor row
-//!     ('written' + sha256_on_volume). Inline-hash mismatch (tri-layer L2) or
+//!     crash = startup sweep); stream from disk through the write pipeline
+//!     (reader thread -> hasher thread -> store.execute(src, len, sync) on
+//!     this thread, #390); slice entries update their cursor row
+//!     ('written' + sha256_on_volume). Inline-hash mismatch (tri-layer L2,
+//!     judged before the file's last block reaches the store) or
 //!     ENOSPC  =>  Abort: tape stays UNSEALED, writes 'aborted', staging kept.
 //! ReadyToSeal::seal(store)                -> SealedPending
 //!     regenerate the seal marker with the real sealed_at; write it (sync mark).
@@ -72,8 +74,8 @@ use rusqlite::{params, Connection};
 
 use crate::db::busy::{self, BusyPolicy};
 use crate::error::{Result, TapectlError};
+use crate::pipeline::{self, BufferPool, Verdict};
 use crate::store::{Evidence, Store, Tier};
-use crate::util::HashingReader;
 
 use super::build::{BuildUnit, BuiltLayout};
 use super::format;
@@ -1842,6 +1844,13 @@ fn run_entries(
         .sum();
     let file_count = built.layout.entries.len();
     let phase = crate::progress::phase("write", Some(to_write));
+    // Issue #390: the write pipeline's buffers, one tape block each, reused
+    // by every entry of this call; their total is the pipeline's memory
+    // bound (`pipeline::QUEUE_BYTES`).
+    let mut pool = BufferPool::with_queue_bytes(
+        built.layout.block_size.max(1) as usize,
+        pipeline::QUEUE_BYTES,
+    );
 
     for entry in &content_entries[start_index..] {
         phase.item(format!(
@@ -1875,44 +1884,59 @@ fn run_entries(
             ))
         })?;
 
-        // Stream the entry through the hashing tee reader into the store.
-        // Any store-level failure here — ENOSPC being the expected one,
-        // but this treats any of them alike (device gone, I/O error, ...) —
-        // is caught rather than propagated: a full medium has no salvage
-        // path (ADR-0007), so it becomes the same clean abort as a hash
-        // mismatch, not a hard `Err` out of the whole session.
+        // Stream the entry into the store through the write pipeline
+        // (issue #390): a reader thread reads the staged file, a hasher
+        // thread hashes it, and the store's `execute` writes it here, on this
+        // thread — three stages overlapped, where they used to take turns.
+        // Any store-level failure — ENOSPC being the expected one, but this
+        // treats any of them alike (device gone, I/O error, ...) — is caught
+        // rather than propagated: a full medium has no salvage path
+        // (ADR-0007), so it becomes the same clean abort as a hash mismatch,
+        // not a hard `Err` out of the whole session.
+        //
+        // Tri-layer L2 (`v2-open-questions.md` §2.4): the hash is of the very
+        // bytes the store takes, and a mismatch is a clean abort. This is what
+        // closes the validate->execute TOCTOU window, and since ADR-0012's
+        // 2026-09-30 (later) amendment it is also the DEFAULT rot check for
+        // staged slices: `validate` only size-checks them unless
+        // `--prewrite-hash` asked it to full-hash from disk. Since #390 the
+        // verdict comes BEFORE the file's last block is handed to the store:
+        // a mismatched file never gets its last block or its filemark, let
+        // alone a seal (an empty file, with no block to hold back, is judged
+        // after, as every file used to be).
         let entry_started = std::time::Instant::now();
-        let stream_result: Result<String> = (|| {
-            let file = File::open(path).map_err(|e| {
-                TapectlError::Other(format!(
+        let expected_hash = entry.sha256.as_deref();
+        let (verdict, waits) = match File::open(path) {
+            Err(e) => (
+                Verdict::Failed(TapectlError::Other(format!(
                     "execute: open entry at position {}: {e}",
                     entry.position
-                ))
-            })?;
-            let mut reader = HashingReader::new(crate::progress::CountingReader(file));
-            store.execute(&mut reader, size, false)?;
-            Ok(reader.finalize_hex())
-        })();
+                ))),
+                None,
+            ),
+            Ok(file) => {
+                let streamed =
+                    pipeline::write_verified(&mut pool, file, size, expected_hash, |src| {
+                        // Counted here, as the store takes them — not where
+                        // the reader thread, up to a queue ahead, reads them.
+                        store.execute(&mut crate::progress::CountingReader(src), size, false)
+                    });
+                let waits = streamed.stats;
+                (streamed.verdict(expected_hash), Some(waits))
+            }
+        };
 
-        // Tri-layer L2 (`v2-open-questions.md` §2.4): re-hash inline on the
-        // same streaming read that fed the store, and clean-abort on
-        // mismatch. This is what closes the validate->execute TOCTOU window,
-        // and since ADR-0012's 2026-09-30 (later) amendment it is also the
-        // DEFAULT rot check for staged slices: `validate` only size-checks
-        // them unless `--prewrite-hash` asked it to full-hash from disk.
-        // Either way no rotted slice is ever sealed.
-        let expected_hash = entry.sha256.as_deref();
-        let abort_reason = match &stream_result {
-            Err(e) => Some(format!(
-                "execute failed at position {}: {e}",
-                entry.position
-            )),
-            Ok(actual_hash) if expected_hash != Some(actual_hash.as_str()) => Some(format!(
+        let abort_reason = match &verdict {
+            Verdict::Written(_) => None,
+            Verdict::Mismatch(actual_hash) => Some(format!(
                 "hash mismatch at position {}: expected {}, got {actual_hash}",
                 entry.position,
                 expected_hash.unwrap_or("no recorded hash")
             )),
-            Ok(_) => None,
+            Verdict::Failed(e) => Some(format!(
+                "execute failed at position {}: {e}",
+                entry.position
+            )),
         };
 
         if let ZoneKind::Slice { stage_slice_id } = entry.kind {
@@ -1923,8 +1947,8 @@ fn run_entries(
             // catalog is waited out (minutes), never allowed to stop the
             // drive mid-tape; each UPDATE is idempotent, so a retry is safe.
             busy::retry(BusyPolicy::DEFAULT, "a slice's write position", || {
-                match (&stream_result, &abort_reason) {
-                    (Ok(actual_hash), None) => {
+                match &verdict {
+                    Verdict::Written(actual_hash) => {
                         conn.execute(
                             "UPDATE write_positions
                              SET status = 'written', written_at = datetime('now'),
@@ -1933,7 +1957,7 @@ fn run_entries(
                             params![actual_hash, write_id, stage_slice_id],
                         )?;
                     }
-                    (Ok(actual_hash), Some(_)) => {
+                    Verdict::Mismatch(actual_hash) => {
                         // Streamed, but the hash didn't match.
                         conn.execute(
                             "UPDATE write_positions SET status = 'failed', sha256_on_volume = ?1
@@ -1941,8 +1965,8 @@ fn run_entries(
                             params![actual_hash, write_id, stage_slice_id],
                         )?;
                     }
-                    (Err(_), _) => {
-                        // Never streamed at all (open failed or store.execute
+                    Verdict::Failed(_) => {
+                        // Never streamed in full (open failed or store.execute
                         // errored) — no sha256_on_volume to record.
                         conn.execute(
                             "UPDATE write_positions SET status = 'failed'
@@ -1957,13 +1981,24 @@ fn run_entries(
 
         // Issue #386: one session-log line per file written, so a log
         // always says which file a long write was on, and how fast each went.
+        // Issue #390 adds where the time went: the tape writer waiting for
+        // data (the disk read or the hash behind), or the reader waiting for
+        // queue space (the tape behind).
         let took = entry_started.elapsed();
         crate::progress::log(&format!(
-            "wrote file {} ({}): {} in {}{}",
+            "wrote file {} ({}): {} in {}{}{}",
             entry.position,
             entry.kind.type_label(),
             crate::progress::format_bytes(size),
             crate::progress::format_duration(took),
+            match waits {
+                Some(w) => format!(
+                    "; tape waited {} for data, queue full {}",
+                    crate::progress::format_duration(w.consumer_waited),
+                    crate::progress::format_duration(w.producer_waited)
+                ),
+                None => String::new(),
+            },
             match &abort_reason {
                 Some(_) => " — ABORTED",
                 None => "",
@@ -5603,5 +5638,235 @@ mod tests {
             !msg.contains('[') && !msg.contains("\"/scratch"),
             "no Debug rendering of the directory list: {msg}"
         );
+    }
+
+    // ── issue #390: the write pipeline under the execute loop ──
+
+    /// Each `execute` call's outcome, in order, over a `MemStore` — and, on
+    /// the call `fail_on` names, a store error after taking `take` bytes
+    /// (a full medium mid-file).
+    struct Recording {
+        inner: MemStore,
+        calls: Vec<std::result::Result<u64, String>>,
+        fail_on: Option<(usize, usize)>,
+    }
+
+    impl Recording {
+        fn new() -> Self {
+            Self {
+                inner: MemStore::new(BS as usize),
+                calls: Vec::new(),
+                fail_on: None,
+            }
+        }
+    }
+
+    impl Store for Recording {
+        fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, src: &mut dyn std::io::Read, len: u64, sync: bool) -> Result<u64> {
+            let result = match self.fail_on {
+                Some((call, take)) if call == self.calls.len() => {
+                    let mut some = vec![0u8; take];
+                    src.read_exact(&mut some).unwrap();
+                    Err(TapectlError::TapeIo(
+                        "write: No space left on device (os error 28)".into(),
+                    ))
+                }
+                _ => self.inner.execute(src, len, sync),
+            };
+            self.calls
+                .push(result.as_ref().map(|n| *n).map_err(|e| e.to_string()));
+            result
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            self.inner.read_file(position, sink)
+        }
+        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+            self.inner.reposition_for_resume(file_index)
+        }
+    }
+
+    fn slice_position(f: &Fixture, slice_id: i64) -> usize {
+        f.built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::Slice { stage_slice_id } if stage_slice_id == slice_id))
+            .unwrap()
+    }
+
+    /// Byte-identical output: every entry the pipelined execute hands the
+    /// store is its source file's bytes, block-padded — checked against the
+    /// files on disk, not against another run of the same code. The write
+    /// phase counts exactly the entries' true sizes, on the session's own
+    /// thread, and the session log names each file with its waits.
+    #[test]
+    fn every_entry_reaches_the_store_byte_identical_to_its_source() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let sources: Vec<(usize, Vec<u8>)> = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .filter(|e| !matches!(e.kind, ZoneKind::SealMarker))
+            .map(|e| {
+                (
+                    e.position as usize,
+                    std::fs::read(entry_path(e).unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        let true_total: u64 = sources.iter().map(|(_, b)| b.len() as u64).sum();
+
+        let logs = TempDir::new().unwrap();
+        let session = crate::progress::start_session(
+            Some(logs.path()),
+            "volume write",
+            crate::progress::Display::Off,
+            false,
+        );
+        let log_path = session.log_path().unwrap().to_path_buf();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready"),
+        };
+        let phases = crate::progress::drain();
+        drop(session);
+
+        assert_eq!(store.files.len(), sources.len());
+        for (position, bytes) in &sources {
+            let mut want = bytes.clone();
+            want.resize(bytes.len().div_ceil(BS as usize) * BS as usize, 0);
+            assert!(
+                store.files[*position] == want,
+                "file {position} differs from its source"
+            );
+        }
+        let write = phases.iter().find(|p| p.phase == "write").unwrap();
+        assert_eq!(write.bytes, Some(true_total), "every true byte, once");
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(
+            log.matches("; tape waited ").count(),
+            sources.len(),
+            "one line per file names its waits:\n{log}"
+        );
+        drop(ready);
+    }
+
+    /// Tri-layer L2 since #390: the rotted slice never completes at the
+    /// store — its `execute` ends in an error, so neither its last block nor
+    /// its filemark is written, and MemStore records nothing for it — while
+    /// the abort reason, the `writes` rows and the slice's cursor row (with
+    /// the hash the bytes actually have) are exactly what they always were.
+    #[test]
+    fn an_l2_mismatch_never_reaches_the_files_filemark() {
+        let f = make_fixture();
+        let mut store = Recording::new();
+        let slice = &f.units[0].slices[0];
+        let position = slice_position(&f, slice.slice_id);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        rot_in_place(&slice.staging_path);
+        let rotted_hash = format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(&slice.staging_path).unwrap())
+        );
+
+        let aborted = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Aborted(a) => a,
+            _ => panic!("L2 must abort"),
+        };
+        assert_eq!(
+            aborted.reason,
+            format!(
+                "hash mismatch at position {position}: expected {}, got {rotted_hash}",
+                slice.sha256_encrypted
+            )
+        );
+        assert_eq!(
+            store.calls.len(),
+            position + 1,
+            "nothing after the rotted slice"
+        );
+        assert!(
+            store.calls[..position].iter().all(|c| c.is_ok()),
+            "{:?}",
+            store.calls
+        );
+        let err = store.calls[position].as_ref().unwrap_err();
+        assert!(err.contains("withheld"), "the store stopped short: {err}");
+        assert_eq!(
+            store.inner.files.len(),
+            position,
+            "the rotted slice was never completed on the medium"
+        );
+        let (wp_status, wp_hash): (String, Option<String>) = f
+            .conn
+            .query_row(
+                "SELECT status, sha256_on_volume FROM write_positions WHERE stage_slice_id = ?1",
+                params![slice.slice_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(wp_status, "failed");
+        assert_eq!(wp_hash.as_deref(), Some(rotted_hash.as_str()));
+        let statuses: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(statuses, vec!["aborted".to_string()]);
+    }
+
+    /// A store error partway through a file (a full medium) is the same
+    /// clean abort with the store's own message, as before #390 — and the
+    /// call returns, so the pipeline's threads have been joined.
+    #[test]
+    fn a_store_error_mid_file_is_the_same_clean_abort() {
+        let f = make_fixture();
+        let mut store = Recording::new();
+        let slice = &f.units[0].slices[0];
+        let position = slice_position(&f, slice.slice_id);
+        store.fail_on = Some((position, 10));
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let aborted = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Aborted(a) => a,
+            _ => panic!("a store error must abort"),
+        };
+        assert_eq!(
+            aborted.reason,
+            format!(
+                "execute failed at position {position}: {}",
+                TapectlError::TapeIo("write: No space left on device (os error 28)".into())
+            )
+        );
+        let (wp_status, wp_hash): (String, Option<String>) = f
+            .conn
+            .query_row(
+                "SELECT status, sha256_on_volume FROM write_positions WHERE stage_slice_id = ?1",
+                params![slice.slice_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((wp_status.as_str(), wp_hash), ("failed", None));
+        assert_eq!(store.inner.files.len(), position);
     }
 }

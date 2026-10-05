@@ -50,6 +50,30 @@ total, not an end-reservation).
    catches a window the others cannot. Finding ③'s "no double read" applies to
    front-index generation only — it reuses the stage-time `sha256_encrypted`
    verbatim rather than re-reading slices a third time.
+
+   **Execute's data path (since 1.0.6, #390).** The staged-file read, the
+   inline hash and the tape write run on three threads (`src/pipeline.rs`):
+   a reader fills tape-block buffers from the staged file, a hasher hashes
+   them in order and passes them on, and the store writes them on the
+   session's own thread. They are joined by a queue bounded at 256 MiB of
+   blocks (`pipeline::QUEUE_BYTES`), so the drive streams at the slowest
+   stage's rate instead of waiting out each disk read and each hash in turn
+   (L6-0001's serial write spent ~49 min of 5 h 22 m in tape write calls).
+   The L2 verdict is now reached **before the file's last block is handed to
+   the store**: the hasher holds the last block until the hash is finished,
+   and on a mismatch drops it, so the store's write ends in an error with
+   neither that block nor the filemark after it written (by tapectl — the st
+   driver writes a filemark when the device closes after a write, the same
+   tape shape an ENOSPC abort leaves). Before 1.0.6 the hash was compared
+   after the whole file and its filemark were on tape; either way no seal
+   follows. An empty file has no block to hold back and is judged after, as
+   before. Everything else is unchanged: the abort reason, the `writes`
+   rows (`aborted`), the slice's cursor row (`failed`, with the hash its
+   bytes actually have), and a store error (ENOSPC, a drive fault, a staged
+   file that fails or ends short) wins over the hash, with its own message,
+   exactly as when the stages ran in turn. The threads are scoped and joined
+   before the file's verdict is recorded, on every path; Ctrl-C is still
+   honoured between files only.
 3. Keys resolvable: every tenant on the volume has ≥1 active key; operator
    keys present; **escrow recipient present** (once #68 lands — its absence
    fails validation the same way rotate refuses).
@@ -238,7 +262,12 @@ Rules that hold in every path:
   behind it or after anything that leaves the position uncertain (an error, a
   write, a read that returns nothing, or st's own count disagreeing). Before
   1.0.5 every read rewound to BOT, which cost a full-tape confirm about five
-  hours of rewinds on LTO-6. Record a
+  hours of rewinds on LTO-6. Since 1.0.6 (#390) each file's tape read runs
+  on its own thread, up to the 256 MiB read queue ahead of the hash, so the
+  drive keeps reading while the host hashes; the cursor follows how the
+  tape read itself ended (a sink that fails mid-file stops the read there,
+  so the position is unknown; one that fails after the read crossed the
+  filemark leaves the head, truthfully, at the next file). Record a
   `verification_sessions` row stating **which tier** ran (ADR-0001). Match →
   mark `sealed`. Mismatch → **three outcomes, not two** (ADR-0012's 2026-09-18
   amendment, issues #260/#267): a mismatch that `MismatchKind::proves_medium_bad`
@@ -267,7 +296,14 @@ v2 `EotReached`'s only outcome is abort-to-unsealed, not salvage);
 and `read` are **streaming** (they take/return a `Read` plus a known length, not
 a whole `&[u8]` buffered in RAM) so peak memory tracks block size, not slice
 size — the H9 fix (age's STREAM already gives constant-memory encryption;
-`volume-format-v2.md` §7). TapeStore implements contact as drive I/O with
+`volume-format-v2.md` §7). Since 1.0.6 (#390) the write session's execute and
+`TapeStore`'s reads overlap disk, hash and tape on separate threads through a
+queue of reused tape-block buffers, so "tracks block size" is now a fixed
+number of blocks: at most 256 MiB (`pipeline::QUEUE_BYTES`) per pipeline, one
+pipeline at a time — still a constant, still never the slice size. The trait
+did not change: the pipeline sits above `execute` (the session feeds it a
+`Read`) and inside `TapeStore::read_file`, so `MemStore` and every test store
+see the same calls they always did. TapeStore implements contact as drive I/O with
 readback confirm; the anti-tape-ism test is that WarehouseStore's shapes
 (execute=upload, confirm=deposit-receipt, restore-request before read) fit the
 same signatures without violence (#72, phase 3).
