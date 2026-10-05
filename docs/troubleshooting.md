@@ -1578,6 +1578,11 @@ What an abort leaves behind:
   was recorded (`volumes.sealed_at` is empty), so there is no sealed tape to re-confirm, and an unsealed aborted
   session is never resumable. Run `tapectl volume write <label>` to start a new one.
   ```
+- **The next `volume write` replaces it.** When the new session is planned,
+  the aborted session's `writes`/`write_positions` rows and its staging
+  session directory are removed, and a `write_session_superseded` event names
+  them; the abort itself stays in the `write_aborted` event. (Through 1.0.7 the
+  old rows made the retry fail with `UNIQUE constraint failed`.)
 - **`volume abort` is not needed.** The session is already aborted.
   [`volume abort`](cli/volume.md#tapectl-volume-abort) is for a `planned`
   session, or an interrupted one you know cannot be resumed.

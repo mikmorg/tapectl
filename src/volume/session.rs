@@ -161,46 +161,68 @@ impl ValidatedLayout {
     /// files never get a cursor row, `write_positions.stage_slice_id` is
     /// NOT NULL by schema). Never called on resume: resume reuses the
     /// existing rows (`writes` has `UNIQUE(stage_set_id, volume_id)`).
+    ///
+    /// **One transaction (issue #401).** Every row lands, or none does: a
+    /// failure partway used to leave a `planned` row behind, which then
+    /// blocked the next `volume write` as an "unresolved write session".
+    ///
+    /// **A new attempt replaces an abandoned one (issue #401).** A volume
+    /// whose earlier session ended `aborted` or `failed` before its seal was
+    /// recorded (an end of tape, a tri-layer L2 mismatch, a plan cleared by
+    /// `volume abort`) is written again from the beginning — that is what
+    /// the operator documentation has always told the operator to do. The
+    /// old attempt's rows used to make that impossible: `writes` is
+    /// `UNIQUE(stage_set_id, volume_id)`, so the retry's own INSERT failed
+    /// on them. They describe a recording the new session is about to
+    /// overwrite from BOT and that no command can ever resume (an unsealed
+    /// aborted session is never adopted, ADR-0012 2026-09-23), so they are
+    /// deleted here, in this same transaction, with a `write_session_superseded`
+    /// event saying which rows went; the abort itself stays recorded in the
+    /// `write_aborted` event it already has. A volume's `writes` rows thus
+    /// keep describing ONE session, which `rehydrate`, `adopt_aborted`,
+    /// `volume abort` and `staging clean`'s guard all assume. Their frozen
+    /// session directories are removed after the commit
+    /// ([`supersede_abandoned_attempts`]).
     pub fn plan(
         self,
         conn: &Connection,
         volume_id: i64,
         units: &[BuildUnit],
     ) -> Result<PlannedSession> {
-        let mut write_ids = Vec::with_capacity(units.len());
-        let mut slice_write_id = HashMap::new();
         // The frozen staging directory is recorded here, and only here
         // (migration 006, issue #25): plan is the sole `writes`-row writer,
         // and after a process restart this path is the ONLY way back to the
         // materialized zones a resume must re-hash rather than regenerate.
         let session_dir = self.built.session_dir.to_string_lossy().to_string();
-        for u in units {
-            conn.execute(
-                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
-                 VALUES (?1, ?2, ?3, 'planned', ?4)",
-                params![u.stage_set_id, u.snapshot_id, volume_id, session_dir],
-            )?;
-            let write_id = conn.last_insert_rowid();
-            write_ids.push((write_id, u.snapshot_id));
-            for slice in &u.slices {
-                slice_write_id.insert(slice.slice_id, write_id);
-            }
-        }
+        let entries = &self.built.layout.entries;
+        let (write_ids, slice_write_id, superseded_dirs) =
+            busy::retry(BusyPolicy::DEFAULT, "a write session's plan", || {
+                let tx = busy::immediate_tx(conn)?;
+                let superseded_dirs = supersede_abandoned_attempts(&tx, volume_id)?;
+                let (write_ids, slice_write_id) =
+                    insert_plan_rows(&tx, volume_id, units, entries, &session_dir)?;
+                tx.commit()?;
+                Ok((write_ids, slice_write_id, superseded_dirs))
+            })?;
 
-        for entry in &self.built.layout.entries {
-            if let ZoneKind::Slice { stage_slice_id } = entry.kind {
-                let write_id = *slice_write_id.get(&stage_slice_id).ok_or_else(|| {
-                    TapectlError::Other(format!(
-                        "plan: no unit in `units` owns staged slice {stage_slice_id} \
-                         (Layout position {})",
-                        entry.position
-                    ))
-                })?;
-                conn.execute(
-                    "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
-                     VALUES (?1, ?2, ?3, 'pending')",
-                    params![write_id, stage_slice_id, entry.position.to_string()],
-                )?;
+        // After the commit, never before: a directory removed for rows a
+        // rollback then kept would strand them (the DB-then-filesystem order
+        // `staging::clean` documents). Best-effort — a directory that cannot
+        // be removed is an orphan `staging clean --force` reclaims, never a
+        // reason to fail a write whose rows are already committed.
+        for dir in superseded_dirs {
+            if dir == session_dir {
+                continue;
+            }
+            let path = Path::new(&dir);
+            if path.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(path) {
+                    tracing::warn!(
+                        dir = %path.display(),
+                        error = %e,
+                        "could not remove a superseded write session's staging directory"
+                    );
+                }
             }
         }
 
@@ -211,6 +233,165 @@ impl ValidatedLayout {
             slice_write_id,
         })
     }
+}
+
+/// `plan`'s rows: one `writes` row per unit and one `write_positions` row
+/// per slice entry, on `tx`. Returns the `(write_id, snapshot_id)` pairs and
+/// the `stage_slice_id -> write_id` map the session carries.
+#[allow(clippy::type_complexity)]
+fn insert_plan_rows(
+    tx: &Connection,
+    volume_id: i64,
+    units: &[BuildUnit],
+    entries: &[LayoutEntry],
+    session_dir: &str,
+) -> Result<(Vec<(i64, i64)>, HashMap<i64, i64>)> {
+    let mut write_ids = Vec::with_capacity(units.len());
+    let mut slice_write_id = HashMap::new();
+    for u in units {
+        tx.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+             VALUES (?1, ?2, ?3, 'planned', ?4)",
+            params![u.stage_set_id, u.snapshot_id, volume_id, session_dir],
+        )?;
+        let write_id = tx.last_insert_rowid();
+        write_ids.push((write_id, u.snapshot_id));
+        for slice in &u.slices {
+            slice_write_id.insert(slice.slice_id, write_id);
+        }
+    }
+
+    for entry in entries {
+        if let ZoneKind::Slice { stage_slice_id } = entry.kind {
+            let write_id = *slice_write_id.get(&stage_slice_id).ok_or_else(|| {
+                TapectlError::Other(format!(
+                    "plan: no unit in `units` owns staged slice {stage_slice_id} \
+                     (Layout position {})",
+                    entry.position
+                ))
+            })?;
+            tx.execute(
+                "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                 VALUES (?1, ?2, ?3, 'pending')",
+                params![write_id, stage_slice_id, entry.position.to_string()],
+            )?;
+        }
+    }
+    Ok((write_ids, slice_write_id))
+}
+
+/// Delete the `writes` rows (and their `write_positions`) of every earlier
+/// session on `volume_id` that ended `aborted` or `failed` before its seal
+/// was recorded, inside `plan`'s transaction (issue #401). Returns the
+/// session directories those rows named that no remaining row names, for
+/// `plan` to remove once the transaction commits.
+///
+/// Does nothing when the volume's seal is recorded: such an `aborted`
+/// session is the one `volume resume` may adopt for re-confirmation
+/// (ADR-0012's 2026-09-23 amendment, #280), and a sealed volume is never
+/// planned again anyway — `volume write` refuses it first.
+///
+/// Refuses, changing nothing, if a `verification_results` row points at
+/// one of those positions: the rows are then evidence about the medium, not
+/// leftovers of an abandoned attempt, and only a person should decide what
+/// becomes of them.
+fn supersede_abandoned_attempts(tx: &Connection, volume_id: i64) -> Result<Vec<String>> {
+    let (label, sealed): (String, bool) = tx.query_row(
+        "SELECT label, sealed_at IS NOT NULL FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if sealed {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(i64, String, Option<String>)> = tx
+        .prepare(
+            "SELECT id, status, session_dir FROM writes
+             WHERE volume_id = ?1 AND status IN ('aborted', 'failed')
+             ORDER BY id",
+        )?
+        .query_map(params![volume_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids = rows
+        .iter()
+        .map(|(id, _, _)| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `ids` is integers this function just read, never input.
+    let evidence: i64 = tx.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM verification_results vr
+             JOIN write_positions wp ON wp.id = vr.write_position_id
+             WHERE wp.write_id IN ({ids})"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if evidence > 0 {
+        return Err(TapectlError::Other(format!(
+            "volume \"{label}\": cannot start a new write session — its earlier, abandoned \
+             session (writes row(s) {ids}) has {evidence} verification result(s) recorded \
+             against its positions, so those rows are evidence about this cartridge and \
+             tapectl will not delete them to make room. Nothing was changed. Inspect them \
+             (`verification_results`, `write_positions` with write_id in {ids}) before \
+             writing this volume again."
+        )));
+    }
+
+    tx.execute(
+        &format!("DELETE FROM write_positions WHERE write_id IN ({ids})"),
+        [],
+    )?;
+    tx.execute(&format!("DELETE FROM writes WHERE id IN ({ids})"), [])?;
+
+    let mut dirs: Vec<String> = rows.iter().filter_map(|(_, _, d)| d.clone()).collect();
+    dirs.sort();
+    dirs.dedup();
+    let statuses = rows
+        .iter()
+        .map(|(id, status, _)| format!("{id} {status}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::db::events::log_event(
+        tx,
+        "volume",
+        volume_id,
+        Some(&label),
+        "write_session_superseded",
+        None,
+        None,
+        None,
+        Some(&format!(
+            "a new write session replaces an earlier unsealed attempt that ended aborted or \
+             failed; its writes rows ({statuses}) and their write_positions were removed; \
+             session dir(s): {}",
+            if dirs.is_empty() {
+                "none recorded".to_string()
+            } else {
+                dirs.join(", ")
+            }
+        )),
+        None,
+    )?;
+
+    let mut orphaned = Vec::new();
+    for dir in dirs {
+        let still_named: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM writes WHERE session_dir = ?1",
+            params![dir],
+            |r| r.get(0),
+        )?;
+        if still_named == 0 {
+            orphaned.push(dir);
+        }
+    }
+    Ok(orphaned)
 }
 
 // ── Executing / ReadyToSeal / Interrupted / Aborted ──
@@ -2336,8 +2517,21 @@ mod tests {
         keys: KeyAvailability,
         units: Vec<BuildUnit>,
         volume_id: i64,
+        /// What `built` was built from, so a test can build the same
+        /// volume's session again — a second attempt (issue #401).
+        inputs: BuildInputs,
         _slices_dir: tempfile::TempDir,
         _session_dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        /// The same volume's Layout built again into a fresh session
+        /// directory — what a second `volume write` of the label builds.
+        fn rebuild(&self) -> (BuiltLayout, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let built = build::build(&self.inputs, dir.path()).unwrap();
+            (built, dir)
+        }
     }
 
     fn make_fixture() -> Fixture {
@@ -2477,6 +2671,7 @@ mod tests {
             keys,
             units: vec![build_unit],
             volume_id,
+            inputs,
             _slices_dir: slices_dir,
             _session_dir: session_dir,
         }
@@ -3360,6 +3555,244 @@ mod tests {
             )
             .unwrap();
         assert_ne!(volume_status, "sealed");
+    }
+
+    // --- issue #401: an abandoned attempt never blocks the next one ---
+
+    fn statuses_on(conn: &Connection, volume_id: i64) -> Vec<String> {
+        conn.prepare("SELECT status FROM writes WHERE volume_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map(params![volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// What a second attempt needs from a [`Fixture`] whose `built` the
+    /// first attempt consumed.
+    #[derive(Clone, Copy)]
+    struct Retry<'a> {
+        conn: &'a Connection,
+        keys: &'a KeyAvailability,
+        units: &'a [BuildUnit],
+        volume_id: i64,
+    }
+
+    /// Field by field, so it works on a fixture whose `built` is gone.
+    macro_rules! retry_of {
+        ($f:expr) => {
+            Retry {
+                conn: &$f.conn,
+                keys: &$f.keys,
+                units: &$f.units,
+                volume_id: $f.volume_id,
+            }
+        };
+    }
+
+    /// Run a fresh session for `built` to its end over `store` and say how
+    /// it ended — Sealed must be what a retry reaches.
+    fn run_to_sealed(f: Retry<'_>, built: BuiltLayout, store: &mut MemStore) -> SealedSession {
+        let planned = built
+            .into_validated(f.keys, SliceCheck::Size, store)
+            .unwrap_or_else(|e| panic!("validate: {e:?}"))
+            .plan(f.conn, f.volume_id, f.units)
+            .expect("issue #401: a new attempt plans on the same volume");
+        let ready = match planned.execute(f.conn, store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("the retry's execute did not reach Ready"),
+        };
+        match ready
+            .seal(store)
+            .unwrap()
+            .confirm(f.conn, store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Sealed(s) => s,
+            _ => panic!("the retry did not seal"),
+        }
+    }
+
+    /// Issue #401: after an END OF TAPE abort, the same volume is written
+    /// again from the beginning and seals. The old attempt's rows used to
+    /// make that second `plan` fail on `writes`' `UNIQUE(stage_set_id,
+    /// volume_id)`, wedging the label. The superseded rows are gone, the
+    /// event says which went, and the old attempt's session directory is
+    /// removed with them.
+    #[test]
+    fn an_enospc_abort_is_written_again_on_the_same_volume_and_seals() {
+        let f = make_fixture();
+        let first_dir = f.built.session_dir.clone();
+        let (second, _second_dir) = f.rebuild();
+        let mut short = MemStore::new(BS as usize).with_enospc_after(2 * BS);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut short)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        assert!(matches!(
+            planned.execute(&f.conn, &mut short).unwrap(),
+            ExecuteOutcome::Aborted(_)
+        ));
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["aborted"]);
+        assert!(
+            first_dir.is_dir(),
+            "positive control: the first attempt's dir exists"
+        );
+
+        // The same cartridge reloaded: what the first attempt left on it,
+        // without the simulated end of tape.
+        let mut store = MemStore::new(BS as usize);
+        store.files = short.files.clone();
+        store.syncs = short.syncs.clone();
+        store.reposition_for_resume(0).unwrap();
+        run_to_sealed(retry_of!(f), second, &mut store);
+
+        assert_eq!(
+            statuses_on(&f.conn, f.volume_id),
+            vec!["completed"],
+            "the aborted attempt's row was superseded, not left beside the new one"
+        );
+        let orphan_positions: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM write_positions
+                 WHERE write_id NOT IN (SELECT id FROM writes)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_positions, 0);
+        let detail: String = f
+            .conn
+            .query_row(
+                "SELECT details FROM events WHERE action = 'write_session_superseded'
+                 AND entity_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .expect("the supersession is recorded");
+        assert!(detail.contains("aborted"), "{detail}");
+        assert!(
+            !first_dir.exists(),
+            "the superseded attempt's session dir is removed: {}",
+            first_dir.display()
+        );
+    }
+
+    /// Issue #401: after a tri-layer L2 abort (a staged slice rotted after
+    /// plan), the slice is put right and the same volume is written again
+    /// from the beginning — the troubleshooting guide's recipe.
+    #[test]
+    fn an_l2_abort_is_written_again_on_the_same_volume_once_the_slice_is_good() {
+        let f = make_fixture();
+        let (second, _second_dir) = f.rebuild();
+        let mut store = MemStore::new(BS as usize);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let slice_path = f.units[0].slices[0].staging_path.clone();
+        let good = std::fs::read(&slice_path).unwrap();
+        rot_in_place(&slice_path);
+        assert!(matches!(
+            planned.execute(&f.conn, &mut store).unwrap(),
+            ExecuteOutcome::Aborted(_)
+        ));
+        std::fs::write(&slice_path, &good).unwrap();
+
+        store.reposition_for_resume(0).unwrap();
+        run_to_sealed(retry_of!(f), second, &mut store);
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
+    }
+
+    /// Issue #401: a session killed between plan and execute leaves
+    /// `planned` rows; `volume abort` turns them `aborted`, and the next
+    /// attempt plans and seals — what `volume resume`'s refusal tells the
+    /// operator to do.
+    #[test]
+    fn a_plan_cleared_by_volume_abort_does_not_block_the_next_attempt() {
+        let f = make_fixture();
+        let (second, _second_dir) = f.rebuild();
+        let mut store = MemStore::new(BS as usize);
+        let _planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        // The kill, then `volume abort`'s own UPDATE.
+        f.conn
+            .execute(
+                "UPDATE writes SET status = 'aborted' WHERE volume_id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+
+        run_to_sealed(retry_of!(f), second, &mut store);
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
+    }
+
+    /// Issue #401: `plan` is one transaction. A failure after the first
+    /// `writes` row used to leave it `planned`, and that stray row then
+    /// refused every later `volume write` as an unresolved session.
+    #[test]
+    fn a_plan_that_fails_partway_leaves_no_rows() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        // A unit that owns none of the Layout's slices: the first INSERT
+        // lands, then the position loop fails.
+        let mut unit = f.units[0].clone();
+        unit.slices.clear();
+        let err = match validated.plan(&f.conn, f.volume_id, &[unit]) {
+            Ok(_) => panic!("plan must fail when no unit owns a slice"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("owns staged slice"), "{err}");
+        let rows: i64 = f
+            .conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a failed plan leaves no `writes` row behind");
+    }
+
+    /// Issue #401's limit: a volume whose seal is recorded keeps its
+    /// `aborted` rows — they are the session `volume resume` may adopt for
+    /// re-confirmation (ADR-0012 2026-09-23) — so `plan` touches nothing and
+    /// still fails on the constraint, as `volume write` refuses such a
+    /// volume long before it would get here.
+    #[test]
+    fn a_volume_whose_seal_is_recorded_keeps_its_aborted_rows() {
+        let f = make_fixture();
+        let (second, _second_dir) = f.rebuild();
+        let mut store = MemStore::new(BS as usize).with_enospc_after(2 * BS);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let _ = planned.execute(&f.conn, &mut store).unwrap();
+        f.conn
+            .execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        let mut fresh = MemStore::new(BS as usize);
+        let result = second
+            .into_validated(&f.keys, SliceCheck::Size, &mut fresh)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units);
+        assert!(result.is_err(), "a sealed volume is never planned over");
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["aborted"]);
     }
 
     // --- behavior 4: SIGINT between entries -> Interrupted + resumable ---

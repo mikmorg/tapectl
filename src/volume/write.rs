@@ -15056,6 +15056,119 @@ mod tests {
             assert!(left.is_empty(), "the home's copy is removed: {left:?}");
         }
 
+        /// One `volume write` of `label` over `store`, as the CLI runs it.
+        fn write_once(
+            conn: &Connection,
+            config: &Config,
+            paths: &TapectlPaths,
+            label: &str,
+            store: &mut MemStore,
+        ) -> Result<()> {
+            use crate::tape::log_pages::tests::FixtureSource;
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            let mut slot = ContactSlot::empty()
+                .with_drive_identity(identity_with_serial(Some("XYZZY_A1")))
+                .with_log_source(&src);
+            let r = volume_write_contacted(
+                conn,
+                paths,
+                config,
+                label,
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                true,
+                &mut slot,
+                ContactStore::Injected(store),
+            );
+            slot.finish_result(r).map(|_| ())
+        }
+
+        /// Issue #401, through `volume write` itself: a write aborted by
+        /// tri-layer L2 (a staged slice that rotted in place, same size) is
+        /// followed, once the slice is right again, by a second `volume
+        /// write` of the same label on the same cartridge — and that one
+        /// seals. It used to fail at `plan` with a raw `UNIQUE constraint
+        /// failed`, which is what the abort message and the troubleshooting
+        /// guide both told the operator to run.
+        #[test]
+        fn a_write_aborted_by_l2_is_written_again_and_seals() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-AGAIN", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let slice = tmp.path().join("slices").join("slice_1.age");
+            let good = fs::read(&slice).unwrap();
+            let mut rotted = good.clone();
+            rotted[0] ^= 0xff;
+            fs::write(&slice, &rotted).unwrap();
+
+            let mut store = MemStore::new(512 * 1024);
+            let err = write_once(&conn, &config, &paths, "SW-AGAIN", &mut store)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("hash mismatch"),
+                "positive control: L2 aborted: {err}"
+            );
+
+            fs::write(&slice, &good).unwrap();
+            write_once(&conn, &config, &paths, "SW-AGAIN", &mut store)
+                .expect("issue #401: the second `volume write` of the label seals");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "sealed");
+            let rows: Vec<String> = conn
+                .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+                .unwrap()
+                .query_map(params![volume_id], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(rows, vec!["completed"]);
+        }
+
+        /// Issue #401, the end-of-tape case through `volume write`: the
+        /// medium runs out, and a second `volume write` of the label on the
+        /// same cartridge (here: the same recorded files, with room) seals.
+        #[test]
+        fn a_write_aborted_at_end_of_tape_is_written_again_and_seals() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-EOT", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+
+            let mut short = MemStore::new(512 * 1024).with_enospc_after(2 * 512 * 1024);
+            let err = write_once(&conn, &config, &paths, "SW-EOT", &mut short)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("aborted"),
+                "positive control: the write aborted: {err}"
+            );
+
+            let mut store = MemStore::new(512 * 1024);
+            store.files = short.files.clone();
+            store.syncs = short.syncs.clone();
+            write_once(&conn, &config, &paths, "SW-EOT", &mut store)
+                .expect("issue #401: the second `volume write` of the label seals");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "sealed");
+        }
+
         /// Issue #386: a MemStore write inside a progress session records
         /// every phase, in order, against the volume — the rows `volume
         /// info` shows — with the write and confirm phases counting bytes.
