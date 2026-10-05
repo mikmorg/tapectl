@@ -1101,3 +1101,38 @@ production size it costs hours per copy: 1.2 TiB at ~136 MB/s single-core on the
 host. The price of the default is a cartridge pass wasted on the rare slice that rotted in
 staging; the remedy is to re-stage that unit and write the cartridge again. No on-tape byte
 changes; this is a patch release (1.0.3).
+
+## Amendment, 2026-10-06 — rulings after the first production tape's timeline audit
+
+*Ruled by the CTO on 2026-10-05 and 2026-10-06.* The reasoning and measurements are in
+`docs/research/2026-10-06-plaintext-free-staging.md`; the issues carry the details.
+
+1. **Confirm is navigable by default** (#387). After #387 is built, `volume write` confirms with
+   the quick tier; `--full-confirm` opts in to the full readback.
+2. **RESTORE.sh moves forward-only** (#396), with #405 and #412, as a 1.1.0 on-tape change. The
+   CTO reviews the golden re-pin.
+3. **The dar catalogues already in the envelopes become heir-usable in 1.1.0** (#418): RESTORE.sh
+   reads them, and each tenant envelope gets a backup copy if cheap. Envelope catalogues stay
+   uncompressed. A cross-volume index and a new `catalog.db` shape wait for 1.2.0.
+4. **Staging writes no plaintext to the staging device** (#370). dar writes its archive to
+   standard output; tapectl cuts it into dar slices identical in structure to dar's own and
+   encrypts each in memory. dar's retry-on-change is off, so a file changing during staging
+   refuses the stage (this amends #367's per-slice pipelining). It ships in 1.1.0 if ready
+   before the next tape run, else 1.2.0; only the recorded `dar_command` changes on tape. The
+   proof has three layers: by construction, an ungated write audit, and a gated raw-image scan
+   with a planted canary as its positive control. The temporary `catalog_snapshot.db` moves off
+   staging and `read-slices` directories are named by unit uuid.
+5. **Sources are read once** (#364, reversing #354). Each file is hashed as dar reads it, tied to
+   dar's read by a stat check before, after, and once more after dar finishes.
+6. **The tapectl home device stays encrypted** (it holds file names). On the production host,
+   swap is off or encrypted and the service does not dump core.
+7. **Per-file data** (#380 option A, #381): paths are stored once per unit with search over
+   distinct paths; per-version rows are narrow with the sha256 as 32 raw bytes. dar's catalogue is
+   the authority for permissions, owners, xattrs, special files and hard links. The on-tape
+   `catalog.db` follows in 1.2.0. `<home>/catalogs` is kept for the life of each version, and
+   there is one isolated catalogue per stage set (#419).
+8. **Encryption is X25519-only, with a single X25519 escrow identity** (#385), accepted
+   explicitly: the media are in the operator's physical custody, the data is personal, and the
+   threat model is loss and inheritance, not a state adversary. Revisit if age adds a
+   post-quantum recipient type and it reaches a stable release, or if a cartridge's custody ever
+   leaves the operator's control.
