@@ -2083,7 +2083,8 @@ fn volume_resume_in_contact(
 ///
 /// It never contacts the tape (hence no device argument): the cartridge is
 /// left exactly as the interrupted session left it — physically unharmed;
-/// unsealed and reusable after a bulk erase plus `cartridge mark-erased`,
+/// unsealed and reusable after an erase in the drive plus `cartridge
+/// mark-erased`,
 /// or, when its seal is recorded (an Inconclusive confirm), sealed. Only the
 /// `writes` rows move. `aborted` is not "never resumable" since ADR-0012's
 /// 2026-09-23 amendment (#280): a session whose seal is recorded is adopted
@@ -2287,7 +2288,8 @@ pub(crate) fn abort_consent_facts(
              volume is never written again (ADR-0003); the catalog holds it as `{status}`."
         ),
         AbortSeal::Unsealed => "The cartridge is NOT touched: it is left unsealed and \
-             physically unharmed, so it can be bulk-erased and reused (`cartridge mark-erased`)."
+             physically unharmed, so it can be erased in the drive and reused (`cartridge \
+             mark-erased`). Never degauss an LTO cartridge: that destroys its servo tracks."
             .to_string(),
     };
 
@@ -3599,11 +3601,27 @@ fn seal_recorded_refusal(conn: &Connection, label: &str, volume_id: i64) -> Resu
     }
     msg.push_str(&format!(
         " To reuse the cartridge instead: retire this volume (`tapectl volume retire {label}`), \
-         bulk-erase the physical tape, then run `tapectl cartridge mark-erased` before writing \
-         to it again."
+         {ERASE_IN_THE_DRIVE}, then run `tapectl cartridge mark-erased` before writing to it \
+         again. {NEVER_DEGAUSS}"
     ));
     Ok(msg)
 }
+
+/// How a cartridge is erased for reuse — the one wording every message that
+/// names the step uses (issue #417), with [`NEVER_DEGAUSS`] beside it. A
+/// long erase leaves the tape blank (`volume init` proceeds); a filemark at
+/// BOT leaves File 0 EMPTY (`volume init --force`), the old bytes past it
+/// unreachable but not overwritten.
+pub(crate) const ERASE_IN_THE_DRIVE: &str = "erase the tape in the drive (a long erase, \
+     `mt -f <device> erase`, takes hours on real LTO; a filemark at its start, \
+     `mt -f <device> rewind; mt -f <device> weof 1`, takes seconds and then needs \
+     `volume init --force`)";
+
+/// Why the erase is in the drive (issue #417): an LTO cartridge carries
+/// factory-written servo tracks that a bulk eraser (degausser) wipes, and no
+/// drive can use the tape after that. The docs used to recommend one.
+pub(crate) const NEVER_DEGAUSS: &str = "Never degauss or bulk-erase an LTO cartridge: that \
+     destroys its factory servo tracks, and the cartridge with them.";
 
 /// A tiny, pure decision — no I/O, no `Store` — over an already-computed
 /// `ContactOutcome` (issue #27). Kept separate from [`check_fresh_write_contact`]
@@ -3617,9 +3635,10 @@ fn seal_recorded_refusal(conn: &Connection, label: &str, volume_id: i64) -> Resu
 /// stale identity at File 0 that the operator has physically verified is
 /// safe to overwrite. It can defeat `IdentityMismatch`. It can NEVER defeat
 /// `AlreadySealed` — ADR-0003 makes a sealed volume's immutability absolute,
-/// and the sanctioned way past a sealed cartridge is to bulk-erase it first
-/// (`cartridge mark-erased`), which is exactly what turns its File 0
-/// unreadable again (`ContactOutcome::Blank`) on the next attempt — not a
+/// and the sanctioned way past a sealed cartridge is to erase it in the
+/// drive first ([`ERASE_IN_THE_DRIVE`], then `cartridge mark-erased`): a long
+/// erase turns its File 0 blank (`ContactOutcome::Blank`) on the next
+/// attempt, a filemark at BOT turns it EMPTY (`--force` applies) — not a
 /// software override.
 fn decide_fresh_write_contact(
     outcome: &ContactOutcome,
@@ -3633,8 +3652,9 @@ fn decide_fresh_write_contact(
             "refusing to write volume \"{label}\": the loaded cartridge already carries a SEALED \
              volume — a valid seal marker parses at tape position {seal_position}. ADR-0003: \
              sealed volumes are immutable, there is no append, and --force cannot override this. \
-             If this cartridge should be reused: retire its current volume, bulk-erase the \
-             physical tape, then run `tapectl cartridge mark-erased` before writing to it again."
+             If this cartridge should be reused: retire its current volume, \
+             {ERASE_IN_THE_DRIVE}, then run `tapectl cartridge mark-erased` before writing to it \
+             again. {NEVER_DEGAUSS}"
         ))),
         ContactOutcome::IdentityMismatch { found } => {
             let found_desc = describe_file0_identity(found.as_ref());
@@ -10476,6 +10496,28 @@ mod tests {
             msg.contains("ADR-0003"),
             "expected the ADR citation in: {msg}"
         );
+    }
+
+    /// Issue #417: the reuse recipe a sealed cartridge's refusals print
+    /// erases the tape IN THE DRIVE and warns against a degausser — which
+    /// wipes an LTO cartridge's factory servo tracks. It used to say
+    /// "bulk-erase the physical tape". Both refusals that name the step.
+    #[test]
+    fn the_sealed_cartridge_reuse_recipe_erases_in_the_drive_and_never_degausses() {
+        let outcome = ContactOutcome::AlreadySealed { seal_position: 12 };
+        let contact = decide_fresh_write_contact(&outcome, FW_LABEL, FW_UUID, false)
+            .unwrap_err()
+            .to_string();
+        let (conn, volume_id) = seal_recorded_fixture(true, None);
+        let recorded = seal_recorded_refusal(&conn, "L6-SEALED", volume_id).unwrap();
+        for msg in [contact, recorded] {
+            assert!(msg.contains("erase the tape in the drive"), "{msg}");
+            assert!(msg.contains("`mt -f <device> erase`"), "{msg}");
+            assert!(msg.contains("weof 1"), "{msg}");
+            assert!(msg.contains("Never degauss"), "{msg}");
+            assert!(msg.contains("`tapectl cartridge mark-erased`"), "{msg}");
+            assert!(!msg.contains("bulk-erase the"), "{msg}");
+        }
     }
 
     // -- check_fresh_write_contact: full pipeline via MemStore -----

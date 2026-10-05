@@ -229,11 +229,12 @@ step_stage_symlinks() { TCTL stage create unitC; }
 # never-yet-sealed) cartridge on the first run after #27, and add an
 # explicit erase step here if repeat runs against the same media are
 # wanted.
-# Bulk-erase the scratch cartridge first — the gate reuses one cartridge across
+# Long-erase the scratch cartridge first — the gate reuses one cartridge across
 # runs, so from the second run onward it carries a SEALED volume and contact
 # discipline (#27) correctly refuses to overwrite it. `--force` cannot defeat
 # AlreadySealed by design (ADR-0003), so the honest fix is a real erase, which
-# mirrors the production reuse procedure (retire, bulk-erase, mark-erased) and
+# mirrors the production reuse procedure (retire, erase in the drive,
+# mark-erased; never a degausser, #417) and
 # is instant on mhvtl. Erasing lets the gate exercise the DEFAULT no-force
 # path, which is the one an operator actually runs.
 step_erase_scratch_tape() {

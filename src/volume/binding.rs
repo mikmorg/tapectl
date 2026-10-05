@@ -1848,7 +1848,7 @@ mod tests {
     #[test]
     fn every_other_status_still_binds_silently() {
         // ADR-0010: binding relitigates nothing. `in_use` (a live volume),
-        // `pending_erase` (awaiting a bulk erase) and `available` are all
+        // `pending_erase` (awaiting an erase) and `available` are all
         // ordinary reuse, and File 0 already made the decision.
         for status in ["available", "in_use", "pending_erase"] {
             let conn = db::open_memory().unwrap();
@@ -3007,7 +3007,7 @@ mod tests {
     }
 
     /// The lifecycle ADR-0010 makes live for the first time: a cartridge left
-    /// `pending_erase` by `compact-finish`, bulk-erased, then reused. No
+    /// `pending_erase` by `compact-finish`, erased in the drive, then reused. No
     /// precondition, no `--force`.
     #[test]
     fn a_pending_erase_cartridge_is_reusable_with_no_override() {

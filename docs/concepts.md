@@ -352,8 +352,10 @@ If both directories already exist, both are kept and new reports go to
 A **cartridge** is the physical object: the plastic shell with tape in it. A
 **volume** is the logical tape image tapectl writes onto a cartridge, with a
 label you choose (`L8-0001`). They are tracked separately because a cartridge
-outlives its volumes. You can retire a volume, bulk-erase the cartridge, and
-initialize a new volume on the same cartridge.
+outlives its volumes. You can retire a volume, erase the cartridge in the
+drive, and initialize a new volume on the same cartridge. Never degauss
+(bulk-erase) an LTO cartridge: that destroys the servo tracks written on it at
+the factory, and no drive can use it again.
 
 - **A cartridge is known by its chip serial.** Every LTO cartridge has a memory
   chip (MAM) that reports a serial number. That serial is the cartridge's
@@ -679,7 +681,7 @@ retired with the cartridge, each to the status it had before.
 | `initialized` | `volume init` wrote the ID file. This is the only status `volume write` or `volume resume` accepts. An interrupted write leaves the volume here; the session's own progress is tracked separately. |
 | `sealed` | Written, sealed, confirmed. Immutable. The only status that counts as a copy. |
 | `retired` | You took it out of service (`volume retire` shows the impact first; `compact-finish` and `cartridge retire` also retire volumes). Not a copy. `volume retire` accepts a volume in any status. |
-| `erased` | Its cartridge was bulk-erased (`cartridge mark-erased`) or re-initialized with a new volume. The bytes are gone. |
+| `erased` | Its cartridge was erased (`cartridge mark-erased`) or re-initialized with a new volume. The bytes are gone. |
 | `active` | Set only by [`import`](cli/import.md), for a volume written outside this catalog. |
 | `full` | Legacy: a volume sealed before the current tape format. No current command sets it. Treated like `sealed` for inventory. |
 
@@ -716,7 +718,7 @@ stateDiagram-v2
     [*] --> in_use : auto-registered by volume init or catalog rebuild
     available --> in_use : a volume is bound to it (volume init, catalog rebuild)
     in_use --> pending_erase : its last live volume is retired
-    pending_erase --> available : cartridge mark-erased (after a physical bulk erase)
+    pending_erase --> available : cartridge mark-erased (after an erase in the drive)
     in_use --> available : cartridge mark-erased, with consent
     pending_erase --> in_use : volume init reuses it
     available --> retired_permanent : cartridge retire
@@ -731,7 +733,7 @@ stateDiagram-v2
 |---|---|
 | `available` | Registered and holding no live volume, ready for `volume init`. |
 | `in_use` | Holds at least one volume. |
-| `pending_erase` | Its volumes have all been retired. It is waiting for you to bulk-erase it and run `cartridge mark-erased`. |
+| `pending_erase` | Its volumes have all been retired. It is waiting for you to erase it in the drive (`mt erase`, or a filemark at the start with `mt weof 1`; never a degausser) and run `cartridge mark-erased`. |
 | `retired_permanent` | You declared the medium unfit (`cartridge retire`, from any status). It is never written again. `cartridge mark-erased` refuses it. Only `cartridge unretire` brings it back, restoring the prior status when the catalog's event history still has it. |
 
 `cartridge mark-erased` on a cartridge that is not `pending_erase` needs

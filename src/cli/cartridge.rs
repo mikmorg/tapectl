@@ -105,6 +105,11 @@ pub enum CartridgeCommands {
     },
     /// Mark a cartridge as erased (available for reuse)
     ///
+    /// Run it after erasing the tape in the drive: a long erase (`mt -f
+    /// <device> erase`, hours on real LTO) or a filemark at its start (`mt
+    /// -f <device> rewind; mt -f <device> weof 1`). Never degauss or
+    /// bulk-erase an LTO cartridge: that destroys its factory servo tracks.
+    ///
     /// Refused outright on a `retired_permanent` cartridge — no `--force`, no
     /// `--yes`, no exception (ADR-0011, corrected 2026-09-14):
     /// this command's own mutation is the cartridge returning to `available`,

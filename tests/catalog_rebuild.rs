@@ -1573,8 +1573,8 @@ fn a_serial_with_no_identity_source_also_rebuilds_unbound_and_says_so() {
 }
 
 /// The recipe `volume_init`'s `AlreadySealed` refusal prints — "retire its
-/// current volume, bulk-erase the physical tape, then run `tapectl cartridge
-/// mark-erased`" — must reach a rebuilt tape rather than dead-end on a
+/// current volume, erase the tape IN THE DRIVE …, then run `tapectl
+/// cartridge mark-erased`" — must reach a rebuilt tape rather than dead-end on a
 /// missing row. Before issue #165 there was no cartridge row to name at all.
 ///
 /// Issue #289 changed what "runnable" means here, and the change is the

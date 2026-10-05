@@ -1813,7 +1813,7 @@ tapectl cartridge edit L6-0001 --generation LTO-5  # the registration was wrong 
 tapectl cartridge move L6-0001 --to offsite-vault   # the cartridge and every volume on it
 tapectl cartridge retire L6-0001            # worn out or too many errors: never write it again
 tapectl cartridge unretire L6-0001          # you were wrong about the medium; undo the retire
-tapectl cartridge mark-erased L6-0001       # after a physical erase
+tapectl cartridge mark-erased L6-0001       # after erasing it in the drive (mt erase; never a degausser)
 tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did not (later commands use the new barcode)
 ```
 

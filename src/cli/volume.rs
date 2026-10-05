@@ -27,8 +27,10 @@ pub enum VolumeCommands {
         /// (a filemark at the beginning of the tape). Refused by
         /// default — loading the wrong cartridge would
         /// otherwise silently overwrite it. Never overrides a cartridge
-        /// that is already SEALED (ADR-0003): bulk-erase the physical tape
-        /// and run `cartridge mark-erased` first for that case. It also
+        /// that is already SEALED (ADR-0003): retire its volume, erase the
+        /// tape in the drive (`mt erase`, or `mt weof 1` at the start) and
+        /// run `cartridge mark-erased` first for that case. Never degauss
+        /// an LTO cartridge: that destroys its servo tracks. It also
         /// never overrides the drive/media compatibility refusal, which is
         /// a physical fact rather than a risk judgement (ADR-0010).
         #[arg(long)]

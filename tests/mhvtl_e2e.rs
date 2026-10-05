@@ -151,8 +151,9 @@ fn mhvtl_load() {
         "no generation-matched cartridge could be loaded into the mhvtl drive; \
          the gate cannot run without one"
     );
-    // Bulk-erase the scratch cartridge — the test equivalent of the production
-    // reuse procedure (#27: retire, bulk-erase, `cartridge mark-erased`). The
+    // Long-erase the scratch cartridge in the drive — the test equivalent of
+    // the production reuse procedure (#27: retire, erase in the drive,
+    // `cartridge mark-erased`; never a degausser, #417). The
     // gated suite reuses ONE cartridge across many writes, so from the second
     // run onward it carries a SEALED volume, and contact discipline correctly
     // refuses to overwrite it (ADR-0003 — `--force` cannot and must not defeat

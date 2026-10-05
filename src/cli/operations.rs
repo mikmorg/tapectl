@@ -1359,7 +1359,7 @@ fn print_cartridge_retire_impact(
 fn mark_erased_consent_facts(barcode: &str, status: &str, volume_labels: &[String]) -> Vec<String> {
     let mut facts = vec![format!(
         "cartridge \"{barcode}\" is in status \"{status}\", not \"pending_erase\" -- \
-         marking it erased skips the normal bulk-erase lifecycle checkpoint"
+         marking it erased skips the normal retire-then-erase lifecycle checkpoint"
     )];
     for label in volume_labels {
         facts.push(format!(
@@ -1445,7 +1445,7 @@ fn print_mark_erased_impact(
 ///
 /// **This floor is a structural no-op on the ORDINARY `pending_erase`
 /// lifecycle**, not merely scoped away from it: by the time `mark-erased`
-/// runs at the end of retire → bulk-erase → mark-erased, the volume was
+/// runs at the end of retire → erase in the drive → mark-erased, the volume was
 /// already moved to `'retired'` by `volume retire` (which ran this same
 /// floor itself before that transition). `holds_sealed_bytes` — the
 /// predicate [`crate::policy::coverage::versions_at_stake`] joins the
@@ -1458,7 +1458,7 @@ fn print_mark_erased_impact(
 /// Enforces the physical-reuse lifecycle (ADR-0008 Tier 2): the cartridge
 /// should be in `pending_erase` — the state `volume compact-finish` (and
 /// the write path generally) leaves it in once its data has actually been
-/// superseded and the physical tape is meant to be bulk-erased next.
+/// superseded and the physical tape is meant to be erased (in the drive) next.
 /// Marking a cartridge erased from any OTHER status skips that checkpoint
 /// and needs consent (`--force`, the global `--yes`, or an interactive
 /// confirmation; a non-interactive session with neither refuses rather
@@ -1526,7 +1526,7 @@ pub fn cartridge_mark_erased(
     }
 
     // Currently-mounted volume(s), if any -- these physically lose their
-    // data the instant the cartridge is bulk-erased, so they move to
+    // data the instant the cartridge is erased, so they move to
     // 'erased' regardless of which path (pending_erase, or an override)
     // got us here.
     let mut stmt = conn.prepare(
@@ -1636,7 +1636,7 @@ pub fn cartridge_mark_erased(
 
     // ADR-0008 Tier 2: the normal path (cartridge already pending_erase)
     // needs no consent at all -- it's the expected end of the retire ->
-    // bulk-erase -> mark-erased lifecycle. Any OTHER status is a
+    // erase -> mark-erased lifecycle. Any OTHER status is a
     // precondition violation and needs an explicit override.
     if status != "pending_erase" {
         let facts = mark_erased_consent_facts(barcode, &status, &volume_labels);
@@ -7590,7 +7590,7 @@ mod tests {
         fn pending_erase_proceeds_without_consent_and_moves_the_volume_to_erased() {
             // Safe with force=false, assume_yes=false: the cartridge is
             // already pending_erase (the expected end of the retire ->
-            // bulk-erase -> mark-erased lifecycle), so the gate is never
+            // erase -> mark-erased lifecycle), so the gate is never
             // reached.
             let (conn, cart_id, vol_id) = setup_cartridge("pending_erase", true);
             cartridge_mark_erased(&conn, "BC001", false, false, false, false)
@@ -7823,7 +7823,7 @@ mod tests {
         }
 
         /// The positive control for the floor's PLACEMENT, not just its
-        /// existence (issue #289): on the ORDINARY retire -> bulk-erase ->
+        /// existence (issue #289): on the ORDINARY retire -> erase ->
         /// mark-erased lifecycle, `volume_retire` already ran this same
         /// floor and, on success, left the volume `'retired'` and freed the
         /// cartridge to `pending_erase` (`free_cartridge_if_last_live`).

@@ -961,8 +961,11 @@ being overwritten (ADR-0010).
 ```text
 error: refusing to write volume "<label>": the loaded cartridge already carries a SEALED volume — a valid seal
 marker parses at tape position <n>. ADR-0003: sealed volumes are immutable, there is no append, and --force
-cannot override this. If this cartridge should be reused: retire its current volume, bulk-erase the physical
-tape, then run `tapectl cartridge mark-erased` before writing to it again.
+cannot override this. If this cartridge should be reused: retire its current volume, erase the tape in the drive
+(a long erase, `mt -f <device> erase`, takes hours on real LTO; a filemark at its start, `mt -f <device> rewind;
+mt -f <device> weof 1`, takes seconds and then needs `volume init --force`), then run `tapectl cartridge
+mark-erased` before writing to it again. Never degauss or bulk-erase an LTO cartridge: that destroys its factory
+servo tracks, and the cartridge with them.
 ```
 
 This is a Tier-3 refusal. A sealed tape is never appended to or written over,
@@ -975,17 +978,32 @@ sealed tape of any label. If you really mean to reuse the cartridge:
    ```bash
    tapectl volume retire <old-label>
    ```
-2. Erase the tape. A bulk eraser works, and so does the drive's long erase
-   (`mt -f "$TAPE" erase`, which takes hours on real LTO).
+2. Erase the tape **in the drive**. Never use a bulk eraser (degausser) on an
+   LTO cartridge: LTO tape carries servo tracks written at the factory, a
+   degausser wipes them, and no drive can use the cartridge after that. Two
+   ways work:
+   - A long erase overwrites the whole tape and leaves it blank. It takes
+     hours on real LTO:
+     ```bash
+     mt -f "$TAPE" erase
+     ```
+   - A filemark at the start of the tape takes seconds. The old data stays on
+     the tape past it, unreachable to a normal read but not overwritten:
+     ```bash
+     mt -f "$TAPE" rewind
+     mt -f "$TAPE" weof 1
+     ```
 3. Record that its bytes are gone, then initialise it again:
    ```bash
    tapectl cartridge mark-erased <barcode>
    tapectl volume init <new-label> --device "$TAPE"
    ```
-
-If instead you only wrote a filemark at the start of the tape (`mt weof 1`),
-the seal is no longer readable. `volume init` then reports File 0 as EMPTY or
-unparseable, and wants `--force` (see the previous entry).
+   After a long erase the tape is blank and `volume init` needs nothing more.
+   After the filemark the seal is no longer readable, `volume init` reports
+   File 0 as EMPTY, and wants `--force` (see the previous entry):
+   ```bash
+   tapectl volume init <new-label> --device "$TAPE" --force
+   ```
 
 ### The drive reports no medium serial: name the cartridge
 
