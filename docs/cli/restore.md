@@ -30,9 +30,9 @@ tapectl restore unit [OPTIONS] --unit <UNIT> --from <FROM> --to <TO>
 - `--from <FROM>` *(required)* — Volume label
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--scratch <DIR>` — Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside --to. Never the system temp directory: a unit's slices can be as large as the unit
+- `--scratch <DIR>` — Where the restore's scratch directory is made (removed when the restore ends); defaults to inside --to, never the system temp directory. A unit whose isolated catalogue from `stage create` is on disk streams its slices into dar and puts only named pipes there; otherwise (a rebuilt catalog, dar older than 2.7.9) every decrypted slice waits there, as large as the unit
 - `--overwrite` — Restore into a destination that already holds files, replacing any that collide. Without it a destination that is not empty is refused before the tape is touched
-- `--no-space-check` — Skip the free-space check (about twice the unit's size, plus one slice, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
+- `--no-space-check` — Skip the free-space check (the unit's size when it streams; about twice that when its slices are spooled, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
 - `--dry-run` — Show what would be restored without restoring
 
 ### tapectl restore file
@@ -50,9 +50,9 @@ tapectl restore file [OPTIONS] --file <FILE> --unit <UNIT> --from <FROM> --to <T
 - `--from <FROM>` *(required)* — Volume label
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--scratch <DIR>` — Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside --to. Never the system temp directory: a unit's slices can be as large as the unit
+- `--scratch <DIR>` — Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside --to, never the system temp directory. With the unit's isolated catalogue from `stage create` on disk only the slices holding the file (and the last) are read; otherwise every slice
 - `--overwrite` — Replace a file of the same name already in --to. Without it one is refused before the tape is touched
-- `--no-space-check` — Skip the free-space check (the unit's decrypted slices, plus one slice and the file, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
+- `--no-space-check` — Skip the free-space check (the decrypted slices read, plus the file, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
 
 ### tapectl restore raw-volume
 

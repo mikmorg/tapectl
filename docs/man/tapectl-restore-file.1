@@ -53,13 +53,13 @@ tapectl home directory: database, keys, catalogs, stage\-reports, logs.
 Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
 .TP
 \fB\-\-scratch\fR \fI<DIR>\fR
-Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside \-\-to. Never the system temp directory: a unit\*(Aqs slices can be as large as the unit
+Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside \-\-to, never the system temp directory. With the unit\*(Aqs isolated catalogue from `stage create` on disk only the slices holding the file (and the last) are read; otherwise every slice
 .TP
 \fB\-\-overwrite\fR
 Replace a file of the same name already in \-\-to. Without it one is refused before the tape is touched
 .TP
 \fB\-\-no\-space\-check\fR
-Skip the free\-space check (the unit\*(Aqs decrypted slices, plus one slice and the file, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
+Skip the free\-space check (the decrypted slices read, plus the file, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

@@ -746,7 +746,7 @@ tapectl restore file --file 1998-letter-to-mum.txt --unit family/letters \
 # Dry run
 tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE" --dry-run
 
-# A large unit: the decrypted slices wait on another disk
+# A large unit whose slices are spooled: they wait on another disk
 tapectl restore unit --unit family/letters --from L8-0002 --to /srv/restore/letters \
   --scratch /mnt/big --device "$TAPE"
 
@@ -777,23 +777,33 @@ Before it opens the drive, a restore checks everything it can without the
 tape, and refuses with nothing read
 ([troubleshooting](troubleshooting.md#restoring)):
 
-- **Space.** A restore decrypts every slice of the unit to disk before dar
-  extracts them. The slices wait in a `.tapectl-restore-tmp` directory inside
-  `--to`, or inside `--scratch DIR` when you name one, and never in the system
-  temp directory. With both on one disk a unit needs about twice its size
-  free, plus one slice; `restore file` needs the unit's slices plus the one
-  file. Pick a `--to` with room: `/tmp`, used in these small examples, is often
-  RAM or the root filesystem. `--no-space-check` skips the check, for a
-  compressed or thin-provisioned filesystem that holds more than it reports
-  free.
+- **Space.** A unit whose isolated catalogue from `stage create` is still on
+  disk (under `~/.tapectl/catalogs/`) **streams**: each slice is decrypted
+  off the tape straight into dar through a named pipe, so it needs only about
+  the unit's size free in `--to`, and the drive keeps reading while dar
+  extracts. Otherwise — a catalog rebuilt from tape, or dar older than 2.7.9 —
+  the restore **spools**: every slice is decrypted to disk before dar
+  extracts them, in a `.tapectl-restore-tmp` directory inside `--to`, or
+  inside `--scratch DIR` when you name one, never in the system temp
+  directory; with both on one disk a unit then needs about twice its size
+  free. `restore file` needs the slices it reads plus the one file. Pick a
+  `--to` with room: `/tmp`, used in these small examples, is often RAM or the
+  root filesystem. `--no-space-check` skips the check, for a compressed or
+  thin-provisioned filesystem that holds more than it reports free.
 - **The destination.** `restore unit` wants an empty or new `--to`, and
   `restore file` refuses when a file of the same name is already there.
   `--overwrite` restores anyway and replaces what collides.
 - **The file.** `restore file --file` must be a path the catalog recorded for
   that version, relative to the unit's root, as `catalog ls` and
   `catalog search` print it. A directory is refused: restore the unit. dar is
-  asked for that one entry, but every slice of the unit is still read off the
-  tape.
+  asked for that one entry, and with the unit's isolated catalogue on disk
+  only the slices that hold it, its directories and dar's own catalogue (the
+  last slice) are read off the tape; without it, every slice.
+- **A streamed restore that fails partway** — a slice that fails its
+  checksum, a read error — has already let dar extract what came before it
+  into `--to`. The error says so: empty `--to` (or restore again with
+  `--overwrite`) before you trust it. A spooled restore extracts nothing until
+  every slice has been read.
 - **A leftover scratch directory.** A restore that was killed, or lost power,
   leaves its `.tapectl-restore-tmp` behind, and it may hold decrypted data. The
   next restore refuses and names it; remove it by hand.

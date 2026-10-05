@@ -31,10 +31,12 @@ pub enum RestoreCommands {
         /// does
         #[arg(long)]
         version: Option<i64>,
-        /// Where the decrypted slices wait for dar: a scratch directory is
-        /// made inside DIR and removed when the restore ends. Defaults to
-        /// inside --to. Never the system temp directory: a unit's slices
-        /// can be as large as the unit
+        /// Where the restore's scratch directory is made (removed when the
+        /// restore ends); defaults to inside --to, never the system temp
+        /// directory. A unit whose isolated catalogue from `stage create`
+        /// is on disk streams its slices into dar and puts only named
+        /// pipes there; otherwise (a rebuilt catalog, dar older than 2.7.9)
+        /// every decrypted slice waits there, as large as the unit
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Restore into a destination that already holds files, replacing
@@ -42,10 +44,11 @@ pub enum RestoreCommands {
         /// refused before the tape is touched
         #[arg(long)]
         overwrite: bool,
-        /// Skip the free-space check (about twice the unit's size, plus one
-        /// slice, with the scratch directory and --to on one disk), for a
-        /// filesystem that holds more than it reports free, such as a
-        /// compressed or thin-provisioned one
+        /// Skip the free-space check (the unit's size when it streams;
+        /// about twice that when its slices are spooled, with the scratch
+        /// directory and --to on one disk), for a filesystem that holds
+        /// more than it reports free, such as a compressed or
+        /// thin-provisioned one
         #[arg(long)]
         no_space_check: bool,
         /// Show what would be restored without restoring
@@ -81,18 +84,19 @@ pub enum RestoreCommands {
         version: Option<i64>,
         /// Where the decrypted slices wait for dar: a scratch directory is
         /// made inside DIR and removed when the restore ends. Defaults to
-        /// inside --to. Never the system temp directory: a unit's slices
-        /// can be as large as the unit
+        /// inside --to, never the system temp directory. With the unit's
+        /// isolated catalogue from `stage create` on disk only the slices
+        /// holding the file (and the last) are read; otherwise every slice
         #[arg(long, value_name = "DIR")]
         scratch: Option<String>,
         /// Replace a file of the same name already in --to. Without it one
         /// is refused before the tape is touched
         #[arg(long)]
         overwrite: bool,
-        /// Skip the free-space check (the unit's decrypted slices, plus one
-        /// slice and the file, with the scratch directory and --to on one
-        /// disk), for a filesystem that holds more than it reports free,
-        /// such as a compressed or thin-provisioned one
+        /// Skip the free-space check (the decrypted slices read, plus the
+        /// file, with the scratch directory and --to on one disk), for a
+        /// filesystem that holds more than it reports free, such as a
+        /// compressed or thin-provisioned one
         #[arg(long)]
         no_space_check: bool,
     },
@@ -207,13 +211,14 @@ pub fn run(
             // Issue #241: unlike `restore unit`, this has no preview. The
             // catalog check of `--file` runs before any tape contact (issue
             // #406), but proving the entry is really in the archive still
-            // means reading every slice of the unit off the tape.
+            // means reading its slices off the tape (every slice, without
+            // the unit's isolated catalogue on disk; issue #411).
             if dry_run {
                 return Err(crate::cli::refuse_dry_run(
                     "restore file",
                     "there is no cheap preview — the file is checked against the catalog \
                      before the tape is touched, but proving it is in the archive means \
-                     reading every slice of the unit. `restore unit --dry-run` previews the \
+                     reading its slices off the tape. `restore unit --dry-run` previews the \
                      containing unit at no cost.",
                 ));
             }

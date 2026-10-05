@@ -42,7 +42,7 @@ Path to config file.
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
 .TP
 \fB\-\-scratch\fR \fI<DIR>\fR
-Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside \-\-to. Never the system temp directory: a unit\*(Aqs slices can be as large as the unit
+Where the restore\*(Aqs scratch directory is made (removed when the restore ends); defaults to inside \-\-to, never the system temp directory. A unit whose isolated catalogue from `stage create` is on disk streams its slices into dar and puts only named pipes there; otherwise (a rebuilt catalog, dar older than 2.7.9) every decrypted slice waits there, as large as the unit
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, stage\-reports, logs.
@@ -53,7 +53,7 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 Restore into a destination that already holds files, replacing any that collide. Without it a destination that is not empty is refused before the tape is touched
 .TP
 \fB\-\-no\-space\-check\fR
-Skip the free\-space check (about twice the unit\*(Aqs size, plus one slice, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
+Skip the free\-space check (the unit\*(Aqs size when it streams; about twice that when its slices are spooled, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
 .TP
 \fB\-\-dry\-run\fR
 Show what would be restored without restoring

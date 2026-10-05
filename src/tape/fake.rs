@@ -64,6 +64,11 @@ pub(crate) struct State {
     pub watch: Option<std::path::PathBuf>,
     /// `(file read, whether `watch` existed then)`, one per read.
     pub watched: Vec<(u32, bool)>,
+    /// `(file read, bytes of regular files directly inside `watch` then)`,
+    /// one per read — how a test sees whether a restore SPOOLS decrypted
+    /// slices to disk or streams them through named pipes (issue #411; a
+    /// FIFO is not a regular file and holds nothing on disk).
+    pub watched_bytes: Vec<(u32, u64)>,
 }
 
 /// A cloneable handle: the test keeps one, `TapeStore` owns the other.
@@ -133,10 +138,26 @@ impl FakeTape {
         self.state().watched.clone()
     }
 
+    /// What every read since [`Self::watch`] saw on disk:
+    /// `(file, bytes of regular files directly inside the watched path)`.
+    pub(crate) fn watched_bytes(&self) -> Vec<(u32, u64)> {
+        self.state().watched_bytes.clone()
+    }
+
     fn note_read(s: &mut State, file: usize) {
         if let Some(path) = &s.watch {
             let seen = path.exists();
+            let bytes = std::fs::read_dir(path)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok()?.metadata().ok())
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0);
             s.watched.push((file as u32, seen));
+            s.watched_bytes.push((file as u32, bytes));
         }
     }
 

@@ -71,8 +71,9 @@ impl<'a> RestoreTarget<'a> {
 /// their `--scratch`, `--overwrite` and `--no-space-check` flags.
 #[derive(Debug, Clone, Default)]
 pub struct RestoreOptions {
-    /// Where the decrypted slices wait for dar: a `.tapectl-restore-tmp`
-    /// directory made inside this one. `None`: inside the destination.
+    /// Where the restore's `.tapectl-restore-tmp` directory is made.
+    /// `None`: inside the destination. A streamed restore (issue #411)
+    /// puts only its named pipes there; a spooled one its decrypted slices.
     /// Never `$TMPDIR` — a unit's slices can be hundreds of GiB, and a
     /// system temp directory is often RAM or the small root filesystem.
     pub scratch: Option<PathBuf>,
@@ -171,7 +172,7 @@ impl Drop for RestoreScratch {
 // comment blaming the count on "the store read seam in #71 (epic #20)" —
 // wrong: #71 was closed and scoped only to the write-side execute/confirm
 // seam. The read seam migrated here directly (issue #85): per-slice tape
-// access below now goes through `Store::read_file` via `restore_one_slice`,
+// access below now goes through `Store::read_file` via `read_slice`,
 // not a bespoke `TapeDevice` call.
 #[allow(clippy::too_many_arguments)]
 pub fn restore_unit(
@@ -242,14 +243,19 @@ fn restore_through_drive(
     // for a large unit), or never. A dry run takes the same checks, so a
     // dry run that says "would restore" means it.
     let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
-    preflight(conn, unit_name, &selection, target, &scratch, options)?;
+    // Issue #411: stream or spool, and which slices — decided here, so the
+    // space check asks for what this restore will actually write.
+    let plan = plan_restore(conn, config, &selection, target, &scratch)?;
+    preflight(
+        conn, unit_name, &selection, &plan, target, &scratch, options,
+    )?;
 
     if dry_run {
         return Ok(RestoreReport {
             unit_name: unit_name.to_string(),
             volume_label: volume_label.to_string(),
             version: selection.version,
-            slices: selection.positions.len(),
+            slices: plan.positions.len(),
             destination: target.destination().to_string(),
             dry_run: true,
             success: true,
@@ -302,6 +308,7 @@ fn preflight(
     conn: &Connection,
     unit_name: &str,
     selection: &RestoreSelection,
+    plan: &RestorePlan,
     target: RestoreTarget<'_>,
     scratch: &Path,
     options: &RestoreOptions,
@@ -367,7 +374,7 @@ fn preflight(
         info!("disk space not checked (--no-space-check)");
         return Ok(());
     }
-    check_restore_space(destination, scratch, selection, file_size)
+    check_restore_space(destination, scratch, plan, file_size)
 }
 
 /// The size `files` records for `file_path` in the selected version, after
@@ -456,32 +463,51 @@ fn placed_path(destination: &Path, file_path: &str) -> PathBuf {
 }
 
 /// Refuse a restore the disk cannot hold, before the first slice is read
-/// (issue #406) — the same arithmetic as RESTORE.sh's `check_space`, so the
-/// two restore paths agree. This design decrypts every slice of the version
-/// into scratch before dar extracts them (until the streaming restore
-/// lands), so scratch needs every slice (a decrypted slice is no larger
-/// than its ciphertext) plus the one being read; the destination receives
-/// about the archive's size again. On one filesystem they add up: about
-/// twice the unit, plus one slice. `restore file` extracts only its one file
-/// (into scratch, then moved into place), so its second term is that file.
+/// (issue #406), for what THIS restore writes ([`RestorePlan`], issue
+/// #411):
+///
+/// - **Streamed** (`restore unit` with its catalogue): nothing in scratch —
+///   each slice goes through a named pipe straight into dar — and about the
+///   archive's size in the destination.
+/// - **Spooled**: every slice read, decrypted, in scratch (a decrypted slice
+///   is no larger than its ciphertext, and since #411 no ciphertext copy
+///   waits beside it), then about the archive's size again in the
+///   destination. On one filesystem: about twice the unit.
+/// - **`restore file`**: the slices it reads (only those dar needs, when
+///   the catalogue is on disk) plus the one file, extracted in scratch and
+///   then moved into place.
+///
+/// RESTORE.sh's `check_space` (the heir's path, which always spools) asks
+/// for the spooled figure plus one slice.
 fn check_restore_space(
     destination: &Path,
     scratch: &Path,
-    selection: &RestoreSelection,
+    plan: &RestorePlan,
     file_size: Option<i64>,
 ) -> Result<()> {
-    let sizes = selection
+    let read: i64 = plan
         .positions
         .iter()
-        .map(|wp| wp.encrypted_bytes.max(0));
-    let total: i64 = sizes.clone().sum();
-    let largest: i64 = sizes.max().unwrap_or(0);
+        .map(|wp| wp.encrypted_bytes.max(0))
+        .sum();
+    let spooled = if plan.stream.is_some() { 0 } else { read };
     let scratch_root = scratch.parent().unwrap_or(scratch);
     let (scratch_need, dest_need) = match file_size {
         // Extracted into scratch, then renamed into place (or copied, when
         // the two are on different filesystems).
-        Some(file) => (total + largest + file, file),
-        None => (total + largest, total),
+        Some(file) => (spooled + file, file),
+        None => (spooled, read),
+    };
+    let why = if plan.stream.is_some() {
+        "A restore streams its slices into dar, so it needs about the unit's size in --to."
+    } else if file_size.is_some() {
+        "A restore file decrypts the slices it reads to disk before dar extracts the file \
+         from them, so it needs those slices and the file."
+    } else {
+        "This restore decrypts every slice of the unit to disk before dar extracts them (it \
+         streams only when the unit's isolated catalogue from `stage create` is on disk and \
+         dar is 2.7.9 or newer), so with the scratch space and --to on one disk it needs the \
+         unit's size about twice over."
     };
     let (Some(scratch_fs), Some(dest_fs)) = (existing(scratch_root), existing(destination)) else {
         warn!(
@@ -518,11 +544,9 @@ fn check_restore_space(
         }
         Err(TapectlError::Other(format!(
             "not enough disk space in {} for this restore: it needs about {}, and {} is free. \
-             Nothing was read from tape. A restore decrypts every slice of the unit to disk \
-             before dar extracts them, so with the scratch space and --to on one disk it needs \
-             the unit's size about twice over, plus one slice. Free space there, choose a \
-             larger disk with --to, or put the decrypted slices on another disk with --scratch \
-             DIR. (--no-space-check skips this check, for a filesystem that holds more than it \
+             Nothing was read from tape. {why} Free space there, choose a larger disk with \
+             --to, or put any decrypted slices on another disk with --scratch DIR. \
+             (--no-space-check skips this check, for a filesystem that holds more than it \
              reports free, such as a compressed or thin-provisioned one.)",
             dir.display(),
             crate::util::format_bytes_binary(bytes),
@@ -846,7 +870,7 @@ fn restore_unit_contacted(
     // ONE version's slices (issue #315). The version is resolved by the
     // caller — `restore_unit` before it opens the drive — and passed here
     // concretely, so the version counted and the version read are the same.
-    let positions = select_write_positions(conn, unit_name, volume_label, Some(version))?.positions;
+    let selection = select_write_positions(conn, unit_name, volume_label, Some(version))?;
 
     // Corroborate at contact (ADR-0012, issue #193), before a scratch
     // directory is made, before a key is loaded and before a single slice is
@@ -867,26 +891,48 @@ fn restore_unit_contacted(
     crate::volume::binding::corroborate_volume(conn, volume_id, volume_label, &medium)?;
     phase.done();
 
-    // Scratch dir for decrypted slices: inside the destination or
-    // `--scratch`, never $TMPDIR ([`scratch_dir`], issue #406). The guard
-    // removes it on EVERY path out of this function, not just the happy one
-    // — see `RestoreScratch`. Named in the log first: if this process is
-    // killed, that line says where decrypted data was left.
-    let restore_tmp = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
-    fs::create_dir_all(&restore_tmp).map_err(|e| {
-        TapectlError::Other(format!(
-            "cannot create the restore scratch directory {}: {e}",
-            restore_tmp.display()
-        ))
-    })?;
-    let _scratch = RestoreScratch(restore_tmp.clone());
-    info!(scratch = %restore_tmp.display(), "decrypted slices wait for dar here");
+    // ONE plan, decided again exactly as `restore_through_drive`'s preflight
+    // decided it before the drive opened: whether the slices stream into dar
+    // or spool to scratch, and which slices a `restore file` reads.
+    let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
+    let plan = plan_restore(conn, config, &selection, target, &scratch)?;
 
-    // Load every secret key the tenant owns, and the operator's, for trial
-    // decryption. Ownership comes from the catalog's key rows, so tenant
-    // `family` no longer also loads tenant `family-old`'s keys; with no row
-    // (after `catalog rebuild`) a file goes to every tenant it may belong to,
-    // so a tenant's own key is never withheld (issue #350, keys::KeyOwners).
+    let identities = load_identities(conn, paths, &tenant)?;
+    restore_planned(
+        config,
+        unit_name,
+        &plan,
+        target,
+        options,
+        &scratch,
+        &identities,
+        store,
+        trace,
+    )?;
+
+    info!(unit = unit_name, volume = volume_label, "restore complete");
+
+    Ok(RestoreReport {
+        unit_name: unit_name.to_string(),
+        volume_label: volume_label.to_string(),
+        version,
+        slices: plan.positions.len(),
+        destination: target.destination().to_string(),
+        dry_run: false,
+        success: true,
+    })
+}
+
+/// Every secret key the tenant owns, and the operator's, for trial
+/// decryption. Ownership comes from the catalog's key rows, so tenant
+/// `family` no longer also loads tenant `family-old`'s keys; with no row
+/// (after `catalog rebuild`) a file goes to every tenant it may belong to,
+/// so a tenant's own key is never withheld (issue #350, keys::KeyOwners).
+fn load_identities(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    tenant: &crate::db::models::Tenant,
+) -> Result<Vec<age::x25519::Identity>> {
     let mut identities = keys::load_tenant_identities(conn, &paths.keys_dir, &tenant.name)?;
     if !tenant.is_operator {
         if let Some(operator) = queries::get_operator_tenant(conn)? {
@@ -903,82 +949,254 @@ fn restore_unit_contacted(
             tenant.name,
         )));
     }
+    Ok(identities)
+}
 
-    let mut dar_slices: Vec<PathBuf> = Vec::new();
+/// How one restore gets its slices to dar, and which slices it reads —
+/// decided before the drive is opened ([`plan_restore`], issue #411).
+#[derive(Debug, Clone)]
+pub(crate) struct RestorePlan {
+    /// `Some(catalogue)`: stream — each slice is decrypted off the tape into
+    /// a named pipe `dar -x --sequential-read -A <catalogue>` reads, and
+    /// nothing of the unit is ever on disk outside the destination.
+    /// `None`: spool — every slice read is decrypted to a file in scratch,
+    /// then dar extracts from those files.
+    pub(crate) stream: Option<PathBuf>,
+    /// The slices to read, in tape order: every slice of the version, or
+    /// for a `restore file` with an isolated catalogue only those dar needs
+    /// for the one entry.
+    pub(crate) positions: Vec<WritePositionInfo>,
+}
 
+/// Decide how a restore of `selection` runs (issue #411), with no tape:
+///
+/// - **`restore unit` streams** when all of these hold, and spools
+///   otherwise: the stage set's own isolated catalogue is on disk
+///   ([`own_catalogue`]); the dar is new enough to read a sliced archive
+///   sequentially with it ([`dar::restore::STREAMING_MIN_VERSION`]); the
+///   slices lie on tape in slice order (dar asks for them in that order,
+///   and the tape is read forward); and the scratch directory's filesystem
+///   takes a named pipe.
+/// - **`restore file` reads only the slices dar needs** for the entry when
+///   the catalogue is on disk: the entry's own and its directories'
+///   ([`dar::restore::entry_slices`]), plus the archive's last, where dar
+///   reads its catalogue. Those are spooled and extracted in dar's direct
+///   mode — sequential mode cannot skip a slice. Without a catalogue every
+///   slice is read, as before.
+pub(crate) fn plan_restore(
+    conn: &Connection,
+    config: &Config,
+    selection: &RestoreSelection,
+    target: RestoreTarget<'_>,
+    scratch: &Path,
+) -> Result<RestorePlan> {
+    let all = selection.positions.clone();
+    let Some(catalogue) = own_catalogue(conn, selection.stage_set_id)? else {
+        return Ok(RestorePlan {
+            stream: None,
+            positions: all,
+        });
+    };
+    match target {
+        RestoreTarget::Unit { .. } => {
+            let stream = streamable(config, &all, scratch).then_some(catalogue);
+            Ok(RestorePlan {
+                stream,
+                positions: all,
+            })
+        }
+        RestoreTarget::File { file_path, .. } => {
+            let needed = dar::restore::entry_slices(&config.dar.binary, &catalogue, file_path)
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "cannot list the isolated catalogue; reading every slice");
+                    None
+                });
+            let positions = match needed {
+                Some(mut needed) => {
+                    if let Some(last) = all.iter().map(|wp| wp.slice_number).max() {
+                        needed.insert(last);
+                    }
+                    let subset: Vec<WritePositionInfo> = all
+                        .iter()
+                        .filter(|wp| needed.contains(&wp.slice_number))
+                        .cloned()
+                        .collect();
+                    // Every slice dar will ask for must be one this volume
+                    // carries; otherwise read them all, as before.
+                    if subset.len() == needed.len() {
+                        subset
+                    } else {
+                        all
+                    }
+                }
+                None => all,
+            };
+            Ok(RestorePlan {
+                stream: None,
+                positions,
+            })
+        }
+    }
+}
+
+/// The isolated dar catalogue `stage create` made for this stage set's OWN
+/// archive, when it is still on disk — `None` otherwise.
+///
+/// `stage create` isolates a catalogue once per snapshot and records the
+/// same `catalog_path` on every later stage set of it (issue #419, ruled
+/// to become one per stage set). A later stage set is a later `dar -c` run,
+/// and dar refuses (FATAL, measured on 2.7.13) to read an archive with a
+/// catalogue isolated from a different run, even of the same content — its
+/// slicing may differ too. So a catalogue counts only for the stage set
+/// that made it: the FIRST stage set of the snapshot to record that path.
+/// Once #419 gives each stage set its own path, each is its own first. A
+/// catalog rebuilt from tape records none.
+fn own_catalogue(conn: &Connection, stage_set_id: i64) -> Result<Option<PathBuf>> {
+    let row: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT ss.catalog_path,
+                    (SELECT MIN(o.id) FROM stage_sets o
+                     WHERE o.snapshot_id = ss.snapshot_id AND o.catalog_path = ss.catalog_path)
+             FROM stage_sets ss WHERE ss.id = ?1",
+            params![stage_set_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((Some(base), Some(owner))) = row else {
+        return Ok(None);
+    };
+    if owner != stage_set_id {
+        info!(
+            stage_set = stage_set_id,
+            catalogue_of = owner,
+            "the isolated catalogue on disk belongs to another staging of this version; not used"
+        );
+        return Ok(None);
+    }
+    let base = PathBuf::from(base);
+    let first = PathBuf::from(format!("{}.1.dar", base.display()));
+    Ok(first.is_file().then_some(base))
+}
+
+/// Whether a `restore unit` with its catalogue can stream (see
+/// [`plan_restore`]), each refusal said once in the log.
+fn streamable(config: &Config, positions: &[WritePositionInfo], scratch: &Path) -> bool {
+    match dar::version::check(&config.dar.binary) {
+        Ok(v) if dar::restore::supports_streaming(&v) => {}
+        Ok(v) => {
+            info!(
+                dar = %v.full_string,
+                "this dar cannot read a sliced archive sequentially; the slices are spooled"
+            );
+            return false;
+        }
+        Err(_) => return false,
+    }
+    let in_slice_order = positions.windows(2).all(|w| {
+        w[0].slice_number < w[1].slice_number
+            && w[0].position.parse::<u32>().ok() < w[1].position.parse::<u32>().ok()
+    });
+    if !in_slice_order {
+        info!("the slices are not on tape in slice order; they are spooled");
+        return false;
+    }
+    if !takes_a_named_pipe(scratch) {
+        info!(
+            scratch = %scratch.display(),
+            "the scratch directory's filesystem does not take a named pipe; the slices are spooled"
+        );
+        return false;
+    }
+    true
+}
+
+/// Whether the filesystem the scratch directory will be made on takes a
+/// named pipe: one is made beside where it will be, and removed.
+fn takes_a_named_pipe(scratch: &Path) -> bool {
+    let Some(dir) = scratch.parent().and_then(existing) else {
+        return false;
+    };
+    let probe = dir.join(format!(".tapectl-fifo-probe-{}", std::process::id()));
+    let made = nix::unistd::mkfifo(&probe, nix::sys::stat::Mode::S_IRUSR).is_ok();
+    let _ = fs::remove_file(&probe);
+    made
+}
+
+/// Run `plan` against `store`: make the scratch directory (removed on every
+/// way out — [`RestoreScratch`]), get the slices to dar — streamed or
+/// spooled — and, for `restore file`, place the one entry.
+#[allow(clippy::too_many_arguments)]
+fn restore_planned(
+    config: &Config,
+    unit_name: &str,
+    plan: &RestorePlan,
+    target: RestoreTarget<'_>,
+    options: &RestoreOptions,
+    scratch: &Path,
+    identities: &[age::x25519::Identity],
+    store: &mut dyn Store,
+    trace: &mut RestoreTrace,
+) -> Result<()> {
+    // Scratch: inside the destination or `--scratch`, never $TMPDIR
+    // ([`scratch_dir`], issue #406). Named in the log first: if this process
+    // is killed, that line says where decrypted data may be left.
+    fs::create_dir_all(scratch).map_err(|e| {
+        TapectlError::Other(format!(
+            "cannot create the restore scratch directory {}: {e}",
+            scratch.display()
+        ))
+    })?;
+    let _scratch = RestoreScratch(scratch.to_path_buf());
+    let archive_base = scratch.join("restore");
+
+    if let (Some(catalogue), RestoreTarget::Unit { dest_dir }) = (&plan.stream, target) {
+        info!(scratch = %scratch.display(), "slices stream to dar through named pipes here");
+        return stream_into_dar(
+            config,
+            unit_name,
+            &plan.positions,
+            catalogue,
+            &archive_base,
+            Path::new(dest_dir),
+            options,
+            identities,
+            store,
+            trace,
+        );
+    }
+
+    info!(scratch = %scratch.display(), "decrypted slices wait for dar here");
     // Issue #386: the tape read and decrypt, counted as ciphertext off the
     // tape, then dar's extract as a phase of its own.
-    let phase = progress::phase(
-        "read",
-        Some(
-            positions
-                .iter()
-                .map(|wp| wp.encrypted_bytes.max(0) as u64)
-                .sum(),
-        ),
-    );
-    for (i, wp) in positions.iter().enumerate() {
-        let position: u32 = wp.position.parse().unwrap_or(0);
-        phase.item(format!(
-            "{unit_name} slice {} of {} (file {position})",
-            i + 1,
-            positions.len()
-        ));
+    let phase = progress::phase("read", Some(ciphertext_bytes(&plan.positions)));
+    for (i, wp) in plan.positions.iter().enumerate() {
+        note_slice(&phase, unit_name, i, plan.positions.len(), wp);
         // Issue #404: between slices — nothing has been extracted into the
         // destination yet.
         crate::signal::check(|| {
             format!(
                 "restore of \"{unit_name}\" stopped after reading {i} of {} slices, before \
                  anything was extracted; run the restore again",
-                positions.len()
+                plan.positions.len()
             )
         })?;
-        info!(
-            slice = i + 1,
-            total = positions.len(),
-            tape_pos = position,
-            "reading slice from tape"
-        );
-
         // dar expects: basename.N.dar
-        let slice_path = restore_tmp.join(format!("restore.{}.dar", wp.slice_number));
-        let ciphertext_tmp_path =
-            restore_tmp.join(format!("restore.{}.dar.age.tmp", wp.slice_number));
-
-        let plain_size = restore_one_slice(
-            store,
-            position,
-            wp,
-            &identities,
-            &ciphertext_tmp_path,
-            &slice_path,
-        )?;
-        dar_slices.push(slice_path);
+        let slice_path = scratch.join(format!("restore.{}.dar", wp.slice_number));
+        let plain_size = read_slice(store, wp, identities, SliceSink::File(&slice_path))?;
         trace.slices_read += 1;
         trace.bytes_decrypted += plain_size as i64;
-
-        info!(
-            slice = i + 1,
-            // Binary (issue #204): a decrypted slice is a measured data
-            // size, so this stays 1024-based -- only the field name was
-            // wrong, not the division.
-            mib = plain_size / (1024 * 1024),
-            "decrypted slice"
-        );
     }
+    phase.done();
 
     // Run dar extract. Its report is kept whenever it ran, on both verdicts
     // (issue #306); the version is read only once dar has actually run, so
     // a restore that never reached dar records no version either.
-    phase.done();
-
-    let archive_base = restore_tmp.join("restore");
     let phase = progress::phase("extract", None);
     phase.item(unit_name.to_string());
     // `restore unit` extracts the whole archive into the destination;
     // `restore file` asks dar for its one entry (`-g`, issue #406) into
     // scratch, and places it below.
-    let extracted = restore_tmp.join("extract");
+    let extracted = scratch.join("extract");
     let (report, verdict) = match target {
         RestoreTarget::Unit { dest_dir } => {
             info!("extracting dar archive to {dest_dir}");
@@ -999,20 +1217,9 @@ fn restore_unit_contacted(
             )
         }
     };
-    if report.is_some() {
-        trace.dar_version = dar::version::check(&config.dar.binary)
-            .ok()
-            .map(|v| v.full_string);
-    }
-    trace.dar = report;
+    record_dar(config, trace, report);
     verdict?;
     phase.done();
-
-    // No explicit cleanup here on purpose: `_scratch` removes the whole
-    // directory on the way out. The hand-rolled version this replaces walked
-    // `dar_slices`, then swept the directory for hash files, then removed the
-    // directory — three steps that only ran if every `?` above succeeded.
-    drop(dar_slices);
 
     // `restore file`: place the one requested entry, inside the recorded
     // span (see `RestoreTarget`).
@@ -1024,145 +1231,362 @@ fn restore_unit_contacted(
         place_one_entry(&extracted, file_path, Path::new(file_dest))?;
         trace.placed = true;
     }
-
-    info!(unit = unit_name, volume = volume_label, "restore complete");
-
-    Ok(RestoreReport {
-        unit_name: unit_name.to_string(),
-        volume_label: volume_label.to_string(),
-        version,
-        slices: positions.len(),
-        destination: target.destination().to_string(),
-        dry_run: false,
-        success: true,
-    })
+    Ok(())
 }
 
-/// Restore one slice: read it off `store` at `position`, verify its on-tape
-/// (true, unpadded) bytes hash to `wp.sha256_encrypted`, decrypt with
-/// whichever of `identities` matches, and stream the plaintext to
-/// `output_path`, verifying it hashes to `wp.sha256_plain`. Returns the
-/// plaintext byte count.
+fn ciphertext_bytes(positions: &[WritePositionInfo]) -> u64 {
+    positions
+        .iter()
+        .map(|wp| wp.encrypted_bytes.max(0) as u64)
+        .sum()
+}
+
+fn note_slice(
+    phase: &progress::Phase,
+    unit_name: &str,
+    i: usize,
+    total: usize,
+    wp: &WritePositionInfo,
+) {
+    phase.item(format!(
+        "{unit_name} slice {} of {total} (file {})",
+        i + 1,
+        wp.position
+    ));
+    info!(
+        slice = wp.slice_number,
+        n = i + 1,
+        total,
+        tape_pos = %wp.position,
+        "reading slice from tape"
+    );
+}
+
+/// Keep dar's report, and its version once it has run (issue #306).
+fn record_dar(config: &Config, trace: &mut RestoreTrace, report: Option<DarReport>) {
+    if report.is_some() {
+        trace.dar_version = dar::version::check(&config.dar.binary)
+            .ok()
+            .map(|v| v.full_string);
+    }
+    trace.dar = report;
+}
+
+/// The streamed restore (issue #411): a named pipe per slice in scratch,
+/// `dar -x --sequential-read -A <catalogue>` reading them in slice order,
+/// and each slice decrypted off the tape into its pipe as the tape is read
+/// — no decrypted byte is ever on disk outside the destination, and the
+/// drive streams while dar extracts (the tape read runs ahead of the
+/// decrypt by the read pipeline's queue, issue #390).
 ///
-/// On any error, both `ciphertext_tmp_path` and a partial `output_path` are
-/// best-effort removed rather than left behind — mirrors
-/// `encrypt_file_streaming`'s cleanup-on-error convention (`src/staging/
-/// mod.rs`). The ciphertext temp file is disposable either way, success or
-/// failure, since nothing downstream ever needs it again once this call
-/// returns.
-fn restore_one_slice(
+/// dar extracts AS the slices arrive, so a failure partway — a slice that
+/// fails its checksum, a tape read error — leaves what dar had extracted
+/// by then in the destination. The error says so.
+#[allow(clippy::too_many_arguments)]
+fn stream_into_dar(
+    config: &Config,
+    unit_name: &str,
+    positions: &[WritePositionInfo],
+    catalogue: &Path,
+    archive_base: &Path,
+    dest: &Path,
+    options: &RestoreOptions,
+    identities: &[age::x25519::Identity],
     store: &mut dyn Store,
-    position: u32,
+    trace: &mut RestoreTrace,
+) -> Result<()> {
+    // Every pipe exists before dar starts: dar opens slice 1, then each
+    // next slice as it finishes the one before.
+    let pipes: Vec<PathBuf> = positions
+        .iter()
+        .map(|wp| {
+            PathBuf::from(format!(
+                "{}.{}.dar",
+                archive_base.display(),
+                wp.slice_number
+            ))
+        })
+        .collect();
+    for pipe in &pipes {
+        nix::unistd::mkfifo(
+            pipe,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .map_err(|e| {
+            TapectlError::Other(format!(
+                "cannot make the named pipe {}: {e}",
+                pipe.display()
+            ))
+        })?;
+    }
+    info!(
+        "extracting dar archive to {} as its slices are read",
+        dest.display()
+    );
+    let darx = dar::restore::SequentialExtract::spawn(
+        &config.dar.binary,
+        archive_base,
+        catalogue,
+        dest,
+        options.overwrite,
+    )?;
+
+    let phase = progress::phase("read", Some(ciphertext_bytes(positions)));
+    let mut failure = None;
+    for (i, (wp, pipe)) in positions.iter().zip(&pipes).enumerate() {
+        note_slice(&phase, unit_name, i, positions.len(), wp);
+        // Issue #404: between slices. dar has been extracting as the slices
+        // arrived, so a stop here leaves a partial restore — said below.
+        if let Err(e) = crate::signal::check(|| {
+            format!(
+                "restore of \"{unit_name}\" stopped after reading {i} of {} slices",
+                positions.len()
+            )
+        }) {
+            failure = Some(e);
+            break;
+        }
+        let sink = SliceSink::Pipe {
+            path: pipe,
+            dar: &darx,
+        };
+        match read_slice(store, wp, identities, sink) {
+            Ok(plain_size) => {
+                trace.slices_read += 1;
+                trace.bytes_decrypted += plain_size as i64;
+            }
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+    if failure.is_some() {
+        // dar may be waiting to open the next slice's pipe; it would wait
+        // forever.
+        darx.kill();
+    } else {
+        phase.done();
+    }
+    let (report, verdict) = darx.finish();
+    record_dar(config, trace, report);
+    if let Some(e) = failure {
+        let partial = |what: String| {
+            format!(
+                "{what}. dar was extracting the unit into {} as its slices arrived, so that \
+                 directory may now hold a partial restore: empty it (or restore again with \
+                 --overwrite) before trusting what is there",
+                dest.display()
+            )
+        };
+        // A stop by signal (#404) stays one, so it exits as one.
+        return Err(match e {
+            TapectlError::Interrupted(what) => TapectlError::Interrupted(partial(what)),
+            other => TapectlError::Other(partial(other.to_string())),
+        });
+    }
+    verdict
+}
+
+/// Where one slice's plaintext goes.
+enum SliceSink<'a> {
+    /// A file in scratch — the spooled restore.
+    File(&'a Path),
+    /// The named pipe `dar` reads this slice from — the streamed restore.
+    Pipe {
+        path: &'a Path,
+        dar: &'a dar::restore::SequentialExtract,
+    },
+}
+
+/// Read one slice off `store` and decrypt it into `sink`, in ONE pass
+/// (issue #411). Returns the plaintext byte count.
+///
+/// The slice streams off the store (`Store::read_file` is push-based, its
+/// tape read on a thread of its own up to `pipeline::QUEUE_BYTES` ahead,
+/// issue #390) through a [`TruncatingWriter`] that trims the block padding
+/// to `wp.encrypted_bytes` (the DB-recorded true length) and a
+/// [`HashingWriter`] for the ciphertext hash, into an OS pipe; a decrypt
+/// thread pulls from the pipe (`age::Decryptor` needs a `Read`) and writes
+/// the plaintext to `sink`. The store never leaves this thread.
+///
+/// The ciphertext hash is checked against `wp.sha256_encrypted` once the
+/// slice has been read, as before. Plaintext no longer waits for it: age's
+/// STREAM authenticates every 64 KiB chunk before releasing it, so a
+/// corrupted byte stops the decrypt at its chunk, and what reached `sink`
+/// was authentic. The plaintext sha256 is not checked any more — the
+/// ciphertext hash and age's authentication already prove it (issue #411).
+///
+/// A decrypt that stops early (a corrupted chunk, a dar that stopped
+/// reading) does not stop the tape read: the rest of the slice is still read
+/// and hashed, so the verdict on a damaged slice is the checksum's, naming
+/// it, and the head ends the slice at the next file as on success — the
+/// next read is a forward space, never a rewind.
+///
+/// Trial-decryption is ONE `decrypt()` call carrying every identity —
+/// `age` tries each against the header's stanzas before reading the body.
+///
+/// A spooled slice that fails is removed rather than left behind.
+fn read_slice(
+    store: &mut dyn Store,
     wp: &WritePositionInfo,
     identities: &[age::x25519::Identity],
-    ciphertext_tmp_path: &Path,
-    output_path: &Path,
+    sink: SliceSink<'_>,
 ) -> Result<u64> {
-    let result = restore_one_slice_inner(
-        store,
-        position,
-        wp,
-        identities,
-        ciphertext_tmp_path,
-        output_path,
-    );
-    let _ = fs::remove_file(ciphertext_tmp_path);
-    if result.is_err() {
-        let _ = fs::remove_file(output_path);
+    let spooled = match &sink {
+        SliceSink::File(path) => Some(path.to_path_buf()),
+        SliceSink::Pipe { .. } => None,
+    };
+    let result = read_slice_inner(store, wp, identities, sink);
+    if let (Err(_), Some(path)) = (&result, spooled) {
+        let _ = fs::remove_file(path);
     }
     result
 }
 
-/// Two passes, one intermediate ciphertext temp file:
-///
-/// **Pass 1** streams the slice off `store` (`Store::read_file` is
-/// push-based — it drives its own read loop and pushes bytes into a
-/// `sink: &mut dyn Write`), through a [`TruncatingWriter`] that trims the
-/// trailing block padding to `wp.encrypted_bytes` (the DB-recorded true
-/// length — `restore_unit` is the DB-catalog restore path and never
-/// consults the on-tape front index) as the bytes arrive, wrapping a
-/// [`HashingWriter`] so the ciphertext hash is known the moment the pass
-/// finishes, with zero extra buffering. That hash is checked against
-/// `wp.sha256_encrypted` — the same integrity check the old whole-buffer
-/// code ran, just computed incrementally instead of over a fully materialized
-/// `Vec`.
-///
-/// **Pass 2** only runs once pass 1's hash has been verified. It reopens the
-/// now-trusted ciphertext temp file, decrypts it, and streams the plaintext
-/// straight to `output_path` through a [`HashingWriter`], checking the
-/// result against `wp.sha256_plain`.
-///
-/// Bridging pass 1's push-based source with pass 2's pull-based
-/// `age::Decryptor` (`Decryptor::new` needs a `Read`) without a spooled
-/// intermediate would mean either buffering the whole ciphertext in RAM
-/// again (the bug this fixes) or a reader thread (unwarranted complexity for
-/// a restore CLI path) — the two-artifact shape mirrors the write side's own
-/// (staged plaintext file -> `encrypt_file_streaming` -> `.age` file ->
-/// tape).
-///
-/// Trial-decryption is ONE `decrypt()` call carrying every identity in
-/// `identities` — `age`'s `obtain_payload_key` tries each of them via
-/// `find_map` over the header's recipient stanzas internally, before any
-/// STREAM body byte is read, so this never needs a per-identity retry loop
-/// that would have to re-open an already-consumed reader.
-///
-/// Peak RAM: pass 1 is bounded by `TapeStore::read_file`'s read queue
-/// (`pipeline::QUEUE_BYTES`, 256 MiB of tape blocks: since issue #390 the
-/// tape read runs on its own thread, up to that far ahead of this pass's
-/// hash and file write); pass 2 is bounded by `RESTORE_STREAM_BUFFER`
-/// (128 KiB) plus age's own constant ~64 KiB STREAM chunk buffer. The passes
-/// never overlap, so peak RAM for the whole function is that fixed queue —
-/// independent of slice size, where the buffered predecessor was ~2x slice
-/// size (issue #85).
-fn restore_one_slice_inner(
+fn read_slice_inner(
     store: &mut dyn Store,
-    position: u32,
     wp: &WritePositionInfo,
     identities: &[age::x25519::Identity],
-    ciphertext_tmp_path: &Path,
-    output_path: &Path,
+    sink: SliceSink<'_>,
 ) -> Result<u64> {
-    // Pass 1: stream the slice off the store, trimming block padding to the
-    // true (DB-recorded) ciphertext length as it arrives, hashing exactly
-    // those bytes — never the whole slice in RAM.
-    let ct_file = fs::File::create(ciphertext_tmp_path)?;
-    let mut bounded = TruncatingWriter::new(HashingWriter::new(ct_file), wp.encrypted_bytes as u64);
-    store.read_file(position, &mut progress::CountingWriter(&mut bounded))?;
-    let hashing_ct = bounded.into_inner();
-    let actual_hash = hashing_ct.finalize_hex();
-    drop(hashing_ct); // closes ciphertext_tmp_path before pass 2 reopens it
-
+    let position: u32 = wp.position.parse().map_err(|_| {
+        TapectlError::Other(format!(
+            "slice {} has no tape position the catalog can read (\"{}\")",
+            wp.slice_number, wp.position
+        ))
+    })?;
+    let (pipe_reader, pipe_writer) = std::io::pipe()?;
+    let slice_number = wp.slice_number;
+    let (read, actual_hash, decrypted) = std::thread::scope(|s| {
+        let decrypt = s.spawn(move || decrypt_into(pipe_reader, identities, sink, slice_number));
+        let mut bounded = TruncatingWriter::new(
+            HashingWriter::new(Detachable::new(pipe_writer)),
+            wp.encrypted_bytes.max(0) as u64,
+        );
+        let read = store.read_file(position, &mut progress::CountingWriter(&mut bounded));
+        let hashing = bounded.into_inner();
+        let actual_hash = hashing.finalize_hex();
+        // Closes the pipe: the decrypt thread sees the end of the slice.
+        drop(hashing);
+        let decrypted = decrypt.join();
+        (read, actual_hash, decrypted)
+    });
+    read?;
     if actual_hash != wp.sha256_encrypted {
         return Err(TapectlError::Other(format!(
             "slice {} checksum mismatch on tape: expected {}..., got {}...",
             wp.slice_number,
-            &wp.sha256_encrypted[..16],
+            &wp.sha256_encrypted[..wp.sha256_encrypted.len().min(16)],
             &actual_hash[..16],
         )));
     }
+    decrypted.map_err(|_| {
+        TapectlError::Other(format!(
+            "slice {}: the decrypt thread panicked",
+            wp.slice_number
+        ))
+    })?
+}
 
-    // Pass 2: decrypt the now-verified ciphertext, streaming plaintext
-    // straight to `output_path`.
-    let ct_file = fs::File::open(ciphertext_tmp_path)?;
-    let decryptor = age::Decryptor::new(ct_file)
+/// The decrypt thread of [`read_slice`]: ciphertext from `src`, plaintext
+/// to `sink`.
+fn decrypt_into(
+    src: std::io::PipeReader,
+    identities: &[age::x25519::Identity],
+    sink: SliceSink<'_>,
+    slice_number: i64,
+) -> Result<u64> {
+    let decryptor = age::Decryptor::new(src)
         .map_err(|e| TapectlError::Encryption(format!("decryptor: {e}")))?;
     let mut reader = decryptor
         .decrypt(identities.iter().map(|id| id as &dyn age::Identity))
         .map_err(|e| TapectlError::Encryption(format!("decrypt: {e}")))?;
+    let mut out = match sink {
+        SliceSink::File(path) => fs::File::create(path)?,
+        SliceSink::Pipe { path, dar } => open_pipe_for_dar(path, dar, slice_number)?,
+    };
+    let copied = stream_copy(&mut reader, &mut out)
+        .map_err(|e| TapectlError::Other(format!("slice {slice_number}: {e}")))?;
+    out.flush()?;
+    Ok(copied)
+}
 
-    let out_file = fs::File::create(output_path)?;
-    let mut hashing_out = HashingWriter::new(out_file);
-    let plain_size = stream_copy(&mut reader, &mut hashing_out)?;
-    let plain_hash = hashing_out.finalize_hex();
+/// Open the named pipe dar will read a slice from, for writing — once dar
+/// has opened it for reading. A plain blocking open would wait forever on a
+/// dar that has already given up, so this opens non-blocking (which fails
+/// with ENXIO while no reader is there), asking between tries whether dar
+/// is still running, then makes the descriptor blocking for the copy.
+fn open_pipe_for_dar(
+    path: &Path,
+    darx: &dar::restore::SequentialExtract,
+    slice_number: i64,
+) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => {
+                nix::fcntl::fcntl(
+                    file.as_raw_fd(),
+                    nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::empty()),
+                )
+                .map_err(|e| TapectlError::Other(format!("named pipe {}: {e}", path.display())))?;
+                return Ok(file);
+            }
+            Err(e) if e.raw_os_error() == Some(nix::libc::ENXIO) => {
+                if darx.exited() {
+                    return Err(TapectlError::Dar(format!(
+                        "dar stopped before it read slice {slice_number}"
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(TapectlError::Other(format!(
+                    "cannot open the named pipe {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
+}
 
-    if plain_hash != wp.sha256_plain {
-        return Err(TapectlError::Other(format!(
-            "slice {} decrypted checksum mismatch",
-            wp.slice_number,
-        )));
+/// A writer that, once its inner writer fails, discards everything after
+/// and claims it written — so [`read_slice`] keeps reading and hashing a
+/// slice to its filemark after its decrypt has stopped.
+struct Detachable<W> {
+    inner: Option<W>,
+}
+
+impl<W: Write> Detachable<W> {
+    fn new(inner: W) -> Self {
+        Self { inner: Some(inner) }
+    }
+}
+
+impl<W: Write> Write for Detachable<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(inner) = self.inner.as_mut() {
+            if inner.write_all(buf).is_err() {
+                self.inner = None;
+            }
+        }
+        Ok(buf.len())
     }
 
-    Ok(plain_size)
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(inner) = self.inner.as_mut() {
+            if inner.flush().is_err() {
+                self.inner = None;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Fixed-size copy buffer for streaming slice decryption (H9 fix, issue
@@ -1470,7 +1894,7 @@ fn get_write_positions(
 
 #[cfg(test)]
 mod tests {
-    //! Tests for the H9 fix (issue #85): `restore_one_slice` must behave
+    //! Tests for the H9 fix (issue #85): `read_slice` (once `restore_one_slice`) must behave
     //! equivalently to the old whole-buffer `tape.read_file()` +
     //! `read_to_end` pair it replaces in `restore_unit`'s slice loop, while
     //! never holding a whole encrypted slice or its decrypted plaintext in
@@ -1522,7 +1946,7 @@ mod tests {
 
     /// Encrypt `plaintext` to every key in `pubkeys` and return the raw
     /// ciphertext — a small buffered test-only helper (production code
-    /// never buffers a whole ciphertext; see `restore_one_slice`).
+    /// never buffers a whole ciphertext; see `read_slice`).
     fn encrypt_to(plaintext: &[u8], pubkeys: &[String]) -> Vec<u8> {
         crate::staging::encrypt_data(plaintext, pubkeys).unwrap()
     }
@@ -1718,7 +2142,7 @@ mod tests {
         );
     }
 
-    // --- restore_one_slice (the 4 required scenarios) --------------------
+    // --- read_slice (the 4 required scenarios) --------------------
 
     #[test]
     fn round_trip_reproduces_the_exact_original_plaintext() {
@@ -1730,18 +2154,13 @@ mod tests {
         let (mut store, wp) = build_fixture(&plaintext, &pubkeys, 4096);
 
         let tmp = TempDir::new().unwrap();
-        let ct_tmp = tmp.path().join("ct.age.tmp");
         let out = tmp.path().join("out.dar");
 
-        let plain_size = restore_one_slice(&mut store, 0, &wp, &[identity], &ct_tmp, &out).unwrap();
+        let plain_size = read_slice(&mut store, &wp, &[identity], SliceSink::File(&out)).unwrap();
 
         assert_eq!(plain_size, plaintext.len() as u64);
         let restored = fs::read(&out).unwrap();
         assert_eq!(restored, plaintext);
-        assert!(
-            !ct_tmp.exists(),
-            "ciphertext temp file must be cleaned up after a successful restore"
-        );
     }
 
     #[test]
@@ -1759,10 +2178,9 @@ mod tests {
         store.files[0][5] ^= 0xFF;
 
         let tmp = TempDir::new().unwrap();
-        let ct_tmp = tmp.path().join("ct.age.tmp");
         let out = tmp.path().join("out.dar");
 
-        let err = restore_one_slice(&mut store, 0, &wp, &[identity], &ct_tmp, &out).unwrap_err();
+        let err = read_slice(&mut store, &wp, &[identity], SliceSink::File(&out)).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("checksum mismatch"), "got: {msg}");
         assert!(
@@ -1772,10 +2190,6 @@ mod tests {
         assert!(
             !out.exists(),
             "no partial plaintext should be left behind on a failed restore"
-        );
-        assert!(
-            !ct_tmp.exists(),
-            "ciphertext temp file must be cleaned up even on failure"
         );
     }
 
@@ -1792,7 +2206,6 @@ mod tests {
         let (mut store, wp) = build_fixture(&plaintext, &pubkeys, 4096);
 
         let tmp = TempDir::new().unwrap();
-        let ct_tmp = tmp.path().join("ct.age.tmp");
         let out = tmp.path().join("out.dar");
 
         // The right identity is SECOND in the list, proving the single
@@ -1800,7 +2213,7 @@ mod tests {
         // does `find_map` over the header internally) rather than only ever
         // succeeding when the match happens to come first.
         let identities = vec![wrong_identity, right_identity];
-        let plain_size = restore_one_slice(&mut store, 0, &wp, &identities, &ct_tmp, &out).unwrap();
+        let plain_size = read_slice(&mut store, &wp, &identities, SliceSink::File(&out)).unwrap();
 
         assert_eq!(plain_size, plaintext.len() as u64);
         assert_eq!(fs::read(&out).unwrap(), plaintext);
@@ -1832,10 +2245,9 @@ mod tests {
         let (mut store, wp) = build_fixture(&plaintext, &pubkeys, 4096);
 
         let tmp = TempDir::new().unwrap();
-        let ct_tmp = tmp.path().join("ct.age.tmp");
         let out = tmp.path().join("out.dar");
 
-        let plain_size = restore_one_slice(&mut store, 0, &wp, &[identity], &ct_tmp, &out).unwrap();
+        let plain_size = read_slice(&mut store, &wp, &[identity], SliceSink::File(&out)).unwrap();
         assert_eq!(plain_size, plaintext.len() as u64);
         assert_eq!(fs::read(&out).unwrap(), plaintext);
     }
@@ -3723,11 +4135,13 @@ mod tests {
                 assert_eq!(existing(tmp.path()), Some(tmp.path().to_path_buf()));
             }
 
-            /// The arithmetic is RESTORE.sh's: about twice the unit plus one
-            /// slice on one filesystem — refused one byte short of it,
-            /// accepted at it.
+            /// A spooled restore (no isolated catalogue on disk, as here)
+            /// needs about twice the unit on one filesystem: its decrypted
+            /// slices, then the extract. Since #411 no ciphertext copy waits
+            /// beside a slice, so the "plus one slice" RESTORE.sh still asks
+            /// for is gone — refused one byte short of twice, accepted at it.
             #[test]
-            fn the_space_needed_is_twice_the_unit_plus_one_slice() {
+            fn the_space_needed_to_spool_is_twice_the_unit() {
                 let r = rig("PF-MATH");
                 let slice: i64 = r
                     .conn
@@ -3735,13 +4149,14 @@ mod tests {
                     .unwrap();
                 let dest = TempDir::new().unwrap();
                 {
-                    let _free = RestoreFreeOverride::set(3 * slice - 1);
+                    let _free = RestoreFreeOverride::set(2 * slice - 1);
                     let err = unit(&r, "PF-MATH", dest.path(), &RestoreOptions::default())
                         .unwrap_err()
                         .to_string();
                     assert!(err.contains("not enough disk space"), "{err}");
+                    assert!(err.contains("twice"), "{err}");
                 }
-                let _free = RestoreFreeOverride::set(3 * slice);
+                let _free = RestoreFreeOverride::set(2 * slice);
                 unit(&r, "PF-MATH", dest.path(), &RestoreOptions::default()).unwrap();
             }
 
@@ -4059,6 +4474,517 @@ mod tests {
                 expected.extend((0..plains.len() as u32).map(|i| Op::Read(FIRST + i)));
                 assert_eq!(fake.ops(), expected);
                 assert_eq!(fake.rewinds(), 1);
+            }
+        }
+
+        // ── issue #411: stream into dar; read only what a file needs ──
+
+        /// A unit of several REAL dar slices — optionally with the isolated
+        /// catalogue `stage create` makes, at `stage_sets.catalog_path` — on
+        /// a fake tape behind an injected drive, so the real `restore_unit`
+        /// / `restore_file` run end to end with real dar.
+        pub(super) mod multi {
+            use super::*;
+            use crate::store::injected::InjectedDrive;
+            use crate::tape::fake::FakeTape;
+
+            /// Tape position of slice 1 (Files 1..3 stand in for the rest
+            /// of the front zone).
+            pub(crate) const FIRST: u32 = 4;
+            pub(crate) const DEVICE: &str = "/nonexistent/tapectl-restore-multi-nst";
+
+            pub(crate) struct Multi {
+                pub conn: Connection,
+                pub paths: TapectlPaths,
+                pub fake: FakeTape,
+                /// The tree archived, `(path relative to the root, bytes)`.
+                pub files: Vec<(String, Vec<u8>)>,
+                /// Each slice's ciphertext length, slice 1 first.
+                pub cipher_lens: Vec<i64>,
+                pub _home: TempDir,
+                pub _drive: InjectedDrive,
+            }
+
+            impl Multi {
+                pub(crate) fn slices(&self) -> usize {
+                    self.cipher_lens.len()
+                }
+
+                /// The slice reads the tape saw, as slice numbers (File 0,
+                /// the contact check, left out).
+                pub(crate) fn slice_reads(&self) -> Vec<u32> {
+                    self.fake
+                        .ops()
+                        .iter()
+                        .filter_map(|op| match op {
+                            crate::tape::fake::Op::Read(n) if *n >= FIRST => Some(n - FIRST + 1),
+                            _ => None,
+                        })
+                        .collect()
+                }
+
+                /// Forget the catalogue, as a catalog rebuilt from tape
+                /// does: the restore must then spool.
+                pub(crate) fn drop_catalogue(&self) {
+                    self.conn
+                        .execute("UPDATE stage_sets SET catalog_path = NULL", [])
+                        .unwrap();
+                }
+
+                pub(crate) fn unit(
+                    &self,
+                    label: &str,
+                    unit: &str,
+                    dest: &Path,
+                    options: &RestoreOptions,
+                ) -> Result<RestoreReport> {
+                    restore_unit(
+                        &self.conn,
+                        &self.paths,
+                        &Config::default(),
+                        unit,
+                        label,
+                        &dest.to_string_lossy(),
+                        DEVICE,
+                        4096,
+                        None,
+                        false,
+                        options,
+                    )
+                }
+
+                pub(crate) fn file(
+                    &self,
+                    label: &str,
+                    unit: &str,
+                    path: &str,
+                    dest: &Path,
+                    options: &RestoreOptions,
+                ) -> Result<()> {
+                    restore_file(
+                        &self.conn,
+                        &self.paths,
+                        &Config::default(),
+                        unit,
+                        path,
+                        label,
+                        &dest.to_string_lossy(),
+                        DEVICE,
+                        4096,
+                        None,
+                        options,
+                    )
+                }
+
+                /// Every archived file is in `dest`, byte for byte.
+                pub(crate) fn assert_restored(&self, dest: &Path) {
+                    for (path, bytes) in &self.files {
+                        assert_eq!(
+                            &fs::read(dest.join(path)).unwrap_or_default(),
+                            bytes,
+                            "{path} restored wrong"
+                        );
+                    }
+                }
+            }
+
+            /// Pseudo-random bytes (incompressible), seeded so each file
+            /// differs.
+            pub(crate) fn noise(len: usize, seed: u32) -> Vec<u8> {
+                (0..len as u32)
+                    .map(|i| (i.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 13) as u8)
+                    .collect()
+            }
+
+            pub(crate) fn multi(
+                label: &str,
+                unit: &str,
+                files: &[(&str, Vec<u8>)],
+                slice_size: &str,
+                catalogue: bool,
+            ) -> Multi {
+                let conn = crate::db::open_memory().unwrap();
+                let home = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(home.path().join(".tapectl"));
+                seed(&conn, label, unit);
+                paths.ensure_dirs().unwrap();
+                let kp = keys::generate_and_save(&paths.keys_dir, "t1", "primary").unwrap();
+
+                let work = TempDir::new().unwrap();
+                let src = work.path().join("src");
+                fs::create_dir_all(&src).unwrap();
+                let snapshot_id: i64 = conn
+                    .query_row("SELECT id FROM snapshots", [], |r| r.get(0))
+                    .unwrap();
+                let mut dirs = std::collections::BTreeSet::new();
+                for (path, bytes) in files {
+                    let at = src.join(path);
+                    fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    fs::write(&at, bytes).unwrap();
+                    conn.execute(
+                        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
+                         VALUES (?1, ?2, ?3, 0)",
+                        params![snapshot_id, path, bytes.len() as i64],
+                    )
+                    .unwrap();
+                    let mut parent = Path::new(path).parent();
+                    while let Some(p) = parent.filter(|p| !p.as_os_str().is_empty()) {
+                        dirs.insert(p.to_string_lossy().into_owned());
+                        parent = p.parent();
+                    }
+                }
+                for dir in dirs {
+                    conn.execute(
+                        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
+                         VALUES (?1, ?2, 0, 1)",
+                        params![snapshot_id, dir],
+                    )
+                    .unwrap();
+                }
+                let base = work.path().join("arch");
+                let created = std::process::Command::new("dar")
+                    .arg("-c")
+                    .arg(&base)
+                    .arg("-R")
+                    .arg(&src)
+                    .arg("-s")
+                    .arg(slice_size)
+                    .arg("-Q")
+                    .output()
+                    .unwrap();
+                assert!(
+                    created.status.success(),
+                    "dar -c failed in test setup: {}",
+                    String::from_utf8_lossy(&created.stderr)
+                );
+                if catalogue {
+                    // Where and how `stage create` isolates it.
+                    let dir = paths.catalogs_dir.join("unit0001");
+                    fs::create_dir_all(&dir).unwrap();
+                    let catalogue = dir.join("unit0001_v1");
+                    crate::dar::create::extract_catalog("dar", &base, &catalogue).unwrap();
+                    conn.execute(
+                        "UPDATE stage_sets SET catalog_path = ?1",
+                        params![catalogue.to_string_lossy()],
+                    )
+                    .unwrap();
+                }
+                let plains: Vec<Vec<u8>> = (1..)
+                    .map(|n| work.path().join(format!("arch.{n}.dar")))
+                    .take_while(|p| p.exists())
+                    .map(|p| fs::read(p).unwrap())
+                    .collect();
+
+                let mut mem = tape_labelled(label);
+                for filler in 1..FIRST {
+                    mem.execute(&mut Cursor::new(vec![filler as u8; 100]), 100, false)
+                        .unwrap();
+                }
+                let ss_id: i64 = conn
+                    .query_row("SELECT id FROM stage_sets", [], |r| r.get(0))
+                    .unwrap();
+                let write_id: i64 = conn
+                    .query_row("SELECT id FROM writes", [], |r| r.get(0))
+                    .unwrap();
+                let mut cipher_lens = Vec::new();
+                for (i, plain) in plains.iter().enumerate() {
+                    let cipher = encrypt_to(plain, std::slice::from_ref(&kp.public_key));
+                    mem.execute(&mut Cursor::new(cipher.clone()), cipher.len() as u64, false)
+                        .unwrap();
+                    cipher_lens.push(cipher.len() as i64);
+                    let number = i as i64 + 1;
+                    let position = (FIRST + i as u32).to_string();
+                    if number == 1 {
+                        conn.execute(
+                            "UPDATE stage_slices SET size_bytes = ?1, encrypted_bytes = ?2,
+                                    sha256_plain = ?3, sha256_encrypted = ?4",
+                            params![
+                                plain.len() as i64,
+                                cipher.len() as i64,
+                                direct_hash(plain),
+                                direct_hash(&cipher)
+                            ],
+                        )
+                        .unwrap();
+                        conn.execute(
+                            "UPDATE write_positions SET position = ?1, sha256_on_volume = ?2",
+                            params![position, direct_hash(&cipher)],
+                        )
+                        .unwrap();
+                    } else {
+                        conn.execute(
+                            "INSERT INTO stage_slices
+                                (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                 sha256_plain, sha256_encrypted)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                ss_id,
+                                number,
+                                plain.len() as i64,
+                                cipher.len() as i64,
+                                direct_hash(plain),
+                                direct_hash(&cipher)
+                            ],
+                        )
+                        .unwrap();
+                        let slice_id = conn.last_insert_rowid();
+                        conn.execute(
+                            "INSERT INTO write_positions
+                                (write_id, stage_slice_id, position, status, sha256_on_volume)
+                             VALUES (?1, ?2, ?3, 'written', ?4)",
+                            params![write_id, slice_id, position, direct_hash(&cipher)],
+                        )
+                        .unwrap();
+                    }
+                }
+                let fake = FakeTape::with_files(mem.files.clone(), 4096);
+                let drive = InjectedDrive::install(&fake);
+                Multi {
+                    conn,
+                    paths,
+                    fake,
+                    files: files
+                        .iter()
+                        .map(|(p, b)| (p.to_string(), b.clone()))
+                        .collect(),
+                    cipher_lens,
+                    _home: home,
+                    _drive: drive,
+                }
+            }
+        }
+
+        mod streaming {
+            use super::multi::{multi, noise, FIRST};
+            use super::record::only_row;
+            use super::*;
+            use crate::tape::fake::Op;
+
+            fn tree() -> Vec<(&'static str, Vec<u8>)> {
+                vec![
+                    ("big.bin", noise(300_000, 1)),
+                    ("mid.bin", noise(150_000, 2)),
+                    ("small.txt", b"small".to_vec()),
+                    ("sub/deep.txt", b"deep".to_vec()),
+                ]
+            }
+
+            /// THE acceptance test for #411's unit half: with the isolated
+            /// catalogue `stage create` keeps, a multi-slice unit restores
+            /// with free space for the DESTINATION ONLY — each slice is
+            /// decrypted off the tape straight into a named pipe that `dar
+            /// --sequential-read -A <catalogue>` reads, so nothing of it is
+            /// ever on disk in scratch, in one forward pass.
+            ///
+            /// The tree is the shape that breaks dar 2.7.13's sequential
+            /// read WITHOUT the catalogue (a large file running into the
+            /// last slice): the restore must be identical anyway.
+            #[test]
+            fn a_unit_with_its_catalogue_streams_with_no_scratch_space() {
+                let m = multi("ST-1", "st-unit", &tree(), "150k", true);
+                assert!(m.slices() >= 3, "want a multi-slice archive");
+                let dest = TempDir::new().unwrap();
+                let need: i64 = m.cipher_lens.iter().sum();
+                let _free = RestoreFreeOverride::set(need);
+                m.fake.watch(&dest.path().join(SCRATCH_NAME));
+
+                m.unit("ST-1", "st-unit", dest.path(), &RestoreOptions::default())
+                    .expect("a streamed restore needs only the destination's space");
+                m.assert_restored(dest.path());
+
+                let argv = only_row(&m.conn).dar_argv.expect("dar ran");
+                assert!(argv.contains(r#""--sequential-read""#), "{argv}");
+                assert!(argv.contains(r#""-A""#), "{argv}");
+                let bytes = m.fake.watched_bytes();
+                assert_eq!(bytes.len(), m.slices() + 1, "{bytes:?}");
+                assert!(
+                    bytes.iter().all(|(_, b)| *b == 0),
+                    "a decrypted slice was on disk while the tape was read: {bytes:?}"
+                );
+                let mut expected = vec![Op::Rewind, Op::Read(0), Op::Space(FIRST - 1)];
+                expected.extend((0..m.slices() as u32).map(|i| Op::Read(FIRST + i)));
+                assert_eq!(m.fake.ops(), expected, "one forward pass");
+            }
+
+            /// The positive control: the same unit with no catalogue (a
+            /// catalog rebuilt from tape has none) spools — its decrypted
+            /// slices ARE on disk in scratch while the tape is read, and the
+            /// space check asks for them.
+            #[test]
+            fn without_its_catalogue_a_unit_spools_and_the_space_check_says_so() {
+                let m = multi("ST-2", "st-unit", &tree(), "150k", true);
+                m.drop_catalogue();
+                let dest = TempDir::new().unwrap();
+                let need: i64 = m.cipher_lens.iter().sum();
+                {
+                    let _free = RestoreFreeOverride::set(need);
+                    let err = m
+                        .unit("ST-2", "st-unit", dest.path(), &RestoreOptions::default())
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("not enough disk space"), "{err}");
+                }
+                m.fake.watch(&dest.path().join(SCRATCH_NAME));
+                m.unit("ST-2", "st-unit", dest.path(), &RestoreOptions::default())
+                    .expect("a spooled restore");
+                m.assert_restored(dest.path());
+                assert!(
+                    m.fake.watched_bytes().iter().any(|(_, b)| *b > 0),
+                    "spooled slices are on disk: {:?}",
+                    m.fake.watched_bytes()
+                );
+                let argv = only_row(&m.conn).dar_argv.expect("dar ran");
+                assert!(!argv.contains("--sequential-read"), "{argv}");
+            }
+
+            /// A slice that fails its checksum mid-stream fails the restore
+            /// naming the slice and saying dar may have written part of the
+            /// unit into --to; the slice is read to its end (no rewind), and
+            /// no later slice is read.
+            #[test]
+            fn a_corrupt_slice_mid_stream_names_the_slice_and_the_partial_extract() {
+                let m = multi("ST-3", "st-unit", &tree(), "150k", true);
+                {
+                    let mut s = m.fake.state();
+                    let at = (FIRST + 1) as usize;
+                    s.files[at][200] ^= 0xFF;
+                }
+                let dest = TempDir::new().unwrap();
+                let err = m
+                    .unit("ST-3", "st-unit", dest.path(), &RestoreOptions::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("slice 2 checksum mismatch"), "{err}");
+                assert!(err.contains("partial"), "{err}");
+                assert_eq!(m.slice_reads(), vec![1, 2], "{:?}", m.fake.ops());
+                assert_eq!(m.fake.rewinds(), 1);
+                assert!(
+                    !dest.path().join(SCRATCH_NAME).exists(),
+                    "the pipes are cleaned up"
+                );
+            }
+
+            /// THE acceptance test for #411's file half: `restore file`
+            /// reads only the slices dar needs for the one file — its own,
+            /// the directories' above it, and the last (dar's catalogue) —
+            /// in one forward pass, never the whole unit.
+            #[test]
+            fn restore_file_reads_only_the_slices_that_hold_it() {
+                let m = multi("SF-1", "sf-unit", &tree(), "64k", true);
+                let all = m.slices() as u32;
+                assert!(all >= 5, "want a many-slice archive, got {all}");
+                let dest = TempDir::new().unwrap();
+                m.file(
+                    "SF-1",
+                    "sf-unit",
+                    "small.txt",
+                    dest.path(),
+                    &RestoreOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(fs::read(dest.path().join("small.txt")).unwrap(), b"small");
+
+                let reads = m.slice_reads();
+                assert!(
+                    !reads.is_empty() && reads.len() <= 3,
+                    "a one-slice file reads at most its slice(s) and the last: {reads:?}"
+                );
+                assert!(
+                    reads.windows(2).all(|w| w[0] < w[1]),
+                    "ascending: {reads:?}"
+                );
+                assert_eq!(reads.last(), Some(&all), "dar's catalogue is in the last");
+                assert_eq!(m.fake.rewinds(), 1);
+                let row = only_row(&m.conn);
+                assert_eq!(row.slices_read, Some(reads.len() as i64));
+            }
+
+            /// A file below directories needs their slices too (their
+            /// attributes are restored with them) — and still not the whole
+            /// unit; the file comes back identical.
+            #[test]
+            fn restore_file_of_a_nested_file_reads_its_ancestors_slices_too() {
+                let m = multi("SF-2", "sf-unit", &tree(), "64k", true);
+                let all = m.slices() as u32;
+                let dest = TempDir::new().unwrap();
+                m.file(
+                    "SF-2",
+                    "sf-unit",
+                    "sub/deep.txt",
+                    dest.path(),
+                    &RestoreOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(fs::read(dest.path().join("deep.txt")).unwrap(), b"deep");
+                let reads = m.slice_reads();
+                assert!((reads.len() as u32) < all, "{reads:?} of {all}");
+                assert_eq!(reads.last(), Some(&all));
+            }
+
+            /// The catalogue `stage create` isolated belongs to the dar run
+            /// that made it — the snapshot's first staging. A later staging
+            /// of the same version (another `dar -c`) records the same
+            /// path, but dar refuses that pairing FATAL, so it must not be
+            /// used: the later stage set spools.
+            #[test]
+            fn a_catalogue_from_another_staging_of_the_version_is_not_used() {
+                let m = multi("ST-OWN", "st-unit", &tree(), "150k", true);
+                let first: i64 = m
+                    .conn
+                    .query_row("SELECT id FROM stage_sets", [], |r| r.get(0))
+                    .unwrap();
+                let base = own_catalogue(&m.conn, first).unwrap();
+                assert!(
+                    base.is_some(),
+                    "positive control: the first staging owns it"
+                );
+                m.conn
+                    .execute(
+                        "INSERT INTO stage_sets (snapshot_id, status, slice_size, catalog_path)
+                         SELECT snapshot_id, 'staged', slice_size, catalog_path
+                         FROM stage_sets WHERE id = ?1",
+                        params![first],
+                    )
+                    .unwrap();
+                let later = m.conn.last_insert_rowid();
+                assert_eq!(own_catalogue(&m.conn, later).unwrap(), None);
+                assert!(own_catalogue(&m.conn, first).unwrap().is_some());
+
+                // Once each staging records its OWN catalogue (#419), the
+                // later one is its own first, and is used.
+                let base = base.unwrap();
+                let own = base.with_file_name("later_v1");
+                fs::copy(
+                    format!("{}.1.dar", base.display()),
+                    format!("{}.1.dar", own.display()),
+                )
+                .unwrap();
+                m.conn
+                    .execute(
+                        "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
+                        params![own.to_string_lossy(), later],
+                    )
+                    .unwrap();
+                assert_eq!(own_catalogue(&m.conn, later).unwrap(), Some(own));
+            }
+
+            /// Without a catalogue there is nothing to say which slices hold
+            /// the file: every slice is read, as before.
+            #[test]
+            fn restore_file_without_a_catalogue_reads_every_slice() {
+                let m = multi("SF-3", "sf-unit", &tree(), "64k", true);
+                m.drop_catalogue();
+                let dest = TempDir::new().unwrap();
+                m.file(
+                    "SF-3",
+                    "sf-unit",
+                    "small.txt",
+                    dest.path(),
+                    &RestoreOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(fs::read(dest.path().join("small.txt")).unwrap(), b"small");
+                assert_eq!(m.slice_reads(), (1..=m.slices() as u32).collect::<Vec<_>>());
             }
         }
     }

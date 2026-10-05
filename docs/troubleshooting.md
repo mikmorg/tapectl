@@ -1676,17 +1676,29 @@ from it.
 
 ```text
 error: not enough disk space in <dir> for this restore: it needs about <size>, and <size> is free. Nothing was read
-from tape. A restore decrypts every slice of the unit to disk before dar extracts them, so with the scratch space
-and --to on one disk it needs the unit's size about twice over, plus one slice. Free space there, choose a larger
-disk with --to, or put the decrypted slices on another disk with --scratch DIR. (--no-space-check skips this
-check, for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one.)
+from tape. <why>. Free space there, choose a larger disk with --to, or put any decrypted slices on another disk
+with --scratch DIR. (--no-space-check skips this check, for a filesystem that holds more than it reports free,
+such as a compressed or thin-provisioned one.)
 ```
 
-The decrypted slices wait in a `.tapectl-restore-tmp` directory inside `--to`,
-never in the system temp directory. With `--scratch DIR` they wait in `DIR`
-instead, and each disk is checked for its own share: the slices plus one more
-in `DIR`, the restored files in `--to`. `restore file` needs room for the
-unit's slices and the one file. The arithmetic is the same as RESTORE.sh's.
+`<why>` names which of three restores this is, because they need different
+room:
+
+- **Streamed** (`restore unit`, with the unit's isolated catalogue from
+  `stage create` still under `<home>/catalogs/`, and dar 2.7.9 or newer):
+  each slice goes from the tape through a named pipe straight into dar, so
+  only about the unit's size is needed in `--to`.
+- **Spooled** (`restore unit` otherwise, for example after `catalog
+  rebuild`, which has no catalogues): every slice is decrypted into a
+  `.tapectl-restore-tmp` directory inside `--to` (never the system temp
+  directory) before dar extracts them, so with both on one disk the unit's
+  size about twice over. With `--scratch DIR` the slices wait in `DIR`
+  instead, and each disk is checked for its own share.
+- **`restore file`**: the slices it reads (with the catalogue, only those
+  that hold the file, its directories and the last; without, all of them),
+  plus the file.
+
+RESTORE.sh, the heir's path, always spools and asks for one slice more.
 
 ### A scratch directory already exists
 
@@ -1746,11 +1758,17 @@ error: slice <n> checksum mismatch on tape: expected <sha>..., got <sha>...
 ```
 
 The ciphertext read off the tape differs from the checksum recorded when it
-was staged. Nothing is decrypted from a slice that fails this check. Run a
-full `volume verify` on the volume and restore from another copy
-(`catalog locate` lists them). Scratch space for decrypted slices is removed
-when a restore fails. If tapectl cannot remove it, it warns and names the
-path, because that directory may hold decrypted data.
+was staged. Run a full `volume verify` on the volume and restore from another
+copy (`catalog locate` lists them). Scratch space for decrypted slices is
+removed when a restore fails. If tapectl cannot remove it, it warns and names
+the path, because that directory may hold decrypted data.
+
+A streamed restore (see above) decrypts as it reads, so dar has already
+extracted the slices before the bad one, and the error goes on to say
+`--to` may now hold a partial restore. age authenticates every 64 KiB of a
+slice before releasing it, so nothing that reached dar was damaged, but the
+unit is incomplete: empty `--to`, or restore again from the other copy with
+`--overwrite`.
 
 ### RESTORE.sh: not enough disk space, or OUT OF DISK SPACE
 

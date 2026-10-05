@@ -125,9 +125,7 @@ fn run_extract(
     args: &[std::ffi::OsString],
     dest: &Path,
 ) -> (Option<DarReport>, Result<()>) {
-    let argv = std::iter::once(dar_binary.to_string())
-        .chain(args.iter().map(|a| a.to_string_lossy().into_owned()))
-        .collect();
+    let argv = argv_of(dar_binary, args);
     // Issue #404: an extraction can take hours; a signal stops dar.
     let output = match super::run_interruptible(super::command(dar_binary).args(args), || {
         format!(
@@ -145,13 +143,274 @@ fn run_extract(
         stdout: output.stdout,
         stderr: output.stderr,
     };
-    let verdict = if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&report.stderr);
-        Err(TapectlError::Dar(format!("{what} failed: {stderr}")))
-    } else {
-        fail_on_skipped(&report.stdout, dest)
-    };
+    let verdict = verdict_of(&report, what, dest);
     (Some(report), verdict)
+}
+
+/// The command line as [`DarReport::argv`] records it, program first.
+fn argv_of(dar_binary: &str, args: &[std::ffi::OsString]) -> Vec<String> {
+    std::iter::once(dar_binary.to_string())
+        .chain(args.iter().map(|a| a.to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// [`run_extract`]'s verdict on a finished dar: a non-zero exit (or a
+/// signal) fails, and so does exit 0 with a silent skip (`fail_on_skipped`).
+fn verdict_of(report: &DarReport, what: &str, dest: &Path) -> Result<()> {
+    if report.exit_code != Some(0) {
+        let stderr = String::from_utf8_lossy(&report.stderr);
+        return Err(TapectlError::Dar(format!("{what} failed: {stderr}")));
+    }
+    fail_on_skipped(&report.stdout, dest)
+}
+
+/// The oldest dar a restore streams into (issue #411): dar reads a SLICED
+/// archive in `--sequential-read` mode only since 2.7.7 ("added support for
+/// sequential reading mode of sliced backup, to accommodate tape support used
+/// with slices"), and reads one correctly with the help of an isolated
+/// catalogue only since 2.7.9 (its ChangeLog: "the unability to properly rely
+/// on a isolated catalogue to read (test/extract/diff) an backup in
+/// sequential read mode, leading dar to report CRC error"). An older dar —
+/// the 2.6 line tapectl still accepts — is restored from spooled slices.
+pub const STREAMING_MIN_VERSION: (u32, u32, u32) = (2, 7, 9);
+
+/// Whether `version` can take a restore's slices as a stream
+/// ([`STREAMING_MIN_VERSION`]).
+pub fn supports_streaming(version: &super::version::DarVersion) -> bool {
+    (version.major, version.minor, version.patch) >= STREAMING_MIN_VERSION
+}
+
+/// A `dar -x --sequential-read` reading its slices from named pipes as the
+/// restore decrypts them off the tape (issue #411) — the process, and the
+/// two threads draining its output.
+///
+/// **Why the isolated catalogue (`-A`) is always passed.** Measured against
+/// dar 2.7.13 (the version this VM and Ubuntu's CI carry): a sliced archive
+/// read with `--sequential-read` and nothing else fails on about half of the
+/// slice layouts tried — a file whose data runs into the last slice is cut
+/// short, dar asks for a slice after the last one, and with `-Q` gives up
+/// ("arch.4.dar is required for further operation"). The SAME archives,
+/// read the same way with the isolated catalogue given as `-A`, came back
+/// identical on every layout tried (slice sizes from 20 KiB to 3 MiB, all
+/// seven compressors, over regular files and over FIFOs), and dar read
+/// every byte of every slice. A catalogue from a DIFFERENT dar run of the
+/// same content is refused by dar itself, FATAL, before any file is
+/// written ("The archive and the isolated catalogue do not correspond to
+/// the same data") — so a wrong catalogue cannot produce a wrong restore.
+pub struct SequentialExtract {
+    child: std::sync::Mutex<std::process::Child>,
+    argv: Vec<String>,
+    stdout: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<std::thread::JoinHandle<Vec<u8>>>,
+    dest: std::path::PathBuf,
+}
+
+impl SequentialExtract {
+    /// Start `dar -x <archive_base> --sequential-read -A <catalogue> -R
+    /// <dest> -O -Q [-w]`. dar opens `<archive_base>.1.dar` first and each
+    /// next slice when it has read the one before to its end, so every slice
+    /// must already exist (as a named pipe) when this is called.
+    pub fn spawn(
+        dar_binary: &str,
+        archive_base: &Path,
+        catalogue: &Path,
+        dest: &Path,
+        overwrite: bool,
+    ) -> Result<Self> {
+        if let Err(e) = std::fs::create_dir_all(dest) {
+            return Err(e.into());
+        }
+        warn_if_non_root();
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "-x".into(),
+            archive_base.into(),
+            "--sequential-read".into(),
+            "-A".into(),
+            catalogue.into(),
+            "-R".into(),
+            dest.into(),
+            // -O is `--comparison-field` (ignore-owner): see `extract`.
+            "-O".into(),
+            "-Q".into(),
+        ];
+        if overwrite {
+            args.push("-w".into());
+        }
+        let argv = argv_of(dar_binary, &args);
+        // Through `dar::command` (#404): dar dies with tapectl. The restore
+        // stops it between slices on a signal ([`Self::kill`]).
+        let mut child = super::command(dar_binary)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| TapectlError::Dar(format!("cannot start {dar_binary}: {e}")))?;
+        // Drained on threads: dar prints a line per file it declines to
+        // overwrite, and a full 64 KiB pipe would stop it mid-extract.
+        let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+            stream.map(|mut s| {
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let _ = s.read_to_end(&mut buf);
+                    buf
+                })
+            })
+        };
+        let stdout = drain(
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        );
+        let stderr = drain(
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        );
+        Ok(Self {
+            child: std::sync::Mutex::new(child),
+            argv,
+            stdout,
+            stderr,
+            dest: dest.to_path_buf(),
+        })
+    }
+
+    /// Whether dar has already exited — asked while waiting for it to open
+    /// the next slice's pipe, so a dar that gave up is never waited on.
+    pub fn exited(&self) -> bool {
+        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        !matches!(child.try_wait(), Ok(None))
+    }
+
+    /// Stop dar — a restore that cannot deliver the next slice. dar may be
+    /// blocked opening that slice's pipe, and would wait for it forever.
+    pub fn kill(&self) {
+        let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+        }
+    }
+
+    /// Wait for dar to end, and hand back its verbatim report and the
+    /// verdict ([`extract_reported`]'s, `fail_on_skipped` included).
+    pub fn finish(mut self) -> (Option<DarReport>, Result<()>) {
+        let status = {
+            let mut child = self.child.lock().unwrap_or_else(|p| p.into_inner());
+            child.wait()
+        };
+        let join = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
+            h.and_then(|h| h.join().ok()).unwrap_or_default()
+        };
+        let stdout = join(self.stdout.take());
+        let stderr = join(self.stderr.take());
+        let status = match status {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    None,
+                    Err(TapectlError::Dar(format!("waiting for dar: {e}"))),
+                )
+            }
+        };
+        let report = DarReport {
+            argv: std::mem::take(&mut self.argv),
+            exit_code: status.code(),
+            stdout,
+            stderr,
+        };
+        let verdict = verdict_of(&report, "dar -x --sequential-read", &self.dest);
+        (Some(report), verdict)
+    }
+}
+
+/// The slice numbers a direct-mode `dar -x -g <file_path>` reads, as an
+/// isolated catalogue lists them (issue #411): every slice the entry and the
+/// directories above it are recorded in (`dar -l -Tslicing -g`), WITHOUT the
+/// archive's last slice, which dar always opens first for its catalogue and
+/// the caller adds.
+///
+/// The ancestors count: a directory's filesystem attributes are stored in
+/// the slice its entry was written to, and dar restores the directories
+/// above the requested entry with them — measured on dar 2.7.13, `dar -x -g
+/// a/b/file` with only the file's own slices and the last present skips the
+/// whole of `a` ("a not restored (user choice)", exit 0); with the ancestors'
+/// slices too it is identical.
+///
+/// `Ok(None)` when the listing does not name `file_path` itself (matched by
+/// its exact text at the end of a line, so a name with spaces or tabs is
+/// still found), or carries a range this cannot read: the caller then reads
+/// every slice, as it always did.
+pub fn entry_slices(
+    dar_binary: &str,
+    catalogue: &Path,
+    file_path: &str,
+) -> Result<Option<std::collections::BTreeSet<i64>>> {
+    let output = super::command(dar_binary)
+        .arg("-l")
+        .arg(catalogue)
+        .arg("-Tslicing")
+        .arg("-g")
+        .arg(file_path)
+        .arg("-Q")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| TapectlError::Dar(e.to_string()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_slicing_listing(
+        &String::from_utf8_lossy(&output.stdout),
+        file_path,
+    ))
+}
+
+/// [`entry_slices`]'s parser over `dar -l -Tslicing` text, e.g. (`<TAB>` stands for a tab):
+///
+/// ```text
+/// Slice(s)|[Data ][D][ EA  ][FSA][Compr][S]|Permission| Filemane
+/// --------+--------------------------------+----------+-----------------------------
+/// 1<TAB> [InRef][-]       [-L-][  51%][ ] drwxrwxr-x a
+/// 4-5<TAB> [InRef][ ]       [-L-][-----][ ] -rw-rw-r-- a/r20.bin
+/// ```
+///
+/// A row is `<slices>\t <flags> <permission> <path>`; `<slices>` is `N`,
+/// `N-M`, comma-separated pieces of those, or EMPTY for an entry with
+/// nothing in any slice (a symlink: its target lives in the catalogue).
+fn parse_slicing_listing(text: &str, file_path: &str) -> Option<std::collections::BTreeSet<i64>> {
+    let mut slices = std::collections::BTreeSet::new();
+    let mut named = false;
+    let suffix = format!(" {file_path}");
+    for line in text.lines() {
+        let Some((field, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        if !field
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == ',')
+        {
+            continue;
+        }
+        if rest.ends_with(&suffix) {
+            named = true;
+        }
+        for piece in field.split(',').filter(|p| !p.is_empty()) {
+            let (lo, hi) = match piece.split_once('-') {
+                Some((lo, hi)) => (lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?),
+                None => {
+                    let n = piece.parse::<i64>().ok()?;
+                    (n, n)
+                }
+            };
+            if lo < 1 || hi < lo {
+                return None;
+            }
+            slices.extend(lo..=hi);
+        }
+    }
+    named.then_some(slices)
 }
 
 /// Extract a dar archive to a destination directory.
@@ -337,6 +596,93 @@ mod tests {
     #[test]
     fn fail_on_skipped_passes_a_clean_restore() {
         assert!(fail_on_skipped(b" 2 inode(s) restored\n", Path::new("/tmp/dest")).is_ok());
+    }
+
+    // ── `-Tslicing` (issue #411) ──
+
+    /// Verbatim from dar 2.7.13, `dar -l <isolated catalogue> -Tslicing -g
+    /// a/b/r20.bin -Q`: the entry, and the directories above it.
+    const REAL_SLICING_NESTED: &str = "\
+Slice(s)|[Data ][D][ EA  ][FSA][Compr][S]|Permission| Filemane
+--------+--------------------------------+----------+-----------------------------
+1\t [InRef][-]       [-L-][  51%][ ] drwxrwxr-x a
+1\t [InRef][-]       [-L-][  51%][ ] drwxrwxr-x a/b
+4-5\t [InRef][ ]       [-L-][-----][ ] -rw-rw-r-- a/b/r20.bin
+-----
+All displayed files have their data in slice range [1,4-5]
+-----
+";
+
+    #[test]
+    fn slicing_listing_gives_the_entry_and_its_directories_slices() {
+        let got = parse_slicing_listing(REAL_SLICING_NESTED, "a/b/r20.bin").unwrap();
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), vec![1, 4, 5]);
+    }
+
+    /// A name with a space and a tab is matched whole, at the end of its row.
+    #[test]
+    fn slicing_listing_matches_a_name_with_whitespace() {
+        let text = "1\t [InRef][-]       [-L-][  51%][ ] drwxrwxr-x a\n\
+                    3\t [InRef][ ]       [-L-][-----][ ] -rw-rw-r-- a/sp ace\ttab.txt\n";
+        let got = parse_slicing_listing(text, "a/sp ace\ttab.txt").unwrap();
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    /// A symlink has no data slice (an empty first field); only its
+    /// directory's slice is needed.
+    #[test]
+    fn slicing_listing_takes_an_entry_with_no_data_slice() {
+        let text = "1\t [InRef][-]       [-L-][  51%][ ] drwxrwxr-x a\n\
+                    \t [InRef][-]       [---][-----][ ] lrwxrwxrwx a/link1\n";
+        let got = parse_slicing_listing(text, "a/link1").unwrap();
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// A listing that does not name the entry — dar printed only the header,
+    /// as it does for a path not in the archive — is no answer at all, so
+    /// the caller reads every slice.
+    #[test]
+    fn slicing_listing_without_the_entry_is_no_answer() {
+        let text = "Slice(s)|[Data ][D][ EA  ][FSA][Compr][S]|Permission| Filemane\n\
+                    -----\nAll displayed files have their data in slice range []\n-----\n";
+        assert_eq!(parse_slicing_listing(text, "nonexist"), None);
+        assert_eq!(
+            parse_slicing_listing(REAL_SLICING_NESTED, "a/b/r2.bin"),
+            None,
+            "a prefix of another name is not that name"
+        );
+        assert_eq!(parse_slicing_listing("5-3\t x a\n", "a"), None);
+    }
+
+    /// The real dar, end to end: a file in the last slices of an archive
+    /// lists its slices off the isolated catalogue, the same way the tool
+    /// will ask for them.
+    #[test]
+    fn real_dar_entry_slices_reads_the_isolated_catalogue() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let noise: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        std::fs::write(src.join("big.bin"), &noise).unwrap();
+        std::fs::write(src.join("sub/late.txt"), b"late").unwrap();
+        let base = tmp.path().join("arch");
+        assert!(Command::new("dar")
+            .arg("-c")
+            .arg(&base)
+            .arg("-R")
+            .arg(&src)
+            .args(["-s", "64k", "-Q"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let cat = tmp.path().join("cat");
+        super::super::create::extract_catalog("dar", &base, &cat).unwrap();
+        let got = entry_slices("dar", &cat, "big.bin").unwrap().unwrap();
+        assert!(got.len() >= 3, "big.bin spans several slices: {got:?}");
+        assert_eq!(entry_slices("dar", &cat, "no/such").unwrap(), None);
     }
 
     // ── the verbatim report (issue #306) ──
