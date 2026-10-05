@@ -416,8 +416,8 @@ padding can be defeated without knowing the exact size:
 /// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_PARSE_FILE_LIST,
-        AWK_SELECT_VERSION, AWK_UNIT_LIST,
+        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
+        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNIT_LIST,
     };
 
     let script = r#"#!/usr/bin/env bash
@@ -655,9 +655,92 @@ done
 
 # ---- tape helpers ----
 
+# The mt this script drives. mt-st is the one that can set the block size;
+# stock Debian and Ubuntu install GNU cpio's mt as plain `mt` when mt-st is
+# absent, and that one has no setblk. tape_init chooses.
+MT=mt
+
 tape_init() {
-  mt -f "$DEVICE" setblk "$BLOCK" 2>/dev/null ||
-    die "cannot set block size — is $DEVICE a tape device?"
+  if command -v mt-st >/dev/null 2>&1; then
+    MT=mt-st
+  fi
+  local ver
+  ver=$("$MT" --version 2>&1 | head -n 1 || true)
+  if "$MT" -f "$DEVICE" setblk "$BLOCK" 2>"$WORK/mt.err"; then
+    return 0
+  fi
+  local why
+  why=$(head -n 1 "$WORK/mt.err" 2>/dev/null || true)
+  case "$ver $why" in
+  *mt-st*)
+    die "cannot set the block size on $DEVICE: ${why:-mt failed}
+       mt-st itself refused, so the device is the problem: is $DEVICE a tape
+       drive, with a cartridge loaded? List the drives: ls -l /dev/tape/by-id/"
+    ;;
+  *"GNU cpio"* | *"invalid argument"* | *setblk*)
+    echo "WARNING: '$MT' is not mt-st (${ver:-unknown version}) and cannot set the block size." >&2
+    echo "         Reading $DEVICE in whatever mode the drive is in. In variable-block mode, the" >&2
+    echo "         st driver's default, dd bs=512k reads each 512 KiB tape block whole and this" >&2
+    echo "         works. If a read fails, install mt-st (apt install mt-st) and run again." >&2
+    ;;
+  *)
+    die "cannot set the block size on $DEVICE with '$MT' (${ver:-unknown version}): ${why:-mt failed}
+       This script needs mt-st (package mt-st). If $MT is mt-st, check that
+       $DEVICE is a tape drive with a cartridge loaded: ls -l /dev/tape/by-id/"
+    ;;
+  esac
+}
+
+# CUR is the tape file the head sits at the START of, or empty when that is
+# not known for certain (#396). It is 0 after a rewind and pos+1 after a read
+# that took file pos through its filemark; a failed mt or dd, or a read that
+# stopped inside a file, empties it. seek_to moves only forward from a known
+# CUR and rewinds whenever it is unknown or behind the target, so any doubt
+# costs a rewind and never a read of the wrong file. Before 1.1.0 every read
+# rewound to the start of the tape, which on LTO costs about two minutes.
+CUR=""
+MT_STATUS_WARNED=0
+
+# Where the drive says the head is, as "FILE BLOCK", or nothing when mt
+# status cannot be read or parsed (mt-st and GNU mt word it differently).
+mt_position() {
+  "$MT" -f "$DEVICE" status 2>/dev/null | awk '__AWK_MT_POSITION__' || true
+}
+
+# Put the head at the start of tape file $1. Returns 1 if mt fails.
+seek_to() {
+  local pos=$1 from=$CUR here
+  CUR=""
+  if [ -n "$from" ]; then
+    # Trust CUR only if the drive agrees, as tapectl checks MTIOCGET.
+    here=$(mt_position)
+    if [ -z "$here" ]; then
+      if [ "$MT_STATUS_WARNED" = 0 ]; then
+        echo "NOTE: '$MT status' gave no file number this script can read; rewinding before every read (slower, still correct)." >&2
+        MT_STATUS_WARNED=1
+      fi
+      from=""
+    elif [ "$here" != "$from 0" ]; then
+      echo "NOTE: the drive reports file/block $here, not the start of file $from; rewinding to be sure." >&2
+      from=""
+    fi
+  fi
+  if [ -n "$from" ] && [ "$pos" -eq "$from" ]; then
+    :
+  elif [ -n "$from" ] && [ "$pos" -gt "$from" ]; then
+    "$MT" -f "$DEVICE" fsf $((pos - from)) 2>/dev/null || return 1
+  else
+    "$MT" -f "$DEVICE" rewind 2>/dev/null || return 1
+    if [ "$pos" -gt 0 ]; then
+      "$MT" -f "$DEVICE" fsf "$pos" 2>/dev/null || return 1
+    fi
+  fi
+  CUR=$pos
+}
+
+# dd's own complaint, for a NOTE: not its record counts.
+dd_detail() {
+  grep -v -e 'records in$' -e 'records out$' -e 'bytes.*copied' "$1" 2>/dev/null | tail -n 2 || true
 }
 
 # Read tape file at position $1 into file $2 (raw bytes, block-padded). Dies
@@ -666,63 +749,99 @@ tape_init() {
 # the script with no message at all.
 read_tape_raw() {
   local pos=$1 out=$2
-  mt -f "$DEVICE" rewind
-  [ "$pos" -gt 0 ] && mt -f "$DEVICE" fsf "$pos"
-  dd if="$DEVICE" of="$out" bs="$BLOCK" 2>"$WORK/dd.err" ||
+  seek_to "$pos" || die "cannot position the tape at file $pos ($MT failed)"
+  if ! dd if="$DEVICE" of="$out" bs="$BLOCK" 2>"$WORK/dd.err"; then
+    CUR=""
     die_io "reading tape file $pos failed" "$WORK/dd.err" "$(dirname "$out")"
+  fi
+  if [ -s "$out" ]; then CUR=$((pos + 1)); else CUR=""; fi
 }
 
 # Same, but never exits: returns 1 on any failure (missing position, I/O
 # error, or an empty read). Used wherever "absent" must be distinguished from
-# "present but wrong" — the ladder's rung selection and --verify's per-file
-# walk both rely on this instead of letting `set -e` kill the script.
+# "present but wrong" — the ladder's rung selection relies on this instead of
+# letting `set -e` kill the script. dd's complaint is kept as a NOTE.
 try_read_tape_raw() {
   local pos=$1 out=$2
-  mt -f "$DEVICE" rewind 2>/dev/null || return 1
-  if [ "$pos" -gt 0 ]; then
-    mt -f "$DEVICE" fsf "$pos" 2>/dev/null || return 1
+  seek_to "$pos" || return 1
+  if ! dd if="$DEVICE" of="$out" bs="$BLOCK" 2>"$WORK/dd.err"; then
+    CUR=""
+    echo "NOTE: reading tape file $pos failed: $(dd_detail "$WORK/dd.err")" >&2
+    return 1
   fi
-  dd if="$DEVICE" of="$out" bs="$BLOCK" 2>/dev/null
-  [ -s "$out" ] || return 1
+  if [ -s "$out" ]; then
+    CUR=$((pos + 1))
+  else
+    CUR=""
+    return 1
+  fi
 }
 
 # sha256 of tape file $1, first $2 bytes (all of it when $2 is empty), hashed
 # as it streams off the tape: --verify used to copy each file into WORK first,
 # twice, and a 10 GiB slice in a RAM-backed /tmp made a good tape FAIL as
 # "unreadable". Returns 1 when the file cannot be reached or read, or yields no
-# bytes at all.
+# bytes at all. The hash is left in TAPE_SHA, not printed: called as
+# $(hash_tape_file ...) it would run in a subshell, and the cursor it moves
+# would be lost with it.
 EMPTY_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+TAPE_SHA=""
 hash_tape_file() {
   local pos=$1 size=$2 sum
-  mt -f "$DEVICE" rewind 2>/dev/null || return 1
-  if [ "$pos" -gt 0 ]; then
-    mt -f "$DEVICE" fsf "$pos" 2>/dev/null || return 1
-  fi
+  TAPE_SHA=""
+  seek_to "$pos" || return 1
+  CUR=""
   if [ -n "$size" ]; then
     # head stops at the exact size; cat drains the block padding after it,
-    # so dd never takes a SIGPIPE that pipefail would read as a tape fault.
-    sum=$(dd if="$DEVICE" bs="$BLOCK" 2>/dev/null | {
+    # so dd never takes a SIGPIPE that pipefail would read as a tape fault,
+    # and the head ends past the filemark.
+    sum=$(dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | {
       head -c "$size" | sha256sum
       cat >/dev/null
     }) || return 1
   else
-    sum=$(dd if="$DEVICE" bs="$BLOCK" 2>/dev/null | sha256sum) || return 1
+    sum=$(dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | sha256sum) || return 1
   fi
   sum=${sum%% *}
   [ -n "$sum" ] && [ "$sum" != "$EMPTY_SHA256" ] || return 1
-  echo "$sum"
+  CUR=$((pos + 1))
+  TAPE_SHA=$sum
 }
 
-# Read tape file at position $1 into file $2, stripping null padding. Use for
-# plaintext text files (ID thunk, front index, seal marker) where padding
-# zeros are harmless to strip but would confuse text-processing tools — the
-# content is TOML text and should never legitimately contain embedded NULs, so
-# stripping every NUL is equivalent to stripping only the trailing padding.
-read_tape_text() {
-  local pos=$1 out=$2
-  mt -f "$DEVICE" rewind
-  [ "$pos" -gt 0 ] && mt -f "$DEVICE" fsf "$pos"
-  dd if="$DEVICE" bs="$BLOCK" 2>/dev/null | tr -d '\0' >"$out"
+# Keep a copy of tape file $1 (at most $3 bytes of it) in file $2 while
+# passing it: --verify reads Files 1 and 2 on its way to File 3 and checks
+# them once File 3 says what they should be, instead of rewinding for them.
+# Returns 1 if the file cannot be read.
+stash_tape_file() {
+  local pos=$1 out=$2 max=$3
+  seek_to "$pos" || return 1
+  CUR=""
+  dd if="$DEVICE" bs="$BLOCK" 2>"$WORK/dd.err" | {
+    head -c "$max" >"$out"
+    cat >/dev/null
+  } || return 1
+  [ -s "$out" ] || return 1
+  CUR=$((pos + 1))
+}
+
+# The most of a file before the front index that --verify keeps while passing
+# it (Files 0-2 are a few KiB each; this only bounds a damaged tape).
+STASH_MAX=$((64 * BLOCK))
+
+# sha256 of the first $2 bytes (all, when $2 is empty) of tape file $1 from
+# what --verify kept of it while passing; returns 1 when nothing was kept, or
+# too little, so the caller reads the tape instead.
+stashed_sha() {
+  local f="$WORK/stash.$1" size=$2 have
+  [ -f "$f" ] || return 1
+  have=$(wc -c <"$f")
+  if [ -n "$size" ]; then
+    [ "$have" -ge "$size" ] || return 1
+    head -c "$size" "$f" | sha256sum | awk '{print $1}'
+  else
+    [ "$have" -lt "$STASH_MAX" ] || return 1
+    sha256sum "$f" | awk '{print $1}'
+  fi
 }
 
 # ---- TOML helpers (flat key = value parsing; sec 3.1 grammar contract) ----
@@ -778,7 +897,11 @@ envelope_positions() {
 bootstrap_thunk() {
   tape_init
   info "Reading ID thunk (file 0)..."
-  read_tape_text 0 "$WORK/id_thunk.txt"
+  # Kept raw as well: --verify checks File 0's bytes against the front index
+  # without going back for them. The text is plaintext TOML with no NULs of
+  # its own, so deleting every NUL removes exactly the block padding.
+  read_tape_raw 0 "$WORK/stash.0"
+  tr -d '\0' <"$WORK/stash.0" >"$WORK/id_thunk.txt"
   sed -n '/^\[volume\]/,$p' "$WORK/id_thunk.txt" >"$WORK/thunk.toml"
 
   check_layout_version "$(toml_val "$WORK/thunk.toml" layout_version)"
@@ -1022,14 +1145,23 @@ do_info() {
 do_verify() {
   bootstrap_thunk
 
-  local fi_ok=0 seal_ok=0
-  try_front_index && fi_ok=1
-  try_seal_copy && seal_ok=1
+  # One pass, ascending, from a single rewind (#396). Files 1 and 2 lie
+  # between File 0 and the front index, so their bytes are kept as the head
+  # passes them and checked once the front index says what they should be.
+  # The seal marker is the last file on the tape, so it is read last (#412),
+  # after the walk, with the same verdict as before. Only when the front index
+  # cannot be used is the seal read first, for its copy of the map.
+  local p
+  for p in 1 2; do
+    stash_tape_file "$p" "$WORK/stash.$p" "$STASH_MAX" || rm -f "$WORK/stash.$p"
+  done
 
-  local files_file=""
-  if [ "$fi_ok" -eq 1 ]; then
+  local fi_ok=0 seal_ok=0 files_file=""
+  if try_front_index; then
+    fi_ok=1
     files_file="$WORK/files_from_index.txt"
-  elif [ "$seal_ok" -eq 1 ]; then
+  elif try_seal_copy; then
+    seal_ok=1
     echo "WARNING: front index unreadable — verifying against the seal marker's embedded copy (degradation ladder RUNG-2)." >&2
     files_file="$WORK/files_from_seal.txt"
   else
@@ -1042,9 +1174,40 @@ do_verify() {
 
   local overall_ok=1
 
-  # File 3 vs the seal binding: the one entry the generic per-file loop below
-  # cannot check when sourced from the front index itself (its own entry
-  # carries no hash there — self-reference).
+  while IFS='|' read -r pos type size hash; do
+    # Entries with no hash are self-referential (front_index's own entry in
+    # the front-index-sourced list, and the seal marker's own entry always)
+    # — nothing on the tape hashes them, so there is nothing to compare.
+    [ -z "$hash" ] && continue
+
+    require_uint "position(@$type)" "$pos"
+    [ -z "$size" ] || require_uint "size_bytes(@$pos)" "$size"
+
+    local actual=""
+    if ! actual=$(stashed_sha "$pos" "$size"); then
+      if hash_tape_file "$pos" "$size"; then
+        actual=$TAPE_SHA
+      else
+        printf "FAIL  file %3d  %-24s  (unreadable)\n" "$pos" "$type"
+        overall_ok=0
+        continue
+      fi
+    fi
+
+    if [ "$actual" = "$hash" ]; then
+      printf "PASS  file %3d  %-24s\n" "$pos" "$type"
+    else
+      printf "FAIL  file %3d  %-24s  (hash mismatch)\n" "$pos" "$type"
+      overall_ok=0
+    fi
+  done <"$files_file"
+
+  # The seal marker, last. File 3 vs the seal binding is the one entry the
+  # per-file loop above cannot check when the list came from the front index
+  # itself (its own entry carries no hash there — self-reference).
+  if [ "$fi_ok" -eq 1 ] && try_seal_copy; then
+    seal_ok=1
+  fi
   if [ "$seal_ok" -eq 1 ] && [ "$fi_ok" -eq 1 ]; then
     if [ "$FRONT_INDEX_HASH" = "$SEAL_FRONT_INDEX_SHA256" ]; then
       printf "PASS  file %3d  %-24s  (matches seal binding)\n" "$FRONT_INDEX" "front_index"
@@ -1056,32 +1219,8 @@ do_verify() {
     printf "FAIL  file %3d  %-24s  (unreadable/unparseable)\n" "$FRONT_INDEX" "front_index"
     overall_ok=0
   else
-    echo "WARNING: no valid seal marker — this tape is UNSEALED; completeness cannot be confirmed. Only the files below were checked." >&2
+    echo "WARNING: no valid seal marker — this tape is UNSEALED; completeness cannot be confirmed. Only the files above were checked." >&2
   fi
-
-  while IFS='|' read -r pos type size hash; do
-    # Entries with no hash are self-referential (front_index's own entry in
-    # the front-index-sourced list, and the seal marker's own entry always)
-    # — nothing on the tape hashes them, so there is nothing to compare.
-    [ -z "$hash" ] && continue
-
-    require_uint "position(@$type)" "$pos"
-    [ -z "$size" ] || require_uint "size_bytes(@$pos)" "$size"
-
-    local actual
-    if ! actual=$(hash_tape_file "$pos" "$size"); then
-      printf "FAIL  file %3d  %-24s  (unreadable)\n" "$pos" "$type"
-      overall_ok=0
-      continue
-    fi
-
-    if [ "$actual" = "$hash" ]; then
-      printf "PASS  file %3d  %-24s\n" "$pos" "$type"
-    else
-      printf "FAIL  file %3d  %-24s  (hash mismatch)\n" "$pos" "$type"
-      overall_ok=0
-    fi
-  done <"$files_file"
 
   echo ""
   if [ "$overall_ok" -eq 1 ]; then
@@ -1507,6 +1646,7 @@ esac
         .replace("__AWK_MANIFEST_HAS_UNIT__", AWK_MANIFEST_HAS_UNIT)
         .replace("__AWK_UNIT_LIST__", AWK_UNIT_LIST)
         .replace("__AWK_SELECT_VERSION__", AWK_SELECT_VERSION)
+        .replace("__AWK_MT_POSITION__", AWK_MT_POSITION)
         .replace("__LABEL__", label)
         .replace("__TOTAL_FILES__", &total_files.to_string());
 
@@ -1826,8 +1966,8 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_PARSE_FILE_LIST,
-        AWK_SELECT_VERSION, AWK_UNIT_LIST,
+        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
+        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNIT_LIST,
     };
 
     #[test]
@@ -2928,6 +3068,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_MANIFEST_HAS_UNIT", AWK_MANIFEST_HAS_UNIT),
             ("AWK_UNIT_LIST", AWK_UNIT_LIST),
             ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
+            ("AWK_MT_POSITION", AWK_MT_POSITION),
         ] {
             assert!(
                 script.contains(fragment),
@@ -2962,6 +3103,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_MANIFEST_HAS_UNIT", AWK_MANIFEST_HAS_UNIT),
             ("AWK_UNIT_LIST", AWK_UNIT_LIST),
             ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
+            ("AWK_MT_POSITION", AWK_MT_POSITION),
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");
         }
@@ -3090,8 +3232,11 @@ sha256_encrypted = \"bbb\"
 
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
+        // `mt-st` too: the script prefers it by name, and the host's real one
+        // must never be reached from a test.
         for tool in [
             "mt",
+            "mt-st",
             "dd",
             "age",
             "dar",
@@ -3100,7 +3245,7 @@ sha256_encrypted = \"bbb\"
             "truncate",
             "tar",
         ] {
-            let body = if tool == "mt" || tool == "dd" {
+            let body = if tool == "mt" || tool == "mt-st" || tool == "dd" {
                 "#!/bin/sh\nif [ -n \"${TAPECTL_TEST_SENTINEL:-}\" ]; then \
                  : >\"$TAPECTL_TEST_SENTINEL\"; fi\nexit 0\n"
             } else {
@@ -3657,8 +3802,11 @@ sha256_encrypted = \"bbb\"
         )
         .unwrap();
         // The prerequisite loop demands these; inert unless a test says more.
+        // `mt-st` too: the script prefers it by name, and the host's real one
+        // must never be reached from a test.
         let mut all: Vec<(&str, &str)> = vec![
             ("mt", "#!/bin/sh\nexit 0\n"),
+            ("mt-st", "#!/bin/sh\nexit 0\n"),
             ("dd", "#!/bin/sh\nexit 0\n"),
             ("age", "#!/bin/sh\nexit 0\n"),
             ("dar", "#!/bin/sh\nexit 0\n"),
@@ -3988,14 +4136,18 @@ sha256_encrypted = \"bbb\"
 
         let dd = format!("#!/bin/sh\ncat \"{}\"\n", tape.display());
         let (dir, path) = heir_harness("stream", &[("dd", &dd)]);
-        let (code, text) = heir_run(&dir, &path, &format!("hash_tape_file 5 {}", payload.len()));
+        let (code, text) = heir_run(
+            &dir,
+            &path,
+            &format!("hash_tape_file 5 {} && echo \"$TAPE_SHA\"", payload.len()),
+        );
         assert_eq!(code, 0, "{text}");
         assert!(
             text.contains(&want),
             "the hash of exactly size_bytes:\n{text}"
         );
         // No size: the whole file, padding included (as before).
-        let (code, text) = heir_run(&dir, &path, "hash_tape_file 5 ''");
+        let (code, text) = heir_run(&dir, &path, "hash_tape_file 5 '' && echo \"$TAPE_SHA\"");
         assert_eq!(code, 0, "{text}");
         assert!(text.contains(&want_padded), "{text}");
 

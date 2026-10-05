@@ -198,3 +198,21 @@ pub(crate) const AWK_SELECT_VERSION: &str = r##"
       }
     }
   "##;
+
+/// Reads `mt status` into `FILE BLOCK`, or prints nothing (issue #396). The
+/// script trusts its tape cursor only when the drive agrees with it, as
+/// tapectl checks `MTIOCGET` since 1.0.5. mt-st prints
+/// `File number=3, block number=0, partition=0.` on one line; GNU cpio mt
+/// prints `file number = 3` and `block number = 0` on two. Matched
+/// case-insensitively with either spacing; anything else yields no output,
+/// and the script then rewinds before every read, as it always did.
+pub(crate) const AWK_MT_POSITION: &str = r##"
+    { l = tolower($0) }
+    l ~ /file number *=/ {
+      s = l; sub(/.*file number *= */, "", s); sub(/[^-0-9].*/, "", s); f = s
+    }
+    l ~ /block number *=/ {
+      s = l; sub(/.*block number *= */, "", s); sub(/[^-0-9].*/, "", s); b = s
+    }
+    END { if (f ~ /^-?[0-9]+$/ && b ~ /^-?[0-9]+$/) print f, b }
+  "##;
