@@ -148,9 +148,11 @@ ln -s target.txt "$SRC/unitC/link-ok"
 ln -s /nonexistent-gate-path "$SRC/unitC/link-broken"
 
 # ---------- leg 1: tapectl round trip ----------
+# Each command's status is checked (issue #415): this step's verdict used to
+# be `mkdir`'s alone, so a failed `init` or config rewrite still read PASS.
 step_init() {
-    TCTL init --operator gate-op --no-escrow
-    python3 - "$CFG" "$RUN" "$TAPE_DEV" "$DRIVE_SG" <<'PY'
+    TCTL init --operator gate-op --no-escrow || return 1
+    python3 - "$CFG" "$RUN" "$TAPE_DEV" "$DRIVE_SG" <<'PY' || return 1
 import sys, re
 cfg, run, tape, sg = sys.argv[1:5]
 t = open(cfg).read()
@@ -245,10 +247,27 @@ step_vol_init() { TCTL volume init "$LABEL" --device "$TAPE_DEV"; }
 # ("host check: ..." lines, never "warning: volume"). --yes reaches no other
 # question on `volume write`, and no Tier-3 refusal.
 step_vol_write() { TCTL volume write "$LABEL" --device "$TAPE_DEV" --yes; }
-step_vol_verify() {
-    TCTL volume verify "$LABEL" --device "$TAPE_DEV" --json | tee "$RUN/verify.json"
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RUN/verify.json"
+# `volume verify --json`, judged on its EXIT STATUS as well as its report
+# (issue #415). Every verify step used to be `verify --json | tee` followed by
+# a python assert on the JSON, and nothing read the verify's own status: a
+# non-zero verify (2 = medium proven bad, 3 = inconclusive, which every error
+# exits) passed whenever the JSON it printed still said failed == 0. The exit
+# is checked first, then the report. PIPESTATUS is read by the very next
+# statement -- any command in between, `local` included, replaces it. tee is
+# kept so the JSON still lands in the step log.
+verify_json() { # verify_json <label> <device> <json-out>
+    local label="$1" dev="$2" json="$3"
+    local -a st
+    TCTL volume verify "$label" --device "$dev" --json | tee "$json"
+    st=("${PIPESTATUS[@]}")
+    [ "${st[0]}" -eq 0 ] || {
+        echo "volume verify $label exited ${st[0]}, want 0 (2 = medium proven bad, 3 = inconclusive)"
+        return 1
+    }
+    [ "${st[1]}" -eq 0 ] || { echo "tee into $json exited ${st[1]}"; return 1; }
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$json"
 }
+step_vol_verify() { verify_json "$LABEL" "$TAPE_DEV" "$RUN/verify.json"; }
 # Issue #277's recording half, which NOTHING else covers. The `sealed_at`
 # UPDATE lives in `finish_session`, reachable only through
 # `volume write`/`volume resume` against a real device -- so every unit test
@@ -318,7 +337,10 @@ echo "gate: leg 1 — tapectl round trip"
 # wiring is proven by nothing the gate runs (a source pin only). Positive
 # control first: at least one completed write contact exists.
 step_feed_ratio_recorded() {
-    python3 - "$HOME_DIR/tapectl.db" <<'PYFEED'
+    # `|| return 1` (issue #415): this python's status was dropped, so the
+    # step's verdict was the grep below alone and none of these asserts could
+    # fail it.
+    python3 - "$HOME_DIR/tapectl.db" <<'PYFEED' || return 1
 import json, sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 writes = c.execute(
@@ -361,12 +383,39 @@ print(f"{len(rows)} write_feed_ratio event(s) for {len(writes)} completed write 
 PYFEED
     # No warning may have reached stderr on mhvtl: the suppression is the
     # point. The gate captures every step's output under $RUN/log-*.txt.
-    if grep -l "warning: volume" "$RUN"/log-*.txt 2>/dev/null | grep -q .; then
-        echo "a 'warning: volume' line reached stderr on mhvtl despite capacity_override:" >&2
-        grep -H "warning: volume" "$RUN"/log-*.txt >&2
+    #
+    # Issue #415: this was `grep -l ... 2>/dev/null | grep -q .`, an absence
+    # check with no positive control. A glob matching nothing made grep exit
+    # 2 into /dev/null and read as "absent", and under pipefail a `grep -l`
+    # SIGPIPEd by the early-exiting `grep -q` read the same way. So: a
+    # positive control first, over the SAME glob with the SAME `grep -l` --
+    # the write's own completion line must be found in the write's own log,
+    # the stream a feed-ratio warning lands in -- then the negative, judged
+    # on grep's own status (the leakscan's rule: 1 is clean, 2+ is
+    # inconclusive, never clean).
+    #
+    # This step's own log is in the glob and is being written while it runs:
+    # nothing echoed before the negative grep may contain its needle.
+    local logs=("$RUN"/log-*.txt) hits rc
+    hits="$(grep -lF "volume \"$LABEL\" write completed" "${logs[@]}")"
+    rc=$?
+    if [ "$rc" -ne 0 ] || ! grep -xF -- "$RUN/log-volume_write.txt" >/dev/null <<<"$hits"; then
+        echo "positive control: grep -l over $RUN/log-*.txt (rc=$rc) did not find the write's completion line in log-volume_write.txt -- the search below could not have found a feed-ratio line either"
         return 1
     fi
-    echo "no 'warning: volume' line in any step log (suppressed on the gate's drive)"
+    hits="$(grep -lF "warning: volume" "${logs[@]}")"
+    rc=$?
+    case "$rc" in
+        0)
+            echo "a 'warning: volume' line reached stderr on mhvtl despite capacity_override, in: $hits" >&2
+            grep -H "warning: volume" "${logs[@]}" >&2
+            return 1 ;;
+        1) ;;
+        *)
+            echo "grep failed (rc=$rc) searching $RUN/log-*.txt for 'warning: volume' -- inconclusive, not clean" >&2
+            return 1 ;;
+    esac
+    echo "no 'warning: volume' line in any step log (suppressed on the gate's drive); the same search found the write's completion line"
 }
 
 # Issue #301: every contact journals the st driver's per-device sysfs
@@ -447,28 +496,48 @@ check restore_multislice_unit step_restore_B
 check restore_symlink_unit    step_restore_C
 
 # ---------- leg 3a: negative crypto + leak scan (before heir leg rewinds) ----------
-step_crosskey() {
-    # Slices are uuid-named on disk — resolve unitA's first slice via the catalog.
-    local slice bobkey
-    slice="$(python3 - "$HOME_DIR/tapectl.db" <<'PY'
+# Slices are uuid-named on disk — resolve a unit's first staged slice via the
+# catalog. Prints nothing when there is none.
+first_staged_slice() { # first_staged_slice <unit>
+    python3 - "$HOME_DIR/tapectl.db" "$1" <<'PY'
 import sqlite3, sys
 row = sqlite3.connect(sys.argv[1]).execute(
     """SELECT sl.staging_path FROM stage_slices sl
        JOIN stage_sets ss ON ss.id = sl.stage_set_id
        JOIN snapshots s ON s.id = ss.snapshot_id
        JOIN units u ON u.id = s.unit_id
-       WHERE u.name = 'unitA' AND sl.staging_path IS NOT NULL
-       ORDER BY sl.slice_number LIMIT 1"""
+       WHERE u.name = ? AND sl.staging_path IS NOT NULL
+       ORDER BY sl.slice_number LIMIT 1""", (sys.argv[2],)
 ).fetchone()
 print(row[0] if row else "")
 PY
-)"
+}
+# A rejection proves isolation only if the same `age -d` CAN succeed (issue
+# #415): a slice that is not an age file, or a key file age cannot use, is
+# "rejected" just the same. So two positive controls before the negative --
+# alice's own key opens this slice, and bob's key opens bob's own slice.
+step_crosskey() {
+    local slice bslice alicekey bobkey
+    slice="$(first_staged_slice unitA)"
     [ -n "$slice" ] && [ -f "$slice" ] || { echo "no unitA slice found via catalog"; return 1; }
+    bslice="$(first_staged_slice unitB)"
+    [ -n "$bslice" ] && [ -f "$bslice" ] || { echo "no unitB slice found via catalog"; return 1; }
+    alicekey="$HOME_DIR/keys/alice-primary.age.key"
     bobkey="$HOME_DIR/keys/bob-primary.age.key"
+    [ -f "$alicekey" ] || { echo "alice key missing"; return 1; }
     [ -f "$bobkey" ] || { echo "bob key missing"; return 1; }
+    age -d -i "$alicekey" "$slice" >/dev/null 2>&1 || {
+        echo "positive control: alice's own key did not decrypt alice's slice $slice -- a rejection of bob's key would prove nothing"
+        return 1
+    }
+    age -d -i "$bobkey" "$bslice" >/dev/null 2>&1 || {
+        echo "positive control: bob's key did not decrypt bob's own slice $bslice -- the key, not isolation, would be what fails below"
+        return 1
+    }
     if age -d -i "$bobkey" "$slice" >/dev/null 2>&1; then
         echo "bob's key decrypted alice's slice — isolation broken"; return 1
     fi
+    echo "alice's slice refused bob's key; alice's key opens it, and bob's key opens bob's own slice"
     return 0
 }
 # Read every file on the tape, BOT to EOD, concatenated into one file.
@@ -489,7 +558,8 @@ dump_whole_tape() { # dump_whole_tape <outfile>
             [ "$empty" -ge 2 ] && break
         else
             empty=0
-            cat "$tmp" >> "$out"
+            # A short dump is a scan of less tape, never a clean one (#415).
+            cat "$tmp" >> "$out" || { echo "dump_whole_tape: appending file $n to $out failed"; return 1; }
         fi
         n=$((n + 1))
     done
@@ -537,6 +607,15 @@ step_leakscan() {
     # before trusting it about what must not be.
     grep -a -q "label = \"$LABEL\"" "$dump" || {
         echo "leakscan: volume label $LABEL is NOT in the tape dump -- the scan is broken, not the tape clean"
+        return 1
+    }
+    # And the scan must have reached the END of the tape (issue #415): the
+    # label is in File 0, so it alone cannot tell a whole-tape dump from one
+    # that stopped early. The seal marker is the last file of a sealed v2
+    # volume, and its banner appears nowhere else on tape (one hit, at the
+    # dump's tail, in the 2026-10-05 gate run).
+    grep -a -q "TAPECTL SEAL MARKER" "$dump" || {
+        echo "leakscan: the seal marker (the volume's last file) is NOT in the tape dump -- the scan stopped short of the end, not the tape clean"
         return 1
     }
 
@@ -844,10 +923,7 @@ PYX
 
 # A resumed tape must be indistinguishable from a straight-through one:
 # verify passes and a real unit round-trips byte-for-byte.
-step_resume_verify() {
-    TCTL volume verify "$RLABEL2" --device "$TAPE_DEV" --json | tee "$RUN/verify-resumed.json"
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RUN/verify-resumed.json"
-}
+step_resume_verify() { verify_json "$RLABEL2" "$TAPE_DEV" "$RUN/verify-resumed.json"; }
 step_resume_restore() {
     TCTL restore unit --unit unitA --from "$RLABEL2" --to "$RUN/restored-resumed" --device "$TAPE_DEV" \
     && diff -r "$SRC/unitA" "$RUN/restored-resumed"
@@ -928,11 +1004,16 @@ PYS
 # produces — the distinction this gate exists to make (issue #275: a check
 # that only asserts a failure cannot tell WHICH failure it got).
 assert_retire_refused() { # assert_retire_refused <label> <unit> <want_resume_line:yes|no>
-    local label="$1" unit="$2" want_resume="$3" out rc
+    local label="$1" unit="$2" want_resume="$3" out rc needle has_resume errexit_was=0
+    # Restore the CALLER's errexit state rather than forcing it on (issue
+    # #415). This was `set +e ... set -e`, and this script never sets -e
+    # (`set -uo pipefail`, line 33), so every gate run left errexit ON for
+    # everything after leg 4.
+    case $- in *e*) errexit_was=1 ;; esac
     set +e
     out="$(TCTL volume retire "$label" --yes 2>&1)"
     rc=$?
-    set -e
+    if [ "$errexit_was" = 1 ]; then set -e; fi
     printf '%s\n' "$out" > "$RUN/retire-refusal-$label.txt"
     if [ $rc -eq 0 ]; then
         echo "assert_retire_refused: $label: retire SUCCEEDED (rc=0). This is issue #276 \
@@ -941,8 +1022,11 @@ with no ADR-0008 Tier-3 refusal. Output:"
         printf '%s\n' "$out"
         return 1
     fi
+    # grep reads a here-string, not `printf | grep -q` (issue #415): under
+    # pipefail a grep -q that exits on its first match can SIGPIPE the
+    # printf, and the pipeline then reads as "absent".
     for needle in "LAST eligible copy" "$unit"; do
-        if ! printf '%s' "$out" | grep -qF "$needle"; then
+        if ! grep -F -- "$needle" >/dev/null <<<"$out"; then
             echo "assert_retire_refused: $label: refused (rc=$rc) but the message does not \
 contain \"$needle\" — a non-zero exit alone does not prove the Tier-3 floor fired rather \
 than some unrelated error. Output:"
@@ -954,7 +1038,17 @@ than some unrelated error. Output:"
     # it does not -- asserting only its presence would pass a build that printed
     # it unconditionally, which would be wrong advice for an ordinary sealed
     # tape. Checked in both directions for that reason.
-    if printf '%s' "$out" | grep -qF "volume resume"; then
+    #
+    # The absent direction's positive control is the loop above: the same
+    # grep over the same $out has just found "LAST eligible copy" and the
+    # unit. grep's own status decides (issue #415), and 2+ is never "absent".
+    grep -F -- "volume resume" >/dev/null <<<"$out"
+    has_resume=$?
+    [ "$has_resume" -le 1 ] || {
+        echo "assert_retire_refused: $label: grep failed (rc=$has_resume) looking for \`volume resume\` -- inconclusive"
+        return 1
+    }
+    if [ "$has_resume" -eq 0 ]; then
         if [ "$want_resume" != yes ]; then
             echo "assert_retire_refused: $label: the refusal offers \`volume resume\` for a \
 volume that is already sealed. is_sealed_but_unconfirmed should be false here; that advice \
@@ -1007,6 +1101,39 @@ check resume_restore    step_resume_restore
 check resume_after_crash step_resume_after_crash
 check tier3_floor_unconfirmed step_tier3_floor_unconfirmed
 
+# cfg_names_device_tape <device>: 0 if an uncommented `device_tape = ...` line
+# in $CFG names "<device>", 1 if none does, 2 if $CFG could not be read.
+# Issue #415: both by-id steps below asserted the by-id spelling ABSENT with
+# `grep ... "$CFG" | grep -qF ...`, which an unreadable $CFG (grep exit 2) or a
+# first grep SIGPIPEd under pipefail satisfied as "absent". One routine, its
+# own status, and each caller runs it first on the spelling the config DOES
+# carry ($TAPE_DEV, written there by step_init) as the positive control.
+cfg_names_device_tape() {
+    local lines rc
+    lines="$(grep -E '^[[:space:]]*device_tape[[:space:]]*=' "$CFG")"
+    rc=$?
+    [ "$rc" -le 1 ] || return 2
+    grep -F -- "\"$1\"" >/dev/null <<<"$lines"
+}
+# The two by-id steps' shared config precondition: $CFG names $TAPE_DEV (the
+# positive control) and does NOT name <by_id>.
+by_id_absent_from_cfg() { # by_id_absent_from_cfg <by_id>
+    local rc
+    cfg_names_device_tape "$TAPE_DEV"
+    rc=$?
+    [ "$rc" -eq 0 ] || {
+        echo "positive control: $CFG has no device_tape line naming $TAPE_DEV (rc=$rc) -- the absence check for $1 could not have matched either"
+        return 1
+    }
+    cfg_names_device_tape "$1"
+    rc=$?
+    case "$rc" in
+        0) echo "precondition: $CFG already names $1 as a device_tape -- string equality would carry the lookup"; return 1 ;;
+        1) return 0 ;;
+        *) echo "precondition: could not read $CFG (rc=$rc) -- inconclusive, not absent"; return 1 ;;
+    esac
+}
+
 # ---------- by-id device spelling (issue #321, #313's acceptance) ----------
 # CLAUDE.md tells the operator to name the drive by serial,
 # /dev/tape/by-id/scsi-<serial>-nst, because /dev/nstN moves across reboots.
@@ -1040,16 +1167,11 @@ step_health_by_id_device() {
         echo "precondition: the gate was run with TAPECTL_GATE_TAPE=$by_id; this step needs the /dev/nstN spelling in config"
         return 1
     }
-    if grep -E '^[[:space:]]*device_tape[[:space:]]*=' "$CFG" | grep -qF "\"$by_id\""; then
-        echo "precondition: $CFG already names $by_id as a device_tape -- string equality would carry the lookup"
-        return 1
-    fi
+    by_id_absent_from_cfg "$by_id" || return 1
     before="$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT COALESCE(MAX(id),0) FROM cartridge_contacts WHERE operation = '"'volume verify'"'").fetchone()[0])' "$HOME_DIR/tapectl.db")" \
         || { echo "could not read the last verify contact id"; return 1; }
     echo "by-id: $by_id -> $(readlink -f "$by_id") (config says $TAPE_DEV); last verify contact before: $before"
-    TCTL volume verify "$RLABEL4" --device "$by_id" --json | tee "$RUN/verify-by-id.json"
-    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RUN/verify-by-id.json" \
-        || return 1
+    verify_json "$RLABEL4" "$by_id" "$RUN/verify-by-id.json" || return 1
     python3 - "$HOME_DIR/tapectl.db" "$before" "$by_id" "$serial" <<'PYBYID'
 import sqlite3, sys
 db, before, by_id, want = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
@@ -1117,10 +1239,7 @@ step_health_by_id_restore() {
         echo "precondition: the gate was run with TAPECTL_GATE_TAPE=$by_id; this step needs the /dev/nstN spelling in config"
         return 1
     }
-    if grep -E '^[[:space:]]*device_tape[[:space:]]*=' "$CFG" | grep -qF "\"$by_id\""; then
-        echo "precondition: $CFG already names $by_id as a device_tape -- string equality would carry the lookup"
-        return 1
-    fi
+    by_id_absent_from_cfg "$by_id" || return 1
     before="$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("SELECT COALESCE(MAX(id),0) FROM cartridge_contacts WHERE operation = '"'restore unit'"'").fetchone()[0])' "$HOME_DIR/tapectl.db")" \
         || { echo "could not read the last restore contact id"; return 1; }
     echo "by-id: $by_id -> $(readlink -f "$by_id") (config says $TAPE_DEV); last restore contact before: $before"
