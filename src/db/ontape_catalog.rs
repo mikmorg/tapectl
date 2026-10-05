@@ -425,16 +425,51 @@ pub fn write(conn: &Connection, stage_set_ids: &[i64], out_path: &Path) -> Resul
         std::fs::remove_file(out_path)?;
     }
 
+    let out = open_output(out_path)?;
+    fill(conn, stage_set_ids, &out)
+}
+
+/// Open the output file for a build that nothing has to survive (issue
+/// #399): no rollback journal, no syncs. The file is throwaway — `volume
+/// write` tars and age-encrypts it into the operator envelope, and a new
+/// session rebuilds it from the catalog after a crash — so SQLite's
+/// durability work buys nothing here. With the defaults (`journal_mode =
+/// DELETE`, `synchronous = FULL`) every commit cost about four fsyncs on the
+/// staging disk, while the cartridge sat loaded and idle.
+fn open_output(out_path: &Path) -> Result<Connection> {
     let out = Connection::open(out_path)?;
-    out.execute_batch(SCHEMA)?;
+    // Both before any transaction: SQLite cannot change the journal mode
+    // inside one.
+    out.pragma_update(None, "journal_mode", "OFF")?;
+    out.pragma_update(None, "synchronous", "OFF")?;
+    Ok(out)
+}
+
+/// The rows of [`write`], into an already-open `out`: the schema, the
+/// `user_version` stamp and every row, in ONE transaction with one prepared
+/// INSERT per table (issue #399). It used to be one autocommit per row —
+/// about 100 rows/s, so ~5 hours for L6-0001's ~181k `files` rows.
+///
+/// Same rows in the same order as before: each table's SELECT is unchanged,
+/// and the tables are filled in the same sequence. Nothing pins this file's
+/// bytes; `read` and `catalog rebuild` read it by content.
+pub(crate) fn fill(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Result<()> {
+    let tx = out.unchecked_transaction()?;
+    tx.execute_batch(SCHEMA)?;
 
     let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    out.execute(&format!("PRAGMA user_version = {user_version}"), [])?;
+    tx.execute(&format!("PRAGMA user_version = {user_version}"), [])?;
 
-    if stage_set_ids.is_empty() {
-        return Ok(());
+    if !stage_set_ids.is_empty() {
+        copy_rows(conn, stage_set_ids, &tx)?;
     }
+    tx.commit()?;
+    Ok(())
+}
 
+/// Every table's rows for `stage_set_ids`, from `conn` into `out` — called
+/// only inside [`fill`]'s transaction.
+fn copy_rows(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Result<()> {
     let ph = || {
         (0..stage_set_ids.len())
             .map(|_| "?")
@@ -462,6 +497,10 @@ pub fn write(conn: &Connection, stage_set_ids: &[i64], out_path: &Path) -> Resul
                 row.get::<_, Option<String>>(6)?,
             ))
         })?;
+        let mut insert = out.prepare(
+            "INSERT INTO stage_sets (id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size, key_fingerprints)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
         for r in rows {
             let (
                 id,
@@ -472,11 +511,15 @@ pub fn write(conn: &Connection, stage_set_ids: &[i64], out_path: &Path) -> Resul
                 total_encrypted_size,
                 key_fingerprints,
             ) = r?;
-            out.execute(
-                "INSERT INTO stage_sets (id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size, key_fingerprints)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![id, snapshot_id, slice_size, num_slices, total_dar_size, total_encrypted_size, key_fingerprints],
-            )?;
+            insert.execute(rusqlite::params![
+                id,
+                snapshot_id,
+                slice_size,
+                num_slices,
+                total_dar_size,
+                total_encrypted_size,
+                key_fingerprints
+            ])?;
         }
     }
 
@@ -500,13 +543,21 @@ pub fn write(conn: &Connection, stage_set_ids: &[i64], out_path: &Path) -> Resul
                 row.get::<_, Option<i64>>(6)?,
             ))
         })?;
+        let mut insert = out.prepare(
+            "INSERT INTO snapshots (id, unit_id, version, snapshot_type, source_path, total_size, file_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
         for r in rows {
             let (id, unit_id, version, snapshot_type, source_path, total_size, file_count) = r?;
-            out.execute(
-                "INSERT INTO snapshots (id, unit_id, version, snapshot_type, source_path, total_size, file_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![id, unit_id, version, snapshot_type, source_path, total_size, file_count],
-            )?;
+            insert.execute(rusqlite::params![
+                id,
+                unit_id,
+                version,
+                snapshot_type,
+                source_path,
+                total_size,
+                file_count
+            ])?;
         }
     }
 
@@ -530,12 +581,12 @@ pub fn write(conn: &Connection, stage_set_ids: &[i64], out_path: &Path) -> Resul
                 row.get::<_, Option<String>>(4)?,
             ))
         })?;
+        let mut insert = out.prepare(
+            "INSERT INTO units (id, uuid, name, tenant_id, status) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
         for r in rows {
             let (id, uuid, name, tenant_id, status) = r?;
-            out.execute(
-                "INSERT INTO units (id, uuid, name, tenant_id, status) VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![id, uuid, name, tenant_id, status],
-            )?;
+            insert.execute(rusqlite::params![id, uuid, name, tenant_id, status])?;
         }
     }
 
@@ -557,12 +608,10 @@ pub fn write(conn: &Connection, stage_set_ids: &[i64], out_path: &Path) -> Resul
         let rows = stmt.query_map(params_from_iter(stage_set_ids.iter()), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
+        let mut insert = out.prepare("INSERT INTO tenants (id, name) VALUES (?1, ?2)")?;
         for r in rows {
             let (id, name) = r?;
-            out.execute(
-                "INSERT INTO tenants (id, name) VALUES (?1, ?2)",
-                rusqlite::params![id, name],
-            )?;
+            insert.execute(rusqlite::params![id, name])?;
         }
     }
 
@@ -585,6 +634,10 @@ pub fn write(conn: &Connection, stage_set_ids: &[i64], out_path: &Path) -> Resul
                 row.get::<_, String>(6)?,
             ))
         })?;
+        let mut insert = out.prepare(
+            "INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
         for r in rows {
             let (
                 id,
@@ -595,11 +648,15 @@ pub fn write(conn: &Connection, stage_set_ids: &[i64], out_path: &Path) -> Resul
                 sha256_plain,
                 sha256_encrypted,
             ) = r?;
-            out.execute(
-                "INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![id, stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted],
-            )?;
+            insert.execute(rusqlite::params![
+                id,
+                stage_set_id,
+                slice_number,
+                size_bytes,
+                encrypted_bytes,
+                sha256_plain,
+                sha256_encrypted
+            ])?;
         }
     }
 
@@ -624,13 +681,21 @@ pub fn write(conn: &Connection, stage_set_ids: &[i64], out_path: &Path) -> Resul
                 row.get::<_, i64>(6)?,
             ))
         })?;
+        let mut insert = out.prepare(
+            "INSERT INTO files (id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
         for r in rows {
             let (id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory) = r?;
-            out.execute(
-                "INSERT INTO files (id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory],
-            )?;
+            insert.execute(rusqlite::params![
+                id,
+                snapshot_id,
+                path,
+                size_bytes,
+                sha256,
+                modified_at,
+                is_directory
+            ])?;
         }
     }
 
@@ -769,6 +834,85 @@ mod tests {
             .query_row("SELECT sha256_plain FROM stage_slices", [], |r| r.get(0))
             .unwrap();
         assert_eq!(plain, "plainhash");
+    }
+
+    /// Issue #399: the build is ONE transaction, whatever the row count. It
+    /// used to be one autocommit per row — about four fsyncs each, ~100
+    /// rows/s on the staging disk, so ~5 h for L6-0001's ~181k file rows
+    /// while the cartridge sat loaded. Counted with SQLite's commit hook on
+    /// the output connection: deterministic, unlike a timing bound.
+    #[test]
+    fn the_build_commits_once_whatever_the_row_count() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const FILES: usize = 500;
+        let conn = crate::db::open_memory().unwrap();
+        let (_unit, ss_id) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
+        let snap_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                [ss_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
+                     VALUES (?1, ?2, 1, 'h', 0)",
+                )
+                .unwrap();
+            for i in 0..FILES {
+                insert
+                    .execute(rusqlite::params![snap_id, format!("dir/f{i:04}")])
+                    .unwrap();
+            }
+            drop(insert);
+            tx.commit().unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = Connection::open(dir.path().join("catalog.db")).unwrap();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&commits);
+        out.commit_hook(Some(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            false
+        }))
+        .unwrap();
+
+        fill(&conn, &[ss_id], &out).unwrap();
+
+        let rows: i64 = out
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, FILES as i64 + 1, "positive control: every row landed");
+        assert_eq!(
+            commits.load(Ordering::SeqCst),
+            1,
+            "the catalog.db build must commit once, not once per row"
+        );
+    }
+
+    /// Issue #399: the throwaway output file is written with no rollback
+    /// journal and no syncs — it is tarred and age-encrypted, and a new
+    /// session rebuilds it after a crash. Both settings belong to the
+    /// connection, not the file, so they are read off the connection
+    /// `write` builds through.
+    #[test]
+    fn the_output_connection_keeps_no_journal_and_never_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = open_output(&dir.path().join("catalog.db")).unwrap();
+        let mode: String = out
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        let sync: i64 = out
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "off");
+        assert_eq!(sync, 0);
     }
 
     #[test]
