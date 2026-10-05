@@ -484,6 +484,12 @@ fn check_restore_space(
         None => (total + largest, total),
     };
     let (Some(scratch_fs), Some(dest_fs)) = (existing(scratch_root), existing(destination)) else {
+        warn!(
+            destination = %destination.display(),
+            scratch = %scratch_root.display(),
+            "cannot find the filesystem a restore would write to; continuing without the space \
+             check"
+        );
         return Ok(());
     };
     let same_fs = match (fs::metadata(&scratch_fs), fs::metadata(&dest_fs)) {
@@ -537,10 +543,19 @@ fn check_restore_space(
 }
 
 /// `path` itself if it exists, else its nearest existing ancestor — where
-/// a directory the restore will create gets its space from.
+/// a directory the restore will create gets its space from. A relative path
+/// is taken from the working directory, as every later step takes it, so a
+/// bare `--to restored` that does not exist yet is measured on the working
+/// directory's filesystem rather than not at all.
 fn existing(path: &Path) -> Option<PathBuf> {
-    path.ancestors()
-        .find(|p| !p.as_os_str().is_empty() && p.exists())
+    let absolute = if path.is_relative() {
+        std::env::current_dir().ok()?.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    absolute
+        .ancestors()
+        .find(|p| p.exists())
         .map(Path::to_path_buf)
 }
 
@@ -3678,6 +3693,25 @@ mod tests {
                 };
                 unit(&r, "PF-SPACE", dest.path(), &options).unwrap();
                 assert_eq!(names_in(dest.path()), ["a.txt", "b.txt"]);
+            }
+
+            /// A destination that does not exist yet is measured on its
+            /// nearest existing ancestor — and a RELATIVE one (`--to
+            /// restored`) on the working directory's, never skipped: its
+            /// ancestors as written end in "", which exists nowhere.
+            #[test]
+            fn a_missing_destination_is_measured_on_its_nearest_existing_ancestor() {
+                let cwd = std::env::current_dir().unwrap();
+                assert_eq!(
+                    existing(Path::new("tapectl-no-such-relative-dir/deeper")),
+                    Some(cwd)
+                );
+                let tmp = TempDir::new().unwrap();
+                assert_eq!(
+                    existing(&tmp.path().join("not/yet/made")),
+                    Some(tmp.path().to_path_buf())
+                );
+                assert_eq!(existing(tmp.path()), Some(tmp.path().to_path_buf()));
             }
 
             /// The arithmetic is RESTORE.sh's: about twice the unit plus one
