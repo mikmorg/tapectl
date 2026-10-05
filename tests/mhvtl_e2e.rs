@@ -731,6 +731,19 @@ fn slice_plaintext_hashes(conn: &Connection, unit_name: &str) -> Vec<String> {
     hashes
 }
 
+/// The plaintext-leak scan's ONE routine: every needle found in `data`, read
+/// as lossy UTF-8. The leak assertions and their positive controls both call
+/// this, so a control that passes proves the very search the assertion runs
+/// (issue #415).
+fn needles_found<'a>(data: &[u8], needles: &'a [String]) -> Vec<&'a str> {
+    let text = String::from_utf8_lossy(data);
+    needles
+        .iter()
+        .map(String::as_str)
+        .filter(|n| text.contains(n))
+        .collect()
+}
+
 /// Leg 2 (v2-implementation-plan.md T9, `volume-format-v2.md` sec 2's
 /// isolation invariant, D4's real enforcement): plaintext positions are
 /// `{0, 1, 2, 3, seal_marker}` — everything else must start with the age
@@ -872,20 +885,54 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     // marker (last file). Everything else must be age-encrypted.
     let age_magic = b"age-encryption.org/v1";
     let plaintext_positions = [0i32, 1, 2, front_index_pos, seal_marker_pos];
+    let label_needle = [label.to_string()];
+    let (mut plaintext_scanned, mut encrypted_scanned) = (0usize, 0usize);
 
     for pos in 0..total_files {
         let data = read_tape_file_at(&tape_dev(), BLOCK_SIZE, pos);
         assert!(!data.is_empty(), "file {pos} empty");
 
+        // Positive control (issue #415): every assertion below is an ABSENCE,
+        // and an absence cannot tell "searched and found nothing" from
+        // "searched nothing". So first prove the scan finds each forbidden
+        // needle when it IS in these bytes: plant all of them mid-file in a
+        // copy of this very file and run the same routine over it.
+        // Mid-file on purpose: it can split a multi-byte sequence, which is
+        // exactly where a lossy decode would swallow a needle if it could.
+        let mid = data.len() / 2;
+        let marker: Vec<u8> = forbidden
+            .iter()
+            .flat_map(|n| format!("\n{n}\n").into_bytes())
+            .collect();
+        let planted = [&data[..mid], &marker[..], &data[mid..]].concat();
+        let found = needles_found(&planted, &forbidden);
+        assert_eq!(
+            found.len(),
+            forbidden.len(),
+            "positive control: with every forbidden needle planted in file {pos}'s own bytes, \
+             the scan found only {found:?} -- an empty result below would prove nothing"
+        );
+
         if plaintext_positions.contains(&pos) {
-            let s = String::from_utf8_lossy(&data);
-            for needle in &forbidden {
-                assert!(
-                    !s.contains(needle.as_str()),
-                    "plaintext leak at file {pos}: contains {needle:?}"
+            plaintext_scanned += 1;
+            // And on the real bytes: File 0 carries the label in plaintext by
+            // design (volume-format-v2.md), so the same routine must see it
+            // in what came off the tape -- the gate's leakscan reasoning.
+            if pos == 0 {
+                assert_eq!(
+                    needles_found(&data, &label_needle),
+                    [label],
+                    "positive control: the scan did not find the label {label:?} in File 0, \
+                     where it is plaintext by design -- the scan is broken, not the tape clean"
                 );
             }
+            let leaks = needles_found(&data, &forbidden);
+            assert!(
+                leaks.is_empty(),
+                "plaintext leak at file {pos}: contains {leaks:?}"
+            );
         } else {
+            encrypted_scanned += 1;
             // Encrypted file — must start with age header magic.
             assert!(
                 data.starts_with(age_magic),
@@ -896,15 +943,25 @@ fn mhvtl_no_plaintext_tenant_metadata() {
             // forbidden substrings either (age ciphertext is effectively
             // random; this guards against pathological mis-wiring where a
             // file ends up encrypted but still carries a plaintext prefix).
-            let s = String::from_utf8_lossy(&data);
-            for needle in &forbidden {
-                assert!(
-                    !s.contains(needle.as_str()),
-                    "encrypted file {pos} contains plaintext {needle:?}"
-                );
-            }
+            let leaks = needles_found(&data, &forbidden);
+            assert!(
+                leaks.is_empty(),
+                "encrypted file {pos} contains plaintext {leaks:?}"
+            );
         }
     }
+    // The loop covered both kinds of file: five plaintext-by-design positions
+    // (0, 1, 2, the front index at 3, the seal marker last) and at least one
+    // encrypted one. A zero here means the scan above asserted about nothing.
+    assert_eq!(
+        plaintext_scanned, 5,
+        "positive control: expected the 5 plaintext positions {plaintext_positions:?} \
+         among {total_files} files, scanned {plaintext_scanned}"
+    );
+    assert!(
+        encrypted_scanned > 0,
+        "positive control: no encrypted file among {total_files} was scanned"
+    );
 
     // Envelope-range sanity block, v2 order (volume-format-v2.md sec 1):
     // envelopes start at File 4 and every envelope precedes every data slice.
