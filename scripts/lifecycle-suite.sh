@@ -1495,10 +1495,27 @@ fy_json_capture_keeps_stdout_clean() {
         echo "stdout did not parse as JSON even with the streams split -- the capture is still contaminated:"
         head -c 400 "$d/out.json"; return 1
     }
-    grep -q "DEBUG" "$d/out.json" && {
-        echo "a DEBUG line reached the JSON file: stderr is still being merged into stdout (issue #270)"
-        return 1
+    # The negative below needs a positive control on its OWN needle (issue
+    # #415): a non-empty stderr does not prove it carried "DEBUG", and if it
+    # did not, "no DEBUG in the JSON" would hold for any capture. Same grep,
+    # same needle, the other stream -- then the negative on grep's own status,
+    # where 2+ (an unreadable file) is never "absent".
+    grep "DEBUG" "$d/out.err" >/dev/null || {
+        echo "positive control: --verbose put no DEBUG line on stderr, so finding none in the JSON would prove nothing (issue #270):"
+        head -c 400 "$d/out.err"; return 1
     }
+    local rc
+    grep "DEBUG" "$d/out.json" >/dev/null
+    rc=$?
+    case "$rc" in
+        0)
+            echo "a DEBUG line reached the JSON file: stderr is still being merged into stdout (issue #270)"
+            return 1 ;;
+        1) ;;
+        *)
+            echo "grep failed (rc=$rc) reading $d/out.json -- inconclusive, not clean"
+            return 1 ;;
+    esac
     echo "stdout parsed as JSON while stderr carried $(wc -c <"$d/out.err") bytes of diagnostics"
     return 0
 }
@@ -1927,7 +1944,7 @@ tor_mark_tape_only_solo_refused() {
     local out rc
     out="$(TCTL unit mark-tape-only solo 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || { echo "mark-tape-only solo unexpectedly succeeded with only 1 copy: $out"; return 1; }
-    echo "$out" | grep -qi "insufficient copies" || { echo "refusal did not name the shortfall ('insufficient copies'): $out"; return 1; }
+    echo "$out" | grep -i "insufficient copies" >/dev/null || { echo "refusal did not name the shortfall ('insufficient copies'): $out"; return 1; }
 }
 
 tor_report_tape_only() { TCTL report tape-only; }
@@ -1982,11 +1999,11 @@ tor_staging_clean() {
         echo "staging clean must now SUCCEED while retaining the under-copied unit (issue #262), got rc=$rc: $out"
         return 1
     }
-    echo "$out" | grep -q "solo" || {
+    echo "$out" | grep "solo" >/dev/null || {
         echo "staging clean retained data but did not name the under-copied unit, so an operator cannot tell which one: $out"
         return 1
     }
-    echo "$out" | grep -q -- "--force" || {
+    echo "$out" | grep -- "--force" >/dev/null || {
         echo "staging clean retained data without naming --force as the override: $out"
         return 1
     }
@@ -2192,7 +2209,7 @@ cp_compact_finish_refused_first() {
     local out rc
     out="$(TCTL volume compact-finish VOL-E 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || { echo "compact-finish VOL-E unexpectedly succeeded before VOL-G existed: $out"; return 1; }
-    echo "$out" | grep -qi "have no copy on another volume" || { echo "unexpected refusal text: $out"; return 1; }
+    echo "$out" | grep -i "have no copy on another volume" >/dev/null || { echo "unexpected refusal text: $out"; return 1; }
 }
 
 # `vinit` is not optional here, and its absence was a third latent defect
@@ -2289,18 +2306,18 @@ rr_retire_refused_sole_copy() {
     local out rc
     out="$(TCTL volume retire VOL-A 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || { echo "volume retire VOL-A unexpectedly succeeded without consent while it is the sole copy: $out"; return 1; }
-    echo "$out" | grep -qi "ZERO copies remaining" || { echo "impact analysis did not name a zero-copy unit ('ZERO copies remaining'): $out"; return 1; }
+    echo "$out" | grep -i "ZERO copies remaining" >/dev/null || { echo "impact analysis did not name a zero-copy unit ('ZERO copies remaining'): $out"; return 1; }
 
     out="$(TCTL volume retire VOL-A --yes 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || {
         echo "volume retire VOL-A --yes SUCCEEDED on the sole eligible copy of a live version -- ADR-0008 Tier 3 is absolute and no flag may reach it (issue #147): $out"
         return 1
     }
-    echo "$out" | grep -qi "LAST eligible copy" || {
+    echo "$out" | grep -i "LAST eligible copy" >/dev/null || {
         echo "refused with --yes, but not by the Tier-3 floor -- the message does not name the LAST eligible copy, so this refusal is the non-interactive guard and the floor is unproven: $out"
         return 1
     }
-    echo "$out" | grep -qi "no --force for this" || {
+    echo "$out" | grep -i "no --force for this" >/dev/null || {
         echo "the Tier-3 refusal did not say that no flag reaches it, which is the property this check exists to pin: $out"
         return 1
     }
@@ -2369,7 +2386,7 @@ rr_volinit_volx_refused_no_force() {
     local out rc
     out="$(TCTL volume init VOL-X --device "$TAPE_DEV" 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || { echo "volume init VOL-X unexpectedly succeeded on a cartridge still sealed as VOL-A: $out"; return 1; }
-    echo "$out" | grep -q "ADR-0003" || { echo "refusal did not cite ADR-0003: $out"; return 1; }
+    echo "$out" | grep "ADR-0003" >/dev/null || { echo "refusal did not cite ADR-0003: $out"; return 1; }
 }
 
 rr_volinit_volx_refused_with_force() {
@@ -2381,7 +2398,7 @@ rr_volinit_volx_refused_with_force() {
     local out rc
     out="$(TCTL volume init VOL-X --device "$TAPE_DEV" --force 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || { echo "volume init VOL-X --force unexpectedly succeeded over a sealed cartridge (violates ADR-0003): $out"; return 1; }
-    echo "$out" | grep -q "ADR-0003" || { echo "refusal did not cite ADR-0003: $out"; return 1; }
+    echo "$out" | grep "ADR-0003" >/dev/null || { echo "refusal did not cite ADR-0003: $out"; return 1; }
 }
 
 # Now the documented reuse procedure for real: physically erase, THEN
@@ -2759,7 +2776,7 @@ eo_stage_before_escrow_refused() {
         echo "$out"
         return 1
     fi
-    if ! echo "$out" | grep -qi "no escrow recipient is registered"; then
+    if ! echo "$out" | grep -i "no escrow recipient is registered" >/dev/null; then
         echo "refused, but not with the expected message ('no escrow recipient is registered'):"
         echo "$out"
         return 1
@@ -2781,7 +2798,7 @@ eo_rotate_before_escrow_refused() {
     local out rc
     out="$(TCTL key rotate --tenant alice 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || { echo "key rotate unexpectedly succeeded with no escrow recipient: $out"; return 1; }
-    echo "$out" | grep -qi "no escrow recipient is registered" || { echo "unexpected refusal text: $out"; return 1; }
+    echo "$out" | grep -i "no escrow recipient is registered" >/dev/null || { echo "unexpected refusal text: $out"; return 1; }
 }
 
 eo_escrow()       { TCTL key generate --escrow; }
@@ -3607,7 +3624,7 @@ for v in vols:
 ' 2>/dev/null)"
         last=""
         for cand in "${PM_WRITTEN[@]}"; do
-            echo "$labels" | grep -qx "$cand" && last="$cand"
+            echo "$labels" | grep -x -- "$cand" >/dev/null && last="$cand"
         done
         if [ -n "$last" ]; then
             # Issue #252, second half. Compare against the baseline FROZEN
@@ -3888,7 +3905,7 @@ PY2
         echo "volume write VOL-S SUCCEEDED against an already-sealed tape — ADR-0003 violation (issue #208): $out"
         return 1
     }
-    echo "$out" | grep -q "ADR-0003" || {
+    echo "$out" | grep "ADR-0003" >/dev/null || {
         echo "refused, but not by the tape-side seal check: the message does not cite ADR-0003, so the catalog guard fired first and this scenario did not exercise what it claims: $out"
         return 1
     }
@@ -4020,22 +4037,40 @@ cd_init_d2_displaces() {
         echo "volume init VOL-D2 was REFUSED on a blanked cartridge (exit $rc). ADR-0010 records a displacement, it never gates one; a second consent point was deliberately rejected: $out"
         return 1
     }
-    printf '%s\n' "$out" | grep -q 'previously held volume "VOL-D1"' || {
+    printf '%s\n' "$out" | grep 'previously held volume "VOL-D1"' >/dev/null || {
         echo "init succeeded but recorded no displacement of VOL-D1 -- the cartridge binding did not survive the erase, or mount_and_record never ran: $out"
         return 1
     }
-    printf '%s\n' "$out" | grep -qE 'unit "solo" \[[^]]*\] now has ZERO copies' || {
+    printf '%s\n' "$out" | grep -E 'unit "solo" \[[^]]*\] now has ZERO copies' >/dev/null || {
         echo "the displacement warning did not name solo as left with ZERO copies -- this is the half of render_displacement that #235 found dropped on the rebuild path: $out"
         return 1
     }
-    printf '%s\n' "$out" | grep -qE 'unit "kept" \[[^]]*\]: 1 other copy' || {
+    printf '%s\n' "$out" | grep -E 'unit "kept" \[[^]]*\]: 1 other copy' >/dev/null || {
         echo "the displacement warning did not report kept's surviving copy: $out"
         return 1
     }
-    printf '%s\n' "$out" | grep -E 'unit "kept"' | grep -q 'ZERO copies' && {
-        echo "the warning called kept zero-copy as well as solo -- it is naming every unit on the volume, not the ones actually left uncovered: $out"
+    # Absence, judged on grep's own status (issue #415). This was
+    # `... | grep -E 'unit "kept"' | grep -q 'ZERO copies' && fail`: under
+    # pipefail the first grep finding no kept line, or being SIGPIPEd by the
+    # early-exiting `grep -q`, read as "absent". Now the search's input is
+    # proven non-empty first -- the positive control, the same kept lines the
+    # negative reads -- and 2+ is never "absent".
+    local kept_lines
+    kept_lines="$(grep -E 'unit "kept"' <<<"$out")" || {
+        echo "positive control: no 'unit \"kept\"' line in the output, so the ZERO-copies check below would search nothing: $out"
         return 1
     }
+    grep -F 'ZERO copies' >/dev/null <<<"$kept_lines"
+    rc=$?
+    case "$rc" in
+        0)
+            echo "the warning called kept zero-copy as well as solo -- it is naming every unit on the volume, not the ones actually left uncovered: $out"
+            return 1 ;;
+        1) ;;
+        *)
+            echo "grep failed (rc=$rc) looking for 'ZERO copies' on kept's line -- inconclusive, not clean: $out"
+            return 1 ;;
+    esac
     return 0
 }
 
