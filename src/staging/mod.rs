@@ -1708,7 +1708,9 @@ fn ask_to_stage_anyway(
 
 /// What happens to a stage that proceeds and then runs out of staging.
 const STAGING_RUNS_OUT: &str =
-    "if it runs out, the stage stops there and its partial slices are removed";
+    "if it runs out, the stage stops there and its partial slices are removed. \
+     `tapectl staging status` shows what staging holds; a bare `tapectl staging clean` \
+     frees what failed stages left and what is already on tape";
 
 #[cfg(test)]
 thread_local! {
@@ -4007,6 +4009,12 @@ mod tests {
             "the refusal carries the figures: {msg}"
         );
         assert!(!msg.contains("dar-must-never-run"), "before dar: {msg}");
+        // Issue #409: it names the fix, since what fills staging is often a
+        // failed stage's files or slices already on tape.
+        assert!(
+            msg.contains("`tapectl staging status`") && msg.contains("`tapectl staging clean`"),
+            "names what frees staging: {msg}"
+        );
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();

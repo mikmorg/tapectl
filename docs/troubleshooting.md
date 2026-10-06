@@ -780,7 +780,9 @@ So a short staging directory is never refused outright:
 ```text
 staging directory <directory> may be too small for unit "<unit>": 1.0 MiB free, and staging it needs up to 5.7
 MiB, its encrypted slices at the snapshot's full size (less if dar stores runs of zeros as holes and a
-hard-linked file once); if it runs out, the stage stops there and its partial slices are removed
+hard-linked file once); if it runs out, the stage stops there and its partial slices are removed.
+`tapectl staging status` shows what staging holds; a bare `tapectl staging clean` frees what failed
+stages left and what is already on tape
 ```
 
 With compression on, the bracket reads `(less if its data may compress
@@ -815,7 +817,46 @@ error: cannot write staged slice <directory>/<slice>.dar.age: No space left on d
 ```
 
 The half-built stage set's files are removed, and the next tapectl command
-marks its stage set `failed`.
+marks its stage set `failed`. `tapectl staging status` shows what staging
+holds; a bare `tapectl staging clean` frees what failed stages left and what
+is already on tape.
+
+#### Why a failed stage starts over
+
+A stage that fails part-way — a full disk, a source file that changed, a
+stop, a crash — is staged again from the start: `stage create` makes a new
+stage set, and dar reads the whole unit again. Keeping the slices already
+encrypted and finishing only the rest is not possible while staging writes no
+plaintext (ADR-0012, 2026-10-06, item 4):
+
+- dar writes the archive once, to standard output, and tapectl encrypts each
+  slice as it is cut; no copy of the archive stays on any disk. The rest of
+  the archive can only come from dar again, and dar makes an archive only
+  from its beginning: it has no way to start at a given file or offset.
+- A second dar run is a different archive. dar draws a new random internal
+  name and data name for every archive; they are in every slice's header and
+  in the archive itself, and dar refuses to read slices, or to use an
+  isolated catalogue, from two different runs as one archive. So the first
+  run's slices cannot be joined to the end of a second run's.
+- The names cannot be made to match: dar has no option to set them, and
+  rewriting them inside dar's archive would rely on dar's internal layout,
+  which tapectl does not guess at.
+
+What tapectl does instead is keep a late failure from happening, and keep
+what is already finished when it can:
+
+- the staging-space check counts what other stages running at the same time
+  may still write, so a full disk is asked about before dar starts, not found
+  at slice 120 of 130;
+- every catalog write a stage makes waits out a busy catalog (another stage
+  or command writing) for up to ten minutes rather than failing, and a set
+  that reached `staged` is never removed;
+- dar's exit 11 (a file changed while dar read it) is refused as that, by
+  name, with what to do;
+- each encrypted slice is on disk (synced) before it is recorded.
+
+A restart costs that one unit's staging; every other unit's stage set is
+kept.
 
 Earlier versions also counted the unit's non-zero bytes in a read before
 dar and refused outright below them. The source is now read once, while dar
