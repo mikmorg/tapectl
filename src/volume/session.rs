@@ -1158,6 +1158,19 @@ impl InterruptedSession {
             phase.done();
         }
         if let Err(errs) = revalidated {
+            // #404's follow-up: a signal stopped `--prewrite-hash`'s full
+            // read. That is a stop, not a finding about the slices: nothing
+            // was compared past that point, nothing was written, and the
+            // session keeps the state it had, so the answer is to run the
+            // resume again — not to "fix the cause" or abort.
+            if let Some(stop) = LayoutError::interruption(&errs) {
+                return Err(TapectlError::Interrupted(format!(
+                    "volume resume: {stop}, before anything was written — the session keeps \
+                     its state and the cartridge is untouched. Run `tapectl volume resume {}` \
+                     again",
+                    self.built.layout.label
+                )));
+            }
             let detail = errs
                 .iter()
                 .map(|e| e.to_string())
@@ -3008,6 +3021,60 @@ mod tests {
             store.files.is_empty(),
             "nothing written: {}",
             store.files.len()
+        );
+    }
+
+    /// #404's follow-up: a signal during resume's `--prewrite-hash` stops
+    /// the revalidation as a stop (`TapectlError::Interrupted`, "run the
+    /// resume again"), not as a revalidation failure telling the operator
+    /// to fix a cause or abort. Before, it was `Other("revalidation
+    /// failed … Causes: …")`.
+    #[test]
+    fn a_signal_during_resume_revalidation_is_a_stop_not_a_failure() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+        let written = store.files.len();
+
+        crate::signal::interrupt_this_thread(true);
+        let r =
+            interrupted
+                .resume_checking(&f.conn, &f.keys, SliceCheck::FullHash, &mut store, || false);
+        crate::signal::interrupt_this_thread(false);
+        match r {
+            Err(TapectlError::Interrupted(at)) => {
+                assert!(
+                    at.contains("full hash of the staged slices stopped"),
+                    "{at}"
+                );
+                assert!(at.contains("volume resume SESSTEST"), "{at}");
+            }
+            Err(other) => panic!("a stop, not a failure: {other}"),
+            Ok(_) => panic!("the signal must stop the revalidation"),
+        }
+        assert_eq!(store.files.len(), written, "nothing more written");
+        let states: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !states.is_empty() && states.iter().all(|s| s == "interrupted"),
+            "the session keeps its state: {states:?}"
         );
     }
 

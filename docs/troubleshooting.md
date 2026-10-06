@@ -1352,6 +1352,19 @@ next — `volume resume` after a write or confirm, the same command again after 
 stage, verify, read-slices or restore. A second signal stops at once (exit
 130); the next command's startup recovers the session as after a crash.
 
+`volume write --prewrite-hash` stops too, inside the full hash of the staged
+slices (`… the full hash of the staged slices stopped at file N of M, before
+the tape was opened`). Nothing was written and no session was recorded, so
+there is nothing to resume: run the same `volume write` again. A `volume
+resume --prewrite-hash` stopped the same way says so (`volume resume: … the full
+hash of the staged slices stopped at file N of M, before anything was
+written`), writes nothing and leaves the session as it was; run the resume
+again.
+
+Output to a pipe whose reader has gone (`tapectl … | head`, or a `| tee`
+killed by the same Ctrl-C) is dropped rather than ending the command: it
+finishes, and exits with its own status.
+
 ### A real end of tape during the write
 
 If the drive reports that it is out of space, the session ends as a clean
