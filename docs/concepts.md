@@ -118,7 +118,7 @@ because tape punishes surprises.
     work/invoices-2024 v1: 1 slices, 1.7 KiB
 
   total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
-  estimated tapes: 1 (at 92% usable capacity)
+  estimated tapes: 1 (at the 97% fill ceiling)
   ```
 
 - **Stage once, write many.** A stage set stays on disk after it is written, so

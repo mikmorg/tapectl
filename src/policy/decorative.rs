@@ -149,7 +149,7 @@ mod tests {
             device_sg: "/dev/sg0".to_string(),
             generation: "LTO-8".to_string(),
             capacity_override: Some("2.5T".to_string()),
-            usable_capacity_factor: 0.92,
+            fill_ceiling: 0.92,
             enospc_buffer: "50M".to_string(),
         }
     }

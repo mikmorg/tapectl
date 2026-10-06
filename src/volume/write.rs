@@ -481,7 +481,7 @@ fn volume_init_in_contact<'c>(
     // usable_bytes (the T4 capacity oracle) is informational at this stage —
     // volume_init only ever writes the provisional identity thunk; real
     // capacity gating happens in volume_write's pre-open validate.
-    let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
+    let usable_bytes = backend.fill_budget_bytes(nominal_capacity as u64);
     // The tape device opens HERE and not a line earlier (see the ordering
     // invariant in `volume_init`'s doc); an injected store is never opened.
     let mut opened;
@@ -1160,7 +1160,7 @@ fn volume_write_contacted<'c>(
     // consulted for it again. Reading `backends.lto[].nominal_capacity` here
     // is exactly how issue #141 planned an LTO-5 cartridge as 2.5 TB.
     let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
-    let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
+    let usable_bytes = backend.fill_budget_bytes(nominal_capacity as u64);
     // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
     // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
     // gone (T10 config cleanup: nothing read it after this path stopped, and
@@ -1337,6 +1337,17 @@ fn volume_write_contacted<'c>(
     // sealed; the warning is about the host.
     if let Ok(layout_snapshot) = &result {
         if let Ok(data_bytes) = layout_snapshot.on_tape_bytes() {
+            // Issue #391: the capacity this write actually used, so the
+            // fill ceiling can be tuned from data (ADR-0012 item 16).
+            feed_ratio::record_capacity_used(
+                conn,
+                contact.id(),
+                volume_id,
+                label,
+                data_bytes,
+                nominal_capacity as u64,
+                backend.fill_ceiling,
+            );
             let suppressed = backend
                 .capacity_override
                 .as_ref()
@@ -1588,11 +1599,18 @@ fn volume_write_in_contact<'c>(
             );
         }
         if !blocking.is_empty() {
+            // Issue #391: a capacity refusal also names the fill ceiling.
+            let note = crate::volume::layout_model::capacity_refusal_note(
+                &blocking,
+                backend.fill_ceiling,
+                nominal_capacity as u64,
+            );
             return Err(TapectlError::Other(format!(
                 "volume \"{label}\" failed pre-write validation: {}",
                 blocking
                     .iter()
                     .map(|e| e.to_string())
+                    .chain(note)
                     .collect::<Vec<_>>()
                     .join("; ")
             )));
@@ -1898,7 +1916,7 @@ fn volume_resume_contacted<'c>(
     // in any case reuse the figure the interrupted session planned against —
     // a capacity that moved mid-session would be a different plan.
     let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
-    let usable_bytes = (nominal_capacity as f64 * backend.usable_capacity_factor) as u64;
+    let usable_bytes = backend.fill_budget_bytes(nominal_capacity as u64);
 
     // Corroborate at contact (ADR-0012, issue #193). Resume is a contact
     // under CONTEXT.md's definition and corroborated nothing until now: an
@@ -5450,7 +5468,7 @@ mod tests {
                     device_sg: "/nonexistent/tapectl-contact-test-sg".to_string(),
                     generation: "LTO-6".to_string(),
                     capacity_override: None,
-                    usable_capacity_factor: 0.95,
+                    fill_ceiling: 0.95,
                     enospc_buffer: "1GiB".to_string(),
                 }),
                 mam,
@@ -6917,7 +6935,7 @@ mod tests {
             device_sg: "/nonexistent/tapectl-health-backend-sg".to_string(),
             generation: "LTO-6".to_string(),
             capacity_override: None,
-            usable_capacity_factor: 0.95,
+            fill_ceiling: 0.95,
             enospc_buffer: "1GiB".to_string(),
         });
         config
@@ -8770,7 +8788,7 @@ mod tests {
             // would refuse earlier, for the wrong reason.
             generation: "LTO-6".into(),
             capacity_override: Some("2400G".into()),
-            usable_capacity_factor: 0.92,
+            fill_ceiling: 0.92,
             enospc_buffer: "50M".into(),
         });
 
@@ -10243,7 +10261,7 @@ mod tests {
             device_sg: "/nonexistent/tapectl-gencheck-sg".into(),
             generation: "LTO-8".into(),
             capacity_override: None,
-            usable_capacity_factor: 1.0,
+            fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
         });
         let paths = TapectlPaths::new(tmp.path().join("home"));
@@ -10395,7 +10413,7 @@ mod tests {
             device_sg: "/nonexistent/tapectl-resume-gencheck-sg".into(),
             generation: "LTO-8".into(),
             capacity_override: None,
-            usable_capacity_factor: 1.0,
+            fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
         });
 
@@ -11557,7 +11575,7 @@ mod tests {
                 // here would refuse earlier, for the wrong reason.
                 generation: "LTO-6".into(),
                 capacity_override: Some("2400G".into()),
-                usable_capacity_factor: 0.92,
+                fill_ceiling: 0.92,
                 enospc_buffer: "50M".into(),
             });
 
@@ -12418,7 +12436,7 @@ mod tests {
                 device_sg: "/nonexistent/tapectl-contact-test-sg".to_string(),
                 generation: "LTO-6".to_string(),
                 capacity_override: None,
-                usable_capacity_factor: 0.95,
+                fill_ceiling: 0.95,
                 enospc_buffer: "1GiB".to_string(),
             });
             config
@@ -12826,7 +12844,7 @@ mod tests {
                 device_sg: "/nonexistent/tapectl-contact-genchk-sg".into(),
                 generation: "LTO-8".into(),
                 capacity_override: None,
-                usable_capacity_factor: 1.0,
+                fill_ceiling: 1.0,
                 enospc_buffer: "0".into(),
             });
             config
@@ -14153,6 +14171,28 @@ mod tests {
                 feed_ratio_events(&conn),
                 1,
                 "one feed ratio, from this sweep's page 0x0c (issue #338)"
+            );
+            // Issue #391: the capacity the write used, recorded beside it.
+            let details: String = conn
+                .query_row(
+                    "SELECT details FROM events WHERE action = ?1",
+                    params![crate::tape::feed_ratio::CAPACITY_EVENT_ACTION],
+                    |r| r.get(0),
+                )
+                .expect("a completed write records the capacity it used");
+            let d: serde_json::Value = serde_json::from_str(&details).unwrap();
+            assert_eq!(
+                d["capacity_bytes"], 2_500_000_000_000u64,
+                "the ROW, not config: {d}"
+            );
+            assert_eq!(
+                d["fill_ceiling"], config.backends.lto[0].fill_ceiling,
+                "{d}"
+            );
+            assert!(d["data_bytes"].as_u64().unwrap() > 0, "{d}");
+            assert!(
+                d["native_fraction"].is_number(),
+                "page 0x0c was journalled: {d}"
             );
         }
 

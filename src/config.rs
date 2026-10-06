@@ -320,20 +320,74 @@ pub struct LtoBackendConfig {
     /// invites someone to re-fix what is already fixed.
     #[serde(default)]
     pub capacity_override: Option<String>,
-    #[serde(default = "default_usable_capacity_factor")]
-    pub usable_capacity_factor: f64,
+    /// The **fill ceiling** (issue #391, ADR-0012 2026-10-06 items 9 and 16):
+    /// the fraction of a volume's capacity a write may fill. Every write's
+    /// pre-flight capacity gate refuses a layout above it, and `volume plan`,
+    /// `collection plan` and `collection run` size batches with it. A value
+    /// in (0, 1]; `--fill-ceiling` overrides it for one command
+    /// ([`Config::with_fill_ceiling`]).
+    ///
+    /// It replaces `usable_capacity_factor` (default 0.92), which already
+    /// was this knob under another name; the old key is refused by name
+    /// ([`stale_backend_fields_message`]). The default is the CTO's ruling,
+    /// 97%, to be tuned from the capacity each write records using
+    /// (`write_capacity_used` events, [`crate::tape::feed_ratio`]).
+    #[serde(default = "default_fill_ceiling")]
+    pub fill_ceiling: f64,
     #[serde(default = "default_enospc_buffer")]
     pub enospc_buffer: String,
 }
 
-fn default_usable_capacity_factor() -> f64 {
-    0.92
+/// ADR-0012, 2026-10-06 amendment, item 16: 97% of the cartridge's capacity.
+pub const DEFAULT_FILL_CEILING: f64 = 0.97;
+
+fn default_fill_ceiling() -> f64 {
+    DEFAULT_FILL_CEILING
+}
+
+/// Parse a fill ceiling as written on a command line: a fraction (`0.97`)
+/// or a percentage (`97%`). Refuses anything outside (0, 1] — a ceiling
+/// above the capacity is the end-of-tape abort this exists to prevent, and
+/// zero would refuse every write.
+pub fn parse_fill_ceiling(s: &str) -> std::result::Result<f64, String> {
+    let t = s.trim();
+    let value = match t.strip_suffix('%') {
+        Some(pct) => pct
+            .trim()
+            .parse::<f64>()
+            .map(|p| p / 100.0)
+            .map_err(|_| format!("{s:?} is not a percentage"))?,
+        None => t.parse::<f64>().map_err(|_| {
+            format!("{s:?} is not a fraction such as 0.97 or a percentage such as 97%")
+        })?,
+    };
+    validate_fill_ceiling(value)?;
+    Ok(value)
+}
+
+/// The one range check every fill ceiling passes, config or flag.
+pub fn validate_fill_ceiling(value: f64) -> std::result::Result<(), String> {
+    if value.is_finite() && value > 0.0 && value <= 1.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "fill ceiling {value} is out of range: it is a fraction of the cartridge's \
+             capacity, above 0 and at most 1 (e.g. 0.97 or 97%)"
+        ))
+    }
 }
 fn default_enospc_buffer() -> String {
     "50M".to_string()
 }
 
 impl LtoBackendConfig {
+    /// The most a write may put on a volume of `capacity_bytes`: the
+    /// capacity times [`LtoBackendConfig::fill_ceiling`] (issue #391). The
+    /// one place that multiplication is written, for every gate and planner.
+    pub fn fill_budget_bytes(&self, capacity_bytes: u64) -> u64 {
+        (capacity_bytes as f64 * self.fill_ceiling) as u64
+    }
+
     /// This drive's own native generation, parsed.
     pub fn native_generation(&self) -> Result<crate::media::Generation> {
         crate::media::Generation::parse(&self.generation).ok_or_else(|| {
@@ -383,6 +437,91 @@ impl LtoBackendConfig {
             None => None,
         };
         Ok(crate::media::resolve_capacity(override_bytes, None, generation).0)
+    }
+
+    /// What one tape of `media` (default: this drive's own generation) can
+    /// take, for PLANNING: its capacity times the fill ceiling, less the
+    /// end-of-tape reserve — the per-tape budget `collection plan` packs
+    /// against, and the most a single unit may be (issue #395, ADR-0012
+    /// 2026-10-06 item 17: a unit is never split across cartridges). Same
+    /// "no write path" rule as [`Self::planning_capacity_bytes`].
+    pub fn planning_tape_budget(&self, media: Option<&str>) -> Result<TapeBudget> {
+        let capacity_bytes = self.planning_capacity_bytes(media)?;
+        let generation = match media {
+            Some(m) => crate::media::Generation::parse(m)
+                .map(|g| g.to_string())
+                .unwrap_or_else(|| m.to_string()),
+            None => self.native_generation()?.to_string(),
+        };
+        Ok(TapeBudget::new(
+            format!("one {generation} tape"),
+            capacity_bytes,
+            self.fill_ceiling,
+            crate::staging::parse_size_to_bytes(&self.enospc_buffer)?.max(0) as u64,
+            self.capacity_override.is_some(),
+        ))
+    }
+}
+
+/// One tape's planning budget, and how it was reached (issues #391, #395):
+/// the figures a refusal names so the operator can see which one binds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TapeBudget {
+    /// What the budget is for, as a message names it: `one LTO-6 tape`
+    /// (planning by generation) or `volume "L6-0001"` (a destination).
+    pub subject: String,
+    /// The capacity planned against (the generation table's, or a virtual
+    /// drive's `capacity_override`).
+    pub capacity_bytes: u64,
+    /// The fill ceiling applied.
+    pub fill_ceiling: f64,
+    /// The end-of-tape reserve (`enospc_buffer`) subtracted.
+    pub reserve_bytes: u64,
+    /// `capacity_bytes * fill_ceiling - reserve_bytes`: what one tape takes.
+    pub bytes: u64,
+    /// The capacity is the drive's `capacity_override`, not the table's.
+    pub overridden: bool,
+}
+
+impl TapeBudget {
+    pub fn new(
+        subject: String,
+        capacity_bytes: u64,
+        fill_ceiling: f64,
+        reserve_bytes: u64,
+        overridden: bool,
+    ) -> Self {
+        let bytes = ((capacity_bytes as f64 * fill_ceiling) as u64).saturating_sub(reserve_bytes);
+        TapeBudget {
+            subject,
+            capacity_bytes,
+            fill_ceiling,
+            reserve_bytes,
+            bytes,
+            overridden,
+        }
+    }
+
+    /// `"one LTO-6 tape takes 2.42 TB (2424947571200 bytes): its 2.50 TB
+    /// capacity at the 97% fill ceiling, less the 50.0 MiB end-of-tape
+    /// reserve"` — the limit, and each figure it comes from.
+    pub fn describe(&self) -> String {
+        let dec = |b: u64| crate::util::format_bytes_decimal(i64::try_from(b).unwrap_or(i64::MAX));
+        format!(
+            "{} takes {} ({} bytes): its {} capacity{} at the {}% fill ceiling, less the {} \
+             end-of-tape reserve",
+            self.subject,
+            dec(self.bytes),
+            self.bytes,
+            dec(self.capacity_bytes),
+            if self.overridden {
+                " (the drive's capacity_override)"
+            } else {
+                ""
+            },
+            crate::volume::layout_model::fill_ceiling_percent(self.fill_ceiling),
+            crate::util::format_bytes_binary(i64::try_from(self.reserve_bytes).unwrap_or(i64::MAX)),
+        )
     }
 }
 
@@ -731,6 +870,22 @@ impl LoggingConfig {
 }
 
 impl Config {
+    /// This config with every `[[backends.lto]]` block's
+    /// [`LtoBackendConfig::fill_ceiling`] replaced by `ceiling` — the
+    /// `--fill-ceiling` flag (issue #391: "overridable per write"). Applied
+    /// to every block because a command resolves its drive later, by
+    /// device; the flag means "for this command, fill to this fraction",
+    /// whichever drive that turns out to be. `None` returns the config as is.
+    pub fn with_fill_ceiling(&self, ceiling: Option<f64>) -> Config {
+        let mut cfg = self.clone();
+        if let Some(c) = ceiling {
+            for b in &mut cfg.backends.lto {
+                b.fill_ceiling = c;
+            }
+        }
+        cfg
+    }
+
     /// Load config from file, falling back to defaults.
     ///
     /// Every check here is load-bearing (see each validator's own doc
@@ -1063,6 +1218,17 @@ impl Config {
                 path.display()
             ));
         }
+        // Issue #391: the fill ceiling multiplies the sole pre-flight capacity
+        // defence. 0 refuses every write; above 1 plans past the end of tape.
+        for (i, backend) in self.backends.lto.iter().enumerate() {
+            if let Err(e) = validate_fill_ceiling(backend.fill_ceiling) {
+                problems.push(format!(
+                    "{}: backends.lto[{i}] (\"{}\").fill_ceiling: {e}",
+                    path.display(),
+                    backend.name
+                ));
+            }
+        }
         // `[host_check]`: a load threshold of 0 or below would make every
         // host "loaded", and a pressure percentage outside (0, 100] is
         // either always or never true — each an off switch or an always-on
@@ -1327,6 +1493,17 @@ fn stale_backend_fields_message(value: &toml::Value) -> Option<String> {
                  path disables drive compression unconditionally on every open \
                  (TapeStore::open -> MTCOMPRESSION 0), so the knob could never re-enable it \
                  and a true value was silently ignored. Delete the line."
+            ));
+        }
+        // Issue #391 (ADR-0012, 2026-10-06 item 16): renamed, same meaning —
+        // the fraction of a cartridge's capacity a write may fill. Refused
+        // by name rather than silently reinterpreted, as #348's renames were.
+        if table.contains_key("usable_capacity_factor") {
+            return Some(format!(
+                "backends.lto[\"{name}\"]: \"usable_capacity_factor\" was renamed \
+                 \"fill_ceiling\", with the same meaning: the fraction of a cartridge's \
+                 capacity a write may fill (ADR-0012, 2026-10-06; the default is now 0.97). \
+                 Rename the line to keep your value, or delete it to take the default."
             ));
         }
     }
@@ -2242,6 +2419,85 @@ mod tests {
         }
     }
 
+    // ---- issue #391: the fill ceiling ----
+
+    const LTO_BLOCK: &str = "[[backends.lto]]\nname = \"d\"\ndevice_tape = \"/dev/null\"\n\
+                             device_sg = \"/dev/null\"\ngeneration = \"LTO-6\"\n";
+
+    /// `usable_capacity_factor` was renamed `fill_ceiling` (ADR-0012,
+    /// 2026-10-06 item 16): a config still carrying it is refused by name,
+    /// with the new key, never silently read as the old 0.92 or dropped.
+    #[test]
+    fn a_config_carrying_usable_capacity_factor_is_refused_naming_fill_ceiling() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, format!("{LTO_BLOCK}usable_capacity_factor = 0.92\n")).unwrap();
+        let msg = Config::load(&path).unwrap_err().to_string();
+        assert!(msg.contains("usable_capacity_factor"), "{msg}");
+        assert!(msg.contains("renamed"), "{msg}");
+        assert!(msg.contains("fill_ceiling"), "{msg}");
+    }
+
+    /// The default is the ruled 97%, and an explicit value loads and is the
+    /// figure the budget uses.
+    #[test]
+    fn fill_ceiling_defaults_to_97_percent_and_an_explicit_value_loads() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, LTO_BLOCK).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.backends.lto[0].fill_ceiling, 0.97);
+        assert_eq!(
+            cfg.backends.lto[0].fill_budget_bytes(2_500_000_000_000),
+            2_425_000_000_000
+        );
+        std::fs::write(&path, format!("{LTO_BLOCK}fill_ceiling = 0.9\n")).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.backends.lto[0].fill_ceiling, 0.9);
+    }
+
+    /// A ceiling outside (0, 1] is a config error, not a silent multiplier.
+    #[test]
+    fn a_fill_ceiling_outside_zero_to_one_is_refused() {
+        for bad in ["0", "1.2", "-0.5"] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("config.toml");
+            std::fs::write(&path, format!("{LTO_BLOCK}fill_ceiling = {bad}\n")).unwrap();
+            let msg = Config::load(&path).unwrap_err().to_string();
+            assert!(msg.contains("fill_ceiling"), "{bad} -> {msg}");
+            assert!(msg.contains("out of range"), "{bad} -> {msg}");
+        }
+    }
+
+    #[test]
+    fn parse_fill_ceiling_takes_a_fraction_or_a_percentage() {
+        assert_eq!(parse_fill_ceiling("0.97"), Ok(0.97));
+        assert_eq!(parse_fill_ceiling("97%"), Ok(0.97));
+        assert_eq!(parse_fill_ceiling("100%"), Ok(1.0));
+        assert!(parse_fill_ceiling("101%").is_err());
+        assert!(parse_fill_ceiling("0").is_err());
+        assert!(parse_fill_ceiling("most").is_err());
+    }
+
+    /// `--fill-ceiling` replaces every block's ceiling for one command, and
+    /// `None` changes nothing.
+    #[test]
+    fn with_fill_ceiling_overrides_every_backend_for_one_command() {
+        let mut cfg = Config::default();
+        let mut b = backend_with("a", "/dev/nst0");
+        b.fill_ceiling = 0.9;
+        cfg.backends.lto.push(b);
+        cfg.backends.lto.push(backend_with("b", "/dev/nst1"));
+        let same = cfg.with_fill_ceiling(None);
+        assert_eq!(same.backends.lto[0].fill_ceiling, 0.9);
+        let over = cfg.with_fill_ceiling(Some(0.99));
+        assert!(over.backends.lto.iter().all(|b| b.fill_ceiling == 0.99));
+        assert_eq!(
+            cfg.backends.lto[0].fill_ceiling, 0.9,
+            "the original is untouched"
+        );
+    }
+
     /// The positive control for the refusal above: the new names load, and
     /// the values reach the fields every policy reader uses.
     #[test]
@@ -2359,7 +2615,7 @@ mod tests {
             device_sg: "/dev/sg0".to_string(),
             generation: "LTO-6".to_string(),
             capacity_override: None,
-            usable_capacity_factor: default_usable_capacity_factor(),
+            fill_ceiling: default_fill_ceiling(),
             enospc_buffer: default_enospc_buffer(),
         }
     }
@@ -2976,7 +3232,7 @@ mod tests {
     /// Mirrors `scripts/lifecycle-suite.sh`'s `bootstrap_config` /
     /// `scripts/mhvtl-verify-gate.sh`'s `step_init` python rewrite: a single
     /// `[[backends.lto]]` entry, a bare-integer decimal `capacity_override`,
-    /// a non-default `usable_capacity_factor`/`enospc_buffer`, `slice_size
+    /// a non-default `fill_ceiling`/`enospc_buffer`, `slice_size
     /// = "1M"`, and `compaction.utilization_threshold` raised to `0.95`.
     /// None of this issue's new validation may reject the one shape every
     /// mhvtl gate run actually writes to disk.
@@ -2991,7 +3247,7 @@ mod tests {
              [compaction]\nutilization_threshold = 0.95\n\n\
              [[backends.lto]]\nname = \"lifecycle\"\ndevice_tape = \"/dev/null\"\n\
              device_sg = \"/dev/null\"\ngeneration = \"LTO-8\"\n\
-             capacity_override = \"2748779069440\"\nusable_capacity_factor = 0.95\n\
+             capacity_override = \"2748779069440\"\nfill_ceiling = 0.95\n\
              enospc_buffer = \"2G\"\n",
         )
         .unwrap();

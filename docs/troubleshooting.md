@@ -307,6 +307,7 @@ line, or rename it where the message says so:
 |---|---|
 | `[defaults]` `min_copies_for_tape_only`, `min_locations_for_tape_only` | renamed: the keys are now `min_copies` and `min_locations`, with the same meaning and values. Rename the lines. `first-run.sh` offers to do it at step 0 |
 | `[[backends.lto]]` `media_type`, `nominal_capacity` | moved: declare the **drive's** generation as `generation = "LTO-6"`; capacity now follows the cartridge's detected generation ([ADR-0010](adr/0010-media-generation-is-a-cartridge-property.md)); `capacity_override` is for virtual drives only |
+| `[[backends.lto]]` `usable_capacity_factor` | renamed: the key is now `fill_ceiling`, with the same meaning (the fraction of a cartridge's capacity a write may fill). Rename the line to keep your value, or delete it to take the new default, 0.97. `first-run.sh` offers the rename at step 0 |
 | `[[backends.lto]]` `block_size` | removed: the block size is a format constant (512 KiB) |
 | `[[backends.lto]]` `hardware_compression` | removed: drive compression is always switched off |
 | `[packing]` (`min_free_for_append`, `strategy`, `fill_threshold`) | removed: there is no append, and the batch selector is not configurable |
@@ -875,6 +876,30 @@ you archive the new contents, compare the file against a copy you trust.
 and names that version, so a file you edited on purpose since an older
 version is not reported.
 
+### A unit larger than one cartridge
+
+```text
+error: unit "<unit>" is <size> bytes (<size, binary>), <over> bytes (<over, binary>) more than one cartridge
+can take — one LTO-6 tape takes 2.42 TB (2424947571200 bytes): its 2.50 TB capacity at the 97% fill ceiling,
+less the 50.0 MiB end-of-tape reserve. A unit is never split across cartridges (ADR-0012), so it cannot be
+written; nothing was staged. A unit this size waits for planned spanning, which is not built yet.
+```
+
+A write session fills one cartridge, and a unit is never split across two
+(ADR-0012, 2026-10-06). `stage create` refuses such a unit before dar runs, so
+it costs no staging time; `collection plan` and `collection run` refuse it the
+same way, naming the per-tape budget and by how much the unit is over. The
+limit is the largest generation any configured drive writes, times the
+[fill ceiling](#over-full-plan-the-pre-flight-capacity-gate), less the
+`enospc_buffer` reserve; with no drive configured, `stage create` has no
+generation to name and the check is left to `volume write`'s pre-flight gate.
+The size checked is the unit's source size, the same figure `collection plan`
+uses, whatever compression would later make of it.
+
+Planned spanning (the planner splitting a unit's slices across a named set of
+cartridges) is to be designed once a unit passes about half a cartridge. Until
+then such a unit cannot be archived. Do not split it by hand.
+
 ### `policy sets encrypt = false, which tapectl never honours`
 
 ```text
@@ -1243,14 +1268,23 @@ at all. On such a host, watching disk load during a write is up to you.
 ### Over-full plan: the pre-flight capacity gate
 
 ```text
-error: volume "<label>" failed pre-write validation: capacity exceeded: on-tape <needed> + reserve <reserve> > available <available>
+error: volume "<label>" failed pre-write validation: capacity exceeded: the layout needs <needed> bytes on tape plus a <reserve>-byte end-of-tape reserve, <over> bytes (<over, binary>) over the <available> bytes this volume may be filled to; the fill ceiling is 97% of this volume's 2.50 TB capacity (ADR-0012). Write less to this volume — a unit is never split — or, if you know this cartridge can take it, raise the ceiling for this write with --fill-ceiling
 ```
 
 tapectl has no end-of-tape salvage, so the capacity gate is its only defence
 against running out of tape. It compares the whole planned layout with the
 capacity decided **at `volume init`**: the cartridge's detected generation,
-times `usable_capacity_factor`, less the `enospc_buffer` reserve. The staged
-batch does not fit on this cartridge. Nothing has been written.
+times the **fill ceiling** (`fill_ceiling`, 97% by default), less the
+`enospc_buffer` reserve. The staged batch does not fit on this cartridge, by the
+amount the message names. Nothing has been written.
+
+The ceiling exists because usable capacity is not fixed: a worn cartridge, or an
+irregular feed, costs tape the plan assumed it had, and a real end of tape aborts
+the whole session (see below). `--fill-ceiling 0.99` (or `99%`) lifts it for one
+write, for a cartridge you have reason to trust; the drive's `fill_ceiling` changes
+it for every write. Every completed write records the share of capacity it used —
+`tapectl report events` lists them as `write_capacity_used` — which is the data the
+default is to be tuned from.
 
 Size the batch before you write:
 
@@ -1355,7 +1389,8 @@ stage, verify, read-slices or restore. A second signal stops at once (exit
 ### A real end of tape during the write
 
 If the drive reports that it is out of space, the session ends as a clean
-abort:
+abort. The fill ceiling (above) is what keeps this rare. Write the same staged
+data to another cartridge. The error reads:
 
 ```text
 error: volume "<label>" write aborted: execute failed at position <n>: tape I/O error: write: <OS error, e.g. No space left on device (os error 28)>

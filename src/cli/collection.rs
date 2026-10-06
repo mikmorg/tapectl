@@ -64,6 +64,11 @@ pub enum CollectionCommands {
         /// rather than asking.
         #[arg(long)]
         device: Option<String>,
+        /// Fill each tape to at most this fraction of its capacity, for this
+        /// command only: `0.99` or `99%`. Overrides the drive's
+        /// `fill_ceiling` (default 97%, ADR-0012).
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
     },
 
     /// Execute one batch: stage every unit in it once, write one session to
@@ -104,6 +109,11 @@ pub enum CollectionCommands {
         /// before the tape moves, for every copy this run writes.
         #[arg(long)]
         prewrite_hash: bool,
+        /// Fill each tape to at most this fraction of its capacity, for this
+        /// command only: `0.99` or `99%`. Overrides the drive's
+        /// `fill_ceiling` (default 97%, ADR-0012).
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
     },
 }
 
@@ -152,9 +162,10 @@ pub fn run(
             copies,
             generation,
             device,
+            fill_ceiling,
         } => cmd_plan(
             conn,
-            config,
+            &config.with_fill_ceiling(*fill_ceiling),
             *copies,
             generation.as_deref(),
             device.as_deref(),
@@ -166,10 +177,11 @@ pub fn run(
             labels,
             device,
             prewrite_hash,
+            fill_ceiling,
         } => cmd_run(
             conn,
             paths,
-            config,
+            &config.with_fill_ceiling(*fill_ceiling),
             name,
             *batch,
             labels,

@@ -181,7 +181,7 @@ generation = "LTO-8"
 # doing both at once means a red gate cannot be attributed to either.
 # A bare integer is the one literal both parsers read identically.
 capacity_override = "2748779069440"
-usable_capacity_factor = 0.95
+fill_ceiling = 0.95
 enospc_buffer = "2G"
 '''
 open(cfg, 'w').write(t)

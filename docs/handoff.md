@@ -161,7 +161,7 @@ and sense capture).
   it again before any production contact.
 - MAM's "remaining capacity" is not host-writable space: the drive stops host writes at its
   early-warning point with ~107 GB still "remaining". tapectl plans against the generation
-  table times 0.92, never against MAM remaining.
+  table times the fill ceiling (`fill_ceiling`, 97% by default; 92% before #391), never against MAM remaining.
 - A bursty host feed costs tape (1.48 native bytes per data byte measured); a steady one
   does not. Keep the host quiet.
 - The tape lock is `/tmp/tapectl-tape.lock`, per host; a second user on the same host is

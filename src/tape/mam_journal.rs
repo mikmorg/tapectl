@@ -884,7 +884,7 @@ mod tests {
             device_sg: "/nonexistent/tapectl-journal-sg".into(),
             generation: "LTO-6".into(),
             capacity_override: None,
-            usable_capacity_factor: 1.0,
+            fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
         });
         {

@@ -950,7 +950,7 @@ pub(crate) mod tests {
             device_sg: "/dev/sg-nonexistent".to_string(),
             generation: "LTO-6".to_string(),
             capacity_override: None,
-            usable_capacity_factor: 0.95,
+            fill_ceiling: 0.95,
             enospc_buffer: "1GiB".to_string(),
         }
     }

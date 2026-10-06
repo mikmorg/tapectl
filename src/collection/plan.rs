@@ -63,11 +63,16 @@ const BLOCK_SIZE: u64 = 512 * 1024;
 /// so its `refused` list is carried straight through here rather than
 /// dropped — every caller of this function (`plan_for_collection`,
 /// `plan_for_run`) must keep reporting it and exit non-zero.
+///
+/// `limit` says where `budget` came from, for the refusal of a unit too big
+/// for one tape (issues #391, #395: the refusal names the overage and the
+/// per-generation limit, ADR-0012 2026-10-06 items 16 and 17).
 fn batches_for_budget(
     conn: &Connection,
     config: &Config,
     lib: &CollectionConfig,
     budget: u64,
+    limit: &str,
 ) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
     let scan = super::fingerprint::pending_units_for_collection(
         conn,
@@ -86,7 +91,9 @@ fn batches_for_budget(
     let batches = selector::plan_batches(synthetic, budget, BLOCK_SIZE).map_err(|oversized| {
         TapectlError::Other(format!(
             "collection \"{}\": {} unit(s) exceed the per-tape budget and can never be \
-             batched (units are never split across tapes): {}",
+             batched (a unit is never split across tapes; ADR-0012): {}. The limit: {limit}. \
+             A unit this size cannot be written until spanning is designed; `--fill-ceiling` \
+             raises the ceiling only up to the whole cartridge",
             lib.name,
             oversized.len(),
             oversized
@@ -123,12 +130,11 @@ pub fn plan_for_collection(
     // negative value with `Err` rather than letting one flow through as a
     // valid byte count, so a successfully parsed `Ok` is already guaranteed
     // non-negative here.
-    let nominal = backend.planning_capacity_bytes(media)?;
-    let usable = (nominal as f64 * backend.usable_capacity_factor) as u64;
-    let enospc_buffer = crate::staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
-    let budget = usable.saturating_sub(enospc_buffer);
+    // Issue #395: the budget and the description of where it came from are
+    // one value, so the refusal names the figures the packing used.
+    let tape = backend.planning_tape_budget(media)?;
 
-    batches_for_budget(conn, config, lib, budget)
+    batches_for_budget(conn, config, lib, tape.bytes, &tape.describe())
 }
 
 /// `collection run`'s per-tape budget (issue #175): resolved from the
@@ -149,10 +155,36 @@ pub struct DestinationBudget {
     /// [`destination_budget`]'s doc comment for why the minimum).
     pub binding_label: String,
     /// That label's own recorded `capacity_bytes`, before the
-    /// usable-capacity-factor / ENOSPC-buffer arithmetic.
+    /// fill-ceiling / ENOSPC-buffer arithmetic.
     pub binding_capacity_bytes: i64,
     /// How many `--label` destinations were given.
     pub num_destinations: usize,
+    /// The drive's fill ceiling the budget was computed at (issue #391).
+    pub fill_ceiling: f64,
+    /// The end-of-tape reserve (`enospc_buffer`) subtracted.
+    pub reserve_bytes: u64,
+    /// What is already staged and will ride along (issue #232 item 1),
+    /// subtracted.
+    pub already_staged_bytes: u64,
+}
+
+impl DestinationBudget {
+    /// Where [`Self::bytes`] came from, for a refusal (issues #391, #395).
+    pub fn describe(&self) -> String {
+        let dec = |b: u64| crate::util::format_bytes_decimal(i64::try_from(b).unwrap_or(i64::MAX));
+        let bin = |b: u64| crate::util::format_bytes_binary(i64::try_from(b).unwrap_or(i64::MAX));
+        format!(
+            "volume \"{}\" takes {} ({} bytes) for this batch: its {} capacity at the {}% fill \
+             ceiling, less the {} end-of-tape reserve and the {} already staged",
+            self.binding_label,
+            dec(self.bytes),
+            self.bytes,
+            dec(self.binding_capacity_bytes.max(0) as u64),
+            crate::volume::layout_model::fill_ceiling_percent(self.fill_ceiling),
+            bin(self.reserve_bytes),
+            bin(self.already_staged_bytes),
+        )
+    }
 }
 
 /// Sum of the on-tape (block-padded) footprint every currently `'staged'`
@@ -247,7 +279,7 @@ fn already_staged_on_tape_bytes(conn: &Connection) -> Result<u64> {
 /// here — the row already absorbed `capacity_override` at init, and
 /// re-applying it would double-count. The arithmetic that follows is
 /// genuinely identical to `volume::write::volume_write`'s own gate: the same
-/// `usable_bytes = nominal * usable_capacity_factor`, the same
+/// `usable_bytes = nominal * fill_ceiling` (`fill_budget_bytes`), the same
 /// `enospc_buffer = parse_size_to_bytes(...)` (`src/volume/write.rs`, right
 /// after `resolve_lto_backend`) — but this function reads `capacity_bytes`
 /// with its own inline query above (`SELECT id, status, capacity_bytes FROM
@@ -325,7 +357,7 @@ pub fn destination_budget(
         .ok_or_else(|| TapectlError::Other("collection run: no destination labels given".into()))?;
 
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
-    let usable = (binding_capacity_bytes as f64 * backend.usable_capacity_factor) as u64;
+    let usable = backend.fill_budget_bytes(binding_capacity_bytes as u64);
     let enospc_buffer = crate::staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
     // Issue #232 item 1: `volume_write`'s `find_staged_data` selects every
     // `'staged'` stage set in the database, not just the batch this run is
@@ -345,6 +377,9 @@ pub fn destination_budget(
         binding_label,
         binding_capacity_bytes,
         num_destinations: labels.len(),
+        fill_ceiling: backend.fill_ceiling,
+        reserve_bytes: enospc_buffer,
+        already_staged_bytes: already_staged,
     })
 }
 
@@ -390,7 +425,8 @@ pub fn plan_for_run(
         )));
     }
     let budget = destination_budget(conn, config, device, labels)?;
-    let (batches, refused) = batches_for_budget(conn, config, lib, budget.bytes)?;
+    let (batches, refused) =
+        batches_for_budget(conn, config, lib, budget.bytes, &budget.describe())?;
     Ok((batches, budget, refused))
 }
 
@@ -409,7 +445,7 @@ mod tests {
             device_sg: "/dev/null".into(),
             generation: "LTO-8".into(),
             capacity_override: Some("10M".into()),
-            usable_capacity_factor: 1.0,
+            fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
         });
         config
@@ -453,6 +489,70 @@ mod tests {
         );
     }
 
+    /// Issues #391 and #395 (ADR-0012 2026-10-06 items 16 and 17): a unit
+    /// bigger than one tape is refused by `collection plan`, and the refusal
+    /// names the overage, the generation, the capacity, the fill ceiling and
+    /// the reserve — every figure the limit is made of. A 9 MiB unit on a
+    /// 10 MB LTO-8 (virtual) tape at a 90% ceiling: it fits the capacity
+    /// and not the ceiling, so the ceiling is what binds.
+    #[test]
+    fn a_unit_bigger_than_one_tape_is_refused_naming_the_limit_and_the_overage() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dir = root.path().join("huge");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 4 KiB under 9 MiB, so the unit (its dotfile included) pads to
+        // exactly 9 MiB (9,437,184 bytes).
+        std::fs::write(dir.join("f.dat"), vec![0u8; 9 * 1024 * 1024 - 4096]).unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        let mut config = config_with_tiny_backend();
+        config.backends.lto[0].fill_ceiling = 0.9;
+        let msg = plan_for_collection(&conn, &config, &lib, None, None)
+            .unwrap_err()
+            .to_string();
+        // 10,000,000 x 0.9 = 9,000,000; the unit pads to 9,437,184.
+        assert!(
+            msg.contains("exceeds the per-tape budget (9000000 bytes) by 437184 bytes"),
+            "the overage: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "one LTO-8 tape takes 9.0 MB (9000000 bytes): its 10.0 MB capacity (the \
+                 drive's capacity_override) at the 90% fill ceiling"
+            ),
+            "the limit and its figures: {msg}"
+        );
+        assert!(msg.contains("never split"), "{msg}");
+
+        // Positive control: at a 100% ceiling the same unit fits one tape.
+        let (batches, _) = plan_for_collection(
+            &conn,
+            &config.with_fill_ceiling(Some(1.0)),
+            &lib,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+    }
+
     /// Spec W4 / ADR-0010: `collection plan` resolved with `None`, so a
     /// second configured drive made it error outright instead of asking
     /// which one. `--device` picks, and the batch sizes follow THAT drive's
@@ -494,7 +594,7 @@ mod tests {
             device_sg: "/dev/null".into(),
             generation: "LTO-8".into(),
             capacity_override: Some("4M".into()),
-            usable_capacity_factor: 1.0,
+            fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
         });
 
@@ -638,7 +738,8 @@ mod tests {
         assert_eq!(budget.binding_capacity_bytes, 4 * 1024 * 1024);
         assert_eq!(budget.num_destinations, 2);
 
-        let (batches, refused) = batches_for_budget(&conn, &config, &lib, budget.bytes).unwrap();
+        let (batches, refused) =
+            batches_for_budget(&conn, &config, &lib, budget.bytes, "test").unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -1240,7 +1341,8 @@ mod tests {
              the other staged set, not the raw 10 MiB capacity"
         );
 
-        let (batches, refused) = batches_for_budget(&conn, &config, &lib, budget.bytes).unwrap();
+        let (batches, refused) =
+            batches_for_budget(&conn, &config, &lib, budget.bytes, "test").unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),

@@ -863,7 +863,7 @@ mod tests {
             device_sg: "/dev/sg9".to_string(),
             generation: generation.to_string(),
             capacity_override: None,
-            usable_capacity_factor: 0.92,
+            fill_ceiling: 0.92,
             enospc_buffer: "50M".to_string(),
         }
     }
@@ -991,7 +991,7 @@ mod tests {
             device_sg: "/nonexistent/tapectl-no-medium-sg".into(),
             generation: "LTO-6".into(),
             capacity_override: None,
-            usable_capacity_factor: 1.0,
+            fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
         });
         config

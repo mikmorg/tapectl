@@ -523,6 +523,7 @@ fn stage_create_inner(
     let snapshot = get_snapshot(conn, snapshot_id)?;
     let unit = get_unit_for_snapshot(conn, &snapshot)?;
     check_file_list_complete(conn, &snapshot, &unit.name)?;
+    check_unit_fits_one_tape(config, &unit.name, &snapshot)?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
 
@@ -1365,6 +1366,52 @@ fn resolve_slice_size_string(
     // receives the config string verbatim, never round-tripped through
     // `parse_size_to_bytes`.
     config.defaults.slice_size.clone()
+}
+
+/// Refuse to stage a unit bigger than one tape (issue #395, ADR-0012
+/// 2026-10-06 item 17): a Layout and a write session are bounded to one
+/// cartridge and a unit is never split across cartridges, so such a unit
+/// could be staged — hours of dar and age, a cartridge's worth of staging
+/// disk — and then never written. Refused here, before the `stage_sets`
+/// INSERT and before dar, naming the limit for the cartridge generation.
+///
+/// The size is the snapshot's own `total_size` (the walk's sum of file
+/// sizes), the same figure `collection plan` sizes a unit by. The limit is
+/// the most any configured drive's native generation can take
+/// ([`crate::config::LtoBackendConfig::planning_tape_budget`]: capacity x
+/// fill ceiling - end-of-tape reserve); with no drive configured there is
+/// no generation to name and nothing is refused here — `volume write`'s
+/// pre-flight gate still refuses a layout that does not fit.
+fn check_unit_fits_one_tape(
+    config: &Config,
+    unit_name: &str,
+    snapshot: &models::Snapshot,
+) -> Result<()> {
+    let Some(size) = snapshot.total_size.map(|s| s.max(0) as u64) else {
+        return Ok(());
+    };
+    let Some(limit) = config
+        .backends
+        .lto
+        .iter()
+        .filter_map(|b| b.planning_tape_budget(None).ok())
+        .max_by_key(|b| b.bytes)
+    else {
+        return Ok(());
+    };
+    if size <= limit.bytes {
+        return Ok(());
+    }
+    let over = size - limit.bytes;
+    Err(TapectlError::Other(format!(
+        "unit \"{unit_name}\" is {size} bytes ({}), {over} bytes ({}) more than one cartridge \
+         can take — {}. A unit is never split across cartridges (ADR-0012), so it cannot be \
+         written; nothing was staged. A unit this size waits for planned spanning, which is \
+         not built yet.",
+        crate::util::format_bytes_binary(i64::try_from(size).unwrap_or(i64::MAX)),
+        crate::util::format_bytes_binary(i64::try_from(over).unwrap_or(i64::MAX)),
+        limit.describe(),
+    )))
 }
 
 /// Refuse to stage a snapshot whose file list is short (issue #374).
@@ -5313,5 +5360,76 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
+    }
+
+    /// Issue #395 (ADR-0012 2026-10-06 item 17): a unit bigger than one
+    /// cartridge is refused at `stage create`, before the `stage_sets`
+    /// INSERT and before dar, naming the limit for the generation and by
+    /// how much the unit is over. The limit is the LARGEST any configured
+    /// drive's generation takes: two virtual drives, 1 MB and 3 MB (each at
+    /// 100% and no reserve), and a unit of a little over 2 MiB — it fits
+    /// the larger, so it stages; with only the smaller configured it is
+    /// refused. dar is pointed nowhere in the refused case, so reaching it
+    /// would change the error.
+    #[test]
+    fn stage_create_refuses_a_unit_bigger_than_one_cartridge() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("big.dat"), vec![7u8; 2 * 1024 * 1024]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let drive = |name: &str, dev: &str, cap: &str| crate::config::LtoBackendConfig {
+            name: name.into(),
+            device_tape: dev.into(),
+            device_sg: "/dev/null".into(),
+            generation: "LTO-6".into(),
+            capacity_override: Some(cap.into()),
+            fill_ceiling: 1.0,
+            enospc_buffer: "0".into(),
+        };
+        config.backends.lto.push(drive("small", "/dev/null", "1M"));
+        let real_dar = std::mem::replace(
+            &mut config.dar.binary,
+            "/nonexistent/dar-must-never-run".to_string(),
+        );
+
+        let msg = stage_create(&conn, &paths, &config, snap_id, false)
+            .unwrap_err()
+            .to_string();
+        // The snapshot's own size: the 2 MiB file plus the unit's dotfile.
+        let size: i64 = conn
+            .query_row(
+                "SELECT total_size FROM snapshots WHERE id = ?1",
+                params![snap_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(size > 2 * 1024 * 1024, "positive control: {size}");
+        assert!(
+            msg.contains(&format!(
+                "unit \"unit1\" is {size} bytes (2.0 MiB), {} bytes",
+                size - 1_000_000
+            )),
+            "the size and the overage: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "one LTO-6 tape takes 1.0 MB (1000000 bytes): its 1.0 MB capacity (the drive's \
+                 capacity_override) at the 100% fill ceiling"
+            ),
+            "the limit for the generation, and its figures: {msg}"
+        );
+        assert!(msg.contains("never split"), "{msg}");
+        assert!(!msg.contains("dar-must-never-run"), "{msg}");
+        let stage_sets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
+
+        // Positive control: a second, larger drive raises the limit, and the
+        // same unit stages.
+        config.backends.lto.push(drive("big", "/dev/zero", "3M"));
+        config.dar.binary = real_dar;
+        stage_create(&conn, &paths, &config, snap_id, false)
+            .expect("a unit that fits the largest configured generation stages");
     }
 }

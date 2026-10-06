@@ -371,6 +371,25 @@ if [ "$SVC_MODE" = 0 ] || id "$SVC_USER" >/dev/null 2>&1; then
       note "left as is — every tapectl command will refuse this config until the two keys are renamed"
     fi
   fi
+  # Issue #391 (ADR-0012, 2026-10-06 items 9 and 16): [[backends.lto]]
+  # usable_capacity_factor → fill_ceiling, same meaning (the share of a
+  # cartridge a write may fill). Renaming keeps the value the file has; deleting
+  # the line instead takes the ruled default, 0.97.
+  if as_svc test -f "$CFG0" 2>/dev/null \
+     && as_svc grep -qE '^[[:space:]]*usable_capacity_factor[[:space:]]*=' "$CFG0" 2>/dev/null; then
+    note "$CFG0 uses a key this tapectl renamed (same meaning): usable_capacity_factor → fill_ceiling"
+    note "  renaming keeps your value; to take the new default (0.97) delete the line instead"
+    if confirm "Rename it in place now, keeping its value (the old file is kept beside it)?"; then
+      run as_svc cp "$CFG0" "$CFG0.pre-rename-$(date +%Y%m%d-%H%M%S)"
+      run as_svc sed -i -E \
+        -e 's/^([[:space:]]*)usable_capacity_factor([[:space:]]*=)/\1fill_ceiling\2/' "$CFG0"
+      as_svc grep -qE '^[[:space:]]*usable_capacity_factor[[:space:]]*=' "$CFG0" \
+        && die "the rename did not take — edit [[backends.lto]] in $CFG0 by hand"
+      ok "config key renamed"
+    else
+      note "left as is — every tapectl command will refuse this config until the key is renamed or deleted"
+    fi
+  fi
 fi
 resolve_tapectl() {
   if [ -n "$TAPECTL" ]; then [ -x "$TAPECTL" ] || die "--tapectl $TAPECTL is not executable"; return; fi

@@ -409,7 +409,7 @@ device_tape = "{dev}"
 device_sg = "{dev}"
 generation = "LTO-6"
 capacity_override = "10M"
-usable_capacity_factor = 1.0
+fill_ceiling = 1.0
 enospc_buffer = "0"
 
 [[collections]]

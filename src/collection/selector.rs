@@ -72,12 +72,19 @@ pub struct OversizedUnit {
 
 impl std::fmt::Display for OversizedUnit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Issue #391: the overage is named, not only the two sides.
+        let over = self.padded_bytes.saturating_sub(self.budget_bytes);
         write!(
             f,
             "unit \"{}\" ({} bytes, {} block-padded) exceeds the per-tape budget \
-             ({} bytes) — units are never split across tapes, so this one cannot \
-             be batched at all",
-            self.name, self.size_bytes, self.padded_bytes, self.budget_bytes
+             ({} bytes) by {} bytes ({}) — units are never split across tapes, so this \
+             one cannot be batched at all",
+            self.name,
+            self.size_bytes,
+            self.padded_bytes,
+            self.budget_bytes,
+            over,
+            crate::util::format_bytes_binary(i64::try_from(over).unwrap_or(i64::MAX)),
         )
     }
 }

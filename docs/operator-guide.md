@@ -302,7 +302,7 @@ volume write plan (2 copy/copies):
   work/invoices-2024 v1: 1 slices, 1.7 KiB
 
 total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
-estimated tapes: 1 (at 92% usable capacity)
+estimated tapes: 1 (at the 97% fill ceiling)
 
 $ tapectl volume init L8-0001 --device "$TAPE"
 cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
@@ -627,6 +627,18 @@ full LTO-6). It is off by default (ADR-0012, 2026-09-30) because the streaming
 hash already keeps a bad slice off a sealed tape; `volume resume`,
 `volume compact-write`, `volume compact`, `collection run` and `quick-archive`
 take the same flag.
+
+**The fill ceiling.** A write fills at most 97% of the cartridge's capacity by
+default (`fill_ceiling` in the drive's `[[backends.lto]]` block; ADR-0012,
+2026-10-06). A real end of tape is a clean abort that costs the whole session,
+and usable capacity is not fixed: a worn cartridge loses some to the drive's
+rewrites, an uneven feed loses more. A batch above the ceiling is refused before
+the tape moves, with the overage named. `--fill-ceiling 0.99` (or `99%`) lifts it
+for one write; `volume plan`, `collection plan` and `collection run` take the
+same flag. Each completed write records how much of the capacity it used, as a
+`write_capacity_used` event (`tapectl report events`): the data and the native
+tape the drive used (page 0x0c), each as a share of the capacity. Those figures
+are what the default is to be tuned from.
 
 `staging clean` releases every unit that has met its policy's `min_copies` and
 **retains** the ones that have not, naming them (ADR-0012). So a unit still

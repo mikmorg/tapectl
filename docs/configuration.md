@@ -263,7 +263,7 @@ tapectl config check
 | `device_sg` | path | *required* | The SCSI generic node of the **same** drive (find it with `lsscsi -g`). It is used to read the cartridge memory chip (serial, generation) and the drive's health log pages. A write refuses if this node is provably a different drive from `device_tape`. |
 | `generation` | string | *required* | The generation the drive natively writes, such as `"LTO-6"` or `"LTO-8"`. `LTO-5`, `L5` and `lto5` are all accepted. `"LTO-7-M8"` is refused here: it is a cartridge format, and the drive that writes it declares `LTO-8`. |
 | `capacity_override` | size (**decimal**) | unset | **Virtual drives only** (mhvtl, test harnesses). It overrides the capacity for every cartridge this drive touches. A real drive gets its capacity from the loaded cartridge's detected generation, so leave this unset. `config check` warns whenever it is set. |
-| `usable_capacity_factor` | float | `0.92` | The fraction of a cartridge's capacity that tapectl assumes you can fill. Planning sizes tapes with it, and the pre-write capacity check of every write refuses a layout that does not fit in that fraction of the volume's capacity. |
+| `fill_ceiling` | float | `0.97` | The **fill ceiling**: the fraction of a cartridge's capacity a write may fill, above 0 and at most 1. The pre-write capacity check of every write refuses a layout above it and says by how much; planning sizes tapes with it. `--fill-ceiling` on `volume write`, `volume plan`, `collection plan` and `collection run` overrides it for one command (`0.99` or `99%`). It was called `usable_capacity_factor` (default `0.92`) until issue #391; a config that still uses that name is refused, naming the new key. Each completed write records the capacity it used (a `write_capacity_used` event in `report events`), so the ceiling can be tuned from what writes really take. |
 | `enospc_buffer` | size (binary) | `"50M"` | Headroom kept free before end of tape. The pre-write capacity check reserves it, and `collection plan` and `collection run` subtract it from each tape's budget. |
 
 Which commands read which keys:
@@ -300,7 +300,7 @@ Which commands read which keys:
   generation: the detected one, or the fallbacks in the bullet above when none can
   be detected. It is stored on the volume. After that, no command reads
   capacity from `config.toml`.
-- **`usable_capacity_factor`** is read by
+- **`fill_ceiling`** is read by
   [`volume plan`](cli/volume.md#tapectl-volume-plan), `collection plan` and
   `collection run` budgeting, and by the pre-write capacity check of `volume write`
   (so also `volume compact-write`, `volume compact`, `collection run` and
@@ -575,7 +575,7 @@ name = "lto6"
 device_tape = "/dev/tape/by-id/scsi-<SERIAL>-nst"
 device_sg = "/dev/sg1"
 generation = "LTO-6"
-usable_capacity_factor = 0.92
+fill_ceiling = 0.97
 enospc_buffer = "50M"
 
 # Policies. These take effect after `tapectl archive-set sync`.

@@ -40,7 +40,7 @@ fn backend() -> &'static tapectl::config::LtoBackendConfig {
         device_sg: "/nonexistent/tapectl-rebuild-test-sg".to_string(),
         generation: "LTO-6".to_string(),
         capacity_override: None,
-        usable_capacity_factor: 0.95,
+        fill_ceiling: 0.95,
         enospc_buffer: "1GiB".to_string(),
     })
 }

@@ -304,10 +304,113 @@ pub fn assess_and_record(
     Some(assessment)
 }
 
+/// The `events.action` a write's capacity use is recorded under (issue #391).
+pub const CAPACITY_EVENT_ACTION: &str = "write_capacity_used";
+/// Its `events.field`: `new_value` is the data the write sent, as a
+/// fraction of the volume's capacity.
+pub const CAPACITY_EVENT_FIELD: &str = "fraction_of_capacity";
+
+/// Record how much of the volume's capacity a completed write used (issue
+/// #391: "record capacity actually used per write so the ceiling can be
+/// tuned"; ADR-0012 2026-10-06 item 16: "tune from home2's recorded
+/// capacity use").
+///
+/// One `events` row per completed write, beside the feed ratio's and for
+/// the same reason (ADR-0013 §3: a derived figure is what tapectl said, not
+/// a column). `new_value` is the data fraction — the whole block-padded
+/// Layout over `volumes.capacity_bytes`, the two figures the fill ceiling
+/// compares. `details` carries both, the ceiling the write was planned
+/// against, and — when this contact's sweep journalled page 0x0c — the
+/// native tape the drive used for it (`native_fraction`), which is what
+/// really decides whether a fuller tape would have fit. Best-effort: a
+/// refused INSERT is a log warning. Returns the data fraction recorded.
+pub fn record_capacity_used(
+    conn: &Connection,
+    contact_id: Option<i64>,
+    volume_id: i64,
+    label: &str,
+    data_bytes: u64,
+    capacity_bytes: u64,
+    fill_ceiling: f64,
+) -> Option<f64> {
+    if capacity_bytes == 0 {
+        return None;
+    }
+    let fraction = data_bytes as f64 / capacity_bytes as f64;
+    let native_mb = contact_id
+        .and_then(|c| journalled_0x0c_decode(conn, c).ok().flatten())
+        .and_then(|d| parse_native_bop_to_eod_mb(&d));
+    let mut details = serde_json::json!({
+        "data_bytes": data_bytes,
+        "capacity_bytes": capacity_bytes,
+        "fill_ceiling": fill_ceiling,
+        "contact_id": contact_id,
+    });
+    if let Some(mb) = native_mb {
+        details["native_bop_to_eod_mb"] = mb.into();
+        details["native_fraction"] = ((mb * NATIVE_MB_BYTES) as f64 / capacity_bytes as f64).into();
+    }
+    if let Err(e) = events::log_event(
+        conn,
+        "volume",
+        volume_id,
+        Some(label),
+        CAPACITY_EVENT_ACTION,
+        Some(CAPACITY_EVENT_FIELD),
+        None,
+        Some(&format!("{fraction:.4}")),
+        Some(&details.to_string()),
+        None,
+    ) {
+        warn!(err = %e, "events insert for the capacity used failed");
+    }
+    Some(fraction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tape::log_pages::{self, JournalRow};
+
+    /// Issue #391: a completed write records its capacity use — the data
+    /// fraction, the ceiling it was planned against, and the native tape
+    /// the drive used when the sweep journalled page 0x0c.
+    #[test]
+    fn a_write_records_the_capacity_it_used() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
+             VALUES (7, 'L6-0001', 'lto', 'p', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+        let f = record_capacity_used(
+            &conn,
+            None,
+            7,
+            "L6-0001",
+            2_000_000_000_000,
+            2_500_000_000_000,
+            0.97,
+        );
+        assert_eq!(f, Some(0.8));
+        let (value, details): (String, String) = conn
+            .query_row(
+                "SELECT new_value, details FROM events WHERE action = ?1 AND field = ?2",
+                [CAPACITY_EVENT_ACTION, CAPACITY_EVENT_FIELD],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(value, "0.8000");
+        let d: serde_json::Value = serde_json::from_str(&details).unwrap();
+        assert_eq!(d["fill_ceiling"], 0.97);
+        assert_eq!(d["capacity_bytes"], 2_500_000_000_000u64);
+        assert!(
+            d.get("native_fraction").is_none(),
+            "no 0x0c journalled: {d}"
+        );
+        assert_eq!(record_capacity_used(&conn, None, 7, "x", 1, 0, 0.97), None);
+    }
 
     /// The real HP LTO-6 with the FUJIFILM cartridge loaded (2026-09-23):
     /// 23 MB recorded from BOP to EOD.

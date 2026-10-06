@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-collection\-plan \- Show the batch plan (alphabetical first\-fit, §7) for every configured collection\*(Aqs pending units
 .SH SYNOPSIS
-\fBtapectl collection plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-generation\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl collection plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-generation\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Show the batch plan (alphabetical first\-fit, §7) for every configured collection\*(Aqs pending units
 .SH OPTIONS
@@ -26,6 +26,9 @@ Which configured drive to plan against, by its device path. Only needed when mor
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
+.TP
+\fB\-\-fill\-ceiling\fR \fI<FILL_CEILING>\fR
+Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive\*(Aqs `fill_ceiling` (default 97%, ADR\-0012)
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/

@@ -4162,7 +4162,7 @@ mod tests {
             device_sg: "/dev/null".to_string(),
             generation: "LTO-6".to_string(),
             capacity_override: None,
-            usable_capacity_factor: 0.92,
+            fill_ceiling: 0.92,
             enospc_buffer: "50M".to_string(),
         }];
         conn.execute(
@@ -4823,7 +4823,7 @@ mod tests {
                 device_sg: "/dev/null".to_string(),
                 generation: "LTO-6".to_string(),
                 capacity_override: None,
-                usable_capacity_factor: 0.92,
+                fill_ceiling: 0.92,
                 enospc_buffer: "50M".to_string(),
             }
         }

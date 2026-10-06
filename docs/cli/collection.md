@@ -50,6 +50,7 @@ tapectl collection plan [OPTIONS]
 - `--copies <COPIES>` *(default: `2`)* — Copies to plan for — informational only (batches don't change; this scales the printed cartridge-count estimate)
 - `--generation <GENERATION>` — Plan against this media generation rather than the drive's own (ADR-0010) — e.g. sizing batches for LTO-5 stock that an LTO-6 drive will write. No cartridge need be loaded
 - `--device <DEVICE>` — Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi-drive config rather than asking
+- `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012)
 
 ### tapectl collection run
 
@@ -66,4 +67,5 @@ tapectl collection run [OPTIONS] --collection <COLLECTION>
 - `--label <LABELS>` — Destination volume label — already `volume init`'d on its own cartridge. Exactly one: tapectl drives no changer, so it cannot write a second copy without a human swapping cartridges, and a batch run has no point where that swap could happen. More than one is refused. For a second and further copy, swap in the next cartridge after this run finishes and use `tapectl volume write <label>` directly against the same staged data
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--prewrite-hash` — See `volume write --prewrite-hash`: full-hash every staged slice before the tape moves, for every copy this run writes
+- `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012)
 

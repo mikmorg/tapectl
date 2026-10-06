@@ -290,7 +290,7 @@ volume write plan (2 copy/copies):
   work/invoices-2024 v1: 1 slices, 1.7 KiB
 
 total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
-estimated tapes: 1 (at 92% usable capacity)
+estimated tapes: 1 (at the 97% fill ceiling)
 ```
 
 `volume plan` is an estimate. The authoritative capacity is read from the cartridge

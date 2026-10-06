@@ -73,6 +73,7 @@ tapectl volume write [OPTIONS] <LABEL>
 - `--force` — See `volume init --force` — same override, same limits
 - `--allow-missing-escrow` — Seal slices that were staged before the escrow recipient existed (ADR-0005). Only reachable for tapes copied forward via `read-slices`/`compact-read`, since `stage create` refuses to stage without escrow; use it to migrate a dying pre-escrow cartridge, knowing the copy stays unrecoverable by the escrow key
 - `--prewrite-hash` — Full-hash every staged slice from disk before the tape moves (tri-layer L1). Off by default (ADR-0012, 2026-09-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch
+- `--fill-ceiling <FILL_CEILING>` — Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012). The pre-write check refuses a layout above the ceiling and names by how much
 
 ### tapectl volume resume
 
@@ -231,6 +232,7 @@ tapectl volume plan [OPTIONS]
 - `--copies <COPIES>` *(default: `1`)* — Number of copies to plan
 - `--generation <GENERATION>` — Estimate against this media generation rather than the drive's own (ADR-0010) — e.g. counting LTO-5 cartridges for an LTO-6 drive. No cartridge need be loaded; this is an estimate, and the authoritative figure is each volume's own `capacity_bytes` once `volume init` has detected the medium it is actually on
 - `--device <DEVICE>` — Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi-drive config rather than asking
+- `--fill-ceiling <FILL_CEILING>` — Estimate at this fill ceiling instead of the drive's `fill_ceiling` (default 97%): `0.99` or `99%`
 
 ### tapectl volume compact-finish
 

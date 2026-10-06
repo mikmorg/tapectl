@@ -2090,7 +2090,7 @@ fn test_volume_write_refuses_over_capacity() {
         // earlier, for the wrong reason.
         generation: "LTO-6".into(),
         capacity_override: Some("50M".into()),
-        usable_capacity_factor: 1.0,
+        fill_ceiling: 1.0,
         enospc_buffer: "0".into(),
     });
     // build() materializes the Layout's generated zones under
@@ -2121,13 +2121,24 @@ fn test_volume_write_refuses_over_capacity() {
         "expected a capacity refusal, got: {msg}"
     );
     // Pin the actual boundary: the refusal must name the ROW's figure
-    // (usable_capacity_factor is 1.0 here, so `available` equals
+    // (fill_ceiling is 1.0 here, so `available` equals
     // capacity_bytes exactly), never config's "50M"/52,428,800 — that is
     // the whole point of this test (issue #188 / ADR-0010 decision 3).
-    let expected_available = format!("available {ROW_CAPACITY_BYTES}");
+    let expected_available = format!("over the {ROW_CAPACITY_BYTES} bytes this volume may be");
     assert!(
         msg.contains(&expected_available),
         "expected the refusal to name the volume row's capacity ({expected_available}), got: {msg}"
+    );
+    // Issue #391: the refusal names the overage (9,437,184 on tape + 0
+    // reserve - 4,194,304) and the fill ceiling it was judged against.
+    assert!(
+        msg.contains("5242880 bytes (5.0 MiB) over"),
+        "the refusal must name by how much the layout is over, got: {msg}"
+    );
+    assert!(
+        msg.contains("the fill ceiling is 100% of this volume's 4.2 MB capacity")
+            && msg.contains("--fill-ceiling"),
+        "the refusal must name the ceiling, the capacity and the override, got: {msg}"
     );
     assert!(
         !msg.contains("52428800"),
@@ -2139,6 +2150,117 @@ fn test_volume_write_refuses_over_capacity() {
         .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
         .unwrap();
     assert_eq!(writes, 0, "capacity refusal must not create write records");
+}
+
+/// Issue #391: the fill ceiling binds. The same fixture as
+/// `test_volume_write_refuses_over_capacity` (a layout of 9,437,184 bytes on
+/// tape), on a volume of 9,500,000 bytes: it fits at a 100% ceiling and not
+/// at the default 97% (9,215,000). The default refuses, naming the
+/// ceiling; `--fill-ceiling` (`Config::with_fill_ceiling`, what the flag
+/// applies) clears the capacity check for the same write — which is then
+/// refused for other reasons this fixture leaves (no escrow), never capacity.
+#[test]
+fn test_volume_write_refuses_above_the_fill_ceiling_and_the_override_lifts_it() {
+    use tapectl::config::{Config, LtoBackendConfig, TapectlPaths};
+    let (tmp, conn, _home) = setup();
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    let key = tapectl::crypto::keys::generate_keypair();
+    conn.execute(
+        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+         VALUES (?1, 'op-primary', ?2, ?3, 'primary', 1)",
+        rusqlite::params![tid, key.fingerprint, key.public_key],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'big', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let uid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp')",
+        [uid],
+    )
+    .unwrap();
+    let snap = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 104857600)",
+        [snap],
+    )
+    .unwrap();
+    let ss = conn.last_insert_rowid();
+    let slice = tmp.path().join("slice.dar.age");
+    std::fs::File::create(&slice)
+        .unwrap()
+        .set_len(5242880)
+        .unwrap();
+    conn.execute(
+        "INSERT INTO stage_slices
+            (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+         VALUES (?1, 1, 5000000, 5242880, 'p', 'e', ?2)",
+        rusqlite::params![ss, slice.to_string_lossy()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES ('L6-CEIL', 'lto', 'p', 'LTO-6', 9500000, 'initialized')",
+        [],
+    )
+    .unwrap();
+
+    let mut config = Config::default();
+    config.backends.lto.push(LtoBackendConfig {
+        name: "p".into(),
+        device_tape: "/dev/null".into(),
+        device_sg: "/dev/null".into(),
+        generation: "LTO-6".into(),
+        capacity_override: None,
+        fill_ceiling: tapectl::config::DEFAULT_FILL_CEILING,
+        enospc_buffer: "0".into(),
+    });
+    config.staging.directory = tmp.path().join("staging").to_string_lossy().to_string();
+    let paths = TapectlPaths::new(tmp.path().to_path_buf());
+    let write = |config: &Config| {
+        tapectl::volume::write::volume_write(
+            &conn,
+            &paths,
+            config,
+            "L6-CEIL",
+            "/dev/null",
+            512 * 1024,
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+    };
+
+    let refused = write(&config);
+    assert!(
+        refused.contains("capacity exceeded") && refused.contains("over the 9215000 bytes"),
+        "the default 97% ceiling must refuse a layout that fits only at 100%: {refused}"
+    );
+    assert!(
+        refused.contains("the fill ceiling is 97% of this volume's 9.5 MB capacity"),
+        "{refused}"
+    );
+
+    // Positive control: the override lifts the ceiling for this write, and
+    // the same write gets past the capacity gate.
+    let past = write(&config.with_fill_ceiling(Some(1.0)));
+    assert!(
+        !past.contains("capacity exceeded"),
+        "at a 100% ceiling the layout fits; no capacity refusal may remain: {past}"
+    );
 }
 
 /// T8: `volume_write` refuses fast (before touching the device or calling
@@ -2203,7 +2325,7 @@ fn test_volume_write_refuses_when_an_unresolved_write_session_already_exists() {
         device_sg: "/dev/null".into(),
         generation: "LTO-8".into(),
         capacity_override: Some("2500G".into()),
-        usable_capacity_factor: 1.0,
+        fill_ceiling: 1.0,
         enospc_buffer: "0".into(),
     });
     config.staging.directory = tmp.path().join("staging").to_string_lossy().to_string();
@@ -2313,7 +2435,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
         device_sg: "/dev/null".into(),
         generation: "LTO-8".into(),
         capacity_override: Some("2500G".into()),
-        usable_capacity_factor: 1.0,
+        fill_ceiling: 1.0,
         enospc_buffer: "0".into(),
     });
     config.staging.directory = tmp.path().join("staging").to_string_lossy().to_string();

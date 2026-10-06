@@ -1260,7 +1260,7 @@ name = "lifecycle"
 device_tape = "{tape}"
 device_sg = "{sg}"
 generation = "{generation}"
-{override}usable_capacity_factor = 0.95
+{override}fill_ceiling = 0.95
 enospc_buffer = "2G"
 '''
 open(cfg, "w").write(t)

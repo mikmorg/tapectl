@@ -652,7 +652,7 @@ mod tests {
             device_sg: "/dev/null".to_string(),
             generation: generation.to_string(),
             capacity_override: Some(cap.to_string()),
-            usable_capacity_factor: 0.92,
+            fill_ceiling: 0.92,
             enospc_buffer: "50M".to_string(),
         }
     }
@@ -772,7 +772,7 @@ mod tests {
             device_sg: "/dev/sg-tapectl-test-nonexistent".to_string(),
             generation: "LTO-8".to_string(),
             capacity_override: Some("2.5T".to_string()),
-            usable_capacity_factor: 0.92,
+            fill_ceiling: 0.92,
             enospc_buffer: "50M".to_string(),
         });
         let hits = scan_tape_devices(&config);

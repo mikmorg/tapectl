@@ -86,6 +86,12 @@ pub enum VolumeCommands {
         /// tape left unsealed). This costs one extra full read of the batch.
         #[arg(long)]
         prewrite_hash: bool,
+        /// Fill this volume to at most this fraction of its capacity, for
+        /// this write only: `0.99` or `99%`. Overrides the drive's
+        /// `fill_ceiling` (default 97%, ADR-0012). The pre-write check
+        /// refuses a layout above the ceiling and names by how much.
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
     },
 
     /// Resume an interrupted write session. Reload the SAME
@@ -274,6 +280,10 @@ pub enum VolumeCommands {
         /// rather than asking.
         #[arg(long)]
         device: Option<String>,
+        /// Estimate at this fill ceiling instead of the drive's
+        /// `fill_ceiling` (default 97%): `0.99` or `99%`.
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
     },
 
     /// Retire source volume after compaction (compaction step 3)
@@ -624,6 +634,7 @@ pub fn run(
             force,
             allow_missing_escrow,
             prewrite_hash,
+            fill_ceiling,
         } => {
             // Issue #241: a real preview would have to open the drive and
             // re-derive the whole layout (session build/validate/plan) —
@@ -639,6 +650,8 @@ pub fn run(
                 ));
             }
             let device = write_device(config, device.as_deref())?;
+            // Issue #391: `--fill-ceiling` for this write only.
+            let config = &config.with_fill_ceiling(*fill_ceiling);
             write::volume_write(
                 conn,
                 paths,
@@ -1175,7 +1188,9 @@ pub fn run(
             copies,
             generation,
             device,
+            fill_ceiling,
         } => {
+            let config = &config.with_fill_ceiling(*fill_ceiling);
             // Show what staged data would be written
             let mut stmt = conn.prepare(
                 "SELECT u.name, s.version, ss.num_slices, ss.total_encrypted_size
@@ -1237,11 +1252,11 @@ pub fn run(
                 // capacity declared on the drive.
                 let backend = crate::config::resolve_lto_backend(config, device.as_deref())?;
                 let tape_cap = backend.planning_capacity_bytes(generation.as_deref())? as i64;
-                let factor = backend.usable_capacity_factor;
-                let usable = (tape_cap as f64 * factor) as i64;
+                let factor = backend.fill_ceiling;
+                let usable = backend.fill_budget_bytes(tape_cap as u64) as i64;
                 let tapes_needed = ((total_bytes * copies) + usable - 1) / usable;
                 println!(
-                    "estimated tapes: {tapes_needed} (at {}% usable capacity)",
+                    "estimated tapes: {tapes_needed} (at the {}% fill ceiling)",
                     (factor * 100.0).round() as i64
                 );
             }
@@ -2856,7 +2871,7 @@ mod tests {
                 device_sg: "/nonexistent/tapectl-compact-sg".into(),
                 generation: "LTO-6".into(),
                 capacity_override: None,
-                usable_capacity_factor: 1.0,
+                fill_ceiling: 1.0,
                 enospc_buffer: "0".into(),
             });
             let cmd = VolumeCommands::Compact {

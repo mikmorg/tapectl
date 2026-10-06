@@ -265,6 +265,41 @@ pub struct KeyAvailability {
     pub stage_sets_lacking_escrow: Option<Vec<(i64, String, String)>>,
 }
 
+/// The sentence a capacity refusal ends with (issue #391): the fill ceiling
+/// and the capacity it is a fraction of, and the two ways forward. `None`
+/// unless `errs` holds a [`LayoutError::CapacityExceeded`], so a caller can
+/// append it to any refusal unconditionally.
+pub fn capacity_refusal_note(
+    errs: &[LayoutError],
+    fill_ceiling: f64,
+    capacity_bytes: u64,
+) -> Option<String> {
+    errs.iter()
+        .any(|e| matches!(e, LayoutError::CapacityExceeded { .. }))
+        .then(|| {
+            format!(
+                "the fill ceiling is {}% of this volume's {} capacity (ADR-0012). Write less \
+                 to this volume — a unit is never split — or, if you know this cartridge can \
+                 take it, raise the ceiling for this write with --fill-ceiling",
+                fill_ceiling_percent(fill_ceiling),
+                crate::util::format_bytes_decimal(
+                    i64::try_from(capacity_bytes).unwrap_or(i64::MAX)
+                ),
+            )
+        })
+}
+
+/// A fill ceiling as a percentage for a message: `0.97` -> `"97"`,
+/// `0.975` -> `"97.5"`.
+pub fn fill_ceiling_percent(fill_ceiling: f64) -> String {
+    let pct = (fill_ceiling * 1000.0).round() / 10.0;
+    if pct.fract() == 0.0 {
+        format!("{}", pct as i64)
+    } else {
+        format!("{pct}")
+    }
+}
+
 /// A validation failure. `validate` collects all failures rather than
 /// stopping at the first, because this is a pre-flight report.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -273,7 +308,19 @@ pub enum LayoutError {
     Unsized { position: i32, label: &'static str },
     #[error("slice at position {position} has no recorded sha256")]
     SliceMissingChecksum { position: i32 },
-    #[error("capacity exceeded: on-tape {needed} + reserve {reserve} > available {available}")]
+    /// Issue #391: names the overage, not only the two sides of the sum.
+    /// `available` is the volume's capacity times its fill ceiling;
+    /// [`capacity_refusal_note`] adds the ceiling and the capacity it came
+    /// from where the caller knows them.
+    #[error(
+        "capacity exceeded: the layout needs {needed} bytes on tape plus a {reserve}-byte \
+         end-of-tape reserve, {over} bytes ({over_h}) over the {available} bytes this volume \
+         may be filled to",
+        over = (needed + reserve).saturating_sub(*available),
+        over_h = crate::util::format_bytes_binary(
+            i64::try_from((needed + reserve).saturating_sub(*available)).unwrap_or(i64::MAX)
+        ),
+    )]
     CapacityExceeded {
         needed: u64,
         reserve: u64,

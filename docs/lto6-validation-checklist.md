@@ -108,7 +108,7 @@ TAPECTL_BIN=/usr/local/bin/tapectl scripts/lifecycle-suite.sh --scenario first-y
 ## End of tape (measured once; re-run only for a new drive or media type)
 
 There is no EOT salvage in Layout v2: a real EOT is a clean abort to an unsealed tape,
-and the pre-flight gate (generation table × 0.92 usable) is the capacity defence. What
+and the pre-flight gate (generation table × the fill ceiling, 97% by default) is the capacity defence. What
 to measure is where the drive stops host writes, with `scripts/lto6-fill.sh`:
 
 ```bash

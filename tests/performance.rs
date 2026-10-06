@@ -112,7 +112,7 @@ fn setup(name: &str) -> PerfHarness {
         device_sg: "/dev/null".into(),
         generation: "LTO-8".into(),
         capacity_override: Some("2400G".into()),
-        usable_capacity_factor: 0.92,
+        fill_ceiling: 0.92,
         enospc_buffer: "50M".into(),
     });
 
