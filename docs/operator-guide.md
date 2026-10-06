@@ -184,7 +184,7 @@ generation = "LTO-6"        # what the DRIVE is, not what you feed it
 # capacity_override = "2400M"   # virtual drives and test harnesses only
 
 [staging]
-directory = "/mnt/staging"  # Peak need: one unit's dar archive + one encrypted slice
+directory = "/mnt/staging"  # Peak need: one unit's encrypted slices (no plaintext is written here)
 
 [defaults]
 slice_size = "1G"
@@ -414,8 +414,9 @@ of every staged slice under `--prewrite-hash`, a size check otherwise),
 seal marker at the end, one rewind, then every file in a single forward pass)
 and `health-sweep`; a resume has `drive-open`, `revalidate`, `identify` (the File 0
 and seal checks) and `positioning` in place of the build and pre-write steps,
-and the log names each file as it is written. `stage create` has `validate`, `archive` (dar,
-slicing and encryption in one pass), `catalog` and `finalize`.
+and the log names each file as it is written. `stage create` has `check` (the source against
+the snapshot, by metadata), `archive` (dar, slicing, encryption and the source's hashing in one
+pass), `recheck` (every hashed file unchanged since), `catalog` and `finalize`.
 
 Every such command also writes a **session log**, whether or not anything
 was shown: `<home>/logs/<UTC start>-<command>-<label>-<pid>.log` (mode 0600,
@@ -546,27 +547,21 @@ tapectl volume write L6-0001 --device "$TAPE"
 tapectl volume verify L6-0001 --device "$TAPE"
 ```
 
-**Staging space.** At its peak, `stage create` holds one unit's dar archive
-plus one encrypted slice written beside it: about the unit's size plus one
-`slice_size`, not a multiple of the unit. It checks for that room before dar
-runs:
+**Staging space.** `stage create` writes only a unit's encrypted slices to
+staging, never the plaintext archive: dar writes its archive to standard
+output, and tapectl cuts and encrypts it in memory. At its peak staging holds
+the unit's slices, about the unit's size. The source is read once: each file
+is hashed within 1 GiB of dar reading it, so the second read comes from the
+page cache.
 
-- With `compression = "none"` (the default) it first reads the whole unit (the
-  sha256 validation pass), because only the content says what dar will store.
-  If free space is below that floor, the unit's non-zero bytes plus one slice,
-  it refuses with the figures (`not enough space in staging directory …`), and
-  no flag overrides that. If free space is between the floor and the unit's
-  full size (hard-linked and zero-filled files make them differ), the unit may
-  or may not fit, so it asks.
-- With compression on, what dar writes cannot be known in advance. If free
-  space is below the uncompressed figure, it asks before reading anything.
-
-The question is an ADR-0008 Tier-2 one: a terminal gets
+Before reading anything, it compares the free space with the unit's size (plus
+dar's records). If free space is below that, the unit may or may not fit
+(compression, zero-filled and hard-linked files all make it smaller), so it
+asks. The question is an ADR-0008 Tier-2 one: a terminal gets
 `stage unit "…" — proceed? [y/N]`, `--yes` proceeds (the figures are still
 printed), and a run with no terminal and no `--yes` refuses. That includes
 `collection run`, `quick-archive` and anything you script. If a stage that
-went ahead does run out of room, dar fails partway and the partial slices are
-removed.
+went ahead does run out of room, it stops and the partial slices are removed.
 
 Each stage set also leaves a short stage report (unit, tenant, snapshot, and
 every slice's size and hash) in `<home>/stage-reports/`. A home initialised

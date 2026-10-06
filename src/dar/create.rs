@@ -159,6 +159,16 @@ pub fn spawn_archive(params: &DarCreateParams) -> Result<DarStream> {
     })
 }
 
+/// How many bytes process `pid` has read so far (`rchar` in
+/// `/proc/<pid>/io`), or `None` where the kernel does not say. For dar this
+/// is how far it has read the source, compressed or not.
+pub fn bytes_read(pid: u32) -> Option<u64> {
+    let io = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    io.lines()
+        .find_map(|l| l.strip_prefix("rchar:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
 /// The first few lines of dar's stderr, for an error message.
 fn excerpt(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)

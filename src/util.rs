@@ -35,6 +35,11 @@ impl<R: Read> HashingReader<R> {
     pub fn finalize_hex(&self) -> String {
         format!("{:x}", self.hasher.clone().finalize())
     }
+
+    /// The wrapped reader, giving up the hash state.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
 }
 
 impl<R: Read> Read for HashingReader<R> {

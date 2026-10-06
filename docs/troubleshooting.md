@@ -763,61 +763,34 @@ Fix the ownership (the service user must own it on a first-run install), or
 point `[staging] directory` somewhere else. Staging must not live on a small
 root partition.
 
-### Staging space: refused, or asked about
+### Staging space: asked about
 
-Staging peaks at the unit's dar archive plus one encrypted slice written
-beside it: about the unit's size plus one `slice_size`, or twice the unit when
-it fits in a single slice. `stage create`
-compares that with the free space in `[staging] directory`, and one of three
-things happens.
+Staging holds a unit's encrypted slices and nothing else: at most about the
+unit's size, plus dar's own records for each file, for which the check allows
+up to 1 KiB a file. `stage create` compares that figure with the free space in
+`[staging] directory` before it reads anything.
 
 **It fits.** Nothing is said.
 
-**It cannot fit.** With `compression = "none"`, every non-zero byte of the
-unit is a byte dar must store. When free space is below that bound, the stage
-is refused. This is a fact, not a risk, so no flag gets past it. The unit has
-to be read to count those bytes, so the refusal comes after the sha256 pass
-and before dar:
+**It may not fit.** You are asked (Tier 2). The figure is an upper bound:
+dar stores runs of zeros as holes and a hard-linked file once, and with
+compression on, nothing can say in advance how well the data will compress.
+So a short staging directory is never refused outright:
 
 ```text
-error: not enough space in staging directory <directory> for unit "<unit>": staging it needs at least 5.7 MiB —
-its dar archive (at least 2.8 MiB, the unit's non-zero bytes, every one of which dar stores) plus one encrypted
-slice (2.8 MiB) written beside it — and 1.0 MiB is free. Free space there, or point [staging] directory at a
-larger filesystem.
+staging directory <directory> may be too small for unit "<unit>": 1.0 MiB free, and staging it needs up to 5.7
+MiB, its encrypted slices at the snapshot's full size (less if dar stores runs of zeros as holes and a
+hard-linked file once); if it runs out, the stage stops there and its partial slices are removed
 ```
 
-**It may not fit.** Then you are asked (Tier 2). When the question comes
-depends on `compression`:
-
-- With `compression = "none"`, which is what `init` writes, nothing about
-  space is printed before the source is read. The question comes **after** the
-  sha256 pass, which can take hours on a large unit, and only when free space
-  lies between the unit's non-zero bytes and its apparent size. Zero-filled
-  disk images, sparse files and hard links make the two differ:
-
-  ```text
-  staging directory <directory> may be too small for unit "<unit>": 1.0 MiB free, and staging it needs between
-  340 B and 5.7 MiB (the low end counts only non-zero bytes: dar stores runs of zeros as holes and a hard-linked
-  file once); if it runs out, dar fails partway and the partial slices are removed
-  ```
-
-- With compression switched on, nothing can say in advance how well the data
-  will compress. The question comes **before** the source is read, whenever
-  free space is below the uncompressed figure:
-
-  ```text
-  staging directory <directory> may be too small for unit "<unit>": <free> free, and staging it needs up to <n>
-  if its data does not compress (compression = "<algorithm>") — the dar archive plus one encrypted slice beside
-  it; if it runs out, dar fails partway and the partial slices are removed
-  ```
+With compression on, the bracket reads `(less if its data may compress
+(compression = "<algorithm>"))`.
 
 A terminal is asked `stage unit "<unit>" — proceed? [y/N]`. A non-interactive
 run without `--yes` refuses with the same figures
-(`error: stage unit "<unit>" refused: non-interactive session …`). With
-`compression = "none"` that refusal also comes only after the sha256 pass, so
-an unattended run that should go ahead anyway needs `--yes` from the start.
-With `--yes` the stage goes ahead and still prints the figures, ending
-`— staging anyway (--yes given)`:
+(`error: stage unit "<unit>" refused: non-interactive session …`), before
+anything is read or written. With `--yes` the stage goes ahead and still prints
+the figures, ending `— staging anyway (--yes given)`:
 
 ```bash
 tapectl --yes stage create <unit>
@@ -830,23 +803,26 @@ the check:
 warning: could not read the free space of staging directory <directory> (<error>); staging unit "<unit>" without a space check
 ```
 
-A refused attempt leaves no files to clean up. A refusal before the read
-costs nothing more. A refusal after it has cost the sha256 pass: the hard
-refusal, and with `compression = "none"` also an `N` at the prompt or a
-non-interactive refusal. It leaves the attempt's stage set for the next
-tapectl command to mark `failed`, and a `WARN` line says so each time. If the disk fills
-anyway, the failure names the slice being written:
+A refused attempt leaves nothing to clean up. If the disk fills during a
+stage that went ahead, the failure names the slice being written:
 
 ```text
 error: cannot write staged slice <directory>/<slice>.dar.age: No space left on device (os error 28)
 ```
 
-The half-built stage set's files are removed either way.
+The half-built stage set's files are removed, and the next tapectl command
+marks its stage set `failed`.
+
+Earlier versions also counted the unit's non-zero bytes in a read before
+dar and refused outright below them. The source is now read once, while dar
+runs, so there is no such count before dar.
 
 ### The source changed after the snapshot
 
-`stage create` re-reads every file and checks it against the snapshot before
-archiving:
+`stage create` checks every file against the snapshot. A file missing or at
+another size is refused before dar starts; the content is hashed as dar reads
+it, so a file whose content changed at the same size (BITROT suspected) is
+refused while dar runs, and dar is stopped:
 
 ```text
 error: DIRTY: source file size changed: <path> (expected <n> bytes, found <n> bytes) — a real edit (size and
@@ -858,9 +834,20 @@ current=<sha>. Refusing to stage; investigate before re-staging (`tapectl unit c
 every file against its recorded baseline).
 ```
 
-A file that changes while dar is reading it refuses the stage too. tapectl
-runs dar with `--retry-on-change 0`, so dar saves no half-changed copy and
-exits 11, which `stage create` reports as:
+A file that changes while staging reads it refuses the stage too. Each file is
+read once from disk: tapectl hashes it within 1 GiB of dar reading it, and
+after dar has finished checks that every file still has the size and change
+time it had when it was hashed. A file that changed in between is refused:
+
+```text
+error: DIRTY: source file changed while staging read it: <path> (it changed after it was hashed). Its recorded
+sha256 would not be of the bytes dar archived, so nothing was staged. Stage again once the source is quiet; if
+the change is real, take a new snapshot (`tapectl snapshot create <unit>`) and stage that.
+```
+
+A change during dar's own read of a file is caught by dar: tapectl runs dar
+with `--retry-on-change 0`, so dar saves no half-changed copy and exits 11,
+which `stage create` reports as:
 
 ```text
 error: DIRTY: a source file of unit "<unit>" changed while dar was reading it (dar exit 11). tapectl runs dar
@@ -1995,7 +1982,7 @@ on a different home. The first lines of every run print the `home:` and
   config until the two keys are renamed`, and a later step stops on that
   refusal. Re-run and accept, or rename the two lines by hand.
 - **Step 13, `stage failed for <unit>`.** When the staging directory may be too
-  small for a unit ([Staging space](#staging-space-refused-or-asked-about)),
+  small for a unit ([Staging space](#staging-space-asked-about)),
   `stage create` asks before it goes ahead. Step 13 runs it with stdin taken
   from its list of units, not from your terminal, so the question cannot be
   asked and the stage is refused. The figures are in the output above the

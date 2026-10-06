@@ -2776,9 +2776,10 @@ fn stage_create_json_is_unchanged_and_its_session_is_logged() {
     let log = only_session_log(home.path(), "-stage-create-unit1-");
     for want in [
         "session start: stage create unit1",
-        "phase start: validate",
-        "phase end: validate",
+        "phase start: check",
+        "phase end: check",
         "phase start: archive",
+        "phase end: recheck",
         "phase end: catalog",
         "phase end: finalize",
         "session end after",

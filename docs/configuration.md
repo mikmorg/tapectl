@@ -192,14 +192,13 @@ so keep the key.
 
 `stage create` (and `collection run` and `quick-archive`, which call it) checks this
 directory before it runs dar. A directory it cannot create or write to is refused by
-path. Staging one unit needs room for the unit's dar archive plus one encrypted slice
-written beside it. That comes to about the unit's size plus one `slice_size`, plus
-dar's own records for each file, for which the check allows up to 1 KiB a file. When the
-free space is certainly too small, the stage is refused with the figures, and no flag
-overrides that. When it only *may* be too small (with compression on, how far dar
-shrinks the data cannot be known in advance, and dar stores runs of zeros and
-hard-linked files in less space), you are asked on a terminal. `--yes` proceeds, and a non-interactive run without
-`--yes` refuses.
+path. Staging one unit needs room for its encrypted slices, and only those: no
+plaintext is written there. That comes to about the unit's size, plus dar's own records
+for each file, for which the check allows up to 1 KiB a file. When the free space is
+below that, the stage only *may* not fit (with compression on, how far dar shrinks the
+data cannot be known in advance, and dar stores runs of zeros and hard-linked files in
+less space), so you are asked on a terminal. `--yes` proceeds, and a non-interactive run
+without `--yes` refuses.
 
 ### `[defaults]`
 
@@ -209,7 +208,7 @@ These are the system-wide defaults. They form the bottom layer of
 | Key | Type | Default | What it does | Read by |
 |---|---|---|---|---|
 | `slice_size` | size (binary) | `"1G"` | Maximum size of one dar slice. A slice is the unit that is encrypted, written, retried and restored. Can be overridden by an archive set or a dotfile. | `stage create`, `collection run` |
-| `compression` | `none` \| `gzip` \| `bzip2` \| `lzo` \| `xz` \| `lzma` \| `zstd` \| `lz4` | `"none"` | dar compression. Must also be supported by your dar build, and for this key (and a dotfile's `compression`) nothing checks that in advance. Loading checks only the spelling, and `config check` says `config: valid`. A codec your dar lacks is found only when `stage create` runs dar, after its sha256 pass over the unit. An archive set's value is checked against the real binary: `archive-set create/edit/sync` refuse a codec it cannot perform, and `config check` warns about a stored set that has one. | `stage create` |
+| `compression` | `none` \| `gzip` \| `bzip2` \| `lzo` \| `xz` \| `lzma` \| `zstd` \| `lz4` | `"none"` | dar compression. Must also be supported by your dar build, and for this key (and a dotfile's `compression`) nothing checks that in advance. Loading checks only the spelling, and `config check` says `config: valid`. A codec your dar lacks is found only when `stage create` runs dar. An archive set's value is checked against the real binary: `archive-set create/edit/sync` refuse a codec it cannot perform, and `config check` warns about a stored set that has one. | `stage create` |
 | `checksum_mode` | `mtime_size` \| `sha256` \| `sha256_on_archive` | `"mtime_size"` | How a unit's files are compared with its last snapshot to decide whether it is dirty. `mtime_size` compares each file's path, size and modification time. `sha256` also compares a content hash when those match. `sha256_on_archive` detects changes as `mtime_size` does. A new unit takes the resolved mode (dotfile, then archive set, then `[defaults]`) **when it is registered**, and keeps it. A later change here does not reach units already registered. See [below](#keys-that-are-accepted-but-do-less-than-their-name-says). | `unit init`, `unit init-bulk`, `collection sync`, `unit discover`, `quick-archive` (at registration) |
 | `encrypt` | bool | `true` | Encryption **cannot** be turned off: the escrow recipient takes part in every write. When a unit's *resolved* `encrypt` is `false`, `stage create` prints a warning for it that `[logging] level` cannot silence, and encrypts anyway. `false` here is overridden by an archive set that sets `encrypt = true`, so that set's units stage with no warning. `audit` checks that a unit's stage sets on tape are encrypted, but only while the unit's resolved `encrypt` is `true`: `false` turns that check off for the unit. | `stage create`, `audit` |
 | `preserve_xattrs` | bool | `true` | `true` archives every extended attribute, and with them the POSIX ACLs that Linux stores as extended attributes. `false` passes dar `-u "*"`, which drops them all, ACLs included. | `stage create` |

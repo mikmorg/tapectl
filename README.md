@@ -12,7 +12,7 @@ software, the database and the machine that wrote it.
 ```mermaid
 flowchart LR
     D["/media/family/photos/2019-italy<br/>(a unit)"] -->|snapshot create| S[Snapshot<br/>what exists, fast]
-    S -->|stage create| G["Staging<br/>dar archive → sha256 → age encrypt"]
+    S -->|stage create| G["Staging<br/>dar + sha256 → age encrypt, in one pass"]
     G -->|volume write| T1[("Tape L6-0001<br/>home shelf")]
     G -->|volume write| T2[("Tape L6-0002<br/>offsite")]
     T1 & T2 -->|audit| A{{copies, places,<br/>verification age}}
