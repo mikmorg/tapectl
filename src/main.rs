@@ -563,6 +563,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ref tag,
             ref device,
             prewrite_hash,
+            full_confirm,
         } => {
             cli::operations::quick_archive(
                 &conn,
@@ -574,6 +575,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 tag,
                 device.as_deref(),
                 prewrite_hash,
+                full_confirm,
                 cli.json,
                 cli.dry_run,
                 cli.yes,

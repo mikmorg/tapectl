@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-resume \- Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them
 .SH SYNOPSIS
-\fBtapectl volume resume\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume resume\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-full\-confirm\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them.
 .PP
@@ -28,6 +28,9 @@ Show what would be done without making changes. Commands that cannot preview ref
 .TP
 \fB\-\-prewrite\-hash\fR
 See `volume write \-\-prewrite\-hash`: the revalidation full\-hashes every staged slice instead of size\-checking it. The session\*(Aqs frozen generated files are re\-hashed either way
+.TP
+\fB\-\-full\-confirm\fR
+See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enters) reads every file back
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-collection\-run \- Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit\*(Aqs resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action
 .SH SYNOPSIS
-\fBtapectl collection run\fR <\fB\-\-collection\fR> [\fB\-\-json\fR] [\fB\-\-batch\fR] [\fB\-\-dry\-run\fR] [\fB\-\-label\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl collection run\fR <\fB\-\-collection\fR> [\fB\-\-json\fR] [\fB\-\-batch\fR] [\fB\-\-dry\-run\fR] [\fB\-\-label\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit\*(Aqs resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action
 .SH OPTIONS
@@ -43,6 +43,9 @@ Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal 
 Path to config file.
 
 NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-full\-confirm\fR
+See `volume write \-\-full\-confirm`: read every copy this run writes back in full after sealing it
 .TP
 \fB\-\-home\fR \fI<HOME>\fR
 tapectl home directory: database, keys, catalogs, stage\-reports, logs.

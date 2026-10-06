@@ -271,6 +271,9 @@ pub enum Commands {
         /// See `volume write --prewrite-hash`.
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --full-confirm`.
+        #[arg(long)]
+        full_confirm: bool,
     },
 
     /// Tape drive backends

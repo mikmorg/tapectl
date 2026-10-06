@@ -63,7 +63,7 @@ Round 1 leaned "minimal." The robustness pass flips the lean. Failure analysis:
 `volume-format-v2.md` §4 gains the two-ended-redundancy rationale; the heir
 degradation ladder (§3.4) gets its second rung.
 
-### 1.2 Confirm default at seal: navigable vs **integrity**  ·  RATIFIED: INTEGRITY (opt-down `--quick`)
+### 1.2 Confirm default at seal: navigable vs **integrity**  ·  RATIFIED: INTEGRITY (opt-down `--quick`) — **reversed on 2026-10-06: navigable by default, `--full-confirm` opts in** (ADR-0012, amendment 2026-10-06 item 1, #387; see §2.4 L3)
 Round 1 leaned "navigable default, `--full` opt-in." Flipped by two arguments:
 - **The asymmetry of when a bad copy is discovered.** At seal time the staged
   slices are still on disk — a failed confirm costs a fresh cartridge and hours.
@@ -193,7 +193,20 @@ layers, each covering a window the others can't (now committed in
    filemark written by tapectl, where before 1.0.6 the comparison ran after
    both. Same abort, same reason, same rows.
 3. **confirm** (#23) hashes the tape readback against the front index — the
-   only end-to-end (host→medium) check, per §1.2.
+   only end-to-end (host→medium) check, per §1.2. **Opt-in at write time
+   since 2026-10-06** (ADR-0012, amendment 2026-10-06 item 1, #387): a
+   write's confirm is navigable by default — it reads File 3 and the seal
+   marker, checks the binding and the front index against the Layout, and a
+   passing one seals — and `--full-confirm` (on every command that writes a
+   volume) restores the full readback. On home2 the full confirm cost ~2.3 h
+   per tape at drive speed. What the default gives up is L3 at write time:
+   the staged slices may be released before any end-to-end check ran. So
+   `audit` (`no_full_verify`) and `report verify-status` name every sealed
+   volume with no passed full `volume verify` recorded, the operator guide
+   carries a full-verify cadence that closes the gap, and #360's adoption
+   still requires a recorded full verify — a quick-sealed volume becomes
+   adoptable only once one passes. Same tier mapping (navigable→`quick`,
+   integrity→`full`), so no schema change.
 Finding ③'s "no double read" survives *only* as: front-index generation reuses
 `stage_slices.sha256_encrypted` verbatim (no third read).
 

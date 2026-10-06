@@ -3988,6 +3988,7 @@ pub fn quick_archive(
     tag: &[String],
     device: Option<&str>,
     prewrite_hash: bool,
+    full_confirm: bool,
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
@@ -4066,6 +4067,7 @@ pub fn quick_archive(
         false,
         false,
         prewrite_hash,
+        full_confirm,
         assume_yes,
     )?;
     if json_output {
@@ -4197,6 +4199,7 @@ mod tests {
             &[],
             Some(&device),
             false,
+            false, // --full-confirm
             false,
             false,
             true,
@@ -4235,6 +4238,7 @@ mod tests {
                 &[],
                 Some(&device),
                 false,
+                false, // --full-confirm
                 false,
                 false,
                 assume_yes,

@@ -1337,6 +1337,9 @@ fn report_verify_status(
     // which. `verification_results` now knows, so the most recent failed
     // session — the one an operator is actually acting on — names them.
     let latest_failure = latest_failed_session(conn, volume_filter)?;
+    // Issue #387: every volume that counts as a copy with no passed FULL
+    // readback recorded — the same query `audit`'s `no_full_verify` uses.
+    let unverified = crate::policy::evidence::sealed_without_full_verify(conn, volume_filter)?;
 
     if json_output {
         let json: Vec<serde_json::Value> = rows.iter().map(verify_status_row_json).collect();
@@ -1344,6 +1347,13 @@ fn report_verify_status(
         // iterates it keeps working — and the detail rides on each element
         // of it, attached to the session it belongs to.
         let mut json = json;
+        for row in json.iter_mut() {
+            let named = row
+                .get("volume")
+                .and_then(|v| v.as_str())
+                .is_some_and(|label| unverified.iter().any(|u| u == label));
+            row["no_full_verify"] = serde_json::json!(named);
+        }
         if let Some(failure) = &latest_failure {
             for row in json.iter_mut() {
                 let is_the_one = row.get("volume").and_then(|v| v.as_str()) == Some(&failure.label)
@@ -1397,8 +1407,29 @@ fn report_verify_status(
                 println!("    position {}: {} — {}", f.position, f.result, f.notes);
             }
         }
+        if let Some(text) = no_full_verify_text(&unverified) {
+            println!("\n{text}");
+        }
     }
     Ok(())
+}
+
+/// The block `report verify-status` ends with when a sealed volume has no
+/// full readback recorded (issue #387, ADR-0012 2026-10-06 item 1): a
+/// write's confirm is quick by default, so its rows above say `quick
+/// passed` and nothing else would tell the operator the bytes were never
+/// read back. `None` when there is nothing to name.
+fn no_full_verify_text(labels: &[String]) -> Option<String> {
+    if labels.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "  sealed with no full readback recorded — run `tapectl volume verify <label>`:",
+    );
+    for label in labels {
+        out.push_str(&format!("\n    {label}"));
+    }
+    Some(out)
 }
 
 /// One recorded per-slice verification failure.
@@ -2556,6 +2587,19 @@ mod tests {
     /// this fix from the bug it fixes.
     mod verify_status_never_verified {
         use super::*;
+
+        /// Issue #387: a volume sealed by a quick confirm has a `quick
+        /// passed` row and nothing else, so the report names it in a block
+        /// of its own — and says nothing when every sealed volume has had a
+        /// full readback.
+        #[test]
+        fn a_sealed_volume_with_no_full_readback_is_named() {
+            assert_eq!(no_full_verify_text(&[]), None);
+            let text = no_full_verify_text(&["L6-0002".into(), "L6-0003".into()]).unwrap();
+            assert!(text.contains("no full readback"), "{text}");
+            assert!(text.contains("tapectl volume verify <label>"), "{text}");
+            assert!(text.contains("\n    L6-0002\n    L6-0003"), "{text}");
+        }
 
         /// #293's acceptance says a never-verified volume must be MARKED as
         /// such. The other tests in this module prove it is a ROW; this one

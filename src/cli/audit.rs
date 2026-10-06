@@ -287,6 +287,12 @@ const CHECKS: &[Check] = &[
             run: check_escrow_identity_mismatch,
         },
     },
+    Check {
+        name: "no_full_verify",
+        scope: Scope::Archive {
+            run: check_no_full_verify,
+        },
+    },
 ];
 
 /// Collect every audit finding for `unit_filter` (or all active units),
@@ -1406,6 +1412,39 @@ fn check_escrow_identity_mismatch(ctx: &Ctx<'_>) -> Result<Findings> {
         violations: Vec::new(),
         warnings: escrow_identity_findings(ctx.conn, ctx.escrow)?,
     })
+}
+
+// NO FULL VERIFY (#387, ADR-0012 2026-10-06 item 1).
+//
+// A write's confirm is quick by default, and a passing quick confirm seals:
+// the volume counts as a copy with its front index and seal read back but
+// none of its bytes. Every such volume is named, once, until a full
+// `volume verify` passes on it — the readback the write no longer does.
+// A warning, never a violation (ADR-0004): the copy is real, only its
+// end-to-end evidence is missing. Archive-wide, because the gap is a
+// volume's, whatever units it holds.
+fn check_no_full_verify(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: no_full_verify_findings(ctx.conn)?,
+    })
+}
+
+fn no_full_verify_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
+    Ok(
+        crate::policy::evidence::sealed_without_full_verify(conn, None)?
+            .into_iter()
+            .map(|label| AuditFinding {
+                unit: "archive".into(),
+                check: "no_full_verify".into(),
+                message: format!(
+                    "volume \"{label}\" is sealed with no full readback recorded — its \
+                     write confirmed the front index and seal only"
+                ),
+                action: format!("tapectl volume verify {label}"),
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn copy_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
@@ -3556,6 +3595,62 @@ mod tests {
         }
     }
 
+    /// Issue #387 (ADR-0012, 2026-10-06 item 1): a volume sealed by a quick
+    /// confirm counts as a copy with none of its bytes read back, and audit
+    /// names it until a full verify passes — a quick verify, a failed full
+    /// one, or one in progress does not take it off; a quarantined volume
+    /// (no longer a copy) and an unsealed one are not named.
+    #[test]
+    fn audit_names_every_sealed_volume_with_no_full_verify() {
+        let conn = crate::db::open_memory().unwrap();
+        let vol = |label: &str, status: &str, condition: &str| -> i64 {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, \
+                 capacity_bytes, status, observed_condition)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, ?2, ?3)",
+                params![label, status, condition],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let session = |volume_id: i64, verify_type: &str, outcome: &str| {
+            conn.execute(
+                "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+                 VALUES (?1, ?2, ?3)",
+                params![volume_id, verify_type, outcome],
+            )
+            .unwrap();
+        };
+        let quick = vol("Q-QUICK", "sealed", "ok");
+        session(quick, "quick", "passed");
+        let failed = vol("Q-FAILEDFULL", "sealed", "ok");
+        session(failed, "quick", "passed");
+        session(failed, "full", "failed");
+        let none = vol("Q-NONE", "sealed", "ok");
+        let _ = none;
+        let full = vol("Q-FULL", "sealed", "ok");
+        session(full, "quick", "passed");
+        session(full, "full", "passed");
+        vol("Q-QUAR", "sealed", "quarantined");
+        vol("Q-INIT", "initialized", "ok");
+
+        let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+        assert!(violations.is_empty(), "{violations:?}");
+        let named: Vec<&str> = warnings
+            .iter()
+            .filter(|f| f.check == "no_full_verify")
+            .map(|f| f.action.as_str())
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                "tapectl volume verify Q-FAILEDFULL",
+                "tapectl volume verify Q-NONE",
+                "tapectl volume verify Q-QUICK",
+            ]
+        );
+    }
+
     /// Issue #138 / C4 architecture review: `CHECKS` is now the scope table
     /// that used to be a comment above `collect_findings`. These tests pin
     /// the table's shape and the runner's use of it, independent of any
@@ -3563,7 +3658,7 @@ mod tests {
     mod checks_table {
         use super::*;
 
-        /// The 13 distinct `check` name literals this file's findings can
+        /// The 14 distinct `check` name literals this file's findings can
         /// carry (grep-verified against every `check: "..."` / `check ==
         /// "..."` in this file, non-test code). Every `CHECKS` row name
         /// must be one of these, and every one of these must be covered by
@@ -3582,6 +3677,7 @@ mod tests {
             "escrow_kit_missing",
             "escrow_kit_stale",
             "escrow_identity_mismatch",
+            "no_full_verify",
         ];
 
         #[test]
@@ -3597,13 +3693,13 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 8 per-unit checks + 3 archive-wide checks. `policy_unresolvable`
+            // 8 per-unit checks + 4 archive-wide checks. `policy_unresolvable`
             // is not one of them (see below), and `escrow_kit_missing`/
             // `escrow_kit_stale` share one row.
             assert_eq!(
                 names.len(),
-                11,
-                "expected 8 per-unit + 3 archive-wide CHECKS rows, got: {names:?}"
+                12,
+                "expected 8 per-unit + 4 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {

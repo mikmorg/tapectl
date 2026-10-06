@@ -104,6 +104,10 @@ pub enum CollectionCommands {
         /// before the tape moves, for every copy this run writes.
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --full-confirm`: read every copy this run
+        /// writes back in full after sealing it.
+        #[arg(long)]
+        full_confirm: bool,
     },
 }
 
@@ -166,6 +170,7 @@ pub fn run(
             labels,
             device,
             prewrite_hash,
+            full_confirm,
         } => cmd_run(
             conn,
             paths,
@@ -175,6 +180,7 @@ pub fn run(
             labels,
             &crate::cli::write_device(config, device.as_deref())?,
             *prewrite_hash,
+            *full_confirm,
             json_output,
             global_dry_run,
             assume_yes,
@@ -458,6 +464,7 @@ fn cmd_run(
     labels: &[String],
     device: &str,
     prewrite_hash: bool,
+    full_confirm: bool,
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
@@ -558,6 +565,7 @@ fn cmd_run(
         device,
         DEFAULT_BLOCK_SIZE,
         prewrite_hash,
+        full_confirm,
         assume_yes,
     )?;
 

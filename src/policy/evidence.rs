@@ -154,6 +154,37 @@ pub fn per_volume_verification(conn: &Connection, unit_id: i64) -> Result<Vec<Co
     tape_rows(conn, unit_id, false, None)
 }
 
+/// The labels of every volume that counts as a copy
+/// ([`crate::policy::coverage::eligible`]) but has no PASSED FULL readback
+/// recorded — no `verification_sessions` row with `verify_type = 'full'`
+/// and `outcome = 'passed'` — in label order, optionally only `label`.
+///
+/// ADR-0012, 2026-10-06 item 1 (issue #387): a write's confirm is quick by
+/// default, and a passing quick confirm seals. Such a volume has had its
+/// map read back, never its bytes, so the one host→medium end-to-end check
+/// (tri-layer L3) has not run on it. `audit` (`no_full_verify`) and
+/// `report verify-status` both name these through this one query, and a
+/// clean `volume verify` (full) takes a volume off the list. A quick
+/// verify does not: it reads the same two files the quick confirm did.
+pub fn sealed_without_full_verify(conn: &Connection, label: Option<&str>) -> Result<Vec<String>> {
+    let sql = format!(
+        "SELECT v.label FROM volumes v
+         WHERE {eligible}
+           AND (?1 IS NULL OR v.label = ?1)
+           AND NOT EXISTS (
+               SELECT 1 FROM verification_sessions vs
+               WHERE vs.volume_id = v.id AND vs.verify_type = 'full'
+                 AND vs.outcome = 'passed')
+         ORDER BY v.label",
+        eligible = crate::policy::coverage::eligible("v")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let labels = stmt
+        .query_map(params![label], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(labels)
+}
+
 /// Per-volume remaining-coverage evidence for `unit_id`, optionally
 /// excluding `exclude_volume_id` (the volume being retired/consumed) by
 /// identity.

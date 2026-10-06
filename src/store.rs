@@ -29,8 +29,10 @@ use crate::volume::layout_model::{pad_to_blocks, Layout, ZoneKind};
 /// (`docs/design/volume-format-v2.md` §5). `Navigable` diffs the front index
 /// against the Layout only; `Integrity` additionally hashes every content
 /// file's on-tape bytes against the front index's `sha256_encrypted`.
-/// Integrity is the seal default (ratified 2026-07-22, §1.2); `--quick` opts
-/// down to Navigable.
+///
+/// There is no `Default`: the two callers default differently, and each
+/// says which it means. `volume verify` is full unless `--quick`; a write's
+/// confirm is quick unless `--full-confirm` ([`Tier::write_confirm`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Navigable,
@@ -48,17 +50,34 @@ impl Tier {
             Tier::Navigable => "quick navigation check",
         }
     }
-}
 
-impl Default for Tier {
-    /// Integrity is the ratified seal-time default (`--quick` opts down to
-    /// Navigable) — `docs/design/v2-open-questions.md` §1.2: at seal time
-    /// the staged slices still exist on disk, so a failed confirm costs a
-    /// fresh cartridge and hours, not an unrecoverable loss; skipping the
-    /// full readback would mean no end-to-end host-to-medium check ever ran
-    /// on the sealed artifact.
-    fn default() -> Self {
-        Tier::Integrity
+    /// The tier a write session's post-seal confirm runs at: navigable
+    /// unless `full_confirm` (`--full-confirm`, on every command that
+    /// writes a tape).
+    ///
+    /// ADR-0012, 2026-10-06 item 1 (issue #387), reversing the 2026-07-22
+    /// seal-time default (`v2-open-questions.md` §1.2/§2.4): the full
+    /// readback cost ~2.3 h per tape at drive speed on home2, and LTO's
+    /// read-after-write already checks drive→medium while execute's inline
+    /// hash (L2) checks disk→tapectl. What the quick tier gives up is the
+    /// one host→medium end-to-end check (L3) at write time, so a
+    /// quick-sealed volume carries no full verify until `volume verify`
+    /// runs one; `audit` and `report verify-status` name every sealed
+    /// volume that has none.
+    pub fn write_confirm(full_confirm: bool) -> Tier {
+        if full_confirm {
+            Tier::Integrity
+        } else {
+            Tier::Navigable
+        }
+    }
+
+    /// The `verification_sessions.verify_type` this tier records.
+    pub fn verify_type(self) -> &'static str {
+        match self {
+            Tier::Integrity => "full",
+            Tier::Navigable => "quick",
+        }
     }
 }
 
@@ -1729,11 +1748,14 @@ mod tests {
         assert_eq!(store.files.len(), 2);
     }
 
-    // --- Tier::default (T6) ----------------------------------------------
+    // --- the write confirm's tier (issue #387) ---------------------------
 
     #[test]
-    fn tier_defaults_to_integrity() {
-        assert_eq!(Tier::default(), Tier::Integrity);
+    fn a_write_confirms_quick_unless_full_confirm_is_asked_for() {
+        assert_eq!(Tier::write_confirm(false), Tier::Navigable);
+        assert_eq!(Tier::write_confirm(true), Tier::Integrity);
+        assert_eq!(Tier::Navigable.verify_type(), "quick");
+        assert_eq!(Tier::Integrity.verify_type(), "full");
     }
 
     // --- confirm / chain_walk, via MemStore -----------------------------

@@ -252,7 +252,12 @@ Rules that hold in every path:
 - **Confirm** (#23): a single forward pass from BOP (the index is at the front,
   not the tail — no seek-back). Read the seal marker and verify it binds File 3;
   diff the front index against the Layout (navigable tier); hash each file
-  against the front index's `sha256_encrypted` (integrity tier). The exact
+  against the front index's `sha256_encrypted` (integrity tier). A write's
+  confirm runs the navigable tier by default and the integrity tier only
+  under `--full-confirm` (ADR-0012, amendment 2026-10-06 item 1, #387); a
+  passing navigable confirm seals, and the volume's full readback is then
+  owed to `volume verify` — `audit` and `report verify-status` name every
+  sealed volume without one. The exact
   cryptographic chain is fixed in `volume-format-v2.md` §4–5. On tape that is
   one rewind, then Files 0, 1, 2, 3 and every content file in position order
   (#389): Files 0–2 are held in memory until File 3 says what they hash to,

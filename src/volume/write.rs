@@ -982,7 +982,13 @@ fn blocking_validation_errors(
 /// L1). Off by default since ADR-0012's 2026-09-30 (later) amendment —
 /// validate then checks only that each slice exists at its recorded size,
 /// and a rotted slice is caught by L2 while streaming (clean abort, no seal).
-#[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow + prewrite_hash + assume_yes
+///
+/// `full_confirm` is `--full-confirm`: the post-seal confirm reads every
+/// file back and hashes it (tri-layer L3). Off by default since ADR-0012's
+/// 2026-10-06 item 1 (issue #387) — the confirm then reads File 3 and the
+/// seal ([`Tier::write_confirm`]), a passing one still seals, and the
+/// volume's full readback is left to `volume verify`.
+#[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow + prewrite_hash + full_confirm + assume_yes
 pub fn volume_write(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -993,6 +999,7 @@ pub fn volume_write(
     force: bool,
     allow_missing_escrow: bool,
     prewrite_hash: bool,
+    full_confirm: bool,
     assume_yes: bool,
 ) -> Result<()> {
     // ONE contact for the whole write, and the one `volume compact-write`,
@@ -1011,6 +1018,7 @@ pub fn volume_write(
         force,
         allow_missing_escrow,
         prewrite_hash,
+        full_confirm,
         assume_yes,
         &mut contact,
         ContactStore::Device,
@@ -1031,6 +1039,7 @@ fn volume_write_contacted<'c>(
     force: bool,
     allow_missing_escrow: bool,
     prewrite_hash: bool,
+    full_confirm: bool,
     assume_yes: bool,
     contact: &mut ContactSlot<'c>,
     store: ContactStore<'_>,
@@ -1267,6 +1276,7 @@ fn volume_write_contacted<'c>(
         force,
         allow_missing_escrow,
         SliceCheck::from_prewrite_hash(prewrite_hash),
+        Tier::write_confirm(full_confirm),
         StagedWrite {
             backend,
             volume_id,
@@ -1402,6 +1412,7 @@ fn volume_write_in_contact<'c>(
     force: bool,
     allow_missing_escrow: bool,
     slice_check: SliceCheck,
+    confirm_tier: Tier,
     staged: StagedWrite<'_>,
     det: &crate::tape::media_detect::Detected,
     contact: &contact::ContactGuard<'c>,
@@ -1700,6 +1711,7 @@ fn volume_write_in_contact<'c>(
         &layout_snapshot,
         block_size as u64,
         execute_outcome.into(),
+        confirm_tier,
     )
     .map(|()| layout_snapshot)
 }
@@ -1734,6 +1746,10 @@ fn volume_write_in_contact<'c>(
 /// `prewrite_hash` is `--prewrite-hash`, as on [`volume_write`]: the resume
 /// revalidation full-hashes every staged slice instead of size-checking it.
 /// The frozen generated zones are re-hashed byte-identical either way.
+///
+/// `full_confirm` is `--full-confirm`, as on [`volume_write`]: the confirm
+/// this resume runs, or re-enters, reads every file back.
+#[allow(clippy::too_many_arguments)]
 pub fn volume_resume(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -1742,6 +1758,7 @@ pub fn volume_resume(
     device: &str,
     block_size: usize,
     prewrite_hash: bool,
+    full_confirm: bool,
 ) -> Result<()> {
     // See [`ContactSlot`]: resume refuses on the volume's status, on its
     // `writes` rows and on a missing backend long before it reads the MAM,
@@ -1755,6 +1772,7 @@ pub fn volume_resume(
         device,
         block_size,
         SliceCheck::from_prewrite_hash(prewrite_hash),
+        Tier::write_confirm(full_confirm),
         &mut contact,
     );
     contact.finish_result(r)
@@ -1770,6 +1788,7 @@ fn volume_resume_contacted<'c>(
     device: &str,
     block_size: usize,
     slice_check: SliceCheck,
+    confirm_tier: Tier,
     contact: &mut ContactSlot<'c>,
 ) -> Result<()> {
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
@@ -1961,6 +1980,7 @@ fn volume_resume_contacted<'c>(
         &layout_snapshot,
         &keys,
         slice_check,
+        confirm_tier,
     );
 
     // ONE post-command sweep per resume contact (issue #342; ADR-0013),
@@ -2028,6 +2048,7 @@ fn volume_resume_in_contact(
     layout_snapshot: &Layout,
     keys: &KeyAvailability,
     slice_check: SliceCheck,
+    confirm_tier: Tier,
 ) -> Result<()> {
     binding::corroborate_volume(
         conn,
@@ -2076,6 +2097,7 @@ fn volume_resume_in_contact(
         layout_snapshot,
         block_size as u64,
         outcome,
+        confirm_tier,
     )
 }
 
@@ -2651,6 +2673,7 @@ fn assemble_session_keys(
 /// `ResumeOutcome::Ready`; it never constructs a seal entry of its own, and
 /// the `Confirming` arm below deliberately does NOT call it — the tape is
 /// already sealed (ADR-0012's 2026-09-21 amendment, issues #260/#267).
+#[allow(clippy::too_many_arguments)]
 fn finish_session(
     conn: &Connection,
     store: &mut dyn Store,
@@ -2659,6 +2682,7 @@ fn finish_session(
     layout: &Layout,
     block_size: u64,
     outcome: ResumeOutcome,
+    confirm_tier: Tier,
 ) -> Result<()> {
     match outcome {
         ResumeOutcome::Ready(ready) => {
@@ -2736,6 +2760,7 @@ fn finish_session(
                 layout,
                 block_size,
                 sealed_pending,
+                confirm_tier,
             )
         }
         // ADR-0012's 2026-09-21 amendment (issues #260/#267): resume found
@@ -2753,6 +2778,7 @@ fn finish_session(
             layout,
             block_size,
             sealed_pending,
+            confirm_tier,
         ),
         ResumeOutcome::Quarantined(q) => Err(quarantine_error(label, &q.reason)),
         ResumeOutcome::Interrupted(_) => {
@@ -2869,6 +2895,7 @@ fn park_after_seal(marker: &str) -> bool {
 /// [`ResumeOutcome::Confirming`] (which never does — the tape is already
 /// sealed). Factored out so the [`ConfirmOutcome`] three-way match exists in
 /// exactly one place — ADR-0012's 2026-09-18 amendment, issues #260/#267.
+#[allow(clippy::too_many_arguments)]
 fn finish_confirm(
     conn: &Connection,
     store: &mut dyn Store,
@@ -2877,13 +2904,14 @@ fn finish_confirm(
     layout: &Layout,
     block_size: u64,
     sealed_pending: session::SealedPending,
+    confirm_tier: Tier,
 ) -> Result<()> {
     // Issue #404: a signal during the readback stops it between files.
     // `confirm` returns before recording anything, so its rows keep their
     // status (`in_progress` is swept to `interrupted` on the next open) and
     // the seal stays recorded: `volume resume` re-enters confirm.
     let confirmed = sealed_pending
-        .confirm(conn, store, Tier::default())
+        .confirm(conn, store, confirm_tier)
         .map_err(|e| match e {
             TapectlError::Interrupted(at) => TapectlError::Interrupted(format!(
                 "volume \"{label}\": confirm {at}. The tape IS sealed; the catalog cannot \
@@ -4906,6 +4934,7 @@ pub fn compact_write(
     block_size: usize,
     allow_missing_escrow: bool,
     prewrite_hash: bool,
+    full_confirm: bool,
     assume_yes: bool,
 ) -> Result<()> {
     // The normal volume_write picks up all staged data. `force` is not
@@ -4923,6 +4952,7 @@ pub fn compact_write(
         false,
         allow_missing_escrow,
         prewrite_hash,
+        full_confirm,
         assume_yes,
     )
 }
@@ -8784,6 +8814,7 @@ mod tests {
             true,  // --force
             false, // --allow-missing-escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes: the host pre-flight is not under test here
         )
         .expect_err("force must not bypass pre-write validation");
@@ -8877,6 +8908,7 @@ mod tests {
                 false, // force
                 false, // allow_missing_escrow
                 false, // --prewrite-hash
+                false, // --full-confirm
                 true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err();
@@ -8979,6 +9011,7 @@ mod tests {
             false, // force
             false, // allow_missing_escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err();
@@ -9059,6 +9092,7 @@ mod tests {
             false, // force
             false, // allow_missing_escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes
         )
         .unwrap_err();
@@ -9132,6 +9166,7 @@ mod tests {
             false,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .unwrap_err();
@@ -9220,6 +9255,7 @@ mod tests {
             false, // force
             false, // allow_missing_escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err();
@@ -9320,6 +9356,7 @@ mod tests {
             "/nonexistent/tapectl-resume-rebuilt-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -9381,6 +9418,7 @@ mod tests {
             false,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .expect_err("no staged data exists, so this must fail at a LATER check");
@@ -9596,6 +9634,7 @@ mod tests {
             false,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .expect_err("no backend is configured, so this must fail at backend resolution");
@@ -9675,6 +9714,7 @@ mod tests {
             "/nonexistent/tapectl-resume-status-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -9765,6 +9805,7 @@ mod tests {
             "/nonexistent/tapectl-resume-planned-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -9823,6 +9864,7 @@ mod tests {
             "/nonexistent/tapectl-resume-inprogress-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -9931,6 +9973,7 @@ mod tests {
                 "/nonexistent/tapectl-resume-live-test-nst",
                 512 * 1024,
                 false,
+                false, // --full-confirm
             )
             .unwrap_err()
         };
@@ -9967,6 +10010,7 @@ mod tests {
             true,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .unwrap_err();
@@ -10023,6 +10067,7 @@ mod tests {
             "/nonexistent/tapectl-resume-interrupted-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -10101,6 +10146,7 @@ mod tests {
             "/nonexistent/tapectl-resume-pm280-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err()
     }
@@ -10259,6 +10305,7 @@ mod tests {
                 force,
                 false,
                 false,
+                false, // --full-confirm
                 true,
             )
             .unwrap_err();
@@ -10407,6 +10454,7 @@ mod tests {
             "/nonexistent/tapectl-resume-gencheck-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -10482,6 +10530,7 @@ mod tests {
             false,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .unwrap_err();
@@ -11571,6 +11620,7 @@ mod tests {
                 false, // --force
                 false, // --allow-missing-escrow
                 false, // --prewrite-hash
+                false, // --full-confirm
                 true,  // --yes: the host pre-flight is not under test here
             )
             .expect_err("the escrow gap must refuse before the device is touched");
@@ -12879,6 +12929,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
             )
             .unwrap_err()
@@ -12924,6 +12975,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
             )
             .unwrap_err();
@@ -12967,6 +13019,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false, // --prewrite-hash
+                false, // --full-confirm
                 true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err();
@@ -13020,6 +13073,7 @@ mod tests {
                 GENCHK_DEVICE,
                 512 * 1024,
                 false, // --prewrite-hash
+                false, // --full-confirm
                 true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err()
@@ -13166,6 +13220,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
             )
             .unwrap_err();
@@ -14045,6 +14100,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
@@ -14118,6 +14174,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
@@ -14156,6 +14213,133 @@ mod tests {
             );
         }
 
+        /// A `MemStore` that logs which positions were read back since the
+        /// last write — after a session, the confirm's reads.
+        struct ReadLog {
+            inner: MemStore,
+            reads: Vec<u32>,
+        }
+
+        impl Store for ReadLog {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(
+                &mut self,
+                src: &mut dyn std::io::Read,
+                len: u64,
+                sync: bool,
+            ) -> Result<u64> {
+                self.reads.clear();
+                self.inner.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn std::io::Write) -> Result<u64> {
+                self.reads.push(position);
+                self.inner.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+        }
+
+        /// Issue #387 (ADR-0012, 2026-10-06 item 1): a write confirms with
+        /// the quick tier by default — File 3 and the seal read back, no
+        /// content file — records `quick`, and a passing quick confirm
+        /// seals the volume.
+        #[test]
+        fn a_default_write_confirms_quick_and_seals() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-QUICK", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let mut store = ReadLog {
+                inner: MemStore::new(512 * 1024),
+                reads: Vec::new(),
+            };
+
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-QUICK",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                false, // --full-confirm
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            slot.finish_result(r).expect("the write completes");
+            let seal = store.inner.files.len() as u32 - 1;
+            let (status, sessions): (String, Vec<(String, String)>) = (
+                conn.query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+                conn.prepare(
+                    "SELECT verify_type, outcome FROM verification_sessions WHERE volume_id = ?1",
+                )
+                .unwrap()
+                .query_map(params![volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap(),
+            );
+            assert_eq!(status, "sealed", "a passing quick confirm seals");
+            assert_eq!(sessions, vec![("quick".to_string(), "passed".to_string())]);
+            assert_eq!(store.reads, vec![3, seal], "no content file read back");
+        }
+
+        /// The other half of #387: `--full-confirm` reads every file back
+        /// (the seal last, issue #397) and records `full`.
+        #[test]
+        fn full_confirm_reads_every_file_back_and_records_full() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-FULL", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let mut store = ReadLog {
+                inner: MemStore::new(512 * 1024),
+                reads: Vec::new(),
+            };
+
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-FULL",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                true, // --full-confirm
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            slot.finish_result(r).expect("the write completes");
+            let files = store.inner.files.len() as u32;
+            let sessions: Vec<(String, String)> = conn
+                .prepare(
+                    "SELECT verify_type, outcome FROM verification_sessions WHERE volume_id = ?1",
+                )
+                .unwrap()
+                .query_map(params![volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(sessions, vec![("full".to_string(), "passed".to_string())]);
+            assert_eq!(store.reads, (0..files).collect::<Vec<u32>>());
+        }
+
         /// ADR-0012 2026-10-06 item 4 (issue #370): the filtered
         /// `catalog.db` a write puts in its operator envelopes is plaintext
         /// (paths, sizes, hashes), so it is built in the tapectl home and
@@ -14183,6 +14367,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
@@ -14251,6 +14436,7 @@ mod tests {
                     false,
                     false,
                     prewrite_hash,
+                    false, // --full-confirm
                     true,
                     &mut slot,
                     ContactStore::Injected(&mut store),
@@ -14335,6 +14521,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
@@ -14389,6 +14576,7 @@ mod tests {
                     false,
                     false,
                     prewrite_hash,
+                    false, // --full-confirm
                     true,
                     &mut slot,
                     ContactStore::Injected(&mut store),
@@ -14803,6 +14991,7 @@ mod tests {
             force,
             false, // allow_missing_escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err()

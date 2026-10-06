@@ -1327,8 +1327,9 @@ blocks for seconds.
 
 Hours in `prewrite-check` are the full read of the staged slices that
 `--prewrite-hash` asks for; without the flag that phase is a size check and
-takes moments. Hours in `confirm` are the readback of the whole tape, which
-every write ends with.
+takes moments. Hours in `confirm` are the readback of the whole tape that
+`--full-confirm` asks for; without the flag confirm reads the front index and
+the seal marker back and takes a minute or two.
 
 When the command has finished, `volume info <label>` shows the same phases
 with their durations and rates (see the operator guide, [Watching a long
@@ -1414,8 +1415,9 @@ this one is suspect.
 
 ### Confirm could not complete, or the volume was quarantined at write
 
-After sealing, the write reads the tape back ("confirm"). There are two
-failure outcomes:
+After sealing, the write reads the tape back ("confirm"): by default the
+front index and the seal marker, under `--full-confirm` every file. There are
+two failure outcomes:
 
 ```text
 error: volume "<label>": confirm could not complete — <n> mismatch(es) during readback, none proving the medium
@@ -1997,7 +1999,7 @@ audit: 0 violations, 1 warnings (exit 1)
 
 The per-unit checks cover every unit, whatever its status (`active`,
 `tape_only` or `missing`), except `dirty`, which looks only at `active` ones.
-The archive-wide checks (the last four rows below) run only for a
+The archive-wide checks (the last five rows below) run only for a
 whole-archive audit, not with `--unit`.
 
 | Check | Severity | Message | Meaning and fix |
@@ -2016,6 +2018,7 @@ whole-archive audit, not with `--unit`.
 | `escrow_kit_missing` | warning | `<n> sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them` | Fix: `tapectl key escrow-kit --out <dir>`, then do the paper steps it lists ([keys-and-recovery.md](keys-and-recovery.md)). |
 | `escrow_kit_stale` | warning | `` <n> volume(s) were sealed after the last heir kit (<date>): the kit's escrow secret still opens them (it is a recipient of every tape), but the kit's encrypted catalog (catalog.db.age) does not list them — regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog rebuild --from-volume` `` | Only the kit's catalog is behind; its secret opens every tape. Fix: `tapectl key escrow-kit --out <dir>` and replace the stored copies. The escrow secret itself does not change. |
 | `escrow_identity_mismatch` | warning | `<n> stage set(s) the current escrow key cannot open all name a recipient this catalog does not recognise: <key> — …` | Typical after a disaster rebuild that created a **new** escrow identity. No command replaces a registered escrow identity. The fix is to re-initialise a fresh home with `tapectl init --escrow-public-key <original>` (from the heir kit) and run `catalog rebuild` again. |
+| `no_full_verify` | warning | `volume "<label>" is sealed with no full readback recorded — its write confirmed the front index and seal only` | A write's confirm reads back only the front index and the seal marker unless `--full-confirm` was given (ADR-0012, 2026-10-06), so this volume counts as a copy with none of its data read back yet. Fix: `tapectl volume verify <label>` (full, the default); a passing one clears it, a `--quick` one does not. |
 
 ---
 

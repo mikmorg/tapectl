@@ -1510,10 +1510,7 @@ impl SealedPending {
         store: &mut dyn Store,
         tier: Tier,
     ) -> Result<ConfirmOutcome> {
-        let verify_type = match tier {
-            Tier::Integrity => "full",
-            Tier::Navigable => "quick",
-        };
+        let verify_type = tier.verify_type();
         conn.execute(
             "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
              VALUES (?1, ?2, 'in_progress')",
@@ -1540,8 +1537,14 @@ impl SealedPending {
             .collect::<rusqlite::Result<_>>()?;
 
         // Issue #386: the readback — hours on a full cartridge — is its own
-        // phase, counted byte by byte through `Store::confirm`.
-        let phase = crate::progress::phase("confirm", self.built.layout.on_tape_bytes().ok());
+        // phase, counted byte by byte through `Store::confirm`. A quick
+        // confirm reads no content file, so only a full one has a byte
+        // total (as `volume verify` already does).
+        let total = match tier {
+            Tier::Integrity => self.built.layout.on_tape_bytes().ok(),
+            Tier::Navigable => None,
+        };
+        let phase = crate::progress::phase("confirm", total);
         let evidence = store.confirm_with(
             &self.built.layout,
             ConfirmPlan::new(tier).with_order(self.seal_order),
@@ -1549,10 +1552,10 @@ impl SealedPending {
         phase.done();
         let passed = evidence.mismatches.is_empty();
         // ADR-0012's 2026-09-18 amendment: a mismatch alone is not a
-        // quarantine verdict. `Tier::default()` is `Tier::Integrity`, so a
-        // routine confirm reads back the WHOLE cartridge — hours on a full
-        // LTO-6 — and one transient SCSI error in that window must not
-        // condemn a physically sound tape.
+        // quarantine verdict. A full confirm (`--full-confirm`) reads back
+        // the WHOLE cartridge — hours on a full LTO-6 — and one transient
+        // SCSI error in that window must not condemn a physically sound
+        // tape.
         let proves_medium_bad = evidence.proves_medium_bad();
 
         // Issue #377: recorded after an hours-long readback, so a busy
