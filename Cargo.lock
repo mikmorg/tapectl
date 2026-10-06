@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "tapectl"
-version = "1.0.7"
+version = "1.1.0"
 dependencies = [
  "age",
  "anyhow",
