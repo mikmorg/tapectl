@@ -2992,3 +2992,134 @@ fn a_slice_row_with_the_same_number_but_other_ciphertext_is_refused() {
         "a refused rebuild changes nothing"
     );
 }
+
+/// A `MemStore` that, before every read, checks from a SECOND connection
+/// whether the catalog's write lock is free (`BEGIN IMMEDIATE` with no busy
+/// wait). Issue #413: a rebuild must never hold the write lock across tape
+/// I/O, which on a real drive takes seconds per positioning and would stall
+/// every other tapectl command for that long.
+struct LockProbeStore {
+    inner: MemStore,
+    db: std::path::PathBuf,
+    reads: usize,
+    locked_reads: Vec<u32>,
+}
+
+impl LockProbeStore {
+    fn probe(&mut self, position: u32) {
+        self.reads += 1;
+        let other = rusqlite::Connection::open(&self.db).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match other.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => other.execute_batch("ROLLBACK").unwrap(),
+            Err(_) => self.locked_reads.push(position),
+        }
+    }
+}
+
+impl tapectl::store::Store for LockProbeStore {
+    fn capacity(&mut self) -> tapectl::error::Result<tapectl::store::CapacityReport> {
+        self.inner.capacity()
+    }
+    fn execute(
+        &mut self,
+        src: &mut dyn std::io::Read,
+        len: u64,
+        sync: bool,
+    ) -> tapectl::error::Result<u64> {
+        self.inner.execute(src, len, sync)
+    }
+    fn read_file(
+        &mut self,
+        position: u32,
+        sink: &mut dyn std::io::Write,
+    ) -> tapectl::error::Result<u64> {
+        self.probe(position);
+        self.inner.read_file(position, sink)
+    }
+    fn read_file_head(
+        &mut self,
+        position: u32,
+        max_bytes: u64,
+        sink: &mut dyn std::io::Write,
+    ) -> tapectl::error::Result<u64> {
+        self.probe(position);
+        self.inner.read_file_head(position, max_bytes, sink)
+    }
+    fn reposition_for_resume(&mut self, file_index: u32) -> tapectl::error::Result<()> {
+        self.inner.reposition_for_resume(file_index)
+    }
+}
+
+/// Issue #413: no tape read happens while the rebuild holds the catalog's
+/// write lock. Attestation reads one slice header per unit, and it used to
+/// run inside the rebuild's one IMMEDIATE transaction.
+#[test]
+fn a_rebuild_reads_no_tape_while_it_holds_the_write_lock() {
+    let vol = build_sealed_volume_with(CatalogDb::Old);
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rebuilt.db");
+    let conn = fresh_db(dir.path());
+    register_escrow(&conn, &vol.escrow_public);
+    let scratch = tempfile::tempdir().unwrap();
+
+    let key_dir = tempfile::tempdir().unwrap();
+    let key = key_file(key_dir.path(), "k.age.key", &vol.escrow_secret);
+    let identity: age::x25519::Identity = tapectl::crypto::keys::read_secret_key(&key)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut store = LockProbeStore {
+        inner: vol.store,
+        db: db_path,
+        reads: 0,
+        locked_reads: Vec::new(),
+    };
+
+    // Positive control: the probe sees the rebuild connection's write lock.
+    let held = db::busy::immediate_tx(&conn).unwrap();
+    store.probe(u32::MAX);
+    held.rollback().unwrap();
+    assert_eq!(
+        store.locked_reads,
+        vec![u32::MAX],
+        "positive control: the probe must see a held write lock on this catalog"
+    );
+    store.locked_reads.clear();
+    store.reads = 0;
+
+    let site = ContactSite::new(
+        cfg(),
+        Operation::CatalogRebuild,
+        "memstore",
+        Medium::NoBackend,
+    );
+    let report = rebuild::rebuild_from_store(
+        &conn,
+        &mut store,
+        &[identity],
+        Some(LABEL),
+        "recovered",
+        Some("lto0"),
+        scratch.path(),
+        "memstore",
+        site,
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.attested,
+        UNITS.len(),
+        "positive control: attestation read a slice header per unit"
+    );
+    assert!(
+        store.reads > UNITS.len(),
+        "positive control: {} reads",
+        store.reads
+    );
+    assert!(
+        store.locked_reads.is_empty(),
+        "tape positions read while the write lock was held: {:?}",
+        store.locked_reads
+    );
+}

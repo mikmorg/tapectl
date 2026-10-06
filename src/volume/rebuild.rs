@@ -568,6 +568,12 @@ fn rebuild_contacted(
     // `unchecked_transaction` matches the codebase's convention (session,
     // write, key, operations): the CLI holds a shared `Connection`, and
     // requiring `&mut` here would ripple through every caller for nothing.
+    //
+    // Issue #413: no tape is read while this holds the write lock. The rows
+    // the envelopes and `catalog.db` describe (all read above) and the
+    // cartridge binding commit together; attestation, which reads one slice
+    // header per unit off the tape, runs after the commit with each receipt
+    // its own guarded UPDATE; the event is a second short transaction.
     let tx = crate::db::busy::immediate_tx(conn)?;
     let volume_id = insert_all(
         &tx,
@@ -591,7 +597,14 @@ fn rebuild_contacted(
         media.as_ref(),
         &mut report,
     )?;
-    attest_escrow(&tx, store, identities, &operator.manifest, &mut report)?;
+    tx.commit()?;
+
+    // The rows above are committed, so the provenance event is recorded even
+    // when attestation fails partway (a busy catalog, say); its error is
+    // returned after. Re-running the rebuild attests what is left.
+    let attested = attest_escrow(conn, store, identities, &operator.manifest, &mut report);
+
+    let tx = crate::db::busy::immediate_tx(conn)?;
     report.unknown_remaining = tx.query_row(
         "SELECT COUNT(*) FROM stage_sets ss
          JOIN writes w ON w.stage_set_id = ss.id
@@ -602,6 +615,7 @@ fn rebuild_contacted(
     record_event(&tx, &report, volume_id, device_label)?;
     tx.commit()?;
 
+    attested?;
     Ok(report)
 }
 
@@ -633,13 +647,13 @@ const ATTEST_HEAD_BYTES: u64 = 64 * 1024;
 /// `rebuilt`. Any failure other than "not a recipient" is logged and skipped:
 /// attestation is an add-on, and a rebuild must not fail because of it.
 fn attest_escrow(
-    tx: &Connection,
+    conn: &Connection,
     store: &mut dyn Store,
     identities: &[age::x25519::Identity],
     manifest: &EnvelopeManifest,
     report: &mut RebuildReport,
 ) -> Result<()> {
-    let Some(registered) = crate::db::queries::escrow_public_key(tx)? else {
+    let Some(registered) = crate::db::queries::escrow_public_key(conn)? else {
         return Ok(());
     };
     let Some(escrow_id) = identities
@@ -673,7 +687,7 @@ fn attest_escrow(
         // #379): a Version can have several stage sets, and attesting one
         // from another's slice header would record a claim no slice of it
         // demonstrated.
-        let stage_set_id: Option<i64> = tx
+        let stage_set_id: Option<i64> = conn
             .query_row(
                 "SELECT ss.id FROM stage_sets ss
                  JOIN snapshots s ON s.id = ss.snapshot_id
@@ -709,7 +723,9 @@ fn attest_escrow(
             .and_then(|d| d.decrypt(std::iter::once(escrow_id as &dyn age::Identity)));
         match opened {
             Ok(_) => {
-                tx.execute(
+                // Autocommit, and guarded: a receipt is never overwritten,
+                // and the rows it completes committed before any tape read.
+                conn.execute(
                     "UPDATE stage_sets SET key_fingerprints = ?1
                      WHERE id = ?2 AND key_fingerprints IS NULL",
                     params![receipt, stage_set_id],
