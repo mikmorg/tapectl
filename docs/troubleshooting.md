@@ -1304,6 +1304,18 @@ tapectl volume resume L6-0003 --device "$TAPE"
 - `has no write sessions at all` / `its write sessions are all resolved`: use
   `volume write`.
 
+Under `scripts/first-run.sh`, re-run step 13 with the same label
+(`--from 13 --label <label>`): it finds the interrupted session, offers the
+resume, and then runs the verify, audit, shelf and Heir Kit steps the first
+run never reached (`docs/install.md`, §5).
+
+After a power cut the same holds: resume first, never re-initialise the
+cartridge. A cut after the seal leaves the seal on the medium (it is written
+with a synchronous filemark, which flushes the drive's buffer before the
+catalog records it), and `volume resume` re-confirms it. What each point of
+failure costs is tabled in
+[design/threat-model.md §3](design/threat-model.md#3-power-the-baseline).
+
 ### The write seems stuck: nothing moves
 
 A write that shows no progress for a long time is in a phase that moves no

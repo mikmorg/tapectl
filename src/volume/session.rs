@@ -2563,6 +2563,56 @@ mod tests {
         }
     }
 
+    /// Issue #394 (`docs/design/threat-model.md` §2, ADR-0012 2026-10-06
+    /// item 14): every file of a volume ends with an immediate filemark and
+    /// the seal marker — the last — with a synchronous one, which flushes
+    /// the drive's buffer to the medium before the catalog records the
+    /// seal. The power baseline rests on this, so it is pinned.
+    #[test]
+    fn only_the_seal_marker_is_written_with_a_synchronous_filemark() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let seal_position = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready"),
+        };
+        assert!(
+            store.syncs.iter().all(|s| !s),
+            "every file before the seal ends with an immediate filemark: {:?}",
+            store.syncs
+        );
+        ready.seal(&mut store).unwrap();
+        let synced: Vec<usize> = store
+            .syncs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            synced,
+            [seal_position],
+            "only the seal marker's filemark is synchronous"
+        );
+        assert_eq!(
+            store.syncs.len(),
+            seal_position + 1,
+            "the seal is the last file"
+        );
+    }
+
     // --- behavior 1: happy path over MemStore ends Sealed ----------------
 
     #[test]

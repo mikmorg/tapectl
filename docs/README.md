@@ -26,6 +26,7 @@ the repository, grouped by what you are trying to do.
 | [Write session](design/layout-session.md) | The state machine of a tape write: build → validate → plan → execute → seal → confirm. |
 | [v2 open questions](design/v2-open-questions.md) | The format v2 design questions and how each was resolved (§§1–11) — normative after the two above. |
 | [v2 implementation plan](design/v2-implementation-plan.md) | The T0–T11 build playbook the v2 write path was built from — last in the same order of authority. |
+| [Threat model and boundaries](design/threat-model.md) | Who the adversary is and is not; integrity versus authenticity (the seal is not a signature); the st/SG boundary and the synchronous seal filemark; the power baseline; how the format grows; one cartridge, one recovery unit. |
 | [Architecture decisions](adr/) | ADR-0001 … ADR-0013: the rules and why (escrow, consent tiers, cartridge identity, generations, …). |
 | [Vocabulary](../CONTEXT.md) | The project's defined terms. |
 | [Original design document](../tapectl-design-v4_0.md) | Design v4.0 — still the reference for whatever the documents above do not cover; read it with the errata. |

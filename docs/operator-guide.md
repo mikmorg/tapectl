@@ -2088,6 +2088,12 @@ hold — not on how bad the loss is. This section is the procedure;
 and [install.md §8](install.md#8-getting-the-catalog-back) covers the cheapest
 case, restoring a catalog from a `db backup` copy.
 
+What a power cut costs at each point of a write, why a write host wants a UPS
+and a catalog backup after every write session, and what the on-tape hashes
+do and do not prove (they detect damage, not a deliberate rewrite: the seal is
+not a signature) are in
+[design/threat-model.md](design/threat-model.md).
+
 > [!IMPORTANT]
 > Every device below is written `$TAPE`. Find the drive by serial with
 > `ls -l /dev/tape/by-id/` and set `TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst`
