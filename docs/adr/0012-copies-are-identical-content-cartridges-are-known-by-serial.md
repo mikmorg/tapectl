@@ -1182,3 +1182,29 @@ telemetry and cold-storage resilience" handoff.
     for the cartridge generation, at `stage create` and `collection plan`. Planned spanning (the
     planner splits a unit's slices across a named set of cartridges) is designed once any unit
     passes about half a cartridge; #15's mechanism lets it arrive without breaking older readers.
+
+### Later on 2026-10-06 — the 1.1.0 re-pin and the restore rulings
+
+*Ruled by the CTO on 2026-10-06.*
+
+18. **The 1.1.0 RESTORE.sh re-pin is approved** (#396, #405, #412, #418 item 1, #384): forward-only
+    navigation; an empty `--to` unless `--overwrite`; dar's skip line fatal; the trailing-only
+    padding strip; streaming into dar with `-N` and the envelope's catalogue (`-A`), falling back
+    to slices on disk where dar is older than 2.7.21 and no matching catalogue exists (dar 2.7.13
+    loses a file's tail streaming without one); `--all`, repeated `--unit`, `--list`, `--path`;
+    `--find-envelope` listing every envelope; damage told apart from a wrong key; the `requires`
+    and magic checks with the seal found at end of data.
+19. **Several units restore to `--to/UNIT`**, in RESTORE.sh and in tapectl alike.
+20. **RESTORE.sh's "this tape needs a newer version" text is fixed** ("tapectl 1.1.0") and moves
+    by hand only when a new required feature arrives, so patch releases leave RESTORE.sh's bytes
+    alone.
+21. **gpg is detected and named, not required**: dar 2.7.x aborts under `-Q` without `gpg` on
+    PATH and has no option to skip it; RESTORE.sh checks before reading the tape and names the
+    package, and the heir documents list it.
+22. **The backup copy of each tenant envelope waits for 1.2.0**: it shifts every position after
+    the envelopes, through the build, the readers and the write session.
+23. **`tapectl restore volume <label> --to DIR [--unit …]`** restores several units from one
+    volume in one forward pass (#398), each to `DIR/<unit>`. **`--spool`** forces the
+    decrypt-to-disk path on `restore unit`/`restore volume`. **The plaintext sha256 is no longer
+    re-checked after decryption** in tapectl's restore: the ciphertext hash plus age's per-chunk
+    authentication cover the same bytes.
