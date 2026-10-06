@@ -3535,9 +3535,16 @@ fn record_write_bookkeeping(
         .filter_map(|e| e.on_tape_bytes(block_size))
         .sum::<u64>() as i64;
     let num_data_files = slice_entries.len() as i64;
+    // `first_write` is when the volume's first write BEGAN (issue #392):
+    // this runs after confirm, hours after the session started, and
+    // stamping it now made it the same instant as `last_write`.
+    // `last_write` stays the completion.
     conn.execute(
         "UPDATE volumes SET bytes_written = ?1, num_data_files = ?2, has_manifest = 1,
-         first_write = COALESCE(first_write, datetime('now')), last_write = datetime('now')
+         first_write = COALESCE(first_write,
+                                (SELECT MIN(started_at) FROM writes WHERE volume_id = ?3),
+                                datetime('now')),
+         last_write = datetime('now')
          WHERE id = ?3",
         params![bytes_written, num_data_files, volume_id],
     )?;
@@ -10558,6 +10565,49 @@ mod tests {
             "must sum block-PADDED (on-tape) slice bytes, not the true size_bytes"
         );
         assert_eq!(has_manifest, 1);
+    }
+
+    /// Issue #392: `first_write` was stamped when the write session
+    /// FINISHED, the same instant as `last_write`. It is when the volume's
+    /// first write began (`writes.started_at`); `last_write` stays the
+    /// completion.
+    #[test]
+    fn record_write_bookkeeping_dates_first_write_from_when_the_write_began() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
+             INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES ('u', 'unit', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (1, 1, 'full', 'current', '/x');
+             INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (1, 'staged', 1);
+             INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+                 VALUES ('BKTEST3', 'lto', 'lto0', 1000000, 'sealed');
+             INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, started_at)
+                 VALUES (1, 1, 1, 'completed', '2026-10-01 02:53:12');",
+        )
+        .unwrap();
+        let layout = Layout {
+            label: "BKTEST3".to_string(),
+            volume_uuid: "u".to_string(),
+            media_type: "LTO-6".to_string(),
+            block_size: 4096,
+            budget: CapacityBudget {
+                available_bytes: 0,
+                reserve_bytes: 0,
+            },
+            entries: vec![],
+        };
+        record_write_bookkeeping(&conn, 1, &layout, 4096).unwrap();
+        let (first, last): (String, String) = conn
+            .query_row(
+                "SELECT first_write, last_write FROM volumes WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(first, "2026-10-01 02:53:12");
+        assert_ne!(last, first, "last_write is the completion, stamped now");
     }
 
     #[test]

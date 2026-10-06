@@ -1186,6 +1186,10 @@ fn pending_text_lines(all: &[StagedSetRow]) -> Vec<String> {
 /// the never-verified discriminator: it is NOT NULL on every real session
 /// (schema default `'in_progress'`), so `None` here can only come from the
 /// LEFT JOIN finding no session row.
+///
+/// `(label, verify_type, outcome, completed_at, checked, passed, failed,
+/// started_at)` — `started_at` last (issue #392) so every older index is
+/// unchanged.
 type VerifyStatusRow = (
     String,
     Option<String>,
@@ -1194,6 +1198,7 @@ type VerifyStatusRow = (
     Option<i64>,
     Option<i64>,
     Option<i64>,
+    Option<String>,
 );
 
 /// The query behind `report verify-status`, split out from the printing
@@ -1218,7 +1223,7 @@ fn verify_status_rows(
     // this report is for.
     let mut sql = String::from(
         "SELECT v.label, vs.verify_type, vs.outcome, vs.completed_at,
-                vs.slices_checked, vs.slices_passed, vs.slices_failed
+                vs.slices_checked, vs.slices_passed, vs.slices_failed, vs.started_at
          FROM volumes v
          LEFT JOIN verification_sessions vs ON vs.volume_id = v.id
          WHERE 1=1",
@@ -1264,6 +1269,7 @@ fn verify_status_rows(
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1285,17 +1291,20 @@ fn verify_status_rows(
 /// repo have already outlived the behaviour they described (#209, #274,
 /// #281), so a string an acceptance criterion names gets a test.
 fn verify_status_row_text(row: &VerifyStatusRow) -> String {
-    let (label, vtype, outcome, completed, checked, passed, failed) = row;
+    let (label, vtype, outcome, completed, checked, passed, failed, started) = row;
     if outcome.is_none() {
         // The line that tells the operator what to verify next — spelled
         // out, not left as an empty column to interpret.
         return format!("  {label}: never verified");
     }
+    // Both ends, each named (issue #392): `volume info` printed the start
+    // and this the completion, unlabelled, so one verify showed two times.
     format!(
-        "  {label}: {} {} at {} ({}/{}/{} checked/passed/failed)",
+        "  {label}: {} {}, started {}, completed {} ({}/{}/{} checked/passed/failed)",
         vtype.as_deref().unwrap_or("?"),
         outcome.as_deref().unwrap_or("?"),
-        completed.as_deref().unwrap_or("?"),
+        started.as_deref().unwrap_or("?"),
+        completed.as_deref().unwrap_or("(not completed)"),
         checked.unwrap_or(0),
         passed.unwrap_or(0),
         failed.unwrap_or(0),
@@ -1303,12 +1312,13 @@ fn verify_status_row_text(row: &VerifyStatusRow) -> String {
 }
 
 fn verify_status_row_json(row: &VerifyStatusRow) -> serde_json::Value {
-    let (label, vtype, outcome, completed, checked, passed, failed) = row;
+    let (label, vtype, outcome, completed, checked, passed, failed, started) = row;
     serde_json::json!({
         "volume": label,
         "never_verified": outcome.is_none(),
         "type": vtype,
         "outcome": outcome,
+        "started": started,
         "completed": completed,
         "checked": checked,
         "passed": passed,
@@ -2552,8 +2562,16 @@ mod tests {
         /// proves it is a marked row, which is the half an operator reads.
         #[test]
         fn the_text_line_marks_never_verified_and_never_mislabels_a_verified_one() {
-            let never: VerifyStatusRow =
-                ("ZZZ-NEVER".to_string(), None, None, None, None, None, None);
+            let never: VerifyStatusRow = (
+                "ZZZ-NEVER".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
             let done: VerifyStatusRow = (
                 "AAA-VERIFIED".to_string(),
                 Some("full".to_string()),
@@ -2562,6 +2580,7 @@ mod tests {
                 Some(3),
                 Some(3),
                 Some(0),
+                Some("2019-12-31T14:00:00Z".to_string()),
             );
 
             assert_eq!(
@@ -2585,6 +2604,30 @@ mod tests {
                     "the verified line must carry its evidence ({needle}): {t}"
                 );
             }
+        }
+
+        /// Issue #392: `volume info` printed a verify's start and this report
+        /// its completion, unlabelled, so one verify showed two different
+        /// times. Both are printed here, each named.
+        #[test]
+        fn the_text_line_names_the_start_and_the_completion() {
+            let conn = crate::db::open_memory().unwrap();
+            seed_verified(&conn, "VOL-T", "2026-10-01 18:06:17");
+            conn.execute(
+                "UPDATE verification_sessions SET started_at = '2026-10-01 08:14:57'",
+                [],
+            )
+            .unwrap();
+            let rows = verify_status_rows(&conn, Some("VOL-T")).unwrap();
+            let t = verify_status_row_text(&rows[0]);
+            assert!(
+                t.contains("started 2026-10-01 08:14:57")
+                    && t.contains("completed 2026-10-01 18:06:17"),
+                "both times, each labelled: {t}"
+            );
+            let json = verify_status_row_json(&rows[0]);
+            assert_eq!(json["started"], "2026-10-01 08:14:57");
+            assert_eq!(json["completed"], "2026-10-01 18:06:17");
         }
 
         /// A volume with one completed, passed verification session.

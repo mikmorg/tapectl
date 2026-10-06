@@ -2348,9 +2348,14 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
             // cartridge_volumes/location row yet, and it must still be
             // inspectable (mirrors `cartridge info`'s LEFT JOIN for the
             // same reason).
+            // `first_write` is when the first write BEGAN (issue #392),
+            // read from the writes themselves: a volume written before that
+            // fix stored its first write's completion there instead.
             "SELECT v.id, v.status, v.observed_condition, v.backend_type, v.backend_name,
                     v.media_type, v.capacity_bytes, v.bytes_written, v.created_at,
-                    v.first_write, v.last_write, v.notes, l.name, c.barcode, c.serial_number
+                    COALESCE((SELECT MIN(w.started_at) FROM writes w WHERE w.volume_id = v.id),
+                             v.first_write),
+                    v.last_write, v.notes, l.name, c.barcode, c.serial_number
              FROM volumes v
              LEFT JOIN locations l ON l.id = v.location_id
              LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
@@ -2562,6 +2567,41 @@ fn render_write_history(writes: &[WriteRow]) -> String {
     out
 }
 
+/// `volume info`'s two write-date lines (issue #392): when the first write
+/// began and when the last one completed, each line saying which.
+fn render_write_span(first_write: Option<&str>, last_write: Option<&str>) -> String {
+    let first = first_write
+        .map(|t| format!("{t} (started)"))
+        .unwrap_or_else(|| "(never written)".to_string());
+    let last = last_write
+        .map(|t| format!("{t} (completed)"))
+        .unwrap_or_else(|| "(never written)".to_string());
+    format!("  First write: {first}\n  Last write:  {last}\n")
+}
+
+/// `volume info`'s verification-history section, one line per session.
+/// Both ends of each verify are printed and named (issue #392): this showed
+/// the start alone while `report verify-status` showed the completion, so
+/// one verify read as two different times.
+fn render_verification_history(verifications: &[VerificationRow]) -> String {
+    if verifications.is_empty() {
+        return "Verification history: never verified\n".to_string();
+    }
+    let mut out = String::from("Verification history:\n");
+    for v in verifications {
+        out.push_str(&format!(
+            "    [{}] {}: started {}, completed {} ({}/{} slices passed)\n",
+            v.verify_type,
+            v.outcome,
+            v.started_at,
+            v.completed_at.as_deref().unwrap_or("(not completed)"),
+            v.slices_passed,
+            v.slices_checked,
+        ));
+    }
+    out
+}
+
 fn print_volume_info(info: &VolumeInfo) {
     println!("Volume: {}", info.label);
     println!("  Status:      {}", info.status);
@@ -2601,13 +2641,9 @@ fn print_volume_info(info: &VolumeInfo) {
         info.location.as_deref().unwrap_or("(not placed)")
     );
     println!("  Created:     {}", info.created_at);
-    println!(
-        "  First write: {}",
-        info.first_write.as_deref().unwrap_or("(never written)")
-    );
-    println!(
-        "  Last write:  {}",
-        info.last_write.as_deref().unwrap_or("(never written)")
+    print!(
+        "{}",
+        render_write_span(info.first_write.as_deref(), info.last_write.as_deref())
     );
     if let Some(notes) = &info.notes {
         println!("  Notes:       {notes}");
@@ -2650,17 +2686,7 @@ fn print_volume_info(info: &VolumeInfo) {
     print!("{}", render_write_history(&info.writes));
 
     println!();
-    if info.verifications.is_empty() {
-        println!("Verification history: never verified");
-    } else {
-        println!("Verification history:");
-        for v in &info.verifications {
-            println!(
-                "    {} [{}]: {} ({}/{} slices passed)",
-                v.started_at, v.verify_type, v.outcome, v.slices_passed, v.slices_checked,
-            );
-        }
-    }
+    print!("{}", render_verification_history(&info.verifications));
 
     println!();
     if info.deposits.is_empty() {
@@ -3756,6 +3782,69 @@ mod tests {
             let info = volume_info(&conn, "L6-0003", false).unwrap();
             assert_eq!(info.deposits.len(), 1);
             assert_eq!(info.deposits[0].location, "glacier");
+        }
+
+        /// Issue #392: "First write" and "Last write" both showed when the
+        /// write session FINISHED (the bookkeeping stamps both at the end),
+        /// so a write that ran from 02:53 to 18:06 showed 18:06 twice. First
+        /// write is when the first write began — from `writes.started_at`,
+        /// which also corrects a row stamped before this was fixed — and
+        /// each line says which end it is.
+        #[test]
+        fn info_first_write_is_when_the_first_write_began() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute_batch(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
+                 INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                     VALUES ('u', 'unit', 1, 'mtime_size', 1, 'active');
+                 INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (1, 1, 'full', 'current', '/x');
+                 INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (1, 'staged', 1);
+                 INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, first_write, last_write)
+                     VALUES ('L6-T', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                             '2026-10-01 18:06:17', '2026-10-01 18:06:17');
+                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status,
+                                     started_at, completed_at)
+                     VALUES (1, 1, 1, 'completed', '2026-10-01 02:53:12',
+                             '2026-10-01 18:06:17');",
+            )
+            .unwrap();
+            let info = volume_info(&conn, "L6-T", false).unwrap();
+            assert_eq!(info.first_write.as_deref(), Some("2026-10-01 02:53:12"));
+            assert_eq!(info.last_write.as_deref(), Some("2026-10-01 18:06:17"));
+            let text = render_write_span(info.first_write.as_deref(), info.last_write.as_deref());
+            assert!(
+                text.contains("First write: 2026-10-01 02:53:12 (started)")
+                    && text.contains("Last write:  2026-10-01 18:06:17 (completed)"),
+                "{text}"
+            );
+            assert!(render_write_span(None, None).contains("First write: (never written)"));
+        }
+
+        /// Issue #392: the verification history printed a verify's START,
+        /// unlabelled, while `report verify-status` printed its completion.
+        #[test]
+        fn verification_history_names_the_start_and_the_completion() {
+            let rows = [VerificationRow {
+                started_at: "2026-10-01 08:14:57".into(),
+                completed_at: Some("2026-10-01 18:06:17".into()),
+                verify_type: "full".into(),
+                outcome: "passed".into(),
+                slices_checked: 27,
+                slices_passed: 27,
+                slices_failed: 0,
+            }];
+            let text = render_verification_history(&rows);
+            assert!(
+                text.contains("started 2026-10-01 08:14:57")
+                    && text.contains("completed 2026-10-01 18:06:17"),
+                "{text}"
+            );
+            assert_eq!(
+                render_verification_history(&[]),
+                "Verification history: never verified\n"
+            );
         }
 
         /// Rule #8: `volume info` summarises by default (the design probes

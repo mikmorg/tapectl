@@ -353,8 +353,8 @@ Volume: L8-0001
                serial E01001L8_1775794348
   Location:    (not placed)
   Created:     2026-09-29 08:19:59
-  First write: 2026-09-29 08:20:01
-  Last write:  2026-09-29 08:20:01
+  First write: 2026-09-29 08:20:01 (started)
+  Last write:  2026-09-29 08:20:01 (completed)
 
 Units carried: 4 (1.7 MiB across 2 tenant(s), 2026-09-29 08:19:50)
     family/photos/2019-italy v1 (family) — 1.1 MiB
@@ -369,8 +369,8 @@ Writes:
     family/letters v1: completed (2026-09-29 08:20:01)
 
 Verification history:
-    2026-09-29 08:20:02 [full]: passed (13/13 slices passed)
-    2026-09-29 08:20:01 [full]: passed (13/13 slices passed)
+    [full] passed: started 2026-09-29 08:20:02, completed 2026-09-29 08:20:02 (13/13 slices passed)
+    [full] passed: started 2026-09-29 08:20:01, completed 2026-09-29 08:20:01 (13/13 slices passed)
 
 Warehouse deposits: none
 ```

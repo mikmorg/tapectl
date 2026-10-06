@@ -1133,6 +1133,10 @@ and `dirty_on_metadata_change`, `key import --reactivate` prints
 `version` (the version it compared against) and
 `newer_version_without_checksums` (`null` unless a newer version is not yet
 staged).
+`report verify-status` gains `started` beside `completed`, and its text line
+prints both, each named. `volume info`'s `first_write` is when the volume's
+first write began (it was the time that write finished, the same as
+`last_write`), for volumes written before this change too.
 
 ## Warehouse Copies (Cold Cloud)
 
@@ -1548,9 +1552,9 @@ verified twice appears twice. Judge each volume by its newest line:
 
 ```text
 $ tapectl report verify-status
-  L8-0001: full passed at 2026-09-28 23:14:34 (13/13/0 checked/passed/failed)
-  L8-0001: full passed at 2026-09-28 23:14:35 (13/13/0 checked/passed/failed)
-  L8-0002: full passed at 2026-09-28 23:14:39 (13/13/0 checked/passed/failed)
+  L8-0001: full passed, started 2026-09-28 23:14:34, completed 2026-09-28 23:14:34 (13/13/0 checked/passed/failed)
+  L8-0001: full passed, started 2026-09-28 23:14:35, completed 2026-09-28 23:14:35 (13/13/0 checked/passed/failed)
+  L8-0002: full passed, started 2026-09-28 23:14:39, completed 2026-09-28 23:14:39 (13/13/0 checked/passed/failed)
 ```
 
 Pick the N volumes whose newest pass is oldest, such that **every volume gets
