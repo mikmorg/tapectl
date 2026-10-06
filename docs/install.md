@@ -174,6 +174,7 @@ archive"). For the service user that is **`/var/lib/tapectl/.tapectl`**, mode
 ├── stage-reports/       stage reports: one text file per stage set (slice sizes and hashes)
 ├── staging/             created 0700 by init as the default [staging] directory; stays empty once step 7 points staging elsewhere
 ├── logs/                created by ensure_dirs; may stay empty
+├── tmp/                 0700: a stage's dar slice template and a write's catalog.db, each removed once used (never under staging)
 ├── locks/               stage-<id>.lock: one lockfile per stage set, held while its stage create runs (`staging clean` reclaims them)
 ├── config.toml.pre-rename-<stamp>   only after the pre-step-1 check renamed old [defaults] keys (§6)
 └── config.toml.superseded-<stamp>   only after step 7 regenerated a config this version could not load

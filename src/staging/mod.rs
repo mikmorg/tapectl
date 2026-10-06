@@ -720,10 +720,7 @@ fn stage_create_inner(
     // The slice header is dar's own: from a tiny archive of an empty
     // directory at the same `-s`, made in the tapectl home, never staging.
     let template = {
-        let work = tempfile::Builder::new()
-            .prefix(".dar-slice-template-")
-            .tempdir_in(&paths.home)
-            .map_err(|e| staging_io_error("cannot make a work directory in", &paths.home, e))?;
+        let work = home_work_dir(paths, ".dar-slice-template-")?;
         dar::slice::template(&config.dar.binary, &slice_size, work.path())?
     };
 
@@ -1066,6 +1063,21 @@ pub(crate) fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64
 /// `_s10.1.dar`.
 pub(crate) fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
     format!("{}.", archive_base_name(unit_uuid, version, stage_set_id))
+}
+
+/// A fresh work directory under `<home>/tmp` (0700), removed when the
+/// returned value drops — for the plaintext a stage or a write needs for a
+/// moment (dar's slice template, the write's `catalog.db`), which must not
+/// go under staging (ADR-0012 2026-10-06 item 4) nor to a world-readable
+/// `/tmp`.
+pub(crate) fn home_work_dir(paths: &TapectlPaths, prefix: &str) -> Result<tempfile::TempDir> {
+    let tmp = paths.home.join("tmp");
+    fs::create_dir_all(&tmp).map_err(|e| staging_io_error("cannot create", &tmp, e))?;
+    crate::config::secure_path(&tmp, 0o700);
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(&tmp)
+        .map_err(|e| staging_io_error("cannot make a work directory in", &tmp, e))
 }
 
 /// What a stop during the archive pass says (issue #404).

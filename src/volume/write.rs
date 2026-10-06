@@ -227,7 +227,7 @@ fn volume_init_contacted<'c>(
 ) -> Result<i64> {
     // Creation-time label validation (issue #103). A label reaches the
     // filesystem too: `volume_read_slices` below joins
-    // `{staging}/clone-{from_label}-{unit_name}`. Same defect, third entry
+    // `{staging}/clone-{from_label}-{unit_uuid}`. Same defect, third entry
     // point — this codebase's recurring lesson is that one of these is never
     // the only one.
     crate::naming::validate_volume_label(label)?;
@@ -1021,14 +1021,9 @@ pub fn volume_write(
 #[allow(clippy::too_many_arguments)]
 fn volume_write_contacted<'c>(
     conn: &'c Connection,
-    // Unused now that backend resolution goes through `resolve_lto_backend`
-    // (ADR-0010) rather than `no_lto_backend_error(Some(paths))`. Kept as a
-    // parameter (not removed) since it is public API called positionally
-    // from `cli::volume`, from `collection::batch` and directly from tests.
-    // The ADR's cartridge binding turned out not to need it: every message
-    // it emits names a barcode or a medium serial, neither of which lives
-    // under the tapectl home.
-    _paths: &TapectlPaths,
+    // The tapectl home: where the write's plaintext `catalog.db` is built
+    // (ADR-0012 2026-10-06 item 4), never under staging.
+    paths: &TapectlPaths,
     config: &Config,
     label: &str,
     device: &str,
@@ -1264,6 +1259,7 @@ fn volume_write_contacted<'c>(
 
     let result = volume_write_in_contact(
         conn,
+        paths,
         config,
         label,
         device,
@@ -1398,6 +1394,7 @@ struct StagedWrite<'a> {
 #[allow(clippy::too_many_arguments)]
 fn volume_write_in_contact<'c>(
     conn: &'c Connection,
+    paths: &TapectlPaths,
     config: &Config,
     label: &str,
     device: &str,
@@ -1519,9 +1516,16 @@ fn volume_write_in_contact<'c>(
     // rows below, and nothing else is staged at this instant (the
     // unresolved-write-session check above refuses a second concurrent
     // write). `build()` appends it to the OPERATOR envelope only.
+    //
+    // It is plaintext — every path, size and hash of the write — so it is
+    // built in the tapectl home, read once by `build()` into the encrypted
+    // operator envelopes, and removed when `catalog_work` drops after
+    // `build()`: never under staging (ADR-0012 2026-10-06 item 4), where it
+    // used to stay in the session directory until `staging clean`.
     let phase = progress::phase("build", None);
     fs::create_dir_all(&session_dir)?;
-    let catalog_db_path = session_dir.join("catalog_snapshot.db");
+    let catalog_work = crate::staging::home_work_dir(paths, ".catalog-snapshot-")?;
+    let catalog_db_path = catalog_work.path().join("catalog_snapshot.db");
     crate::db::catalog_snapshot::build_catalog_snapshot(conn, &stage_set_ids, &catalog_db_path)?;
 
     let inputs = BuildInputs {
@@ -1553,6 +1557,7 @@ fn volume_write_in_contact<'c>(
     };
 
     let built = build::build(&inputs, &session_dir)?;
+    drop(catalog_work);
     phase.done();
     // Snapshot the Layout before the typestate chain consumes `built` — the
     // terminal `SealedSession` only exposes `volume_id`/`label`, not the
@@ -4565,8 +4570,10 @@ fn read_slices_contacted(
 
     // Read encrypted slices from source tape to staging
     let staging_dir = &config.staging.directory;
+    // Named by the unit's uuid: a unit name is plaintext metadata, and the
+    // staging device holds none (ADR-0012 2026-10-06 item 4).
     let clone_dir =
-        std::path::Path::new(staging_dir).join(format!("clone-{from_label}-{unit_name}"));
+        std::path::Path::new(staging_dir).join(format!("clone-{from_label}-{}", unit.uuid));
     fs::create_dir_all(&clone_dir)?;
 
     let mut total_bytes: i64 = 0;
@@ -8059,6 +8066,59 @@ mod tests {
         assert!(!staging_path.is_empty());
         let on_disk = fs::read(&staging_path).unwrap();
         assert_eq!(on_disk, data, "staged bytes must be the true plaintext");
+    }
+
+    /// ADR-0012 2026-10-06 item 4: the directory `read-slices` copies a
+    /// unit's slices into is named by the unit's uuid, not its name — the
+    /// staging device holds no unit names (a directory name is plaintext
+    /// on it).
+    #[test]
+    fn read_slices_names_its_directory_by_unit_uuid_not_name() {
+        let conn = crate::db::open_memory().unwrap();
+        let data = b"read_slices directory-name fixture, repeated. ".repeat(10);
+        let slice_id = seed_one_slice_fixture(
+            &conn,
+            "RSUUID",
+            "secret-name",
+            4,
+            &data,
+            "completed",
+            "staged",
+        );
+        let uuid = "0123456789abcdef0123456789abcdef";
+        conn.execute(
+            "UPDATE units SET uuid = ?1 WHERE name = 'secret-name'",
+            params![uuid],
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().to_string_lossy().into_owned();
+        let mut store = mem_store_with_slice_at(4, &data);
+        read_slices(
+            &conn,
+            &config,
+            "RSUUID",
+            "secret-name",
+            &mut store,
+            site(Operation::VolumeReadSlices),
+        )
+        .unwrap();
+
+        let staging_path: String = conn
+            .query_row(
+                "SELECT staging_path FROM stage_slices WHERE id = ?1",
+                params![slice_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let dir = Path::new(&staging_path).parent().unwrap();
+        assert_eq!(dir, tmp.path().join(format!("clone-RSUUID-{uuid}")));
+        assert!(
+            !staging_path.contains("secret-name"),
+            "no unit name under staging: {staging_path}"
+        );
     }
 
     /// Issue #404: a signal stops `read-slices` between slices with a
@@ -14044,6 +14104,75 @@ mod tests {
                 1,
                 "one feed ratio, from this sweep's page 0x0c (issue #338)"
             );
+        }
+
+        /// ADR-0012 2026-10-06 item 4 (issue #370): the filtered
+        /// `catalog.db` a write puts in its operator envelopes is plaintext
+        /// (paths, sizes, hashes), so it is built in the tapectl home and
+        /// removed once the envelopes are built — never under staging, where
+        /// it used to sit in the session directory until `staging clean`.
+        #[test]
+        fn a_write_builds_its_catalog_database_outside_staging() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-NODB", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let staging = tmp.path().join("staging");
+            fs::create_dir_all(&staging).unwrap();
+            config.staging.directory = staging.to_string_lossy().into_owned();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let mut store = MemStore::new(512 * 1024);
+
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-NODB",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            slot.finish_result(r)
+                .expect("a write to a blank MemStore completes");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "sealed", "positive control: the write completed");
+
+            let files: Vec<PathBuf> = walkdir::WalkDir::new(&staging)
+                .into_iter()
+                .flatten()
+                .filter(|e| e.file_type().is_file())
+                .map(|e| e.into_path())
+                .collect();
+            assert!(
+                files
+                    .iter()
+                    .any(|f| f.to_string_lossy().contains("/sessions/")),
+                "positive control: the session's files are under staging: {files:?}"
+            );
+            let dbs: Vec<&PathBuf> = files
+                .iter()
+                .filter(|f| f.extension().is_some_and(|e| e == "db"))
+                .collect();
+            assert!(dbs.is_empty(), "no database under staging: {dbs:?}");
+            let left: Vec<PathBuf> = walkdir::WalkDir::new(&paths.home)
+                .into_iter()
+                .flatten()
+                .filter(|e| e.file_type().is_file())
+                .map(|e| e.into_path())
+                .filter(|p| p.to_string_lossy().contains("catalog_snapshot"))
+                .collect();
+            assert!(left.is_empty(), "the home's copy is removed: {left:?}");
         }
 
         /// Issue #386: a MemStore write inside a progress session records
