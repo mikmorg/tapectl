@@ -242,3 +242,20 @@ pub(crate) const AWK_UNITS_TABLE: &str = r##"
       }
     }
   "##;
+
+/// The `uuid` of one version of a unit in an envelope manifest (issue #418):
+/// the envelope's dar catalogue for it is `catalogs/<first 8 of uuid>_v<N>`,
+/// which `--list` and `--path` read. Matches `name` and `snapshot_version`
+/// only in the `[[units]]` head, as `AWK_SELECT_VERSION` does (#135).
+pub(crate) const AWK_UNIT_UUID: &str = r##"
+    function done_head() {
+      if (hit && v == want + 0 && id != "") { print id; found = 1 }
+      hit = 0; v = -1; id = ""
+    }
+    /^\[\[units\]\]/ { if (!found) done_head(); in_head = 1; next }
+    /^\[/ { if (in_head && !found) done_head(); in_head = 0; next }
+    in_head && /^name = / { x = $3; gsub(/"/, "", x); hit = (x == unit) }
+    in_head && /^uuid = / { id = $3; gsub(/"/, "", id) }
+    in_head && /^snapshot_version = / { v = $3 + 0 }
+    END { if (in_head && !found) done_head() }
+  "##;

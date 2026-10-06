@@ -1456,3 +1456,91 @@ fn repeated_unit_restores_those_units_across_tenants_with_escrow() {
     assert!(!dest.join("photos/2019").exists(), "{text}");
     assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
 }
+
+// ---- #418 R1 / #412 item 2: the envelope's dar catalogues, read ----
+
+/// --list prints a unit's files from the dar catalogue its envelope carries
+/// (catalogs/<uuid8>_v<version>.1.dar), reading no data slice at all.
+#[test]
+fn list_shows_a_units_files_from_the_envelope_catalogue_without_reading_slices() {
+    let h = Heir::new();
+    let photos = unit("photos/2019");
+    let (code, text) = h.run(&["--list", "--key", &h.key("alice"), "--unit", "photos/2019"]);
+    assert_eq!(code, 0, "{text}");
+    for f in ["file0.bin", "file4.bin", "sub/note.txt"] {
+        assert!(text.contains(f), "{f} must be listed:\n{text}");
+    }
+    assert!(
+        text.contains("catalogs/11111111_v2"),
+        "names the catalogue:\n{text}"
+    );
+    let slices = reads(&h)
+        .into_iter()
+        .filter(|p| photos.positions.contains(p))
+        .count();
+    assert_eq!(slices, 0, "no data slice is read:\n{:#?}", h.ops());
+}
+
+/// --restore --path restores one file reading only the slices that hold it
+/// (and the directories above it) plus the last, which carries dar's own
+/// catalogue: the catalogue in the envelope says which (`-T slice`).
+#[test]
+fn path_restores_one_file_reading_only_its_slices_and_the_last() {
+    let h = Heir::new();
+    let photos = unit("photos/2019");
+    let dest = h.dir.join("one");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--path",
+        "sub/note.txt",
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        std::fs::read(dest.join("sub/note.txt")).unwrap(),
+        std::fs::read(photos.src.join("sub/note.txt")).unwrap()
+    );
+    assert!(!dest.join("file0.bin").exists(), "only the path asked for");
+    let read: Vec<i64> = reads(&h)
+        .into_iter()
+        .filter(|p| photos.positions.contains(p))
+        .collect();
+    assert!(
+        read.len() < photos.positions.len(),
+        "fewer slices than the whole unit: {read:?} of {:?}",
+        photos.positions
+    );
+    assert_eq!(
+        read.last(),
+        photos.positions.last(),
+        "the last slice is read: {read:?}"
+    );
+    assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
+
+    // A path the catalogue does not hold is refused before any slice is read.
+    let h = Heir::new();
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--path",
+        "no/such/file",
+        "--to",
+        &h.sub("none"),
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("no/such/file"), "{text}");
+    assert!(text.contains("--list"), "points at --list:\n{text}");
+    let slices = reads(&h)
+        .into_iter()
+        .filter(|p| photos.positions.contains(p))
+        .count();
+    assert_eq!(slices, 0, "{:#?}", h.ops());
+}

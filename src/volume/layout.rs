@@ -432,7 +432,7 @@ padding can be defeated without knowing the exact size:
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
         AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
-        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST,
+        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
     let script = r#"#!/usr/bin/env bash
@@ -449,7 +449,13 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #   ./RESTORE.sh --restore --key KEYFILE [--key K2 ...] --to DIR
 #                [--unit U [--unit U2 ...] | --all] [--version N]
 #                [--no-space-check] [--overwrite]
+#   ./RESTORE.sh --restore --key KEYFILE --to DIR --unit U --path P [--path P2 ...]
+#                [--version N] [--scratch DIR]                One file or folder
+#   ./RESTORE.sh --list --key KEYFILE [--unit U] [--version N]  A unit's files
 #
+# --list and --path read the dar catalogue each envelope carries
+# (catalogs/<uuid8>_v<version>.1.dar): --list reads no data slice at all, and
+# --path reads only the slices that hold what it asks for, plus the last.
 # --to must be empty or new: dar keeps a file that is already there and
 # reports success, so a restore over an earlier one cannot be trusted.
 # --overwrite replaces such files instead, to finish a restore that stopped.
@@ -1765,10 +1771,11 @@ pick_slices() { # <manifest> <unit> <out> [version]
 }
 
 do_restore() {
-  local destdir=$1 want_version=${2:-}
+  local destdir=$1 want_version=${2:-} scratch_parent=${3:-}
 
-  check_destination "$destdir" "$destdir"
-  mkdir -p "$destdir"
+  [ -n "$scratch_parent" ] || scratch_parent=$destdir
+  check_destination "$destdir" "$scratch_parent"
+  mkdir -p "$destdir" "$scratch_parent"
   set_age_ids
 
   establish_files
@@ -1804,6 +1811,17 @@ do_restore() {
   fi
   if [ -n "$want_version" ] && [ ${#targets[@]} -gt 1 ]; then
     die "--version applies to one unit; give a single --unit with it"
+  fi
+  if [ ${#RESTORE_PATHS[@]} -gt 0 ]; then
+    [ ${#targets[@]} -eq 1 ] || die "--path needs exactly one unit: give one --unit with it"
+    info "Parsing slices for unit: ${targets[0]}"
+    pick_slices "$manifest" "${targets[0]}" "$WORK/slices.0" "$want_version"
+    info "Restoring from '${targets[0]}' snapshot version ${PICKED_VERSION:-unknown}"
+    restore_paths "$WORK/slices.0" "$CHOSEN_ENV" "${targets[0]}" "$PICKED_VERSION" "$destdir" "$scratch_parent"
+    echo ""
+    info "RESTORE COMPLETE"
+    info "${RESTORE_PATHS[*]} of '${targets[0]}' restored to: $destdir"
+    return 0
   fi
 
   # Step 3: each unit's slices, checked against the file map, before any is
@@ -1847,6 +1865,120 @@ do_restore() {
   done
 }
 
+# ---- the envelope's dar catalogues (--list, --path; #418) ----
+
+# Every envelope carries, under catalogs/, the isolated dar catalogue of each
+# unit it lists, named <first 8 of the unit uuid>_v<snapshot version>. With
+# it dar lists a unit's files, and says which slice holds each, without
+# reading the tape. Prints the catalogue's base path, or dies.
+catalogue_for() { # <envelope dir> <unit> <version>
+  local env=$1 unit=$2 ver=$3 uuid base
+  uuid=$(awk -v unit="$unit" -v want="$ver" '__AWK_UNIT_UUID__' "$env/MANIFEST.toml")
+  [ -n "$uuid" ] || die "the envelope lists no uuid for unit '$unit' version $ver"
+  base="$env/catalogs/${uuid:0:8}_v$ver"
+  [ -f "$base.1.dar" ] || die "the envelope carries no dar catalogue for '$unit' version $ver
+       (expected catalogs/${uuid:0:8}_v$ver.1.dar). --restore without --path
+       restores the whole unit, which needs no catalogue."
+  echo "$base"
+}
+
+# The units --list and --path work on: those named, else the envelope's only
+# one, else (for --list) every unit in it.
+units_of_envelope() { # <manifest>
+  awk '__AWK_UNIT_LIST__' "$1"
+}
+
+do_list() {
+  local want_version=${1:-} manifest u base
+  set_age_ids
+  establish_files
+  walk_envelopes pick_for_restore
+  local wanted="${RESTORE_UNITS[*]-}"
+  [ -n "$CHOSEN_ENV" ] || die_no_envelope "${wanted// /, }"
+  info "Decrypted envelope at file $CHOSEN_POS"
+  info "  opened with key $CHOSEN_KEY"
+  manifest="$CHOSEN_ENV/MANIFEST.toml"
+  [ -f "$manifest" ] || die "envelope missing MANIFEST.toml"
+  local -a targets=()
+  if [ ${#RESTORE_UNITS[@]} -gt 0 ]; then
+    targets=("${RESTORE_UNITS[@]}")
+  else
+    while IFS= read -r u; do targets+=("$u"); done < <(units_of_envelope "$manifest")
+  fi
+  for u in "${targets[@]}"; do
+    pick_slices "$manifest" "$u" "$WORK/list.slices" "$want_version"
+    base=$(catalogue_for "$CHOSEN_ENV" "$u" "$PICKED_VERSION")
+    echo ""
+    echo "=== $u, snapshot version $PICKED_VERSION — catalogs/${base##*/} ==="
+    dar -l "$base" -N -Q || die "dar could not list the catalogue of '$u'"
+  done
+  echo ""
+  echo "To restore one of these, give its path as listed:"
+  echo "  $0 --restore $(keys_args) --unit UNIT --path PATH --to /your/destination"
+}
+
+# --restore --path: dar's catalogue says which slices hold each path and the
+# directories above it (dar -l -T slice); those, and the last slice, which
+# carries the archive's own catalogue, are read from the tape, checked,
+# decrypted into scratch, and dar extracts just the paths from them.
+RESTORE_PATHS=()
+restore_paths() { # <slices file> <envelope dir> <unit> <version> <destination> <scratch parent>
+  local list=$1 env=$2 unit=$3 ver=$4 destdir=$5 scr=$6 base p range lo hi last
+  local -a g=()
+  for p in "${RESTORE_PATHS[@]}"; do
+    p=${p#/}
+    p=${p#./}
+    g+=(-g "$p")
+  done
+  base=$(catalogue_for "$env" "$unit" "$ver")
+  dar -l "$base" -N -Q -Tslice "${g[@]}" >"$WORK/slicing.txt" 2>&1 ||
+    die "dar could not read the catalogue of '$unit': $(tail -n 3 "$WORK/slicing.txt")"
+  range=$(sed -n 's/.*slice range \[\([0-9-]*\)\].*/\1/p' "$WORK/slicing.txt" | head -n 1)
+  if [ -z "$range" ]; then
+    die "'$unit' version $ver holds nothing at: ${RESTORE_PATHS[*]}
+       A path is relative to the unit's root, exactly as --list prints it:
+         $0 --list $(keys_args) --unit '$unit'
+       No slice has been read."
+  fi
+  lo=${range%-*}
+  hi=${range#*-}
+  require_uint slice_range "$lo"
+  require_uint slice_range "$hi"
+  last=$(tail -n 1 "$list" | cut -d'|' -f1)
+  awk -F'|' -v lo="$lo" -v hi="$hi" -v last="$last" \
+    '($1 + 0 >= lo + 0 && $1 + 0 <= hi + 0) || $1 == last' "$list" >"$WORK/path.slices"
+  local total=0 n num tpos size sha
+  n=$(wc -l <"$WORK/path.slices")
+  while IFS='|' read -r num tpos size sha; do
+    total=$((total + size))
+  done <"$WORK/path.slices"
+  info "'${RESTORE_PATHS[*]}' is in slice(s) $lo-$hi of $last; reading $n of them"
+  check_space "$destdir" "$scr" "$total" "$total"
+  SCRATCH="$(mktemp -d "$scr/.tapectl-restore.XXXXXX")" ||
+    die "cannot create a scratch directory in $scr"
+  local actual i=0
+  while IFS='|' read -r num tpos size sha; do
+    i=$((i + 1))
+    info "Slice $num ($i/$n) — tape file $tpos"
+    read_tape_raw "$tpos" "$SCRATCH/slice.enc"
+    truncate -s "$size" "$SCRATCH/slice.enc"
+    actual=$(sha256sum "$SCRATCH/slice.enc" | awk '{print $1}')
+    [ "$actual" = "$sha" ] ||
+      die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${actual:0:16}…)"
+    info "  checksum verified against front index"
+    decrypt_slice "$SCRATCH/slice.enc" "$SCRATCH/restore.$num.dar" "$num"
+    rm -f "$SCRATCH/slice.enc"
+  done <"$WORK/path.slices"
+  local -a dar_opts=(-O -Q -N)
+  [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
+  info "Extracting ${RESTORE_PATHS[*]} to $destdir ..."
+  dar -x "$SCRATCH/restore" -R "$destdir" "${g[@]}" "${dar_opts[@]}" 2>&1 | tee "$WORK/extract.log" ||
+    die "dar extraction failed — dar's own message is above"
+  die_if_dar_skipped "$WORK/extract.log" "$destdir"
+  rm -rf "$SCRATCH"
+  SCRATCH=""
+}
+
 # ---- main ----
 
 case "${1:-}" in
@@ -1877,14 +2009,14 @@ case "${1:-}" in
 --restore)
   shift
   KEYS=()
-  dest="" want=""
+  dest="" want="" scratch=""
   # Every flag but the switches takes a value. `shift 2` on a TRAILING bare
   # flag fails because $# is 1, `set -e` fires, and the script exits 1 having
   # printed nothing at all — the usage check below is never reached. Check the
   # arity first and say which flag was short (#133).
   while [ $# -gt 0 ]; do
     case "$1" in
-    --key | --to | --unit | --version | --scratch)
+    --key | --to | --unit | --version | --scratch | --path)
       [ $# -ge 2 ] || die "$1 needs a value
 
        usage: $0 --restore --key KEYFILE --to DIR [--unit U | --all] [--version N]"
@@ -1893,7 +2025,8 @@ case "${1:-}" in
       --to) dest=$2 ;;
       --unit) RESTORE_UNITS+=("$2") ;;
       --version) want=$2 ;;
-      --scratch) die "--scratch is for --path; a full restore streams its slices and needs no scratch space" ;;
+      --scratch) scratch=$2 ;;
+      --path) RESTORE_PATHS+=("$2") ;;
       esac
       shift 2
       ;;
@@ -1917,9 +2050,37 @@ case "${1:-}" in
   if [ "$RESTORE_ALL" = 1 ] && [ ${#RESTORE_UNITS[@]} -gt 0 ]; then
     die "--all restores every unit; give it without --unit"
   fi
+  if [ -n "$scratch" ] && [ ${#RESTORE_PATHS[@]} -eq 0 ]; then
+    die "--scratch is for --path; a full restore streams its slices and needs no scratch space"
+  fi
   require_key_files
   [ -z "$want" ] || require_uint version "$want"
-  do_restore "$dest" "$want"
+  do_restore "$dest" "$want" "$scratch"
+  ;;
+--list)
+  shift
+  KEYS=()
+  want=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --key | --unit | --version)
+      [ $# -ge 2 ] || die "$1 needs a value
+
+       usage: $0 --list --key KEYFILE [--unit U] [--version N]"
+      case "$1" in
+      --key) KEYS+=("$2") ;;
+      --unit) RESTORE_UNITS+=("$2") ;;
+      --version) want=$2 ;;
+      esac
+      shift 2
+      ;;
+    *) die "unknown option: $1" ;;
+    esac
+  done
+  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --list --key KEYFILE [--unit U] [--version N]"
+  require_key_files
+  [ -z "$want" ] || require_uint version "$want"
+  do_list "$want"
   ;;
 --help | -h)
   echo "RESTORE.sh — Emergency restore for tapectl volume $LABEL (layout v2)"
@@ -1937,6 +2098,14 @@ case "${1:-}" in
   echo "      encrypted envelope manifest, so --info cannot report it."
   echo "      --all restores every unit of the envelope (--unit repeated, the"
   echo "      ones named), in one pass along the tape, each into --to/UNIT."
+  echo "  $0 --restore --key KEYFILE --to DIR --unit U --path P [--path P2 ...]"
+  echo "               [--version N] [--scratch DIR]"
+  echo "      Restore only P (a file or folder, as --list prints it), reading"
+  echo "      just the slices that hold it and the last. Those wait in a scratch"
+  echo "      directory inside --to, or in --scratch DIR."
+  echo "  $0 --list --key KEYFILE [--unit U] [--version N]"
+  echo "      A unit's files, from the dar catalogue in the envelope: no slice"
+  echo "      is read."
   echo ""
   echo "  --key may be repeated, and each key is tried on its own for the"
   echo "      envelope and for every slice: a key rotation between staging a"
@@ -1981,6 +2150,7 @@ esac
         .replace("__AWK_SELECT_VERSION__", AWK_SELECT_VERSION)
         .replace("__AWK_MT_POSITION__", AWK_MT_POSITION)
         .replace("__AWK_UNITS_TABLE__", AWK_UNITS_TABLE)
+        .replace("__AWK_UNIT_UUID__", AWK_UNIT_UUID)
         .replace("__LABEL__", label)
         .replace("__TOTAL_FILES__", &total_files.to_string());
 
@@ -2344,7 +2514,7 @@ mod tests {
     use super::*;
     use crate::volume::restore_script::{
         AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
-        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST,
+        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
     #[test]
@@ -3447,6 +3617,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
             ("AWK_MT_POSITION", AWK_MT_POSITION),
             ("AWK_UNITS_TABLE", AWK_UNITS_TABLE),
+            ("AWK_UNIT_UUID", AWK_UNIT_UUID),
         ] {
             assert!(
                 script.contains(fragment),
@@ -3483,6 +3654,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
             ("AWK_MT_POSITION", AWK_MT_POSITION),
             ("AWK_UNITS_TABLE", AWK_UNITS_TABLE),
+            ("AWK_UNIT_UUID", AWK_UNIT_UUID),
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");
         }
@@ -4740,7 +4912,10 @@ sha256_encrypted = \"bbb\"
         }];
         let s = generate_recovery_md("LAB01", "alice", &units);
         assert_eq!(s.matches("mt -f /dev/nst0 rewind").count(), 1, "{s}");
-        assert!(s.contains("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 10\n"), "{s}");
+        assert!(
+            s.contains("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 10\n"),
+            "{s}"
+        );
         // 11 follows 10 directly; 14 is two files further on.
         assert_eq!(s.matches("mt -f /dev/nst0 fsf 2\n").count(), 1, "{s}");
         assert_eq!(s.matches("mt -f /dev/nst0 fsf").count(), 2, "{s}");
