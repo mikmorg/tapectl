@@ -1700,6 +1700,10 @@ room:
 
 RESTORE.sh, the heir's path, always spools and asks for one slice more.
 
+There is no flag to choose. A restore streams exactly when the unit's
+catalogue files (`<home>/catalogs/<dir>/<name>.N.dar`, named by the stage set's
+`catalog_path`) are there, so moving them aside for one run makes it spool.
+
 ### A scratch directory already exists
 
 ```text

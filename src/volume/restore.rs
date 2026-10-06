@@ -313,6 +313,26 @@ fn preflight(
     scratch: &Path,
     options: &RestoreOptions,
 ) -> Result<()> {
+    let file_size = preflight_checks(conn, unit_name, selection, target, scratch, options)?;
+    if options.no_space_check {
+        info!("disk space not checked (--no-space-check)");
+        return Ok(());
+    }
+    check_restore_space(Path::new(target.destination()), scratch, plan, file_size)
+}
+
+/// [`preflight`] without the space check — the file, a leftover scratch
+/// directory, the destination — so a multi-unit restore can check the
+/// space of the whole set at once (issue #398). Returns the size of the
+/// `restore file` file (`None` for a unit).
+fn preflight_checks(
+    conn: &Connection,
+    unit_name: &str,
+    selection: &RestoreSelection,
+    target: RestoreTarget<'_>,
+    scratch: &Path,
+    options: &RestoreOptions,
+) -> Result<Option<i64>> {
     let destination = Path::new(target.destination());
 
     // `restore file`: the path must be one this version archived. The
@@ -369,12 +389,7 @@ fn preflight(
             }
         }
     }
-
-    if options.no_space_check {
-        info!("disk space not checked (--no-space-check)");
-        return Ok(());
-    }
-    check_restore_space(destination, scratch, plan, file_size)
+    Ok(file_size)
 }
 
 /// The size `files` records for `file_path` in the selected version, after
@@ -485,19 +500,6 @@ fn check_restore_space(
     plan: &RestorePlan,
     file_size: Option<i64>,
 ) -> Result<()> {
-    let read: i64 = plan
-        .positions
-        .iter()
-        .map(|wp| wp.encrypted_bytes.max(0))
-        .sum();
-    let spooled = if plan.stream.is_some() { 0 } else { read };
-    let scratch_root = scratch.parent().unwrap_or(scratch);
-    let (scratch_need, dest_need) = match file_size {
-        // Extracted into scratch, then renamed into place (or copied, when
-        // the two are on different filesystems).
-        Some(file) => (spooled + file, file),
-        None => (spooled, read),
-    };
     let why = if plan.stream.is_some() {
         "A restore streams its slices into dar, so it needs about the unit's size in --to."
     } else if file_size.is_some() {
@@ -509,6 +511,41 @@ fn check_restore_space(
          dar is 2.7.9 or newer), so with the scratch space and --to on one disk it needs the \
          unit's size about twice over."
     };
+    match space_needs(destination, scratch, plan, file_size) {
+        Some(needs) => require_space(&needs, why),
+        None => Ok(()),
+    }
+}
+
+/// Disk a restore takes on one filesystem: `kept` stays (the restored
+/// files), `transient` is gone when the restore ends (its scratch).
+#[derive(Debug, Clone)]
+struct SpaceNeed {
+    /// An existing directory on the filesystem — where free space is asked.
+    dir: PathBuf,
+    /// Its `st_dev`; `None` when it cannot be read (then counted with every
+    /// other unknown: over-ask, never under-ask).
+    dev: Option<u64>,
+    kept: i64,
+    transient: i64,
+}
+
+/// What one restore of `plan` needs, per filesystem ([`check_restore_space`]
+/// says what and why). `None` when the filesystems cannot be found: then
+/// the check is skipped, with a warning.
+fn space_needs(
+    destination: &Path,
+    scratch: &Path,
+    plan: &RestorePlan,
+    file_size: Option<i64>,
+) -> Option<Vec<SpaceNeed>> {
+    let read: i64 = plan
+        .positions
+        .iter()
+        .map(|wp| wp.encrypted_bytes.max(0))
+        .sum();
+    let spooled = if plan.stream.is_some() { 0 } else { read };
+    let scratch_root = scratch.parent().unwrap_or(scratch);
     let (Some(scratch_fs), Some(dest_fs)) = (existing(scratch_root), existing(destination)) else {
         warn!(
             destination = %destination.display(),
@@ -516,22 +553,61 @@ fn check_restore_space(
             "cannot find the filesystem a restore would write to; continuing without the space \
              check"
         );
-        return Ok(());
+        return None;
     };
-    let same_fs = match (fs::metadata(&scratch_fs), fs::metadata(&dest_fs)) {
-        (Ok(a), Ok(b)) => {
-            std::os::unix::fs::MetadataExt::dev(&a) == std::os::unix::fs::MetadataExt::dev(&b)
+    let dev = |dir: &Path| {
+        fs::metadata(dir)
+            .ok()
+            .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
+    };
+    let (scratch_dev, dest_dev) = (dev(&scratch_fs), dev(&dest_fs));
+    // One filesystem unless proven otherwise: over-ask, never under-ask.
+    let same_fs = scratch_dev.is_none() || dest_dev.is_none() || scratch_dev == dest_dev;
+    let need = |dir: &PathBuf, dev: Option<u64>, kept: i64, transient: i64| SpaceNeed {
+        dir: dir.clone(),
+        dev,
+        kept,
+        transient,
+    };
+    Some(match (file_size, same_fs) {
+        // `restore file` extracts into scratch, then renames into place,
+        // which costs nothing more on one filesystem.
+        (Some(file), true) => vec![need(&dest_fs, dest_dev, 0, spooled + file)],
+        // ...and is a copy across two.
+        (Some(file), false) => vec![
+            need(&scratch_fs, scratch_dev, 0, spooled + file),
+            need(&dest_fs, dest_dev, file, 0),
+        ],
+        (None, true) => vec![need(&dest_fs, dest_dev, read, spooled)],
+        (None, false) => vec![
+            need(&scratch_fs, scratch_dev, 0, spooled),
+            need(&dest_fs, dest_dev, read, 0),
+        ],
+    })
+}
+
+/// Refuse when a filesystem cannot hold `needs`: per filesystem, everything
+/// kept plus the largest transient — restores of a set run one after
+/// another, each removing its scratch before the next (issue #398).
+fn require_space(needs: &[SpaceNeed], why: &str) -> Result<()> {
+    let mut by_fs: Vec<(Option<u64>, PathBuf, i64, i64)> = Vec::new();
+    for n in needs {
+        match by_fs.iter_mut().find(|(dev, ..)| *dev == n.dev) {
+            Some((_, _, kept, transient)) => {
+                *kept += n.kept;
+                *transient = (*transient).max(n.transient);
+            }
+            None => by_fs.push((n.dev, n.dir.clone(), n.kept, n.transient)),
         }
-        // One filesystem unless proven otherwise: over-ask, never under-ask.
-        _ => true,
-    };
-    let need = |dir: &Path, bytes: i64| -> Result<()> {
-        let Some(free) = restore_free_bytes(dir) else {
+    }
+    for (_, dir, kept, transient) in by_fs {
+        let bytes = kept + transient;
+        let Some(free) = restore_free_bytes(&dir) else {
             warn!(
                 path = %dir.display(),
                 "cannot measure free disk space; continuing without the check"
             );
-            return Ok(());
+            continue;
         };
         info!(
             path = %dir.display(),
@@ -539,31 +615,20 @@ fn check_restore_space(
             free = %crate::util::format_bytes_binary(free),
             "restore disk space"
         );
-        if free >= bytes {
-            return Ok(());
+        if free < bytes {
+            return Err(TapectlError::Other(format!(
+                "not enough disk space in {} for this restore: it needs about {}, and {} is \
+                 free. Nothing was read from tape. {why} Free space there, choose a larger disk \
+                 with --to, or put any decrypted slices on another disk with --scratch DIR. \
+                 (--no-space-check skips this check, for a filesystem that holds more than it \
+                 reports free, such as a compressed or thin-provisioned one.)",
+                dir.display(),
+                crate::util::format_bytes_binary(bytes),
+                crate::util::format_bytes_binary(free),
+            )));
         }
-        Err(TapectlError::Other(format!(
-            "not enough disk space in {} for this restore: it needs about {}, and {} is free. \
-             Nothing was read from tape. {why} Free space there, choose a larger disk with \
-             --to, or put any decrypted slices on another disk with --scratch DIR. \
-             (--no-space-check skips this check, for a filesystem that holds more than it \
-             reports free, such as a compressed or thin-provisioned one.)",
-            dir.display(),
-            crate::util::format_bytes_binary(bytes),
-            crate::util::format_bytes_binary(free),
-        )))
-    };
-    if same_fs {
-        let combined = match file_size {
-            // The rename into place costs nothing on one filesystem.
-            Some(_) => scratch_need,
-            None => scratch_need + dest_need,
-        };
-        need(&dest_fs, combined)
-    } else {
-        need(&scratch_fs, scratch_need)?;
-        need(&dest_fs, dest_need)
     }
+    Ok(())
 }
 
 /// `path` itself if it exists, else its nearest existing ancestor — where
@@ -791,42 +856,19 @@ pub(crate) fn restore_unit_from_store(
         site.medium_serial(),
         &mut trace,
     ));
-    // The restore's own record: what came back, where to, how it ended,
-    // and dar's report verbatim. Best-effort, like the contact row — the
-    // result `r` is decided and this cannot change it.
-    let (outcome, error) = match &r {
-        Ok(_) => (contact::OUTCOME_OK, None),
-        Err(e) => (contact::OUTCOME_FAILED, Some(e.to_string())),
-    };
-    let files_restored = match target {
-        RestoreTarget::Unit { .. } => trace.dar.as_ref().and_then(DarReport::inodes_restored),
-        RestoreTarget::File { .. } => trace.placed.then_some(1),
-    };
-    let unit_id = queries::get_unit_by_name(conn, unit_name)
-        .ok()
-        .flatten()
-        .map(|u| u.id);
-    restore_record::record(
+    record_restore(
         conn,
-        &RestoreRecord {
+        RecordAt {
             contact_id,
             volume_id,
-            volume_label: Some(volume_label),
-            unit_id,
-            unit_name: Some(unit_name),
-            version: Some(version),
-            kind: target.kind(),
-            file_path: target.file_path(),
-            destination: target.destination(),
+            volume_label,
             started_at: &started_at,
-            outcome,
-            error: error.as_deref(),
-            slices_read: Some(trace.slices_read),
-            bytes_restored: Some(trace.bytes_decrypted),
-            files_restored,
-            dar: trace.dar.as_ref(),
-            dar_version: trace.dar_version.as_deref(),
         },
+        unit_name,
+        version,
+        target,
+        r.as_ref().err(),
+        &trace,
     );
     // ONE post-command health reading for this contact (issue #320), on
     // every outcome, naming the volume the contact names. This seam is the
@@ -872,24 +914,7 @@ fn restore_unit_contacted(
     // concretely, so the version counted and the version read are the same.
     let selection = select_write_positions(conn, unit_name, volume_label, Some(version))?;
 
-    // Corroborate at contact (ADR-0012, issue #193), before a scratch
-    // directory is made, before a key is loaded and before a single slice is
-    // read. Restoring from the wrong tape used to surface as a per-slice
-    // sha256 failure with no word about why.
-    let volume_id: i64 = conn
-        .query_row(
-            "SELECT id FROM volumes WHERE label = ?1",
-            rusqlite::params![volume_label],
-            |r| r.get(0),
-        )
-        .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
-    let phase = progress::phase("identify", None);
-    let medium = crate::volume::binding::MediumFacts::new(
-        medium_serial.map(str::to_string),
-        crate::volume::binding::read_file0_facts(store),
-    );
-    crate::volume::binding::corroborate_volume(conn, volume_id, volume_label, &medium)?;
-    phase.done();
+    corroborate_at_contact(conn, volume_label, store, medium_serial)?;
 
     // ONE plan, decided again exactly as `restore_through_drive`'s preflight
     // decided it before the drive opened: whether the slices stream into dar
@@ -921,6 +946,90 @@ fn restore_unit_contacted(
         dry_run: false,
         success: true,
     })
+}
+
+/// Corroborate at contact (ADR-0012, issue #193), before a scratch
+/// directory is made, before a key is loaded and before a single slice is
+/// read. Restoring from the wrong tape used to surface as a per-slice
+/// sha256 failure with no word about why. Reads File 0.
+fn corroborate_at_contact(
+    conn: &Connection,
+    volume_label: &str,
+    store: &mut dyn Store,
+    medium_serial: Option<&str>,
+) -> Result<()> {
+    let volume_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            rusqlite::params![volume_label],
+            |r| r.get(0),
+        )
+        .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
+    let phase = progress::phase("identify", None);
+    let medium = crate::volume::binding::MediumFacts::new(
+        medium_serial.map(str::to_string),
+        crate::volume::binding::read_file0_facts(store),
+    );
+    crate::volume::binding::corroborate_volume(conn, volume_id, volume_label, &medium)?;
+    phase.done();
+    Ok(())
+}
+
+/// The contact a `restores` row hangs under (issue #306).
+#[derive(Clone, Copy)]
+struct RecordAt<'a> {
+    contact_id: Option<i64>,
+    volume_id: Option<i64>,
+    volume_label: &'a str,
+    started_at: &'a str,
+}
+
+/// The restore's own record: what came back, where to, how it ended, and
+/// dar's report verbatim. Best-effort, like the contact row — the result is
+/// decided and this cannot change it.
+fn record_restore(
+    conn: &Connection,
+    at: RecordAt<'_>,
+    unit_name: &str,
+    version: i64,
+    target: RestoreTarget<'_>,
+    error: Option<&TapectlError>,
+    trace: &RestoreTrace,
+) {
+    let (outcome, error) = match error {
+        None => (contact::OUTCOME_OK, None),
+        Some(e) => (contact::OUTCOME_FAILED, Some(e.to_string())),
+    };
+    let files_restored = match target {
+        RestoreTarget::Unit { .. } => trace.dar.as_ref().and_then(DarReport::inodes_restored),
+        RestoreTarget::File { .. } => trace.placed.then_some(1),
+    };
+    let unit_id = queries::get_unit_by_name(conn, unit_name)
+        .ok()
+        .flatten()
+        .map(|u| u.id);
+    restore_record::record(
+        conn,
+        &RestoreRecord {
+            contact_id: at.contact_id,
+            volume_id: at.volume_id,
+            volume_label: Some(at.volume_label),
+            unit_id,
+            unit_name: Some(unit_name),
+            version: Some(version),
+            kind: target.kind(),
+            file_path: target.file_path(),
+            destination: target.destination(),
+            started_at: at.started_at,
+            outcome,
+            error: error.as_deref(),
+            slices_read: Some(trace.slices_read),
+            bytes_restored: Some(trace.bytes_decrypted),
+            files_restored,
+            dar: trace.dar.as_ref(),
+            dar_version: trace.dar_version.as_deref(),
+        },
+    );
 }
 
 /// Every secret key the tenant owns, and the operator's, for trial
@@ -1659,6 +1768,346 @@ pub fn restore_file(
         false,
     )?;
     Ok(())
+}
+
+/// One unit of a multi-unit restore (issue #398).
+#[derive(Debug, Clone)]
+pub struct UnitRequest {
+    pub unit: String,
+    /// The snapshot version; `None` is the newest on the volume.
+    pub version: Option<i64>,
+    /// Where this unit is restored — its own directory.
+    pub dest_dir: String,
+}
+
+/// How one unit of a multi-unit restore ended (issue #398).
+#[derive(Debug, Clone)]
+pub struct UnitOutcome {
+    pub unit_name: String,
+    pub version: i64,
+    pub slices: usize,
+    pub destination: String,
+    /// `None`: restored (or, in a dry run, would be). `Some`: why not.
+    pub error: Option<String>,
+    /// `false`: never started — an earlier unit failed under `fail_fast`,
+    /// or this is a dry run.
+    pub attempted: bool,
+}
+
+/// What a multi-unit restore did, unit by unit, in tape order.
+#[derive(Debug)]
+pub struct UnitsReport {
+    pub volume_label: String,
+    pub dry_run: bool,
+    pub units: Vec<UnitOutcome>,
+}
+
+impl UnitsReport {
+    /// Units that failed or never started.
+    pub fn failed(&self) -> usize {
+        self.units
+            .iter()
+            .filter(|u| u.error.is_some() || (!self.dry_run && !u.attempted))
+            .count()
+    }
+}
+
+/// Restore several units from one volume in ONE pass over the tape (issue
+/// #398) — the disaster-recovery shape, where restoring a whole volume unit
+/// by unit paid a drive open, a rewind and a locate per unit.
+///
+/// Everything that can be refused without the tape is refused for the
+/// WHOLE set before the drive is opened: each unit's version, plan and
+/// [`preflight`] checks, a unit asked for twice, two units into one
+/// directory, and the disk space of the set (per filesystem, the restored
+/// units add up and the largest scratch counts once — the units restore one
+/// after another, each removing its scratch). Then the drive is opened ONCE,
+/// File 0 is corroborated ONCE, and the units are restored in the order
+/// their slices lie on the tape, so the head only moves forward ([`TapeStore`]'s
+/// cursor, #389). Each unit streams or spools as [`plan_restore`] decides.
+///
+/// One unit's failure does not stop the others unless `fail_fast`; every
+/// unit that was attempted gets its own `restores` row under the one
+/// contact. The report lists every requested unit in tape order. `Err` is
+/// for a refusal before the tape, a drive that will not open, or a tape
+/// that is not the volume named.
+#[allow(clippy::too_many_arguments)]
+pub fn restore_units(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    volume_label: &str,
+    requests: &[UnitRequest],
+    options: &RestoreOptions,
+    fail_fast: bool,
+    device: &str,
+    block_size: usize,
+    dry_run: bool,
+) -> Result<UnitsReport> {
+    let planned = plan_units(conn, config, volume_label, requests, options)?;
+    if dry_run {
+        return Ok(UnitsReport {
+            volume_label: volume_label.to_string(),
+            dry_run: true,
+            units: planned.iter().map(|p| p.outcome(None, false)).collect(),
+        });
+    }
+    // The drive, as `restore_through_drive` opens it: both MAM reads, then
+    // the store, once for the whole set.
+    let reads = MamReads::new(conn, Operation::RestoreUnit);
+    reads.check_read_contact(config, device)?;
+    let observed = crate::volume::binding::loaded_medium(config, device, &reads);
+    let phase = progress::phase("drive-open", None);
+    let mut store = TapeStore::open_read(device, block_size)?;
+    phase.done();
+    restore_units_from_store(
+        conn,
+        paths,
+        config,
+        volume_label,
+        &planned,
+        options,
+        fail_fast,
+        &mut store,
+        ContactSite::new(
+            config,
+            Operation::RestoreUnit,
+            device,
+            Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+        )
+        .with_mam_reads(&reads),
+    )
+}
+
+/// One unit of a set, planned before the tape ([`plan_units`]).
+struct PlannedUnit {
+    unit: String,
+    version: i64,
+    dest_dir: String,
+    scratch: PathBuf,
+    plan: RestorePlan,
+}
+
+impl PlannedUnit {
+    fn target(&self) -> RestoreTarget<'_> {
+        RestoreTarget::Unit {
+            dest_dir: &self.dest_dir,
+        }
+    }
+
+    fn first_position(&self) -> u32 {
+        self.plan
+            .positions
+            .iter()
+            .filter_map(|wp| wp.position.parse().ok())
+            .min()
+            .unwrap_or(u32::MAX)
+    }
+
+    fn outcome(&self, error: Option<String>, attempted: bool) -> UnitOutcome {
+        UnitOutcome {
+            unit_name: self.unit.clone(),
+            version: self.version,
+            slices: self.plan.positions.len(),
+            destination: self.dest_dir.clone(),
+            error,
+            attempted,
+        }
+    }
+}
+
+/// [`restore_units`]'s half before the tape: every unit planned and
+/// checked, the set's space checked, the units sorted into tape order.
+fn plan_units(
+    conn: &Connection,
+    config: &Config,
+    volume_label: &str,
+    requests: &[UnitRequest],
+    options: &RestoreOptions,
+) -> Result<Vec<PlannedUnit>> {
+    if requests.is_empty() {
+        return Err(TapectlError::Other("no unit to restore".into()));
+    }
+    let mut seen_units = std::collections::HashSet::new();
+    let mut seen_dests = std::collections::HashSet::new();
+    for req in requests {
+        if !seen_units.insert(req.unit.as_str()) {
+            return Err(TapectlError::Other(format!(
+                "unit \"{}\" is asked for more than once. Nothing was read from tape.",
+                req.unit
+            )));
+        }
+        if !seen_dests.insert(Path::new(&req.dest_dir)) {
+            return Err(TapectlError::Other(format!(
+                "two units would be restored into the same destination {}: each unit needs its \
+                 own. Nothing was read from tape.",
+                req.dest_dir
+            )));
+        }
+    }
+
+    let mut planned = Vec::with_capacity(requests.len());
+    let mut needs = Vec::new();
+    for req in requests {
+        let unit = queries::get_unit_by_name(conn, &req.unit)?
+            .ok_or_else(|| TapectlError::UnitNotFound(req.unit.clone()))?;
+        queries::get_tenant_by_id(conn, unit.tenant_id)?
+            .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
+        let selection = select_write_positions(conn, &req.unit, volume_label, req.version)?;
+        let target = RestoreTarget::Unit {
+            dest_dir: &req.dest_dir,
+        };
+        let scratch = scratch_dir(Path::new(&req.dest_dir), options.scratch.as_deref());
+        let plan = plan_restore(conn, config, &selection, target, &scratch)?;
+        preflight_checks(conn, &req.unit, &selection, target, &scratch, options)?;
+        if let Some(n) = space_needs(Path::new(&req.dest_dir), &scratch, &plan, None) {
+            needs.extend(n);
+        }
+        planned.push(PlannedUnit {
+            unit: req.unit.clone(),
+            version: selection.version,
+            dest_dir: req.dest_dir.clone(),
+            scratch,
+            plan,
+        });
+    }
+    if options.no_space_check {
+        info!("disk space not checked (--no-space-check)");
+    } else {
+        require_space(
+            &needs,
+            "Restoring these units one after another keeps every restored unit and the largest \
+             unit's spooled slices (a unit whose isolated catalogue is on disk streams and \
+             spools nothing).",
+        )?;
+    }
+    planned.sort_by_key(PlannedUnit::first_position);
+    Ok(planned)
+}
+
+/// [`restore_units`] minus the tape device: ONE contact, ONE corroboration
+/// of File 0, then each planned unit in turn over the same store, each with
+/// its own `restores` row, then ONE health reading.
+#[allow(clippy::too_many_arguments)]
+fn restore_units_from_store(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    volume_label: &str,
+    planned: &[PlannedUnit],
+    options: &RestoreOptions,
+    fail_fast: bool,
+    store: &mut dyn Store,
+    site: ContactSite<'_>,
+) -> Result<UnitsReport> {
+    let volume_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            rusqlite::params![volume_label],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let phase = progress::phase("contact-open", None);
+    let guard = site.open(conn, volume_id);
+    phase.done();
+    let contact_id = guard.id();
+
+    let corroborated = corroborate_at_contact(conn, volume_label, store, site.medium_serial());
+    let mut units = Vec::with_capacity(planned.len());
+    let mut stopped = false;
+    for p in planned {
+        if stopped {
+            units.push(p.outcome(None, false));
+            continue;
+        }
+        let started_at = restore_record::now_sqlite();
+        let mut trace = RestoreTrace::default();
+        let r = match &corroborated {
+            // The wrong tape: every unit is refused for the same reason.
+            Err(e) => Err(TapectlError::Other(e.to_string())),
+            Ok(()) => restore_planned_unit(conn, paths, config, p, options, store, &mut trace),
+        };
+        record_restore(
+            conn,
+            RecordAt {
+                contact_id,
+                volume_id,
+                volume_label,
+                started_at: &started_at,
+            },
+            &p.unit,
+            p.version,
+            p.target(),
+            r.as_ref().err(),
+            &trace,
+        );
+        match &r {
+            Ok(()) => info!(unit = %p.unit, volume = volume_label, "unit restored"),
+            Err(e) => warn!(unit = %p.unit, error = %e, "unit not restored"),
+        }
+        if r.is_err() && fail_fast {
+            stopped = true;
+        }
+        units.push(p.outcome(r.err().map(|e| e.to_string()), true));
+    }
+
+    let failed = units
+        .iter()
+        .filter(|u| u.error.is_some() || !u.attempted)
+        .count();
+    let detail = (failed > 0).then(|| format!("{failed} of {} units not restored", units.len()));
+    guard.finish(
+        if failed == 0 {
+            contact::OUTCOME_OK
+        } else {
+            contact::OUTCOME_FAILED
+        },
+        detail.as_deref(),
+    );
+    let phase = progress::phase("health-sweep", None);
+    crate::volume::write::health_after_read_contact(conn, &site, volume_id, contact_id);
+    phase.done();
+    if let Some(id) = volume_id {
+        crate::db::phase_timings::record_drained(
+            conn,
+            "restore units",
+            crate::db::phase_timings::Subject::Volume(id),
+        );
+    }
+    corroborated?;
+    Ok(UnitsReport {
+        volume_label: volume_label.to_string(),
+        dry_run: false,
+        units,
+    })
+}
+
+/// One unit of a set, after the contact was corroborated.
+fn restore_planned_unit(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    p: &PlannedUnit,
+    options: &RestoreOptions,
+    store: &mut dyn Store,
+    trace: &mut RestoreTrace,
+) -> Result<()> {
+    let unit = queries::get_unit_by_name(conn, &p.unit)?
+        .ok_or_else(|| TapectlError::UnitNotFound(p.unit.clone()))?;
+    let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
+        .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
+    let identities = load_identities(conn, paths, &tenant)?;
+    restore_planned(
+        config,
+        &p.unit,
+        &p.plan,
+        p.target(),
+        options,
+        &p.scratch,
+        &identities,
+        store,
+        trace,
+    )
 }
 
 /// Move the one entry `file_path` out of the extract at `extracted` into
@@ -3383,10 +3832,20 @@ mod tests {
                 1,
                 "the seam that opens the contact takes its one reading"
             );
+            // Issue #398: a multi-unit restore is ONE contact, so its seam
+            // takes ONE reading for the whole set — never one per unit.
+            let units = body("fn restore_units_from_store(");
+            assert_eq!(units.matches("health_after_read_contact(").count(), 1);
+            assert_eq!(units.matches(".open(conn").count(), 1);
+            assert!(
+                !units.contains("restore_unit_from_store("),
+                "the set must not take a contact per unit"
+            );
             assert_eq!(
                 prod.matches("health_after_read_contact(").count(),
-                2,
-                "restore.rs takes readings in exactly two seams: restore unit's and raw-volume's"
+                3,
+                "restore.rs takes readings in exactly three seams: restore unit's, the \
+                 multi-unit restore's and raw-volume's"
             );
         }
 
@@ -4501,8 +4960,21 @@ mod tests {
                 pub files: Vec<(String, Vec<u8>)>,
                 /// Each slice's ciphertext length, slice 1 first.
                 pub cipher_lens: Vec<i64>,
+                /// Every unit on the volume, in tape order.
+                pub units: Vec<UnitFixture>,
                 pub _home: TempDir,
                 pub _drive: InjectedDrive,
+            }
+
+            /// `(unit name, its files as (path, bytes), dar slice size)`.
+            pub(crate) type UnitSpec<'a> = (&'a str, &'a [(&'a str, Vec<u8>)], &'a str);
+
+            pub(crate) struct UnitFixture {
+                pub name: String,
+                pub files: Vec<(String, Vec<u8>)>,
+                /// Tape position of the unit's slice 1.
+                pub first_position: u32,
+                pub cipher_lens: Vec<i64>,
             }
 
             impl Multi {
@@ -4603,115 +5075,139 @@ mod tests {
                 slice_size: &str,
                 catalogue: bool,
             ) -> Multi {
+                volume_of(label, &[(unit, files, slice_size)], catalogue)
+            }
+
+            /// [`multi`] for several units, one after another on the tape
+            /// in the order given (slices of the first from [`FIRST`]),
+            /// each its own unit, snapshot v1, stage set and completed
+            /// write on the one volume — `stage create` and `volume write`
+            /// in miniature. [`Multi::files`] / [`Multi::cipher_lens`]
+            /// describe the FIRST unit; [`Multi::units`] every unit.
+            pub(crate) fn volume_of(label: &str, units: &[UnitSpec<'_>], catalogue: bool) -> Multi {
                 let conn = crate::db::open_memory().unwrap();
                 let home = TempDir::new().unwrap();
                 let paths = TapectlPaths::new(home.path().join(".tapectl"));
-                seed(&conn, label, unit);
                 paths.ensure_dirs().unwrap();
                 let kp = keys::generate_and_save(&paths.keys_dir, "t1", "primary").unwrap();
-
-                let work = TempDir::new().unwrap();
-                let src = work.path().join("src");
-                fs::create_dir_all(&src).unwrap();
-                let snapshot_id: i64 = conn
-                    .query_row("SELECT id FROM snapshots", [], |r| r.get(0))
-                    .unwrap();
-                let mut dirs = std::collections::BTreeSet::new();
-                for (path, bytes) in files {
-                    let at = src.join(path);
-                    fs::create_dir_all(at.parent().unwrap()).unwrap();
-                    fs::write(&at, bytes).unwrap();
-                    conn.execute(
-                        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-                         VALUES (?1, ?2, ?3, 0)",
-                        params![snapshot_id, path, bytes.len() as i64],
-                    )
-                    .unwrap();
-                    let mut parent = Path::new(path).parent();
-                    while let Some(p) = parent.filter(|p| !p.as_os_str().is_empty()) {
-                        dirs.insert(p.to_string_lossy().into_owned());
-                        parent = p.parent();
-                    }
-                }
-                for dir in dirs {
-                    conn.execute(
-                        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-                         VALUES (?1, ?2, 0, 1)",
-                        params![snapshot_id, dir],
-                    )
-                    .unwrap();
-                }
-                let base = work.path().join("arch");
-                let created = std::process::Command::new("dar")
-                    .arg("-c")
-                    .arg(&base)
-                    .arg("-R")
-                    .arg(&src)
-                    .arg("-s")
-                    .arg(slice_size)
-                    .arg("-Q")
-                    .output()
-                    .unwrap();
-                assert!(
-                    created.status.success(),
-                    "dar -c failed in test setup: {}",
-                    String::from_utf8_lossy(&created.stderr)
-                );
-                if catalogue {
-                    // Where and how `stage create` isolates it.
-                    let dir = paths.catalogs_dir.join("unit0001");
-                    fs::create_dir_all(&dir).unwrap();
-                    let catalogue = dir.join("unit0001_v1");
-                    crate::dar::create::extract_catalog("dar", &base, &catalogue).unwrap();
-                    conn.execute(
-                        "UPDATE stage_sets SET catalog_path = ?1",
-                        params![catalogue.to_string_lossy()],
-                    )
-                    .unwrap();
-                }
-                let plains: Vec<Vec<u8>> = (1..)
-                    .map(|n| work.path().join(format!("arch.{n}.dar")))
-                    .take_while(|p| p.exists())
-                    .map(|p| fs::read(p).unwrap())
-                    .collect();
+                conn.execute(
+                    "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+                    [],
+                )
+                .unwrap();
+                let tenant_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+                    params![label],
+                )
+                .unwrap();
+                let volume_id = conn.last_insert_rowid();
 
                 let mut mem = tape_labelled(label);
                 for filler in 1..FIRST {
                     mem.execute(&mut Cursor::new(vec![filler as u8; 100]), 100, false)
                         .unwrap();
                 }
-                let ss_id: i64 = conn
-                    .query_row("SELECT id FROM stage_sets", [], |r| r.get(0))
+                let mut fixtures = Vec::new();
+                for (k, (name, files, slice_size)) in units.iter().enumerate() {
+                    conn.execute(
+                        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                         VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                        params![format!("unit{k:04}-uuid"), name, tenant_id],
+                    )
                     .unwrap();
-                let write_id: i64 = conn
-                    .query_row("SELECT id FROM writes", [], |r| r.get(0))
+                    let unit_id = conn.last_insert_rowid();
+                    conn.execute(
+                        "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                         VALUES (?1, 1, 'staged', '/tmp', 1, 16)",
+                        params![unit_id],
+                    )
                     .unwrap();
-                let mut cipher_lens = Vec::new();
-                for (i, plain) in plains.iter().enumerate() {
-                    let cipher = encrypt_to(plain, std::slice::from_ref(&kp.public_key));
-                    mem.execute(&mut Cursor::new(cipher.clone()), cipher.len() as u64, false)
-                        .unwrap();
-                    cipher_lens.push(cipher.len() as i64);
-                    let number = i as i64 + 1;
-                    let position = (FIRST + i as u32).to_string();
-                    if number == 1 {
+                    let snapshot_id = conn.last_insert_rowid();
+                    conn.execute(
+                        "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                        params![snapshot_id],
+                    )
+                    .unwrap();
+                    let ss_id = conn.last_insert_rowid();
+                    conn.execute(
+                        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                         VALUES (?1, ?2, ?3, 'completed')",
+                        params![ss_id, snapshot_id, volume_id],
+                    )
+                    .unwrap();
+                    let write_id = conn.last_insert_rowid();
+
+                    let work = TempDir::new().unwrap();
+                    let src = work.path().join("src");
+                    fs::create_dir_all(&src).unwrap();
+                    let mut dirs = std::collections::BTreeSet::new();
+                    for (path, bytes) in files.iter() {
+                        let at = src.join(path);
+                        fs::create_dir_all(at.parent().unwrap()).unwrap();
+                        fs::write(&at, bytes).unwrap();
                         conn.execute(
-                            "UPDATE stage_slices SET size_bytes = ?1, encrypted_bytes = ?2,
-                                    sha256_plain = ?3, sha256_encrypted = ?4",
-                            params![
-                                plain.len() as i64,
-                                cipher.len() as i64,
-                                direct_hash(plain),
-                                direct_hash(&cipher)
-                            ],
+                            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
+                             VALUES (?1, ?2, ?3, 0)",
+                            params![snapshot_id, path, bytes.len() as i64],
                         )
                         .unwrap();
+                        let mut parent = Path::new(path).parent();
+                        while let Some(p) = parent.filter(|p| !p.as_os_str().is_empty()) {
+                            dirs.insert(p.to_string_lossy().into_owned());
+                            parent = p.parent();
+                        }
+                    }
+                    for dir in dirs {
                         conn.execute(
-                            "UPDATE write_positions SET position = ?1, sha256_on_volume = ?2",
-                            params![position, direct_hash(&cipher)],
+                            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
+                             VALUES (?1, ?2, 0, 1)",
+                            params![snapshot_id, dir],
                         )
                         .unwrap();
-                    } else {
+                    }
+                    let base = work.path().join("arch");
+                    let created = std::process::Command::new("dar")
+                        .arg("-c")
+                        .arg(&base)
+                        .arg("-R")
+                        .arg(&src)
+                        .arg("-s")
+                        .arg(slice_size)
+                        .arg("-Q")
+                        .output()
+                        .unwrap();
+                    assert!(
+                        created.status.success(),
+                        "dar -c failed in test setup: {}",
+                        String::from_utf8_lossy(&created.stderr)
+                    );
+                    if catalogue {
+                        // Where and how `stage create` isolates it.
+                        let dir = paths.catalogs_dir.join(format!("unit{k:04}"));
+                        fs::create_dir_all(&dir).unwrap();
+                        let catalogue = dir.join(format!("unit{k:04}_v1"));
+                        crate::dar::create::extract_catalog("dar", &base, &catalogue).unwrap();
+                        conn.execute(
+                            "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
+                            params![catalogue.to_string_lossy(), ss_id],
+                        )
+                        .unwrap();
+                    }
+                    let plains: Vec<Vec<u8>> = (1..)
+                        .map(|n| work.path().join(format!("arch.{n}.dar")))
+                        .take_while(|p| p.exists())
+                        .map(|p| fs::read(p).unwrap())
+                        .collect();
+                    let first_position = mem.files.len() as u32;
+                    let mut cipher_lens = Vec::new();
+                    for (i, plain) in plains.iter().enumerate() {
+                        let cipher = encrypt_to(plain, std::slice::from_ref(&kp.public_key));
+                        let position = mem.files.len().to_string();
+                        mem.execute(&mut Cursor::new(cipher.clone()), cipher.len() as u64, false)
+                            .unwrap();
+                        cipher_lens.push(cipher.len() as i64);
                         conn.execute(
                             "INSERT INTO stage_slices
                                 (stage_set_id, slice_number, size_bytes, encrypted_bytes,
@@ -4719,7 +5215,7 @@ mod tests {
                              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                             params![
                                 ss_id,
-                                number,
+                                i as i64 + 1,
                                 plain.len() as i64,
                                 cipher.len() as i64,
                                 direct_hash(plain),
@@ -4736,6 +5232,15 @@ mod tests {
                         )
                         .unwrap();
                     }
+                    fixtures.push(UnitFixture {
+                        name: name.to_string(),
+                        files: files
+                            .iter()
+                            .map(|(p, b)| (p.to_string(), b.clone()))
+                            .collect(),
+                        first_position,
+                        cipher_lens,
+                    });
                 }
                 let fake = FakeTape::with_files(mem.files.clone(), 4096);
                 let drive = InjectedDrive::install(&fake);
@@ -4743,11 +5248,9 @@ mod tests {
                     conn,
                     paths,
                     fake,
-                    files: files
-                        .iter()
-                        .map(|(p, b)| (p.to_string(), b.clone()))
-                        .collect(),
-                    cipher_lens,
+                    files: fixtures[0].files.clone(),
+                    cipher_lens: fixtures[0].cipher_lens.clone(),
+                    units: fixtures,
                     _home: home,
                     _drive: drive,
                 }
@@ -4985,6 +5488,265 @@ mod tests {
                 .unwrap();
                 assert_eq!(fs::read(dest.path().join("small.txt")).unwrap(), b"small");
                 assert_eq!(m.slice_reads(), (1..=m.slices() as u32).collect::<Vec<_>>());
+            }
+        }
+
+        // ── issue #398: several units from one volume, one tape pass ──
+
+        mod several_units {
+            use super::multi::{noise, volume_of, Multi, DEVICE};
+            use super::*;
+            use crate::tape::fake::Op;
+            use crate::volume::restore_record::rows;
+
+            fn three(catalogue: bool) -> Multi {
+                let a = [("a.bin", noise(90_000, 1)), ("a.txt", b"alpha".to_vec())];
+                let b = [("b.bin", noise(120_000, 2)), ("d/b.txt", b"bravo".to_vec())];
+                let c = [("c.txt", b"charlie".to_vec())];
+                volume_of(
+                    "MU-1",
+                    &[("ua", &a, "64k"), ("ub", &b, "64k"), ("uc", &c, "64k")],
+                    catalogue,
+                )
+            }
+
+            fn requests(m: &Multi, root: &Path) -> Vec<UnitRequest> {
+                m.units
+                    .iter()
+                    .map(|u| UnitRequest {
+                        unit: u.name.clone(),
+                        version: None,
+                        dest_dir: root.join(&u.name).to_string_lossy().into_owned(),
+                    })
+                    .collect()
+            }
+
+            fn run(m: &Multi, reqs: &[UnitRequest], fail_fast: bool) -> Result<UnitsReport> {
+                restore_units(
+                    &m.conn,
+                    &m.paths,
+                    &Config::default(),
+                    "MU-1",
+                    reqs,
+                    &RestoreOptions::default(),
+                    fail_fast,
+                    DEVICE,
+                    4096,
+                    false,
+                )
+            }
+
+            fn reads(m: &Multi) -> Vec<u32> {
+                m.fake
+                    .ops()
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Read(n) => Some(*n),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            fn count(m: &Multi, sql: &str) -> i64 {
+                m.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+            }
+
+            fn assert_unit_restored(m: &Multi, k: usize, root: &Path) {
+                for (path, bytes) in &m.units[k].files {
+                    assert_eq!(
+                        &fs::read(root.join(&m.units[k].name).join(path)).unwrap_or_default(),
+                        bytes,
+                        "{}: {path}",
+                        m.units[k].name
+                    );
+                }
+            }
+
+            /// THE acceptance test for #398: three units restored in one
+            /// session open the drive once and rewind once, and read the
+            /// tape strictly forward — File 0 once, then every slice of
+            /// every unit in ascending position. One contact, one
+            /// `restores` row per unit. Asked for in NON-tape order, so the
+            /// order is the restore's own doing. Spooled (no catalogues),
+            /// streamed below.
+            #[test]
+            fn three_units_are_one_rewind_and_one_forward_pass() {
+                for catalogue in [false, true] {
+                    let m = three(catalogue);
+                    let root = TempDir::new().unwrap();
+                    let mut reqs = requests(&m, root.path());
+                    reqs.reverse();
+                    let report = run(&m, &reqs, false).unwrap();
+                    assert_eq!(report.failed(), 0, "{report:?}");
+                    for k in 0..3 {
+                        assert_unit_restored(&m, k, root.path());
+                    }
+                    let names: Vec<&str> =
+                        report.units.iter().map(|u| u.unit_name.as_str()).collect();
+                    assert_eq!(names, ["ua", "ub", "uc"], "outcomes in tape order");
+
+                    assert_eq!(m.fake.opens().len(), 1, "the drive is opened once");
+                    assert_eq!(m.fake.rewinds(), 1, "{:?}", m.fake.ops());
+                    let reads = reads(&m);
+                    assert_eq!(reads[0], 0, "File 0, once: {reads:?}");
+                    assert!(
+                        reads.windows(2).all(|w| w[0] < w[1]),
+                        "strictly ascending: {reads:?}"
+                    );
+                    let slices: usize = m.units.iter().map(|u| u.cipher_lens.len()).sum();
+                    assert_eq!(reads.len(), slices + 1, "{reads:?}");
+                    assert_eq!(count(&m, "SELECT COUNT(*) FROM cartridge_contacts"), 1);
+                    let rows = rows(&m.conn).unwrap();
+                    assert_eq!(rows.len(), 3);
+                    assert!(rows.iter().all(|r| r.outcome == "ok" && r.kind == "unit"));
+                    let contact: i64 = m
+                        .conn
+                        .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+                        .unwrap();
+                    assert!(rows.iter().all(|r| r.contact_id == Some(contact)));
+                }
+            }
+
+            /// One unit's failure does not stop the others: B's slice is
+            /// corrupt, A and C restore, B is reported (and recorded)
+            /// failed — and the pass is still one rewind, forward only.
+            #[test]
+            fn a_failing_unit_does_not_stop_the_others() {
+                let m = three(false);
+                let b_first = m.units[1].first_position as usize;
+                m.fake.state().files[b_first][300] ^= 0xFF;
+                let root = TempDir::new().unwrap();
+                let report = run(&m, &requests(&m, root.path()), false).unwrap();
+                assert_eq!(report.failed(), 1, "{report:?}");
+                let b = &report.units[1];
+                assert!(
+                    b.error
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("checksum mismatch"),
+                    "{b:?}"
+                );
+                assert_unit_restored(&m, 0, root.path());
+                assert_unit_restored(&m, 2, root.path());
+                assert_eq!(m.fake.rewinds(), 1, "{:?}", m.fake.ops());
+                assert!(reads(&m).windows(2).all(|w| w[0] < w[1]));
+                let outcomes: Vec<String> = rows(&m.conn)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.outcome)
+                    .collect();
+                assert_eq!(outcomes, ["ok", "failed", "ok"]);
+            }
+
+            /// `fail_fast`: the first failure ends the session; the units
+            /// after it are reported not attempted, and have no row.
+            #[test]
+            fn fail_fast_stops_at_the_first_failing_unit() {
+                let m = three(false);
+                let b_first = m.units[1].first_position as usize;
+                m.fake.state().files[b_first][300] ^= 0xFF;
+                let root = TempDir::new().unwrap();
+                let report = run(&m, &requests(&m, root.path()), true).unwrap();
+                assert_eq!(report.failed(), 2, "{report:?}");
+                assert!(report.units[0].error.is_none());
+                assert!(report.units[1].error.is_some());
+                assert!(!report.units[2].attempted, "{report:?}");
+                assert_eq!(rows(&m.conn).unwrap().len(), 2);
+                assert!(!root.path().join("uc").exists());
+            }
+
+            /// Everything that can be refused without the tape is refused
+            /// for the WHOLE set before the drive opens: an unknown unit,
+            /// a unit asked for twice, two units into one directory, a
+            /// destination that is not empty, and a set that does not fit
+            /// on the disk though each unit alone would.
+            #[test]
+            fn the_whole_set_is_checked_before_the_drive_opens() {
+                let m = three(false);
+                let root = TempDir::new().unwrap();
+                let refused = |reqs: &[UnitRequest], want: &str| {
+                    let err = run(&m, reqs, false).unwrap_err().to_string();
+                    assert!(err.contains(want), "{want}: {err}");
+                    assert_eq!(m.fake.opens(), vec![], "the drive was opened: {err}");
+                };
+
+                let mut reqs = requests(&m, root.path());
+                reqs[2].unit = "nope".into();
+                refused(&reqs, "nope");
+
+                let mut reqs = requests(&m, root.path());
+                reqs[2].unit = "ua".into();
+                refused(&reqs, "more than once");
+
+                let mut reqs = requests(&m, root.path());
+                reqs[2].dest_dir = reqs[0].dest_dir.clone();
+                refused(&reqs, "same destination");
+
+                let reqs = requests(&m, root.path());
+                fs::create_dir_all(&reqs[1].dest_dir).unwrap();
+                fs::write(Path::new(&reqs[1].dest_dir).join("x"), b"x").unwrap();
+                refused(&reqs, "is not empty");
+                fs::remove_dir_all(&reqs[1].dest_dir).unwrap();
+
+                // Spooled, each unit needs about twice itself; one at a
+                // time the scratch is reused, the restored units add up.
+                let sizes: Vec<i64> = m.units.iter().map(|u| u.cipher_lens.iter().sum()).collect();
+                let largest = *sizes.iter().max().unwrap();
+                let total: i64 = sizes.iter().sum();
+                {
+                    let _free = RestoreFreeOverride::set(2 * largest);
+                    refused(&reqs, "not enough disk space");
+                }
+                let _free = RestoreFreeOverride::set(total + largest);
+                let report = run(&m, &reqs, false).unwrap();
+                assert_eq!(report.failed(), 0, "{report:?}");
+            }
+
+            /// The wrong tape in the drive refuses the whole set at the one
+            /// corroboration, before any slice is read: one contact, and
+            /// every unit's row failed, naming the tape.
+            #[test]
+            fn the_wrong_tape_refuses_the_set_after_one_file0_read() {
+                let m = three(false);
+                let other = super::tape_labelled("MU-OTHER").files[0].clone();
+                m.fake.state().files[0] = other;
+                let root = TempDir::new().unwrap();
+                let err = run(&m, &requests(&m, root.path()), false)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("wrong tape"), "{err}");
+                assert_eq!(reads(&m), vec![0], "only File 0 was read");
+                assert_eq!(count(&m, "SELECT COUNT(*) FROM cartridge_contacts"), 1);
+                let rows = rows(&m.conn).unwrap();
+                assert_eq!(rows.len(), 3);
+                assert!(rows.iter().all(|r| r.outcome == "failed"));
+            }
+
+            /// A dry run plans the whole set — the version and slices of
+            /// each unit, in tape order — and touches nothing.
+            #[test]
+            fn a_dry_run_plans_the_set_without_the_drive() {
+                let m = three(false);
+                let root = TempDir::new().unwrap();
+                let report = restore_units(
+                    &m.conn,
+                    &m.paths,
+                    &Config::default(),
+                    "MU-1",
+                    &requests(&m, root.path()),
+                    &RestoreOptions::default(),
+                    false,
+                    DEVICE,
+                    4096,
+                    true,
+                )
+                .unwrap();
+                assert!(report.dry_run);
+                let slices: Vec<usize> = report.units.iter().map(|u| u.slices).collect();
+                let want: Vec<usize> = m.units.iter().map(|u| u.cipher_lens.len()).collect();
+                assert_eq!(slices, want);
+                assert_eq!(m.fake.opens(), vec![]);
+                assert_eq!(rows(&m.conn).unwrap().len(), 0);
             }
         }
     }

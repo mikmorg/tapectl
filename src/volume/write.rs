@@ -12603,9 +12603,10 @@ mod tests {
                     .count();
             }
             assert_eq!(
-                total, 6,
-                "six read seams — restore unit, restore raw-volume, catalog rebuild, \
-                 volume identify, read-slices, compact-read — one call each"
+                total, 7,
+                "seven read seams — restore unit, restore of several units (#398), restore \
+                 raw-volume, catalog rebuild, volume identify, read-slices, compact-read — one \
+                 call each"
             );
             let write = corpus[0].1.split("#[cfg(test)]\nmod tests").next().unwrap();
             for f in [
@@ -13205,13 +13206,13 @@ mod tests {
                 with_reads += src.matches("with_mam_reads(").count();
             }
             assert_eq!(
-                checks, 8,
-                "verify, restore unit, catalog rebuild, restore raw-volume, identify, \
-                 read-slices, compact-read, compact"
+                checks, 9,
+                "verify, restore unit, restore of several units (#398), catalog rebuild, \
+                 restore raw-volume, identify, read-slices, compact-read, compact"
             );
             assert_eq!(
-                with_reads, 8,
-                "each of the eight hands its holder to its contact"
+                with_reads, 9,
+                "each of the nine hands its holder to its contact"
             );
         }
 
@@ -13394,9 +13395,10 @@ mod tests {
             // Positive control on the walk: it found every read path the
             // count test names, in the files they live in.
             assert_eq!(
-                reads, 8,
-                "verify, restore unit, catalog rebuild, restore raw-volume, identify, \
-                 read-slices, compact-read, compact — found in {files:?}"
+                reads, 9,
+                "verify, restore unit, restore of several units (#398), catalog rebuild, \
+                 restore raw-volume, identify, read-slices, compact-read, compact — found in \
+                 {files:?}"
             );
             assert_eq!(writes, 3, "init, write, resume — found in {files:?}");
             assert_eq!(
