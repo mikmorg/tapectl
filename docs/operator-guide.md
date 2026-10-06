@@ -748,6 +748,17 @@ tapectl restore unit --unit family/letters --from L8-0002 --to /srv/restore/lett
 # Into a directory that already holds an older copy, replacing what collides
 tapectl restore unit --unit family/letters --from L8-0002 --to /srv/restore/letters \
   --overwrite --device "$TAPE"
+
+# Spool the slices to disk even though the unit could stream into dar
+tapectl restore unit --unit family/letters --from L8-0002 --to /srv/restore/letters \
+  --spool --device "$TAPE"
+
+# Every unit on a volume, in one pass over the tape, each into /srv/restore/<unit>
+tapectl restore volume L8-0002 --to /srv/restore --device "$TAPE"
+
+# Only some of them, still in one pass
+tapectl restore volume L8-0002 --to /srv/restore --unit family/letters --unit mike/notes \
+  --device "$TAPE"
 ```
 
 ```text
@@ -768,6 +779,21 @@ than their archived owners. `--version N` restores an older snapshot; by default
 of the unit on that volume is used. `catalog locate` (below) tells you which
 volumes to restore `--from`.
 
+`restore volume <label> --to DIR` restores several units from one volume in
+one forward pass over the tape: the drive is opened and rewound once, and the
+units are read in the order they lie on the tape, however they were named.
+Each unit goes into its own directory, `DIR/<unit name>`, which must be empty
+or new. Without `--unit` it restores every unit with written slices on that
+volume; `--unit NAME`, repeated, names the set. Each unit's newest version on
+the volume is restored, as `restore unit` does by default; for an older
+version, use `restore unit --version`. Restoring a whole volume this way costs
+one pass instead of a rewind and locate per unit, which is what makes it the
+disaster-recovery path ([keys-and-recovery](keys-and-recovery.md#c-the-catalog-is-gone-and-you-hold-the-operator-or-escrow-key)).
+One unit's failure does not stop the others: the report lists every unit in
+tape order with how it ended, and the command fails when any unit did
+(`--fail-fast` stops at the first failure instead). `--dry-run` lists the set
+without opening the drive.
+
 Before it opens the drive, a restore checks everything it can without the
 tape, and refuses with nothing read
 ([troubleshooting](troubleshooting.md#restoring)):
@@ -781,11 +807,17 @@ tape, and refuses with nothing read
   extracts them, in a `.tapectl-restore-tmp` directory inside `--to`, or
   inside `--scratch DIR` when you name one, never in the system temp
   directory; with both on one disk a unit then needs about twice its size
-  free. `restore file` needs the slices it reads plus the one file. Pick a
+  free. `--spool` makes a unit that could stream spool anyway (to get round
+  a streaming problem, or to rehearse what a rebuilt catalog will do), at
+  that larger size. `restore volume` checks the set as a whole: every
+  restored unit, plus the largest unit's spooled slices, since the units
+  run one after another. `restore file` needs the slices it reads plus the
+  one file. Pick a
   `--to` with room: `/tmp`, used in these small examples, is often RAM or the
   root filesystem. `--no-space-check` skips the check, for a compressed or
   thin-provisioned filesystem that holds more than it reports free.
-- **The destination.** `restore unit` wants an empty or new `--to`, and
+- **The destination.** `restore unit` wants an empty or new `--to`
+  (`restore volume`, an empty or new `DIR/<unit name>` for each unit), and
   `restore file` refuses when a file of the same name is already there.
   `--overwrite` restores anyway and replaces what collides.
 - **The file.** `restore file --file` must be a path the catalog recorded for

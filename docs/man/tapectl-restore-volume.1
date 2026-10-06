@@ -1,0 +1,67 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-restore-volume 1  "tapectl-restore-volume " 
+.SH NAME
+tapectl\-restore\-volume \- Restore several units from one volume in one pass over the tape
+.SH SYNOPSIS
+\fBtapectl restore volume\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-unit\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-home\fR] [\fB\-\-spool\fR] [\fB\-\-fail\-fast\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+.SH DESCRIPTION
+Restore several units from one volume in one pass over the tape
+.PP
+The disaster\-recovery path: the drive is opened and rewound once and the units are read in the order they lie on the tape, each into its own directory, `DIR/<unit name>`. Each unit\*(Aqs newest version on the volume is restored (use `restore unit \-\-version` for an older one). One unit\*(Aqs failure does not stop the others (unless \-\-fail\-fast); the command fails if any unit was not restored
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-to\fR \fI<DIR>\fR
+Destination directory: each unit is restored into `DIR/<unit name>`, which must be empty or new
+.TP
+\fB\-\-unit\fR \fI<NAME>\fR
+A unit to restore; repeat for several. Without it, every unit with written slices on the volume
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-\-scratch\fR \fI<DIR>\fR
+Where each unit\*(Aqs scratch directory is made, one at a time (removed when that unit ends); defaults to inside the unit\*(Aqs own directory, never the system temp directory
+.TP
+\fB\-\-overwrite\fR
+Restore into unit directories that already hold files, replacing any that collide. Without it a unit directory that is not empty is refused before the tape is touched
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-no\-space\-check\fR
+Skip the free\-space check of the whole set (every restored unit, plus the largest unit\*(Aqs spooled slices)
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-\-spool\fR
+Spool every unit\*(Aqs slices to the scratch directory instead of streaming them into dar (see `restore unit \-\-spool`)
+.TP
+\fB\-\-fail\-fast\fR
+Stop at the first unit that fails; the units after it are not attempted. Without it every unit is tried
+.TP
+\fB\-\-dry\-run\fR
+Show what would be restored, unit by unit in tape order, without opening the drive
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+<\fILABEL\fR>
+Volume label

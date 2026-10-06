@@ -1652,6 +1652,39 @@ destination that is not empty is refused before the tape is read (above), so
 this now means a file appeared in `--to` while the restore ran. Restore into an
 empty directory, or pass `--overwrite`.
 
+### `restore volume`: some units were not restored
+
+```text
+restored "family/letters" v1 (1 slices) to /srv/restore/family/letters
+FAILED "family/photos" v2 (12 slices) to /srv/restore/family/photos: slice 3 checksum mismatch on tape: expected <sha>..., got <sha>...
+restored "mike/notes" v4 (1 slices) to /srv/restore/mike/notes
+2 of 3 unit(s) restored from L8-0002
+error: 1 of 3 units not restored from L8-0002
+```
+
+`restore volume` reads the tape once, front to back, and one unit's failure
+does not stop the others. The report lists the units in the order they lie on
+the tape, and the command exits 2, as for any error, when any unit failed.
+Each unit has its own `restores` row. The units that were restored are
+complete. For each failed one, read its error in the matching section on this
+page, empty its directory, and restore it with `restore unit` (from another
+copy if the tape is damaged; `catalog locate` lists them).
+
+With `--fail-fast` the first failure ends the pass, and the units after it
+are reported `not attempted`.
+
+Before it opens the drive, `restore volume` refuses the whole set when any one
+unit would be refused (see the sections above), and also when one unit's
+directory would lie inside another's:
+
+```text
+error: unit "<a/b>" would be restored inside unit "<a>"'s destination (<dir>/a/b is inside <dir>/a). Restore them
+separately, each to its own --to. Nothing was read from tape.
+```
+
+Name the units with `--unit` so that no two of them nest, and restore the
+remaining one with `restore unit`.
+
 ### `restore file`: the file is not in the catalog
 
 ```text
@@ -1685,12 +1718,12 @@ such as a compressed or thin-provisioned one.)
 `<why>` names which of three restores this is, because they need different
 room:
 
-- **Streamed** (`restore unit`, with the unit's isolated catalogue from
-  `stage create` still under `<home>/catalogs/`, and dar 2.7.9 or newer):
-  each slice goes from the tape through a named pipe straight into dar, so
-  only about the unit's size is needed in `--to`.
-- **Spooled** (`restore unit` otherwise, for example after `catalog
-  rebuild`, which has no catalogues): every slice is decrypted into a
+- **Streamed** (`restore unit` or `restore volume`, with the unit's isolated
+  catalogue from `stage create` still under `<home>/catalogs/`, and dar 2.7.9
+  or newer): each slice goes from the tape through a named pipe straight into
+  dar, so only about the unit's size is needed in `--to`.
+- **Spooled** (otherwise, for example after `catalog rebuild`, which has no
+  catalogues, or with `--spool`): every slice is decrypted into a
   `.tapectl-restore-tmp` directory inside `--to` (never the system temp
   directory) before dar extracts them, so with both on one disk the unit's
   size about twice over. With `--scratch DIR` the slices wait in `DIR`
@@ -1701,9 +1734,15 @@ room:
 
 RESTORE.sh, the heir's path, always spools and asks for one slice more.
 
-There is no flag to choose. A restore streams exactly when the unit's
-catalogue files (`<home>/catalogs/<dir>/<name>.N.dar`, named by the stage set's
-`catalog_path`) are there, so moving them aside for one run makes it spool.
+`restore volume` checks the whole set at once: every unit it restores stays,
+and the units run one after another, so only the largest unit's spooled
+slices count on top.
+
+A restore streams when the unit's catalogue files
+(`<home>/catalogs/<dir>/<name>.N.dar`, named by the stage set's
+`catalog_path`) are there. `--spool` on `restore unit` or `restore volume`
+makes it spool anyway, for example to get round a streaming problem or to
+rehearse the path a rebuilt catalog takes. It needs the larger space above.
 
 ### A scratch directory already exists
 

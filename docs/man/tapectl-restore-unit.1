@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-unit \- Restore a unit from a volume
 .SH SYNOPSIS
-\fBtapectl restore unit\fR [\fB\-\-json\fR] <\fB\-\-unit\fR> <\fB\-\-from\fR> <\fB\-\-to\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-version\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-scratch\fR] [\fB\-\-home\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl restore unit\fR [\fB\-\-json\fR] <\fB\-\-unit\fR> <\fB\-\-from\fR> <\fB\-\-to\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-version\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-scratch\fR] [\fB\-\-home\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-spool\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Restore a unit from a volume
 .SH OPTIONS
@@ -54,6 +54,9 @@ Restore into a destination that already holds files, replacing any that collide.
 .TP
 \fB\-\-no\-space\-check\fR
 Skip the free\-space check (the unit\*(Aqs size when it streams; about twice that when its slices are spooled, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
+.TP
+\fB\-\-spool\fR
+Decrypt every slice to the scratch directory before dar extracts them, even when the unit could stream (its isolated catalogue on disk). Needs about twice the unit\*(Aqs size with the scratch directory and \-\-to on one disk
 .TP
 \fB\-\-dry\-run\fR
 Show what would be restored without restoring

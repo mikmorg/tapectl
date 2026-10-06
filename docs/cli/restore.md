@@ -13,6 +13,7 @@ tapectl restore [OPTIONS] <COMMAND>
 **Subcommands**
 
 - [`unit`](#tapectl-restore-unit) — Restore a unit from a volume
+- [`volume`](#tapectl-restore-volume) — Restore several units from one volume in one pass over the tape
 - [`file`](#tapectl-restore-file) — Restore a single file from a unit
 - [`raw-volume`](#tapectl-restore-raw-volume) — Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path
 
@@ -33,7 +34,34 @@ tapectl restore unit [OPTIONS] --unit <UNIT> --from <FROM> --to <TO>
 - `--scratch <DIR>` — Where the restore's scratch directory is made (removed when the restore ends); defaults to inside --to, never the system temp directory. A unit whose isolated catalogue from `stage create` is on disk streams its slices into dar and puts only named pipes there; otherwise (a rebuilt catalog, dar older than 2.7.9) every decrypted slice waits there, as large as the unit
 - `--overwrite` — Restore into a destination that already holds files, replacing any that collide. Without it a destination that is not empty is refused before the tape is touched
 - `--no-space-check` — Skip the free-space check (the unit's size when it streams; about twice that when its slices are spooled, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
+- `--spool` — Decrypt every slice to the scratch directory before dar extracts them, even when the unit could stream (its isolated catalogue on disk). Needs about twice the unit's size with the scratch directory and --to on one disk
 - `--dry-run` — Show what would be restored without restoring
+
+### tapectl restore volume
+
+Restore several units from one volume in one pass over the tape
+
+The disaster-recovery path: the drive is opened and rewound once and the units are read in the order they lie on the tape, each into its own directory, `DIR/<unit name>`. Each unit's newest version on the volume is restored (use `restore unit --version` for an older one). One unit's failure does not stop the others (unless --fail-fast); the command fails if any unit was not restored
+
+```text
+tapectl restore volume [OPTIONS] --to <DIR> <LABEL>
+```
+
+**Arguments**
+
+- `<LABEL>` — Volume label
+
+**Options**
+
+- `--to <DIR>` *(required)* — Destination directory: each unit is restored into `DIR/<unit name>`, which must be empty or new
+- `--unit <NAME>` — A unit to restore; repeat for several. Without it, every unit with written slices on the volume
+- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--scratch <DIR>` — Where each unit's scratch directory is made, one at a time (removed when that unit ends); defaults to inside the unit's own directory, never the system temp directory
+- `--overwrite` — Restore into unit directories that already hold files, replacing any that collide. Without it a unit directory that is not empty is refused before the tape is touched
+- `--no-space-check` — Skip the free-space check of the whole set (every restored unit, plus the largest unit's spooled slices)
+- `--spool` — Spool every unit's slices to the scratch directory instead of streaming them into dar (see `restore unit --spool`)
+- `--fail-fast` — Stop at the first unit that fails; the units after it are not attempted. Without it every unit is tried
+- `--dry-run` — Show what would be restored, unit by unit in tape order, without opening the drive
 
 ### tapectl restore file
 

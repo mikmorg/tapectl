@@ -208,6 +208,11 @@ pub enum Operation {
     /// Also the operation recorded for `restore file`, which reaches the
     /// drive through `restore_unit` and so shares its one contact.
     RestoreUnit,
+    /// Several units restored in one pass over one volume (issue #398):
+    /// ONE contact for the set, with a `restores` row of kind `unit` per
+    /// unit under it. Not `restore unit`, which would count one pass as one
+    /// unit's restore.
+    RestoreVolume,
     RestoreRawVolume,
     CatalogRebuild,
 }
@@ -224,6 +229,7 @@ impl Operation {
             Operation::VolumeCompactRead => "volume compact-read",
             Operation::VolumeCompact => "volume compact",
             Operation::RestoreUnit => "restore unit",
+            Operation::RestoreVolume => "restore volume",
             Operation::RestoreRawVolume => "restore raw-volume",
             Operation::CatalogRebuild => "catalog rebuild",
         }
@@ -240,6 +246,7 @@ impl Operation {
         Operation::VolumeCompactRead,
         Operation::VolumeCompact,
         Operation::RestoreUnit,
+        Operation::RestoreVolume,
         Operation::RestoreRawVolume,
         Operation::CatalogRebuild,
     ];
@@ -1108,6 +1115,7 @@ pub(crate) mod tests {
                 "volume compact-read",
                 "volume compact",
                 "restore unit",
+                "restore volume",
                 "restore raw-volume",
                 "catalog rebuild",
             ],

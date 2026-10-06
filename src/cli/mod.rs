@@ -421,6 +421,8 @@ pub fn progress_session_name(command: &Commands) -> Option<String> {
             // A dry run reads nothing and opens no session.
             R::Unit { dry_run: true, .. } => return None,
             R::Unit { unit, .. } => format!("restore unit {unit}"),
+            R::Volume { dry_run: true, .. } => return None,
+            R::Volume { label, .. } => format!("restore volume {label}"),
             R::File { unit, .. } => format!("restore file {unit}"),
             R::RawVolume { .. } => "restore raw-volume".to_string(),
         },

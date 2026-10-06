@@ -554,8 +554,17 @@ restored "family/letters" v1 from L8-0002 (1 slices) to /tmp/restore/unit
 restored "1998-letter-to-mum.txt" from "family/letters" on L8-0002 to /tmp/restore
 ```
 
+To bring back several units from one volume, `restore volume` reads the tape
+once, front to back, and puts each unit in its own directory under `--to`
+(`/tmp/restore/family/letters` here). Without `--unit` it restores every unit
+on the volume:
+
+```bash
+tapectl restore volume L8-0002 --to /tmp/restore --unit family/letters --unit family/photos --device "$TAPE"
+```
+
 `--version N` picks an older version. The default is the newest one on that
-volume. Restoring as a non-root user logs a warning that restored files will be
+volume (`restore volume` always restores the newest). Restoring as a non-root user logs a warning that restored files will be
 owned by you, not by their archived owners. tapectl tries every key file in
 `keys/` that belongs to the unit's tenant or to the operator, deactivated ones
 included (see [Tenant keys](#tenant-keys) for how a file's owner is decided), so
@@ -790,6 +799,23 @@ is the same procedure for a service-user host.
 
    `audit` reports what is actually true. One rebuilt cartridge is one copy, and
    if your policy asks for two, `audit` exiting 2 is the correct answer.
+
+   **To bring the data itself back,** restore each tape in one pass. This
+   reads the tape once, front to back, and restores every unit on it into its
+   own directory, `/srv/restore/<unit name>`, rather than rewinding and
+   locating once per unit:
+   ```bash
+   tapectl restore volume L8-0002 --to /srv/restore --device "$TAPE" --dry-run
+   tapectl restore volume L8-0002 --to /srv/restore --device "$TAPE"
+   ```
+   A rebuilt home has no isolated catalogues on disk, so every unit spools: each
+   slice is decrypted to disk before dar reads it, and the space check asks for
+   every unit plus the largest unit's slices (`--scratch DIR` puts those on
+   another disk). One unit's failure does not stop the rest; the report names
+   it, and the command exits non-zero. tapectl's restore reads only the private
+   keys in `<home>/keys/` (step 5), never the escrow secret. With only the
+   escrow secret, restore through `RESTORE.sh --key` from
+   [runbook B](#b-a-tenant-holding-only-their-key-files-and-a-tape).
 
    One exception, after step 6: what `audit` says about the Heir Kit
    (`escrow_kit_missing`, `escrow_kit_stale`) is measured against the kit

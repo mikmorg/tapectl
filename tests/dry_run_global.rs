@@ -1233,24 +1233,10 @@ fn key_import_dry_run_inserts_nothing() {
     );
 }
 
-/// `restore unit`'s LOCAL `dry_run` field shares clap's arg id with the
-/// GLOBAL `--dry-run` (both fields are literally named `dry_run`), so clap
-/// unifies them by id and the global flag reaches it with no extra
-/// plumbing in `cli::restore::run` — the same mechanism
-/// `a_global_dry_run_before_collection_sync_registers_nothing` above pins
-/// for `collection sync`. This is a characterisation, not a regression
-/// guard for a bug that existed.
-///
-/// Fabricates the minimal write-position chain `restore_unit`'s query
-/// joins across (`write_positions` -> `writes` -> `stage_slices` ->
-/// `stage_sets` -> `snapshots` -> `volumes`) directly, the same way
-/// `home_with_a_bound_cartridge` above fabricates `volumes`/
-/// `cartridge_volumes` rather than running a real `volume write` — a real
-/// write needs a tape this suite must never touch, and `restore_unit`'s
-/// dry branch returns before opening one anyway, so nothing but the
-/// catalog rows it reads is exercised.
-#[test]
-fn restore_unit_dry_run_reports_a_preview_via_the_shared_arg_id() {
+/// A home holding one unit, `u1`, with one written slice on the sealed
+/// volume `L6-0001` — the catalog rows a restore's dry run reads, and no
+/// tape. Returns the home and a root for the destination.
+fn home_with_one_written_unit() -> (TempDir, TempDir) {
     let home = TempDir::new().unwrap();
     ok(home.path(), &["init"]);
     ok(home.path(), &["tenant", "add", "acme"]);
@@ -1319,6 +1305,28 @@ fn restore_unit_dry_run_reports_a_preview_via_the_shared_arg_id() {
     )
     .unwrap();
     drop(conn);
+    (home, root)
+}
+
+/// `restore unit`'s LOCAL `dry_run` field shares clap's arg id with the
+/// GLOBAL `--dry-run` (both fields are literally named `dry_run`), so clap
+/// unifies them by id and the global flag reaches it with no extra
+/// plumbing in `cli::restore::run` — the same mechanism
+/// `a_global_dry_run_before_collection_sync_registers_nothing` above pins
+/// for `collection sync`. This is a characterisation, not a regression
+/// guard for a bug that existed.
+///
+/// Fabricates the minimal write-position chain `restore_unit`'s query
+/// joins across (`write_positions` -> `writes` -> `stage_slices` ->
+/// `stage_sets` -> `snapshots` -> `volumes`) directly, the same way
+/// `home_with_a_bound_cartridge` above fabricates `volumes`/
+/// `cartridge_volumes` rather than running a real `volume write` — a real
+/// write needs a tape this suite must never touch, and `restore_unit`'s
+/// dry branch returns before opening one anyway, so nothing but the
+/// catalog rows it reads is exercised.
+#[test]
+fn restore_unit_dry_run_reports_a_preview_via_the_shared_arg_id() {
+    let (home, root) = home_with_one_written_unit();
 
     // `--device` is required here for a reason unrelated to this test:
     // `restore` resolves its device LENIENTLY (`cli::read_device`, ADR-0005's
@@ -1367,6 +1375,45 @@ fn restore_unit_dry_run_reports_a_preview_via_the_shared_arg_id() {
         !root.path().join("out").exists(),
         "--dry-run created the destination directory or restored into it"
     );
+}
+
+/// `restore volume`'s local `dry_run` field shares the global flag's arg id
+/// the same way `restore unit`'s does: the global `--dry-run` previews the
+/// set — each unit, its version and slices, in tape order — with no drive
+/// opened, no `restores` row and no destination made.
+#[test]
+fn restore_volume_dry_run_reports_a_preview_via_the_shared_arg_id() {
+    let (home, root) = home_with_one_written_unit();
+    let out = ok(
+        home.path(),
+        &[
+            "--dry-run",
+            "restore",
+            "volume",
+            "L6-0001",
+            "--to",
+            root.path().join("out").to_str().unwrap(),
+            "--device",
+            "/dev/tapectl-dry-run-contract-nonexistent",
+        ],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("would restore \"u1\" v1 (1 slices)"),
+        "dry-run output does not preview the unit: {text}"
+    );
+    assert!(
+        !root.path().join("out").exists(),
+        "--dry-run created the destination directory or restored into it"
+    );
+    let conn = db(home.path());
+    let restores: i64 = conn
+        .query_row("SELECT COUNT(*) FROM restores", [], |r| r.get(0))
+        .unwrap();
+    let contacts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cartridge_contacts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!((restores, contacts), (0, 0), "--dry-run touched the record");
 }
 
 // ---------------------------------------------------------------------------

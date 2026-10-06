@@ -244,6 +244,10 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // opened. Proven with its own characterisation test in
     // `tests/dry_run_global.rs`.
     (&["restore", "unit"], Verdict::Honours),
+    // restore volume: the same shared-arg-id mechanism as `restore unit`;
+    // `restore_units`' dry branch plans the set and returns before the
+    // drive is opened. Proven in `tests/dry_run_global.rs`.
+    (&["restore", "volume"], Verdict::Honours),
     (
         &["snapshot", "create"],
         Verdict::Refuses {

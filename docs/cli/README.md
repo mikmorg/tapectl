@@ -134,6 +134,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`report supersedable`](report.md#tapectl-report-supersedable) | Superseded snapshot versions that could be marked reclaimable |
 | [`restore`](restore.md) | Restore data from volumes |
 | &nbsp;&nbsp;[`restore unit`](restore.md#tapectl-restore-unit) | Restore a unit from a volume |
+| &nbsp;&nbsp;[`restore volume`](restore.md#tapectl-restore-volume) | Restore several units from one volume in one pass over the tape |
 | &nbsp;&nbsp;[`restore file`](restore.md#tapectl-restore-file) | Restore a single file from a unit |
 | &nbsp;&nbsp;[`restore raw-volume`](restore.md#tapectl-restore-raw-volume) | Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path |
 | [`export`](export.md) | Export encrypted slices to directory |

@@ -51,7 +51,64 @@ pub enum RestoreCommands {
         /// thin-provisioned one
         #[arg(long)]
         no_space_check: bool,
+        /// Decrypt every slice to the scratch directory before dar extracts
+        /// them, even when the unit could stream (its isolated catalogue
+        /// on disk). Needs about twice the unit's size with the scratch
+        /// directory and --to on one disk
+        #[arg(long)]
+        spool: bool,
         /// Show what would be restored without restoring
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Restore several units from one volume in one pass over the tape
+    ///
+    /// The disaster-recovery path: the drive is opened and rewound once and
+    /// the units are read in the order they lie on the tape, each into its
+    /// own directory, `DIR/<unit name>`. Each unit's newest version on the
+    /// volume is restored (use `restore unit --version` for an older one).
+    /// One unit's failure does not stop the others (unless --fail-fast);
+    /// the command fails if any unit was not restored
+    Volume {
+        /// Volume label
+        label: String,
+        /// Destination directory: each unit is restored into `DIR/<unit
+        /// name>`, which must be empty or new
+        #[arg(long, value_name = "DIR")]
+        to: String,
+        /// A unit to restore; repeat for several. Without it, every unit
+        /// with written slices on the volume
+        #[arg(long = "unit", value_name = "NAME")]
+        units: Vec<String>,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
+        /// Where each unit's scratch directory is made, one at a time
+        /// (removed when that unit ends); defaults to inside the unit's own
+        /// directory, never the system temp directory
+        #[arg(long, value_name = "DIR")]
+        scratch: Option<String>,
+        /// Restore into unit directories that already hold files, replacing
+        /// any that collide. Without it a unit directory that is not empty
+        /// is refused before the tape is touched
+        #[arg(long)]
+        overwrite: bool,
+        /// Skip the free-space check of the whole set (every restored unit,
+        /// plus the largest unit's spooled slices)
+        #[arg(long)]
+        no_space_check: bool,
+        /// Spool every unit's slices to the scratch directory instead of
+        /// streaming them into dar (see `restore unit --spool`)
+        #[arg(long)]
+        spool: bool,
+        /// Stop at the first unit that fails; the units after it are not
+        /// attempted. Without it every unit is tried
+        #[arg(long)]
+        fail_fast: bool,
+        /// Show what would be restored, unit by unit in tape order, without
+        /// opening the drive
         #[arg(long)]
         dry_run: bool,
     },
@@ -142,6 +199,7 @@ pub fn run(
             scratch,
             overwrite,
             no_space_check,
+            spool,
             dry_run,
         } => {
             let device = crate::cli::read_device(config, device.as_deref())?;
@@ -149,6 +207,7 @@ pub fn run(
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
+                spool: *spool,
             };
             let report = volume::restore::restore_unit(
                 conn,
@@ -227,6 +286,8 @@ pub fn run(
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
+                // `restore file` always spools the slices it reads.
+                spool: false,
             };
             volume::restore::restore_file(
                 conn,
@@ -249,6 +310,77 @@ pub fn run(
                 );
             } else {
                 println!("restored \"{file}\" from \"{unit}\" on {from} to {to}");
+            }
+        }
+
+        RestoreCommands::Volume {
+            label,
+            to,
+            units,
+            device,
+            scratch,
+            overwrite,
+            no_space_check,
+            spool,
+            fail_fast,
+            dry_run,
+        } => {
+            let names = if units.is_empty() {
+                volume::restore::units_on_volume(conn, label)?
+            } else {
+                units.clone()
+            };
+            let requests = names
+                .iter()
+                .map(|name| {
+                    // The name becomes a path under --to: hold it to the
+                    // unit-name rules (no `..`, no leading `/`) even for a
+                    // row a rebuilt catalog brought in from tape.
+                    crate::naming::validate_unit_name(name)?;
+                    Ok(volume::restore::UnitRequest {
+                        unit: name.clone(),
+                        version: None,
+                        dest_dir: std::path::Path::new(to)
+                            .join(name)
+                            .to_string_lossy()
+                            .into_owned(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let device = crate::cli::read_device(config, device.as_deref())?;
+            let options = volume::restore::RestoreOptions {
+                scratch: scratch.as_ref().map(std::path::PathBuf::from),
+                overwrite: *overwrite,
+                no_space_check: *no_space_check,
+                spool: *spool,
+            };
+            let report = volume::restore::restore_units(
+                conn,
+                paths,
+                config,
+                label,
+                &requests,
+                &options,
+                *fail_fast,
+                &device,
+                DEFAULT_BLOCK_SIZE,
+                *dry_run,
+            )?;
+
+            if json_output {
+                println!("{}", units_report_json(&report));
+            } else {
+                for line in units_report_lines(&report) {
+                    println!("{line}");
+                }
+            }
+            let failed = report.failed();
+            if failed > 0 {
+                return Err(TapectlError::Other(format!(
+                    "{failed} of {} units not restored from {}",
+                    report.units.len(),
+                    report.volume_label
+                )));
             }
         }
 
@@ -358,4 +490,69 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+/// `restore volume`'s report, one line per unit in the order the units lie
+/// on the tape (the order they were restored in), then a summary.
+pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<String> {
+    let mut lines = Vec::with_capacity(report.units.len() + 1);
+    for u in &report.units {
+        let what = format!(
+            "\"{}\" v{} ({} slices) to {}",
+            u.unit_name, u.version, u.slices, u.destination
+        );
+        lines.push(match (&u.error, u.attempted, report.dry_run) {
+            (_, _, true) => format!("would restore {what}"),
+            (None, true, false) => format!("restored {what}"),
+            (Some(e), _, false) => format!("FAILED {what}: {e}"),
+            (None, false, false) => format!("not attempted {what} (--fail-fast)"),
+        });
+    }
+    let total = report.units.len();
+    lines.push(if report.dry_run {
+        format!(
+            "would restore {total} unit(s) from {} in one pass",
+            report.volume_label
+        )
+    } else {
+        format!(
+            "{} of {total} unit(s) restored from {}",
+            total - report.failed(),
+            report.volume_label
+        )
+    });
+    lines
+}
+
+/// `restore volume --json`: the units in tape order, each with its outcome.
+fn units_report_json(report: &volume::restore::UnitsReport) -> serde_json::Value {
+    let units: Vec<_> = report
+        .units
+        .iter()
+        .map(|u| {
+            let outcome = if report.dry_run {
+                "dry-run"
+            } else if u.error.is_some() {
+                "failed"
+            } else if u.attempted {
+                "restored"
+            } else {
+                "not-attempted"
+            };
+            serde_json::json!({
+                "unit": u.unit_name,
+                "version": u.version,
+                "slices": u.slices,
+                "destination": u.destination,
+                "outcome": outcome,
+                "error": u.error,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "volume": report.volume_label,
+        "dry_run": report.dry_run,
+        "failed": if report.dry_run { 0 } else { report.failed() },
+        "units": units,
+    })
 }

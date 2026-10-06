@@ -85,6 +85,12 @@ pub struct RestoreOptions {
     /// `statvfs` reports (a compressed or thin-provisioned one) — the same
     /// escape RESTORE.sh's `--no-space-check` is.
     pub no_space_check: bool,
+    /// Never stream (`--spool`, ADR-0012 2026-10-06 item 23): decrypt every
+    /// slice to scratch and let dar extract from the files, even when the
+    /// unit's isolated catalogue is on disk and streaming would be chosen.
+    /// The way round a streaming problem, and the way to reproduce the
+    /// path a rebuilt catalog takes. `restore file` always spools anyway.
+    pub spool: bool,
 }
 
 /// The scratch directory's name, inside the destination or `--scratch`.
@@ -245,7 +251,7 @@ fn restore_through_drive(
     let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
     // Issue #411: stream or spool, and which slices — decided here, so the
     // space check asks for what this restore will actually write.
-    let plan = plan_restore(conn, config, &selection, target, &scratch)?;
+    let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
     preflight(
         conn, unit_name, &selection, &plan, target, &scratch, options,
     )?;
@@ -507,9 +513,9 @@ fn check_restore_space(
          from them, so it needs those slices and the file."
     } else {
         "This restore decrypts every slice of the unit to disk before dar extracts them (it \
-         streams only when the unit's isolated catalogue from `stage create` is on disk and \
-         dar is 2.7.9 or newer), so with the scratch space and --to on one disk it needs the \
-         unit's size about twice over."
+         streams only when the unit's isolated catalogue from `stage create` is on disk, \
+         dar is 2.7.9 or newer and --spool was not given), so with the scratch space and --to \
+         on one disk it needs the unit's size about twice over."
     };
     match space_needs(destination, scratch, plan, file_size) {
         Some(needs) => require_space(&needs, why),
@@ -920,7 +926,7 @@ fn restore_unit_contacted(
     // decided it before the drive opened: whether the slices stream into dar
     // or spool to scratch, and which slices a `restore file` reads.
     let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
-    let plan = plan_restore(conn, config, &selection, target, &scratch)?;
+    let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
 
     let identities = load_identities(conn, paths, &tenant)?;
     restore_planned(
@@ -1092,12 +1098,16 @@ pub(crate) struct RestorePlan {
 ///   reads its catalogue. Those are spooled and extracted in dar's direct
 ///   mode — sequential mode cannot skip a slice. Without a catalogue every
 ///   slice is read, as before.
+/// - **`spool`** (`--spool`, ADR-0012 2026-10-06 item 23) forces a
+///   `restore unit` to spool though it could stream. It changes nothing for
+///   `restore file`, which never streams.
 pub(crate) fn plan_restore(
     conn: &Connection,
     config: &Config,
     selection: &RestoreSelection,
     target: RestoreTarget<'_>,
     scratch: &Path,
+    spool: bool,
 ) -> Result<RestorePlan> {
     let all = selection.positions.clone();
     let Some(catalogue) = own_catalogue(conn, selection.stage_set_id)? else {
@@ -1108,7 +1118,12 @@ pub(crate) fn plan_restore(
     };
     match target {
         RestoreTarget::Unit { .. } => {
-            let stream = streamable(config, &all, scratch).then_some(catalogue);
+            let stream = if spool {
+                info!("--spool: the slices are spooled, not streamed");
+                None
+            } else {
+                streamable(config, &all, scratch).then_some(catalogue)
+            };
             Ok(RestorePlan {
                 stream,
                 positions: all,
@@ -1827,8 +1842,9 @@ impl UnitsReport {
 /// cursor, #389). Each unit streams or spools as [`plan_restore`] decides.
 ///
 /// One unit's failure does not stop the others unless `fail_fast`; every
-/// unit that was attempted gets its own `restores` row under the one
-/// contact. The report lists every requested unit in tape order. `Err` is
+/// unit that was attempted gets its own `restores` row (kind `unit`) under
+/// the one contact, whose operation is `restore volume` — the CLI command
+/// this is (ADR-0012 2026-10-06 item 23), not N `restore unit`s. The report lists every requested unit in tape order. `Err` is
 /// for a refusal before the tape, a drive that will not open, or a tape
 /// that is not the volume named.
 #[allow(clippy::too_many_arguments)]
@@ -1854,7 +1870,7 @@ pub fn restore_units(
     }
     // The drive, as `restore_through_drive` opens it: both MAM reads, then
     // the store, once for the whole set.
-    let reads = MamReads::new(conn, Operation::RestoreUnit);
+    let reads = MamReads::new(conn, Operation::RestoreVolume);
     reads.check_read_contact(config, device)?;
     let observed = crate::volume::binding::loaded_medium(config, device, &reads);
     let phase = progress::phase("drive-open", None);
@@ -1871,7 +1887,7 @@ pub fn restore_units(
         &mut store,
         ContactSite::new(
             config,
-            Operation::RestoreUnit,
+            Operation::RestoreVolume,
             device,
             Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
         )
@@ -1945,6 +1961,22 @@ fn plan_units(
             )));
         }
     }
+    // One unit inside another's destination (units `a` and `a/b` restored
+    // to DIR/a and DIR/a/b): both are empty when checked, but whichever is
+    // restored second would land in a directory the first has filled.
+    for outer in requests {
+        for inner in requests {
+            let (o, i) = (Path::new(&outer.dest_dir), Path::new(&inner.dest_dir));
+            if o != i && i.starts_with(o) {
+                return Err(TapectlError::Other(format!(
+                    "unit \"{}\" would be restored inside unit \"{}\"'s destination ({} is \
+                     inside {}). Restore them separately, each to its own --to. Nothing was \
+                     read from tape.",
+                    inner.unit, outer.unit, inner.dest_dir, outer.dest_dir
+                )));
+            }
+        }
+    }
 
     let mut planned = Vec::with_capacity(requests.len());
     let mut needs = Vec::new();
@@ -1958,7 +1990,7 @@ fn plan_units(
             dest_dir: &req.dest_dir,
         };
         let scratch = scratch_dir(Path::new(&req.dest_dir), options.scratch.as_deref());
-        let plan = plan_restore(conn, config, &selection, target, &scratch)?;
+        let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
         preflight_checks(conn, &req.unit, &selection, target, &scratch, options)?;
         if let Some(n) = space_needs(Path::new(&req.dest_dir), &scratch, &plan, None) {
             needs.extend(n);
@@ -1978,7 +2010,7 @@ fn plan_units(
             &needs,
             "Restoring these units one after another keeps every restored unit and the largest \
              unit's spooled slices (a unit whose isolated catalogue is on disk streams and \
-             spools nothing).",
+             spools nothing, unless --spool).",
         )?;
     }
     planned.sort_by_key(PlannedUnit::first_position);
@@ -2070,7 +2102,7 @@ fn restore_units_from_store(
     if let Some(id) = volume_id {
         crate::db::phase_timings::record_drained(
             conn,
-            "restore units",
+            "restore volume",
             crate::db::phase_timings::Subject::Volume(id),
         );
     }
@@ -2297,6 +2329,54 @@ pub fn select_write_positions(
         versions_on_volume,
         positions,
     })
+}
+
+/// Every unit with a live copy on `volume_label` — written slices of a
+/// completed write, the predicate [`select_write_positions`] reads by, so
+/// each unit named is one `restore unit --from <label>` would accept — in
+/// the order its first slice lies on the tape. `restore volume`'s default
+/// set (ADR-0012 2026-10-06 item 23, issue #398).
+///
+/// Not gated on the volume's status or condition: a quarantined or retired
+/// tape can be the only copy left, and reading it is the operator's call,
+/// exactly as with `restore unit`. Refused when the catalog has no such
+/// volume or nothing on it, so an empty set never reaches the drive.
+pub fn units_on_volume(conn: &Connection, volume_label: &str) -> Result<Vec<String>> {
+    let known: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![volume_label],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if known.is_none() {
+        return Err(TapectlError::Other(format!(
+            "no volume \"{volume_label}\" in the catalog. Nothing was read from tape."
+        )));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT u.name, MIN(CAST(wp.position AS INTEGER)) AS first
+         FROM write_positions wp
+         JOIN writes w ON w.id = wp.write_id
+         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+         JOIN stage_sets ss ON ss.id = sl.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE v.label = ?1 AND w.status = 'completed' AND wp.status = 'written'
+         GROUP BY u.id
+         ORDER BY first, u.name",
+    )?;
+    let names = stmt
+        .query_map(params![volume_label], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if names.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "volume \"{volume_label}\" holds no unit with written slices. Nothing was read \
+             from tape."
+        )));
+    }
+    Ok(names)
 }
 
 /// The written slices of ONE stage set on one volume, in tape order.
@@ -5747,6 +5827,338 @@ mod tests {
                 assert_eq!(slices, want);
                 assert_eq!(m.fake.opens(), vec![]);
                 assert_eq!(rows(&m.conn).unwrap().len(), 0);
+            }
+        }
+
+        // ── ADR-0012 2026-10-06 item 23: `restore volume` and `--spool`,
+        // driven through the CLI's own `run` over the injected drive ──
+
+        mod restore_volume_cli {
+            use super::multi::{multi, noise, volume_of, Multi, DEVICE};
+            use super::*;
+            use crate::cli::restore::{run, units_report_lines, RestoreCommands};
+            use crate::tape::fake::Op;
+            use crate::volume::restore_record::rows;
+
+            fn three(label: &str, catalogue: bool) -> Multi {
+                let a = [("a.bin", noise(90_000, 1)), ("a.txt", b"alpha".to_vec())];
+                let b = [("b.bin", noise(120_000, 2)), ("d/b.txt", b"bravo".to_vec())];
+                let c = [("c.txt", b"charlie".to_vec())];
+                volume_of(
+                    label,
+                    &[("ua", &a, "64k"), ("ub", &b, "64k"), ("uc", &c, "64k")],
+                    catalogue,
+                )
+            }
+
+            /// `restore volume <label> --to <to> [--unit …]`.
+            fn volume(label: &str, to: &Path, units: &[&str]) -> RestoreCommands {
+                RestoreCommands::Volume {
+                    label: label.to_string(),
+                    to: to.to_string_lossy().into_owned(),
+                    units: units.iter().map(|u| u.to_string()).collect(),
+                    device: Some(DEVICE.to_string()),
+                    scratch: None,
+                    overwrite: false,
+                    no_space_check: false,
+                    spool: false,
+                    fail_fast: false,
+                    dry_run: false,
+                }
+            }
+
+            fn with_spool(mut cmd: RestoreCommands) -> RestoreCommands {
+                match &mut cmd {
+                    RestoreCommands::Volume { spool, .. } | RestoreCommands::Unit { spool, .. } => {
+                        *spool = true
+                    }
+                    _ => unreachable!(),
+                }
+                cmd
+            }
+
+            fn cli(m: &Multi, cmd: &RestoreCommands) -> Result<()> {
+                run(&m.conn, &m.paths, &Config::default(), cmd, false, false)
+            }
+
+            fn reads(m: &Multi) -> Vec<u32> {
+                m.fake
+                    .ops()
+                    .iter()
+                    .filter_map(|op| match op {
+                        Op::Read(n) => Some(*n),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            fn assert_unit_restored(m: &Multi, k: usize, root: &Path) {
+                for (path, bytes) in &m.units[k].files {
+                    assert_eq!(
+                        &fs::read(root.join(&m.units[k].name).join(path)).unwrap_or_default(),
+                        bytes,
+                        "{}: {path}",
+                        m.units[k].name
+                    );
+                }
+            }
+
+            /// Every row's dar argv, oldest first.
+            fn argvs(m: &Multi) -> Vec<String> {
+                rows(&m.conn)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.dar_argv.expect("dar ran"))
+                    .collect()
+            }
+
+            /// THE acceptance test for the CLI half of #398: with no
+            /// `--unit`, every unit on the volume is restored, each into
+            /// `--to/<unit>`, in ONE pass — one drive open, one rewind, File
+            /// 0 once, every slice in ascending position — under ONE contact
+            /// recorded as `restore volume`, with a `unit` row per unit.
+            #[test]
+            fn restore_volume_restores_every_unit_into_its_own_directory_in_one_pass() {
+                let m = three("RV-1", false);
+                let root = TempDir::new().unwrap();
+                let to = root.path().join("out");
+                cli(&m, &volume("RV-1", &to, &[])).expect("restore volume");
+                for k in 0..3 {
+                    assert_unit_restored(&m, k, &to);
+                }
+                let mut entries: Vec<String> = fs::read_dir(&to)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                entries.sort();
+                assert_eq!(entries, ["ua", "ub", "uc"], "one directory per unit");
+
+                assert_eq!(m.fake.opens().len(), 1, "the drive is opened once");
+                assert_eq!(m.fake.rewinds(), 1, "{:?}", m.fake.ops());
+                let reads = reads(&m);
+                assert_eq!(reads[0], 0, "File 0 first: {reads:?}");
+                assert!(
+                    reads.windows(2).all(|w| w[0] < w[1]),
+                    "strictly ascending: {reads:?}"
+                );
+                let slices: usize = m.units.iter().map(|u| u.cipher_lens.len()).sum();
+                assert_eq!(reads.len(), slices + 1, "{reads:?}");
+
+                let ops: Vec<String> = {
+                    let mut stmt = m
+                        .conn
+                        .prepare("SELECT operation FROM cartridge_contacts")
+                        .unwrap();
+                    stmt.query_map([], |r| r.get(0))
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap()
+                };
+                assert_eq!(ops, ["restore volume"], "one contact, under its own name");
+                let rows = rows(&m.conn).unwrap();
+                let dests: Vec<String> = rows.iter().map(|r| r.destination.clone()).collect();
+                let want: Vec<String> = ["ua", "ub", "uc"]
+                    .iter()
+                    .map(|u| to.join(u).to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(dests, want);
+                assert!(rows.iter().all(|r| r.kind == "unit" && r.outcome == "ok"));
+            }
+
+            /// `--unit` names the set: only those units are read and
+            /// restored, the others neither read nor created. A dry run of
+            /// the same set opens no drive.
+            #[test]
+            fn restore_volume_unit_restores_only_the_units_named() {
+                let m = three("RV-2", false);
+                let root = TempDir::new().unwrap();
+                let to = root.path().join("out");
+
+                let mut dry = volume("RV-2", &to, &["uc", "ua"]);
+                if let RestoreCommands::Volume { dry_run, .. } = &mut dry {
+                    *dry_run = true;
+                }
+                cli(&m, &dry).expect("dry run");
+                assert_eq!(m.fake.opens(), vec![], "a dry run opens no drive");
+
+                cli(&m, &volume("RV-2", &to, &["uc", "ua"])).expect("restore volume");
+                assert_unit_restored(&m, 0, &to);
+                assert_unit_restored(&m, 2, &to);
+                assert!(!to.join("ub").exists(), "ub was not asked for");
+                let b_first = m.units[1].first_position;
+                let b_last = b_first + m.units[1].cipher_lens.len() as u32;
+                assert!(
+                    reads(&m).iter().all(|n| !(b_first..b_last).contains(n)),
+                    "ub's slices were read: {:?}",
+                    reads(&m)
+                );
+                let names: Vec<String> = rows(&m.conn)
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.unit_name.unwrap())
+                    .collect();
+                assert_eq!(names, ["ua", "uc"], "tape order, not the order asked");
+            }
+
+            /// A unit that fails makes the command fail — non-zero exit,
+            /// naming how many — while the others are still restored; with
+            /// `--fail-fast` the units after it are not attempted.
+            #[test]
+            fn restore_volume_fails_when_any_unit_fails() {
+                let m = three("RV-3", false);
+                let b_first = m.units[1].first_position as usize;
+                m.fake.state().files[b_first][300] ^= 0xFF;
+                let root = TempDir::new().unwrap();
+                let to = root.path().join("out");
+                let err = cli(&m, &volume("RV-3", &to, &[]))
+                    .expect_err("a failed unit fails the command")
+                    .to_string();
+                assert!(err.contains("1 of 3 units not restored from RV-3"), "{err}");
+                assert_unit_restored(&m, 0, &to);
+                assert_unit_restored(&m, 2, &to);
+
+                let to = root.path().join("fast");
+                let mut cmd = volume("RV-3", &to, &[]);
+                if let RestoreCommands::Volume { fail_fast, .. } = &mut cmd {
+                    *fail_fast = true;
+                }
+                let err = cli(&m, &cmd).unwrap_err().to_string();
+                assert!(err.contains("2 of 3 units not restored"), "{err}");
+                assert!(!to.join("uc").exists(), "--fail-fast stopped before uc");
+            }
+
+            /// The report prints one line per unit in TAPE order — asked
+            /// for backwards here — saying how each ended, then a summary.
+            #[test]
+            fn the_report_is_in_tape_order_and_names_each_outcome() {
+                let m = three("RV-4", false);
+                let b_first = m.units[1].first_position as usize;
+                m.fake.state().files[b_first][300] ^= 0xFF;
+                let root = TempDir::new().unwrap();
+                let reqs: Vec<UnitRequest> = ["uc", "ub", "ua"]
+                    .iter()
+                    .map(|u| UnitRequest {
+                        unit: u.to_string(),
+                        version: None,
+                        dest_dir: root.path().join(u).to_string_lossy().into_owned(),
+                    })
+                    .collect();
+                let report = restore_units(
+                    &m.conn,
+                    &m.paths,
+                    &Config::default(),
+                    "RV-4",
+                    &reqs,
+                    &RestoreOptions::default(),
+                    false,
+                    DEVICE,
+                    4096,
+                    false,
+                )
+                .unwrap();
+                let lines = units_report_lines(&report);
+                assert_eq!(lines.len(), 4, "{lines:#?}");
+                assert!(lines[0].starts_with("restored \"ua\" v1"), "{lines:#?}");
+                assert!(lines[1].starts_with("FAILED \"ub\" v1"), "{lines:#?}");
+                assert!(lines[1].contains("checksum mismatch"), "{lines:#?}");
+                assert!(lines[2].starts_with("restored \"uc\" v1"), "{lines:#?}");
+                assert_eq!(lines[3], "2 of 3 unit(s) restored from RV-4");
+            }
+
+            /// No volume of that label, or two units of which one would
+            /// land inside the other's directory: refused before the drive.
+            #[test]
+            fn restore_volume_refuses_before_the_drive() {
+                let a = [("a.txt", b"alpha".to_vec())];
+                let b = [("b.txt", b"bravo".to_vec())];
+                let m = volume_of(
+                    "RV-5",
+                    &[("nest", &a, "64k"), ("nest/inner", &b, "64k")],
+                    false,
+                );
+                let root = TempDir::new().unwrap();
+                let err = cli(&m, &volume("NOPE", root.path(), &[]))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("no volume \"NOPE\""), "{err}");
+                let err = cli(&m, &volume("RV-5", root.path(), &[]))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("inside"), "{err}");
+                assert!(err.contains("Nothing was read from tape"), "{err}");
+                assert_eq!(m.fake.opens(), vec![], "the drive was opened");
+            }
+
+            /// `restore volume --spool`: units whose catalogues are on disk
+            /// (they would stream) are spooled instead — dar reads files in
+            /// direct mode, no `--sequential-read`. The same set without the
+            /// flag streams: the positive control.
+            #[test]
+            fn restore_volume_spool_forces_the_spooled_path() {
+                let m = three("RV-6", true);
+                let root = TempDir::new().unwrap();
+                let streamed = root.path().join("streamed");
+                cli(&m, &volume("RV-6", &streamed, &[])).unwrap();
+                let argv = argvs(&m);
+                assert_eq!(argv.len(), 3);
+                assert!(
+                    argv.iter().all(|a| a.contains(r#""--sequential-read""#)),
+                    "positive control: without --spool these stream: {argv:#?}"
+                );
+
+                let spooled = root.path().join("spooled");
+                cli(&m, &with_spool(volume("RV-6", &spooled, &[]))).unwrap();
+                for k in 0..3 {
+                    assert_unit_restored(&m, k, &spooled);
+                }
+                let argv = argvs(&m);
+                assert_eq!(argv.len(), 6);
+                assert!(
+                    argv[3..].iter().all(|a| !a.contains("--sequential-read")),
+                    "--spool must not stream: {argv:#?}"
+                );
+            }
+
+            /// `restore unit --spool`, the same: a unit that would stream
+            /// spools, and its decrypted slices are on disk in scratch while
+            /// the tape is read.
+            #[test]
+            fn restore_unit_spool_forces_the_spooled_path() {
+                let tree = [
+                    ("big.bin", noise(300_000, 1)),
+                    ("small.txt", b"small".to_vec()),
+                ];
+                let m = multi("RU-SP", "sp-unit", &tree, "150k", true);
+                let unit = |to: &Path| RestoreCommands::Unit {
+                    unit: "sp-unit".into(),
+                    from: "RU-SP".into(),
+                    to: to.to_string_lossy().into_owned(),
+                    device: Some(DEVICE.into()),
+                    version: None,
+                    scratch: None,
+                    overwrite: false,
+                    no_space_check: false,
+                    spool: false,
+                    dry_run: false,
+                };
+                let root = TempDir::new().unwrap();
+                cli(&m, &unit(&root.path().join("streamed"))).unwrap();
+                assert!(
+                    argvs(&m)[0].contains(r#""--sequential-read""#),
+                    "positive control: without --spool it streams"
+                );
+
+                let spooled = root.path().join("spooled");
+                m.fake.watch(&spooled.join(SCRATCH_NAME));
+                cli(&m, &with_spool(unit(&spooled))).unwrap();
+                m.assert_restored(&spooled);
+                let argv = &argvs(&m)[1];
+                assert!(!argv.contains("--sequential-read"), "{argv}");
+                assert!(
+                    m.fake.watched_bytes().iter().any(|(_, b)| *b > 0),
+                    "spooled slices are on disk: {:?}",
+                    m.fake.watched_bytes()
+                );
             }
         }
     }
