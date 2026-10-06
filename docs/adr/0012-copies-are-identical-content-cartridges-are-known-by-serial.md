@@ -1208,3 +1208,7 @@ telemetry and cold-storage resilience" handoff.
     decrypt-to-disk path on `restore unit`/`restore volume`. **The plaintext sha256 is no longer
     re-checked after decryption** in tapectl's restore: the ciphertext hash plus age's per-chunk
     authentication cover the same bytes.
+24. **`writes.write_verified` means "this write was fully read back"** (#392). It is set when a
+    confirm of the Integrity tier (every slice's hash checked) completes, and for every completed
+    write on a volume when a full `volume verify` passes. A quick confirm, the default after #387,
+    leaves it unset.
