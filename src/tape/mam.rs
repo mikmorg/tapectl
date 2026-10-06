@@ -36,6 +36,91 @@ pub struct MamInfo {
     /// when the medium density code is unavailable (mhvtl reports only
     /// this one). Same `0x..` hex format.
     pub format_density_code: Option<u8>,
+
+    // ── The chip's lifetime attributes (issue #299, ADR-0012 2026-10-06
+    // item 11). Kept, not converted: each is the integer the drive printed,
+    // in the unit its label names (`MiB` on every capture so far). Whether
+    // MAM's `[MiB]` is honest is #182's open question, so no `* MIB`
+    // multiply happens here — the field names carry the unit instead, and a
+    // ruling on #182 changes how these are READ, never what was parsed.
+    /// "Total MiB written in medium life" — lifetime write wear.
+    pub life_written_mib_raw: Option<i64>,
+    /// "Total MiB read in medium life" — lifetime read wear.
+    pub life_read_mib_raw: Option<i64>,
+    /// "Total MiB written in current/last load". Whether this resets per
+    /// load or per power-on is not established: shown, never differenced.
+    pub load_written_mib_raw: Option<i64>,
+    /// "Total MiB read in current/last load"; see `load_written_mib_raw`.
+    pub load_read_mib_raw: Option<i64>,
+    /// "Initialization count" — how many times the medium was re-initialised.
+    pub initialization_count: Option<i64>,
+    /// "Medium manufacture date", verbatim (`20170824` on the one real
+    /// capture). One sample is one sample: [`MamInfo::manufacture_date`]
+    /// derives a date on read, and the raw text is what is kept.
+    pub manufacture_date_raw: Option<String>,
+    /// "TapeAlert flags" as the chip reports them — `Some(0)` when the line
+    /// says 0 (the drive said zero, which is not the same fact as "never
+    /// asked").
+    pub tape_alert_flags: Option<i64>,
+    /// "Density vendor/serial number at last load", `load-1`, `load-2`,
+    /// `load-3`: the last four drives that loaded this cartridge, most
+    /// recent first. A slot is `Some` whenever its line is present — even
+    /// one carrying a vendor and no serial, which is what the real HP
+    /// capture shows for three of the four. `None` would claim the chip said
+    /// nothing, which is a different fact.
+    pub drive_ring: [Option<DriveRingSlot>; 4],
+}
+
+/// One slot of the chip's four-deep "Density vendor/serial number at …"
+/// ring (issue #299).
+///
+/// The raw value is kept beside the split because one capture cannot tell
+/// "vendor recorded, serial blank" from "the tool padded an empty record":
+/// a parser that collapsed them would destroy the evidence that settles it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DriveRingSlot {
+    /// The value as printed, padding trimmed from both ends.
+    pub raw: String,
+    /// The first 8 characters (the T10 vendor field), trimmed.
+    pub vendor: String,
+    /// Everything after them, trimmed — possibly empty.
+    pub serial: String,
+}
+
+impl DriveRingSlot {
+    /// `value` is the text after the label's colon, its one separating
+    /// space removed and the padding inside it intact.
+    fn parse(value: &str) -> DriveRingSlot {
+        let value = value.trim_end();
+        let (vendor, serial) = match value.char_indices().nth(8) {
+            Some((i, _)) => value.split_at(i),
+            None => (value, ""),
+        };
+        DriveRingSlot {
+            raw: value.trim().to_string(),
+            vendor: vendor.trim().to_string(),
+            serial: serial.trim().to_string(),
+        }
+    }
+}
+
+impl MamInfo {
+    /// [`MamInfo::manufacture_date_raw`] read as `YYYYMMDD`, when it is one.
+    pub fn manufacture_date(&self) -> Option<chrono::NaiveDate> {
+        let raw = self.manufacture_date_raw.as_deref()?.trim();
+        chrono::NaiveDate::parse_from_str(raw, "%Y%m%d").ok()
+    }
+
+    /// Whether the chip reported any of its lifetime attributes — "this
+    /// chip says nothing about wear" (mhvtl) is a different fact from a
+    /// chip reporting zeros (a new cartridge).
+    pub fn has_lifetime_attributes(&self) -> bool {
+        self.life_written_mib_raw.is_some()
+            || self.life_read_mib_raw.is_some()
+            || self.initialization_count.is_some()
+            || self.manufacture_date_raw.is_some()
+            || self.drive_ring.iter().any(Option::is_some)
+    }
 }
 
 /// The program [`read_mam`] runs. One constant, so the argv the journal
@@ -47,11 +132,11 @@ pub const MAM_TOOL: &str = "sg_read_attr";
 ///
 /// Deliberately a SIBLING of [`MamInfo`], never a field of it: `MamInfo` is
 /// the parse, and it compares equal to `MamInfo::default()` for output that
-/// carries none of its eight attributes. The capture is the observation, and
-/// the attributes `MamInfo` does not keep — the four-deep "Density
-/// vendor/serial number at last load" ring, the per-load byte counters, the
-/// vendor-specific blocks — are overwritten by the act of loading the
-/// cartridge, so this is the only place they survive.
+/// carries none of its attributes. The capture is the observation, and the
+/// attributes `MamInfo` does not keep — the second `Assigning organization`,
+/// the vendor-specific hex blocks, anything a later drive adds — survive
+/// only here. (`MamInfo` has kept the lifetime attributes and the four-deep
+/// drive ring since issue #299; this capture kept them before that.)
 ///
 /// No hook, trigger or contact here: which call site took the reading, for
 /// which command, inside which contact, are facts about the CALLER, attached
@@ -207,6 +292,21 @@ const JOURNAL_ATTRIBUTES: &[(&str, &str)] = &[
     ("medium_length", "Medium length"),
     ("medium_density_code", "Medium density code"),
     ("format_density_code", "Format density code"),
+    // Issue #299: the lifetime attributes `parse_mam` now keeps.
+    ("life_written", "Total MiB written in medium life"),
+    ("life_read", "Total MiB read in medium life"),
+    ("load_written", "Total MiB written in current/last load"),
+    ("load_read", "Total MiB read in current/last load"),
+    ("initialization_count", "Initialization count"),
+    ("manufacture_date", "Medium manufacture date"),
+    ("tape_alert_flags", "TapeAlert flags"),
+    (
+        "ring_last_load",
+        "Density vendor/serial number at last load",
+    ),
+    ("ring_load_1", "Density vendor/serial number at load-1"),
+    ("ring_load_2", "Density vendor/serial number at load-2"),
+    ("ring_load_3", "Density vendor/serial number at load-3"),
 ];
 
 /// The journal's `parsed_json` for one raw capture.
@@ -288,9 +388,51 @@ pub fn parse_mam(raw: &str) -> MamInfo {
             m.medium_density_code = parse_hex_density(value);
         } else if label.eq_ignore_ascii_case("Format density code") {
             m.format_density_code = parse_hex_density(value);
+        } else if label.eq_ignore_ascii_case("Total MiB written in medium life") {
+            m.life_written_mib_raw = value.parse::<i64>().ok();
+        } else if label.eq_ignore_ascii_case("Total MiB read in medium life") {
+            m.life_read_mib_raw = value.parse::<i64>().ok();
+        } else if label.eq_ignore_ascii_case("Total MiB written in current/last load") {
+            m.load_written_mib_raw = value.parse::<i64>().ok();
+        } else if label.eq_ignore_ascii_case("Total MiB read in current/last load") {
+            m.load_read_mib_raw = value.parse::<i64>().ok();
+        } else if label.eq_ignore_ascii_case("Initialization count") {
+            m.initialization_count = value.parse::<i64>().ok();
+        } else if label.eq_ignore_ascii_case("Medium manufacture date") {
+            if !value.is_empty() {
+                m.manufacture_date_raw = Some(value.to_string());
+            }
+        } else if label.eq_ignore_ascii_case("TapeAlert flags") {
+            m.tape_alert_flags = parse_int_or_hex(value);
+        } else if let Some(slot) = ring_slot(label) {
+            // The padding between vendor and serial is meaningful, so the
+            // slot is parsed from the value before `trim`.
+            let (_, untrimmed) = line.split_once(':').unwrap_or_default();
+            let untrimmed = untrimmed.strip_prefix(' ').unwrap_or(untrimmed);
+            m.drive_ring[slot] = Some(DriveRingSlot::parse(untrimmed));
         }
     }
     m
+}
+
+/// Which drive-ring slot a label names, most recent load first.
+fn ring_slot(label: &str) -> Option<usize> {
+    const RING: [&str; 4] = [
+        "Density vendor/serial number at last load",
+        "Density vendor/serial number at load-1",
+        "Density vendor/serial number at load-2",
+        "Density vendor/serial number at load-3",
+    ];
+    RING.iter().position(|r| label.eq_ignore_ascii_case(r))
+}
+
+/// A decimal integer, or a `0x..` hex one.
+fn parse_int_or_hex(value: &str) -> Option<i64> {
+    let v = value.trim();
+    match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        Some(hex) => i64::from_str_radix(hex, 16).ok(),
+        None => v.parse::<i64>().ok(),
+    }
 }
 
 /// Parse a `sg_read_attr` density code value, e.g. `"0x5a"`, into its byte.
@@ -400,8 +542,122 @@ mod tests {
 
     #[test]
     fn missing_fields_are_none_not_error() {
-        let m = parse_mam("Attribute values:\n  TapeAlert flags: 0\n");
+        let m = parse_mam("Attribute values:\n  MAM space remaining [B]: 3062\n");
         assert_eq!(m, MamInfo::default());
+    }
+
+    // ── the lifetime attributes (issue #299) ──
+
+    /// The controlling distinction: on the real HP capture every lifetime
+    /// counter is present and zero, so each parses as `Some(0)` — "the
+    /// drive said zero" — never `None`, "we never asked".
+    #[test]
+    fn lto6_lifetime_attributes_parse_as_present_zeros_not_absent() {
+        let m = parse_mam(LTO6_SAMPLE);
+        assert_eq!(m.life_written_mib_raw, Some(0));
+        assert_eq!(m.life_read_mib_raw, Some(0));
+        assert_eq!(m.load_written_mib_raw, Some(0));
+        assert_eq!(m.load_read_mib_raw, Some(0));
+        assert_eq!(m.initialization_count, Some(0));
+        assert_eq!(m.tape_alert_flags, Some(0));
+        assert!(m.has_lifetime_attributes());
+    }
+
+    /// The positive control for the test above, in ONE fixture: the mhvtl
+    /// sample carries no lifetime line, so every lifetime field is `None`
+    /// — while its `TapeAlert flags: 0` line IS present and parses as
+    /// `Some(0)`. It can pass neither by a blanket default nor by parsing
+    /// nothing.
+    #[test]
+    fn mhvtl_sample_has_tape_alert_flags_but_no_lifetime_attributes() {
+        let m = parse_mam(SAMPLE);
+        assert_eq!(m.life_written_mib_raw, None);
+        assert_eq!(m.life_read_mib_raw, None);
+        assert_eq!(m.load_written_mib_raw, None);
+        assert_eq!(m.load_read_mib_raw, None);
+        assert_eq!(m.initialization_count, None);
+        assert_eq!(m.manufacture_date_raw, None);
+        assert_eq!(m.drive_ring, [None, None, None, None]);
+        assert_eq!(m.tape_alert_flags, Some(0));
+        assert!(!m.has_lifetime_attributes());
+    }
+
+    /// The drive ring: `at last load` splits into vendor and serial; the
+    /// three older slots carry a vendor and no serial, and are PRESENT with
+    /// an empty serial — never `None`, which would claim the chip said
+    /// nothing. The raw value is kept beside the split.
+    #[test]
+    fn the_drive_ring_keeps_every_slot_and_its_raw_value() {
+        let m = parse_mam(LTO6_SAMPLE);
+        let last = m.drive_ring[0].as_ref().expect("last-load slot present");
+        assert_eq!(last.vendor, "HP");
+        assert_eq!(last.serial, "HUJ808A5L4");
+        assert_eq!(last.raw, "HP      HUJ808A5L4");
+        for (i, slot) in m.drive_ring.iter().enumerate().skip(1) {
+            let slot = slot
+                .as_ref()
+                .unwrap_or_else(|| panic!("ring slot {i} must be present, not None"));
+            assert_eq!(slot.vendor, "HP", "slot {i}");
+            assert_eq!(slot.serial, "", "slot {i}");
+            assert_eq!(slot.raw, "HP", "slot {i}");
+        }
+    }
+
+    /// The manufacture date is kept as the raw text; the date is a
+    /// separate, derived accessor.
+    #[test]
+    fn the_manufacture_date_is_kept_raw_and_derived_on_read() {
+        let m = parse_mam(LTO6_SAMPLE);
+        assert_eq!(m.manufacture_date_raw.as_deref(), Some("20170824"));
+        assert_eq!(
+            m.manufacture_date(),
+            chrono::NaiveDate::from_ymd_opt(2017, 8, 24)
+        );
+        let odd = MamInfo {
+            manufacture_date_raw: Some("2017-08".into()),
+            ..MamInfo::default()
+        };
+        assert_eq!(odd.manufacture_date(), None);
+    }
+
+    /// SYNTHETIC, not a recording: distinct non-zero counters, because the
+    /// real capture's zeros cannot detect a stray unit conversion
+    /// (`0 * 2^20 == 0`). The parsed value must equal the printed integer —
+    /// #182 (is MAM's `[MiB]` honest?) stays cheap to settle only while no
+    /// converted figure is kept.
+    const SYNTHETIC_WORN: &str = "Attribute values:
+  TapeAlert flags: 0x40
+  Load count: 812
+  Initialization count: 3
+  Total MiB written in medium life: 41230117
+  Total MiB read in medium life: 9876543
+  Total MiB written in current/last load: 2301
+  Total MiB read in current/last load: 17
+";
+
+    #[test]
+    fn lifetime_counters_are_the_printed_integers_with_no_unit_conversion() {
+        let m = parse_mam(SYNTHETIC_WORN);
+        assert_eq!(m.life_written_mib_raw, Some(41_230_117));
+        assert_eq!(m.life_read_mib_raw, Some(9_876_543));
+        assert_eq!(m.load_written_mib_raw, Some(2301));
+        assert_eq!(m.load_read_mib_raw, Some(17));
+        assert_eq!(m.initialization_count, Some(3));
+        assert_eq!(m.tape_alert_flags, Some(0x40));
+        assert_eq!(m.load_count, Some(812));
+    }
+
+    /// The journal's `parsed_json` keeps them too, with the unit the label
+    /// named.
+    #[test]
+    fn journal_attributes_keep_the_lifetime_attributes_and_their_unit() {
+        let v = journal_attributes(SYNTHETIC_WORN);
+        assert_eq!(v["life_written"]["value"], 41_230_117);
+        assert_eq!(v["life_written"]["unit"], serde_json::Value::Null);
+        assert_eq!(v["initialization_count"]["value"], 3);
+        let v = journal_attributes(LTO6_SAMPLE);
+        assert_eq!(v["ring_last_load"]["value"], "HP      HUJ808A5L4");
+        assert_eq!(v["manufacture_date"]["value"], 20170824);
     }
 
     // `LTO6_SAMPLE`: the real HP LTO-6 capture, in `tests_support` above.
@@ -514,7 +770,7 @@ mod tests {
             parse_mam("  Maximum capacity in partition [MB]: 2500000\n").max_capacity_bytes,
             None
         );
-        let empty = journal_attributes("Attribute values:\n  TapeAlert flags: 0\n");
+        let empty = journal_attributes("Attribute values:\n  MAM space remaining [B]: 3062\n");
         assert_eq!(empty, serde_json::json!({}));
     }
 }
