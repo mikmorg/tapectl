@@ -133,7 +133,7 @@ pub struct PolicyArgs {
     /// Checksum mode
     #[arg(long)]
     pub checksum_mode: Option<String>,
-    /// Slice size (e.g., "10G", the default)
+    /// Slice size (e.g., "1G", the default)
     #[arg(long)]
     pub slice_size: Option<String>,
     /// Verify interval in days

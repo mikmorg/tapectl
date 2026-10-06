@@ -82,7 +82,7 @@ and is recorded honestly. Schema note: **no new column needed** — the existing
 `verification_sessions.verify_type CHECK('full','quick')` maps integrity→`full`,
 navigable→`quick` (#23's honesty requirement lands on the existing column).
 
-### 1.3 Slice-size default  ·  RATIFIED: **10G**, policy-resolved
+### 1.3 Slice-size default  ·  RATIFIED: **10G**, policy-resolved — **changed to 1G on 2026-10-06** (ADR-0012, amendment 2026-10-06: the slice must fit after the drive's early warning once a short seal exists, #420)
 The shipped default is `2400G` (`config.rs:155`) — one slice per tape: OOM under
 the current buffering glue, a whole-tape blast radius on damage, and no
 per-slice retry quantum. Sizing analysis for LTO-6 (2.5 TB):

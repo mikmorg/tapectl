@@ -460,13 +460,14 @@ pub struct DefaultsConfig {
 }
 
 fn default_slice_size() -> String {
-    // Ratified 2026-07-22 (docs/design/v2-open-questions.md §1.3). dar -s is an
-    // exact per-slice cut and a per-unit max; 10G ≈ 250 slices per LTO-6 tape,
-    // ~1 min retry quantum, ≤5G expected loss per damage event, zero padding on
-    // full slices (multiple of the 512 KB block). The old 2400G default was a
-    // whole-tape slice: maximal blast radius and guaranteed OOM under the
-    // pre-#35 buffering glue. Per-class overrides ride the policy chain (#35).
-    "10G".to_string()
+    // Ratified 2026-10-06 (ADR-0012, amendment 2026-10-06; was 10G from
+    // 2026-07-22, docs/design/v2-open-questions.md §1.3). dar -s is an exact
+    // per-slice cut and a per-unit max; 1G ≈ 2,300 slices per LTO-6 tape. A
+    // slice is the unit that must still fit after the drive's early warning
+    // once a short seal exists (#420), and the most a single-file restore or a
+    // damage event costs. Full slices carry zero padding (a multiple of the
+    // 512 KiB block). Per-class overrides ride the policy chain (#35).
+    "1G".to_string()
 }
 fn default_compression() -> String {
     "none".to_string()

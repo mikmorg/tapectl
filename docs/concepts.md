@@ -311,7 +311,7 @@ also current. Neither a prompt nor `--yes` accepts it; only an explicit
 
 A **stage set** is one snapshot turned into encrypted, checksummed files in the
 staging directory. `stage create` runs `dar`, which cuts the archive into
-**slices** of at most `slice_size` (default `10G`). Each slice is then encrypted
+**slices** of at most `slice_size` (default `1G`). Each slice is then encrypted
 with age to the unit's tenant, the operator, and the escrow recipient. A slice
 is the unit of tape I/O: one slice becomes one file on tape.
 

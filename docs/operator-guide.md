@@ -187,7 +187,7 @@ generation = "LTO-6"        # what the DRIVE is, not what you feed it
 directory = "/mnt/staging"  # Peak need: one unit's dar archive + one encrypted slice
 
 [defaults]
-slice_size = "10G"
+slice_size = "1G"
 global_excludes = ["*.nfo", "Thumbs.db", ".DS_Store", "*.tmp"]   # keep: a [defaults] table without it excludes nothing
 min_copies = 2              # copies every unit needs (an archive set may ask for more)
 min_locations = 2           # distinct locations those copies must be in

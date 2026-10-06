@@ -37,7 +37,7 @@ tapectl archive-set create [OPTIONS] <NAME>
 - `--encrypt <ENCRYPT>` *(one of `true`, `false`)* — Encryption enabled
 - `--compression <COMPRESSION>` — Compression mode
 - `--checksum-mode <CHECKSUM_MODE>` — Checksum mode
-- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "10G", the default)
+- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "1G", the default)
 - `--verify-interval-days <VERIFY_INTERVAL_DAYS>` — Verify interval in days
 - `--warehouse-copies <WAREHOUSE_COPIES>` — Warehouse copies expected (ADR-0006). Never set means "defer to the system default"
 - `--preserve-xattrs <PRESERVE_XATTRS>` *(one of `true`, `false`)* — Keep extended attributes, and the POSIX ACLs stored as them (true/false; false drops them all)
@@ -65,7 +65,7 @@ tapectl archive-set edit [OPTIONS] <NAME>
 - `--encrypt <ENCRYPT>` *(one of `true`, `false`)* — Encryption enabled
 - `--compression <COMPRESSION>` — Compression mode
 - `--checksum-mode <CHECKSUM_MODE>` — Checksum mode
-- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "10G", the default)
+- `--slice-size <SLICE_SIZE>` — Slice size (e.g., "1G", the default)
 - `--verify-interval-days <VERIFY_INTERVAL_DAYS>` — Verify interval in days
 - `--warehouse-copies <WAREHOUSE_COPIES>` — Warehouse copies expected (ADR-0006). Never set means "defer to the system default"
 - `--preserve-xattrs <PRESERVE_XATTRS>` *(one of `true`, `false`)* — Keep extended attributes, and the POSIX ACLs stored as them (true/false; false drops them all)
