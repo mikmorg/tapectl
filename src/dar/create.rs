@@ -364,6 +364,34 @@ pub fn test_archive(dar_binary: &str, archive_base: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Test-only: isolate the catalogue of the archive at `archive_base` into
+/// `catalog_base` (`dar -C … -A …`), for tests that build an archive with
+/// dar directly. Staging makes its catalogue on the fly instead
+/// ([`reisolate_catalogue`], issue #419).
+#[cfg(test)]
+pub(crate) fn extract_catalog(
+    dar_binary: &str,
+    archive_base: &Path,
+    catalog_base: &Path,
+) -> Result<()> {
+    if let Some(parent) = catalog_base.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let output = super::command(dar_binary)
+        .arg("-C")
+        .arg(catalog_base)
+        .arg("-A")
+        .arg(archive_base)
+        .arg("-Q")
+        .output()
+        .map_err(|e| TapectlError::Dar(e.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(TapectlError::Dar(format!("dar -C failed: {stderr}")));
+    }
+    Ok(())
+}
+
 /// Re-isolate the on-the-fly catalogue at `on_fly_base` (`-@`, which dar
 /// always compresses with bzip2 where it can) to an uncompressed one at
 /// `catalogue_base` (`dar -C … -A … -znone`) — ADR-0012's 2026-10-06
