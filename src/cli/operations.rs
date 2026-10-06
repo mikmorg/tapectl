@@ -66,8 +66,56 @@ pub fn snapshot_purge(
     Ok(())
 }
 
-/// Check unit integrity: compare disk files against staged checksums.
-pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: bool) -> Result<()> {
+/// What `unit check-integrity` found: the version whose checksums it
+/// compared the source against, and the verdict for each of its paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntegrityReport {
+    pub unit: String,
+    /// The version whose staged checksums the source was compared against
+    /// (issue #375): the newest live version that carries checksums.
+    pub version: i64,
+    /// A newer live version with no checksums yet (snapshotted, never
+    /// staged), if there is one — named so the operator knows the baseline
+    /// is an older version.
+    pub newer_without_checksums: Option<i64>,
+    pub ok: i64,
+    pub bitrot: i64,
+    pub missing: i64,
+    pub size_mismatch: i64,
+    /// Every path that is not OK.
+    pub details: Vec<IntegrityDetail>,
+}
+
+/// One path `unit check-integrity` did not find intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityDetail {
+    pub path: String,
+    /// `MISSING`, `SIZE_MISMATCH` or `BITROT`.
+    pub status: &'static str,
+    /// The recorded and the on-disk size, for `SIZE_MISMATCH` only.
+    pub sizes: Option<(i64, i64)>,
+}
+
+impl IntegrityReport {
+    /// How many paths were checked — each one stat'd, and hashed at most
+    /// once.
+    pub fn paths_checked(&self) -> i64 {
+        self.ok + self.bitrot + self.missing + self.size_mismatch
+    }
+}
+
+/// Compare a unit's source directory against ONE version's staged
+/// checksums (issue #375).
+///
+/// The baseline is the newest live version (`current`, `staged` or
+/// `created`) that carries checksums. A unit keeps several live versions at
+/// once — the write session promotes a version and never demotes its
+/// predecessor — so comparing against all of them, as this used to,
+/// reported every file changed since v1 as BITROT or SIZE_MISMATCH and
+/// every file deleted since v1 as MISSING, and hashed the unit once per
+/// version. A version that is `created` but not yet staged has no checksums
+/// and cannot be the baseline; the report names it instead.
+pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityReport> {
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
@@ -76,47 +124,69 @@ pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: boo
         .as_deref()
         .ok_or_else(|| TapectlError::Other("unit has no current path".into()))?;
 
-    // Get latest staged files with sha256
+    // The newest live version that carries checksums.
+    let baseline: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT s.id, s.version FROM snapshots s
+             WHERE s.unit_id = ?1 AND s.status IN ('current', 'staged', 'created')
+               AND EXISTS (SELECT 1 FROM files f
+                           WHERE f.snapshot_id = s.id
+                             AND f.is_directory = 0 AND f.sha256 IS NOT NULL)
+             ORDER BY s.version DESC LIMIT 1",
+            params![unit.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((snapshot_id, version)) = baseline else {
+        return Err(TapectlError::Other(format!(
+            "no staged files with checksums for \"{unit_name}\" — stage at least once first"
+        )));
+    };
+    let newer_without_checksums: Option<i64> = conn.query_row(
+        "SELECT MAX(version) FROM snapshots
+         WHERE unit_id = ?1 AND status IN ('current', 'staged', 'created') AND version > ?2",
+        params![unit.id, version],
+        |row| row.get(0),
+    )?;
+
     let mut stmt = conn.prepare(
         "SELECT f.path, f.size_bytes, f.sha256
          FROM files f
-         JOIN snapshots s ON s.id = f.snapshot_id
-         WHERE s.unit_id = ?1 AND s.status IN ('current', 'staged', 'created')
-           AND f.is_directory = 0 AND f.sha256 IS NOT NULL
-         ORDER BY s.version DESC",
+         WHERE f.snapshot_id = ?1 AND f.is_directory = 0 AND f.sha256 IS NOT NULL
+         ORDER BY f.path",
     )?;
     let staged_files: Vec<(String, i64, String)> = stmt
-        .query_map(params![unit.id], |row| {
+        .query_map(params![snapshot_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    if staged_files.is_empty() {
-        return Err(TapectlError::Other(format!(
-            "no staged files with checksums for \"{unit_name}\" — stage at least once first"
-        )));
-    }
-
-    let mut ok = 0i64;
-    let mut bitrot = 0i64;
-    let mut missing = 0i64;
-    let mut size_mismatch = 0i64;
-    let mut details: Vec<serde_json::Value> = Vec::new();
+    let mut report = IntegrityReport {
+        unit: unit_name.to_string(),
+        version,
+        newer_without_checksums,
+        ..IntegrityReport::default()
+    };
 
     for (rel_path, expected_size, expected_sha) in &staged_files {
         let full_path = Path::new(current_path).join(rel_path);
         if !full_path.exists() {
-            missing += 1;
-            details.push(serde_json::json!({"path": rel_path, "status": "MISSING"}));
+            report.missing += 1;
+            report.details.push(IntegrityDetail {
+                path: rel_path.clone(),
+                status: "MISSING",
+                sizes: None,
+            });
             continue;
         }
         let meta = fs::metadata(&full_path)?;
         if meta.len() as i64 != *expected_size {
-            size_mismatch += 1;
-            details.push(serde_json::json!({
-                "path": rel_path, "status": "SIZE_MISMATCH",
-                "expected": expected_size, "actual": meta.len(),
-            }));
+            report.size_mismatch += 1;
+            report.details.push(IntegrityDetail {
+                path: rel_path.clone(),
+                status: "SIZE_MISMATCH",
+                sizes: Some((*expected_size, meta.len() as i64)),
+            });
             continue;
         }
         // SHA256 check — streamed (issue #32/H6, the last H9-class
@@ -126,41 +196,82 @@ pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: boo
         // with the hash `stage_create`'s own baseline was established with.
         let (actual, _) = crate::staging::validate::hash_source_file(&full_path, rel_path)?;
         if actual != *expected_sha {
-            bitrot += 1;
-            details.push(serde_json::json!({"path": rel_path, "status": "BITROT"}));
+            report.bitrot += 1;
+            report.details.push(IntegrityDetail {
+                path: rel_path.clone(),
+                status: "BITROT",
+                sizes: None,
+            });
         } else {
-            ok += 1;
+            report.ok += 1;
         }
     }
+    Ok(report)
+}
 
+/// The human rendering of an [`IntegrityReport`]. It names the version the
+/// source was compared against (issue #375).
+fn render_integrity(r: &IntegrityReport) -> String {
+    let mut out = format!(
+        "integrity check for \"{}\" against v{}'s checksums:\n",
+        r.unit, r.version
+    );
+    if let Some(newer) = r.newer_without_checksums {
+        out.push_str(&format!(
+            "  v{newer} is newer but not staged yet, so it has no checksums; \
+             v{} is the baseline\n",
+            r.version
+        ));
+    }
+    out.push_str(&format!("  OK:            {}\n", r.ok));
+    if r.bitrot > 0 {
+        out.push_str(&format!("  BITROT:        {}\n", r.bitrot));
+    }
+    if r.missing > 0 {
+        out.push_str(&format!("  MISSING:       {}\n", r.missing));
+    }
+    if r.size_mismatch > 0 {
+        out.push_str(&format!("  SIZE_MISMATCH: {}\n", r.size_mismatch));
+    }
+    for d in &r.details {
+        out.push_str(&format!("    {} — {}\n", d.path, d.status));
+    }
+    out
+}
+
+/// The `--json` rendering of an [`IntegrityReport`]. `version` and
+/// `newer_version_without_checksums` were added by issue #375; every older
+/// key keeps its shape.
+fn integrity_json(r: &IntegrityReport) -> serde_json::Value {
+    let details: Vec<serde_json::Value> = r
+        .details
+        .iter()
+        .map(|d| match d.sizes {
+            Some((expected, actual)) => serde_json::json!({
+                "path": d.path, "status": d.status,
+                "expected": expected, "actual": actual,
+            }),
+            None => serde_json::json!({"path": d.path, "status": d.status}),
+        })
+        .collect();
+    serde_json::json!({
+        "unit": r.unit,
+        "version": r.version,
+        "newer_version_without_checksums": r.newer_without_checksums,
+        "ok": r.ok, "bitrot": r.bitrot,
+        "missing": r.missing, "size_mismatch": r.size_mismatch,
+        "details": details,
+    })
+}
+
+/// `unit check-integrity`: compare the source against one version's staged
+/// checksums ([`check_integrity`]) and print the result.
+pub fn unit_check_integrity(conn: &Connection, unit_name: &str, json_output: bool) -> Result<()> {
+    let report = check_integrity(conn, unit_name)?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
-                "unit": unit_name, "ok": ok, "bitrot": bitrot,
-                "missing": missing, "size_mismatch": size_mismatch,
-                "details": details,
-            })
-        );
+        println!("{}", integrity_json(&report));
     } else {
-        println!("integrity check for \"{unit_name}\":");
-        println!("  OK:            {ok}");
-        if bitrot > 0 {
-            println!("  BITROT:        {bitrot}");
-        }
-        if missing > 0 {
-            println!("  MISSING:       {missing}");
-        }
-        if size_mismatch > 0 {
-            println!("  SIZE_MISMATCH: {size_mismatch}");
-        }
-        for d in &details {
-            println!(
-                "    {} — {}",
-                d["path"].as_str().unwrap_or("?"),
-                d["status"].as_str().unwrap_or("?")
-            );
-        }
+        print!("{}", render_integrity(&report));
     }
     Ok(())
 }
@@ -4306,6 +4417,106 @@ mod tests {
             crate::staging::validate::hash_source_file(&tmp.path().join("f.txt"), "f.txt").unwrap();
         assert_ne!(actual, stale_hash);
         unit_check_integrity(&conn, "unit1", true).expect("check-integrity must still succeed");
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!((report.ok, report.bitrot), (0, 1));
+    }
+
+    /// Insert version `version` of `unit1` with `status`.
+    fn insert_version(conn: &Connection, version: i64, status: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES ((SELECT id FROM units WHERE name = 'unit1'), ?1, 'full', ?2, '/src')",
+            params![version, status],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Issue #375: from a unit's second live version on, check-integrity
+    /// compared the source against EVERY live version's checksums, so a file
+    /// changed since v1 read as BITROT, a file deleted since v1 read as
+    /// MISSING, and every path was hashed once per version. It must check
+    /// only the newest version that carries checksums.
+    #[test]
+    fn check_integrity_checks_only_the_newest_version_with_checksums() {
+        let tmp = TempDir::new().unwrap();
+        // The source as it is now: `same` unchanged since v1, `edited`
+        // rewritten (same size, so a v1 comparison would say BITROT),
+        // `grown` rewritten longer (SIZE_MISMATCH against v1), `gone`
+        // deleted (MISSING against v1).
+        std::fs::write(tmp.path().join("same"), b"same").unwrap();
+        std::fs::write(tmp.path().join("edited"), b"EDIT").unwrap();
+        std::fs::write(tmp.path().join("grown"), b"grown longer").unwrap();
+
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        insert_file(&conn, v1, "same", 4, &direct_old_style_hash(b"same"));
+        insert_file(&conn, v1, "edited", 4, &direct_old_style_hash(b"edit"));
+        insert_file(&conn, v1, "grown", 5, &direct_old_style_hash(b"grown"));
+        insert_file(&conn, v1, "gone", 4, &direct_old_style_hash(b"gone"));
+
+        let v2 = insert_version(&conn, 2, "current");
+        insert_file(&conn, v2, "same", 4, &direct_old_style_hash(b"same"));
+        insert_file(&conn, v2, "edited", 4, &direct_old_style_hash(b"EDIT"));
+        insert_file(
+            &conn,
+            v2,
+            "grown",
+            12,
+            &direct_old_style_hash(b"grown longer"),
+        );
+
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(report.version, 2, "the baseline is the newest version");
+        assert_eq!(report.newer_without_checksums, None);
+        assert_eq!(
+            (report.bitrot, report.missing, report.size_mismatch),
+            (0, 0, 0),
+            "nothing changed since v2: {:?}",
+            report.details
+        );
+        assert_eq!(report.ok, 3);
+        assert_eq!(
+            report.paths_checked(),
+            3,
+            "each of v2's three paths is checked exactly once"
+        );
+        assert!(render_integrity(&report).contains("against v2's checksums"));
+        assert_eq!(integrity_json(&report)["version"], 2);
+    }
+
+    /// Issue #375: a version snapshotted but not yet staged has no
+    /// checksums. It must not hide the staged one, and the report says
+    /// which version it checked and why.
+    #[test]
+    fn check_integrity_with_an_unstaged_newer_version_checks_the_staged_one_and_says_so() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        insert_file(&conn, v1, "f.txt", 5, &direct_old_style_hash(b"hello"));
+
+        // v2: created by `snapshot create`, never staged — no sha256.
+        let v2 = insert_version(&conn, 2, "created");
+        conn.execute(
+            "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
+             VALUES (?1, 'f.txt', 5, NULL, 0)",
+            params![v2],
+        )
+        .unwrap();
+
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(report.version, 1);
+        assert_eq!(report.newer_without_checksums, Some(2));
+        assert_eq!((report.ok, report.paths_checked()), (1, 1));
+        let text = render_integrity(&report);
+        assert!(text.contains("against v1's checksums"), "{text}");
+        assert!(
+            text.contains("v2 is newer but not staged yet"),
+            "the report must say why v2 was not the baseline: {text}"
+        );
+        assert_eq!(
+            integrity_json(&report)["newer_version_without_checksums"],
+            2
+        );
     }
 
     /// Issue #36/H10: `unit_mark_tape_only`'s dirty guard. Full migrations

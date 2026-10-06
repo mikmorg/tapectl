@@ -50,7 +50,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`unit tag`](unit.md#tapectl-unit-tag) | Add/remove tags |
 | &nbsp;&nbsp;[`unit rename`](unit.md#tapectl-unit-rename) | Rename a unit |
 | &nbsp;&nbsp;[`unit discover`](unit.md#tapectl-unit-discover) | Scan watch_roots for .tapectl-unit.toml dotfiles |
-| &nbsp;&nbsp;[`unit check-integrity`](unit.md#tapectl-unit-check-integrity) | Check file integrity against staged checksums |
+| &nbsp;&nbsp;[`unit check-integrity`](unit.md#tapectl-unit-check-integrity) | Check file integrity against the newest staged version's checksums |
 | &nbsp;&nbsp;[`unit mark-tape-only`](unit.md#tapectl-unit-mark-tape-only) | Mark unit as tape-only (local data can be deleted) |
 | [`collection`](collection.md) | Manage media collections (folder=unit factory + batch tape driver) |
 | &nbsp;&nbsp;[`collection sync`](collection.md#tapectl-collection-sync) | Sync every configured collection: register new unit folders, resolve moved/renamed ones by dotfile uuid, mark vanished ones `missing` (never deleted or retired — those are operator acts) |

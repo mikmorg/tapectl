@@ -86,7 +86,7 @@ pub enum UnitCommands {
     /// Scan watch_roots for .tapectl-unit.toml dotfiles
     Discover,
 
-    /// Check file integrity against staged checksums
+    /// Check file integrity against the newest staged version's checksums
     CheckIntegrity {
         /// Unit name
         name: String,

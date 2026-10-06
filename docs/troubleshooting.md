@@ -871,6 +871,9 @@ tapectl stage create <unit>
 different contents, which is what silent disk corruption looks like. Check
 the rest of the unit with `tapectl unit check-integrity <unit>`, and before
 you archive the new contents, compare the file against a copy you trust.
+`check-integrity` compares against the checksums of the newest staged version
+and names that version, so a file you edited on purpose since an older
+version is not reported.
 
 ### `policy sets encrypt = false, which tapectl never honours`
 

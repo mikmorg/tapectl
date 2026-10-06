@@ -19,7 +19,7 @@ tapectl unit [OPTIONS] <COMMAND>
 - [`tag`](#tapectl-unit-tag) — Add/remove tags
 - [`rename`](#tapectl-unit-rename) — Rename a unit
 - [`discover`](#tapectl-unit-discover) — Scan watch_roots for .tapectl-unit.toml dotfiles
-- [`check-integrity`](#tapectl-unit-check-integrity) — Check file integrity against staged checksums
+- [`check-integrity`](#tapectl-unit-check-integrity) — Check file integrity against the newest staged version's checksums
 - [`mark-tape-only`](#tapectl-unit-mark-tape-only) — Mark unit as tape-only (local data can be deleted)
 
 ### tapectl unit init
@@ -128,7 +128,7 @@ tapectl unit discover [OPTIONS]
 
 ### tapectl unit check-integrity
 
-Check file integrity against staged checksums
+Check file integrity against the newest staged version's checksums
 
 ```text
 tapectl unit check-integrity [OPTIONS] <NAME>

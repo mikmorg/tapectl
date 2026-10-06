@@ -916,10 +916,14 @@ tapectl unit mark-tape-only tv/breaking-bad/s01
 
 `check-integrity` exits 0 whether or not the files match, so read what it
 prints: a `BITROT`, `MISSING` or `SIZE_MISMATCH` line means they do not.
+It compares the files against the checksums of one version, the newest one
+that has been staged, and names it. A file you changed or deleted since an
+older version is not reported. A version you have snapshotted but not yet
+staged has no checksums, so the check uses the version before it and says so.
 
 ```text
 $ tapectl unit check-integrity family/letters
-integrity check for "family/letters":
+integrity check for "family/letters" against v1's checksums:
   OK:            1
   SIZE_MISMATCH: 1
     a.txt — SIZE_MISMATCH
@@ -1096,7 +1100,7 @@ and `report fire-risk` exits 0 with units at risk. A script reads those from
 
 ```text
 $ tapectl --json unit check-integrity family/letters; echo "exit=$?"
-{"bitrot":0,"details":[{"actual":12,"expected":6,"path":"a.txt","status":"SIZE_MISMATCH"}],"missing":0,"ok":1,"size_mismatch":1,"unit":"family/letters"}
+{"bitrot":0,"details":[{"actual":12,"expected":6,"path":"a.txt","status":"SIZE_MISMATCH"}],"missing":0,"newer_version_without_checksums":null,"ok":1,"size_mismatch":1,"unit":"family/letters","version":1}
 exit=0
 ```
 
@@ -1124,8 +1128,11 @@ These `--json` fields changed incompatibly from older builds:
 Additions a parser can ignore: `db backup` gains `keys_dir` (`null` when no
 keys were copied), `archive-set sync` gains `unchanged`, `archive-set info`
 gains `warehouse_copies`, `preserve_xattrs`, `preserve_acls`, `preserve_fsa`
-and `dirty_on_metadata_change`, and `key import --reactivate` prints
-`alias`, `fingerprint` and `reactivated`.
+and `dirty_on_metadata_change`, `key import --reactivate` prints
+`alias`, `fingerprint` and `reactivated`, and `unit check-integrity` gains
+`version` (the version it compared against) and
+`newer_version_without_checksums` (`null` unless a newer version is not yet
+staged).
 
 ## Warehouse Copies (Cold Cloud)
 
