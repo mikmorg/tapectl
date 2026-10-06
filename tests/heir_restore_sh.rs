@@ -1239,3 +1239,220 @@ fn a_damaged_envelope_is_reported_as_damage_not_as_a_wrong_key() {
     assert!(text.contains("try your OTHER keys"), "{text}");
     assert!(!text.contains("DAMAGED"), "{text}");
 }
+
+// ---- #412 item 1: streaming restore; item 3: --all and repeated --unit ----
+
+/// Rewrite the stub-age recipient list of tape file `pos` in place, keeping
+/// its 32-byte header length, as if the slice had been sealed to `to`.
+fn reseal(h: &Heir, pos: i64, to: &str) {
+    let f = h.dir.join("tape").join(pos.to_string());
+    let mut bytes = std::fs::read(&f).unwrap();
+    let mut new = format!("STUBAGE:{to}");
+    while new.len() < 32 {
+        new.push(' ');
+    }
+    bytes[..32].copy_from_slice(new.as_bytes());
+    std::fs::write(&f, bytes).unwrap();
+}
+
+/// A dar that records how it was called and whether every slice it was
+/// handed is a FIFO, then runs the real one.
+const DAR_SPY: &str = "#!/bin/sh\necho \"$*\" >>\"$FAKE_TAPE/dar.args\"\n\
+    for a in \"$@\"; do case \"$a\" in */restore) for f in \"$a\".*.dar; do \
+    if [ -p \"$f\" ]; then echo fifo >>\"$FAKE_TAPE/dar.slices\"; \
+    else echo file >>\"$FAKE_TAPE/dar.slices\"; fi; done ;; esac; done\n\
+    exec \"$FAKE_TAPE/hostbin/dar\" \"$@\"\n";
+
+/// The slices go from the tape through age straight into dar: dar reads
+/// FIFOs with --sequential-read, nothing decrypted is written to disk, and
+/// the space check asks only for the unit's own size (it asked for about
+/// twice that, plus a slice, which refused a 470 GiB unit on a 1 TB disk).
+#[test]
+fn a_restore_streams_slices_into_dar_without_decrypting_to_disk() {
+    let h = Heir::with_stubs(&[("dar", DAR_SPY)]);
+    let photos = unit("photos/2019");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
+    let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
+    assert!(args.contains("--sequential-read"), "{args}");
+    assert!(args.contains("-N"), "{args}");
+    let kinds = std::fs::read_to_string(h.dir.join("dar.slices")).unwrap();
+    assert_eq!(
+        kinds.lines().collect::<Vec<_>>(),
+        vec!["fifo"; photos.positions.len()],
+        "every slice handed to dar is a FIFO"
+    );
+    assert!(
+        text.contains("(the files); "),
+        "the space check asks only for the files:\n{text}"
+    );
+    assert!(!text.contains("decrypted slices"), "{text}");
+}
+
+/// A slice no key opens stops the restore with the rotation hint — and does
+/// not hang dar waiting for a slice that will never come.
+#[test]
+fn a_slice_no_key_opens_stops_the_restore_with_the_rotation_hint() {
+    let h = Heir::new();
+    let photos = unit("photos/2019");
+    reseal(&h, photos.positions[1], "carol,op,esc");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--key",
+        &h.key("bob"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("cannot decrypt slice 2"), "{text}");
+    assert!(text.contains("none of the 2 key(s) decrypted it"), "{text}");
+    assert!(text.contains("key rotation"), "{text}");
+    assert!(
+        text.contains("no identity matched any of the recipients"),
+        "age's own words stay visible:\n{text}"
+    );
+    assert!(!text.contains("RESTORE COMPLETE"), "{text}");
+}
+
+/// Ciphertext that decrypts but does not match the front index (the stub age
+/// does not authenticate, so a changed byte gets through it): the restore
+/// fails on the slice's hash and says the files already written are suspect.
+#[test]
+fn a_slice_that_does_not_match_the_front_index_fails_the_restore() {
+    let h = Heir::new();
+    let photos = unit("photos/2019");
+    let f = h.dir.join("tape").join(photos.positions[2].to_string());
+    let mut bytes = std::fs::read(&f).unwrap();
+    bytes[100] ^= 0xff;
+    std::fs::write(&f, bytes).unwrap();
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("slice 3 checksum MISMATCH"), "{text}");
+    assert!(!text.contains("RESTORE COMPLETE"), "{text}");
+}
+
+/// dar dying part way (here, before it reads anything) ends the restore
+/// with dar's own words, instead of the tape side waiting forever to hand
+/// it the next slice.
+#[test]
+fn dar_dying_mid_restore_ends_it_instead_of_hanging() {
+    let dar = "#!/bin/sh\necho 'dar: simulated failure' >&2\nexit 2\n";
+    let h = Heir::with_stubs(&[("dar", dar)]);
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("dar: simulated failure"), "{text}");
+    assert!(text.contains("dar extraction failed"), "{text}");
+}
+
+/// A tape read failing mid-unit ends the restore, names the file, and does
+/// not leave dar waiting.
+#[test]
+fn a_tape_read_failing_mid_unit_ends_the_restore() {
+    let h = Heir::new();
+    let photos = unit("photos/2019");
+    let bad = photos.positions[1].to_string();
+    let (code, text) = h.run_env(
+        &[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--unit",
+            "photos/2019",
+            "--to",
+            &h.sub("restored"),
+        ],
+        &[("FAKE_DD_FAIL", &bad)],
+    );
+    assert_ne!(code, 0, "{text}");
+    assert!(
+        text.contains(&format!("reading tape file {bad} failed")),
+        "{text}"
+    );
+    assert!(text.contains("Input/output error"), "{text}");
+}
+
+/// --all restores every unit of the envelope in one pass from one rewind,
+/// each into its own directory under --to.
+#[test]
+fn all_restores_every_unit_in_one_ascending_pass() {
+    let h = Heir::new();
+    let dest = h.dir.join("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--all",
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    for u in ["photos/2019", "docs"] {
+        assert!(same_tree(&unit(u).src, &dest.join(u)), "{u}:\n{text}");
+    }
+    assert!(!dest.join("ledgers").exists(), "bob's unit is not alice's");
+    assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
+    let got = reads(&h);
+    let mut sorted = got.clone();
+    sorted.sort();
+    assert_eq!(got, sorted, "one ascending pass:\n{:#?}", h.ops());
+    assert!(
+        text.contains("Disk space: needs about"),
+        "one combined check:\n{text}"
+    );
+    assert_eq!(text.matches("Disk space: needs about").count(), 1, "{text}");
+}
+
+/// Repeated --unit restores exactly those units; with the escrow key the
+/// envelope that lists them all (the operator's) is used.
+#[test]
+fn repeated_unit_restores_those_units_across_tenants_with_escrow() {
+    let h = Heir::new();
+    let dest = h.dir.join("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("esc"),
+        "--unit",
+        "ledgers",
+        "--unit",
+        "docs",
+        "--to",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    for u in ["ledgers", "docs"] {
+        assert!(same_tree(&unit(u).src, &dest.join(u)), "{u}:\n{text}");
+    }
+    assert!(!dest.join("photos/2019").exists(), "{text}");
+    assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
+}
