@@ -51,6 +51,24 @@
 //! warns); and `tar` in the two Requirements lines (#363). The test checks
 //! each item is present. The previous pin was `299a34c0…`.
 //!
+//! **RE-PINNED A FOURTH TIME, 2026-10-06, for tapectl 1.1.0, under the CTO's
+//! rulings recorded in ADR-0012's 2026-10-06 amendments** (the minor version
+//! moves because generated on-tape bytes change). One batch, one re-pin,
+//! reviewed by the CTO: forward-only tape navigation with a cursor checked
+//! against `mt status` (#396); a non-empty `--to` refused unless
+//! `--overwrite`, dar's skip line fatal, and the rung-3 zero-strip recipe
+//! stripping only trailing padding (#405); streaming restore into dar through
+//! FIFOs, `--all` and repeated `--unit`, `--find-envelope` listing every
+//! envelope, damage told apart from a wrong key, `mt-st` detection, the seal
+//! read last, and dar `-N` (#412), with the envelope's dar catalogue given to
+//! a streaming dar (2.7.13 loses a file's tail without it) and a fall-back
+//! to slices on disk, and a dar that needs `gpg` named up front; `--list`
+//! and `--path` reading the dar catalogues the envelopes already carry
+//! (#418); and `magic`/`requires`
+//! checks with the seal found at end of data (ADR-0012 amendment item 15,
+//! #384). The test checks each item is present. The previous pin was
+//! `6b64da4b…`.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -67,7 +85,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "6b64da4bc941df7baa2f9a79167f7597177f9a56fde0baaefe657f8daf63333f";
+const RESTORE_SH_SHA256: &str = "e8ca5902f62730f926e310393989d02978ac68a1f19901de0d666793706be9c4";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -81,25 +99,55 @@ fn restore_sh_bytes_are_pinned() {
         "RESTORE.sh bytes changed. That is an on-tape format change and a CTO decision; \
          do not re-pin without one."
     );
-    // The #349 line is still the prerequisite loop.
+    // The prerequisite check: tar (#349), mt or mt-st, and the FIFO tools
+    // the streaming restore needs (1.1.0).
     assert_eq!(
         script
-            .matches("for tool in mt dd age sha256sum dar head truncate tar; do\n")
+            .matches("for tool in dd age sha256sum dar head truncate tar mkfifo tee; do\n")
             .count(),
         1,
-        "the #349 prerequisite line"
+        "the prerequisite line"
     );
-    // Every item of the 2026-09-30 ruling is in the pinned bytes.
+    // Every item of the 2026-09-30 ruling still standing, and of 1.1.0's, is
+    // in the pinned bytes.
     for ruled in [
-        "SCRATCH=\"$(mktemp -d \"$scratch_parent/.tapectl-restore.XXXXXX\")\"",
-        "check_space \"$destdir\" \"$scratch_parent\" \"$total\" \"$largest\"",
+        // 2026-09-30
         "--scratch) scratch=$2 ;;",
         "--no-space-check)\n      SKIP_SPACE_CHECK=1",
         "OUT OF DISK SPACE in $where",
-        "if ! actual=$(hash_tape_file \"$pos\" \"$size\"); then",
         "check_layout_version \"$(toml_val \"$WORK/thunk.toml\" layout_version)\"",
-        "# Requirements: mt, dd, age, dar, sha256sum, head, truncate, tar\n",
-        "echo \"Requirements: mt, dd, age, dar, sha256sum, head, truncate, tar\"",
+        "# Requirements: mt (mt-st), dd, age, dar, sha256sum, head, truncate, tar, mkfifo, tee\n",
+        "echo \"Requirements: mt (mt-st), dd, age, dar, sha256sum, head, truncate, tar, mkfifo, tee\"",
+        // #396: forward-only navigation, cursor checked against mt status
+        "\"$MT\" -f \"$DEVICE\" fsf $((pos - from))",
+        "elif [ \"$here\" != \"$from 0\" ]; then",
+        // #405: an empty --to, dar's skip line, the trailing-only strip
+        "check_destination \"$destdir\" \"$scratch_parent\"",
+        "--overwrite)\n      OVERWRITE=1",
+        "skipped=$(grep 'not restored (user choice)$' \"$1\" 2>/dev/null |",
+        "head -c $((size - tail_len + keep)) candidate.raw > candidate.stripped",
+        // #412: streaming, -N, --all, every envelope, damage, mt-st
+        "local -a dar_opts=(-O -Q -N --sequential-read)",
+        // dar 2.7.13 loses a file's tail streaming without the catalogue:
+        // -A from the envelope, else stream only on 2.7.21+, else spool;
+        // a dar that needs gpg is named before the tape is read
+        "[ -z \"$cat\" ] || dar_opts+=(-A \"$cat\")",
+        "if [ -n \"$cat\" ] && dar_at_least 2.7.9; then",
+        "if dar_at_least 2.7.21; then",
+        "spool_unit \"$list\" \"$destdir\"",
+        "grep -i 'INITIALIZATION FAILED FOR GPGME' >/dev/null; then",
+        "mkfifo \"$fifos/restore.$num.dar\"",
+        "check_space \"$destdir\" \"$destdir\" \"$total\" 0",
+        "--all)\n      RESTORE_ALL=1",
+        "walk_envelopes found_envelope",
+        "if grep 'no identity matched' \"$WORK/age.err\" >/dev/null 2>&1; then\n      info \"  key $keyfile did not open the envelope at file $pos\"",
+        "MT=mt-st",
+        // #418: the envelope's dar catalogues
+        "--list)\n  shift",
+        "--path) RESTORE_PATHS+=(\"$2\") ;;",
+        // ADR-0012 item 15 (#384): requires, the seal at end of data
+        "check_requires \"File 0\" \"$WORK/thunk.toml\"",
+        "\"$MT\" -f \"$DEVICE\" bsfm 2 2>/dev/null || return 1",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
