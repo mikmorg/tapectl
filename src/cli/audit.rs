@@ -4060,5 +4060,27 @@ mod tests {
                 "{warnings:?}"
             );
         }
+
+        /// The review of #421: once the operator has done what the warning
+        /// says — copied the units off and retired the cartridge — the
+        /// cartridge is never verified again, so its last two points never
+        /// change. The warning must clear, or `audit` exits 1 forever.
+        #[test]
+        fn a_retired_cartridge_is_no_longer_flagged() {
+            let conn = crate::db::open_memory().unwrap();
+            read_errors::tests::seed_verifies(&conn, "C-RISE", &[1, 5]);
+            let config = Config::default();
+            let flagged = |conn: &Connection| {
+                let (_, warnings) = collect_findings(conn, &config, None).unwrap();
+                warnings.iter().any(|w| w.check == "read_error_trend")
+            };
+            assert!(flagged(&conn), "positive control: rising and in service");
+            conn.execute(
+                "UPDATE cartridges SET status = 'retired_permanent' WHERE barcode = 'C-RISE'",
+                [],
+            )
+            .unwrap();
+            assert!(!flagged(&conn), "retired: the warning clears");
+        }
     }
 }

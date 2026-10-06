@@ -1644,7 +1644,7 @@ write-protect tab set: it verifies without sliding the tab. So does a
 
 A verify that passes can still be a warning. The drive corrects read errors
 as it goes, and a cartridge whose surface is wearing makes it correct more of
-them each year, long before a sha256 fails. So every completed `volume verify`
+them each year, long before a sha256 fails. So every completed full `volume verify`
 records the read errors its drive corrected (log page 0x03: corrected with and
 without delay, rereads, uncorrected), each per GiB the drive read, as a
 `verify_read_errors` event naming its verification session. There is no
@@ -1674,6 +1674,10 @@ read_error_rise_factor = 2.0
 
 How to read it:
 
+- Only full verifies are recorded. `volume verify --quick` reads File 0, the
+  front index and the seal — a few MB — and a rate over that is a sample of
+  nothing, so a quick verify (before moving a tape, say) adds no point and
+  cannot make a healthy cartridge look as if it is rising.
 - A rate of `-` is a verify whose drive counted no bytes read on page 0x03
   (mhvtl always does this). It is skipped, never read as zero.
 - The counters are the drive's since it last cleared the page, which the HP
@@ -1685,7 +1689,11 @@ How to read it:
   reading's drive).
 - Rising, with the data still verifying: copy its units to a fresh cartridge
   while it still reads (`volume read-slices --from <LABEL> --unit <UNIT>`, then
-  `volume write` to the new one), then retire it.
+  `volume write` to the new one), then retire it. Once the cartridge is
+  `retired_permanent` or `pending_erase` (or, for a trend shown as
+  `volume:<label>`, the volume is retired or erased) it drops out of the trend
+  and the warning clears: it will not be verified again, so its last two
+  points would otherwise warn forever.
 
 ### Annually — the heir-path restore drill
 

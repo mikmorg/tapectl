@@ -43,6 +43,8 @@ use tracing::warn;
 
 use crate::db::events;
 use crate::error::Result;
+use crate::policy::coverage;
+use crate::store::Tier;
 use crate::tape::health::parse_sg_logs_page;
 
 /// The `events.action` one verify's read-error figures are recorded under.
@@ -55,6 +57,11 @@ pub const EVENT_FIELD: &str = "corrected_per_gib";
 /// starting point to be replaced from home2's recorded verifies, not a
 /// measured threshold.
 pub const DEFAULT_RISE_FACTOR: f64 = 2.0;
+
+/// Cartridge statuses whose trend is no longer reported: the operator has
+/// retired it, or its last live volume is gone and it waits to be erased.
+/// Neither will be verified again, so a rise on it could never clear.
+pub const OUT_OF_SERVICE_CARTRIDGE: &[&str] = &["retired_permanent", "pending_erase"];
 
 const GIB: f64 = (1u64 << 30) as f64;
 
@@ -129,7 +136,11 @@ fn journalled_0x03(conn: &Connection, contact_id: i64) -> Result<Option<String>>
 /// contact's sweep journalled on page 0x03, each per GiB read, as an
 /// `events` row naming the verification session, the contact, and the
 /// cartridge and drive the contact names. Called by `volume verify` after
-/// its post-command sweep, for a verify that made a session.
+/// its post-command sweep, for a FULL verify that made a session: a
+/// `--quick` verify reads a few MB, and a rate over that is no sample of the
+/// medium (the review of #421). `tier` goes into the details by the name
+/// `verification_sessions.verify_type` gives it, and [`trends`] reads only
+/// full verifies whatever was recorded.
 ///
 /// `None` — nothing recorded — when the contact could not be named or its
 /// sweep journalled no page 0x03 (a drive that does not list it, a failed
@@ -141,6 +152,7 @@ pub fn record_for_verify(
     session_id: i64,
     volume_id: i64,
     label: &str,
+    tier: Tier,
 ) -> Option<ReadErrors> {
     let contact_id = contact_id?;
     let decoded = match journalled_0x03(conn, contact_id) {
@@ -165,6 +177,10 @@ pub fn record_for_verify(
         .unwrap_or((None, None));
     let details = serde_json::json!({
         "session_id": session_id,
+        "tier": match tier {
+            Tier::Integrity => "full",
+            Tier::Navigable => "quick",
+        },
         "contact_id": contact_id,
         "cartridge_id": cartridge_id,
         "drive_serial": drive_serial,
@@ -267,15 +283,41 @@ impl CartridgeTrend {
 }
 
 /// Every cartridge's recorded verify figures, grouped and in time order.
+///
+/// Full verifies only: the point's `verification_sessions` row must say
+/// `verify_type = 'full'`. `volume verify` records no other (the review of
+/// #421), and this is the second check — read from the session the point
+/// names rather than from a details field, so it holds for every row
+/// whenever it was written.
+///
+/// Only media that will be verified again (the review of #421): a trend on
+/// a cartridge the operator has already acted on would warn forever, its
+/// last two points never changing. A cartridge's points drop out while it
+/// is [`OUT_OF_SERVICE_CARTRIDGE`] (`cartridge retire`, or `volume retire`
+/// /`compact-finish` freeing it for erasure); a `volume:<label>` trend's
+/// while its volume no longer holds bytes to verify
+/// ([`coverage::holds_bytes_to_verify`]: retired or erased — a quarantined
+/// volume stays, since re-verifying it is when its trend matters).
 pub fn trends(conn: &Connection) -> Result<Vec<CartridgeTrend>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT e.timestamp, COALESCE(e.entity_label, v.label, '?'), e.details, c.barcode
            FROM events e
+           JOIN verification_sessions s
+             ON s.id = json_extract(e.details, '$.session_id') AND s.verify_type = 'full'
            LEFT JOIN volumes v ON v.id = e.entity_id AND e.entity_type = 'volume'
            LEFT JOIN cartridges c ON c.id = json_extract(e.details, '$.cartridge_id')
           WHERE e.action = ?1
+            AND CASE WHEN c.id IS NOT NULL
+                     THEN c.status NOT IN ({out})
+                     ELSE COALESCE({live}, 0) END
           ORDER BY e.id",
-    )?;
+        out = OUT_OF_SERVICE_CARTRIDGE
+            .iter()
+            .map(|s| format!("'{s}'"))
+            .collect::<Vec<_>>()
+            .join(","),
+        live = coverage::holds_bytes_to_verify("v"),
+    ))?;
     let rows = stmt
         .query_map([EVENT_ACTION], |r| {
             Ok((
@@ -337,7 +379,7 @@ pub(crate) mod tests {
     /// A registered cartridge `barcode` holding a sealed volume
     /// `V-<barcode>`, verified once per entry of `corrected` through the
     /// route `volume verify` takes: a contact, its journalled page 0x03
-    /// (that many errors corrected over 1 GiB read), a passed
+    /// (that many errors corrected over 1 GiB read), a passed full
     /// verification session, then [`record_for_verify`].
     pub(crate) fn seed_verifies(conn: &Connection, barcode: &str, corrected: &[i64]) {
         conn.execute(
@@ -347,40 +389,71 @@ pub(crate) mod tests {
         )
         .unwrap();
         let cart = conn.last_insert_rowid();
-        let label = format!("V-{barcode}");
+        let vol = seed_volume(conn, &format!("V-{barcode}"));
+        for &n in corrected {
+            seed_one_verify(conn, Some(cart), vol, n, Tier::Integrity);
+        }
+    }
+
+    /// A sealed volume `label` whose verifies' contacts identified no
+    /// cartridge (the trend's `volume:<label>` key), verified once per
+    /// entry of `corrected` as [`seed_verifies`] does. Returns its id.
+    pub(crate) fn seed_unbound_verifies(conn: &Connection, label: &str, corrected: &[i64]) -> i64 {
+        let vol = seed_volume(conn, label);
+        for &n in corrected {
+            seed_one_verify(conn, None, vol, n, Tier::Integrity);
+        }
+        vol
+    }
+
+    fn seed_volume(conn: &Connection, label: &str) -> i64 {
         conn.execute(
             "INSERT INTO volumes (label, backend_type, backend_name, media_type,
                  capacity_bytes, status)
              VALUES (?1, 'lto', 'p', 'LTO-6', 2500000000000, 'sealed')",
-            [&label],
+            [label],
         )
         .unwrap();
-        let vol = conn.last_insert_rowid();
-        for &n in corrected {
-            conn.execute(
-                "INSERT INTO cartridge_contacts (cartridge_id, volume_id, operation, device)
-                 VALUES (?1, ?2, 'volume verify', '/dev/nst0')",
-                params![cart, vol],
-            )
+        conn.last_insert_rowid()
+    }
+
+    /// One verify of `vol` at `tier`: its contact (on `cart`, or none), the
+    /// page 0x03 its sweep journalled (`n` corrected over 1 GiB), its
+    /// session, and [`record_for_verify`] — called whatever the tier, so a
+    /// test can put a quick verify's figures in front of [`trends`].
+    fn seed_one_verify(conn: &Connection, cart: Option<i64>, vol: i64, n: i64, tier: Tier) {
+        let label: String = conn
+            .query_row("SELECT label FROM volumes WHERE id = ?1", [vol], |r| {
+                r.get(0)
+            })
             .unwrap();
-            let contact = conn.last_insert_rowid();
-            conn.execute(
-                "INSERT INTO log_page_journal (contact_id, device_sg, trigger, page_code, ok,
-                     tool_argv, decoded, tapectl_version)
-                 VALUES (?1, '/dev/sg0', 'volume verify', 3, 1, '[]', ?2, 't')",
-                params![contact, page_0x03(n, 0, 0, 1 << 30)],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
-                 VALUES (?1, datetime('now'), 'passed')",
-                [vol],
-            )
-            .unwrap();
-            let session = conn.last_insert_rowid();
-            record_for_verify(conn, Some(contact), session, vol, &label)
-                .expect("the journalled page 0x03 is recorded");
-        }
+        conn.execute(
+            "INSERT INTO cartridge_contacts (cartridge_id, volume_id, operation, device)
+             VALUES (?1, ?2, 'volume verify', '/dev/nst0')",
+            params![cart, vol],
+        )
+        .unwrap();
+        let contact = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO log_page_journal (contact_id, device_sg, trigger, page_code, ok,
+                 tool_argv, decoded, tapectl_version)
+             VALUES (?1, '/dev/sg0', 'volume verify', 3, 1, '[]', ?2, 't')",
+            params![contact, page_0x03(n, 0, 0, 1 << 30)],
+        )
+        .unwrap();
+        let verify_type = match tier {
+            Tier::Integrity => "full",
+            Tier::Navigable => "quick",
+        };
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, completed_at, outcome)
+             VALUES (?1, ?2, datetime('now'), 'passed')",
+            params![vol, verify_type],
+        )
+        .unwrap();
+        let session = conn.last_insert_rowid();
+        record_for_verify(conn, Some(contact), session, vol, &label, tier)
+            .expect("the journalled page 0x03 is recorded");
     }
 
     /// A page 0x03 decode with chosen counters, in sg_logs's own shape.
@@ -456,5 +529,101 @@ pub(crate) mod tests {
             trend(&[Some(1.0), Some(2.1), None]).render(),
             "1.000 -> 2.100 -> - corrected/GiB over 3 verifies (uncorrected 0, 0, 0)"
         );
+    }
+
+    fn trend_keys(conn: &Connection) -> Vec<String> {
+        trends(conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.cartridge)
+            .collect()
+    }
+
+    /// The second check of the review of #421: whatever reaches `events`,
+    /// [`trends`] reads only points whose verification session was full. A
+    /// quick verify's 0.0 between two full ones would otherwise read as a
+    /// rise past any factor. Seen failing without the session join: three
+    /// points, rising from 0.000.
+    #[test]
+    fn trends_read_only_full_verifies() {
+        let conn = crate::db::open_memory().unwrap();
+        seed_verifies(&conn, "C-Q", &[2]);
+        let (cart, vol): (i64, i64) = conn
+            .query_row(
+                "SELECT c.id, v.id FROM cartridges c, volumes v
+                  WHERE c.barcode = 'C-Q' AND v.label = 'V-C-Q'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        seed_one_verify(&conn, Some(cart), vol, 0, Tier::Navigable);
+        seed_one_verify(&conn, Some(cart), vol, 3, Tier::Integrity);
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE action = ?1",
+                [EVENT_ACTION],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 3,
+            "positive control: the quick point is in events"
+        );
+        let t = trends(&conn).unwrap();
+        assert_eq!(t.len(), 1, "{t:?}");
+        let rates: Vec<_> = t[0].points.iter().map(|p| p.corrected_per_gib).collect();
+        assert_eq!(rates, [Some(2.0), Some(3.0)], "the quick verify is skipped");
+        assert_eq!(t[0].rising(DEFAULT_RISE_FACTOR), None);
+    }
+
+    /// The review of #421: a cartridge the operator has acted on — retired
+    /// (`retired_permanent`) or freed for erasure (`pending_erase`) — is
+    /// never verified again, so a rise on it would warn forever. It drops
+    /// out of the trend; back in service, it returns (the positive control).
+    #[test]
+    fn a_retired_or_pending_erase_cartridge_leaves_the_trend() {
+        let conn = crate::db::open_memory().unwrap();
+        seed_verifies(&conn, "C-OLD", &[1, 5]);
+        seed_verifies(&conn, "C-KEEP", &[1, 1]);
+        assert_eq!(trend_keys(&conn), ["C-KEEP", "C-OLD"]);
+        for status in ["retired_permanent", "pending_erase"] {
+            conn.execute(
+                "UPDATE cartridges SET status = ?1 WHERE barcode = 'C-OLD'",
+                [status],
+            )
+            .unwrap();
+            assert_eq!(trend_keys(&conn), ["C-KEEP"], "{status}");
+        }
+        conn.execute(
+            "UPDATE cartridges SET status = 'in_use' WHERE barcode = 'C-OLD'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(trend_keys(&conn), ["C-KEEP", "C-OLD"], "in service again");
+    }
+
+    /// The same for a trend keyed by volume (no cartridge identified): a
+    /// retired or erased volume holds nothing a verify will read again, so
+    /// it drops out (`policy::coverage::holds_bytes_to_verify`). A
+    /// quarantined one stays: re-verifying it is when its trend matters.
+    #[test]
+    fn a_gone_volume_leaves_the_trend_and_a_quarantined_one_stays() {
+        let conn = crate::db::open_memory().unwrap();
+        let v = seed_unbound_verifies(&conn, "V-LOOSE", &[1, 5]);
+        assert_eq!(trend_keys(&conn), ["volume:V-LOOSE"]);
+        conn.execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE id = ?1",
+            [v],
+        )
+        .unwrap();
+        assert_eq!(trend_keys(&conn), ["volume:V-LOOSE"], "quarantined stays");
+        for status in ["retired", "erased"] {
+            conn.execute(
+                "UPDATE volumes SET status = ?1 WHERE id = ?2",
+                params![status, v],
+            )
+            .unwrap();
+            assert!(trend_keys(&conn).is_empty(), "{status}");
+        }
     }
 }

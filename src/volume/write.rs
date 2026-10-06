@@ -4087,20 +4087,28 @@ pub(crate) fn volume_verify_with_store(
     phase.done();
     // Issue #421 (ADR-0012 2026-10-06 item 12): the read errors the drive
     // corrected during this verify, per GiB read, from the page 0x03 the
-    // sweep above just journalled — recorded for a verify that made a
+    // sweep above just journalled — recorded for a FULL verify that made a
     // session, so `audit` and `report health` can trend them per cartridge.
-    if let Ok(VerifyReport {
-        session_id: Some(session_id),
-        ..
-    }) = &r
-    {
-        crate::tape::read_errors::record_for_verify(
-            conn,
-            contact_id,
-            *session_id,
-            volume_id,
-            label,
-        );
+    // Not for `--quick` (Tier::Navigable): it reads File 0, the front index
+    // and the seal, a few MB, and a rate over that sample is 0 or huge —
+    // either one beside full readbacks flags a healthy cartridge or hides a
+    // real rise. #421's figure is "the delta over the readback", and a
+    // quick verify has none.
+    if tier == Tier::Integrity {
+        if let Ok(VerifyReport {
+            session_id: Some(session_id),
+            ..
+        }) = &r
+        {
+            crate::tape::read_errors::record_for_verify(
+                conn,
+                contact_id,
+                *session_id,
+                volume_id,
+                label,
+                tier,
+            );
+        }
     }
     // Issue #386: this verify's phases, on every outcome.
     phase_timings::record_drained(
@@ -12729,6 +12737,91 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(after, 2, "a verify with no session records no figures");
+        }
+
+        /// Review of #421: a `--quick` verify reads File 0, the front index
+        /// and the seal — a few MB — so its page 0x03 rate is a sample of
+        /// nothing, and comparing it with full readbacks flags a healthy
+        /// cartridge (0.0 then anything is a rise past any factor). Only a
+        /// full verify is recorded. Full (8 corrected over 4 GiB = 2.0),
+        /// quick (0 corrected over 1 MiB = 0.0), full (9 over 4 GiB = 2.25):
+        /// two points, no rise. Seen failing before the tier guard: three
+        /// rows, and the trend rose from 0.000 to 2.250.
+        #[test]
+        fn a_quick_verify_records_no_read_error_figures() {
+            use crate::tape::log_pages::tests::FixtureSource;
+            use crate::tape::read_errors;
+            let conn = crate::db::open_memory().unwrap();
+            let data = b"read-error tier fixture bytes, repeated. ".repeat(4);
+            seed_one_slice_fixture(&conn, "RQ-VOL", "rq-unit", 4, &data, "completed", "staged");
+            let v = volume_id(&conn, "RQ-VOL");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = swept_config(tmp.path());
+            let identity = identity_with_serial(Some("XYZZY_A1"));
+            let page = |corrected: i64, bytes: u64| {
+                format!(
+                    "Read error counter page  [0x3]\n  Errors corrected without substantial \
+                     delay = {corrected}\n  Errors corrected with possible delays = 0\n  Total \
+                     rewrites or rereads = 0\n  Total errors corrected = 0\n  Total times \
+                     correction algorithm processed = 0\n  Total bytes processed = {bytes}\n  \
+                     Total uncorrected errors = 0\n"
+                )
+            };
+            for (tier, corrected, bytes) in [
+                (Tier::Integrity, 8, 4u64 << 30),
+                (Tier::Navigable, 0, 1u64 << 20),
+                (Tier::Integrity, 9, 4u64 << 30),
+            ] {
+                let src = std::cell::RefCell::new(FixtureSource::default());
+                src.borrow_mut().text.insert(0x03, page(corrected, bytes));
+                let mut store = mem_store_v2_tape("RQ-VOL", &data, &data);
+                let report = volume_verify_with_store(
+                    &conn,
+                    &mut store,
+                    "RQ-VOL",
+                    v,
+                    4096,
+                    tier,
+                    ContactSite::new(
+                        &config,
+                        Operation::VolumeVerify,
+                        TEST_DEVICE,
+                        Medium::NoBackend,
+                    )
+                    .with_drive_identity(&identity)
+                    .with_log_source(&src),
+                )
+                .unwrap();
+                assert!(report.session_id.is_some(), "{tier:?} made a session");
+            }
+            let tiers: Vec<String> = conn
+                .prepare("SELECT details FROM events WHERE action = ?1 ORDER BY id")
+                .unwrap()
+                .query_map([read_errors::EVENT_ACTION], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|d| {
+                    let d: serde_json::Value = serde_json::from_str(&d.unwrap()).unwrap();
+                    d["tier"].as_str().unwrap_or("<none>").to_string()
+                })
+                .collect();
+            assert_eq!(
+                tiers,
+                ["full", "full"],
+                "only the full verifies are recorded"
+            );
+            let trends = read_errors::trends(&conn).unwrap();
+            assert_eq!(trends.len(), 1, "{trends:?}");
+            let rates: Vec<_> = trends[0]
+                .points
+                .iter()
+                .map(|p| p.corrected_per_gib)
+                .collect();
+            assert_eq!(rates, [Some(2.0), Some(2.25)]);
+            assert_eq!(
+                trends[0].rising(read_errors::DEFAULT_RISE_FACTOR),
+                None,
+                "2.0 -> 2.25 is no rise"
+            );
         }
 
         /// Issue #342: `volume verify`'s post-command sweep lives INSIDE its
