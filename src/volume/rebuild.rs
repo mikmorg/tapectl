@@ -870,8 +870,13 @@ struct Supplement {
     snapshots: HashMap<(String, i64), SnapshotFacts>,
     /// unit name -> slice_size for the stage set.
     slice_size: HashMap<String, i64>,
-    /// (unit name, version) -> the file rows of that snapshot.
-    files: HashMap<(String, i64), Vec<FileRow>>,
+    /// (unit name, version) -> that snapshot's id in `db` and the span of
+    /// `files.id` its rows occupy (`ontape_catalog::file_id_spans`), which
+    /// `ensure_files` streams one version at a time (issue #413). A version
+    /// with no rows on tape has no entry.
+    file_snapshot: HashMap<(String, i64), (i64, (i64, i64))>,
+    /// The open `catalog.db`, when the tape carries one.
+    db: Option<Connection>,
     /// unit name -> owning tenant name, when `catalog.db` carries `tenants`.
     tenant_of: HashMap<String, String>,
     /// unit name -> recorded recipient list JSON, when `catalog.db` carries
@@ -890,22 +895,16 @@ struct SnapshotFacts {
     file_count: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
-struct FileRow {
-    path: String,
-    size_bytes: i64,
-    sha256: Option<String>,
-    modified_at: Option<String>,
-    is_directory: i64,
-}
-
 impl Supplement {
-    /// Read every table via `ontape_catalog::read`, then derive exactly the
-    /// maps `insert_all`/`tenant_index`/`ensure_*` already consume, keyed by
-    /// unit name (and version, where a fact is per-snapshot) the way the
-    /// hand-written joins used to key them.
+    /// Read every table but `files` via `ontape_catalog::read_all_but_files`,
+    /// then derive exactly the maps `insert_all`/`tenant_index`/`ensure_*`
+    /// already consume, keyed by unit name (and version, where a fact is
+    /// per-snapshot) the way the hand-written joins used to key them. The
+    /// `files` rows, nearly all of the file (about 250 MB of rows for a
+    /// million-file tape), stay on disk until `ensure_files` streams each
+    /// version's (issue #413).
     fn load(path: &Path) -> Result<Self> {
-        let cat = ontape_catalog::read(path)?;
+        let (db, cat) = ontape_catalog::read_all_but_files(path)?;
         let mut out = Supplement::default();
 
         let unit_name: HashMap<i64, String> =
@@ -961,24 +960,13 @@ impl Supplement {
             }
         }
 
-        for f in &cat.files {
-            let Some(key) = snapshot_key.get(&f.snapshot_id) else {
-                continue;
-            };
-            let size_bytes = f.size_bytes.ok_or_else(|| {
-                TapectlError::Other(format!(
-                    "catalog.db files row {} ({:?}) has NULL size_bytes",
-                    f.id, f.path
-                ))
-            })?;
-            out.files.entry(key.clone()).or_default().push(FileRow {
-                path: f.path.clone(),
-                size_bytes,
-                sha256: f.sha256.clone(),
-                modified_at: f.modified_at.clone(),
-                is_directory: f.is_directory,
-            });
-        }
+        // Only where each version's rows lie: `ensure_files` streams them.
+        let spans = ontape_catalog::file_id_spans(&db)?;
+        out.file_snapshot = snapshot_key
+            .into_iter()
+            .filter_map(|(id, key)| spans.get(&id).map(|span| (key, (id, *span))))
+            .collect();
+        out.db = Some(db);
 
         out.has_tenants = cat.generation == Generation::WithOwnershipAndReceipts;
         if out.has_tenants {
@@ -1422,10 +1410,12 @@ fn ensure_files(
     supplement: &Supplement,
     report: &mut RebuildReport,
 ) -> Result<()> {
-    let Some(files) = supplement
-        .files
-        .get(&(unit.name.clone(), unit.snapshot_version))
-    else {
+    let (Some(db), Some(&(ontape_snapshot, (first_id, last_id)))) = (
+        supplement.db.as_ref(),
+        supplement
+            .file_snapshot
+            .get(&(unit.name.clone(), unit.snapshot_version)),
+    ) else {
         return Ok(());
     };
     // The on-tape shape (path, hex sha256, RFC 3339 mtime, is_directory) is
@@ -1438,29 +1428,41 @@ fn ensure_files(
     // type. A symlink or special file on such a tape is therefore rebuilt as
     // regular — dar's catalogue still holds its real type, and the on-tape
     // half is ADR-0012 item 7's 1.2.0 change.
-    let bad = |f: &FileRow, e: TapectlError| {
+    //
+    // Streamed (issue #413): one on-tape row at a time, straight into the
+    // bulk insert, never the whole tape's rows in memory.
+    let bad = |f: &ontape_catalog::FileRow, e: TapectlError| {
         TapectlError::Other(format!(
-            "catalog.db files row {:?} of {} v{}: {e}",
-            f.path, unit.name, unit.snapshot_version
+            "catalog.db files row {} ({:?}) of {} v{}: {e}",
+            f.id, f.path, unit.name, unit.snapshot_version
         ))
     };
-    let entries = files.iter().map(|f| {
+    let mut stmt = db.prepare(ontape_catalog::FILES_OF_SNAPSHOT)?;
+    let rows = stmt.query_map(
+        params![ontape_snapshot, first_id, last_id],
+        ontape_catalog::file_row,
+    )?;
+    let entries = rows.map(|row| {
+        let f = row?;
+        let size_bytes = f
+            .size_bytes
+            .ok_or_else(|| bad(&f, TapectlError::Other("NULL size_bytes".to_string())))?;
         Ok(files_db::FileEntry {
             path: f.path.clone(),
             kind: files_db::FileKind::from_is_directory(f.is_directory != 0),
-            size_bytes: f.size_bytes,
+            size_bytes,
             mtime_ns: f
                 .modified_at
                 .as_deref()
                 .map(files_db::mtime_ns_from_rfc3339)
                 .transpose()
-                .map_err(|e| bad(f, e))?,
+                .map_err(|e| bad(&f, e))?,
             sha256: f
                 .sha256
                 .as_deref()
                 .map(files_db::sha256_from_hex)
                 .transpose()
-                .map_err(|e| bad(f, e))?,
+                .map_err(|e| bad(&f, e))?,
             link_target: None,
         })
     });

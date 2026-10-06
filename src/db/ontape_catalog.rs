@@ -39,6 +39,7 @@
 //! probes the actual shape instead; see its doc for why an operator database
 //! at the same `user_version` can still carry either shape of `catalog.db`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{params_from_iter, Connection};
@@ -231,11 +232,66 @@ pub struct OnTapeCatalog {
     pub files: Vec<FileRow>,
 }
 
+/// The `files` rows of one on-tape snapshot (`?1`), in `id` order: what
+/// [`file_row`] maps. A rebuild streams them one version at a time (issue
+/// #413) instead of holding every row of the tape in memory.
+///
+/// `?2`/`?3` are the snapshot's lowest and highest `id` from
+/// [`file_id_spans`]. `files` has no index on `snapshot_id` (and this file's
+/// shape is fixed until its 1.2.0 change), so without the bounds each
+/// version would be a scan of every row on the tape, once per unit; with
+/// them it is one range of the table's own b-tree. Both writers put a
+/// version's rows in one run of ids, and a row of another version inside
+/// the range is still excluded by `snapshot_id`.
+pub const FILES_OF_SNAPSHOT: &str =
+    "SELECT id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory
+     FROM files WHERE id BETWEEN ?2 AND ?3 AND snapshot_id = ?1 ORDER BY id";
+
+/// Each snapshot's lowest and highest `files.id`, for [`FILES_OF_SNAPSHOT`]:
+/// one pass over `files`.
+pub fn file_id_spans(conn: &Connection) -> Result<HashMap<i64, (i64, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT snapshot_id, MIN(id), MAX(id) FROM files GROUP BY snapshot_id")?;
+    let spans = stmt
+        .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    Ok(spans)
+}
+
+/// One row of a `files` SELECT in [`FILES_OF_SNAPSHOT`]'s column order.
+pub fn file_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
+    Ok(FileRow {
+        id: r.get(0)?,
+        snapshot_id: r.get(1)?,
+        path: r.get(2)?,
+        size_bytes: r.get(3)?,
+        sha256: r.get(4)?,
+        modified_at: r.get(5)?,
+        is_directory: r.get(6)?,
+    })
+}
+
 /// Read every table of the `catalog.db` at `path`, tolerating
 /// [`Generation::Original`] (no `tenants`; `key_fingerprints`/`sha256_plain`
 /// come back as `None`). Rows are returned in `id` order, which is also
 /// insertion order for every table this module writes.
 pub fn read(path: &Path) -> Result<OnTapeCatalog> {
+    let (conn, mut cat) = read_all_but_files(path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory
+         FROM files ORDER BY id",
+    )?;
+    cat.files = stmt
+        .query_map([], file_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(cat)
+}
+
+/// [`read`] without the `files` table (left empty), and the open connection,
+/// for a reader that streams the files itself with [`FILES_OF_SNAPSHOT`]:
+/// `files` is nearly all of a `catalog.db` (about 250 MB of rows for a
+/// million-file tape, issue #413).
+pub fn read_all_but_files(path: &Path) -> Result<(Connection, OnTapeCatalog)> {
     let conn = Connection::open(path)?;
     let generation = detect_generation(&conn)?;
     let has_new = generation == Generation::WithOwnershipAndReceipts;
@@ -378,36 +434,16 @@ pub fn read(path: &Path) -> Result<OnTapeCatalog> {
         rows
     };
 
-    let files = {
-        let mut stmt = conn.prepare(
-            "SELECT id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory
-             FROM files ORDER BY id",
-        )?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(FileRow {
-                    id: r.get(0)?,
-                    snapshot_id: r.get(1)?,
-                    path: r.get(2)?,
-                    size_bytes: r.get(3)?,
-                    sha256: r.get(4)?,
-                    modified_at: r.get(5)?,
-                    is_directory: r.get(6)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows
-    };
-
-    Ok(OnTapeCatalog {
+    let cat = OnTapeCatalog {
         generation,
         tenants,
         units,
         snapshots,
         stage_sets,
         slices,
-        files,
-    })
+        files: Vec::new(),
+    };
+    Ok((conn, cat))
 }
 
 /// Build the filtered `catalog.db` for exactly `stage_set_ids` (this write's
@@ -1168,5 +1204,80 @@ mod tests {
         );
         let ids: Vec<i64> = cat.files.iter().map(|f| f.id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    /// Issue #413: a rebuild streams one version's `files` rows at a time,
+    /// and each version is one range of the table's b-tree, not a scan of
+    /// every row on the tape (there is no index on `snapshot_id`, and a
+    /// rebuild reads one version per unit). Streamed version by version,
+    /// the rows are exactly what [`read`] returns, in the same order.
+    #[test]
+    fn a_version_streams_as_one_range_of_ids() {
+        let conn = crate::db::open_memory().unwrap();
+        let ss: Vec<i64> = ["unit-a", "unit-b", "unit-c"]
+            .iter()
+            .map(|u| insert_unit_snapshot_stageset_slice_file(&conn, u).1)
+            .collect();
+        for (n, &ss_id) in ss.iter().enumerate() {
+            let snap: i64 = conn
+                .query_row(
+                    "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                    [ss_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            for i in 0..=n {
+                crate::db::files::fixture::insert(
+                    &conn,
+                    snap,
+                    &format!("more/{i}.bin"),
+                    i as i64,
+                    "regular",
+                    None,
+                );
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("catalog.db");
+        write(&conn, &ss, &out_path).unwrap();
+        let whole = read(&out_path).unwrap();
+
+        let (ontape, cat) = read_all_but_files(&out_path).unwrap();
+        assert!(cat.files.is_empty(), "the files are left to the stream");
+        let spans = file_id_spans(&ontape).unwrap();
+        assert_eq!(spans.len(), 3, "one span per version");
+        let mut stmt = ontape.prepare(FILES_OF_SNAPSHOT).unwrap();
+        let mut streamed = Vec::new();
+        let mut snapshots: Vec<i64> = spans.keys().copied().collect();
+        snapshots.sort();
+        for snap in snapshots {
+            let (first, last) = spans[&snap];
+            let rows = stmt
+                .query_map(rusqlite::params![snap, first, last], file_row)
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(rows.iter().all(|f| f.snapshot_id == snap));
+            streamed.extend(rows);
+        }
+        let key = |f: &FileRow| (f.id, f.snapshot_id, f.path.clone(), f.size_bytes);
+        assert_eq!(
+            streamed.iter().map(key).collect::<Vec<_>>(),
+            whole.files.iter().map(key).collect::<Vec<_>>(),
+            "streamed version by version, the rows are the whole table's"
+        );
+
+        let plan: Vec<String> = ontape
+            .prepare(&format!("EXPLAIN QUERY PLAN {FILES_OF_SNAPSHOT}"))
+            .unwrap()
+            .query_map(rusqlite::params![1, 1, 1], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|d| d.contains("INTEGER PRIMARY KEY"))
+                && !plan.iter().any(|d| d.starts_with("SCAN files")),
+            "one version must be a range of ids, not a scan of every row: {plan:?}"
+        );
     }
 }

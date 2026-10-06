@@ -356,7 +356,8 @@ fn perf_large_single_file() {
 /// and the first big `snapshot create` on a new install, through the one
 /// function both use. Row by row it went superlinear (306 s measured):
 /// each statement flushed the search index. Then the version goes on tape
-/// in the `catalog.db` shape and comes back, both timed.
+/// in the `catalog.db` shape and is streamed back the way a rebuild reads
+/// it, both timed.
 #[test]
 #[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
 fn perf_fresh_catalog_takes_a_184k_file_version() {
@@ -409,10 +410,25 @@ fn perf_fresh_catalog_takes_a_184k_file_version() {
         start.elapsed(),
     );
 
+    // The way `catalog rebuild` reads it back: everything but `files`, then
+    // each version's rows streamed as one range of ids.
     let start = Instant::now();
-    let rows = db::ontape_catalog::read(&out).unwrap().files.len();
+    let (ontape, _) = db::ontape_catalog::read_all_but_files(&out).unwrap();
+    let spans = db::ontape_catalog::file_id_spans(&ontape).unwrap();
+    let (first, last) = spans[&1];
+    let mut stmt = ontape
+        .prepare(db::ontape_catalog::FILES_OF_SNAPSHOT)
+        .unwrap();
+    let rows = stmt
+        .query_map(params![1, first, last], db::ontape_catalog::file_row)
+        .unwrap()
+        .count();
     assert_eq!(rows, files);
-    report("catalog.db read", &format!("{files} rows"), start.elapsed());
+    report(
+        "catalog.db stream",
+        &format!("{files} rows"),
+        start.elapsed(),
+    );
 
     assert!(
         files > 184_552 || insert < Duration::from_secs(10),
