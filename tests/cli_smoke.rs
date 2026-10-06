@@ -570,6 +570,88 @@ fn logs_are_uncoloured_when_stderr_is_not_a_terminal() {
     );
 }
 
+/// Issue #391 / #299 (ADR-0012 2026-10-06 item 11): `cartridge info` shows
+/// the cartridge's wear — the chip's lifetime attributes and the drive's
+/// page 0x17 counters, from the journal — and a WARNING only for what the
+/// hardware raised. Before any reading it says so rather than staying
+/// silent; after a contact whose page 0x17 counts two unrecovered read
+/// errors, the human output and `--json` both carry the warning.
+#[test]
+fn cartridge_info_shows_wear_and_warns_on_what_the_hardware_raised() {
+    let home = TempDir::new().expect("tempdir");
+    assert!(run_tapectl(home.path(), &["init"]).status.success());
+    let reg = run_tapectl(
+        home.path(),
+        &[
+            "cartridge",
+            "register",
+            "--barcode",
+            "WEAR01",
+            "--generation",
+            "LTO-6",
+        ],
+    );
+    assert!(
+        reg.status.success(),
+        "register: {}",
+        String::from_utf8_lossy(&reg.stderr)
+    );
+
+    let before = run_tapectl(home.path(), &["cartridge", "info", "WEAR01"]);
+    let before = String::from_utf8_lossy(&before.stdout).to_string();
+    assert!(before.contains("Wear (figures only"), "{before}");
+    assert!(
+        before.contains("chip: no successful MAM reading recorded")
+            && before.contains("page 0x17: no reading recorded for this cartridge"),
+        "no reading is said, not left silent: {before}"
+    );
+    assert!(!before.contains("WARNING"), "{before}");
+
+    let db_path = home.path().join(".tapectl").join("tapectl.db");
+    let conn = tapectl::db::open(&db_path).expect("open the initialized db");
+    conn.execute(
+        "INSERT INTO cartridge_contacts (cartridge_id, operation, device)
+         SELECT id, 'volume verify', '/dev/nst0' FROM cartridges WHERE barcode = 'WEAR01'",
+        [],
+    )
+    .unwrap();
+    let contact = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO log_page_journal (contact_id, device_sg, trigger, page_code, ok, tool_argv,
+             decoded, tapectl_version)
+         VALUES (?1, '/dev/sg0', 'volume verify', 23, 1, '[]', ?2, 't')",
+        params![
+            contact,
+            "Volume statistics page (ssc-4), subpage=0\n  Total write retries: 12\n  \
+             Total unrecovered write errors: 0\n  Total read retries: 3\n  \
+             Total unrecovered read errors: 2\n  Beginning of medium passes: 40\n"
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let after = run_tapectl(home.path(), &["cartridge", "info", "WEAR01"]);
+    let after = String::from_utf8_lossy(&after.stdout).to_string();
+    assert!(
+        after.contains("write retries 12, read retries 3"),
+        "the figures are shown: {after}"
+    );
+    assert!(
+        after.contains(
+            "WARNING: worn cartridge? the drive counts 0 unrecovered write and 2 unrecovered \
+             read error(s) on this cartridge (page 0x17)"
+        ),
+        "{after}"
+    );
+    let json = run_tapectl(home.path(), &["--json", "cartridge", "info", "WEAR01"]);
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).expect("cartridge info --json");
+    assert_eq!(
+        v["wear"]["warnings"].as_array().map(Vec::len),
+        Some(1),
+        "{v}"
+    );
+}
+
 /// Issue #361: one meaning per word. "Receipt" is the recipient list a
 /// stage set was encrypted to (CONTEXT.md); `volume info`'s list of this
 /// volume's `writes` rows is headed "Writes:", not "Write receipts:". The

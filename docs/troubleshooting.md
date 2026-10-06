@@ -1389,8 +1389,11 @@ stage, verify, read-slices or restore. A second signal stops at once (exit
 ### A real end of tape during the write
 
 If the drive reports that it is out of space, the session ends as a clean
-abort. The fill ceiling (above) is what keeps this rare. Write the same staged
-data to another cartridge. The error reads:
+abort. The fill ceiling (above) is what keeps this rare; if it happens on a
+cartridge whose plan was under the ceiling, look at the wear figures `volume write`
+printed before it started and at `tapectl cartridge info <barcode>`: a WARNING there
+means the drive itself flagged the medium, and the cartridge should not be written
+again. Write the same staged data to another cartridge. The error reads:
 
 ```text
 error: volume "<label>" write aborted: execute failed at position <n>: tape I/O error: write: <OS error, e.g. No space left on device (os error 28)>

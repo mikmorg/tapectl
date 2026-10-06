@@ -640,6 +640,21 @@ same flag. Each completed write records how much of the capacity it used, as a
 tape the drive used (page 0x0c), each as a share of the capacity. Those figures
 are what the default is to be tuned from.
 
+**Cartridge wear.** Before it writes, `volume write` prints the cartridge's wear
+figures on stderr: the chip's own lifetime record (loads, initialisations,
+lifetime MiB written and read, manufacture date, the last drives that loaded it)
+and the drive's lifetime counters for this cartridge from the newest page 0x17
+reading tapectl journalled (write and read retries, unrecovered errors,
+beginning-of-medium passes). `tapectl cartridge info <barcode>` shows the same
+block. There is no health score: until production data sets thresholds
+(ADR-0012, 2026-10-06 item 11) these are figures to read, and the only
+`WARNING: worn cartridge?` lines are things the hardware itself raised — TapeAlert
+flags on the chip, a medium TapeAlert from the drive (`Media`, `Media life`,
+`Nearing media life`, `Not data grade`), or an unrecovered error on page 0x17.
+A warning never stops the write. If you see one, write that batch to another
+cartridge and retire this one. A line saying `no reading recorded` means tapectl
+has no figure, not that the figure is good.
+
 `staging clean` releases every unit that has met its policy's `min_copies` and
 **retains** the ones that have not, naming them (ADR-0012). So a unit still
 short of its second copy keeps its staged bytes — the release cannot quietly

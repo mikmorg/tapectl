@@ -1256,6 +1256,9 @@ fn volume_write_contacted<'c>(
     // this contact's id, or NULL if the contact row could not be written.
     contact.journal_mam(Operation::VolumeWrite, Hook::VolumeWrite, &det.capture);
     phase.done();
+    // Issue #391: the worn-cartridge notice (ADR-0012 2026-10-06 item 11) —
+    // figures, and a WARNING only on what the hardware raised. Never refuses.
+    crate::tape::wear::preflight_notice(conn, volume_id, label, &det.mam);
 
     let result = volume_write_in_contact(
         conn,
@@ -7007,6 +7010,35 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0, "no backend, so no reading was taken");
+    }
+
+    /// Issue #391 (ADR-0012 2026-10-06 item 11): the worn-cartridge notice
+    /// is part of `volume write`'s pre-flight — after the MAM read it is
+    /// built from (the chip serial names the cartridge, and the reading is
+    /// the chip's figures), and before the write session that moves the
+    /// tape. Pinned by position in the one function every write path
+    /// reaches; what the notice says is `tape::wear`'s tests.
+    #[test]
+    fn the_wear_notice_follows_the_mam_read_and_precedes_the_session() {
+        const SRC: &str = include_str!("write.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let f = "fn volume_write_contacted<'c>(";
+        let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
+        let end = prod[start..].find("\n}\n").unwrap() + start;
+        let body = &prod[start..end];
+        let at = |needle: &str| {
+            let hits = body.matches(needle).count();
+            assert_eq!(hits, 1, "{needle}: expected once in {f}, found {hits}");
+            body.find(needle).unwrap()
+        };
+        let mam = at("crate::tape::media_detect::detect(device");
+        let notice = at("crate::tape::wear::preflight_notice(conn, volume_id, label, &det.mam)");
+        let session = at("volume_write_in_contact(");
+        assert!(
+            mam < notice,
+            "the notice is built from the write's own MAM read"
+        );
+        assert!(notice < session, "the notice precedes the write session");
     }
 
     /// ADR-0012, 2026-09-24 amendment, item 7: `volume write` asks about a

@@ -538,16 +538,22 @@ pub fn run(
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
+            // Issue #391 / #299 (ADR-0012 2026-10-06 item 11): the chip's
+            // lifetime attributes and the drive's counters for this
+            // cartridge, from the journal — figures, and a warning only on
+            // what the hardware raised.
+            let wear = crate::tape::wear::for_cartridge(conn, id, None)?;
             if json_output {
                 println!(
                     "{}",
                     // `location` is ADDITIVE (ADR-0011); `serial_number` /
                     // `operator_serial` likewise (ADR-0012 amendment,
-                    // 2026-09-16; issue #197).
+                    // 2026-09-16; issue #197); `wear` likewise (#391).
                     serde_json::json!({
                         "barcode": barcode, "media_type": media, "status": status,
                         "loads": loads, "location": location, "volumes": volumes.len(),
                         "serial_number": serial_number, "operator_serial": operator_serial,
+                        "wear": {"lines": wear.lines(), "warnings": wear.warnings()},
                     })
                 );
             } else {
@@ -582,6 +588,10 @@ pub fn run(
                         };
                         println!("    {label} ({status}, mounted {mounted})");
                     }
+                }
+                println!("  Wear (figures only; ADR-0012 sets no threshold yet):");
+                for line in wear.lines() {
+                    println!("    {line}");
                 }
             }
         }

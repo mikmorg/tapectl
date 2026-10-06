@@ -10,3 +10,4 @@ pub mod mam;
 pub mod mam_journal;
 pub mod media_detect;
 pub mod st_stats;
+pub mod wear;
