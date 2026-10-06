@@ -1811,6 +1811,31 @@ then `dd if=<dev> bs=512k | tr -d '\0' > RESTORE.sh`. A tape whose File 0
 states no layout_version at all (a damaged ID thunk) only warns, and is read
 as layout v2.
 
+### dar refuses an envelope catalogue: `do not correspond to the same data`
+
+```text
+FATAL error, aborting operation: The archive and the isolated catalogue do not correspond to the same data, they are thus incompatible between them
+```
+
+Every envelope carries each unit's isolated dar catalogue in `catalogs/`. dar
+gives every archive a random label and accepts (`dar -A <catalogue>`) only
+the catalogue made from that same archive. Since issue #419, each stage set
+gets its own catalogue, made by its own dar run, so the catalogue in an
+envelope always fits the slices on the same tape.
+
+Before #419 the catalogue was made once per snapshot and reused when the same
+snapshot was staged again. On a tape written then, a unit whose snapshot had
+more than one stage set (`SELECT snapshot_id FROM stage_sets GROUP BY
+snapshot_id HAVING COUNT(*) > 1`) may carry the first run's catalogue with
+the second run's slices. For such a unit:
+
+- `dar -l <catalogue>` still lists the right files, because the content is the
+  same;
+- `dar -A <catalogue>` against the slices is refused with the message above,
+  so the catalogue cannot stand in for a damaged last slice;
+- a normal restore (tapectl or RESTORE.sh) is unaffected: it reads the
+  catalogue inside the last slice.
+
 ---
 
 ## Audit findings

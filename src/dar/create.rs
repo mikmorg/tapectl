@@ -19,6 +19,11 @@ pub struct DarCreateParams<'a> {
     /// Archive filesystem-specific attributes (Linux chattr flags).
     /// `false` passes dar `--fsa-scope none`.
     pub preserve_fsa: bool,
+    /// Where dar writes this archive's isolated catalogue as it runs (`-@`,
+    /// on-the-fly isolation; issue #419): a dar base name, so dar writes
+    /// `{base}.1.dar`. The catalogue carries this run's data-name label, so
+    /// `dar -A` accepts it against this run's slices and no other.
+    pub on_fly_catalogue: &'a Path,
 }
 
 /// Result of a dar archive creation.
@@ -86,6 +91,7 @@ pub fn create_archive(params: &DarCreateParams) -> Result<DarCreateResult> {
     for path in params.exclude_paths {
         cmd.arg("-P").arg(path);
     }
+    cmd.arg("-@").arg(params.on_fly_catalogue);
 
     let command_str = format!("{cmd:?}");
     info!(command = %command_str, "running dar");
@@ -229,18 +235,26 @@ pub fn test_archive(dar_binary: &str, archive_base: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extract isolated catalog from archive.
-pub fn extract_catalog(dar_binary: &str, archive_base: &Path, catalog_base: &Path) -> Result<()> {
-    if let Some(parent) = catalog_base.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
+/// Re-isolate the on-the-fly catalogue at `on_fly_base` (`-@`, which dar
+/// always compresses with bzip2 where it can) to an uncompressed one at
+/// `catalogue_base` (`dar -C … -A … -znone`) — ADR-0012's 2026-10-06
+/// amendment keeps envelope catalogues uncompressed, so an heir's dar needs
+/// no bzip2. Isolating an isolated catalogue keeps its data-name label, so
+/// the result still rescues (`-A`) the archive it came from (measured,
+/// docs/research/2026-10-06-plaintext-free-staging.md §3.4).
+pub fn reisolate_catalogue(
+    dar_binary: &str,
+    on_fly_base: &Path,
+    catalogue_base: &Path,
+) -> Result<()> {
     let output = super::command(dar_binary)
         .arg("-C")
-        .arg(catalog_base)
+        .arg(catalogue_base)
         .arg("-A")
-        .arg(archive_base)
+        .arg(on_fly_base)
+        .arg("-znone")
         .arg("-Q")
+        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| TapectlError::Dar(e.to_string()))?;
 
@@ -471,6 +485,7 @@ mod tests {
             exclude_paths: &[],
             preserve_xattrs,
             preserve_fsa,
+            on_fly_catalogue: &out.join("onfly"),
         })
         .unwrap();
         dar_listing(&base)

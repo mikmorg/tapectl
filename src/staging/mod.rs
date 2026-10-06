@@ -424,7 +424,7 @@ pub(crate) fn stage_create_reporting(
                     "stage create",
                     crate::db::phase_timings::Subject::StageSet(stage_set_id),
                 );
-                after_failed_stage(conn, config, stage_set_id, &e);
+                after_failed_stage(conn, paths, config, stage_set_id, &e);
             }
             // Issue #404: a stop is a clean end, and says what to run next.
             // Staging resumes by starting the unit over; everything this
@@ -460,7 +460,13 @@ pub(crate) fn stage_create_reporting(
 ///   returns), and `staging clean` reclaims it.
 /// - A set that reached `staged` before the error is complete: its slices
 ///   are the stage, never garbage.
-fn after_failed_stage(conn: &Connection, config: &Config, stage_set_id: i64, e: &TapectlError) {
+fn after_failed_stage(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    stage_set_id: i64,
+    e: &TapectlError,
+) {
     let staged = conn
         .query_row(
             "SELECT status = 'staged' FROM stage_sets WHERE id = ?1",
@@ -475,7 +481,7 @@ fn after_failed_stage(conn: &Connection, config: &Config, stage_set_id: i64, e: 
             "stage_create stopped; its staging files were left in place"
         );
     } else {
-        cleanup_failed_stage_set(conn, config, stage_set_id);
+        cleanup_failed_stage_set(conn, paths, config, stage_set_id);
     }
 }
 
@@ -701,6 +707,28 @@ fn stage_create_inner(
     // matched nothing in dar and the subtree reached tape uncatalogued.
     let dar_masks = exclude::dar_masks(&dar_exclude_patterns);
 
+    // Issue #419: one isolated catalogue per STAGE SET, produced by this
+    // stage set's own dar run. dar draws a fresh random data-name label for
+    // every run and refuses (`dar -A`) a catalogue whose label is another
+    // run's, so the catalogue this run's envelopes carry must be this run's.
+    // It used to be extracted once per snapshot and reused by every later
+    // stage set of it, so a re-staged unit's tape carried a catalogue that
+    // could not rescue its slices. dar writes it on the fly (`-@`) into the
+    // tapectl home — never the staging directory — and it is re-isolated
+    // uncompressed below. The file name inside the per-stage-set directory
+    // is the one envelopes have always carried (`{uuid8}_v{V}.1.dar`).
+    let catalog_dir = stage_set_catalogue_dir(paths, &unit.uuid, stage_set_id);
+    let catalog_base = catalog_dir.join(format!("{}_v{}", &unit.uuid[..8], snapshot.version));
+    let on_fly_base = catalog_dir.join(ON_FLY_CATALOGUE);
+    // Issue #41: a fresh, nested `create_dir_all` gets whatever the umask
+    // hands out; `catalogs_dir` itself is secured by `ensure_dirs`, but a
+    // parent's mode does not propagate to children it didn't create.
+    fs::create_dir_all(&catalog_dir)?;
+    if let Some(unit_dir) = catalog_dir.parent() {
+        crate::config::secure_path(unit_dir, 0o700);
+    }
+    crate::config::secure_path(&catalog_dir, 0o700);
+
     // dar is a subprocess, so no byte of its work passes through tapectl:
     // the phase's count is the size of the slices it has written so far,
     // polled from the staging directory, against the source's non-zero
@@ -728,6 +756,7 @@ fn stage_create_inner(
         exclude_paths: &dar_masks.prune,
         preserve_xattrs: resolved.preserve_xattrs,
         preserve_fsa: resolved.preserve_fsa,
+        on_fly_catalogue: &on_fly_base,
     })?;
 
     phase.done();
@@ -737,41 +766,24 @@ fn stage_create_inner(
         "UPDATE stage_sets SET dar_version = ?1, dar_command = ?2 WHERE id = ?3",
         params![dar_result.dar_version, dar_result.dar_command, stage_set_id],
     )?;
+    #[cfg(test)]
+    failpoint::hit(failpoint::AFTER_DAR)?;
 
-    // Step 3: Extract dar catalog (per-snapshot, first stage only)
-    let existing_catalogs: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM stage_sets WHERE snapshot_id = ?1 AND catalog_path IS NOT NULL",
-        params![snapshot_id],
-        |row| row.get(0),
-    )?;
-
-    // `catalog_base` is deliberately PER-SNAPSHOT ({uuid8}_v{version}), NOT
-    // per-stage-set like `archive_base` above (issue #53) — the dar catalog
-    // is a pure function of the snapshot's content, so the `existing_catalogs
-    // == 0` guard below extracts it once per snapshot and every later stage
-    // set of that snapshot reuses it. Do not change this to include
-    // stage_set_id "for consistency" with archive_base.
-    let catalog_dir = paths.catalogs_dir.join(&unit.uuid[..8]);
-    let catalog_base = catalog_dir.join(format!("{}_v{}", &unit.uuid[..8], snapshot.version));
+    // Step 3: this run's catalogue, uncompressed (ADR-0012, 2026-10-06
+    // amendment item 3: envelope catalogues stay uncompressed, so an heir's
+    // dar needs no bzip2). `-@` always compresses; isolating the isolated
+    // catalogue again keeps its label and drops the compression.
     let phase = progress::phase("catalog", None);
-    if existing_catalogs == 0 {
-        info!("extracting dar catalog");
-        // Issue #41: `catalogs_dir` itself is secured by `ensure_dirs`, but
-        // this per-unit subdirectory is a fresh, nested `create_dir_all`
-        // that gets whatever the process umask hands out unless tightened
-        // explicitly — a parent's mode does not propagate to children it
-        // didn't create. Pre-create it 0700 so dar's own `create_dir_all`
-        // (inside `extract_catalog`, a no-op once it already exists) never
-        // gets a chance to leave it loose.
-        fs::create_dir_all(&catalog_dir)?;
-        crate::config::secure_path(&catalog_dir, 0o700);
-        dar::create::extract_catalog(&config.dar.binary, &archive_base, &catalog_base)?;
-        // dar wrote the catalog file(s) itself via subprocess, with no mode
-        // of its own — tighten what it produced after the fact.
-        secure_catalog_files(&catalog_dir);
-        // ...and nor did it sync them (issue #409).
-        sync_catalogue(&catalog_base)?;
-    }
+    info!("isolating this stage set's dar catalogue");
+    dar::create::reisolate_catalogue(&config.dar.binary, &on_fly_base, &catalog_base)?;
+    let on_fly_file = PathBuf::from(format!("{}.1.dar", on_fly_base.display()));
+    fs::remove_file(&on_fly_file)
+        .map_err(|e| staging_io_error("cannot remove", &on_fly_file, e))?;
+    // dar wrote the catalog file itself via subprocess, with no mode of its
+    // own — tighten what it produced after the fact.
+    secure_catalog_files(&catalog_dir);
+    // ...and nor did it sync it (issue #409).
+    sync_catalogue(&catalog_base)?;
     conn.execute(
         "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
         params![catalog_base.to_string_lossy().to_string(), stage_set_id],
@@ -1032,8 +1044,8 @@ fn record_encrypted_slice(
 /// Per-*stage-set*, not per-snapshot (issue #53) — the single place this
 /// shape is computed, so `stage_create_inner`'s dar run and
 /// `cleanup_failed_stage_set`'s prefix scan can never drift apart again.
-/// `catalog_base` is deliberately NOT built this way — it stays
-/// per-snapshot on purpose (see `stage_create_inner`'s catalog step).
+/// The isolated catalogue is per stage set too since issue #419, by its
+/// directory ([`stage_set_catalogue_dir`]).
 pub(crate) fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
     format!(
         "{}_v{}_s{}",
@@ -1049,6 +1061,25 @@ pub(crate) fn archive_base_name(unit_uuid: &str, version: i64, stage_set_id: i64
 /// `_s10.1.dar`.
 pub(crate) fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i64) -> String {
     format!("{}.", archive_base_name(unit_uuid, version, stage_set_id))
+}
+
+/// The base name dar's on-the-fly catalogue (`-@`) is written under, inside
+/// [`stage_set_catalogue_dir`]; removed once it is re-isolated.
+const ON_FLY_CATALOGUE: &str = "onfly";
+
+/// The directory holding one stage set's isolated dar catalogue (issue
+/// #419): `<home>/catalogs/{uuid8}/s{stage_set_id}/`. Per stage set, because
+/// each dar run labels its archive afresh and dar accepts only that run's
+/// catalogue against it.
+pub(crate) fn stage_set_catalogue_dir(
+    paths: &TapectlPaths,
+    unit_uuid: &str,
+    stage_set_id: i64,
+) -> PathBuf {
+    paths
+        .catalogs_dir
+        .join(unit_uuid.get(..8).unwrap_or(unit_uuid))
+        .join(format!("s{stage_set_id}"))
 }
 
 /// Best-effort cleanup of a `stage_set` that `stage_create` failed to
@@ -1086,14 +1117,19 @@ pub(crate) fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i
 /// `recover_orphaned_sessions` (`src/db/mod.rs`) mark it `'failed'` on the
 /// next `db::open()`, which is the operator's only signal that this stage
 /// attempt didn't complete.
-fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i64) {
+fn cleanup_failed_stage_set(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    stage_set_id: i64,
+) {
     let staging_dir = Path::new(&config.staging.directory);
 
     // Resolve this stage set's archive_base prefix via the SAME
     // `archive_base_name`/`archive_base_prefix` helpers `stage_create_inner`
     // used to build it — the lockstep issue #53 requires: this is not a
     // parallel re-derivation, it's the identical computation.
-    let prefix = match conn
+    let (prefix, uuid) = match conn
         .query_row(
             "SELECT u.uuid, sn.version
              FROM stage_sets ss
@@ -1105,7 +1141,7 @@ fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i6
         )
         .ok()
     {
-        Some((uuid, version)) => archive_base_prefix(&uuid, version, stage_set_id),
+        Some((uuid, version)) => (archive_base_prefix(&uuid, version, stage_set_id), uuid),
         None => {
             tracing::warn!(
                 stage_set_id,
@@ -1155,6 +1191,22 @@ fn cleanup_failed_stage_set(conn: &Connection, config: &Config, stage_set_id: i6
         params![stage_set_id],
     ) {
         tracing::warn!(stage_set_id, error = %e, "cleanup: could not delete stage_slices rows");
+    }
+
+    // Issue #419: this stage set's own isolated catalogue (and dar's
+    // on-the-fly one, if the run died before it was re-isolated). Nothing
+    // else uses the directory: it is per stage set.
+    let catalogue_dir = stage_set_catalogue_dir(paths, &uuid, stage_set_id);
+    if catalogue_dir.exists() {
+        match fs::remove_dir_all(&catalogue_dir) {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!(
+                stage_set_id,
+                path = %catalogue_dir.display(),
+                error = %e,
+                "cleanup: could not remove the stage set's catalogue directory"
+            ),
+        }
     }
 
     tracing::warn!(
@@ -1879,6 +1931,36 @@ pub(crate) mod durability {
     /// Everything recorded on this thread so far, clearing the log.
     pub(crate) fn take() -> Vec<Event> {
         LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+}
+
+/// Test-only: make `stage_create` fail at a named point on this thread, the
+/// way a crash or an io error there would — how a test reaches the cleanup
+/// of a stage set that died after dar.
+#[cfg(test)]
+pub(crate) mod failpoint {
+    use std::cell::Cell;
+
+    use crate::error::{Result, TapectlError};
+
+    /// Right after dar has finished and its command is recorded.
+    pub(crate) const AFTER_DAR: &str = "after dar";
+
+    thread_local! {
+        static ARMED: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    /// Fail the next time `point` is reached on this thread.
+    pub(crate) fn arm(point: &'static str) {
+        ARMED.with(|a| a.set(Some(point)));
+    }
+
+    pub(crate) fn hit(point: &'static str) -> Result<()> {
+        if ARMED.with(|a| a.get()) == Some(point) {
+            ARMED.with(|a| a.set(None));
+            return Err(TapectlError::Other(format!("injected failure: {point}")));
+        }
+        Ok(())
     }
 }
 
@@ -3077,6 +3159,96 @@ mod tests {
         );
     }
 
+    /// Decrypt every `.age` slice of `stage_set_id` with the tenant `alice`'s
+    /// keys into `out/arch.N.dar` — the plaintext dar archive an heir gets
+    /// after `age -d` — and return its base, `out/arch`, for `dar -t`/`-x`.
+    pub(super) fn decrypt_staged_set(
+        conn: &Connection,
+        paths: &TapectlPaths,
+        stage_set_id: i64,
+        out: &Path,
+    ) -> PathBuf {
+        let identities =
+            crate::crypto::keys::load_tenant_identities(conn, &paths.keys_dir, "alice").unwrap();
+        assert!(!identities.is_empty(), "alice has keys");
+        let slices: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT slice_number, staging_path FROM stage_slices
+                 WHERE stage_set_id = ?1 ORDER BY slice_number",
+            )
+            .unwrap()
+            .query_map(params![stage_set_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!slices.is_empty(), "stage set {stage_set_id} has slices");
+        fs::create_dir_all(out).unwrap();
+        for (n, path) in slices {
+            let decryptor = age::Decryptor::new(fs::File::open(&path).unwrap()).unwrap();
+            let mut reader = decryptor
+                .decrypt(identities.iter().map(|i| i as &dyn age::Identity))
+                .unwrap();
+            let mut plain = fs::File::create(out.join(format!("arch.{n}.dar"))).unwrap();
+            std::io::copy(&mut reader, &mut plain).unwrap();
+        }
+        out.join("arch")
+    }
+
+    /// `dar -t <archive> -A <catalogue>`: does dar accept `catalogue` as
+    /// the isolated catalogue of `archive`? dar compares the archive's
+    /// random data-name label with the catalogue's.
+    pub(super) fn dar_accepts_catalogue(archive: &Path, catalogue: &str) -> (bool, String) {
+        let out = std::process::Command::new("dar")
+            .arg("-t")
+            .arg(archive)
+            .arg("-A")
+            .arg(catalogue)
+            .arg("-Q")
+            .output()
+            .expect("dar must be on PATH (tests/test_dependencies.rs)");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// Issue #419: every stage set has its own isolated catalogue, produced
+    /// by its own dar run, so dar's catalogue rescue (`-A`) works against
+    /// that stage set's slices. Before, the catalogue was extracted once per
+    /// snapshot and every later stage set reused the first run's — whose
+    /// random data-name label dar refuses against a later run's slices.
+    #[test]
+    fn a_restaged_snapshots_catalogue_matches_its_own_slices() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("f.txt"), b"restaged content").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let set_1 = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+        let set_2 = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+
+        let catalogue = |id: i64| -> String {
+            conn.query_row(
+                "SELECT catalog_path FROM stage_sets WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let archive_2 = decrypt_staged_set(&conn, &paths, set_2, &tmp.path().join("plain2"));
+
+        let (ok, err) = dar_accepts_catalogue(&archive_2, &catalogue(set_2));
+        assert!(
+            ok,
+            "the second stage set's catalogue must be its own archive's: {err}"
+        );
+        // Positive control: dar does refuse a catalogue from another run.
+        let (ok, _) = dar_accepts_catalogue(&archive_2, &catalogue(set_1));
+        assert!(
+            !ok,
+            "dar refuses the first run's catalogue for the second run's slices"
+        );
+    }
+
     // ── issue #54: stage failure hygiene ──
 
     /// Proves the leak: a failure *after* `dar -c` has written every
@@ -3084,18 +3256,18 @@ mod tests {
     /// worst case, where every slice is orphaned as plaintext. Before the
     /// change-2 fix, those `.dar` files are never cleaned up.
     ///
-    /// The failure is injected at catalog extraction: `catalogs_dir` is a
-    /// regular FILE, so creating the per-unit catalog directory under it
-    /// fails (ENOTDIR — no permission bits involved, so it holds as root
-    /// too). This test used to inject it with a tenant that had no active
-    /// keys, until issue #354 moved that refusal before dar — where it can
-    /// no longer orphan anything, which is the point of moving it.
+    /// The failure is injected right after dar (`failpoint::AFTER_DAR`).
+    /// It used to be injected with a tenant that had no active keys, until
+    /// issue #354 moved that refusal before dar, and then by making
+    /// `catalogs_dir` a file, until issue #419 created the stage set's
+    /// catalogue directory before dar (dar writes the catalogue into it).
+    /// The cleanup also removes that directory.
     #[test]
     fn stage_create_failure_orphans_plaintext_dar_slices() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
-        let mut paths = TapectlPaths::new(home);
+        let paths = TapectlPaths::new(home);
         paths.ensure_dirs().unwrap();
 
         let conn = crate::db::open(&paths.db_file).unwrap();
@@ -3111,11 +3283,6 @@ mod tests {
         crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
         // Issue #115: `stage_create` refuses without a registered escrow.
         register_test_escrow(&conn);
-
-        // The injected post-dar failure (see the doc comment).
-        let catalogs_file = tmp.path().join("catalogs-is-a-file");
-        fs::write(&catalogs_file, b"not a directory").unwrap();
-        paths.catalogs_dir = catalogs_file;
 
         let src = tmp.path().join("src");
         fs::create_dir_all(&src).unwrap();
@@ -3137,11 +3304,13 @@ mod tests {
         .unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        // The injected post-dar failure (see the doc comment).
+        failpoint::arm(failpoint::AFTER_DAR);
         let result = stage_create(&conn, &paths, &config, snap_id, false);
 
         assert!(
-            result.is_err(),
-            "expected stage_create to fail creating the catalog directory"
+            matches!(&result, Err(e) if e.to_string().contains("injected failure")),
+            "expected stage_create to fail at the injected point, got {result:?}"
         );
 
         // Positive control: the failure must have come AFTER dar, or there
@@ -3175,6 +3344,18 @@ mod tests {
              plaintext .dar/.sha512 file — found: {:?}",
             leaked.iter().map(|e| e.file_name()).collect::<Vec<_>>()
         );
+
+        // Issue #419: dar wrote this stage set's on-the-fly catalogue into its
+        // own catalogue directory; the cleanup removes that too.
+        let unit_catalogues = paths.catalogs_dir.read_dir().unwrap().flatten();
+        for unit_dir in unit_catalogues {
+            let left: Vec<_> = fs::read_dir(unit_dir.path()).unwrap().flatten().collect();
+            assert!(
+                left.is_empty(),
+                "the failed stage set's catalogue directory is removed: {:?}",
+                left.iter().map(|e| e.path()).collect::<Vec<_>>()
+            );
+        }
 
         // The stage_sets row must survive the failure — that 'staging'
         // status is what recover_orphaned_sessions (src/db/mod.rs) sweeps
@@ -3266,7 +3447,7 @@ mod tests {
             fs::write(f, b"x").unwrap();
         }
 
-        cleanup_failed_stage_set(&conn, &config, failed_set);
+        cleanup_failed_stage_set(&conn, &paths, &config, failed_set);
 
         assert!(
             !failed_slice.exists(),
@@ -3374,11 +3555,12 @@ mod tests {
     /// does clean them up.
     #[test]
     fn a_busy_error_keeps_the_stage_sets_files_and_any_other_error_cleans_them() {
-        let (_tmp, _db_path, conn, config, stage_set_id, dar, age) = slice_being_recorded();
+        let (tmp, _db_path, conn, config, stage_set_id, dar, age) = slice_being_recorded();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
         record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &dar, &age, &slice_info()).unwrap();
 
         let busy_err = TapectlError::CatalogBusy("the stage set's finalization".into());
-        after_failed_stage(&conn, &config, stage_set_id, &busy_err);
+        after_failed_stage(&conn, &paths, &config, stage_set_id, &busy_err);
         assert!(
             age.exists(),
             "a busy catalog must not discard encrypted slices"
@@ -3387,6 +3569,7 @@ mod tests {
 
         after_failed_stage(
             &conn,
+            &paths,
             &config,
             stage_set_id,
             &TapectlError::Other("dar failed".into()),

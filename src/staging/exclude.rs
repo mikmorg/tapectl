@@ -639,6 +639,7 @@ mod tests {
             exclude_paths: &masks.prune,
             preserve_xattrs: false,
             preserve_fsa: false,
+            on_fly_catalogue: &out.join("onfly"),
         })
         .unwrap();
         let dest = tmp.path().join("restored");

@@ -170,7 +170,7 @@ archive"). For the service user that is **`/var/lib/tapectl/.tapectl`**, mode
 ├── config.toml          dar path, [[backends.lto]], [staging], [defaults], [discovery], [[collections]]
 ├── tapectl.db           the catalog (SQLite, WAL mode: tapectl.db-wal / -shm appear while open)
 ├── keys/                every PRIVATE key: <tenant>-<alias>.age.key, and the .age.pub beside it
-├── catalogs/            dar catalogs per unit (first 8 chars of the unit uuid)
+├── catalogs/            dar catalogues: <first 8 chars of the unit uuid>/s<stage set id>/, one per stage set, made by its own dar run
 ├── stage-reports/       stage reports: one text file per stage set (slice sizes and hashes)
 ├── staging/             created 0700 by init as the default [staging] directory; stays empty once step 7 points staging elsewhere
 ├── logs/                created by ensure_dirs; may stay empty
