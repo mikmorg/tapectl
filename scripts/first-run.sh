@@ -273,6 +273,8 @@ tape_lock() { exec 9>/tmp/tapectl-tape.lock; flock -n 9 || die "another process 
 # The DRIVE's own generation, parsed from its INQUIRY product id (issue #178).
 # shellcheck source=lib/drive-generation.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/drive-generation.sh"
+# shellcheck source=lib/volume-state.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/volume-state.sh"
 # The heir kit is YOUR artifact to print, but escrow-kit chmods its out dir 0700
 # as whoever runs it. Hand the dir to the service user for the write, take it back after.
 kit_prepare() {
@@ -968,7 +970,7 @@ skip_if || {
 NV="$(tc catalog stats --json 2>/dev/null | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("volumes",0))
 except Exception: print(0)' 2>/dev/null || echo 0)"
-[ "$NV" != 0 ] && note "$NV volume(s) already in the catalog." && { confirm "Write another tape now?" || { ok "nothing to do"; FROM=14; }; }
+[ "$NV" != 0 ] && note "$NV volume(s) already in the catalog." && { confirm "Write another tape now, or finish one an interrupted run left (same label)?" || { ok "nothing to do"; FROM=14; }; }
 if [ "$FROM" -le 13 ]; then
 explain <<'EOF'
 The pipeline is three phases: `snapshot create` walks the unit and records what exists; `stage create` hashes every source file, runs dar, and encrypts the archive once (age: one random file key per slice, wrapped for each recipient in a small header) into slices in staging; `volume write` plans the whole tape first — every file, position and size — then writes it in one session and, before it seals, reads EVERY byte back and checks it against the plan (confirm). A sealed volume is immutable: there is no append. `volume verify --full` afterwards is a second, independent full read — the first entry in this tape's verification history, which `report verify-status` and the audit build on; on a full tape it takes as long as the write did.
@@ -1011,6 +1013,81 @@ EOF
   run as_svc mt -f "$DEVICE" status || true
   if as_svc mt -f "$DEVICE" status 2>/dev/null | grep DR_OPEN >/dev/null; then die "no cartridge loaded in $DEVICE"; fi
   ask LABEL "volume label" "${LABEL:-L6-0001}"
+  # Issue #414: re-entering this step after an interrupted run must pick up
+  # where that run stopped, not die. What $LABEL already is in the catalog
+  # decides what is left: nothing (the whole path below), an initialised but
+  # unwritten volume (the write), an interrupted write (`volume resume`), or a
+  # sealed volume (only the post-write block). `volume info`'s own "not
+  # found" refusal is the only thing read as "absent", so a busy or broken
+  # catalog stops here rather than starting a second write.
+  VSTATE=absent
+  VINFO="$(dirname "$LOG")/volume-info-$LABEL.json"
+  VINFO_ERR="$(dirname "$LOG")/volume-info-$LABEL.err"
+  if tc volume info "$LABEL" --json >"$VINFO" 2>"$VINFO_ERR"; then
+    VSTATE="$(volume_step13_state "$VINFO")"
+  elif ! grep "volume not found" "$VINFO_ERR" >/dev/null; then
+    cat "$VINFO_ERR" >&2
+    die "could not read volume $LABEL from the catalog (above) — fix that, then re-run scripts/first-run.sh --from 13"
+  fi
+  log "step 13: volume $LABEL is $VSTATE"
+  # The quiet-host check (ADR-0012, 2026-09-24 amendment, item 7), run right
+  # before the WRITE or RESUME confirmation: staging's own dar load is over by
+  # then, and what matters is the host the tape I/O will run on. `host check`
+  # reads /proc and systemd only and exits 1 when anything tripped; it never
+  # refuses anything. The two homorg timers are passed with --unit because
+  # unit names are host-specific and tapectl checks none by default; on a host
+  # without them systemd reports them not-found, which counts as quiet.
+  quiet_host_check() {
+    HC_OUT="$(dirname "$LOG")/host-check.out"
+    # Unset = the dev VM's homorg timers (the historical default); a profile
+    # that declares CONTENDER_UNITS, even empty, replaces the list.
+    # `declare -p`, not ${CONTENDER_UNITS+set}: the latter is empty for a
+    # declared-but-empty array, so a profile's `CONTENDER_UNITS=()` read as unset
+    # and brought the dev VM's timers back (found by the 2026-09-28 mhvtl run).
+    if ! declare -p CONTENDER_UNITS >/dev/null 2>&1; then CONTENDER_UNITS=(homorg-db-suite.timer homorg-prune-target.timer); fi
+    HC_ARGS=(); for u in "${CONTENDER_UNITS[@]}"; do HC_ARGS+=(--unit "$u"); done
+    while ! run_capture "$HC_OUT" tc host check "${HC_ARGS[@]}"; do
+      explain <<'EOF'
+THE HOST IS NOT QUIET. Each "host check:" line above names what tripped, what it measured and the limit it crossed. A busy host does not stop the write — it costs tape (the drive stops and restarts below ~54 MB/s of feed; a bursty feed used 48% more tape on this drive) and risks the session (a process killed for memory mid-write is a clean abort, but the hours are gone). Pause what is named, then check again. The limits are [host_check] in config.toml (docs/operator-guide.md, "A quiet host while the tape runs").
+EOF
+      TRIPPED=(); for u in "${CONTENDER_UNITS[@]}"; do grep -qF "unit $u" "$HC_OUT" && TRIPPED+=("$u"); done
+      if [ "${#TRIPPED[@]}" -gt 0 ]; then
+        note "pause them for the write:               sudo systemctl stop ${TRIPPED[*]}"
+        note "and start them again once it is sealed:  sudo systemctl start ${TRIPPED[*]}"
+      fi
+      if [ "$AUTO" = 1 ]; then note "--auto: proceeding with the host NOT quiet — the findings are above and in $LOG"; break; fi
+      ask HC_ANS "press Enter to check again once the host is quiet, or type 'write' to proceed as it is (Ctrl-C stops)" ""
+      [ "$HC_ANS" = write ] && { log "host check: operator chose to write on a host that was not quiet"; break; }
+    done
+  }
+  case "$VSTATE" in
+    absent|fresh) ;;
+    resume)
+      explain <<'EOF'
+THIS VOLUME HAS AN INTERRUPTED WRITE. A run of this step (or a `volume write` by hand) started writing it and stopped before it was sealed and confirmed — a Ctrl-C, a dropped session, a crash. `volume write` refuses it; `volume resume` continues that same session from its frozen staging files, after checking that the loaded tape is the one it was writing (File 0's identity) and that the tape is not already sealed. A tape whose seal was written but whose confirm did not finish is re-confirmed, never written again. The SAME cartridge must be in the drive. Nothing is staged again: the snapshot and staging phases below are skipped.
+EOF
+      quiet_host_check
+      confirm "Resume the interrupted write of $LABEL on the cartridge in $DEVICE?" || die "stopped before resuming — re-run scripts/first-run.sh --from 13 --label $LABEL when ready"
+      run tc volume resume "$LABEL" --device "$DEVICE" || die "resume did not seal and confirm $LABEL — read the output; the catalog knows exactly why. Re-run scripts/first-run.sh --from 13 --label $LABEL once it is fixed"
+      ;;
+    live)
+      die "volume $LABEL has a write session in progress RIGHT NOW (another process is writing it — tapectl turns a crashed session into an interrupted one whenever it opens the catalog). Find that process and let it finish; do not start a second writer"
+      ;;
+    planned)
+      die "volume $LABEL has a write session that was planned and never reached the tape. Clear it with \`tapectl volume abort $LABEL\`, then re-run scripts/first-run.sh --from 13 --label $LABEL to write it"
+      ;;
+    sealed)
+      ok "volume $LABEL is already sealed — going on to the verify, audit, shelf and Heir Kit steps it is still owed"
+      ;;
+    *)
+      VSTAT="$(python3 -c 'import json,sys
+try:
+  d=json.load(open(sys.argv[1])); print("%s, condition %s" % (d.get("status","?"), d.get("condition","?")))
+except Exception: print("unknown")' "$VINFO" 2>/dev/null || echo unknown)"
+      die "volume $LABEL already exists ($VSTAT) and is neither unwritten, interrupted nor sealed — \`tapectl volume info $LABEL\` shows its history. Choose a new label: scripts/first-run.sh --from 13 --label <new>"
+      ;;
+  esac
+if [ "$VSTATE" = absent ] || [ "$VSTATE" = fresh ]; then
   explain <<'EOF'
 THE CARTRIDGE. There is nothing to register and nothing to type. A cartridge is known by the serial its chip reports, and a barcode is a sticker (ADR-0012) — so `volume init` reads that serial, registers the cartridge itself, and wears the serial as a placeholder barcode until you replace it. Put the sticker on whenever you like, before or after this write, with `cartridge relabel`; the command is printed below once the cartridge is registered. Do not register it by hand first WITHOUT its serial: init matches on the serial, finds no row carrying it, and registers a second cartridge — two rows for one tape, with your label on the one the catalog is not using. (`cartridge register --serial <medium serial>` is matched; a bare barcode is not.)
 EOF
@@ -1095,39 +1172,19 @@ EOF
   # uses (issue #269).
   run tc volume plan || true
   # ADR-0012, 2026-09-24 amendment, item 7: the quiet-host rule is CHECKED
-  # here, not only stated in the explain block above — and here, right before
-  # the WRITE confirmation, because staging's own dar load is over by now and
-  # what matters is the host the write will run on. `host check` reads /proc
-  # and systemd only and exits 1 when anything tripped; it never refuses
-  # anything. The two homorg timers are passed with --unit because unit names
-  # are host-specific and tapectl checks none by default; on a host without
-  # them systemd reports them not-found, which counts as quiet.
-  HC_OUT="$(dirname "$LOG")/host-check.out"
-  # Unset = the dev VM's homorg timers (the historical default); a profile
-  # that declares CONTENDER_UNITS, even empty, replaces the list.
-  # `declare -p`, not ${CONTENDER_UNITS+set}: the latter is empty for a
-  # declared-but-empty array, so a profile's `CONTENDER_UNITS=()` read as unset
-  # and brought the dev VM's timers back (found by the 2026-09-28 mhvtl run).
-  if ! declare -p CONTENDER_UNITS >/dev/null 2>&1; then CONTENDER_UNITS=(homorg-db-suite.timer homorg-prune-target.timer); fi
-  HC_ARGS=(); for u in "${CONTENDER_UNITS[@]}"; do HC_ARGS+=(--unit "$u"); done
-  while ! run_capture "$HC_OUT" tc host check "${HC_ARGS[@]}"; do
-    explain <<'EOF'
-THE HOST IS NOT QUIET. Each "host check:" line above names what tripped, what it measured and the limit it crossed. A busy host does not stop the write — it costs tape (the drive stops and restarts below ~54 MB/s of feed; a bursty feed used 48% more tape on this drive) and risks the session (a process killed for memory mid-write is a clean abort, but the hours are gone). Pause what is named, then check again. The limits are [host_check] in config.toml (docs/operator-guide.md, "A quiet host while the tape runs").
-EOF
-    TRIPPED=(); for u in "${CONTENDER_UNITS[@]}"; do grep -qF "unit $u" "$HC_OUT" && TRIPPED+=("$u"); done
-    if [ "${#TRIPPED[@]}" -gt 0 ]; then
-      note "pause them for the write:               sudo systemctl stop ${TRIPPED[*]}"
-      note "and start them again once it is sealed:  sudo systemctl start ${TRIPPED[*]}"
-    fi
-    if [ "$AUTO" = 1 ]; then note "--auto: proceeding with the host NOT quiet — the findings are above and in $LOG"; break; fi
-    ask HC_ANS "press Enter to check again once the host is quiet, or type 'write' to proceed as it is (Ctrl-C stops)" ""
-    [ "$HC_ANS" = write ] && { log "host check: operator chose to write on a host that was not quiet"; break; }
-  done
+  # here, not only stated in the explain block above (`quiet_host_check`).
+  quiet_host_check
   confirm_destructive "WRITE volume $LABEL to the cartridge in $DEVICE (the cartridge's current contents are overwritten)" "$LABEL" "$LABEL_FROM_FLAG" || die "stopped before writing"
   # Capture init's output as well as logging it: two later steps read it back
   # -- the placeholder barcode it reports, and which refusal it gave.
   INIT_OUT="$(dirname "$LOG")/volume-init-$LABEL.out"
-  if ! run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE"; then
+  if [ "$VSTATE" = fresh ]; then
+    # Issue #414: init already ran (an earlier run of this step stopped
+    # between it and the write). Nothing to re-run; the write's own contact
+    # check is what proves the loaded tape is this volume's cartridge.
+    note "volume $LABEL is already initialised and unwritten — continuing to the write"
+    : >"$INIT_OUT"
+  elif ! run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE"; then
     if grep -q "already exists" "$INIT_OUT"; then
       # Re-entering after an interrupted run: the volume row exists. Only an
       # `initialized` one (init done, nothing written) may go straight to the
@@ -1218,7 +1275,11 @@ EOF
   # or, under --auto with no terminal, a Tier-2 decline -- would add nothing.
   # The write still PRINTS any finding it sees. --yes reaches nothing else
   # here: volume write has no other Tier-2 question and no Tier-3 refusal.
-  run tc volume write "$LABEL" --device "$DEVICE" --yes || die "write did not seal — read the output; the catalog knows exactly why"
+  # A write that stops (a signal, a dropped session, an error mid-tape) is
+  # picked up by re-running this step: it finds the interrupted session and
+  # offers `volume resume` (issue #414).
+  run tc volume write "$LABEL" --device "$DEVICE" --yes || die "write did not seal — read the output; the catalog knows exactly why. If it was interrupted, reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session"
+fi
   # Issue #265: a failed verify has TWO outcomes and they need opposite
   # responses. ADR-0012's 2026-09-17 amendment: only a mismatch that PROVES the
   # medium bad takes the volume out of service; a drive or transport error

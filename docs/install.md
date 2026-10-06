@@ -254,9 +254,23 @@ re-entry, and this list gives it for each:
   this is understood` and names no re-entry: `--from 12` once understood.
   Never write real data over a red rehearsal.
 
-Step 13 is re-entrant: a unit that was already staged by hand is skipped, and
-a volume row left `initialized` by an interrupted run goes straight to the
-write; anything else asks for a new label.
+Step 13 is re-entrant (issue #414). A unit that was already staged by hand is
+skipped, and re-running `--from 13 --label <label>` with the label of a volume
+an earlier run left behind picks up where that run stopped, by what the
+catalog says the volume is (`tapectl volume info <label>`):
+
+- **initialised, nothing written** — straight to the write;
+- **an interrupted write** (a Ctrl-C, a dropped session, a crash) — the
+  snapshot and staging phases are skipped and the step offers `volume resume`
+  on the same cartridge, after the quiet-host check. A tape whose seal was
+  written but whose confirm did not finish is re-confirmed, never rewritten;
+- **sealed** — only the post-write block is left: `volume verify --full`,
+  `audit`, the move to the shelf, the Heir Kit;
+- **a write in progress right now**, or **a session planned that never
+  reached the tape** — it stops and names the remedy (let the live writer
+  finish; `tapectl volume abort <label>`, then re-run);
+- anything else (quarantined, retired, erased) — it stops and asks for a new
+  label.
 
 ---
 
