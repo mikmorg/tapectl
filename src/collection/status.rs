@@ -28,6 +28,10 @@ pub struct CollectionStatus {
     /// `cli::collection::cmd_status` must report these and exit non-zero
     /// when non-empty.
     pub refused: Vec<RefusedUnit>,
+    /// Entries under the root that belong to no unit (issue #382) — see
+    /// `collection::outside`. Never archived; `cli::collection::cmd_status`
+    /// names them and exits non-zero.
+    pub outside: Vec<super::outside::OutsideEntry>,
 }
 
 /// Compute one collection's status.
@@ -52,6 +56,9 @@ pub fn status_for_collection(
     status.refused = scan.refused;
 
     let root = super::canonical_root(lib)?;
+    // Issue #382: content under the root that no unit holds, so "nothing
+    // pending" cannot be read as "everything archived" while it exists.
+    status.outside = super::outside::entries_outside_units(std::path::Path::new(&root), lib);
     let tracked = super::units_under_root(conn, &root)?;
     status.missing = tracked.iter().filter(|u| u.status == "missing").count();
 

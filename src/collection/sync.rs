@@ -40,6 +40,11 @@ pub struct SyncReport {
     /// `cli::collection::cmd_sync` must report these and exit non-zero when
     /// non-empty.
     pub refused: Vec<super::fingerprint::RefusedUnit>,
+    /// Entries under the root that belong to no unit (issue #382): loose
+    /// files and symlinks down to `unit_depth`, and a symlinked directory
+    /// where a unit folder would be. Never archived;
+    /// `cli::collection::cmd_sync` names them and exits non-zero.
+    pub outside: Vec<super::outside::OutsideEntry>,
 }
 
 /// Sync one collection with BUILT-IN defaults (`Config::default()`) plus the
@@ -150,6 +155,11 @@ pub fn sync_collection_with_config(
         }
     }
     report.refused = scan.refused;
+
+    // Step 4 (issue #382): what step 1's walk could never register — loose
+    // files and symlinks down to `unit_depth`, and symlinked directories at
+    // it. Read-only, so a dry run reports it the same.
+    report.outside = super::outside::entries_outside_units(&root_path, lib);
 
     Ok((report, errors))
 }

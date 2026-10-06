@@ -3,6 +3,7 @@ use rusqlite::Connection;
 
 use crate::collection;
 use crate::collection::fingerprint::RefusedUnit;
+use crate::collection::outside::OutsideEntry;
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 
@@ -235,6 +236,33 @@ fn print_refused_plain(refused: &[RefusedUnit]) {
     }
 }
 
+/// `outside` (issue #382), shaped for `--json`.
+fn outside_json(outside: &[OutsideEntry]) -> Vec<serde_json::Value> {
+    outside
+        .iter()
+        .map(|e| serde_json::json!({"path": e.path, "kind": e.kind.label()}))
+        .collect()
+}
+
+/// Plain-text report for `outside` (issue #382), shared by `sync` and
+/// `status`: a count, then each entry by its path under the root. Nothing
+/// when there is none, so a clean collection reads as before.
+fn print_outside_plain(outside: &[OutsideEntry]) {
+    let n = outside.len();
+    match n {
+        0 => return,
+        1 => {
+            println!("  OUTSIDE ANY UNIT (not archived): 1 entry under the root belongs to no unit")
+        }
+        _ => println!(
+            "  OUTSIDE ANY UNIT (not archived): {n} entries under the root belong to no unit"
+        ),
+    }
+    for e in outside {
+        println!("    {} ({})", e.path, e.kind.label());
+    }
+}
+
 fn cmd_sync(conn: &Connection, config: &Config, dry_run: bool, json_output: bool) -> Result<i32> {
     if config.collections.is_empty() {
         no_libraries_configured(json_output);
@@ -252,7 +280,9 @@ fn cmd_sync(conn: &Connection, config: &Config, dry_run: bool, json_output: bool
         // exactly like a refused registered one (ADR-0012, 2026-09-22:
         // "refused, and the command exits non-zero"). Printed as `error:`
         // lines below; counted here so the exit code says so too.
-        any_refused |= !report.refused.is_empty() || !errors.is_empty();
+        // Issue #382: content no unit holds is never archived either.
+        any_refused |=
+            !report.refused.is_empty() || !errors.is_empty() || !report.outside.is_empty();
         rows.push((lib.name.clone(), report, errors));
     }
 
@@ -271,6 +301,7 @@ fn cmd_sync(conn: &Connection, config: &Config, dry_run: bool, json_output: bool
                     "dirty": r.dirty,
                     "errors": errors,
                     "refused": refused_json(&r.refused),
+                    "outside": outside_json(&r.outside),
                 })
             })
             .collect();
@@ -287,6 +318,7 @@ fn cmd_sync(conn: &Connection, config: &Config, dry_run: bool, json_output: bool
                 println!("  error: {e}");
             }
             print_refused_plain(&r.refused);
+            print_outside_plain(&r.outside);
         }
     }
     Ok(refused_exit_code(any_refused))
@@ -302,7 +334,7 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i
     let mut any_refused = false;
     for lib in &config.collections {
         let status = collection::status::status_for_collection(conn, config, lib)?;
-        any_refused |= !status.refused.is_empty();
+        any_refused |= !status.refused.is_empty() || !status.outside.is_empty();
         rows.push((lib.name.clone(), status));
     }
 
@@ -317,6 +349,7 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i
                     "missing": s.missing,
                     "under_copied": s.under_copied,
                     "refused": refused_json(&s.refused),
+                    "outside": outside_json(&s.outside),
                 })
             })
             .collect();
@@ -328,6 +361,7 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i
                 s.pending, s.dirty, s.missing, s.under_copied
             );
             print_refused_plain(&s.refused);
+            print_outside_plain(&s.outside);
         }
     }
     Ok(refused_exit_code(any_refused))
@@ -816,6 +850,43 @@ pattern = ["*.tmp"]
         )
         .unwrap();
         assert_eq!(code, 0, "no unit was refused, so the command must exit 0");
+    }
+
+    /// Issue #382: a loose file and a symlinked directory under the root
+    /// belong to no unit and are never archived. `status` and `sync` both
+    /// name them and exit non-zero, the way they do for a refused unit; the
+    /// test above, the same fixture with nothing outside a unit, is the
+    /// positive control that they exit 0 otherwise.
+    #[test]
+    fn content_outside_every_unit_makes_status_and_sync_exit_non_zero() {
+        let conn = db::open_memory().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let lib = seed_three_unit_collection(&conn, root.path(), false);
+        let root_path = std::path::Path::new(&lib.root).to_path_buf();
+        std::fs::write(root_path.join("loose.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), root_path.join("delta")).unwrap();
+
+        let status =
+            collection::status::status_for_collection(&conn, &Config::default(), &lib).unwrap();
+        let named: Vec<&str> = status.outside.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(named, vec!["delta", "loose.txt"]);
+
+        let mut config = Config::default();
+        config.collections.push(lib.clone());
+        let (report, _) =
+            collection::sync::sync_collection_with_config(&conn, &config, &lib, true).unwrap();
+        assert_eq!(report.outside.len(), 2);
+
+        let home = tempfile::tempdir().unwrap();
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        for command in [
+            CollectionCommands::Status,
+            CollectionCommands::Sync { dry_run: true },
+        ] {
+            let code = run(&conn, &paths, &config, &command, false, false, false).unwrap();
+            assert_ne!(code, 0, "{command:?} must exit non-zero");
+        }
     }
 }
 

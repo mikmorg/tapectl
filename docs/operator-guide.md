@@ -388,6 +388,26 @@ media root — a [Collection](cli/collection.md) (`collection sync`,
 `quick-archive` registers, snapshots, stages and writes a single directory
 onto a volume you have already initialised.
 
+A collection archives only its units: the real folders at exactly
+`unit_depth` below its root, and everything inside them. Anything else under
+the root down to that depth is in no unit and never reaches a tape: a loose
+file beside the unit folders (or, with `unit_depth` 2 or more, beside their
+parent folders), a symlink there, and a symlink to a folder standing where a
+unit folder would be (`collection sync` does not follow it). `collection sync`
+and `collection status` name each one and exit 1, so a clean run means the
+whole root is in units:
+
+```text
+collection "movies": 0 pending, 0 dirty, 0 missing, 0 under-copied
+  OUTSIDE ANY UNIT (not archived): 2 entries under the root belong to no unit
+    README.txt (file)
+    Brazil.1985 (symlinked directory)
+```
+
+Move such a file into a unit folder, replace the symlink with the folder
+itself, or list the name in the collection's `exclude` to say you meant to
+leave it out.
+
 ### Watching a long operation: progress and the session log
 
 `stage create`, `volume write`, `volume resume`, `volume verify`,
@@ -1086,7 +1106,7 @@ rows put a finding in their exit status:
 | `audit` | clean | warnings only | violations, or an error | — |
 | `volume verify` | every checked file matched | — | the medium is proven bad: the volume is quarantined and no longer counts as a copy | inconclusive: a drive or transport failure, or any error, including a command line that does not parse |
 | `db fsck` | clean | findings that are not corruption (orphaned rows, repaired or not) | the integrity check failed, or an error | — |
-| `collection sync`, `status`, `plan`, `run` | every unit ran | a unit was refused (its dotfile), or `sync` could not register a folder (invalid name, missing tenant or archive set); the rest ran | an error | — |
+| `collection sync`, `status`, `plan`, `run` | every unit ran | a unit was refused (its dotfile), or `sync` could not register a folder (invalid name, missing tenant or archive set), or (`sync`, `status`) something under the root belongs to no unit; the rest ran | an error | — |
 | `host check` | quiet | something tripped | an error | — |
 | `config check` | the config loads | — | it does not, or an error | — |
 | every other command | it ran, whatever it found | — | an error, including a usage error | — |
@@ -1137,6 +1157,8 @@ staged).
 prints both, each named. `volume info`'s `first_write` is when the volume's
 first write began (it was the time that write finished, the same as
 `last_write`), for volumes written before this change too.
+`collection sync` and `collection status` gain `outside`: each entry under the
+root that belongs to no unit, as `path` and `kind`.
 
 ## Warehouse Copies (Cold Cloud)
 

@@ -16,6 +16,7 @@
 
 pub mod batch;
 pub mod fingerprint;
+pub mod outside;
 pub mod plan;
 pub mod selector;
 pub mod status;

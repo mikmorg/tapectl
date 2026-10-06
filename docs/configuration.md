@@ -384,7 +384,7 @@ archives), where registering units one at a time would be a chore. See
 | `root` | path | *required* | The folder to walk. |
 | `tenant` | string | *required* | The tenant new units are registered under. The tenant must already exist. |
 | `unit_depth` | integer | `1` | How deep below `root` a folder becomes a unit. `1` means the immediate children. `2` means grandchildren, as in `show/season`. |
-| `exclude` | list of globs | `[]` | Unit folders to skip. Case never matters. A plain pattern is matched against the candidate **folder's own name**: `"*.partial"` skips an in-flight copy such as `Beta.PARTIAL`. A pattern ending in `/` (`"incoming/"`) skips a candidate folder of that name and, with `unit_depth` 2 or more, every candidate below one. This is separate from `global_excludes`, which applies to files *inside* units. |
+| `exclude` | list of globs | `[]` | Unit folders to skip. Case never matters. A plain pattern is matched against the candidate **folder's own name**: `"*.partial"` skips an in-flight copy such as `Beta.PARTIAL`. A pattern ending in `/` (`"incoming/"`) skips a candidate folder of that name and, with `unit_depth` 2 or more, every candidate below one. The same patterns silence a loose file or symlink above the unit folders that `collection sync` and `status` would otherwise report as outside any unit. This is separate from `global_excludes`, which applies to files *inside* units. |
 | `archive_set` | string | unset | The archive set new units are bound to. It must already exist in the database (run `archive-set sync` first). Unset means the units use `[defaults]`. |
 | `dotfiles` | bool | `true` | `true`: each new unit gets a `.tapectl-unit.toml`, so renaming or moving the folder keeps its identity. `false`: units are identified by path, for read-only sources you cannot write to. A renamed folder then looks like a new unit. |
 
@@ -405,6 +405,12 @@ Rename such folders (`Alien.1979`, `Alien_1979`), or skip them with `exclude` un
 you do. A collection `name` that breaks the rules, such as `.movies`, passes
 `config check` and fails the same way at `collection sync`, for every folder not
 registered yet.
+
+Only real folders at exactly `unit_depth` become units. A loose file or symlink
+between `root` and that depth, and a symlinked folder at it, belongs to no unit
+and is never archived; `collection sync` and `collection status` name each one
+as `OUTSIDE ANY UNIT` and exit 1 (see the
+[operator guide](operator-guide.md#a-typical-write-session)).
 
 ### `[discovery]`
 
