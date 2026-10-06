@@ -1117,3 +1117,35 @@ fn a_leftover_scratch_directory_is_refused_by_name() {
         h.ops()
     );
 }
+
+// ---- #412 item 9: dar -N, no darrc ----
+
+/// A `~/.darrc` on the heir's machine must not change what is restored. dar
+/// reads `$HOME/.darrc` and `/etc/darrc` unless given -N; this one excludes
+/// every .bin file on extract, so without -N the restore would silently be
+/// missing most of the unit.
+#[test]
+fn a_darrc_on_the_heirs_machine_does_not_change_the_restore() {
+    let h = Heir::new();
+    std::fs::write(
+        h.dir.join("home").join(".darrc"),
+        "extract:\n-X \"*.bin\"\n",
+    )
+    .unwrap();
+    let photos = unit("photos/2019");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        same_tree(&photos.src, Path::new(&dest)),
+        "a .darrc changed the restore:\n{text}"
+    );
+}

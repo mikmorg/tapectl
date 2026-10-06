@@ -456,6 +456,9 @@ pub fn extract_reported(
         // wrong (issue #51).
         "-O".into(),
         "-Q".into(),
+        // -N: read no darrc — an `extract:` section in the restoring
+        // host's ~/.darrc could otherwise drop files (issue #412 item 9).
+        "-N".into(),
     ];
     if overwrite {
         // `-w` (`--no-warn`): overwrite without asking — the real overwrite
@@ -505,6 +508,7 @@ pub fn extract_file_reported(
         // -O is `--comparison-field` (ignore-owner): see `extract`.
         "-O".into(),
         "-Q".into(),
+        "-N".into(), // no darrc: see `extract_reported`
     ];
     run_extract(dar_binary, "dar -x -g", &args, dest)
 }
@@ -759,6 +763,11 @@ All displayed files have their data in slice range [1,4-5]
         assert_eq!(report.exit_code, Some(0));
         assert_eq!(report.argv[0], "dar");
         assert_eq!(report.argv[1], "-x");
+        assert!(
+            report.argv.iter().any(|a| a == "-N"),
+            "-N: no darrc may change a restore (#412): {:?}",
+            report.argv
+        );
         assert!(!report.stdout.is_empty(), "dar's summary is on stdout");
         assert_eq!(
             report.inodes_restored(),

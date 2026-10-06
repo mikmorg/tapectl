@@ -270,9 +270,10 @@ If RESTORE.sh is not available, follow these steps:
    disk with room for all of the unit's decrypted slices at once
    (about the unit's size), not in /tmp, which is RAM on many systems
 8. Reassemble dar slices into an EMPTY directory:
-   `dar -x restore -R /destination -O -Q`. dar keeps any file already
+   `dar -x restore -R /destination -O -Q -N`. dar keeps any file already
    there and still reports success, so to finish an earlier restore that
-   stopped part way, add `-w` (overwrite) instead
+   stopped part way, add `-w` (overwrite). `-N` keeps a `~/.darrc` on
+   your machine from changing what is restored
 
 ## Important: Block Padding
 
@@ -1115,7 +1116,7 @@ without knowing exact sizes:
      size of every slice belonging to your unit(s); read each slice (steps
      1-2, with fsf to its position), trim it to that exact size with
      truncate -s SIZE instead of zero-stripping, decrypt it to restore.N.dar,
-     then, in an empty directory: dar -x restore -R /destination -O -Q
+     then, in an empty directory: dar -x restore -R /destination -O -Q -N
 
 See the system guide (File 1), "If All Else Fails", for the full narrative.
 ZSEOF
@@ -1600,7 +1601,9 @@ do_restore() {
 
   # Step 6: extract with dar
   info "Extracting archive to $destdir ..."
-  local -a dar_opts=(-O -Q)
+  # -N: no darrc. An `extract:` section in this machine's ~/.darrc or
+  # /etc/darrc would otherwise change what is restored, silently.
+  local -a dar_opts=(-O -Q -N)
   [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
   dar -x "$dar_dir/restore" -R "$destdir" "${dar_opts[@]}" 2>&1 | tee "$WORK/extract.log" ||
     die "dar extraction failed — dar's own message is above (No space left on device means $destdir is full)"
@@ -2021,7 +2024,7 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
         }
         s.push_str(
             "# Reassemble and extract all slices (they share the base name `restore`):\n\
-             dar -x restore -R /destination -O -Q\n\
+             dar -x restore -R /destination -O -Q -N\n\
              ```\n\n\
              `-O` ignores stored ownership, needed when restoring as a non-root user.\n\n",
         );

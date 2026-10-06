@@ -372,6 +372,7 @@ pub(crate) fn archive_to_files(
 /// Run dar -t (test archive integrity).
 pub fn test_archive(dar_binary: &str, archive_base: &Path) -> Result<()> {
     let output = super::command(dar_binary)
+        .arg("-N") // no darrc (issue #412 item 9)
         .arg("-t")
         .arg(archive_base)
         .arg("-Q")
@@ -399,6 +400,7 @@ pub(crate) fn extract_catalog(
         std::fs::create_dir_all(parent)?;
     }
     let output = super::command(dar_binary)
+        .arg("-N") // no darrc (issue #412 item 9)
         .arg("-C")
         .arg(catalog_base)
         .arg("-A")
