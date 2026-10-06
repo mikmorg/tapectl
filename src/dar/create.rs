@@ -46,6 +46,10 @@ pub fn create_command(params: &DarCreateParams) -> Command {
     // there ("Slicing (-s option), is not compatible with archive on
     // standard output"), so the slicing is tapectl's (`dar::slice`).
     cmd.arg("-c").arg("-");
+    // No ~/.darrc or /etc/darrc: a `-s` there would break `-c -`, and any
+    // other option there would change the archive behind tapectl's back
+    // (#412 item 9).
+    cmd.arg("-N");
     cmd.arg("-R").arg(params.source_path);
 
     if params.compression != "none" {
@@ -106,6 +110,23 @@ pub fn create_command(params: &DarCreateParams) -> Command {
     cmd
 }
 
+/// The command as recorded in `stage_sets.dar_command`, which MANIFEST.toml
+/// carries to tape: the on-the-fly catalogue's path is a path on the tapectl
+/// host, which says nothing an heir can use, so it is written as
+/// `<catalogue>`.
+fn recorded_command(cmd: &Command, params: &DarCreateParams) -> String {
+    let catalogue = params.on_fly_catalogue.as_os_str();
+    let mut parts = vec![format!("{:?}", cmd.get_program())];
+    parts.extend(cmd.get_args().map(|a| {
+        if a == catalogue {
+            "\"<catalogue>\"".to_string()
+        } else {
+            format!("{a:?}")
+        }
+    }));
+    parts.join(" ")
+}
+
 /// A running `dar -c -`: its archive is read from [`DarStream::take_stdout`]
 /// as it is produced.
 ///
@@ -140,8 +161,8 @@ pub enum DarFinish {
 pub fn spawn_archive(params: &DarCreateParams) -> Result<DarStream> {
     let ver = super::version::check(params.dar_binary)?;
     let mut cmd = create_command(params);
-    let dar_command = format!("{cmd:?}");
-    info!(command = %dar_command, "running dar");
+    let dar_command = recorded_command(&cmd, params);
+    info!(command = %format!("{cmd:?}"), "running dar");
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -460,6 +481,21 @@ mod tests {
         assert_eq!(after("-@").as_deref(), Some("/home/cat/onfly"));
         assert_eq!(after("-R").as_deref(), Some("/src"));
         assert!(!args.iter().any(|a| a == "-s"), "{args:?}");
+        assert!(args.iter().any(|a| a == "-N"), "{args:?}");
+    }
+
+    /// The recorded command (MANIFEST.toml, on tape) names no host path for
+    /// the on-the-fly catalogue.
+    #[test]
+    fn the_recorded_command_hides_the_catalogue_path() {
+        let p = params(
+            Path::new("/src"),
+            Path::new("/home/op/.tapectl/catalogs/ab/s1/x_v1"),
+        );
+        let rec = recorded_command(&create_command(&p), &p);
+        assert!(!rec.contains("/home/op"), "{rec}");
+        assert!(rec.contains("\"-@\" \"<catalogue>\""), "{rec}");
+        assert!(rec.contains("\"-c\" \"-\" \"-N\""), "{rec}");
     }
 
     /// `dar -l -alist-ea` for the archive at `base`: one line per entry,
