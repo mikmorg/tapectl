@@ -50,7 +50,16 @@ pub(crate) struct MtGet {
 pub struct TapePosition {
     pub file_number: i32,
     pub block_number: i32,
+    /// `GMT_EOD` in `mt_gstat`: the st driver last met END OF DATA — a
+    /// space or read that ran into BLANK CHECK (`st.c`: `eof = ST_EOD`).
+    /// After a failed forward space it says the space stopped at the end of
+    /// what is recorded, rather than on a medium or transport error (issues
+    /// #400, #403).
+    pub at_eod: bool,
 }
+
+/// `GMT_EOD(x)` from `<linux/mtio.h>`: `(x) & 0x08000000`.
+const GMT_EOD: i64 = 0x0800_0000;
 
 /// How a read of one tape file ended: what `TapeStore`'s file cursor needs to
 /// know about where the read left the head (issue #389).
@@ -194,6 +203,7 @@ impl TapeDevice {
         Ok(TapePosition {
             file_number: mtget.mt_fileno,
             block_number: mtget.mt_blkno,
+            at_eod: mtget.mt_gstat & GMT_EOD != 0,
         })
     }
 

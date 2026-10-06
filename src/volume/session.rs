@@ -558,11 +558,20 @@ pub enum ConfirmOutcome {
 /// itself having diverged from anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContactOutcome {
-    /// File 0 unreadable: nothing recorded there. For resume this is a
-    /// session crashed before File 0 ever landed; for a fresh write it is
-    /// the ordinary shape of a blank cartridge. Either way: safe to
-    /// (re)write from BOT.
+    /// File 0 unreadable AND the medium proved blank: end of data at the
+    /// beginning of the tape ([`Store::blank_at_bot`], issue #400). For
+    /// resume this is a session crashed before File 0 ever landed; for a
+    /// fresh write it is the ordinary shape of a blank cartridge. Either
+    /// way: safe to (re)write from BOT.
     Blank,
+    /// File 0 could not be read, and nothing proved the medium blank (issue
+    /// #400). st fails a read at BOT with the same EIO for a blank tape, a
+    /// medium error on a recorded tape — a live sealed volume on a drive
+    /// that needs cleaning — and a tape written in another block size, so
+    /// the error alone is no consent to write (ADR-0003 fails closed): the
+    /// fresh-write path refuses unless `--force`, resume refuses and leaves
+    /// the session to be resumed again.
+    FileZeroUnreadable { error: String },
     /// File 0 parsed and its identity matches `expected_label`/`expected_uuid`,
     /// and (when a seal position was given) nothing parseable was found
     /// there either — safe to continue.
@@ -620,72 +629,88 @@ pub fn check_tape_contact(
     expected_uuid: &str,
     seal_position: Option<u32>,
 ) -> ContactOutcome {
-    let mut id_thunk_bytes = Vec::new();
-    let file_zero_present = store.read_file(0, &mut id_thunk_bytes).is_ok();
-    if file_zero_present {
-        let text = String::from_utf8_lossy(&id_thunk_bytes);
-        let identity = format::parse_id_thunk_identity(&text);
-        let matches = matches!(
-            &identity,
-            Ok(id) if id.label == expected_label && id.uuid == expected_uuid
-        );
+    // Bounded (issue #400): File 0 is one block by construction. A file
+    // there larger than `SMALL_FILE_CAP` is not an ID thunk — and reading it
+    // whole could exhaust the host's memory — so it is read no further and
+    // treated as the unparseable File 0 it is.
+    let file_zero_error = match crate::store::read_small(store, 0) {
+        Ok(crate::store::SmallRead::Oversized) => {
+            return ContactOutcome::IdentityMismatch { found: None }
+        }
+        Ok(crate::store::SmallRead::Bytes(id_thunk_bytes)) => {
+            let text = String::from_utf8_lossy(&id_thunk_bytes);
+            let identity = format::parse_id_thunk_identity(&text);
+            let matches = matches!(
+                &identity,
+                Ok(id) if id.label == expected_label && id.uuid == expected_uuid
+            );
 
-        // THE TAPE'S OWN seal pointer, consulted whether or not the identity
-        // matched (issue #208, 2026-09-17 pre-production review).
-        //
-        // This used to sit inside the `!matches` arm below, which left the
-        // matching-identity case relying entirely on the CALLER's
-        // `seal_position` argument. For `resume_checking` that is sound --
-        // its layout is rehydrated from the very session that wrote this
-        // tape, so its seal entry is where the seal really is. For
-        // `volume_write` it is not: its layout is freshly built from
-        // whatever is staged NOW, so its seal position matches the tape's
-        // only when the new content happens to lay out identically. Write
-        // different content to a tape the catalog still believes is
-        // `initialized` -- a DB restored from a backup predating the seal,
-        // or a row a rebuild left alone -- and the probe reads a position
-        // with no marker, returns `Matches`, and a SEALED tape is
-        // overwritten. ADR-0003 forbids that outright and `--force` cannot
-        // reach it, so the guard must not depend on the caller guessing the
-        // right position.
-        //
-        // The tape's self-reported `[layout].seal_marker` has no such
-        // problem: it is where THIS tape says its own seal is. Probing it
-        // first is strictly more conservative -- it can only add refusals,
-        // and only for tapes that genuinely carry a parsing seal marker.
-        // Re-initialising a cartridge is unaffected: that path erases the
-        // medium first, so File 0 is gone or unparseable long before here.
-        if let Ok(pointers) = format::parse_id_thunk_layout_pointers(&text) {
-            if pointers.seal_marker >= 0
-                && seal_marker_parses_at(store, pointers.seal_marker as u32)
-            {
-                return ContactOutcome::AlreadySealed {
-                    seal_position: pointers.seal_marker as u32,
+            // THE TAPE'S OWN seal pointer, consulted whether or not the
+            // identity matched (issue #208, 2026-09-17 pre-production review).
+            //
+            // This used to sit inside the `!matches` arm below, which left the
+            // matching-identity case relying entirely on the CALLER's
+            // `seal_position` argument. For `resume_checking` that is sound --
+            // its layout is rehydrated from the very session that wrote this
+            // tape, so its seal entry is where the seal really is. For
+            // `volume_write` it is not: its layout is freshly built from
+            // whatever is staged NOW, so its seal position matches the tape's
+            // only when the new content happens to lay out identically. Write
+            // different content to a tape the catalog still believes is
+            // `initialized` -- a DB restored from a backup predating the seal,
+            // or a row a rebuild left alone -- and the probe reads a position
+            // with no marker, returns `Matches`, and a SEALED tape is
+            // overwritten. ADR-0003 forbids that outright and `--force` cannot
+            // reach it, so the guard must not depend on the caller guessing the
+            // right position.
+            //
+            // The tape's self-reported `[layout].seal_marker` has no such
+            // problem: it is where THIS tape says its own seal is. Probing it
+            // first is strictly more conservative -- it can only add refusals,
+            // and only for tapes that genuinely carry a parsing seal marker.
+            // Re-initialising a cartridge is unaffected: that path erases the
+            // medium first, so File 0 is gone or unparseable long before here.
+            if let Ok(pointers) = format::parse_id_thunk_layout_pointers(&text) {
+                if pointers.seal_marker >= 0
+                    && seal_marker_parses_at(store, pointers.seal_marker as u32)
+                {
+                    return ContactOutcome::AlreadySealed {
+                        seal_position: pointers.seal_marker as u32,
+                    };
+                }
+            }
+
+            if !matches {
+                // The sealed case already returned above (issue #208), so a
+                // mismatch reaching here is a genuinely unsealed foreign or
+                // stale tape. That is what `--force` is allowed to overwrite;
+                // issue #27's headline scenario -- a foreign-but-SEALED
+                // cartridge presenting as a plain mismatch the flag could
+                // defeat -- is closed by the hoisted probe, not here.
+                //
+                // Issue #327: `Store::read_file` succeeds with zero bytes when
+                // File 0 is only a filemark (`TapeStore`: the first read
+                // returns 0), and "" fails to parse just as garbage does. The
+                // two are different facts and are reported as such; both
+                // still refuse.
+                if id_thunk_bytes.is_empty() {
+                    return ContactOutcome::EmptyFileZero;
+                }
+                return ContactOutcome::IdentityMismatch {
+                    found: identity.ok(),
                 };
             }
+            None
         }
+        Err(e) => Some(e.to_string()),
+    };
 
-        if !matches {
-            // The sealed case already returned above (issue #208), so a
-            // mismatch reaching here is a genuinely unsealed foreign or
-            // stale tape. That is what `--force` is allowed to overwrite;
-            // issue #27's headline scenario -- a foreign-but-SEALED
-            // cartridge presenting as a plain mismatch the flag could
-            // defeat -- is closed by the hoisted probe, not here.
-            //
-            // Issue #327: `Store::read_file` succeeds with zero bytes when
-            // File 0 is only a filemark (`TapeStore`: the first read
-            // returns 0), and "" fails to parse just as garbage does. The
-            // two are different facts and are reported as such; both
-            // still refuse.
-            if id_thunk_bytes.is_empty() {
-                return ContactOutcome::EmptyFileZero;
-            }
-            return ContactOutcome::IdentityMismatch {
-                found: identity.ok(),
-            };
-        }
-    }
+    // Issue #400: an unreadable File 0 is blank only on positive evidence,
+    // asked of the medium itself. Asked before the seal probe below, which
+    // stays independent of it: a File-0-unreadable-but-sealed-tail tape is
+    // exactly the front/tail damage asymmetry `volume-format-v2.md` §4
+    // designs for.
+    let blank = file_zero_error.is_some() && store.blank_at_bot().unwrap_or(false);
 
     if let Some(seal_pos) = seal_position {
         if seal_marker_parses_at(store, seal_pos) {
@@ -695,10 +720,10 @@ pub fn check_tape_contact(
         }
     }
 
-    if file_zero_present {
-        ContactOutcome::Matches
-    } else {
-        ContactOutcome::Blank
+    match file_zero_error {
+        None => ContactOutcome::Matches,
+        Some(_) if blank => ContactOutcome::Blank,
+        Some(error) => ContactOutcome::FileZeroUnreadable { error },
     }
 }
 
@@ -719,12 +744,13 @@ pub fn check_tape_contact(
 /// fresh-write path (`write::check_fresh_write_contact`) and for
 /// [`resume_reconfirm_eligible`]'s defence-in-depth conditions.
 fn seal_marker_parses_at(store: &mut dyn Store, position: u32) -> bool {
-    let mut bytes = Vec::new();
-    if store.read_file(position, &mut bytes).is_ok() {
-        let text = String::from_utf8_lossy(&bytes);
-        format::parse_seal_marker(&text).is_ok()
-    } else {
-        false
+    // Bounded (issue #400): an oversized file is no seal marker.
+    match crate::store::read_small(store, position) {
+        Ok(crate::store::SmallRead::Bytes(bytes)) => {
+            let text = String::from_utf8_lossy(&bytes);
+            format::parse_seal_marker(&text).is_ok()
+        }
+        Ok(crate::store::SmallRead::Oversized) | Err(_) => false,
     }
 }
 
@@ -774,10 +800,10 @@ fn resume_reconfirm_eligible(
     let Some(expected_seal_position) = expected_seal_position else {
         return false;
     };
-    let mut id_thunk_bytes = Vec::new();
-    if store.read_file(0, &mut id_thunk_bytes).is_err() {
+    let Ok(crate::store::SmallRead::Bytes(id_thunk_bytes)) = crate::store::read_small(store, 0)
+    else {
         return false;
-    }
+    };
     let text = String::from_utf8_lossy(&id_thunk_bytes);
     let identity = match format::parse_id_thunk_identity(&text) {
         Ok(id) => id,
@@ -1567,6 +1593,37 @@ impl InterruptedSession {
                 // sealed_at is NULL: the seal is still genuinely owed.
                 // Fall through to the two-case cursor rule exactly as
                 // before.
+            }
+            ContactOutcome::FileZeroUnreadable { error } => {
+                // Issue #400. A sealed session only re-enters confirm, which
+                // reads and never writes — the same answer `Blank` gets
+                // above, and the one a resume of a sealed tape with a bad
+                // File 0 always had.
+                if seal_recorded(conn, self.volume_id)? {
+                    return Ok(ResumeOutcome::Confirming(SealedPending {
+                        built: self.built,
+                        volume_id: self.volume_id,
+                        write_ids: self.write_ids,
+                        // Nothing on this tape read just now: the gate goes
+                        // first, as for a recorded seal that did not read.
+                        seal_order: ReadOrder::SealFirst,
+                    }));
+                }
+                // An unsealed one would write. A read error is not proof
+                // the tape is blank — it may be this session's own File 0
+                // on a drive that needs cleaning, or another cartridge — and
+                // not proof of divergence either, so neither the rewrite
+                // nor a quarantine: refuse, change nothing, and let the
+                // operator resume again once the drive reads.
+                return Err(TapectlError::Other(format!(
+                    "volume resume: File 0 of the loaded cartridge could not be read ({error}), \
+                     and the tape is not provably blank, so tapectl cannot confirm it is \
+                     volume \"{}\" and will not write to it (ADR-0003). Nothing was written; \
+                     the session stays `interrupted`. Check the drive (clean it, reseat the \
+                     cartridge) and that the right cartridge is loaded, then run `tapectl \
+                     volume resume {}` again.",
+                    self.built.layout.label, self.built.layout.label
+                )));
             }
             contact @ (ContactOutcome::IdentityMismatch { .. } | ContactOutcome::EmptyFileZero) => {
                 // Issue #327: an empty File 0 at resume is divergence too —
@@ -3919,6 +3976,131 @@ mod tests {
             )
             .unwrap();
         assert_eq!(written_positions, 2, "both slices written after resume");
+    }
+
+    /// A fresh session of a fixture's `built`, interrupted between entries
+    /// after slice_1 — the SIGINT test's shape: 8 files recorded (id_thunk
+    /// .. slice_1), slice_1 `written`, slice_2 `pending`, rows
+    /// `interrupted`. For the resume tests below.
+    fn interrupt_after_first_slice(
+        built: BuiltLayout,
+        conn: &Connection,
+        keys: &KeyAvailability,
+        units: &[BuildUnit],
+        volume_id: i64,
+    ) -> (InterruptedSession, MemStore) {
+        let mut store = MemStore::new(BS as usize);
+        let planned = built
+            .into_validated(keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(conn, volume_id, units)
+            .unwrap();
+        let calls = AtomicU32::new(0);
+        let is_interrupted = move || calls.fetch_add(1, Ordering::SeqCst) >= 8;
+        match planned
+            .execute_checking(conn, &mut store, is_interrupted)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => {
+                assert_eq!(store.files.len(), 8);
+                (i, store)
+            }
+            _ => panic!("expected Interrupted"),
+        }
+    }
+
+    /// Issue #400: resume over a tape whose File 0 read fails and which is
+    /// NOT provably blank — here the session's own tape, eight files
+    /// recorded, File 0 unreadable as a drive needing cleaning makes it.
+    /// The read error used to count as a blank tape (`ContactOutcome::Blank`),
+    /// which is consent to write: resume repositioned and wrote on. Now it
+    /// refuses, writes nothing, and leaves the session `interrupted`.
+    #[test]
+    fn resume_refuses_an_unreadable_file_zero_on_a_tape_not_provably_blank() {
+        use crate::tape::fake::{FakeTape, Op};
+        let f = make_fixture();
+        let (interrupted, mem) =
+            interrupt_after_first_slice(f.built, &f.conn, &f.keys, &f.units, f.volume_id);
+        let fake = FakeTape::with_files(mem.files.clone(), BS as usize);
+        fake.state().unreadable.push(0);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+
+        let err = match interrupted.resume_checking(
+            &f.conn,
+            &f.keys,
+            SliceCheck::Size,
+            &mut store,
+            || false,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("resume must refuse an unreadable File 0 on a recorded tape"),
+        };
+        assert!(err.contains("could not be read"), "{err}");
+        assert!(
+            !fake.ops().iter().any(|op| matches!(op, Op::Write(_))),
+            "nothing written: {:?}",
+            fake.ops()
+        );
+        assert_eq!(
+            fake.state().files.len(),
+            8,
+            "the tape is as the session left it"
+        );
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["interrupted"]);
+    }
+
+    /// Issue #400 at the contact check itself, through the real
+    /// `TapeStore`: File 0 unreadable on a recorded tape is
+    /// `FileZeroUnreadable` — it used to be `Blank`.
+    #[test]
+    fn check_tape_contact_an_unreadable_file_zero_on_a_recorded_tape_is_not_blank() {
+        use crate::tape::fake::FakeTape;
+        let fake = FakeTape::with_files(vec![vec![7u8; BS as usize]; 3], BS as usize);
+        fake.state().unreadable.push(0);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        match check_tape_contact(&mut store, "L", "U", None) {
+            ContactOutcome::FileZeroUnreadable { error } => {
+                assert!(error.contains("Input/output error"), "{error}")
+            }
+            other => panic!("expected FileZeroUnreadable, got {other:?}"),
+        }
+    }
+
+    /// The positive control: a blank tape — end of data at BOT, so st fails
+    /// the File 0 read with EIO and a forward space with BLANK CHECK at file
+    /// 0 — is `Blank`, through the same real `TapeStore` probe.
+    #[test]
+    fn check_tape_contact_a_blank_tape_is_proved_blank_by_the_medium() {
+        use crate::tape::fake::FakeTape;
+        let fake = FakeTape::with_files(Vec::new(), BS as usize);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        assert_eq!(
+            check_tape_contact(&mut store, "L", "U", Some(9)),
+            ContactOutcome::Blank
+        );
+    }
+
+    /// Issue #400, bounded reads: a File 0 far larger than any ID thunk (the
+    /// fill script leaves 2.5 TB of it) is read no further than
+    /// `SMALL_FILE_CAP` and refused as not an ID thunk. It used to be read
+    /// whole into a `Vec`.
+    #[test]
+    fn check_tape_contact_reads_an_oversized_file_zero_no_further_than_the_cap() {
+        use crate::tape::fake::FakeTape;
+        let cap = crate::store::SMALL_FILE_CAP as usize;
+        let big = vec![b'x'; cap + 8 * BS as usize];
+        let fake = FakeTape::with_files(vec![big], BS as usize);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        assert_eq!(
+            check_tape_contact(&mut store, "L", "U", None),
+            ContactOutcome::IdentityMismatch { found: None }
+        );
+        let read = fake.state().bytes_read;
+        assert!(
+            read <= (cap + BS as usize) as u64,
+            "read {read} bytes of a {}-byte File 0",
+            cap + 8 * BS as usize
+        );
     }
 
     /// Bonus coverage beyond the four required TDD behaviors: the two-case

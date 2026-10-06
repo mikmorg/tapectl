@@ -12,7 +12,8 @@
 //! a rewind puts the head at file 0; a forward space of `k` from anywhere in
 //! file `n` lands at the start of `n + k`, and fails at end of data; a read
 //! delivers the rest of the current file and leaves the head at the start
-//! of the next one; a read at end of data returns nothing; a write replaces
+//! of the next one; a read at end of data returns nothing, except at BOT
+//! of a blank tape, where st fails it with EIO; a write replaces
 //! everything from the head onward. A read can be made to fail partway
 //! through a file, and the head moved behind the store's back.
 //!
@@ -54,6 +55,13 @@ pub(crate) struct State {
     /// A read starting in one of these files delivers one block, then
     /// fails, leaving the head inside the file.
     pub fail_reads_at: Vec<u32>,
+    /// A read starting in one of these files fails before delivering a
+    /// byte — a MEDIUM ERROR, or a block-size mismatch (ILI), on the first
+    /// block, both of which st reports as EIO (issue #400).
+    pub unreadable: Vec<u32>,
+    /// Every byte any read has delivered — how a test sees that a bounded
+    /// read stopped (issue #400).
+    pub bytes_read: u64,
     /// The cartridge's write-protect tab is set.
     pub write_protected: bool,
     /// Every open, in order, as `TapeStore::open`/`open_read` asked for it.
@@ -144,6 +152,18 @@ impl FakeTape {
         self.state().watched_bytes.clone()
     }
 
+    /// The reads st fails with EIO before a byte arrives: a file marked
+    /// [`State::unreadable`], and a read at BOT of a blank tape (`st.c`'s
+    /// `read_tape`: a BLANK CHECK not just after a filemark is `-EIO`; only
+    /// the first BLANK CHECK after crossing a filemark returns 0, which is
+    /// what the end-of-data case below the call keeps).
+    fn refuse_unreadable(s: &State, file: usize) -> Result<()> {
+        if s.unreadable.contains(&(file as u32)) || (file == 0 && s.files.is_empty()) {
+            return Err(io_error("read"));
+        }
+        Ok(())
+    }
+
     fn note_read(s: &mut State, file: usize) {
         if let Some(path) = &s.watch {
             let seen = path.exists();
@@ -211,6 +231,7 @@ impl TapeOps for FakeTape {
         Ok(TapePosition {
             file_number: s.head.0 as i32,
             block_number: s.head.1 as i32,
+            at_eod: s.head.0 >= s.files.len(),
         })
     }
 
@@ -242,6 +263,7 @@ impl TapeOps for FakeTape {
         let (file, start) = s.head;
         s.ops.push(Op::Read(file as u32));
         FakeTape::note_read(&mut s, file);
+        FakeTape::refuse_unreadable(&s, file)?;
         if file >= s.files.len() {
             return Ok((0, ReadEnd::Filemark)); // end of data: st returns 0
         }
@@ -257,6 +279,7 @@ impl TapeOps for FakeTape {
             sink.write_all(block)
                 .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
             total += block.len() as u64;
+            s.bytes_read += block.len() as u64;
         }
         if fails {
             s.head = (file, blocks.len());
@@ -271,6 +294,7 @@ impl TapeOps for FakeTape {
         let (file, start) = s.head;
         s.ops.push(Op::ReadHead(file as u32));
         FakeTape::note_read(&mut s, file);
+        FakeTape::refuse_unreadable(&s, file)?;
         if file >= s.files.len() {
             return Ok((0, ReadEnd::Filemark));
         }
@@ -289,6 +313,7 @@ impl TapeOps for FakeTape {
             sink.write_all(&block[..take])
                 .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
             total += take as u64;
+            s.bytes_read += block.len() as u64;
             next += 1;
         }
         s.head = (file, next);

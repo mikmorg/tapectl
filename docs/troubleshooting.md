@@ -1084,6 +1084,37 @@ being overwritten (ADR-0010).
          *** unit "<unit>" [<unit status>] now has ZERO copies ***
 ```
 
+### File 0 could not be read
+
+```text
+error: refusing to write volume "<label>" (uuid <uuid>): File 0 of the loaded cartridge could not be read (tape
+I/O error: read: Input/output error (os error 5)), and the tape is not provably blank — it does not end at its
+beginning. ...
+```
+
+The drive's driver returns the same I/O error for three different things: a
+blank tape, a recorded tape it cannot read right now (a drive that needs
+cleaning, a damaged first block), and a tape written in another block size
+(LTFS, `tar`). Only the first is safe to write, so tapectl asks the tape
+itself: it spaces forward one filemark from the beginning, and calls the tape
+blank only if the drive answers that the recorded data ends right there.
+`volume init`, `volume write` and `volume resume` all refuse otherwise.
+
+Clean the drive, reseat the cartridge, check it is the one you meant, and run
+the command again. If you know what the cartridge holds and mean to overwrite
+it, `volume init` and `volume write` take `--force`.
+
+`--force` is not accepted when the catalog binds this cartridge (by its chip
+serial) to a live volume: then the unreadable File 0 is that volume's, and the
+message names it. If those bytes really are gone, say so first with
+`tapectl volume retire <label>` or `tapectl cartridge mark-erased <barcode>`;
+to reuse the cartridge, erase it in the drive.
+
+`volume resume` has no `--force`; it refuses, writes nothing, and leaves the
+session `interrupted`, so the same `volume resume` can run again once the
+drive reads. A resume whose seal is already recorded is not refused: it only
+re-runs the read-back.
+
 ### The cartridge already carries a SEALED volume
 
 ```text

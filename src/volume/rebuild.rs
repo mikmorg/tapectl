@@ -443,8 +443,8 @@ fn rebuild_contacted(
     device_label: &str,
     medium_serial: Option<&str>,
 ) -> Result<RebuildReport> {
-    let mut thunk = Vec::new();
-    store.read_file(0, &mut thunk)?;
+    // Bounded (issue #400): read no further than `SMALL_FILE_CAP`.
+    let thunk = crate::store::read_small_bytes(store, 0, "ID thunk")?;
     let thunk_text = String::from_utf8_lossy(&thunk).to_string();
     // Before anything else of it is interpreted (ADR-0012 item 15).
     format::check_id_thunk_readable(&thunk_text)?;
@@ -524,8 +524,7 @@ fn rebuild_contacted(
         None => false,
     };
 
-    let mut fi = Vec::new();
-    store.read_file(pointers.front_index as u32, &mut fi)?;
+    let fi = crate::store::read_small_bytes(store, pointers.front_index as u32, "front index")?;
     let entries = format::parse_front_index(&String::from_utf8_lossy(&fi))?;
 
     let opened = open_all_envelopes(store, &entries, identities, scratch)?;

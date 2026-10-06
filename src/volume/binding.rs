@@ -504,6 +504,39 @@ pub(crate) fn refuse_unwitnessed_displacement(
     )))
 }
 
+/// The labels of the live volumes ([`crate::policy::coverage::in_service`])
+/// with an open mount on the cartridge whose CHIP serial is `serial` — what
+/// the catalog says is recorded on the medium in the drive (issue #400).
+/// Empty with no serial: nothing then says which cartridge this is.
+///
+/// Consulted only when File 0 could not be read and the tape is not
+/// provably blank: there, a live volume on this very cartridge turns
+/// "unreadable" into "a recorded volume we cannot read", which no `--force`
+/// may overwrite. It is not a gate on a displacement File 0 consented to
+/// (ADR-0010's rejected second gate): that consent is exactly what an
+/// unreadable File 0 never gave.
+pub(crate) fn live_volumes_on_serial(
+    conn: &Connection,
+    serial: Option<&str>,
+) -> Result<Vec<String>> {
+    let Some(serial) = serial else {
+        return Ok(Vec::new());
+    };
+    let sql = format!(
+        "SELECT v.label FROM cartridges c
+         JOIN cartridge_volumes cv ON cv.cartridge_id = c.id
+         JOIN volumes v ON v.id = cv.volume_id
+         WHERE c.serial_number = ?1 AND cv.unmounted_at IS NULL AND {}
+         ORDER BY v.id",
+        crate::policy::coverage::in_service("v")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let labels = stmt
+        .query_map(params![serial], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(labels)
+}
+
 /// Refuse to bind a cartridge the operator has declared unfit (ADR-0011).
 ///
 /// This is the ONE status-based refusal binding has, and it is deliberately
@@ -1257,11 +1290,14 @@ pub(crate) enum Corroboration {
 /// read-path leniency, issue #193's constraint 1). The refusals this feeds
 /// are for two KNOWN facts that disagree.
 pub(crate) fn read_file0_facts(store: &mut dyn crate::store::Store) -> File0Facts {
-    let mut raw = Vec::new();
-    if let Err(e) = store.read_file(0, &mut raw) {
-        tracing::warn!(err = %e, "could not read File 0 at contact; corroborating without it");
-        return File0Facts::default();
-    }
+    // Bounded (issue #400): read no further than `SMALL_FILE_CAP`.
+    let raw = match crate::store::read_small_bytes(store, 0, "ID thunk") {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(err = %e, "could not read File 0 at contact; corroborating without it");
+            return File0Facts::default();
+        }
+    };
     file0_facts_from_text(&String::from_utf8_lossy(&raw))
 }
 
@@ -1738,6 +1774,49 @@ mod tests {
             params![barcode, gen, serial, status],
         )
         .unwrap();
+    }
+
+    /// Issue #400: the live volumes on the cartridge whose chip serial is
+    /// given — sealed and open-mounted counts, an `initialized` or a
+    /// closed-mount one does not, and no serial names nothing.
+    #[test]
+    fn live_volumes_on_serial_names_only_live_open_mounted_volumes() {
+        let conn = db::open_memory().unwrap();
+        register(&conn, "C1", "LTO-6", Some("SER-1"), "in_use");
+        let cid: i64 = conn
+            .query_row("SELECT id FROM cartridges WHERE barcode = 'C1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        for (label, status, open) in [
+            ("LIVE", "sealed", true),
+            ("NEW", "initialized", true),
+            ("OLD", "sealed", false),
+        ] {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, ?2)",
+                params![label, status],
+            )
+            .unwrap();
+            let vid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source,
+                                                unmounted_at)
+                 VALUES (?1, ?2, 'mam', CASE WHEN ?3 THEN NULL ELSE datetime('now') END)",
+                params![cid, vid, open],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            live_volumes_on_serial(&conn, Some("SER-1")).unwrap(),
+            vec!["LIVE".to_string()]
+        );
+        assert!(live_volumes_on_serial(&conn, Some("OTHER"))
+            .unwrap()
+            .is_empty());
+        assert!(live_volumes_on_serial(&conn, None).unwrap().is_empty());
     }
 
     /// Like [`register`], but for a PRE-REGISTERED cartridge: the operator's
