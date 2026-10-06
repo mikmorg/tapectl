@@ -1042,7 +1042,7 @@ except Exception: pass' 2>/dev/null || true)"
     run tc snapshot create "$u" || die "snapshot failed for $u"
   done <<< "$UNITS"
   explain <<'EOF'
-Those are the sizes `snapshot create` recorded, before compression and encryption. Staging is the expensive phase — it reads and hashes every file, runs dar over every unit, and encrypts each archive once (the recipients only add a few hundred bytes of header each, not another pass), writing the slices to your staging directory. That is several full passes over the data. If that total looks wrong for the cartridge you have loaded, stop here: nothing has been archived yet, and stopping now costs you only the metadata walk. To do a subset instead, answer no and run `tapectl stage create <unit>` for the ones you want, then re-run this step with --from 13.
+Those are the sizes `snapshot create` recorded, before compression and encryption. Staging is the expensive phase — it reads and hashes every file, runs dar over every unit, and encrypts each archive once (the recipients only add a few hundred bytes of header each, not another pass), writing the slices to your staging directory. That is several full passes over the data. If that total looks wrong for the cartridge you have loaded, stop here: nothing has been archived yet, and stopping now costs you only the metadata walk. To do a subset instead, answer no and run `tapectl stage create <unit>` for the ones you want, then re-run this step with --from 13. `[staging] jobs` in config.toml (1 unless you set it) is how many units are staged at once; the largest start first.
 EOF
   confirm "Stage them now? (runs dar + encryption, writes to staging)" || die "stopped before staging"
   # Issue #283: this loop MUST tolerate a unit that is already staged. The
@@ -1074,16 +1074,38 @@ except Exception:
 sys.exit(0 if any(r.get("unit") == sys.argv[2] for r in rows) else 1)
 PY
   }
+  has_unstaged() { # has_unstaged <unit>: a `created` snapshot waits to be staged
+    local f; f="$(dirname "$LOG")/snapshot-list-created.json"
+    tc snapshot list --unit "$1" --status created --json >"$f" 2>/dev/null || return 1
+    python3 - "$f" <<'PY'
+import json, sys
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if rows else 1)
+PY
+  }
+  # Issue #368: every unit still to stage goes to ONE `stage create`, so
+  # `[staging] jobs` in config.toml can stage several at once (largest
+  # first). The #283 skip is as narrow as it was: a unit is left out only
+  # when it has no unstaged snapshot AND already has a staged set. Any other
+  # unit is passed on, and `stage create` refuses a unit it cannot stage by
+  # name, before it stages anything.
+  TO_STAGE=()
   while IFS= read -r u; do
     [ -z "$u" ] && continue
-    so="$(dirname "$LOG")/stage-$u.out"
-    if run_capture "$so" tc stage create "$u"; then continue; fi
-    if grep -q 'no unstaged snapshot for unit' "$so" && staged_already "$u"; then
+    if ! has_unstaged "$u" && staged_already "$u"; then
       note "$u is already staged -- skipping it (staged by hand, or by an earlier run of this step)"
       continue
     fi
-    die "stage failed for $u"
+    TO_STAGE+=("$u")
   done <<< "$UNITS"
+  if [ "${#TO_STAGE[@]}" -gt 0 ]; then
+    so="$(dirname "$LOG")/stage-create.out"
+    run_capture "$so" tc stage create "${TO_STAGE[@]}" \
+      || die "staging failed (see $so) -- the units it staged stay staged, and re-running this step skips them"
+  fi
   explain <<'EOF'
 `staging status` lists what is staged and what it weighs; `volume plan` totals it against the drive's generation and estimates how many tapes it needs. It is an ESTIMATE (it says so): the authoritative figure is the capacity `volume init` records once it has detected the loaded cartridge, and the gate that refuses an over-full plan is inside `volume write`, before any byte is written. If the estimate already says more than one tape, stage fewer units now — nothing has been written yet.
 EOF

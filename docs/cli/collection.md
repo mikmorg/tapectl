@@ -66,4 +66,5 @@ tapectl collection run [OPTIONS] --collection <COLLECTION>
 - `--label <LABELS>` — Destination volume label — already `volume init`'d on its own cartridge. Exactly one: tapectl drives no changer, so it cannot write a second copy without a human swapping cartridges, and a batch run has no point where that swap could happen. More than one is refused. For a second and further copy, swap in the next cartridge after this run finishes and use `tapectl volume write <label>` directly against the same staged data
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--prewrite-hash` — See `volume write --prewrite-hash`: full-hash every staged slice before the tape moves, for every copy this run writes
+- `--jobs <JOBS>` — How many of the batch's units to stage at once (1 to 16), as `stage create --jobs`. Defaults to `[staging] jobs`, itself 1
 

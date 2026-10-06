@@ -222,10 +222,11 @@ re-entry, and this list gives it for each:
   when the paper is ready");
 - on a config this version cannot load (`--from 7`, after fixing the key it
   named, or let it regenerate — §6);
-- `✗ stage failed for <unit>` in step 13. That line names no re-entry; the
-  refusal above it says why. When the staging directory *may* be too small
-  for that unit, `stage create` asks about the case, but step 13 runs it
-  without a terminal, so it refuses with the figures (`stage unit "<unit>"
+- `✗ staging failed (see <file>) -- the units it staged stay staged, and
+  re-running this step skips them` in step 13. The error at the end of that
+  file names the unit that failed and why. When the staging directory *may*
+  be too small for a unit, `stage create` asks on your terminal; without a
+  terminal on stdin it refuses with the figures (`stage unit "<unit>"
   refused: non-interactive session …`). Free space and re-run `--from 13`, or
   accept the risk for that unit by hand and then re-run `--from 13`, which
   skips a unit that is already staged:

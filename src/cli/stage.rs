@@ -10,9 +10,14 @@ use crate::staging;
 #[derive(Subcommand, Debug)]
 pub enum StageCommands {
     /// Create staged slices (validate → dar → encrypt → checksums)
+    ///
+    /// Several units may be named; `--jobs` stages that many at once.
     Create {
-        /// Unit name
-        name: String,
+        /// Unit name(s). Each unit's latest unstaged snapshot is staged
+        /// (or `--version`'s, with one unit). Every name is checked before
+        /// any unit is staged.
+        #[arg(required = true, value_name = "NAME")]
+        name: Vec<String>,
 
         /// Re-stage a specific snapshot version instead of the latest
         /// unstaged one — for when `tapectl staging clean --unit <name>
@@ -27,6 +32,15 @@ pub enum StageCommands {
         /// which a plain clean leaves untouched regardless of min_copies.
         #[arg(long)]
         version: Option<i64>,
+
+        /// How many units to stage at once (1 to 16). Defaults to
+        /// `[staging] jobs`, itself 1 by default. The largest units start
+        /// first, each stage prints a line as it starts and ends, and once one
+        /// fails no further unit is started. Fewer run when the host's
+        /// available memory cannot hold that many (each keeps up to 1 GiB of
+        /// its source in the page cache).
+        #[arg(long)]
+        jobs: Option<usize>,
     },
 
     /// List stage sets
@@ -285,7 +299,11 @@ pub fn run(
             }
         }
 
-        StageCommands::Create { name, version } => {
+        StageCommands::Create {
+            name,
+            version,
+            jobs,
+        } => {
             // Issue #241: the dar archive + age encryption pipeline IS
             // the work (hours and a tape's worth of staging disk, per
             // `collection run`'s own dry-run comment) — most of the
@@ -297,217 +315,268 @@ pub fn run(
                      work — there is no cheaper way to know what would be staged.",
                 ));
             }
-            let unit = crate::db::queries::get_unit_by_name(conn, name)?
-                .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
-
-            let snapshot_id: i64 = match version {
-                None => {
-                    // Unchanged: the latest 'created' (never-yet-staged)
-                    // snapshot for this unit.
-                    conn.query_row(
-                        "SELECT id FROM snapshots WHERE unit_id = ?1 AND status = 'created'
-                         ORDER BY version DESC LIMIT 1",
-                        params![unit.id],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| {
-                        TapectlError::Other(format!(
-                            "no unstaged snapshot for unit \"{name}\" — run `tapectl snapshot create {name}` first if the contents changed, or re-stage an existing version with `tapectl stage create {name} --version <N>` (`tapectl snapshot list --unit {name}` shows them)"
-                        ))
-                    })?
-                }
-                Some(v) => {
-                    // Re-stage: select that unit's snapshot at version `v`
-                    // regardless of its status, then gate on whether any
-                    // existing stage set for it already has live slices.
-                    let snapshot_id: i64 = conn
-                        .query_row(
-                            "SELECT id FROM snapshots WHERE unit_id = ?1 AND version = ?2",
-                            params![unit.id, v],
-                            |row| row.get(0),
-                        )
-                        .map_err(|_| {
-                            TapectlError::Other(format!(
-                                "unit \"{name}\" has no snapshot at version {v}"
-                            ))
-                        })?;
-
-                    let stage_sets: Vec<(i64, String)> = conn
-                        .prepare("SELECT id, status FROM stage_sets WHERE snapshot_id = ?1")?
-                        .query_map(params![snapshot_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-
-                    let live_ids: Vec<i64> = stage_sets
-                        .iter()
-                        .filter(|(_, status)| staging::stage_set_has_live_slices(status))
-                        .map(|(id, _)| *id)
-                        .collect();
-
-                    if !live_ids.is_empty() {
-                        // Issues #279 and #292: a bare `staging clean`
-                        // leaves a live stage set alone for one of FOUR
-                        // reasons, and the refusal must name the one that
-                        // actually applies. #279 split this two ways and
-                        // recommended `--force` for everything that was
-                        // not a release candidate; `staging::clean::
-                        // release_blocker` answers the finer question,
-                        // because for an interrupted session `--force`
-                        // deletes the very slices `volume resume` needs.
-                        //
-                        // Worst blocker across this version's live sets
-                        // wins, for the same reason `release_blocker`
-                        // orders its own variants: a set may be bin-packed
-                        // across volumes, and the costliest thing to be
-                        // wrong about is telling someone to delete slices
-                        // something is still using.
-                        let mut worst = staging::clean::ReleaseBlocker::None;
-                        for id in &live_ids {
-                            let b = staging::clean::release_blocker(conn, *id)?;
-                            let rank = |x: &staging::clean::ReleaseBlocker| match x {
-                                staging::clean::ReleaseBlocker::WriteInFlight { .. } => 4,
-                                staging::clean::ReleaseBlocker::Interrupted { .. } => 3,
-                                staging::clean::ReleaseBlocker::Abandoned { .. } => 2,
-                                staging::clean::ReleaseBlocker::NeverWritten => 1,
-                                staging::clean::ReleaseBlocker::None => 0,
-                            };
-                            if rank(&b) > rank(&worst) {
-                                worst = b;
-                            }
-                        }
-
-                        let head = format!(
-                            "unit \"{name}\" v{v} already has a stage set with live slices"
-                        );
-                        let msg = match &worst {
-                            // A candidate: a bare clean WOULD release it,
-                            // unless the unit is below its policy's
-                            // min_copies. Today's wording, unchanged.
-                            staging::clean::ReleaseBlocker::None => format!(
-                                "{head} — use `tapectl volume write` to consume them, or \
-                                 `tapectl staging clean --unit {name}` to release them first \
-                                 (retained by default if \"{name}\" is below its policy's \
-                                 min_copies — add --force to release it anyway)"
-                            ),
-                            // Never written: #279's wording, unchanged.
-                            staging::clean::ReleaseBlocker::NeverWritten => format!(
-                                "{head} — use `tapectl volume write` to consume them; it has no \
-                                 completed write backing it, so `tapectl staging clean \
-                                 --unit {name} --version {v}` would leave it untouched — \
-                                 pass --force to release it"
-                            ),
-                            // #292: `--force` here destroys the recovery.
-                            // Name `volume resume` first, as the Tier-3
-                            // refusal does for a sealed-but-unconfirmed
-                            // volume (`operations::refuse_last_eligible_copy`).
-                            staging::clean::ReleaseBlocker::Interrupted { volume_label } => {
-                                let resume = match volume_label {
-                                    Some(l) => format!("`tapectl volume resume {l}`"),
-                                    None => "`tapectl volume resume <LABEL>`".to_string(),
-                                };
-                                format!(
-                                    "{head}, and they are the input to an INTERRUPTED write \
-                                     session — {resume} continues that session from these \
-                                     exact staged files rather than rebuilding them, so \
-                                     releasing them is what would make it unrecoverable. \
-                                     Reload the same cartridge and resume it, or write these \
-                                     slices to another volume. Only give them up on purpose \
-                                     (`tapectl volume abort`, then `staging clean --force`) \
-                                     once you have decided the interrupted write is not \
-                                     worth finishing."
-                                )
-                            }
-                            // #292: something is reading them right now.
-                            staging::clean::ReleaseBlocker::WriteInFlight { volume_label } => {
-                                let onto = match volume_label {
-                                    Some(l) => format!(" onto volume \"{l}\""),
-                                    None => String::new(),
-                                };
-                                format!(
-                                    "{head}, and a write session is using them RIGHT NOW{onto}. \
-                                     Let it finish — `tapectl volume write` is consuming these \
-                                     slices, and releasing them under a running session is not \
-                                     something --force should be pointed at. If no write is \
-                                     actually running, the session died without recording an \
-                                     outcome; `tapectl db fsck` sweeps that."
-                                )
-                            }
-                            // Issue #325: an aborted session whose seal is
-                            // recorded can still be re-confirmed by `volume
-                            // resume` after a clean full verify, and that
-                            // re-confirm needs these frozen files — the same
-                            // facts `volume abort`'s sealed-session text
-                            // states (`write::abort_consent_facts`). Resume
-                            // first, then what --force costs.
-                            staging::clean::ReleaseBlocker::Abandoned {
-                                reconfirm_on: Some(l),
-                            } => format!(
-                                "{head}, left behind by a write session on volume \"{l}\" that \
-                                 was aborted after its seal was recorded. Keep staging if you \
-                                 intend to verify and resume: after a clean full verify \
-                                 (`tapectl volume verify {l}`), `tapectl volume resume {l}` \
-                                 re-confirms that sealed tape against these frozen staged \
-                                 files, and once it passes that session no longer holds them. \
-                                 Releasing them now (`tapectl staging clean --unit {name} \
-                                 --version {v} --force`; a bare `tapectl staging clean` will \
-                                 not) forfeits that re-confirmation."
-                            ),
-                            // Nothing can adopt the session: --force is the
-                            // only release. Issue #325: writing the slices
-                            // to another volume adds a completed row but
-                            // leaves this one, so it does not unblock a bare
-                            // clean — never advise it as if it did.
-                            staging::clean::ReleaseBlocker::Abandoned { reconfirm_on: None } => {
-                                format!(
-                                    "{head}, left behind by a write session that was aborted \
-                                     or failed. A bare `tapectl staging clean` will not release \
-                                     them, and writing them to another volume does not change \
-                                     that — the abandoned session's `writes` row keeps blocking \
-                                     it. Release them with `tapectl staging clean --unit {name} \
-                                     --version {v} --force`."
-                                )
-                            }
-                        };
-                        return Err(TapectlError::Other(msg));
-                    }
-
-                    snapshot_id
-                }
-            };
-
-            let stage_set_id = staging::stage_create(conn, paths, config, snapshot_id, assume_yes)?;
-
-            // Fetch results for display
-            let (num_slices, total_dar, total_enc): (Option<i64>, Option<i64>, Option<i64>) = conn
-                .query_row(
-                    "SELECT num_slices, total_dar_size, total_encrypted_size
-                     FROM stage_sets WHERE id = ?1",
-                    params![stage_set_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )?;
-
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "stage_set_id": stage_set_id,
-                        "unit": name,
-                        "num_slices": num_slices,
-                        "total_dar_size": total_dar,
-                        "total_encrypted_size": total_enc,
-                    })
-                );
-            } else {
-                println!(
-                    "staged: {} ({} slices, {} dar, {} encrypted)",
-                    name,
-                    num_slices.unwrap_or(0),
-                    crate::util::format_bytes_binary(total_dar.unwrap_or(0)),
-                    crate::util::format_bytes_binary(total_enc.unwrap_or(0)),
-                );
+            if name.len() > 1 && version.is_some() {
+                return Err(TapectlError::Other(
+                    "--version names one snapshot, so it takes one unit; stage the others \
+                     with their own `tapectl stage create`"
+                        .into(),
+                ));
             }
+            let jobs = jobs.unwrap_or(config.staging.jobs);
+            if !(1..=staging::jobs::MAX_JOBS).contains(&jobs) {
+                return Err(TapectlError::Other(format!(
+                    "--jobs {jobs}: stage between 1 and {} units at once",
+                    staging::jobs::MAX_JOBS
+                )));
+            }
+            // Every name is resolved before any unit is staged, so a typo or
+            // a unit with nothing to stage costs nothing (issue #368).
+            let mut to_stage: Vec<staging::jobs::StageJob> = Vec::with_capacity(name.len());
+            for n in name {
+                if to_stage.iter().any(|j| &j.unit_name == n) {
+                    return Err(TapectlError::Other(format!(
+                        "unit \"{n}\" is named twice; a unit is staged once"
+                    )));
+                }
+                to_stage.push(staging::jobs::StageJob {
+                    unit_name: n.clone(),
+                    snapshot_id: snapshot_to_stage(conn, n, *version)?,
+                });
+            }
+            let outcomes = staging::jobs::stage_many(
+                conn,
+                paths,
+                config,
+                &to_stage,
+                jobs,
+                assume_yes,
+                &mut std::io::stderr(),
+                &crate::progress::stderr_println,
+            )?;
+            let staged = staging::jobs::first_failure(outcomes);
+            // What was staged is reported even when another unit failed.
+            let done: &[(String, i64)] = match &staged {
+                Ok(done) => done,
+                Err(_) => &[],
+            };
+            let mut rows = Vec::with_capacity(done.len());
+            for (unit_name, stage_set_id) in done {
+                let (num_slices, total_dar, total_enc): (Option<i64>, Option<i64>, Option<i64>) =
+                    conn.query_row(
+                        "SELECT num_slices, total_dar_size, total_encrypted_size
+                         FROM stage_sets WHERE id = ?1",
+                        params![stage_set_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?;
+                rows.push(serde_json::json!({
+                    "stage_set_id": stage_set_id,
+                    "unit": unit_name,
+                    "num_slices": num_slices,
+                    "total_dar_size": total_dar,
+                    "total_encrypted_size": total_enc,
+                }));
+                if !json_output {
+                    println!(
+                        "staged: {} ({} slices, {} dar, {} encrypted)",
+                        unit_name,
+                        num_slices.unwrap_or(0),
+                        crate::util::format_bytes_binary(total_dar.unwrap_or(0)),
+                        crate::util::format_bytes_binary(total_enc.unwrap_or(0)),
+                    );
+                }
+            }
+            if json_output {
+                // One unit: the object it always was. Several: an array.
+                let out = if name.len() == 1 && rows.len() == 1 {
+                    rows.remove(0)
+                } else {
+                    serde_json::Value::Array(rows)
+                };
+                println!("{out}");
+            }
+            staged?;
         }
     }
     Ok(())
+}
+
+/// The snapshot `stage create NAME [--version V]` stages: the unit's latest
+/// unstaged snapshot, or version `V` when no stage set of it has live slices
+/// (issue #53's re-stage, with the refusals that name what to do instead).
+fn snapshot_to_stage(conn: &Connection, name: &String, version: Option<i64>) -> Result<i64> {
+    let unit = crate::db::queries::get_unit_by_name(conn, name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(name.clone()))?;
+
+    let snapshot_id: i64 = match version {
+        None => {
+            // Unchanged: the latest 'created' (never-yet-staged)
+            // snapshot for this unit.
+            conn.query_row(
+                "SELECT id FROM snapshots WHERE unit_id = ?1 AND status = 'created'
+                 ORDER BY version DESC LIMIT 1",
+                params![unit.id],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                TapectlError::Other(format!(
+                    "no unstaged snapshot for unit \"{name}\" — run `tapectl snapshot create {name}` first if the contents changed, or re-stage an existing version with `tapectl stage create {name} --version <N>` (`tapectl snapshot list --unit {name}` shows them)"
+                ))
+            })?
+        }
+        Some(v) => {
+            // Re-stage: select that unit's snapshot at version `v`
+            // regardless of its status, then gate on whether any
+            // existing stage set for it already has live slices.
+            let snapshot_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM snapshots WHERE unit_id = ?1 AND version = ?2",
+                    params![unit.id, v],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    TapectlError::Other(format!("unit \"{name}\" has no snapshot at version {v}"))
+                })?;
+
+            let stage_sets: Vec<(i64, String)> = conn
+                .prepare("SELECT id, status FROM stage_sets WHERE snapshot_id = ?1")?
+                .query_map(params![snapshot_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            let live_ids: Vec<i64> = stage_sets
+                .iter()
+                .filter(|(_, status)| staging::stage_set_has_live_slices(status))
+                .map(|(id, _)| *id)
+                .collect();
+
+            if !live_ids.is_empty() {
+                // Issues #279 and #292: a bare `staging clean`
+                // leaves a live stage set alone for one of FOUR
+                // reasons, and the refusal must name the one that
+                // actually applies. #279 split this two ways and
+                // recommended `--force` for everything that was
+                // not a release candidate; `staging::clean::
+                // release_blocker` answers the finer question,
+                // because for an interrupted session `--force`
+                // deletes the very slices `volume resume` needs.
+                //
+                // Worst blocker across this version's live sets
+                // wins, for the same reason `release_blocker`
+                // orders its own variants: a set may be bin-packed
+                // across volumes, and the costliest thing to be
+                // wrong about is telling someone to delete slices
+                // something is still using.
+                let mut worst = staging::clean::ReleaseBlocker::None;
+                for id in &live_ids {
+                    let b = staging::clean::release_blocker(conn, *id)?;
+                    let rank = |x: &staging::clean::ReleaseBlocker| match x {
+                        staging::clean::ReleaseBlocker::WriteInFlight { .. } => 4,
+                        staging::clean::ReleaseBlocker::Interrupted { .. } => 3,
+                        staging::clean::ReleaseBlocker::Abandoned { .. } => 2,
+                        staging::clean::ReleaseBlocker::NeverWritten => 1,
+                        staging::clean::ReleaseBlocker::None => 0,
+                    };
+                    if rank(&b) > rank(&worst) {
+                        worst = b;
+                    }
+                }
+
+                let head = format!("unit \"{name}\" v{v} already has a stage set with live slices");
+                let msg = match &worst {
+                    // A candidate: a bare clean WOULD release it,
+                    // unless the unit is below its policy's
+                    // min_copies. Today's wording, unchanged.
+                    staging::clean::ReleaseBlocker::None => format!(
+                        "{head} — use `tapectl volume write` to consume them, or \
+                         `tapectl staging clean --unit {name}` to release them first \
+                         (retained by default if \"{name}\" is below its policy's \
+                         min_copies — add --force to release it anyway)"
+                    ),
+                    // Never written: #279's wording, unchanged.
+                    staging::clean::ReleaseBlocker::NeverWritten => format!(
+                        "{head} — use `tapectl volume write` to consume them; it has no \
+                         completed write backing it, so `tapectl staging clean \
+                         --unit {name} --version {v}` would leave it untouched — \
+                         pass --force to release it"
+                    ),
+                    // #292: `--force` here destroys the recovery.
+                    // Name `volume resume` first, as the Tier-3
+                    // refusal does for a sealed-but-unconfirmed
+                    // volume (`operations::refuse_last_eligible_copy`).
+                    staging::clean::ReleaseBlocker::Interrupted { volume_label } => {
+                        let resume = match volume_label {
+                            Some(l) => format!("`tapectl volume resume {l}`"),
+                            None => "`tapectl volume resume <LABEL>`".to_string(),
+                        };
+                        format!(
+                            "{head}, and they are the input to an INTERRUPTED write \
+                             session — {resume} continues that session from these \
+                             exact staged files rather than rebuilding them, so \
+                             releasing them is what would make it unrecoverable. \
+                             Reload the same cartridge and resume it, or write these \
+                             slices to another volume. Only give them up on purpose \
+                             (`tapectl volume abort`, then `staging clean --force`) \
+                             once you have decided the interrupted write is not \
+                             worth finishing."
+                        )
+                    }
+                    // #292: something is reading them right now.
+                    staging::clean::ReleaseBlocker::WriteInFlight { volume_label } => {
+                        let onto = match volume_label {
+                            Some(l) => format!(" onto volume \"{l}\""),
+                            None => String::new(),
+                        };
+                        format!(
+                            "{head}, and a write session is using them RIGHT NOW{onto}. \
+                             Let it finish — `tapectl volume write` is consuming these \
+                             slices, and releasing them under a running session is not \
+                             something --force should be pointed at. If no write is \
+                             actually running, the session died without recording an \
+                             outcome; `tapectl db fsck` sweeps that."
+                        )
+                    }
+                    // Issue #325: an aborted session whose seal is
+                    // recorded can still be re-confirmed by `volume
+                    // resume` after a clean full verify, and that
+                    // re-confirm needs these frozen files — the same
+                    // facts `volume abort`'s sealed-session text
+                    // states (`write::abort_consent_facts`). Resume
+                    // first, then what --force costs.
+                    staging::clean::ReleaseBlocker::Abandoned {
+                        reconfirm_on: Some(l),
+                    } => format!(
+                        "{head}, left behind by a write session on volume \"{l}\" that \
+                         was aborted after its seal was recorded. Keep staging if you \
+                         intend to verify and resume: after a clean full verify \
+                         (`tapectl volume verify {l}`), `tapectl volume resume {l}` \
+                         re-confirms that sealed tape against these frozen staged \
+                         files, and once it passes that session no longer holds them. \
+                         Releasing them now (`tapectl staging clean --unit {name} \
+                         --version {v} --force`; a bare `tapectl staging clean` will \
+                         not) forfeits that re-confirmation."
+                    ),
+                    // Nothing can adopt the session: --force is the
+                    // only release. Issue #325: writing the slices
+                    // to another volume adds a completed row but
+                    // leaves this one, so it does not unblock a bare
+                    // clean — never advise it as if it did.
+                    staging::clean::ReleaseBlocker::Abandoned { reconfirm_on: None } => {
+                        format!(
+                            "{head}, left behind by a write session that was aborted \
+                             or failed. A bare `tapectl staging clean` will not release \
+                             them, and writing them to another volume does not change \
+                             that — the abandoned session's `writes` row keeps blocking \
+                             it. Release them with `tapectl staging clean --unit {name} \
+                             --version {v} --force`."
+                        )
+                    }
+                };
+                return Err(TapectlError::Other(msg));
+            }
+
+            snapshot_id
+        }
+    };
+    Ok(snapshot_id)
 }
 
 #[cfg(test)]
@@ -646,7 +715,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: None,
             },
             false,
@@ -667,7 +737,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: None,
             },
             false,
@@ -686,6 +757,45 @@ mod tests {
         assert_eq!(status, "staged");
     }
 
+    /// Issue #368: every name is checked before any unit is staged — a
+    /// second name with nothing to stage, a name given twice, `--version`
+    /// with several units and a `--jobs` out of range all refuse with
+    /// nothing staged.
+    #[test]
+    fn create_with_several_names_checks_them_all_before_staging_any() {
+        let (conn, paths, config, _tmp) = setup();
+        crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let create = |name: &[&str], version: Option<i64>, jobs: Option<usize>| {
+            run(
+                &conn,
+                &paths,
+                &config,
+                &StageCommands::Create {
+                    name: name.iter().map(|n| n.to_string()).collect(),
+                    version,
+                    jobs,
+                },
+                false,
+                false,
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        let err = create(&["unit1", "nosuch"], None, None);
+        assert!(err.contains("nosuch"), "{err}");
+        let err = create(&["unit1", "unit1"], None, None);
+        assert!(err.contains("named twice"), "{err}");
+        let err = create(&["unit1", "unit1"], Some(1), None);
+        assert!(err.contains("--version names one snapshot"), "{err}");
+        let err = create(&["unit1"], None, Some(0));
+        assert!(err.contains("--jobs 0"), "{err}");
+        let staged: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(staged, 0, "nothing was staged");
+    }
+
     #[test]
     fn create_with_version_on_nonexistent_version_errors() {
         let (conn, paths, config, _tmp) = setup();
@@ -696,7 +806,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: Some(99),
             },
             false,
@@ -719,7 +830,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: None,
             },
             false,
@@ -735,7 +847,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: Some(1),
             },
             false,
@@ -783,7 +896,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: None,
             },
             false,
@@ -840,7 +954,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: Some(1),
             },
             false,
@@ -1017,7 +1132,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: None,
             },
             false,
@@ -1047,7 +1163,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: Some(1),
             },
             false,
@@ -1088,7 +1205,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: None,
             },
             false,
@@ -1128,7 +1246,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: Some(1),
             },
             false,
@@ -1169,7 +1288,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: None,
             },
             false,
@@ -1230,7 +1350,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: Some(1),
             },
             false,
@@ -1259,7 +1380,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: None,
             },
             false,
@@ -1290,7 +1412,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: Some(1),
             },
             false,
@@ -1326,7 +1449,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: None,
             },
             false,
@@ -1389,7 +1513,8 @@ mod tests {
             &paths,
             &config,
             &StageCommands::Create {
-                name: "unit1".to_string(),
+                name: vec!["unit1".to_string()],
+                jobs: None,
                 version: Some(1),
             },
             false,
@@ -1458,7 +1583,8 @@ mod tests {
         let snap_id = crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let _free = crate::staging::FreeSpaceOverride::set(1024);
         let create = StageCommands::Create {
-            name: "unit1".to_string(),
+            name: vec!["unit1".to_string()],
+            jobs: None,
             version: None,
         };
 

@@ -784,7 +784,11 @@ hard-linked file once); if it runs out, the stage stops there and its partial sl
 ```
 
 With compression on, the bracket reads `(less if its data may compress
-(compression = "<algorithm>"))`.
+(compression = "<algorithm>"))`. When other stages are running at the same time
+(`stage create --jobs`, `collection run --jobs`, or another `stage create`),
+what they may still write is not free for this unit, and the free figure says so:
+`… 40.0 GiB free (12.5 GiB of it may still be written by 2 other stage(s) running
+now), and staging it needs …`.
 
 A terminal is asked `stage unit "<unit>" — proceed? [y/N]`. A non-interactive
 run without `--yes` refuses with the same figures
@@ -2097,12 +2101,15 @@ on a different home. The first lines of every run print the `home:` and
   If you decline, it says `left as is — every tapectl command will refuse this
   config until the two keys are renamed`, and a later step stops on that
   refusal. Re-run and accept, or rename the two lines by hand.
-- **Step 13, `stage failed for <unit>`.** When the staging directory may be too
-  small for a unit ([Staging space](#staging-space-asked-about)),
-  `stage create` asks before it goes ahead. Step 13 runs it with stdin taken
-  from its list of units, not from your terminal, so the question cannot be
-  asked and the stage is refused. The figures are in the output above the
-  stop. If you accept them, stage that unit yourself, then re-enter with the
+- **Step 13, `staging failed (see <file>)`.** Step 13 stages every unit still
+  to stage with one `stage create`, `[staging] jobs` at a time. The file it
+  names holds that command's output; the error at its end names the unit that
+  failed, the units staged before it stopped (they stay staged) and any not
+  started. When the staging directory may be too small for a unit
+  ([Staging space](#staging-space-asked-about)), `stage create` asks on your
+  terminal before it goes ahead; run without a terminal on stdin, the
+  question cannot be asked and the stage is refused, with the figures above
+  the stop. To accept them, stage that unit yourself, then re-enter with the
   options of your first run. The `tapectl-op` wrapper is installed only at
   step 14, so on a first run it does not exist yet; run tapectl as the service
   user directly:

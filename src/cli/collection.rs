@@ -104,6 +104,10 @@ pub enum CollectionCommands {
         /// before the tape moves, for every copy this run writes.
         #[arg(long)]
         prewrite_hash: bool,
+        /// How many of the batch's units to stage at once (1 to 16), as
+        /// `stage create --jobs`. Defaults to `[staging] jobs`, itself 1.
+        #[arg(long)]
+        jobs: Option<usize>,
     },
 }
 
@@ -166,6 +170,7 @@ pub fn run(
             labels,
             device,
             prewrite_hash,
+            jobs,
         } => cmd_run(
             conn,
             paths,
@@ -175,6 +180,7 @@ pub fn run(
             labels,
             &crate::cli::write_device(config, device.as_deref())?,
             *prewrite_hash,
+            *jobs,
             json_output,
             global_dry_run,
             assume_yes,
@@ -458,10 +464,27 @@ fn cmd_run(
     labels: &[String],
     device: &str,
     prewrite_hash: bool,
+    jobs: Option<usize>,
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
 ) -> Result<i32> {
+    // `--jobs` stands in for `[staging] jobs` for this run (issue #368).
+    let mut with_jobs;
+    let config = match jobs {
+        Some(jobs) => {
+            if !(1..=crate::staging::jobs::MAX_JOBS).contains(&jobs) {
+                return Err(TapectlError::Other(format!(
+                    "--jobs {jobs}: stage between 1 and {} units at once",
+                    crate::staging::jobs::MAX_JOBS
+                )));
+            }
+            with_jobs = config.clone();
+            with_jobs.staging.jobs = jobs;
+            &with_jobs
+        }
+        None => config,
+    };
     let lib = collection::find_collection(config, collection_name)?;
     // No `--generation` here: `collection run` writes to volumes that are
     // already `volume init`-ed, so each destination's real capacity is on
