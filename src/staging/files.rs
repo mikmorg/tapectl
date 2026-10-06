@@ -14,7 +14,25 @@
 //! archive to standard output (`dar::create::DarStream`), and its on-the-fly
 //! catalogue into the tapectl home. So plaintext on the staging device is
 //! not something this module avoids writing, it is something it has no way
-//! to write.
+//! to write. The proof has three layers (ADR-0012, 2026-10-06 amendment
+//! item 4): this construction, pinned by the tests below (`stage_create`
+//! creates no file but through here, and dar's argv names no staging path);
+//! an inotify audit of a real stage (`staging::plaintext_audit`); and a
+//! raw-image scan with a deleted canary (`scripts/plaintext-scan.sh`).
+//!
+//! Every other file any command creates under the staging root, and why it
+//! carries no plaintext of the archive:
+//!
+//! | Path under staging | Created by | Contents |
+//! |---|---|---|
+//! | `sessions/<label>-<uuid>/` ID thunk, system guide, `RESTORE.sh`, front index, seal marker | `volume::build` (`materialize`) | the public zones written to tape in plaintext; no names, by the isolation invariant (`volume-format-v2.md` §2) |
+//! | `sessions/<label>-<uuid>/layout.json` | `volume::build` | the Layout: positions, sizes, ciphertext hashes, staging paths of `.age` slices |
+//! | `sessions/<label>-<uuid>/` tenant and operator envelopes, operator envelope backup | `volume::build` (`materialize_envelope_streaming`; the backup is a byte copy) | age ciphertext, encrypted as the tar is built |
+//! | `clone-<label>-<unit uuid>/slice_<id>.dat`, `compact-<label>/slice_<id>.dat` | `volume read-slices`, `volume compact-read` | `.age` slices copied off tape: ciphertext |
+//! | the `TAPECTL_TEST_PAUSE_AFTER_SEAL` marker | a test hook, at the path the variable names | the word `parked` |
+//!
+//! The write's `catalog.db` and dar's slice template, both plaintext, are
+//! made under `<home>/tmp` (`staging::home_work_dir`), never here.
 
 use std::fs;
 use std::io::{self, BufWriter, Write};
@@ -357,6 +375,69 @@ mod tests {
             "the cause, printed once: {msg}"
         );
         assert!(Path::new("/dev/full").exists(), "the device is untouched");
+    }
+
+    /// The production source of `name`'s body in `file`'s non-test part.
+    fn body_of(src: &'static str, name: &str) -> &'static str {
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let start = prod.find(name).unwrap_or_else(|| panic!("no {name}"));
+        let end = prod[start..].find("\n}\n").unwrap() + start;
+        &prod[start..end]
+    }
+
+    /// Issue #370, by construction: `stage_create` creates no file itself —
+    /// every file it makes under staging comes from `StagingDir` — and this
+    /// module creates files in exactly two places, the probe and the slice.
+    #[test]
+    fn stage_create_creates_files_only_through_the_staging_dir() {
+        const CREATES: [&str; 5] = [
+            "fs::write(",
+            "File::create(",
+            "OpenOptions",
+            "fs::copy(",
+            "create_new(",
+        ];
+        let stage = body_of(include_str!("mod.rs"), "fn stage_create_inner(");
+        for call in CREATES {
+            assert!(
+                !stage.contains(call),
+                "stage_create_inner must not call {call}: files under staging come \
+                 from StagingDir only"
+            );
+        }
+        assert!(
+            stage.contains("files::StagingDir::prepare(") && stage.contains("create_slice("),
+            "positive control: stage_create_inner goes through StagingDir"
+        );
+        let src = include_str!("files.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+        let creations: usize = CREATES.iter().map(|c| prod.matches(c).count()).sum();
+        let prepare = body_of(src, "pub(crate) fn prepare(");
+        let create_slice = body_of(src, "pub(crate) fn create_slice(");
+        assert_eq!(prepare.matches("fs::write(").count(), 1, "the probe");
+        assert_eq!(
+            create_slice.matches("OpenOptions").count()
+                + create_slice.matches("create_new(").count(),
+            2,
+            "the slice, opened create_new"
+        );
+        assert_eq!(
+            creations, 3,
+            "files.rs creates nothing else: {creations} calls"
+        );
+    }
+
+    /// Issue #370, by construction: dar's argv for the archive names no path
+    /// under the staging directory — the archive is `-`, standard output.
+    #[test]
+    fn dar_is_given_standard_output_as_its_archive() {
+        let body = body_of(include_str!("../dar/create.rs"), "pub fn create_command(");
+        assert!(body.contains(r#"cmd.arg("-c").arg("-");"#), "{body}");
+        assert_eq!(
+            body.matches(r#".arg("-c")"#).count(),
+            1,
+            "one archive argument"
+        );
     }
 
     #[test]

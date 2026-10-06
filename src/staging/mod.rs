@@ -2,6 +2,8 @@ pub mod clean;
 pub mod exclude;
 mod files;
 pub mod lock;
+#[cfg(test)]
+mod plaintext_audit;
 pub mod validate;
 
 use std::fs;
@@ -3097,7 +3099,7 @@ mod tests {
     /// `(conn, paths, config, src_dir)`; the caller writes fixture files
     /// into `src_dir` and drives `snapshot_create`/`stage_create` itself,
     /// since each test needs different file content/timing.
-    fn setup_unit_with_excludes(
+    pub(super) fn setup_unit_with_excludes(
         tmp: &TempDir,
         exclude_patterns: Vec<String>,
     ) -> (Connection, TapectlPaths, Config, PathBuf) {

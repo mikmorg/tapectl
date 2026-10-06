@@ -168,6 +168,11 @@ TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
 scripts/lifecycle-suite.sh --help       # years of use in minutes
 ```
 
+Staging writes no plaintext to the staging device (ADR-0012). `cargo test` audits a
+real stage with inotify; `scripts/plaintext-scan.sh <tapectl binary>` (needs sudo, no
+tape) stages a marker tree onto a `sync,nodiscard` loop-mounted image and scans the raw
+image for the marker, with a deleted canary as its positive control.
+
 The [lifecycle suite](docs/lifecycle-suite.md) is different on both counts: it takes
 an mhvtl drive of any generation, and on a drive that is not mhvtl it switches to a
 real-drive mode that runs only with `--erase short`, `--single-cartridge` and

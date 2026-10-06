@@ -41,6 +41,9 @@ clap_mangen = "0.2"
 # `hooks` for `commit_hook`: the on-tape catalog.db build is asserted to be one
 # transaction by counting its commits (issue #399).
 rusqlite = { version = "0.39", features = ["hooks"] }
+# `inotify`: the staging audit watches every file `stage create` makes under
+# staging (issue #370, `staging::plaintext_audit`). Tests only.
+nix = { version = "0.29", features = ["inotify"] }
 
 [profile.release]
 lto = true
