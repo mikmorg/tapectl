@@ -644,7 +644,10 @@ runs one — see [Monthly — verify a rotating slice of the library](#monthly--
 names every such volume (`no_full_verify`) and `report verify-status` lists
 it. `--full-confirm` makes the write read every file back and hash it, which
 costs about as long as the write itself (~2.3 h on a full LTO-6); the same six
-commands take it.
+commands take it. A full readback that is interrupted (Ctrl-C, a dropped ssh
+session, a reboot) keeps what it has read back clean: `tapectl volume resume
+<label> --full-confirm` continues it from there rather than from the first
+file.
 
 `staging clean` releases every unit that has met its policy's `min_copies` and
 **retains** the ones that have not, naming them (ADR-0012). So a unit still
@@ -1643,6 +1646,14 @@ The exit status says which of three things happened, so a script needs no
 
 An empty drive is refused at once with `no cartridge loaded in <device>`, by
 `volume verify` and by every other command that reads or writes a tape.
+
+A full verify that stops part-way (Ctrl-C, a dropped ssh session, a reboot)
+is recorded `aborted` with every file it had read back clean. Run the same
+`volume verify` again and it continues: it reads File 0, File 3 and the seal
+marker as always, skips the files already read back clean, and reads the
+rest. It continues only the volume's latest readback (a write's interrupted
+`--full-confirm` included), and only while the front index on the tape is the
+one those files were checked against; otherwise it reads everything.
 
 `volume verify` opens the drive read-only, so leave a sealed cartridge's
 write-protect tab set: it verifies without sliding the tab. So does a

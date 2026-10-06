@@ -140,7 +140,12 @@ pub enum VolumeCommands {
         #[arg(long)]
         prewrite_hash: bool,
         /// See `volume write --full-confirm`: the confirm this resume
-        /// runs (or re-enters) reads every file back.
+        /// runs (or re-enters) reads every file back. A full readback that
+        /// was interrupted CONTINUES: the files it already read back clean
+        /// are not read again, as long as the front index on the tape is
+        /// the one they were checked against. Without this flag the resume
+        /// runs the quick confirm and the readback is left to `volume
+        /// verify`.
         #[arg(long)]
         full_confirm: bool,
     },
@@ -178,6 +183,12 @@ pub enum VolumeCommands {
     /// -> content). Default tier is `--full` (integrity: hashes every
     /// content file); `--quick` opts down to navigable (seal binding + front
     /// index self-consistency only, no per-file content hashing).
+    ///
+    /// A full verify that was stopped part-way CONTINUES when run again:
+    /// files the volume's latest readback (this command's or a write's
+    /// `--full-confirm`) already read back clean are not read again, as
+    /// long as the front index on the tape is the one they were checked
+    /// against.
     ///
     /// Exit status: 0 = every checked file matched. 2 = the verify PROVED
     /// THE MEDIUM BAD: the volume is quarantined and no longer counts as a

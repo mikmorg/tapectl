@@ -30,7 +30,7 @@ Show what would be done without making changes. Commands that cannot preview ref
 See `volume write \-\-prewrite\-hash`: the revalidation full\-hashes every staged slice instead of size\-checking it. The session\*(Aqs frozen generated files are re\-hashed either way
 .TP
 \fB\-\-full\-confirm\fR
-See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enters) reads every file back
+See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

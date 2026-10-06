@@ -1353,6 +1353,18 @@ next — `volume resume` after a write or confirm, the same command again after 
 stage, verify, read-slices or restore. A second signal stops at once (exit
 130); the next command's startup recovers the session as after a crash.
 
+A **full readback** stopped this way (a write's `--full-confirm`, or a full
+`volume verify`) is not lost: every file it read back clean is recorded as it
+goes. After a write the message names `tapectl volume resume <label>
+--full-confirm`, which continues it; after a verify, running the same `volume
+verify` again continues it. Either way the next full readback of that volume
+reads File 3 and the seal marker again, skips the files already read back
+clean, and reads the rest. It skips nothing if the front index on the tape no
+longer hashes to the one those files were checked against, or if anything
+else verified the volume in between (only the volume's latest readback is
+continued). A resume without `--full-confirm` runs the quick confirm and
+leaves the full readback to `volume verify`.
+
 ### A real end of tape during the write
 
 If the drive reports that it is out of space, the session ends as a clean

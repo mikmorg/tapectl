@@ -296,7 +296,20 @@ Rules that hold in every path:
   outcomes, so one transient SCSI error inside an hours-long full-cartridge
   readback condemned a sound tape. Crash mid-confirm leaves `in_progress` → swept to
   Interrupted → resume revalidates and re-confirms (confirm is idempotent; no
-  dedicated state needed).
+  dedicated state needed). A full (integrity-tier) readback keeps a
+  **checkpoint** per file as it goes (#410, `readback_checkpoints`, migration
+  032): each file that hashed to its front-index claim is recorded with that
+  claim and the hash of File 3's true bytes. A re-entered full confirm whose
+  volume's latest `verification_sessions` row is a full one that never
+  finished (`in_progress` or `aborted`) re-reads the seal marker and File 3 —
+  always — and skips a recorded file only when File 3 hashes as it did then
+  and the file's claim is unchanged, so the seal it judges binds the very
+  claims the skipped files matched; §2.5's precedence is untouched (the seal
+  is still judged first, a refused seal is still the whole verdict). Skipped
+  files count toward `files_checked` and are recorded again under the new
+  session, so a chain of interruptions accumulates. A readback that finished,
+  passed or failed, is never continued, and the quick tier neither records
+  nor skips anything.
 - **Snapshot lifecycle transitions happen only at Sealed**, inside the same
   transaction that records evidence, and are event-logged (#58).
 

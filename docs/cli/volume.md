@@ -99,7 +99,7 @@ tapectl volume resume [OPTIONS] <LABEL>
 
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--prewrite-hash` — See `volume write --prewrite-hash`: the revalidation full-hashes every staged slice instead of size-checking it. The session's frozen generated files are re-hashed either way
-- `--full-confirm` — See `volume write --full-confirm`: the confirm this resume runs (or re-enters) reads every file back
+- `--full-confirm` — See `volume write --full-confirm`: the confirm this resume runs (or re-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`
 
 ### tapectl volume abort
 
@@ -118,6 +118,8 @@ tapectl volume abort [OPTIONS] <LABEL>
 ### tapectl volume verify
 
 Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing).
+
+A full verify that was stopped part-way CONTINUES when run again: files the volume's latest readback (this command's or a write's `--full-confirm`) already read back clean are not read again, as long as the front index on the tape is the one they were checked against.
 
 Exit status: 0 = every checked file matched. 2 = the verify PROVED THE MEDIUM BAD: the volume is quarantined and no longer counts as a copy — write its content to another cartridge. 3 = inconclusive: a drive or transport failure, or an error before any verdict (no cartridge loaded, the wrong tape, an unknown label, a mistyped command line); the volume is untouched — check the drive and verify again.
 

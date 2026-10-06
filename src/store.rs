@@ -112,20 +112,43 @@ pub enum ReadOrder {
     SealLast,
 }
 
-/// How [`Store::confirm_with`] walks a tape: the tier, and the order the
-/// seal marker is read in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConfirmPlan {
+/// How [`Store::confirm_with`] walks a tape: the tier, the order the seal
+/// marker is read in, and — for a full readback that continues an
+/// interrupted one (issue #410) — what that one already read back clean and
+/// where this one reports each file it reads back clean.
+#[derive(Clone, Copy)]
+pub struct ConfirmPlan<'a> {
     pub tier: Tier,
     pub order: ReadOrder,
+    /// Files an interrupted readback of this tape already read back clean.
+    /// Honoured only at the Integrity tier, and only when File 3's bytes
+    /// hash, on this read, to what they hashed to then.
+    pub resume: Option<&'a Checkpoints>,
+    /// Called for every file the walk counts as read back clean, as it
+    /// goes (a file skipped on `resume`'s word included) — never for File 3
+    /// or the seal, which are read on every walk.
+    pub on_passed: Option<&'a dyn Fn(Checkpoint<'_>)>,
 }
 
-impl ConfirmPlan {
+impl std::fmt::Debug for ConfirmPlan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfirmPlan")
+            .field("tier", &self.tier)
+            .field("order", &self.order)
+            .field("resume", &self.resume.map(|r| r.passed.len()))
+            .field("on_passed", &self.on_passed.is_some())
+            .finish()
+    }
+}
+
+impl<'a> ConfirmPlan<'a> {
     /// `tier`, seal first — what [`Store::confirm`] runs.
     pub fn new(tier: Tier) -> Self {
         Self {
             tier,
             order: ReadOrder::SealFirst,
+            resume: None,
+            on_passed: None,
         }
     }
 
@@ -133,6 +156,47 @@ impl ConfirmPlan {
     pub fn with_order(self, order: ReadOrder) -> Self {
         Self { order, ..self }
     }
+
+    /// The same plan, continuing the interrupted readback that left
+    /// `resume` (issue #410).
+    pub fn resuming(self, resume: Option<&'a Checkpoints>) -> Self {
+        Self { resume, ..self }
+    }
+
+    /// The same plan, reporting every file read back clean to `on_passed`.
+    pub fn checkpointing(self, on_passed: &'a dyn Fn(Checkpoint<'_>)) -> Self {
+        Self {
+            on_passed: Some(on_passed),
+            ..self
+        }
+    }
+}
+
+/// What a full readback had read back clean when it was interrupted
+/// (issue #410), for the next one to skip.
+///
+/// The anchor is `front_index_sha256`, the hash of File 3's true bytes as
+/// that readback read them: every entry was hashed against the claims in
+/// that front index. A resumed walk always re-reads File 3 and the seal,
+/// and honours these only when File 3 hashes the same again — so the seal
+/// it judges binds the very claims the skipped files were checked against,
+/// and a skipped file's claim is checked to be unchanged as well. The seal
+/// and File 3 are never in here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Checkpoints {
+    pub front_index_sha256: String,
+    /// Position → the front index's `sha256_encrypted` the file matched.
+    pub passed: HashMap<u32, String>,
+}
+
+/// One file a full readback read back clean (issue #410): at `position`,
+/// matching `sha256` (its front-index claim), in a front index whose true
+/// bytes hash to `front_index_sha256`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Checkpoint<'a> {
+    pub position: u32,
+    pub sha256: &'a str,
+    pub front_index_sha256: &'a str,
 }
 
 /// What kind of disagreement a [`Mismatch`] reports. Each variant maps to a
@@ -420,7 +484,7 @@ pub trait Store {
     /// order (issue #397). The one method a store overrides to change how it
     /// confirms — [`Self::confirm`] only delegates here, and the write
     /// session calls this.
-    fn confirm_with(&mut self, layout: &Layout, plan: ConfirmPlan) -> Result<Evidence> {
+    fn confirm_with(&mut self, layout: &Layout, plan: ConfirmPlan<'_>) -> Result<Evidence> {
         // Issue #386: every byte read back counts toward the caller's
         // progress phase (`confirm`, `verify`), and the file being read is
         // its current item. No-ops with no progress session.
@@ -568,7 +632,7 @@ pub trait Store {
 /// does not decide, and [`judge`] puts the seal's verdict in front of it —
 /// or, for a seal that fails the gate, in place of it, discarding whatever
 /// was read after it. The [`Evidence`] is identical in either order.
-fn chain_walk<F>(layout: &Layout, plan: ConfirmPlan, mut read: F) -> Result<Evidence>
+fn chain_walk<F>(layout: &Layout, plan: ConfirmPlan<'_>, mut read: F) -> Result<Evidence>
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
 {
@@ -613,7 +677,7 @@ where
         None
     };
 
-    let rest = walk_from_index(layout, tier, fi_pos, seal_pos, fi_true_len, &mut read)?;
+    let rest = walk_from_index(layout, plan, fi_pos, seal_pos, fi_true_len, &mut read)?;
 
     let seal = match early {
         Some(seal) => seal,
@@ -710,7 +774,7 @@ struct FromIndex {
 /// signal between content files (issue #404).
 fn walk_from_index<F>(
     layout: &Layout,
-    tier: Tier,
+    plan: ConfirmPlan<'_>,
     fi_pos: u32,
     seal_pos: u32,
     fi_true_len: usize,
@@ -719,15 +783,21 @@ fn walk_from_index<F>(
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
 {
+    let tier = plan.tier;
     let mut mismatches: Vec<Mismatch> = Vec::new();
     let mut files_checked: u32 = 0;
+    // Issue #410: what an interrupted readback already read back clean.
+    // Only a full readback skips anything (a navigable one reads no
+    // content file at all).
+    let resume = plan.resume.filter(|_| tier == Tier::Integrity);
 
     // Integrity only: read the files ahead of File 3 now, from BOT, so the
     // rest of the walk is one forward pass (issue #389). Held, not judged —
     // nothing here touches `mismatches` or `files_checked`; step 4 judges
-    // them in the front index's order.
+    // them in the front index's order. A file `resume` lists is not read
+    // here: if File 3 turns out to have changed, step 4 reads it then.
     let held = if tier == Tier::Integrity {
-        hold_files_ahead_of_index(layout, fi_pos, read)
+        hold_files_ahead_of_index(layout, fi_pos, resume, read)
     } else {
         HashMap::new()
     };
@@ -840,6 +910,21 @@ where
         });
     }
 
+    // Issue #410: `resume`'s checkpoints stand only for the front index
+    // they were taken against, so they are honoured only when File 3's
+    // bytes hash to that again. The seal, judged in `judge` whatever
+    // happens here, then binds the same claims the skipped files matched.
+    let resume = resume.filter(|r| r.front_index_sha256 == fi_hash);
+    let passed = |position: u32, sha256: &str| {
+        if let Some(on_passed) = plan.on_passed {
+            on_passed(Checkpoint {
+                position,
+                sha256,
+                front_index_sha256: &fi_hash,
+            });
+        }
+    };
+
     // Step 4 (§5.4, Integrity tier only): every file except File 3 and the
     // seal marker, truncated to the front index's claimed size, hashed and
     // compared to the front index's sha256_encrypted.
@@ -847,6 +932,18 @@ where
         let position = claim.position as u32;
         if position == fi_pos || position == seal_pos {
             continue;
+        }
+        // Issue #410: read back clean by the readback this one continues,
+        // against this same claim — counted, reported again under this
+        // walk (so a second interruption keeps it), and not read.
+        if let (Some(r), Some(want), Some(_)) =
+            (resume, claim.sha256_encrypted.as_deref(), claim.size_bytes)
+        {
+            if r.passed.get(&position).map(String::as_str) == Some(want) {
+                files_checked += 1;
+                passed(position, want);
+                continue;
+            }
         }
         // Issue #404: the readback is hours on a full cartridge, so a
         // signal stops it between files. An `Err`, never a mismatch: a stop
@@ -928,6 +1025,10 @@ where
                 expected: want_hash.clone(),
                 actual: actual_hash,
             });
+        } else {
+            // Issue #410: a checkpoint, as the walk goes — what lets an
+            // interrupted readback be continued rather than redone.
+            passed(position, want_hash);
         }
     }
 
@@ -998,8 +1099,15 @@ enum Held {
 /// Read the Layout's files ahead of File 3, in position order, into memory
 /// for [`chain_walk`]'s step 4 (issue #389). A file the Layout gives no size
 /// for, or one over [`AHEAD_OF_INDEX_CAP`], is skipped (step 4 reads it); so
-/// is one that turns out larger on tape than the cap.
-fn hold_files_ahead_of_index<F>(layout: &Layout, fi_pos: u32, read: &mut F) -> HashMap<u32, Held>
+/// is one that turns out larger on tape than the cap, and one `resume` says
+/// was read back clean already (issue #410: step 4 skips it, or reads it
+/// itself if File 3 has changed since).
+fn hold_files_ahead_of_index<F>(
+    layout: &Layout,
+    fi_pos: u32,
+    resume: Option<&Checkpoints>,
+    read: &mut F,
+) -> HashMap<u32, Held>
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
 {
@@ -1009,6 +1117,7 @@ where
         .iter()
         .filter(|e| (e.position as u32) < fi_pos)
         .filter(|e| !matches!(e.kind, ZoneKind::FrontIndex | ZoneKind::SealMarker))
+        .filter(|e| !resume.is_some_and(|r| r.passed.contains_key(&(e.position as u32))))
         .filter(|e| {
             e.size_bytes
                 .is_some_and(|n| pad_to_blocks(n, block) <= AHEAD_OF_INDEX_CAP)
@@ -2924,6 +3033,130 @@ mod tests {
             );
             assert_eq!(fake.rewinds(), 1);
         }
+    }
+
+    // ── issue #410: an interrupted full readback is continued, not redone ──
+
+    /// Run a full readback of `files` (seal last, as after a write) that is
+    /// stopped by a signal once `stop_after` has been read back clean;
+    /// returns what it checkpointed.
+    fn interrupted_readback(layout: &Layout, files: &[Vec<u8>], stop_after: u32) -> Checkpoints {
+        let seen = std::cell::RefCell::new(Vec::<(u32, String, String)>::new());
+        let record = |c: Checkpoint<'_>| {
+            seen.borrow_mut().push((
+                c.position,
+                c.sha256.to_string(),
+                c.front_index_sha256.to_string(),
+            ));
+            if c.position == stop_after {
+                crate::signal::interrupt_this_thread(true);
+            }
+        };
+        let (mut store, _fake) = tape_over(files.to_vec());
+        let plan = ConfirmPlan::new(Tier::Integrity)
+            .with_order(ReadOrder::SealLast)
+            .checkpointing(&record);
+        let r = store.confirm_with(layout, plan);
+        crate::signal::interrupt_this_thread(false);
+        assert!(
+            matches!(r, Err(TapectlError::Interrupted(_))),
+            "the first readback must stop on the signal: {r:?}"
+        );
+        let seen = seen.into_inner();
+        Checkpoints {
+            front_index_sha256: seen[0].2.clone(),
+            passed: seen.into_iter().map(|(p, sha, _)| (p, sha)).collect(),
+        }
+    }
+
+    /// THE acceptance test for #410: interrupted after file k of N, the
+    /// resumed readback reads only File 3, the files after k and the seal —
+    /// one rewind (the open's), File 3, one forward space over what was
+    /// already read — reaches the verdict an uninterrupted run reaches, and
+    /// reports every file again so a second interruption keeps them.
+    #[test]
+    fn a_resumed_full_readback_reads_only_file_3_the_seal_and_what_is_left() {
+        const SLICES: usize = 6;
+        let (layout, mem) = build_confirm_fixture_with(None, SLICES);
+        let seal = 4 + SLICES as u32;
+        let k = 5; // the second slice
+        let checkpoints = interrupted_readback(&layout, &mem.files, k);
+        let mut got: Vec<u32> = checkpoints.passed.keys().copied().collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 4, 5], "checkpointed as it went");
+
+        let (mut fresh, _) = tape_over(mem.files.clone());
+        let want = fresh
+            .confirm_with(
+                &layout,
+                ConfirmPlan::new(Tier::Integrity).with_order(ReadOrder::SealLast),
+            )
+            .unwrap();
+        assert!(want.mismatches.is_empty(), "{:?}", want.mismatches);
+
+        let reported = std::cell::RefCell::new(Vec::new());
+        let record = |c: Checkpoint<'_>| reported.borrow_mut().push(c.position);
+        let (mut store, fake) = tape_over(mem.files.clone());
+        let plan = ConfirmPlan::new(Tier::Integrity)
+            .with_order(ReadOrder::SealLast)
+            .resuming(Some(&checkpoints))
+            .checkpointing(&record);
+        let resumed = store.confirm_with(&layout, plan).unwrap();
+        assert_eq!(resumed, want, "the same verdict as an uninterrupted run");
+
+        let mut expected = vec![Op::Rewind, Op::Space(3), Op::Read(3), Op::Space(k + 1 - 4)];
+        expected.extend((k + 1..=seal).map(Op::Read));
+        assert_eq!(fake.ops(), expected);
+        let mut every: Vec<u32> = (0..seal).filter(|p| *p != 3).collect();
+        every.sort_unstable();
+        let mut reported = reported.into_inner();
+        reported.sort_unstable();
+        assert_eq!(reported, every, "skipped files are reported again");
+    }
+
+    /// The checkpoints stand only for the front index they were taken
+    /// against: a File 3 that hashes differently now (another tape, or the
+    /// same one rewritten) voids them, and everything is read again.
+    #[test]
+    fn checkpoints_from_another_front_index_are_not_honoured() {
+        let (layout, mem) = build_confirm_fixture_with(None, 3);
+        let seal = 4 + 3;
+        let mut checkpoints = interrupted_readback(&layout, &mem.files, 4);
+        checkpoints.front_index_sha256 = "0".repeat(64);
+
+        let (mut store, fake) = tape_over(mem.files.clone());
+        let plan = ConfirmPlan::new(Tier::Integrity)
+            .with_order(ReadOrder::SealLast)
+            .resuming(Some(&checkpoints));
+        let evidence = store.confirm_with(&layout, plan).unwrap();
+        assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
+        assert_eq!(evidence.files_checked, seal + 1);
+        // Files 0-2 were left out of the pass ahead of File 3 on the
+        // checkpoints' word, so step 4 goes back for them: one rewind more.
+        let ops = fake.ops();
+        for p in 0..=seal {
+            assert!(ops.contains(&Op::Read(p)), "file {p} read: {ops:?}");
+        }
+    }
+
+    /// A slice that checkpointed clean but matches another claim now is
+    /// read again: the skip is per claim, not per position.
+    #[test]
+    fn a_checkpoint_for_a_different_claim_is_read_again() {
+        let (layout, mem) = build_confirm_fixture_with(None, 3);
+        let mut checkpoints = interrupted_readback(&layout, &mem.files, 5);
+        checkpoints.passed.insert(5, "f".repeat(64));
+        let (mut store, fake) = tape_over(mem.files.clone());
+        let plan = ConfirmPlan::new(Tier::Integrity)
+            .with_order(ReadOrder::SealLast)
+            .resuming(Some(&checkpoints));
+        assert!(store
+            .confirm_with(&layout, plan)
+            .unwrap()
+            .mismatches
+            .is_empty());
+        assert!(fake.ops().contains(&Op::Read(5)), "{:?}", fake.ops());
+        assert!(!fake.ops().contains(&Op::Read(4)), "{:?}", fake.ops());
     }
 
     /// Issue #397's other acceptance criterion: the read order changes the
