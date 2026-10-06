@@ -91,7 +91,9 @@ pub fn run(
         ReportCommands::VerifyStatus { volume } => {
             report_verify_status(conn, volume.as_deref(), json_output)
         }
-        ReportCommands::Health { volume } => report_health(conn, volume.as_deref(), json_output),
+        ReportCommands::Health { volume } => {
+            report_health(conn, config, volume.as_deref(), json_output)
+        }
         ReportCommands::Capacity { per_volume } => report_capacity(conn, *per_volume, json_output),
         ReportCommands::Age { unit } => report_age(conn, unit.as_deref(), json_output),
         ReportCommands::Events { entity, days } => {
@@ -1597,7 +1599,12 @@ pub(crate) fn health_json(rows: &[HealthRow]) -> serde_json::Value {
     )
 }
 
-fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bool) -> Result<()> {
+fn report_health(
+    conn: &Connection,
+    config: &Config,
+    volume_filter: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
     let rows = health_rows(conn, volume_filter)?;
     if json_output {
         println!(
@@ -1609,6 +1616,11 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
     // Issue #340: before the listing, whatever `--volume` says and however
     // many readings there are, every non-zero TapeAlert ever journalled.
     for line in tape_alert_block(&tape_alert_sightings(conn)?) {
+        println!("{line}");
+    }
+    // Issue #421: each cartridge's corrected read errors per GiB, verify
+    // over verify, with a rise past the factor flagged.
+    for line in read_error_trend_block(conn, config.health().read_error_rise_factor)? {
         println!("{line}");
     }
     if rows.is_empty() {
@@ -1631,6 +1643,30 @@ fn report_health(conn: &Connection, volume_filter: Option<&str>, json_output: bo
         }
     }
     Ok(())
+}
+
+/// `report health`'s read-error trend block (issue #421, ADR-0012
+/// 2026-10-06 item 12): one line per cartridge with recorded verifies —
+/// its corrected read errors per GiB, oldest to newest, and the uncorrected
+/// counts — and a `RISING` line for a cartridge past `factor`
+/// (`[health] read_error_rise_factor`). Empty when no verify recorded any.
+pub(crate) fn read_error_trend_block(conn: &Connection, factor: f64) -> Result<Vec<String>> {
+    let trends = crate::tape::read_errors::trends(conn)?;
+    if trends.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out =
+        vec!["Corrected read errors per GiB, by cartridge, verify over verify:".to_string()];
+    for t in &trends {
+        out.push(format!("  {}: {}", t.cartridge, t.render()));
+        if let Some(rise) = t.rising(factor) {
+            out.push(format!(
+                "    ** RISING — {} **",
+                crate::tape::read_errors::rise_message(t, rise, factor)
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// What a drive-only reading (no volume, migration 021) prints in the label
@@ -4633,6 +4669,41 @@ Read error counter page  [0x3]
         assert_eq!(
             line, "2026-09-16 12:00:00 unit/photos tagged.status: (none) \u{2192} active",
             "a NAMED field change with an absent old side is a real transition: {line}"
+        );
+    }
+
+    /// Issue #421: `report health` shows each cartridge's corrected read
+    /// errors per GiB verify over verify, and marks the one rising past the
+    /// factor — only that one.
+    #[test]
+    fn report_health_shows_the_read_error_trend_and_flags_a_rising_one() {
+        use crate::tape::read_errors::{tests::seed_verifies, DEFAULT_RISE_FACTOR};
+        let conn = crate::db::open_memory().unwrap();
+        assert!(
+            read_error_trend_block(&conn, DEFAULT_RISE_FACTOR)
+                .unwrap()
+                .is_empty(),
+            "no verify recorded: no block"
+        );
+        seed_verifies(&conn, "C-RISE", &[1, 2, 5]);
+        seed_verifies(&conn, "C-FLAT", &[2, 3]);
+        let block = read_error_trend_block(&conn, DEFAULT_RISE_FACTOR)
+            .unwrap()
+            .join("\n");
+        assert!(
+            block.contains(
+                "  C-FLAT: 2.000 -> 3.000 corrected/GiB over 2 verifies (uncorrected 0, 0)"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains("  C-RISE: 1.000 -> 2.000 -> 5.000 corrected/GiB over 3 verifies"),
+            "{block}"
+        );
+        assert_eq!(block.matches("RISING").count(), 1, "{block}");
+        assert!(
+            block.contains("RISING — corrected read errors per GiB rose from 2.000 to 5.000"),
+            "{block}"
         );
     }
 }

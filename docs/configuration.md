@@ -24,7 +24,7 @@ code does.
     [`[[backends.lto]]`](#backendslto) · [`[[archive_sets]]`](#archive_sets) ·
     [`[[collections]]`](#collections) · [`[discovery]`](#discovery) ·
     [`[compaction]`](#compaction) · [`[logging]`](#logging) ·
-    [`[host_check]`](#host_check)
+    [`[host_check]`](#host_check) · [`[health]`](#health)
   - [Keys that are accepted but do less than their name says](#keys-that-are-accepted-but-do-less-than-their-name-says)
 - [Example: a single-drive home setup](#example-a-single-drive-home-setup)
 - [Example: collections, archive sets and a host check](#example-collections-archive-sets-and-a-host-check)
@@ -465,6 +465,17 @@ default.
 ```text
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
 ```
+
+### `[health]`
+
+What `tapectl audit` and `tapectl report health` flag in the drive's health
+readings. Advisory only: a finding is an `audit` warning, never a refusal. Without
+the table, every key takes its default. See
+[Reading the corrected-error trend](operator-guide.md#reading-the-corrected-error-trend).
+
+| Key | Type | Default | Allowed | What it does |
+|---|---|---|---|---|
+| `read_error_rise_factor` | float | `2.0` | at least 1 | A cartridge is flagged (`audit`'s `read_error_trend`, `RISING` in `report health`) when its newest `volume verify` corrected more read errors per GiB than this many times its previous verify's. **Provisional**: the default is a starting point, to be set from the production host's recorded verifies (ADR-0012, 2026-10-06). |
 
 ### Keys that are accepted but do less than their name says
 

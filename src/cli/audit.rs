@@ -287,6 +287,14 @@ const CHECKS: &[Check] = &[
             run: check_escrow_identity_mismatch,
         },
     },
+    Check {
+        // Issue #421 (ADR-0012 2026-10-06 item 12): a cartridge whose
+        // corrected read errors per GiB climb verify over verify.
+        name: "read_error_trend",
+        scope: Scope::Archive {
+            run: check_read_error_trend,
+        },
+    },
 ];
 
 /// Collect every audit finding for `unit_filter` (or all active units),
@@ -1399,6 +1407,44 @@ fn check_escrow_kit(ctx: &Ctx<'_>) -> Result<Findings> {
         violations: Vec::new(),
         warnings: escrow_kit_findings(ctx.conn)?,
     })
+}
+
+fn check_read_error_trend(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: read_error_trend_findings(ctx.conn, ctx.config.health().read_error_rise_factor)?,
+    })
+}
+
+/// Issue #421: one warning per cartridge whose corrected read errors per
+/// GiB rose past `factor` between its last two recorded verifies. A
+/// warning, never a violation: the data still verified (ADR-0004's
+/// advisory audit), and the factor is provisional (ADR-0012 item 12).
+fn read_error_trend_findings(conn: &Connection, factor: f64) -> Result<Vec<AuditFinding>> {
+    Ok(crate::tape::read_errors::trends(conn)?
+        .into_iter()
+        .filter_map(|t| {
+            let rise = t.rising(factor)?;
+            let volume = t
+                .points
+                .last()
+                .map(|p| p.volume.clone())
+                .unwrap_or_default();
+            Some(AuditFinding {
+                unit: if t.cartridge.starts_with("volume:") {
+                    t.cartridge.clone()
+                } else {
+                    format!("cartridge:{}", t.cartridge)
+                },
+                check: "read_error_trend".into(),
+                message: crate::tape::read_errors::rise_message(&t, rise, factor),
+                action: format!(
+                    "tapectl volume read-slices --from {volume} --unit <UNIT> for each unit on \
+                     it, then tapectl volume write <NEW_LABEL> on a fresh cartridge"
+                ),
+            })
+        })
+        .collect())
 }
 
 fn check_escrow_identity_mismatch(ctx: &Ctx<'_>) -> Result<Findings> {
@@ -3563,7 +3609,7 @@ mod tests {
     mod checks_table {
         use super::*;
 
-        /// The 13 distinct `check` name literals this file's findings can
+        /// The 14 distinct `check` name literals this file's findings can
         /// carry (grep-verified against every `check: "..."` / `check ==
         /// "..."` in this file, non-test code). Every `CHECKS` row name
         /// must be one of these, and every one of these must be covered by
@@ -3582,6 +3628,7 @@ mod tests {
             "escrow_kit_missing",
             "escrow_kit_stale",
             "escrow_identity_mismatch",
+            "read_error_trend",
         ];
 
         #[test]
@@ -3597,13 +3644,13 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 8 per-unit checks + 3 archive-wide checks. `policy_unresolvable`
+            // 8 per-unit checks + 4 archive-wide checks. `policy_unresolvable`
             // is not one of them (see below), and `escrow_kit_missing`/
             // `escrow_kit_stale` share one row.
             assert_eq!(
                 names.len(),
-                11,
-                "expected 8 per-unit + 3 archive-wide CHECKS rows, got: {names:?}"
+                12,
+                "expected 8 per-unit + 4 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {
@@ -3948,6 +3995,69 @@ mod tests {
                 warning_indices.iter().any(|&i| i > per_unit_max),
                 "the archive-wide compaction_candidate warning must come after every \
                  per-unit warning: {warning_indices:?}"
+            );
+        }
+    }
+
+    /// Issue #421 (ADR-0012 2026-10-06 item 12): `audit` flags a cartridge
+    /// whose corrected read errors per GiB climb verify over verify, names
+    /// the trend and the remedy, and only that cartridge. Two cartridges,
+    /// each verified twice through the journal route `volume verify` uses
+    /// (`read_errors::record_for_verify` on a contact's journalled page
+    /// 0x03): C-RISE goes 1 -> 5 per GiB, C-FLAT goes 1 -> 1.5. At the
+    /// default factor only C-RISE is flagged; at a factor of 10 neither is
+    /// (the positive control for the factor being what decides).
+    mod read_error_trend {
+        use super::*;
+        use crate::tape::read_errors;
+
+        #[test]
+        fn a_cartridge_whose_corrected_error_rate_climbs_is_flagged() {
+            let conn = crate::db::open_memory().unwrap();
+            read_errors::tests::seed_verifies(&conn, "C-RISE", &[1, 5]);
+            read_errors::tests::seed_verifies(&conn, "C-FLAT", &[2, 3]);
+
+            let findings =
+                read_error_trend_findings(&conn, read_errors::DEFAULT_RISE_FACTOR).unwrap();
+            assert_eq!(findings.len(), 1, "only the climbing one: {findings:?}");
+            let f = &findings[0];
+            assert_eq!(f.unit, "cartridge:C-RISE");
+            assert_eq!(f.check, "read_error_trend");
+            assert!(
+                f.message.contains("rose from 1.000 to 5.000")
+                    && f.message
+                        .contains("1.000 -> 5.000 corrected/GiB over 2 verifies"),
+                "the trend is shown: {}",
+                f.message
+            );
+            assert!(
+                f.message.contains("read_error_rise_factor"),
+                "{}",
+                f.message
+            );
+            assert!(
+                f.action.contains("volume read-slices --from V-C-RISE"),
+                "{}",
+                f.action
+            );
+
+            // The factor decides: at 10x nothing climbs past it.
+            assert!(read_error_trend_findings(&conn, 10.0).unwrap().is_empty());
+
+            // And it is a warning in the full audit, through `[health]`.
+            let mut config = Config::default();
+            let (_, warnings) = collect_findings(&conn, &config, None).unwrap();
+            assert!(
+                warnings.iter().any(|w| w.check == "read_error_trend"),
+                "{warnings:?}"
+            );
+            config.health = Some(crate::config::HealthConfig {
+                read_error_rise_factor: 10.0,
+            });
+            let (_, warnings) = collect_findings(&conn, &config, None).unwrap();
+            assert!(
+                !warnings.iter().any(|w| w.check == "read_error_trend"),
+                "{warnings:?}"
             );
         }
     }

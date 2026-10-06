@@ -126,6 +126,40 @@ pub struct Config {
     /// [`HOST_CHECK_EXAMPLE`], commented out, instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_check: Option<HostCheckConfig>,
+
+    /// `[health]` — what `audit` and `report health` flag in the drive's
+    /// health readings (issue #421). `None` when the file has no `[health]`
+    /// table; every key then takes its default, via [`Config::health`].
+    /// An `Option` for the reason `host_check` is one: a fresh `init` config
+    /// does not serialize the defaults as a live table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthConfig>,
+}
+
+/// `[health]` (issue #421, ADR-0012 2026-10-06 item 12). Advisory: a finding
+/// is an `audit` warning, never a refusal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HealthConfig {
+    /// Flag a cartridge whose newest verify corrected more read errors per
+    /// GiB than this many times its previous verify's. PROVISIONAL: the
+    /// default, 2.0, is a starting point to be set from home2's recorded
+    /// verifies (ADR-0012: no thresholds invented ahead of the data). At
+    /// least 1.0.
+    #[serde(default = "default_read_error_rise_factor")]
+    pub read_error_rise_factor: f64,
+}
+
+fn default_read_error_rise_factor() -> f64 {
+    crate::tape::read_errors::DEFAULT_RISE_FACTOR
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            read_error_rise_factor: default_read_error_rise_factor(),
+        }
+    }
 }
 
 /// `[host_check]` — what counts as a noisy host before a tape write
@@ -1229,6 +1263,17 @@ impl Config {
                 ));
             }
         }
+        // Issue #421: a rise factor below 1 flags a falling rate, and NaN
+        // flags nothing; both are switches, not thresholds.
+        let factor = self.health().read_error_rise_factor;
+        if !(factor.is_finite() && factor >= 1.0) {
+            problems.push(format!(
+                "{}: health.read_error_rise_factor = {factor} must be a number >= 1 (a cartridge \
+                 is flagged when its corrected read errors per GiB rise by more than this \
+                 factor between two verifies)",
+                path.display()
+            ));
+        }
         // `[host_check]`: a load threshold of 0 or below would make every
         // host "loaded", and a pressure percentage outside (0, 100] is
         // either always or never true — each an off switch or an always-on
@@ -1357,6 +1402,12 @@ impl Config {
     /// default when the file has none.
     pub fn host_check(&self) -> HostCheckConfig {
         self.host_check.clone().unwrap_or_default()
+    }
+
+    /// The `[health]` settings in force: the table as written, or every
+    /// default when the file has none (issue #421).
+    pub fn health(&self) -> HealthConfig {
+        self.health.clone().unwrap_or_default()
     }
 
     /// Write config to file.
@@ -2481,6 +2532,28 @@ mod tests {
 
     /// `--fill-ceiling` replaces every block's ceiling for one command, and
     /// `None` changes nothing.
+    /// Issue #421: `[health] read_error_rise_factor` defaults to the
+    /// provisional 2.0 without the table, loads when set, and a factor
+    /// below 1 (which would flag a FALLING rate) is refused by name.
+    #[test]
+    fn health_rise_factor_defaults_loads_and_refuses_below_one() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.health.is_none());
+        assert_eq!(cfg.health().read_error_rise_factor, 2.0);
+        std::fs::write(&path, "[health]\nread_error_rise_factor = 3.5\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().health().read_error_rise_factor,
+            3.5
+        );
+        std::fs::write(&path, "[health]\nread_error_rise_factor = 0.5\n").unwrap();
+        let msg = Config::load(&path).unwrap_err().to_string();
+        assert!(msg.contains("health.read_error_rise_factor = 0.5"), "{msg}");
+        assert!(msg.contains(">= 1"), "{msg}");
+    }
+
     #[test]
     fn with_fill_ceiling_overrides_every_backend_for_one_command() {
         let mut cfg = Config::default();

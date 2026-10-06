@@ -1640,6 +1640,53 @@ An empty drive is refused at once with `no cartridge loaded in <device>`, by
 write-protect tab set: it verifies without sliding the tab. So does a
 `volume resume` that only re-confirms a recorded seal.
 
+#### Reading the corrected-error trend
+
+A verify that passes can still be a warning. The drive corrects read errors
+as it goes, and a cartridge whose surface is wearing makes it correct more of
+them each year, long before a sha256 fails. So every completed `volume verify`
+records the read errors its drive corrected (log page 0x03: corrected with and
+without delay, rereads, uncorrected), each per GiB the drive read, as a
+`verify_read_errors` event naming its verification session. There is no
+separate scrub command (ADR-0012, 2026-10-06): your rotating verifies are the
+scrub.
+
+`tapectl report health` shows the figures per cartridge, oldest verify first:
+
+```text
+$ tapectl report health
+Corrected read errors per GiB, by cartridge, verify over verify:
+  EW7VWMVKF6: 0.012 -> 0.015 -> 0.044 corrected/GiB over 3 verifies (uncorrected 0, 0, 0)
+    ** RISING — corrected read errors per GiB rose from 0.015 to 0.044 between its last two verifies, ... **
+```
+
+A cartridge is flagged when its newest verify corrected more than
+`read_error_rise_factor` times as many errors per GiB as the verify before it,
+and `tapectl audit` warns on it (`read_error_trend`). The factor lives in
+`config.toml` and is **provisional**: 2.0 is a starting point, not a measured
+threshold, to be set once home2's verifies show what a healthy cartridge looks
+like.
+
+```toml
+[health]
+read_error_rise_factor = 2.0
+```
+
+How to read it:
+
+- A rate of `-` is a verify whose drive counted no bytes read on page 0x03
+  (mhvtl always does this). It is skipped, never read as zero.
+- The counters are the drive's since it last cleared the page, which the HP
+  LTO-6 does when a cartridge is loaded. Verify a cartridge on a fresh load and
+  the figure is that verify's readback.
+- One verify's rate means little; the same cartridge's rates over time are the
+  signal. A climb that shows on one drive and not on another is the drive, not
+  the tape: compare across drives before you act (`report health` lists each
+  reading's drive).
+- Rising, with the data still verifying: copy its units to a fresh cartridge
+  while it still reads (`volume read-slices --from <LABEL> --unit <UNIT>`, then
+  `volume write` to the new one), then retire it.
+
 ### Annually — the heir-path restore drill
 
 The drill that matters is not "can tapectl restore this" — it is **can someone

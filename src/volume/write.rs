@@ -4085,6 +4085,23 @@ pub(crate) fn volume_verify_with_store(
         }
     }
     phase.done();
+    // Issue #421 (ADR-0012 2026-10-06 item 12): the read errors the drive
+    // corrected during this verify, per GiB read, from the page 0x03 the
+    // sweep above just journalled — recorded for a verify that made a
+    // session, so `audit` and `report health` can trend them per cartridge.
+    if let Ok(VerifyReport {
+        session_id: Some(session_id),
+        ..
+    }) = &r
+    {
+        crate::tape::read_errors::record_for_verify(
+            conn,
+            contact_id,
+            *session_id,
+            volume_id,
+            label,
+        );
+    }
     // Issue #386: this verify's phases, on every outcome.
     phase_timings::record_drained(
         conn,
@@ -12592,6 +12609,126 @@ mod tests {
                 vec![(Some(cid), "verify".to_string(), Some(volume_id), session_id)],
                 "exactly one health_logs row, of kind 'verify', naming contact {cid}"
             );
+        }
+
+        /// Issue #421 (ADR-0012 2026-10-06 item 12): a completed verify
+        /// records the read errors its drive corrected, per GiB read, from
+        /// the page 0x03 its own sweep journalled — one `events` row naming
+        /// the verification session and the contact. Two verifies of the
+        /// same volume, the drive's page 0x03 answering 8 then 40 corrected
+        /// errors over 4 GiB: the trend reads 2.0 -> 10.0 and is a rise past
+        /// the default factor. Positive control for the "a verify that made
+        /// no session records nothing" half: a verify whose tape is empty
+        /// fails before any session, takes its sweep, and adds no row.
+        #[test]
+        fn a_verify_records_its_corrected_read_errors_per_gib() {
+            use crate::tape::log_pages::tests::FixtureSource;
+            use crate::tape::read_errors;
+            let conn = crate::db::open_memory().unwrap();
+            let data = b"read-error trend fixture bytes, repeated. ".repeat(4);
+            seed_one_slice_fixture(&conn, "RE-VOL", "re-unit", 4, &data, "completed", "staged");
+            let v = volume_id(&conn, "RE-VOL");
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = swept_config(tmp.path());
+            let identity = identity_with_serial(Some("XYZZY_A1"));
+            let page = |corrected: i64| {
+                format!(
+                    "Read error counter page  [0x3]\n  Errors corrected without substantial \
+                     delay = {corrected}\n  Errors corrected with possible delays = 0\n  Total \
+                     rewrites or rereads = 1\n  Total errors corrected = 0\n  Total times \
+                     correction algorithm processed = 0\n  Total bytes processed = {}\n  Total \
+                     uncorrected errors = 0\n",
+                    4u64 << 30
+                )
+            };
+            let mut sessions = Vec::new();
+            for corrected in [8, 40] {
+                let src = std::cell::RefCell::new(FixtureSource::default());
+                src.borrow_mut().text.insert(0x03, page(corrected));
+                let mut store = mem_store_v2_tape("RE-VOL", &data, &data);
+                let report = volume_verify_with_store(
+                    &conn,
+                    &mut store,
+                    "RE-VOL",
+                    v,
+                    4096,
+                    Tier::Integrity,
+                    ContactSite::new(
+                        &config,
+                        Operation::VolumeVerify,
+                        TEST_DEVICE,
+                        Medium::NoBackend,
+                    )
+                    .with_drive_identity(&identity)
+                    .with_log_source(&src),
+                )
+                .unwrap();
+                sessions.push((report.session_id.unwrap(), report.contact_id.unwrap()));
+            }
+
+            let rows: Vec<(i64, Option<String>, String)> = conn
+                .prepare(
+                    "SELECT entity_id, new_value, details FROM events WHERE action = ?1 \
+                     ORDER BY id",
+                )
+                .unwrap()
+                .query_map([read_errors::EVENT_ACTION], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(rows.len(), 2, "one row per completed verify: {rows:?}");
+            for ((entity, value, details), ((session, contact), rate)) in rows
+                .iter()
+                .zip(sessions.iter().zip(["2.000000", "10.000000"]))
+            {
+                assert_eq!(*entity, v);
+                assert_eq!(value.as_deref(), Some(rate));
+                let d: serde_json::Value = serde_json::from_str(details).unwrap();
+                assert_eq!(d["session_id"], *session, "{d}");
+                assert_eq!(d["contact_id"], *contact, "{d}");
+                assert_eq!(d["drive_serial"], "XYZZY_A1", "{d}");
+                assert_eq!(d["rereads_per_gib"], 0.25, "{d}");
+            }
+            let trends = read_errors::trends(&conn).unwrap();
+            assert_eq!(trends.len(), 1, "{trends:?}");
+            assert_eq!(trends[0].cartridge, "volume:RE-VOL", "no cartridge bound");
+            let rise = trends[0]
+                .rising(read_errors::DEFAULT_RISE_FACTOR)
+                .expect("2 -> 10 per GiB is past a 2x factor");
+            assert_eq!((rise.previous, rise.newest), (2.0, 10.0));
+
+            // A verify that made no session (the volume's tape is empty: the
+            // front-index read fails) is swept, and records no figures.
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            src.borrow_mut().text.insert(0x03, page(999));
+            let mut empty = crate::store::MemStore::new(4096);
+            let failed = volume_verify_with_store(
+                &conn,
+                &mut empty,
+                "RE-VOL",
+                v,
+                4096,
+                Tier::Integrity,
+                ContactSite::new(
+                    &config,
+                    Operation::VolumeVerify,
+                    TEST_DEVICE,
+                    Medium::NoBackend,
+                )
+                .with_drive_identity(&identity)
+                .with_log_source(&src),
+            );
+            assert!(failed.is_err(), "positive control: this verify fails");
+            let after: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE action = ?1",
+                    [read_errors::EVENT_ACTION],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(after, 2, "a verify with no session records no figures");
         }
 
         /// Issue #342: `volume verify`'s post-command sweep lives INSIDE its
