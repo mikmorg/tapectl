@@ -55,6 +55,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::db::files as files_db;
 use crate::db::ontape_catalog::{self, Generation};
 use crate::error::{Result, TapectlError};
 use crate::store::{Store, TapeStore};
@@ -1427,30 +1428,43 @@ fn ensure_files(
     else {
         return Ok(());
     };
-    // Issue #381: `file_type` is derived from `is_directory`, as migration
-    // 005 did, because no generation of the on-tape `catalog.db` carries it.
-    // Left NULL, staging's content validation (`file_type = 'regular'` only)
-    // planned zero files for a rebuilt version re-staged from source. A
-    // symlink or special file on such a tape is therefore rebuilt as
-    // 'regular' — dar's catalogue still holds its real type, and the on-tape
+    // The on-tape shape (path, hex sha256, RFC 3339 mtime, is_directory) is
+    // mapped into the catalog's (migration 030). A value that would not come
+    // back as the same text is refused, naming the row: a rebuild does not
+    // guess.
+    //
+    // Issue #381: the kind is derived from `is_directory`, as migration 005
+    // did, because no generation of the on-tape `catalog.db` carries a file
+    // type. A symlink or special file on such a tape is therefore rebuilt as
+    // regular — dar's catalogue still holds its real type, and the on-tape
     // half is ADR-0012 item 7's 1.2.0 change.
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO files (snapshot_id, path, size_bytes, sha256, modified_at,
-                                      is_directory, file_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6,
-                 CASE ?6 WHEN 0 THEN 'regular' ELSE 'dir' END)",
-    )?;
-    for f in files {
-        let changed = stmt.execute(params![
-            snapshot_id,
-            f.path,
-            f.size_bytes,
-            f.sha256,
-            f.modified_at,
-            f.is_directory,
-        ])?;
-        report.files += changed;
-    }
+    let bad = |f: &FileRow, e: TapectlError| {
+        TapectlError::Other(format!(
+            "catalog.db files row {:?} of {} v{}: {e}",
+            f.path, unit.name, unit.snapshot_version
+        ))
+    };
+    let entries = files.iter().map(|f| {
+        Ok(files_db::FileEntry {
+            path: f.path.clone(),
+            kind: files_db::FileKind::from_is_directory(f.is_directory != 0),
+            size_bytes: f.size_bytes,
+            mtime_ns: f
+                .modified_at
+                .as_deref()
+                .map(files_db::mtime_ns_from_rfc3339)
+                .transpose()
+                .map_err(|e| bad(f, e))?,
+            sha256: f
+                .sha256
+                .as_deref()
+                .map(files_db::sha256_from_hex)
+                .transpose()
+                .map_err(|e| bad(f, e))?,
+            link_target: None,
+        })
+    });
+    report.files += files_db::insert_version(tx, snapshot_id, entries)?;
     Ok(())
 }
 

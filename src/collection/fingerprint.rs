@@ -3,7 +3,7 @@
 //! (checksum_mode, default mtime_size) differs."
 //!
 //! The fingerprint is deliberately the same shape `staging::snapshot_create`
-//! already records in the `files` table (path, size_bytes, modified_at) —
+//! already records for each version (path, size_bytes, mtime) —
 //! comparing a fresh walk against that recorded set needs no new schema and
 //! stays consistent with what a real `snapshot create` would see. Media
 //! immutability (§11: "pending ≈ new folders in practice") means the common
@@ -113,7 +113,7 @@ pub struct PendingScan {
 
 /// Fresh walk of `unit_path`, sorted by path. Mirrors
 /// `staging::walk_directory`'s file enumeration and its exact
-/// mtime-to-RFC3339 conversion, so a byte-identical directory always
+/// whole-second mtime conversion, so a byte-identical directory always
 /// produces a byte-identical fingerprint against a byte-identical
 /// snapshot.
 ///
@@ -163,13 +163,10 @@ fn walk_fingerprint(unit_path: &Path, global_excludes: &[String]) -> Result<Vec<
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
-        let modified_at = chrono::DateTime::from_timestamp(meta.mtime(), 0)
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_default();
         out.push(FileStamp {
             path: rel,
             size_bytes: meta.len() as i64,
-            modified_at,
+            mtime_ns: crate::db::files::mtime_ns_from_secs(meta.mtime()),
         });
     }
     out.sort();
@@ -577,8 +574,11 @@ mod tests {
         let (original_hash, _) =
             crate::staging::validate::hash_source_file(&file_path, "f.txt").unwrap();
         conn.execute(
-            "UPDATE files SET sha256 = ?1 WHERE path = 'f.txt'",
-            params![original_hash],
+            "UPDATE file_versions SET sha256 = ?1
+             WHERE path_id = (SELECT id FROM paths WHERE path = 'f.txt')",
+            params![crate::db::files::sha256_from_hex(&original_hash)
+                .unwrap()
+                .as_slice()],
         )
         .unwrap();
 
@@ -717,8 +717,9 @@ mod tests {
         // and a NULL baseline is skipped — so give it one, which is what a
         // previously-staged unit would have.
         conn.execute(
-            "UPDATE files SET sha256 = 'aa00bb11cc22dd33ee44ff55aa66bb77cc88dd99ee00ff11aa22bb33cc44dd55'
-             WHERE path = 'locked.txt'",
+            "UPDATE file_versions
+             SET sha256 = unhex('aa00bb11cc22dd33ee44ff55aa66bb77cc88dd99ee00ff11aa22bb33cc44dd55')
+             WHERE path_id = (SELECT id FROM paths WHERE path = 'locked.txt')",
             [],
         )
         .unwrap();
@@ -1026,7 +1027,7 @@ mod tests {
 
         // The junk file changes (still excluded, still not tracked) — a
         // SIZE-changing edit, deliberately not just a same-size content
-        // swap: `walk_fingerprint`'s `modified_at` is `meta.mtime()`
+        // swap: `walk_fingerprint`'s `mtime_ns` is `meta.mtime()`
         // truncated to whole SECONDS (chrono::DateTime::from_timestamp(_,
         // 0)), so a same-size rewrite that lands within the same
         // wall-clock second as `snapshot_create` produces an IDENTICAL

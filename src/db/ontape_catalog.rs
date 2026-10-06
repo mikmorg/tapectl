@@ -660,41 +660,47 @@ fn copy_rows(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Resu
         }
     }
 
-    // files reachable via those stage_sets' snapshots.
+    // files reachable via those stage_sets' snapshots. The catalog keeps
+    // them interned (`paths` + `file_versions`, migration 030); this file
+    // keeps its own shape (ADR-0012 item 7: its change is 1.2.0), so each
+    // row is mapped back: the sha256 as lowercase hex, the mtime as the
+    // RFC 3339 text the walk always wrote, the kind as `is_directory`. `id`
+    // numbers the rows in (version, interning) order; nothing reads it but
+    // an operator's sqlite3.
     {
         let sql = format!(
-            "SELECT DISTINCT f.id, f.snapshot_id, f.path, f.size_bytes, f.sha256, f.modified_at, f.is_directory
-             FROM files f
-             JOIN stage_sets ss ON ss.snapshot_id = f.snapshot_id
-             WHERE ss.id IN ({})",
+            "SELECT fv.snapshot_id, p.path, fv.size_bytes, fv.sha256, fv.mtime_ns, fv.kind
+             FROM {}
+             WHERE fv.snapshot_id IN (SELECT snapshot_id FROM stage_sets WHERE id IN ({}))
+             ORDER BY fv.snapshot_id, fv.path_id",
+            super::files::VERSION_FILES,
             ph()
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(stage_set_ids.iter()), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, i64>(6)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, super::files::FileKind>(5)?,
             ))
         })?;
         let mut insert = out.prepare(
             "INSERT INTO files (id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
-        for r in rows {
-            let (id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory) = r?;
+        for (n, r) in rows.enumerate() {
+            let (snapshot_id, path, size_bytes, sha256, mtime_ns, kind) = r?;
             insert.execute(rusqlite::params![
-                id,
+                n as i64 + 1,
                 snapshot_id,
                 path,
                 size_bytes,
-                sha256,
-                modified_at,
-                is_directory
+                super::files::sha256_column(sha256),
+                mtime_ns.and_then(super::files::mtime_ns_to_rfc3339),
+                kind.is_dir() as i64,
             ])?;
         }
     }
@@ -732,12 +738,14 @@ mod tests {
         .unwrap();
         let snap_id = conn.last_insert_rowid();
 
-        conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
-             VALUES (?1, 'a.txt', 10, 'deadbeef', 0)",
-            rusqlite::params![snap_id],
-        )
-        .unwrap();
+        crate::db::files::fixture::insert(
+            conn,
+            snap_id,
+            "a.txt",
+            10,
+            "regular",
+            Some(&"de".repeat(32)),
+        );
 
         conn.execute(
             "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices)
@@ -858,18 +866,21 @@ mod tests {
             .unwrap();
         {
             let tx = conn.unchecked_transaction().unwrap();
-            let mut insert = tx
-                .prepare(
-                    "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
-                     VALUES (?1, ?2, 1, 'h', 0)",
-                )
-                .unwrap();
-            for i in 0..FILES {
-                insert
-                    .execute(rusqlite::params![snap_id, format!("dir/f{i:04}")])
-                    .unwrap();
-            }
-            drop(insert);
+            crate::db::files::insert_version(
+                &tx,
+                snap_id,
+                (0..FILES).map(|i| {
+                    Ok(crate::db::files::FileEntry {
+                        path: format!("dir/f{i:04}"),
+                        kind: crate::db::files::FileKind::Regular,
+                        size_bytes: 1,
+                        mtime_ns: None,
+                        sha256: Some([0x11; 32]),
+                        link_target: None,
+                    })
+                }),
+            )
+            .unwrap();
             tx.commit().unwrap();
         }
 
@@ -961,12 +972,14 @@ mod tests {
         )
         .unwrap();
         let snap_b_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
-             VALUES (?1, 'b.txt', 20, 'beefdead', 0)",
-            rusqlite::params![snap_b_id],
-        )
-        .unwrap();
+        crate::db::files::fixture::insert(
+            &conn,
+            snap_b_id,
+            "b.txt",
+            20,
+            "regular",
+            Some(&"be".repeat(32)),
+        );
         conn.execute(
             "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices)
              VALUES (?1, 'staged', 2000, 1)",
@@ -1070,5 +1083,90 @@ mod tests {
             err.contains("key_fingerprints"),
             "error should name key_fingerprints: {err}"
         );
+    }
+
+    /// ADR-0012 item 7: the catalog's interned rows (migration 030) go onto
+    /// tape in the shape `catalog.db` has always had — the sha256 as
+    /// lowercase hex, the mtime as the walk's RFC 3339 text, the kind as
+    /// `is_directory` — so readers of either generation see what they always
+    /// saw.
+    #[test]
+    fn the_interned_rows_go_on_tape_in_the_old_shape() {
+        use crate::db::files::{fixture, FileEntry, FileKind};
+        let conn = crate::db::open_memory().unwrap();
+        let (_unit, ss_id) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
+        let snap_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                [ss_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mtime = 1_788_264_000_i64;
+        fixture::insert_entry(
+            &conn,
+            snap_id,
+            FileEntry {
+                path: "docs".into(),
+                kind: FileKind::Dir,
+                size_bytes: 0,
+                mtime_ns: Some(mtime * 1_000_000_000),
+                sha256: None,
+                link_target: None,
+            },
+        );
+        fixture::insert_entry(
+            &conn,
+            snap_id,
+            FileEntry {
+                path: "docs/b.bin".into(),
+                kind: FileKind::Regular,
+                size_bytes: 3,
+                mtime_ns: Some(mtime * 1_000_000_000),
+                sha256: Some([0xAB; 32]),
+                link_target: None,
+            },
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("catalog.db");
+        write(&conn, &[ss_id], &out_path).unwrap();
+        let cat = read(&out_path).unwrap();
+        type Shape = (String, Option<i64>, Option<String>, Option<String>, i64);
+        let rows: Vec<Shape> = cat
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    f.path.clone(),
+                    f.size_bytes,
+                    f.sha256.clone(),
+                    f.modified_at.clone(),
+                    f.is_directory,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("a.txt".into(), Some(10), Some("de".repeat(32)), None, 0),
+                (
+                    "docs".into(),
+                    Some(0),
+                    None,
+                    Some("2026-09-01T12:00:00+00:00".into()),
+                    1
+                ),
+                (
+                    "docs/b.bin".into(),
+                    Some(3),
+                    Some("ab".repeat(32)),
+                    Some("2026-09-01T12:00:00+00:00".into()),
+                    0
+                ),
+            ]
+        );
+        let ids: Vec<i64> = cat.files.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }

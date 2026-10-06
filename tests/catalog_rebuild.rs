@@ -278,17 +278,14 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         // Two file rows per snapshot, so the `files` assertion has something
         // to count that the manifest alone could never supply.
         for n in 0..2 {
-            conn.execute(
-                "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
-                 VALUES (?1, ?2, ?3, ?4, 0)",
-                rusqlite::params![
-                    snapshot_id,
-                    format!("{unit_name}/file{n}.bin"),
-                    100 + n,
-                    sha256_hex(format!("{unit_name}-{n}").as_bytes()),
-                ],
-            )
-            .unwrap();
+            db::files::fixture::insert(
+                &conn,
+                snapshot_id,
+                &format!("{unit_name}/file{n}.bin"),
+                100 + n,
+                "regular",
+                Some(&sha256_hex(format!("{unit_name}-{n}").as_bytes())),
+            );
         }
 
         conn.execute(
@@ -1207,7 +1204,7 @@ fn the_file_index_comes_back_from_the_operator_catalog_db() {
     assert_eq!(report.files, UNITS.len() * 2);
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM files f JOIN snapshots s ON s.id = f.snapshot_id
+            "SELECT COUNT(*) FROM file_versions fv JOIN snapshots s ON s.id = fv.snapshot_id
              JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
             rusqlite::params![UNITS[0].0],
             |r| r.get(0),
@@ -1366,7 +1363,8 @@ fn row_counts(conn: &rusqlite::Connection) -> Vec<(String, i64)> {
         "volumes",
         "writes",
         "write_positions",
-        "files",
+        "paths",
+        "file_versions",
         // Issue #165: without these two, the idempotence test below proves
         // nothing about the cartridge writes a rebuild now makes.
         "cartridges",

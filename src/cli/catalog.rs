@@ -422,10 +422,11 @@ pub fn run(
                 .map_err(|_| TapectlError::Other("no snapshots found".into()))?
             };
 
-            let mut stmt = conn.prepare(
-                "SELECT path, size_bytes, modified_at, sha256, is_directory
-                 FROM files WHERE snapshot_id = ?1 ORDER BY path",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT p.path, fv.size_bytes, fv.mtime_ns, fv.sha256, fv.kind = 0
+                 FROM {} WHERE fv.snapshot_id = ?1 ORDER BY p.path",
+                crate::db::files::VERSION_FILES
+            ))?;
             let rows: Vec<FileRow> = stmt
                 .query_map(params![snapshot_id], |row| {
                     let size: i64 = row.get(1)?;
@@ -434,8 +435,9 @@ pub fn run(
                         row.get::<_, String>(0)?,
                         size,
                         is_dir,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<i64>>(2)?
+                            .and_then(crate::db::files::mtime_ns_to_rfc3339),
+                        crate::db::files::sha256_column(row.get(3)?),
                     ))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -862,6 +864,10 @@ fn match_expression(pattern: &str) -> Option<String> {
 /// version. Ordered by unit, path and version, never by FTS `rank`: bm25
 /// ranks every match before the LIMIT can apply, which cost seconds on a
 /// large catalog and bought nothing for a path search.
+///
+/// `paths_fts` indexes each unit's DISTINCT paths (migration 030), so a
+/// match is a path, and its versions are found by one primary-key probe of
+/// `file_versions` per candidate version.
 fn search_rows(
     conn: &Connection,
     pattern: &str,
@@ -871,20 +877,25 @@ fn search_rows(
     let Some(expr) = match_expression(pattern) else {
         return Ok(Vec::new());
     };
-    let mut stmt = conn.prepare(
-        "SELECT f.path, f.size_bytes, u.name, s.version
-         FROM files_fts fts
-         JOIN files f ON f.rowid = fts.rowid
-         JOIN snapshots s ON s.id = f.snapshot_id
-         JOIN units u ON u.id = s.unit_id
-         WHERE files_fts MATCH ?1 AND f.is_directory = 0
-           AND (?3 OR s.version = (SELECT MAX(version) FROM snapshots
-                                   WHERE unit_id = s.unit_id))
-         ORDER BY u.name, f.path, s.version
-         LIMIT ?2",
-    )?;
+    let versions = if all_versions {
+        "s.unit_id = p.unit_id"
+    } else {
+        "s.id = (SELECT id FROM snapshots WHERE unit_id = p.unit_id
+                 ORDER BY version DESC LIMIT 1)"
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.path, fv.size_bytes, u.name, s.version
+         FROM paths_fts
+         JOIN paths p ON p.id = paths_fts.rowid
+         JOIN units u ON u.id = p.unit_id
+         JOIN snapshots s ON {versions}
+         JOIN file_versions fv ON fv.snapshot_id = s.id AND fv.path_id = p.id
+         WHERE paths_fts MATCH ?1 AND fv.kind <> 0
+         ORDER BY u.name, p.path, s.version
+         LIMIT ?2"
+    ))?;
     let rows = stmt
-        .query_map(params![expr, limit, all_versions], |row| {
+        .query_map(params![expr, limit], |row| {
             Ok(SearchHit {
                 path: row.get(0)?,
                 size: row.get(1)?,
@@ -1825,12 +1836,7 @@ mod tests {
             .unwrap();
             let snap_id = conn.last_insert_rowid();
             for (path, size, file_type) in *files {
-                conn.execute(
-                    "INSERT INTO files (snapshot_id, path, size_bytes, is_directory, file_type)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![snap_id, path, size, *file_type == "dir", file_type],
-                )
-                .unwrap();
+                db::files::fixture::insert(conn, snap_id, path, *size, file_type, None);
             }
         }
     }

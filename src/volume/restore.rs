@@ -416,7 +416,7 @@ fn catalog_file_size(
         |r| r.get(0),
     )?;
     let known: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1",
+        "SELECT EXISTS (SELECT 1 FROM file_versions WHERE snapshot_id = ?1)",
         params![snapshot_id],
         |r| r.get(0),
     )?;
@@ -431,7 +431,11 @@ fn catalog_file_size(
     }
     let row: Option<(bool, Option<i64>)> = conn
         .query_row(
-            "SELECT is_directory, size_bytes FROM files WHERE snapshot_id = ?1 AND path = ?2",
+            "SELECT fv.kind = 0, fv.size_bytes FROM file_versions fv
+             WHERE fv.snapshot_id = ?1
+               AND fv.path_id = (SELECT id FROM paths
+                                  WHERE unit_id = (SELECT unit_id FROM snapshots WHERE id = ?1)
+                                    AND path = ?2)",
             params![snapshot_id, file_path],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -4471,13 +4475,12 @@ mod tests {
                 let snapshot_id: i64 = conn
                     .query_row("SELECT id FROM snapshots", [], |r| r.get(0))
                     .unwrap();
-                for (path, size, dir) in [("a.txt", 5, 0), ("b.txt", 5, 0), ("docs", 0, 1)] {
-                    conn.execute(
-                        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![snapshot_id, path, size, dir],
-                    )
-                    .unwrap();
+                for (path, size, kind) in [
+                    ("a.txt", 5, "regular"),
+                    ("b.txt", 5, "regular"),
+                    ("docs", 0, "dir"),
+                ] {
+                    crate::db::files::fixture::insert(&conn, snapshot_id, path, size, kind, None);
                 }
                 let fake = FakeTape::with_files(store.files.clone(), 4096);
                 let drive = InjectedDrive::install(&fake);
@@ -5227,12 +5230,14 @@ mod tests {
                         let at = src.join(path);
                         fs::create_dir_all(at.parent().unwrap()).unwrap();
                         fs::write(&at, bytes).unwrap();
-                        conn.execute(
-                            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-                             VALUES (?1, ?2, ?3, 0)",
-                            params![snapshot_id, path, bytes.len() as i64],
-                        )
-                        .unwrap();
+                        crate::db::files::fixture::insert(
+                            &conn,
+                            snapshot_id,
+                            path,
+                            bytes.len() as i64,
+                            "regular",
+                            None,
+                        );
                         let mut parent = Path::new(path).parent();
                         while let Some(p) = parent.filter(|p| !p.as_os_str().is_empty()) {
                             dirs.insert(p.to_string_lossy().into_owned());
@@ -5240,12 +5245,7 @@ mod tests {
                         }
                     }
                     for dir in dirs {
-                        conn.execute(
-                            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-                             VALUES (?1, ?2, 0, 1)",
-                            params![snapshot_id, dir],
-                        )
-                        .unwrap();
+                        crate::db::files::fixture::insert(&conn, snapshot_id, &dir, 0, "dir", None);
                     }
                     let base = work.path().join("arch");
                     let created = std::process::Command::new("dar")

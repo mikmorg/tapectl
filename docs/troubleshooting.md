@@ -662,6 +662,35 @@ Once 027 applies, the same command compacts the catalog once (SQLite's
 `VACUUM`), which needs free disk about twice the catalog's size. If that fails
 it only warns: the catalog is correct, just larger than it needs to be.
 
+### `migration 030 cannot run`
+
+Migration 030 stores each unit's file list in a narrower shape: a path once
+per unit, a sha256 as 32 bytes, a modified time as a number. It converts every
+`files` row exactly or not at all, and refuses a value it could not turn back
+into the same text:
+
+```text
+error: failed to open database: migration error: migration 030 cannot run: 1 files row(s) whose sha256 is not 64
+lowercase hex characters (id 4012). Migration 030 converts every files row exactly (paths interned per unit,
+sha256 as 32 bytes, modified_at as an integer) and will not guess a value it cannot convert. Correct or delete
+each named files row, then run the command again. Nothing has been changed.
+```
+
+The other findings it can name: a `modified_at` not in the spelling every
+tapectl release writes (`2026-09-01T12:00:00+00:00`), an `is_directory` and
+`file_type` that disagree or a `file_type` that is not `dir`, `regular`,
+`symlink` or `special`, and a row whose snapshot no longer exists. tapectl never
+writes any of these, so the rows were edited by hand. Nothing has been changed.
+Look at the named rows with `sqlite3`, the same way as for migration 026 above,
+and correct them (`sqlite3 "$DB" "SELECT * FROM files WHERE id = 4012"`). A
+sha256 or `modified_at` you cannot recover may be set to NULL: a version
+without a sha256 is baselined again by its next stage, and one without a
+modified time reads as changed to the next `snapshot create`. A row with no
+`file_type` at all is not refused: it takes the type its `is_directory` gives,
+as migration 005 did.
+
+Once 030 applies, the same command compacts the catalog once, as after 027.
+
 ---
 
 ## Staging

@@ -36,7 +36,7 @@ pub fn snapshot_purge(
 
     // Delete the file list atomically — keep the snapshot row as 'purged'
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
+    crate::db::files::delete_version(&tx, snap_id)?;
     tx.execute(
         "UPDATE snapshots SET status = 'purged' WHERE id = ?1",
         params![snap_id],
@@ -129,9 +129,9 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
         .query_row(
             "SELECT s.id, s.version FROM snapshots s
              WHERE s.unit_id = ?1 AND s.status IN ('current', 'staged', 'created')
-               AND EXISTS (SELECT 1 FROM files f
-                           WHERE f.snapshot_id = s.id
-                             AND f.is_directory = 0 AND f.sha256 IS NOT NULL)
+               AND EXISTS (SELECT 1 FROM file_versions fv
+                           WHERE fv.snapshot_id = s.id
+                             AND fv.kind <> 0 AND fv.sha256 IS NOT NULL)
              ORDER BY s.version DESC LIMIT 1",
             params![unit.id],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -149,15 +149,20 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
         |row| row.get(0),
     )?;
 
-    let mut stmt = conn.prepare(
-        "SELECT f.path, f.size_bytes, f.sha256
-         FROM files f
-         WHERE f.snapshot_id = ?1 AND f.is_directory = 0 AND f.sha256 IS NOT NULL
-         ORDER BY f.path",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.path, fv.size_bytes, fv.sha256
+         FROM {}
+         WHERE fv.snapshot_id = ?1 AND fv.kind <> 0 AND fv.sha256 IS NOT NULL
+         ORDER BY p.path",
+        crate::db::files::VERSION_FILES
+    ))?;
     let staged_files: Vec<(String, i64, String)> = stmt
         .query_map(params![snapshot_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                crate::db::files::sha256_to_hex(&row.get::<_, Vec<u8>>(2)?),
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -2962,7 +2967,7 @@ pub fn snapshot_delete(
         "DELETE FROM stage_sets WHERE snapshot_id = ?1",
         params![snap_id],
     )?;
-    tx.execute("DELETE FROM files WHERE snapshot_id = ?1", params![snap_id])?;
+    crate::db::files::delete_version(&tx, snap_id)?;
     tx.execute("DELETE FROM snapshots WHERE id = ?1", params![snap_id])?;
 
     events::log_event(
@@ -3277,14 +3282,19 @@ fn get_file_map(
     conn: &Connection,
     snapshot_id: i64,
 ) -> Result<std::collections::HashMap<String, (i64, Option<String>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT path, size_bytes, sha256 FROM files WHERE snapshot_id = ?1 AND is_directory = 0",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.path, fv.size_bytes, fv.sha256 FROM {}
+         WHERE fv.snapshot_id = ?1 AND fv.kind <> 0",
+        crate::db::files::VERSION_FILES
+    ))?;
     let map = stmt
         .query_map(params![snapshot_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                (row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?),
+                (
+                    row.get::<_, i64>(1)?,
+                    crate::db::files::sha256_column(row.get(2)?),
+                ),
             ))
         })?
         .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
@@ -3626,14 +3636,17 @@ pub fn db_fsck(conn: &Connection, repair: bool, dry_run: bool) -> Result<FsckRep
 /// several groups without inflating the reported row COUNT within any
 /// one group beyond that row's single appearance in it.
 fn foreign_key_check_issues(conn: &Connection) -> Result<Vec<String>> {
-    let rows: Vec<(String, i64, String, i64)> = {
+    // `rowid` is NULL for a WITHOUT ROWID table (`file_versions`, migration
+    // 030): such a row is counted, and named by its table's key columns
+    // instead of a rowid it does not have.
+    let rows: Vec<(String, Option<i64>, String, i64)> = {
         let mut stmt =
             conn.prepare("SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check")?;
         let mapped = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<i64>>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
                 ))
@@ -3642,34 +3655,95 @@ fn foreign_key_check_issues(conn: &Connection) -> Result<Vec<String>> {
         mapped
     };
 
-    let mut groups: std::collections::BTreeMap<(String, String, i64), Vec<i64>> =
+    let mut groups: std::collections::BTreeMap<(String, String, i64), (Vec<i64>, usize)> =
         std::collections::BTreeMap::new();
     for (table, rowid, parent, fkid) in rows {
-        groups.entry((table, parent, fkid)).or_default().push(rowid);
+        let group = groups.entry((table, parent, fkid)).or_default();
+        match rowid {
+            Some(id) => group.0.push(id),
+            None => group.1 += 1,
+        }
     }
 
     let mut issues = Vec::with_capacity(groups.len());
-    for ((table, parent, _fkid), mut rowids) in groups {
+    for ((table, parent, fkid), (mut rowids, keyless)) in groups {
         rowids.sort_unstable();
         rowids.dedup();
-        let shown: Vec<String> = rowids.iter().take(5).map(i64::to_string).collect();
-        let more = if rowids.len() > shown.len() {
-            ", ..."
-        } else {
-            ""
-        };
-        let (noun, verb) = if rowids.len() == 1 {
+        let count = rowids.len() + keyless;
+        let (noun, verb) = if count == 1 {
             ("row", "references")
         } else {
             ("rows", "reference")
         };
+        let named = if keyless > 0 {
+            format!("by {}", fk_columns(conn, &table, fkid)?.join(", "))
+        } else {
+            let shown: Vec<String> = rowids.iter().take(5).map(i64::to_string).collect();
+            let more = if rowids.len() > shown.len() {
+                ", ..."
+            } else {
+                ""
+            };
+            format!("rowids {}{more}", shown.join(", "))
+        };
         issues.push(format!(
-            "foreign_key_check: {} {noun} in {table} {verb} missing {parent} (rowids {}{more})",
-            rowids.len(),
-            shown.join(", "),
+            "foreign_key_check: {count} {noun} in {table} {verb} missing {parent} ({named})"
         ));
     }
     Ok(issues)
+}
+
+/// The child columns of foreign key `fkid` on `table`, in key order, and the
+/// parent columns they point at (`None` where the key names the parent's
+/// primary key implicitly).
+fn fk_column_pairs(
+    conn: &Connection,
+    table: &str,
+    fkid: i64,
+) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT \"from\", \"to\" FROM pragma_foreign_key_list(?1) WHERE id = ?2 ORDER BY seq",
+    )?;
+    let pairs = stmt
+        .query_map(params![table, fkid], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(pairs)
+}
+
+fn fk_columns(conn: &Connection, table: &str, fkid: i64) -> Result<Vec<String>> {
+    Ok(fk_column_pairs(conn, table, fkid)?
+        .into_iter()
+        .map(|(from, _)| from)
+        .collect())
+}
+
+/// Delete the rows of WITHOUT ROWID `table` whose foreign key `fkid` names a
+/// missing `parent` row: `pragma_foreign_key_check` gives such a row no
+/// rowid to delete by, so the key itself selects them.
+fn delete_keyless_orphans(
+    conn: &Connection,
+    table: &str,
+    parent: &str,
+    fkid: i64,
+) -> Result<usize> {
+    let pairs = fk_column_pairs(conn, table, fkid)?;
+    let matches = pairs
+        .iter()
+        .map(|(from, to)| format!("p.\"{}\" = c.\"{from}\"", to.as_deref().unwrap_or("rowid")))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let not_null = pairs
+        .iter()
+        .map(|(from, _)| format!("c.\"{from}\" IS NOT NULL"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    Ok(conn.execute(
+        &format!(
+            "DELETE FROM \"{table}\" AS c WHERE {not_null}
+               AND NOT EXISTS (SELECT 1 FROM \"{parent}\" p WHERE {matches})"
+        ),
+        [],
+    )?)
 }
 
 /// Delete every row `pragma_foreign_key_check` names, children first in
@@ -3692,22 +3766,39 @@ fn repair_foreign_key_violations(
     let mut deleted_by_table: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     loop {
-        let violations: Vec<(String, i64)> = {
-            let mut stmt =
-                tx.prepare("SELECT DISTINCT \"table\", rowid FROM pragma_foreign_key_check")?;
+        // A WITHOUT ROWID table's violations come back with a NULL rowid
+        // and are deleted by their foreign key instead (migration 030).
+        let violations: Vec<(String, Option<i64>, String, i64)> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check",
+            )?;
             let mapped = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })?
                 .collect::<std::result::Result<_, _>>()?;
             mapped
         };
         if violations.is_empty() {
             break;
         }
-        for (table, rowid) in violations {
-            let n = tx.execute(
-                &format!("DELETE FROM \"{table}\" WHERE rowid = ?1"),
-                params![rowid],
-            )?;
+        let mut keyless_done = std::collections::BTreeSet::new();
+        for (table, rowid, parent, fkid) in violations {
+            let n = match rowid {
+                Some(rowid) => tx.execute(
+                    &format!("DELETE FROM \"{table}\" WHERE rowid = ?1"),
+                    params![rowid],
+                )?,
+                None if keyless_done.insert((table.clone(), fkid)) => {
+                    delete_keyless_orphans(&tx, &table, &parent, fkid)?
+                }
+                None => 0,
+            };
             *deleted_by_table.entry(table).or_insert(0) += n;
         }
     }
@@ -4349,12 +4440,7 @@ mod tests {
     }
 
     fn insert_file(conn: &Connection, snapshot_id: i64, path: &str, size: i64, sha256: &str) {
-        conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
-             VALUES (?1, ?2, ?3, ?4, 0)",
-            params![snapshot_id, path, size, sha256],
-        )
-        .unwrap();
+        crate::db::files::fixture::insert(conn, snapshot_id, path, size, "regular", Some(sha256));
     }
 
     #[test]
@@ -4496,12 +4582,7 @@ mod tests {
 
         // v2: created by `snapshot create`, never staged — no sha256.
         let v2 = insert_version(&conn, 2, "created");
-        conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
-             VALUES (?1, 'f.txt', 5, NULL, 0)",
-            params![v2],
-        )
-        .unwrap();
+        crate::db::files::fixture::insert(&conn, v2, "f.txt", 5, "regular", None);
 
         let report = check_integrity(&conn, "unit1").unwrap();
         assert_eq!(report.version, 1);
@@ -8365,7 +8446,13 @@ mod tests {
             slice_files.push(f);
         }
 
-        insert_file(conn, snap_id, &format!("/src/{unit_name}.txt"), 3, "cc");
+        insert_file(
+            conn,
+            snap_id,
+            &format!("/src/{unit_name}.txt"),
+            3,
+            &"cc".repeat(32),
+        );
 
         (snap_id, slice_files)
     }
@@ -8490,7 +8577,7 @@ mod tests {
         for (table, sql) in [
             ("stage_slices", "SELECT COUNT(*) FROM stage_slices"),
             ("stage_sets", "SELECT COUNT(*) FROM stage_sets"),
-            ("files", "SELECT COUNT(*) FROM files"),
+            ("file_versions", "SELECT COUNT(*) FROM file_versions"),
             ("writes", "SELECT COUNT(*) FROM writes"),
             ("write_positions", "SELECT COUNT(*) FROM write_positions"),
         ] {
@@ -8818,12 +8905,14 @@ mod tests {
         )
         .unwrap();
 
-        // files.snapshot_id -> snapshots: dangling. (This edge was
-        // manifest_entries -> manifests until migration 027 dropped both
-        // tables, issue #372.)
+        // file_versions.snapshot_id -> snapshots: dangling, on a WITHOUT
+        // ROWID table, whose violations `pragma_foreign_key_check` reports
+        // with a NULL rowid (migration 030). (This edge was files ->
+        // snapshots until 030, and manifest_entries -> manifests until 027
+        // dropped both tables, issue #372.)
         conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes)
-             VALUES (99999, '/nonexistent', 1)",
+            "INSERT INTO file_versions (snapshot_id, path_id, kind, size_bytes)
+             VALUES (99999, 99999, 1, 1)",
             [],
         )
         .unwrap();
@@ -8860,9 +8949,34 @@ mod tests {
             report.issues
         );
         assert!(
-            has_edge("files", "snapshots"),
+            has_edge("file_versions", "snapshots"),
             "issues: {:?}",
             report.issues
+        );
+        assert!(
+            has_edge("file_versions", "paths"),
+            "issues: {:?}",
+            report.issues
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.contains("file_versions") && i.contains("(by snapshot_id)")),
+            "a WITHOUT ROWID table's orphan is named by its key: {:?}",
+            report.issues
+        );
+
+        // And `--repair` removes it, by its key.
+        let repaired = db_fsck(&conn, true, false).unwrap();
+        assert_eq!(repaired.repaired, 4, "the four orphans: {repaired:?}");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM file_versions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "the orphaned file_versions row is deleted");
+        assert!(
+            db_fsck(&conn, false, false).unwrap().issues.is_empty(),
+            "clean after the repair"
         );
         assert!(
             has_edge("cartridge_volumes", "volumes"),

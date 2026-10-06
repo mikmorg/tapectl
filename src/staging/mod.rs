@@ -104,7 +104,7 @@ pub fn snapshot_create_detailed(
             .map(|e| crate::unit::content_match::FileStamp {
                 path: e.path.clone(),
                 size_bytes: e.size,
-                modified_at: e.mtime.clone(),
+                mtime_ns: e.mtime_ns,
             })
             .collect();
         fresh_stamps.sort();
@@ -193,28 +193,25 @@ pub fn snapshot_create_detailed(
             )?;
             let snapshot_id = tx.last_insert_rowid();
 
-            // `files` is the one per-file record (migration 027 dropped the
-            // write-only `manifests`/`manifest_entries` duplicate, issue
-            // #372). Mode/uid/gid live in dar's own catalogue, which is what
-            // a restore reads.
-            {
-                let mut file_insert = tx.prepare(
-                    "INSERT INTO files (snapshot_id, path, size_bytes, modified_at, is_directory,
-                                        file_type, link_target)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )?;
-                for entry in &walked {
-                    file_insert.execute(params![
-                        snapshot_id,
-                        entry.path,
-                        entry.size,
-                        entry.mtime,
-                        entry.is_dir,
-                        entry.file_type,
-                        entry.link_target,
-                    ])?;
-                }
-            }
+            // The version's file list (`db::files`, migration 030): each
+            // path interned once per unit, one narrow row per entry.
+            // Mode/uid/gid/xattrs live in dar's own catalogue, which is what
+            // a restore reads (ADR-0012 item 7).
+            crate::db::files::insert_version(
+                &tx,
+                snapshot_id,
+                walked.iter().map(|entry| {
+                    Ok(crate::db::files::FileEntry {
+                        path: entry.path.clone(),
+                        kind: crate::db::files::FileKind::from_name(entry.file_type)
+                            .expect("walk_directory names only the four kinds"),
+                        size_bytes: entry.size,
+                        mtime_ns: entry.mtime_ns,
+                        sha256: None,
+                        link_target: entry.link_target.clone(),
+                    })
+                }),
+            )?;
 
             events::log_created(
                 &tx,
@@ -1387,7 +1384,7 @@ fn check_file_list_complete(
         return Ok(());
     };
     let recorded: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND is_directory = 0",
+        "SELECT COUNT(*) FROM file_versions WHERE snapshot_id = ?1 AND kind <> 0",
         params![snapshot.id],
         |r| r.get(0),
     )?;
@@ -1877,27 +1874,17 @@ fn render_phase_timings(timings: &[progress::PhaseTiming]) -> String {
 /// value) — but the guard holds even if that invariant is ever violated by
 /// a future caller.
 ///
-/// Issue #372: each UPDATE is keyed by `(snapshot_id, path)`, which the
-/// `UNIQUE(snapshot_id, path)` index serves, so finalization is linear in
-/// the file count. The second UPDATE this used to run, into
-/// `manifest_entries`, could only search by `manifest_id` and scanned the
-/// whole manifest per file; migration 027 dropped that table. The plan is
-/// pinned by `backfill_checksums_searches_the_unique_index`. The `files_au`
-/// FTS trigger fires only on a `path` change since 027, so a sha256-only
-/// UPDATE no longer rewrites the search index either.
-pub(crate) const BACKFILL_SQL: &str =
-    "UPDATE files SET sha256 = ?1 WHERE snapshot_id = ?2 AND path = ?3 AND sha256 IS NULL";
-
+/// Issue #372: each UPDATE is one lookup in `paths`' UNIQUE(unit_id, path)
+/// index and one in `file_versions`' primary key (`db::files::BACKFILL_SQL`,
+/// pinned by `backfill_checksums_searches_the_indexes`), so finalization is
+/// linear in the file count. A sha256 lives on the membership row, never on
+/// the path, so a backfill never touches the search index.
 fn backfill_checksums(
     conn: &Connection,
     snapshot_id: i64,
     checksums: &[(String, String)],
 ) -> Result<()> {
-    let mut file_update = conn.prepare(BACKFILL_SQL)?;
-    for (path, hash) in checksums {
-        file_update.execute(params![hash, snapshot_id, path])?;
-    }
-    Ok(())
+    crate::db::files::backfill_sha256(conn, snapshot_id, checksums)
 }
 
 fn generate_stage_report(
@@ -2146,9 +2133,10 @@ fn walk_directory(
         // falsely flagging every symlink-containing unit as perpetually
         // dirty. Only `total_size` below excludes it (see that comment).
         let size = if is_dir { 0 } else { meta.len() as i64 };
-        let mtime = chrono::DateTime::from_timestamp(meta.mtime(), 0)
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_default();
+        // Whole seconds, as the walk has always recorded them (and as
+        // `collection::fingerprint`'s walk does), so a version recorded
+        // before migration 030 and a fresh walk still compare equal.
+        let mtime_ns = crate::db::files::mtime_ns_from_secs(meta.mtime());
 
         // Classify by filesystem type (issue #33/H7) via entry.file_type(),
         // which — under WalkDir::follow_links(false), already set above —
@@ -2202,7 +2190,7 @@ fn walk_directory(
         entries.push(ManifestEntry {
             path: rel_path,
             size,
-            mtime,
+            mtime_ns,
             is_dir,
             file_type,
             link_target,
@@ -2236,7 +2224,7 @@ pub(crate) fn walk_directory_relative_paths_for_test(
 struct ManifestEntry {
     path: String,
     size: i64,
-    mtime: String,
+    mtime_ns: Option<i64>,
     is_dir: bool,
     file_type: &'static str,
     link_target: Option<String>,
@@ -3890,13 +3878,7 @@ mod tests {
         let snap_id = snapshot_create(&conn, "unit1", &config)
             .expect("a file over the large-file threshold must only warn, not fail");
 
-        let recorded_size: i64 = conn
-            .query_row(
-                "SELECT size_bytes FROM files WHERE snapshot_id = ?1 AND path = 'big.bin'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let recorded_size: i64 = crate::db::files::fixture::size(&conn, snap_id, "big.bin");
         assert_eq!(
             recorded_size, 1024,
             "the large file must still be recorded in the manifest, not skipped"
@@ -3950,22 +3932,10 @@ mod tests {
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
-        let files_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'junk.tmp'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let files_count: i64 = crate::db::files::fixture::count(&conn, snap_id, Some("junk.tmp"));
         assert_eq!(files_count, 0, "excluded file must not appear in `files`");
 
-        let kept_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'keep.txt'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let kept_count: i64 = crate::db::files::fixture::count(&conn, snap_id, Some("keep.txt"));
         assert_eq!(kept_count, 1, "non-excluded file must still be recorded");
     }
 
@@ -3984,26 +3954,16 @@ mod tests {
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         stage_create(&conn, &paths, &config, snap_id, false).unwrap();
 
-        let junk_row_exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'junk.tmp'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let junk_row_exists: i64 =
+            crate::db::files::fixture::count(&conn, snap_id, Some("junk.tmp"));
         assert_eq!(
             junk_row_exists, 0,
             "excluded file must have no `files` row at all, so there is \
              nothing for backfill_checksums to baseline"
         );
 
-        let kept_sha: Option<String> = conn
-            .query_row(
-                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'keep.txt'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let kept_sha: Option<String> =
+            crate::db::files::fixture::sha256(&conn, snap_id, "keep.txt");
         assert!(
             kept_sha.is_some(),
             "the non-excluded file must still get its baseline established"
@@ -4109,14 +4069,8 @@ mod tests {
         }
 
         // The manifest agrees with the archive, directories included.
-        let recorded = |path: &str| -> i64 {
-            conn.query_row(
-                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = ?2",
-                params![snap_id, path],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
+        let recorded =
+            |path: &str| -> i64 { crate::db::files::fixture::count(&conn, snap_id, Some(path)) };
         assert_eq!(recorded(".cache"), 1, "the pruned directory itself is kept");
         assert_eq!(recorded("sub/.cache"), 1, "at any depth");
         assert_eq!(
@@ -4148,13 +4102,7 @@ mod tests {
         fs::write(src.join("media_file.dat"), b"ordinary archival content").unwrap();
 
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
-        let file_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let file_count: i64 = crate::db::files::fixture::count(&conn, snap_id, None);
         // 2 files recorded (keep.txt, media_file.dat) + the dotfile itself
         // (.tapectl-unit.toml, swept up like any other regular file —
         // pre-existing, unrelated behavior this fix does not change).
@@ -4218,26 +4166,14 @@ mod tests {
 
         let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
 
-        let files_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'Thumbs.db'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let files_count: i64 = crate::db::files::fixture::count(&conn, snap_id, Some("Thumbs.db"));
         assert_eq!(
             files_count, 0,
             "a globally-excluded file must not appear in `files`, even with no \
              dotfile override"
         );
 
-        let kept_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'keep.txt'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let kept_count: i64 = crate::db::files::fixture::count(&conn, snap_id, Some("keep.txt"));
         assert_eq!(kept_count, 1, "non-excluded file must still be recorded");
     }
 
@@ -4252,26 +4188,16 @@ mod tests {
         let snap_id = snapshot_create(&conn, "unit1", &config).unwrap();
         stage_create(&conn, &paths, &config, snap_id, false).unwrap();
 
-        let junk_row_exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND path = 'Thumbs.db'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let junk_row_exists: i64 =
+            crate::db::files::fixture::count(&conn, snap_id, Some("Thumbs.db"));
         assert_eq!(
             junk_row_exists, 0,
             "a globally-excluded file must have no `files` row at all, so there \
              is nothing for backfill_checksums to baseline"
         );
 
-        let kept_sha: Option<String> = conn
-            .query_row(
-                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'keep.txt'",
-                params![snap_id],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let kept_sha: Option<String> =
+            crate::db::files::fixture::sha256(&conn, snap_id, "keep.txt");
         assert!(
             kept_sha.is_some(),
             "the non-excluded file must still get its baseline established"
@@ -4406,18 +4332,8 @@ mod tests {
         );
 
         // The two rows really do record the same content.
-        let stamps = |sid: i64| -> Vec<(String, i64)> {
-            let mut st = conn
-                .prepare(
-                    "SELECT path, size_bytes FROM files
-                     WHERE snapshot_id = ?1 AND is_directory = 0 ORDER BY path",
-                )
-                .unwrap();
-            st.query_map(params![sid], |r| Ok((r.get(0)?, r.get(1)?)))
-                .unwrap()
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .unwrap()
-        };
+        let stamps =
+            |sid: i64| -> Vec<(String, i64)> { crate::db::files::fixture::non_dirs(&conn, sid) };
         assert_eq!(
             stamps(v1.snapshot_id),
             stamps(v3.snapshot_id),
@@ -4534,11 +4450,7 @@ mod tests {
         // real `stage_create` would have backfilled via the same
         // `hash_source_file` this scan reuses.
         let (hash, _) = crate::staging::validate::hash_source_file(&sha_file, "f.txt").unwrap();
-        conn.execute(
-            "UPDATE files SET sha256 = ?1 WHERE snapshot_id = ?2 AND path = 'f.txt'",
-            params![hash, s1.snapshot_id],
-        )
-        .unwrap();
+        crate::db::files::fixture::set_sha256(&conn, s1.snapshot_id, "f.txt", Some(&hash));
 
         // Same-size, same-mtime content swap on both units.
         let mtime_before = std::fs::metadata(&mtime_file).unwrap().modified().unwrap();
@@ -4864,11 +4776,7 @@ mod tests {
         fs::write(src.join("a.bin"), noise(256 * 1024)).unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let stale = "0".repeat(64);
-        conn.execute(
-            "UPDATE files SET sha256 = ?1 WHERE snapshot_id = ?2 AND path = 'a.bin'",
-            params![stale, snap_id],
-        )
-        .unwrap();
+        crate::db::files::fixture::set_sha256(&conn, snap_id, "a.bin", Some(&stale));
 
         let err = stage_create(&conn, &paths, &config, snap_id, false)
             .expect_err("a hash unlike its baseline at the same size refuses the stage");
@@ -4879,13 +4787,7 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         assert!(left.is_empty(), "nothing is left in staging: {left:?}");
-        let baseline: String = conn
-            .query_row(
-                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.bin'",
-                params![snap_id],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let baseline: String = crate::db::files::fixture::sha256(&conn, snap_id, "a.bin").unwrap();
         assert_eq!(baseline, stale, "the baseline is untouched");
     }
 
@@ -5090,18 +4992,23 @@ mod tests {
             .unwrap()
     }
 
-    /// The pin: each backfill UPDATE finds its row through the
-    /// UNIQUE(snapshot_id, path) index. Before migration 027 the second
-    /// UPDATE, into `manifest_entries`, searched by `manifest_id` alone and
-    /// scanned the whole manifest per file.
+    /// The pin: each backfill UPDATE finds its row by the version's primary
+    /// key, after one lookup of the path in `paths`' UNIQUE(unit_id, path)
+    /// index (migration 030). Before migration 027 the second UPDATE, into
+    /// `manifest_entries`, searched by `manifest_id` alone and scanned the
+    /// whole manifest per file.
     #[test]
-    fn backfill_checksums_searches_the_unique_index() {
+    fn backfill_checksums_searches_the_indexes() {
         let conn = crate::db::open_memory().unwrap();
-        let plan = query_plan(&conn, BACKFILL_SQL);
+        let plan = query_plan(&conn, crate::db::files::BACKFILL_SQL);
         assert_eq!(
             plan,
-            vec!["SEARCH files USING INDEX sqlite_autoindex_files_1 (snapshot_id=? AND path=?)"],
-            "the backfill must be one indexed lookup per file"
+            vec![
+                "SEARCH file_versions USING PRIMARY KEY (snapshot_id=? AND path_id=?)",
+                "SCALAR SUBQUERY 1",
+                "SEARCH paths USING COVERING INDEX sqlite_autoindex_paths_1 (unit_id=? AND path=?)",
+            ],
+            "the backfill must be indexed lookups only"
         );
     }
 
@@ -5125,11 +5032,7 @@ mod tests {
             for sid in [1i64, 2] {
                 for f in 0..files {
                     let path = format!("d{}/f{f:06}", f % 17);
-                    tx.execute(
-                        "INSERT INTO files (snapshot_id, path, size_bytes) VALUES (?1, ?2, 1)",
-                        params![sid, path],
-                    )
-                    .unwrap();
+                    crate::db::files::fixture::insert(&tx, sid, &path, 1, "regular", None);
                     if sid == 2 {
                         checksums.push((path, format!("{f:064x}")));
                     }
@@ -5137,15 +5040,17 @@ mod tests {
             }
             tx.commit().unwrap();
 
-            let mut stmt = conn.prepare(BACKFILL_SQL).unwrap();
+            let mut stmt = conn.prepare(crate::db::files::BACKFILL_SQL).unwrap();
             for (path, hash) in &checksums {
-                stmt.execute(params![hash, 2i64, path]).unwrap();
+                let hash = crate::db::files::sha256_from_hex(hash).unwrap();
+                stmt.execute(params![hash.as_slice(), 2i64, 1i64, path])
+                    .unwrap();
             }
             let vm = stmt.get_status(rusqlite::StatementStatus::VmStep);
             let fullscan = stmt.get_status(rusqlite::StatementStatus::FullscanStep);
             let done: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM files WHERE snapshot_id = 2 AND sha256 IS NOT NULL",
+                    "SELECT COUNT(*) FROM file_versions WHERE snapshot_id = 2 AND sha256 IS NOT NULL",
                     [],
                     |r| r.get(0),
                 )
@@ -5219,8 +5124,8 @@ mod tests {
             fs::write(src.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
         }
         conn.execute_batch(
-            "CREATE TEMP TRIGGER inject_mid_insert BEFORE INSERT ON files
-             WHEN (SELECT COUNT(*) FROM files WHERE snapshot_id = NEW.snapshot_id) >= 2
+            "CREATE TEMP TRIGGER inject_mid_insert BEFORE INSERT ON file_versions
+             WHEN (SELECT COUNT(*) FROM file_versions WHERE snapshot_id = NEW.snapshot_id) >= 2
              BEGIN SELECT RAISE(ABORT, 'injected mid-insert failure'); END;",
         )
         .unwrap();
@@ -5229,7 +5134,8 @@ mod tests {
         assert!(err.to_string().contains("injected"), "{err}");
         for (what, sql) in [
             ("snapshots", "SELECT COUNT(*) FROM snapshots"),
-            ("files", "SELECT COUNT(*) FROM files"),
+            ("file_versions", "SELECT COUNT(*) FROM file_versions"),
+            ("paths", "SELECT COUNT(*) FROM paths"),
             (
                 "snapshot events",
                 "SELECT COUNT(*) FROM events WHERE entity_type = 'snapshot'",
@@ -5249,7 +5155,7 @@ mod tests {
         );
         let files: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM files WHERE snapshot_id = ?1 AND is_directory = 0",
+                "SELECT COUNT(*) FROM file_versions WHERE snapshot_id = ?1 AND kind <> 0",
                 params![outcome.snapshot_id],
                 |r| r.get(0),
             )
@@ -5285,11 +5191,7 @@ mod tests {
             )
             .unwrap();
         // What an interrupted pre-#374 `snapshot create` left behind.
-        conn.execute(
-            "DELETE FROM files WHERE snapshot_id = ?1 AND path = 'f3.txt'",
-            params![snap_id],
-        )
-        .unwrap();
+        crate::db::files::fixture::delete(&conn, snap_id, "f3.txt");
 
         let msg = stage_create(&conn, &paths, &config, snap_id, false)
             .unwrap_err()
