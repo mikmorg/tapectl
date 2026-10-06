@@ -1,3 +1,29 @@
+// Issue #404's follow-up: the closed-pipe-tolerant shadows of `std`'s
+// printing macros that the library defines (`tapectl::output`), for this
+// crate too.
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! println {
+    () => { tapectl::output::stdout(format_args!(""), true) };
+    ($($arg:tt)*) => { tapectl::output::stdout(format_args!($($arg)*), true) };
+}
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! print {
+    ($($arg:tt)*) => { tapectl::output::stdout(format_args!($($arg)*), false) };
+}
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    () => { tapectl::output::stderr(format_args!(""), true) };
+    ($($arg:tt)*) => { tapectl::output::stderr(format_args!($($arg)*), true) };
+}
+#[cfg(not(test))]
+#[allow(unused_macros)]
+macro_rules! eprint {
+    ($($arg:tt)*) => { tapectl::output::stderr(format_args!($($arg)*), false) };
+}
+
 use tapectl::{cli, config, db, error, signal, startup, tenant};
 
 use std::ffi::OsString;

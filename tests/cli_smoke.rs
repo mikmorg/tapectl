@@ -3096,3 +3096,67 @@ fn dar_dies_with_a_killed_tapectl() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+/// A pipe whose reading end is already closed: every write to the returned
+/// end fails with EPIPE, as `tapectl … | head` does once `head` has its lines.
+fn closed_pipe() -> std::io::PipeWriter {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    writer
+}
+
+/// Issue #404's follow-up: a closed stdout pipe must not panic. Before, the
+/// first `println!` after the reader went panicked ("failed printing to
+/// stdout: Broken pipe") and the process exited 101 — under `first-run.sh`'s
+/// `run … | tee`, a write whose tee died to Ctrl-C read as "did not seal".
+/// `host check` needs no initialised home and always prints.
+#[test]
+fn a_closed_stdout_pipe_does_not_panic() {
+    let home = TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["host", "check"])
+        .env("HOME", home.path())
+        .env_remove("TAPECTL_HOME")
+        .stdout(closed_pipe())
+        .output()
+        .expect("spawn tapectl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed stdout must not panic: {stderr}"
+    );
+    // 0 quiet or 1 findings: `host check`'s own codes, never 101.
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(1)),
+        "exit {:?}, stderr: {stderr}",
+        out.status.code()
+    );
+}
+
+/// The stderr twin: an error reported to a closed stderr still exits with
+/// the error's own code (the one it gives with stderr open), not a panic's
+/// 101.
+#[test]
+fn a_closed_stderr_pipe_does_not_panic() {
+    let home = TempDir::new().unwrap();
+    let run = |closed: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tapectl"));
+        cmd.args(["unit", "list"])
+            .env("HOME", home.path())
+            .env_remove("TAPECTL_HOME");
+        if closed {
+            cmd.stderr(closed_pipe());
+        }
+        cmd.output().expect("spawn tapectl").status.code()
+    };
+    let open = run(false);
+    assert!(
+        matches!(open, Some(c) if c != 0 && c != 101),
+        "positive control: an uninitialised home is refused with an error code, got {open:?}"
+    );
+    assert_eq!(
+        run(true),
+        open,
+        "the not-initialized refusal must exit with its own code with stderr closed"
+    );
+}
