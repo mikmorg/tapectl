@@ -50,8 +50,12 @@ pub const EXIT_CATALOG_BUSY: i32 = 75;
 #[allow(dead_code)]
 pub enum TapectlError {
     // Database
+    /// The SQLite text once, after "database error:". Not `#[from]`: that
+    /// would also make the error this variant's `source()`, and `{:#}`
+    /// (`exit_with_error`) printed the text twice — the shape `Io` had until
+    /// #354 (issue #363). The `From` impl below keeps `?` working.
     #[error("database error: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(rusqlite::Error),
 
     #[error("migration error: {0}")]
     Migration(String),
@@ -276,6 +280,12 @@ pub enum TapectlError {
     Other(String),
 }
 
+impl From<rusqlite::Error> for TapectlError {
+    fn from(e: rusqlite::Error) -> Self {
+        TapectlError::Database(e)
+    }
+}
+
 /// Which layer of `policy::resolve`'s dotfile > archive_set > defaults chain
 /// failed (issue #114).
 ///
@@ -365,5 +375,22 @@ mod tests {
     fn a_custom_io_error_reaches_the_operator_once() {
         let err: TapectlError = std::io::Error::other("staging disk went away").into();
         assert_eq!(as_operator_sees_it(err), "staging disk went away");
+    }
+
+    /// Issue #363: `Database` had the shape `Io` had before #354 — the
+    /// SQLite text in its own Display AND as its `source()` — so `{:#}`
+    /// printed it twice. Once, with the "database error:" prefix kept.
+    #[test]
+    fn a_database_error_reaches_the_operator_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sqlite = conn
+            .execute("INSERT INTO no_such_table VALUES (1)", [])
+            .unwrap_err();
+        let text = sqlite.to_string();
+        assert!(text.contains("no_such_table"), "{text}");
+        let err: TapectlError = sqlite.into();
+        let shown = as_operator_sees_it(err);
+        assert_eq!(shown, format!("database error: {text}"));
+        assert_eq!(shown.matches("no_such_table").count(), 1, "{shown}");
     }
 }

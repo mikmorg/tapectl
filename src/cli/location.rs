@@ -400,12 +400,18 @@ pub fn run(
                 }
                 return Ok(());
             }
-            conn.execute(
+            // Issue #363: archive sets name their required locations (#348),
+            // so the rename carries through to them in the same transaction —
+            // left alone, every unit in such a set was short of a location
+            // that no longer existed, and `audit`, `mark-tape-only` and
+            // `mark-reclaimable` all blocked on it.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
                 "UPDATE locations SET name = ?1 WHERE id = ?2",
                 params![new, id],
             )?;
             events::log_field_change(
-                conn,
+                &tx,
                 "location",
                 id,
                 new,
@@ -415,14 +421,73 @@ pub fn run(
                 new,
                 None,
             )?;
+            let sets = rename_in_archive_sets(&tx, current, new)?;
+            tx.commit()?;
             if json_output {
-                println!("{}", serde_json::json!({"old": current, "new": new}));
+                println!(
+                    "{}",
+                    serde_json::json!({"old": current, "new": new, "archive_sets": sets})
+                );
             } else {
                 println!("location \"{current}\" renamed to \"{new}\"");
+                if !sets.is_empty() {
+                    println!(
+                        "  archive set(s) {} now require \"{new}\". If config.toml's \
+                         [[archive_sets]] name \"{current}\", change it there too, or \
+                         `archive-set sync` will refuse the old name.",
+                        sets.join(", ")
+                    );
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Replace `old` with `new` in every archive set's `required_locations`
+/// (a JSON array of names), logging each change; returns the sets changed,
+/// by name. A value that does not parse is left exactly as it is —
+/// `policy::resolve` already refuses it by name, and guessing at its shape
+/// here could only make it worse.
+fn rename_in_archive_sets(conn: &Connection, old: &str, new: &str) -> Result<Vec<String>> {
+    let rows: Vec<(i64, String, String)> = conn
+        .prepare(
+            "SELECT id, name, required_locations FROM archive_sets
+             WHERE required_locations IS NOT NULL ORDER BY name",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut changed = Vec::new();
+    for (id, set, value) in rows {
+        let Ok(names) = serde_json::from_str::<Vec<String>>(&value) else {
+            continue;
+        };
+        if !names.iter().any(|n| n == old) {
+            continue;
+        }
+        let renamed: Vec<String> = names
+            .into_iter()
+            .map(|n| if n == old { new.to_string() } else { n })
+            .collect();
+        let renamed = serde_json::to_string(&renamed).expect("a list of strings serialises");
+        conn.execute(
+            "UPDATE archive_sets SET required_locations = ?1 WHERE id = ?2",
+            params![renamed, id],
+        )?;
+        events::log_field_change(
+            conn,
+            "archive_set",
+            id,
+            &set,
+            "edited",
+            "required_locations",
+            Some(&value),
+            &renamed,
+            None,
+        )?;
+        changed.push(set);
+    }
+    Ok(changed)
 }
 
 /// Everything one move touched: the cartridge that physically moved (when
@@ -861,6 +926,55 @@ mod tests {
             serde_json::to_string(&value).unwrap(),
             r#"[{"cartridges":2,"deposits":0,"description":"offsite","kind":"shelf","name":"home","volumes":3},{"cartridges":0,"deposits":5,"description":"","kind":"warehouse","name":"glacier","volumes":0}]"#
         );
+    }
+
+    /// Issue #363: archive sets name their required locations (#348), so a
+    /// rename that left `archive_sets.required_locations` alone silently
+    /// made every unit in those sets short of a location that no longer
+    /// existed — blocking `audit`, `mark-tape-only` and `mark-reclaimable`.
+    /// The rename rewrites the names; other names and sets are untouched.
+    #[test]
+    fn rename_rewrites_the_archive_sets_that_name_the_location() {
+        let conn = setup();
+        conn.execute(
+            r#"INSERT INTO archive_sets (name, required_locations) VALUES
+               ('twosite', '["home","glacier"]'),
+               ('elsewhere', '["glacier"]'),
+               ('none', NULL)"#,
+            [],
+        )
+        .unwrap();
+        run(
+            &conn,
+            &LocationCommands::Rename {
+                current: "home".into(),
+                new: "house".into(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        let req = |name: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT required_locations FROM archive_sets WHERE name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let twosite: Vec<String> = serde_json::from_str(&req("twosite").unwrap()).unwrap();
+        assert_eq!(twosite, ["house", "glacier"]);
+        assert_eq!(req("elsewhere").as_deref(), Some(r#"["glacier"]"#));
+        assert_eq!(req("none"), None);
+        // The renamed set resolves to a policy naming a registered location.
+        let missing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM locations WHERE name IN ('house','glacier')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 2);
     }
 
     /// Seed one shelf location, one warehouse location, and a sealed volume.

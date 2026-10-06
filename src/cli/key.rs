@@ -914,7 +914,7 @@ pub fn print_escrow_secret_warning(public_key: &str, secret_key: &str) {
 /// rebuilding the table to widen it. Printed verbatim, that made the one key
 /// that is a recipient of every tape look like an ordinary tenant primary.
 /// `is_escrow` is the fact; this is where it reaches the operator.
-fn displayed_key_type(k: &EncryptionKey) -> &str {
+pub(crate) fn displayed_key_type(k: &EncryptionKey) -> &str {
     if k.is_escrow {
         "escrow"
     } else {

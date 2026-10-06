@@ -333,21 +333,11 @@ pub fn describe_staging_space(check: &StagingSpaceCheck) -> Option<String> {
 /// generations are marketed and how `media::Generation` stores them
 /// (LTO-6 = 2_500_000_000_000). Using binary units here would render a
 /// 2.5 TB cartridge as "2.3 TiB" and invite the operator to think tapectl
-/// had mis-read the drive.
+/// had mis-read the drive. The crate's one decimal formatter (issue #363:
+/// this was a private copy that printed "2.5 TB"/"kB" where every other
+/// capacity line prints "2.50 TB"/"KB").
 fn decimal_bytes(bytes: u64) -> String {
-    const K: f64 = 1_000.0;
-    let b = bytes as f64;
-    if b >= K * K * K * K {
-        format!("{:.1} TB", b / (K * K * K * K))
-    } else if b >= K * K * K {
-        format!("{:.1} GB", b / (K * K * K))
-    } else if b >= K * K {
-        format!("{:.1} MB", b / (K * K))
-    } else if b >= K {
-        format!("{:.1} kB", b / K)
-    } else {
-        format!("{bytes} B")
-    }
+    crate::util::format_bytes_decimal(i64::try_from(bytes).unwrap_or(i64::MAX))
 }
 
 /// Existence of one backend's configured device paths. A mild, informational
@@ -756,10 +746,19 @@ mod tests {
 
     /// Decimal units, matching how tape generations are marketed and stored
     /// — a 2.5 TB cartridge rendered as "2.3 TiB" reads like a mis-detection.
+    /// Issue #363: through the crate's ONE decimal formatter, so `config
+    /// check`'s staging line says "2.50 TB"/"KB" exactly as `cartridge info`
+    /// and `collection plan` do (it said "2.5 TB"/"kB" from a private copy).
     #[test]
     fn decimal_bytes_uses_marketing_units_not_binary_ones() {
-        assert_eq!(decimal_bytes(2_500_000_000_000), "2.5 TB");
-        assert_eq!(decimal_bytes(40_000_000_000), "40.0 GB");
+        for b in [2_500_000_000_000u64, 40_000_000_000, 1_500, 512] {
+            assert_eq!(
+                decimal_bytes(b),
+                crate::util::format_bytes_decimal(b as i64),
+                "{b}"
+            );
+        }
+        assert_eq!(decimal_bytes(2_500_000_000_000), "2.50 TB");
         assert_eq!(decimal_bytes(512), "512 B");
     }
 

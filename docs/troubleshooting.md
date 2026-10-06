@@ -1692,7 +1692,7 @@ remaining one with `restore unit`.
 
 ```text
 error: unit "<unit>" version <n> has no file "<file>" in the catalog's record of what it archived, so the tape was
-not touched. A path is relative to the unit's root and matched exactly; `tapectl catalog search <words of the name>`
+not touched. A path is relative to the unit's root and matched exactly; `tapectl catalog search "<words of the name>"`
 finds one, and `tapectl catalog ls <unit>` lists the newest version's files.
 ```
 
@@ -1701,7 +1701,7 @@ opened. Give the path relative to the unit's root, with no leading `/` or
 `./`, exactly as `catalog ls` prints it:
 
 ```bash
-tapectl catalog search letter mum
+tapectl catalog search "letter mum"
 tapectl catalog ls family/letters
 ```
 
@@ -2028,7 +2028,7 @@ tapectl summary
   Tenants:    2 (the operator not counted)
   Units:      4 active
   Snapshots:  4
-  Volumes:    2 holding data (retired, erased and quarantined not counted)
+  Volumes:    2 holding data (unwritten, retired, erased and quarantined not counted)
   Writes:     8 completed
   Total data: 7.0 MiB on tape
   Staging:    4 stage set(s) held, none owe a copy of their own version (`tapectl staging clean` decides which can be released)

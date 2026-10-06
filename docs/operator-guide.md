@@ -1083,7 +1083,7 @@ tapectl summary
   Tenants:    2 (the operator not counted)
   Units:      4 active
   Snapshots:  4
-  Volumes:    2 holding data (retired, erased and quarantined not counted)
+  Volumes:    2 holding data (unwritten, retired, erased and quarantined not counted)
   Writes:     8 completed
   Total data: 7.0 MiB on tape
   Staging:    4 stage set(s) held, none owe a copy of their own version (`tapectl staging clean` decides which can be released)

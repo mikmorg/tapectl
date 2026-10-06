@@ -3097,6 +3097,40 @@ fn dar_dies_with_a_killed_tapectl() {
     }
 }
 
+/// Issue #363: `tenant info` printed the escrow key's stored `key_type`
+/// (`primary`, the only value migration 001's CHECK leaves it), so the one
+/// key that opens every tape read as an ordinary tenant primary. `key list`
+/// was fixed in #350; `tenant info` now says `escrow` the same way.
+#[test]
+fn tenant_info_names_the_escrow_key_as_escrow() {
+    let home = TempDir::new().unwrap();
+    let init = run_tapectl(home.path(), &["init", "--operator", "op"]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let keys = run_tapectl(home.path(), &["key", "list", "--tenant", "op"]);
+    let keys = String::from_utf8_lossy(&keys.stdout);
+    assert!(
+        keys.contains("escrow"),
+        "positive control: init registered an escrow key: {keys}"
+    );
+    let out = run_tapectl(home.path(), &["tenant", "info", "op"]);
+    assert!(out.status.success());
+    let info = String::from_utf8_lossy(&out.stdout);
+    let key_lines: Vec<&str> = info.lines().filter(|l| l.contains(" [")).collect();
+    assert!(
+        key_lines.iter().any(|l| l.contains("[escrow]")),
+        "the escrow key is shown as escrow: {info}"
+    );
+    assert_eq!(
+        key_lines.iter().filter(|l| l.contains("[primary]")).count(),
+        1,
+        "only the operator's own key reads as primary: {info}"
+    );
+}
+
 /// A pipe whose reading end is already closed: every write to the returned
 /// end fails with EPIPE, as `tapectl … | head` does once `head` has its lines.
 fn closed_pipe() -> std::io::PipeWriter {

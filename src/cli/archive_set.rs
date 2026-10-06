@@ -265,6 +265,39 @@ struct PolicyWrite {
 }
 
 impl PolicyWrite {
+    /// Whether no field is set — an `edit` with nothing to change.
+    fn is_empty(&self) -> bool {
+        let PolicyWrite {
+            min_copies,
+            required_locations,
+            encrypt,
+            compression,
+            checksum_mode,
+            slice_size,
+            verify_interval_days,
+            warehouse_copies,
+            preserve_xattrs,
+            preserve_acls,
+            preserve_fsa,
+            dirty_on_metadata_change,
+            description,
+        } = self;
+        // Destructured, so a new field cannot be added without deciding here.
+        min_copies.is_none()
+            && required_locations.is_none()
+            && encrypt.is_none()
+            && compression.is_none()
+            && checksum_mode.is_none()
+            && slice_size.is_none()
+            && verify_interval_days.is_none()
+            && warehouse_copies.is_none()
+            && preserve_xattrs.is_none()
+            && preserve_acls.is_none()
+            && preserve_fsa.is_none()
+            && dirty_on_metadata_change.is_none()
+            && description.is_none()
+    }
+
     /// Validate `create`/`edit` flags and turn them into a write. Every
     /// check runs here, before either command's dry-run return, so a dry
     /// run refuses exactly what the real run would (#241).
@@ -724,6 +757,16 @@ pub fn run(
 
         ArchiveSetCommands::Edit { name, policy } => {
             let write = PolicyWrite::from_args(conn, config, policy)?;
+            // Issue #363: no flag is nothing to edit — said, not reported
+            // as an update after an empty transaction.
+            if write.is_empty() {
+                return Err(TapectlError::Other(format!(
+                    "archive-set edit {name}: nothing to change — pass at least one policy \
+                     flag (--min-copies, --required-locations, --verify-interval-days, \
+                     --warehouse-copies, --slice-size, --compression, --checksum-mode, …; \
+                     the command's help lists them all)"
+                )));
+            }
             let id: i64 = conn
                 .query_row(
                     "SELECT id FROM archive_sets WHERE name = ?1",
@@ -1281,6 +1324,42 @@ fi
 
     /// Issue #348, the `edit` half: an unknown name is refused and the
     /// stored list is left exactly as it was.
+    #[test]
+    fn edit_with_no_flags_is_refused_rather_than_reported_as_an_update() {
+        // Issue #363: `archive-set edit cold` with no policy flag opened an
+        // empty transaction and said "updated". It now says there was
+        // nothing to change, naming the flags, and writes nothing.
+        let conn = fresh_conn();
+        let config = Config::default();
+        add_location(&conn, "home-rack");
+        run(
+            &conn,
+            &config,
+            &create_with_locations("cold", "home-rack"),
+            false,
+            false,
+        )
+        .unwrap();
+        let events_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        let bare = ArchiveSetCommands::Edit {
+            name: "cold".to_string(),
+            policy: PolicyArgs::default(),
+        };
+        let err = run(&conn, &config, &bare, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nothing to change") && err.contains("--min-copies"),
+            "{err}"
+        );
+        let events_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events_before, events_after);
+    }
+
     #[test]
     fn edit_refuses_a_required_location_that_is_not_registered() {
         let conn = fresh_conn();

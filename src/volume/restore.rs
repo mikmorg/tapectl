@@ -440,7 +440,7 @@ fn catalog_file_size(
         None => Err(TapectlError::Other(format!(
             "unit \"{unit_name}\" version {} has no file \"{file_path}\" in the catalog's record \
              of what it archived, so the tape was not touched. A path is relative to the unit's \
-             root and matched exactly; `tapectl catalog search <words of the name>` finds one, \
+             root and matched exactly; `tapectl catalog search \"<words of the name>\"` finds one, \
              and `tapectl catalog ls {unit_name}` lists the newest version's files.",
             selection.version
         ))),

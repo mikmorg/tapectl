@@ -82,6 +82,36 @@ class Help:
         rc, out = self.get(path)
         return set(re.findall(r"(--[a-z0-9][a-z0-9-]*)", out)) if rc == 0 else set()
 
+    def value_flags(self, path):
+        """(flags that take a value, flags whose value is optional) — long and
+        short spellings, read from the option lines of `--help`."""
+        rc, out = self.get(path)
+        takes, optional = set(), set()
+        if rc != 0:
+            return takes, optional
+        for line in out.splitlines():
+            m = re.match(r"^\s+(?:(-[A-Za-z0-9]), )?(--[a-z0-9][a-z0-9-]*)(\s+\[?<|=<|\s+\[<)?", line)
+            if not m or not m.group(3):
+                continue
+            names = {m.group(2)} | ({m.group(1)} if m.group(1) else set())
+            (optional if "[" in m.group(3) else takes).update(names)
+        return takes, optional
+
+    def max_positionals(self, path):
+        """How many positional arguments the leaf command accepts at most,
+        from its Usage line (`<X>` and `[X]` count one each); None when it is
+        open-ended (`...`) or the line cannot be read."""
+        rc, out = self.get(path)
+        if rc != 0:
+            return None
+        usage = next((l for l in out.splitlines() if l.startswith("Usage:")), None)
+        if usage is None:
+            return None
+        words = usage.split()[2 + len(path):]
+        if any("..." in w for w in words):
+            return None
+        return sum(1 for w in words if w != "[OPTIONS]" and re.match(r"^[<\[][A-Z]", w))
+
 
 def code_blocks(text):
     """Yield (first_line_no, lang, [lines]) for each fenced block."""
@@ -180,6 +210,37 @@ def check_command(helpdb, tokens):
             f = t.split("=", 1)[0]
             if f not in known:
                 probs.append(f"`tapectl {' '.join(path)}` has no flag {f}")
+    # Positional arity (issue #363): an unquoted `catalog search IMG 101`
+    # named only real subcommands and flags and passed, but clap refuses it.
+    # Only "too many" is checked — a doc may elide a required argument in a
+    # sentence-like example, but an extra word is always a broken command.
+    most = helpdb.max_positionals(path)
+    if most is not None and not any(t in ("...", "…") or "…" in t for t in tokens[i:]):
+        takes, optional = helpdb.value_flags(path)
+        gtakes, goptional = helpdb.value_flags([])
+        takes, optional = takes | gtakes, optional | goptional
+        count, rest = 0, tokens[i:]
+        unsure = False
+        k = 0
+        while k < len(rest):
+            t = rest[k]
+            if t == "--":
+                count += len(rest) - k - 1
+                break
+            if t.startswith("-") and len(t) > 1 and not t[1].isdigit():
+                f = t.split("=", 1)[0]
+                if f in optional:
+                    unsure = True
+                elif f in takes and "=" not in t:
+                    k += 1
+            else:
+                count += 1
+            k += 1
+        if not unsure and count > most:
+            probs.append(
+                f"`tapectl {' '.join(path)}` takes at most {most} positional "
+                f"argument(s), this gives {count} (a value with spaces needs quotes)"
+            )
     return probs
 
 
@@ -230,9 +291,13 @@ def self_test(binary):
         "tapectl volume frobnicate L6-0001": "unknown subcommand",
         "tapectl volume write L6-0001 --no-such-flag": "no flag --no-such-flag",
         "tapectl frobnicate": "unknown command",
+        "tapectl catalog search IMG 101": "positional",
+        "tapectl volume info L6-0001 L6-0002 --json": "positional",
     }
     good = ["tapectl volume write L6-0001 --device /dev/tape/by-id/x-nst --yes",
-            "tapectl --home /tmp/h audit --json", "tapectl catalog search '*.jpg'"]
+            "tapectl --home /tmp/h audit --json", "tapectl catalog search '*.jpg'",
+            "tapectl catalog search 'IMG 101'",
+            "tapectl --home /tmp/h volume verify L6-0001 --device /dev/tape/by-id/x-nst --full"]
     ok = True
     for line, want in bad.items():
         p = check_command(helpdb, shlex.split(line)[1:])
