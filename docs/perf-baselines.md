@@ -70,6 +70,12 @@ is the slowest part. On home2's release binary the single-core sha256
 The figure #366 asks for, a many-file unit on home2 at 1/2/4/8 threads, is
 still owed.
 
+Beside dar, each hasher thread reads only within 1 GiB of dar at its own
+place in dar's order, and dar is held to the thread furthest behind (so the
+source is still read from disk once). The threads therefore overlap only
+over files that fit in that window: these 256 KiB files do, a unit of a few
+multi-GiB files is hashed about one file at a time.
+
 ### Observations
 
 - **Snapshot creation for many-files is surprisingly expensive** (~32 s

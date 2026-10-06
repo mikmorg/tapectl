@@ -572,7 +572,9 @@ staging, never the plaintext archive: dar writes its archive to standard
 output, and tapectl cuts and encrypts it in memory. At its peak staging holds
 the unit's slices, about the unit's size. The source is read once: each file
 is hashed within 1 GiB of dar reading it, so the second read comes from the
-page cache.
+page cache. `[staging] hash_threads` files are hashed at once (4 by default,
+never more than the cores) when they fit in that 1 GiB, as many small files do;
+on a single spinning disk, fewer may read faster.
 
 Before reading anything, it compares the free space with the unit's size (plus
 dar's records). If free space is below that, the unit may or may not fit
