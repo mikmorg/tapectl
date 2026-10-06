@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH tapectl-catalog-search 1  "tapectl-catalog-search " 
 .SH NAME
-tapectl\-catalog\-search \- Search for files by pattern
+tapectl\-catalog\-search \- Search for files by pattern, in each unit\*(Aqs newest version
 .SH SYNOPSIS
-\fBtapectl catalog search\fR [\fB\-\-json\fR] [\fB\-\-limit\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATTERN\fR> 
+\fBtapectl catalog search\fR [\fB\-\-json\fR] [\fB\-\-limit\fR] [\fB\-\-all\-versions\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIPATTERN\fR> 
 .SH DESCRIPTION
-Search for files by pattern
+Search for files by pattern, in each unit\*(Aqs newest version
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -14,6 +14,9 @@ Output in JSON format
 .TP
 \fB\-\-limit\fR \fI<LIMIT>\fR [default: 50]
 Limit results
+.TP
+\fB\-\-all\-versions\fR
+Search every version of each unit, not only its newest: a file is listed once per version that holds it
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it

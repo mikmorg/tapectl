@@ -22,7 +22,7 @@ pub enum CatalogCommands {
         version: Option<i64>,
     },
 
-    /// Search for files by pattern
+    /// Search for files by pattern, in each unit's newest version
     Search {
         /// Search pattern. Split on non-alphanumerics; each token is
         /// PREFIX-matched and all must match (AND). So "foo bar" finds
@@ -33,6 +33,10 @@ pub enum CatalogCommands {
         /// Limit results
         #[arg(long, default_value = "50")]
         limit: i64,
+        /// Search every version of each unit, not only its newest: a file
+        /// is listed once per version that holds it
+        #[arg(long)]
+        all_versions: bool,
     },
 
     /// Show which volume(s) contain a unit
@@ -41,7 +45,9 @@ pub enum CatalogCommands {
         unit: String,
     },
 
-    /// Show catalog statistics
+    /// Show catalog statistics. Files and Total are summed over every
+    /// version that still has a file list: Files counts non-directory
+    /// entries, Total counts regular-file bytes.
     Stats,
 
     /// Reconstruct catalog rows by reading a sealed volume — the path back
@@ -446,50 +452,31 @@ pub fn run(
             }
         }
 
-        CatalogCommands::Search { pattern, limit } => {
-            // Build an FTS5 MATCH expression: split on non-alphanumeric, prefix-match each
-            // token with AND. FTS5 default tokenizer already splits paths this way, so a
-            // pattern like "foo/bar" becomes `foo* bar*` which matches 'foo/bar.txt'.
-            let tokens: Vec<String> = pattern
-                .split(|c: char| !c.is_alphanumeric())
-                .filter(|s| !s.is_empty())
-                .map(|t| format!("{}*", t.to_lowercase()))
-                .collect();
-
-            let mut stmt = conn.prepare(
-                "SELECT f.path, f.size_bytes, u.name, s.version
-                 FROM files_fts fts
-                 JOIN files f ON f.rowid = fts.rowid
-                 JOIN snapshots s ON s.id = f.snapshot_id
-                 JOIN units u ON u.id = s.unit_id
-                 WHERE files_fts MATCH ?1 AND f.is_directory = 0
-                 ORDER BY rank
-                 LIMIT ?2",
-            )?;
-            let rows: Vec<(String, i64, String, i64)> = if tokens.is_empty() {
-                Vec::new()
-            } else {
-                stmt.query_map(params![tokens.join(" "), limit], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-            };
+        CatalogCommands::Search {
+            pattern,
+            limit,
+            all_versions,
+        } => {
+            let rows = search_rows(conn, pattern, *limit, *all_versions)?;
 
             if json_output {
                 let json: Vec<serde_json::Value> = rows
                     .iter()
-                    .map(|(path, size, unit, ver)| {
-                        serde_json::json!({"path": path, "size": size, "unit": unit, "version": ver})
+                    .map(|h| {
+                        serde_json::json!({"path": h.path, "size": h.size, "unit": h.unit, "version": h.version})
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&json).unwrap());
             } else if rows.is_empty() {
                 println!("no files matching \"{pattern}\"");
             } else {
-                for (path, size, unit, ver) in &rows {
+                for h in &rows {
                     println!(
-                        "  {unit} v{ver}: {path} ({})",
-                        crate::util::format_bytes_binary(*size)
+                        "  {} v{}: {} ({})",
+                        h.unit,
+                        h.version,
+                        h.path,
+                        crate::util::format_bytes_binary(h.size)
                     );
                 }
                 println!("{} result(s)", rows.len());
@@ -816,45 +803,131 @@ pub fn run(
         }
 
         CatalogCommands::Stats => {
-            let unit_count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM units", [], |row| row.get(0))?;
-            let snapshot_count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))?;
-            let file_count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
-            let total_size: i64 = conn.query_row(
-                "SELECT COALESCE(SUM(size_bytes), 0) FROM files WHERE is_directory = 0",
-                [],
-                |row| row.get(0),
-            )?;
-            let volume_count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM volumes", [], |row| row.get(0))?;
-
+            let stats = catalog_stats(conn)?;
             if json_output {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "units": unit_count,
-                        "snapshots": snapshot_count,
-                        "files": file_count,
-                        "total_size": total_size,
-                        "volumes": volume_count,
+                        "units": stats.units,
+                        "snapshots": stats.snapshots,
+                        "files": stats.files,
+                        "total_size": stats.total_size,
+                        "volumes": stats.volumes,
                     })
                 );
             } else {
                 println!("Catalog statistics:");
-                println!("  Units:     {unit_count}");
-                println!("  Snapshots: {snapshot_count}");
-                println!("  Files:     {file_count}");
+                println!("  Units:     {}", stats.units);
+                println!("  Snapshots: {}", stats.snapshots);
                 println!(
-                    "  Total:     {}",
-                    crate::util::format_bytes_binary(total_size)
+                    "  Files:     {} (non-directory entries, every version)",
+                    stats.files
                 );
-                println!("  Volumes:   {volume_count}");
+                println!(
+                    "  Total:     {} (regular-file bytes, every version)",
+                    crate::util::format_bytes_binary(stats.total_size)
+                );
+                println!("  Volumes:   {}", stats.volumes);
             }
         }
     }
     Ok(())
+}
+
+/// One `catalog search` hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchHit {
+    path: String,
+    size: i64,
+    unit: String,
+    version: i64,
+}
+
+/// The FTS5 MATCH expression for `pattern`: split on non-alphanumerics, each
+/// token prefix-matched, all ANDed. FTS5's default tokenizer splits paths the
+/// same way, so "foo/bar" becomes `foo* bar*` and matches 'foo/bar.txt'.
+/// `None` when the pattern has no token at all.
+fn match_expression(pattern: &str) -> Option<String> {
+    let tokens: Vec<String> = pattern
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|t| format!("{}*", t.to_lowercase()))
+        .collect();
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
+/// `catalog search` (issue #380). By default only each unit's NEWEST version
+/// is searched, the one `catalog ls` lists, so a file kept unchanged through
+/// ten versions is one hit, not ten; `all_versions` lists it once per
+/// version. Ordered by unit, path and version, never by FTS `rank`: bm25
+/// ranks every match before the LIMIT can apply, which cost seconds on a
+/// large catalog and bought nothing for a path search.
+fn search_rows(
+    conn: &Connection,
+    pattern: &str,
+    limit: i64,
+    all_versions: bool,
+) -> Result<Vec<SearchHit>> {
+    let Some(expr) = match_expression(pattern) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT f.path, f.size_bytes, u.name, s.version
+         FROM files_fts fts
+         JOIN files f ON f.rowid = fts.rowid
+         JOIN snapshots s ON s.id = f.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE files_fts MATCH ?1 AND f.is_directory = 0
+           AND (?3 OR s.version = (SELECT MAX(version) FROM snapshots
+                                   WHERE unit_id = s.unit_id))
+         ORDER BY u.name, f.path, s.version
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![expr, limit, all_versions], |row| {
+            Ok(SearchHit {
+                path: row.get(0)?,
+                size: row.get(1)?,
+                unit: row.get(2)?,
+                version: row.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// `catalog stats`'s numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogStats {
+    units: i64,
+    snapshots: i64,
+    files: i64,
+    total_size: i64,
+    volumes: i64,
+}
+
+/// `catalog stats` (issue #380): `files` and `total_size` are the sums of each
+/// version's own totals (`snapshots.file_count`/`total_size`, written once by
+/// `snapshot create`), not a scan of every per-file row. A purged version has
+/// no file list, so it is left out, as the scan left it out. The meaning
+/// moved with this: `file_count` counts non-directory entries (the scan
+/// counted directories too) and `total_size` regular-file bytes (the scan
+/// also added each symlink's target length).
+fn catalog_stats(conn: &Connection) -> Result<CatalogStats> {
+    let count = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |row| row.get(0))?) };
+    let (files, total_size): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(file_count), 0), COALESCE(SUM(total_size), 0)
+         FROM snapshots WHERE status <> 'purged'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(CatalogStats {
+        units: count("SELECT COUNT(*) FROM units")?,
+        snapshots: count("SELECT COUNT(*) FROM snapshots")?,
+        files,
+        total_size,
+        volumes: count("SELECT COUNT(*) FROM volumes")?,
+    })
 }
 
 /// The `escrow: ... still report \`?\` (unknown)` lines `catalog rebuild`
@@ -1717,5 +1790,163 @@ mod tests {
         let json = displacements_json(&report);
         assert_eq!(json[0]["zero_copy_units"], serde_json::json!([]));
         assert_eq!(json[0]["units"].as_array().unwrap().len(), 2);
+    }
+
+    // ── issue #380: search the newest version; stats from per-version totals ──
+
+    /// One seeded file: `(path, size, file_type)`.
+    type SeedFile<'a> = (&'a str, i64, &'a str);
+    /// One seeded version: `(version, status, file_count, total_size, files)`.
+    type SeedVersion<'a> = (i64, &'a str, i64, i64, &'a [SeedFile<'a>]);
+
+    /// A unit `name` whose versions are `versions`.
+    fn seed_versions(conn: &Connection, name: &str, versions: &[SeedVersion<'_>]) {
+        conn.execute(
+            "INSERT OR IGNORE INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 't'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+            params![format!("uuid-{name}"), name, tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        for (version, status, file_count, total_size, files) in versions {
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, ?2, ?3, '/src', ?4, ?5)",
+                params![unit_id, version, status, file_count, total_size],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            for (path, size, file_type) in *files {
+                conn.execute(
+                    "INSERT INTO files (snapshot_id, path, size_bytes, is_directory, file_type)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![snap_id, path, size, *file_type == "dir", file_type],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    const REPORT_V1: &[SeedFile<'static>] = &[
+        ("docs", 0, "dir"),
+        ("docs/report.txt", 10, "regular"),
+        ("old/gone.txt", 5, "regular"),
+    ];
+    const REPORT_V2: &[SeedFile<'static>] =
+        &[("docs", 0, "dir"), ("docs/report.txt", 10, "regular")];
+
+    /// The acceptance test of #380: a file unchanged across two versions is
+    /// ONE hit by default, from the newest version. It used to be one hit per
+    /// version, ranked by bm25 over every match.
+    #[test]
+    fn search_lists_a_file_once_from_the_newest_version_by_default() {
+        let conn = db::open_memory().unwrap();
+        seed_versions(
+            &conn,
+            "u",
+            &[
+                (1, "current", 2, 15, REPORT_V1),
+                (2, "current", 1, 10, REPORT_V2),
+            ],
+        );
+
+        let hits = search_rows(&conn, "report", 50, false).unwrap();
+        assert_eq!(
+            hits,
+            vec![SearchHit {
+                path: "docs/report.txt".into(),
+                size: 10,
+                unit: "u".into(),
+                version: 2,
+            }],
+            "one hit, from the newest version"
+        );
+        assert!(
+            search_rows(&conn, "gone", 50, false).unwrap().is_empty(),
+            "a file only an older version holds is not in the newest version"
+        );
+    }
+
+    #[test]
+    fn search_all_versions_lists_a_file_once_per_version_in_path_order() {
+        let conn = db::open_memory().unwrap();
+        seed_versions(
+            &conn,
+            "u",
+            &[
+                (1, "current", 2, 15, REPORT_V1),
+                (2, "current", 1, 10, REPORT_V2),
+            ],
+        );
+        seed_versions(
+            &conn,
+            "a-unit",
+            &[(1, "current", 1, 3, &[("report/zz.txt", 3, "regular")])],
+        );
+
+        let hits: Vec<(String, String, i64)> = search_rows(&conn, "report", 50, true)
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.unit, h.path, h.version))
+            .collect();
+        assert_eq!(
+            hits,
+            vec![
+                ("a-unit".into(), "report/zz.txt".into(), 1),
+                ("u".into(), "docs/report.txt".into(), 1),
+                ("u".into(), "docs/report.txt".into(), 2),
+            ],
+            "every version, ordered by unit, path and version; directories never"
+        );
+        assert_eq!(search_rows(&conn, "report", 2, true).unwrap().len(), 2);
+        assert!(search_rows(&conn, "  //  ", 50, true).unwrap().is_empty());
+    }
+
+    /// `catalog stats` sums each version's own totals instead of scanning
+    /// every file row: `files` counts non-directory entries and `total_size`
+    /// regular-file bytes, and a purged version (no file list) counts for
+    /// nothing. The scan counted the directory and the symlink's target
+    /// length, so it said 3 files and 30 bytes here.
+    #[test]
+    fn stats_sum_the_per_version_totals() {
+        let conn = db::open_memory().unwrap();
+        seed_versions(
+            &conn,
+            "u",
+            &[
+                (
+                    1,
+                    "current",
+                    2,
+                    10,
+                    &[
+                        ("docs", 0, "dir"),
+                        ("docs/a.txt", 10, "regular"),
+                        ("docs/b.lnk", 20, "symlink"),
+                    ],
+                ),
+                (2, "purged", 5, 50, &[]),
+            ],
+        );
+
+        let stats = catalog_stats(&conn).unwrap();
+        assert_eq!(
+            stats,
+            CatalogStats {
+                units: 1,
+                snapshots: 2,
+                files: 2,
+                total_size: 10,
+                volumes: 0,
+            }
+        );
     }
 }

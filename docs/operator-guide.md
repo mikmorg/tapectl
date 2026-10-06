@@ -859,10 +859,19 @@ tape, and refuses with nothing read
 
 ```bash
 tapectl catalog search "episode01"
+tapectl catalog search "episode01" --all-versions
 tapectl catalog ls family/letters
 tapectl catalog locate family/letters
 tapectl catalog stats
 ```
+
+`catalog search` looks in each unit's newest version, the one `catalog ls`
+lists, and prints its hits in unit and path order; `--all-versions` lists a
+file once for every version that holds it. `catalog stats` adds up each
+version's own totals: `Files` counts the non-directory entries and `Total` the
+bytes of regular files, over every version that still has a file list (a
+purged version has none). Releases up to 1.1.0 counted directories as files
+and a symlink's target length as bytes, so a figure noted then can read higher.
 
 `catalog locate` is the one to know: every copy of a unit, where it is, and
 whether it can be relied on.
