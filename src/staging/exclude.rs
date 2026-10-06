@@ -25,7 +25,7 @@
 //! behaviour (dar 2.7.13, `dar -c -an -D -X … -P …` then `dar -l`/`-x`),
 //! because dar is what actually decides what reaches tape:
 //!
-//!  - **Case never matters.** `dar::create::create_archive` unconditionally
+//!  - **Case never matters.** `dar::create::create_command` unconditionally
 //!    passes `-an` (`--alter=no-case`) before its masks, so every mask dar
 //!    receives is case-insensitive — a case-sensitive matcher here would
 //!    silently disagree with dar. A collection's `exclude` was the one
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn matching_is_case_insensitive_like_dars_an_flag() {
-        // dar's create_archive unconditionally passes -an before its -X
+        // dar's create_command unconditionally passes -an before its -X
         // loop (src/dar/create.rs) — a case-sensitive matcher here would
         // silently disagree with what dar actually excludes.
         let compiled = compile(&["thumbs.db".to_string()]);
@@ -629,18 +629,20 @@ mod tests {
         let out = tmp.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
         let base = out.join("a");
-        crate::dar::create::create_archive(&crate::dar::create::DarCreateParams {
-            dar_binary: "dar",
-            source_path: &root,
-            archive_base: &base,
-            slice_size: "1G",
-            compression: "none",
-            exclude_patterns: &masks.exclude,
-            exclude_paths: &masks.prune,
-            preserve_xattrs: false,
-            preserve_fsa: false,
-            on_fly_catalogue: &out.join("onfly"),
-        })
+        crate::dar::create::archive_to_files(
+            &crate::dar::create::DarCreateParams {
+                dar_binary: "dar",
+                source_path: &root,
+                compression: "none",
+                exclude_patterns: &masks.exclude,
+                exclude_paths: &masks.prune,
+                preserve_xattrs: false,
+                preserve_fsa: false,
+                on_fly_catalogue: &out.join("onfly"),
+            },
+            &base,
+            "1G",
+        )
         .unwrap();
         let dest = tmp.path().join("restored");
         crate::dar::restore::extract("dar", &base, &dest).unwrap();

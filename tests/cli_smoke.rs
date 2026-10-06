@@ -1189,10 +1189,12 @@ fn poll_stage_set_status(
     }
 }
 
-/// Poll `staging_dir` until at least one plaintext `.dar` file appears —
-/// proof dar has actually started producing output, not just that
-/// `stage_create` got as far as its initial INSERT. Bounded by `timeout`.
-fn poll_for_any_dar_file(
+/// Poll `staging_dir` until at least one `.dar.age` slice appears — proof
+/// dar has actually started producing output, not just that `stage_create`
+/// got as far as its initial INSERT. Bounded by `timeout`. (dar writes no
+/// plaintext `.dar` there since issue #370; the slice being written is
+/// ciphertext.)
+fn poll_for_any_slice_file(
     staging_dir: &std::path::Path,
     timeout: std::time::Duration,
 ) -> std::path::PathBuf {
@@ -1201,14 +1203,14 @@ fn poll_for_any_dar_file(
         if let Ok(entries) = std::fs::read_dir(staging_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".dar") {
+                if name.ends_with(".dar.age") {
                     return entry.path();
                 }
             }
         }
         if start.elapsed() > timeout {
             panic!(
-                "timed out after {:?} waiting for a .dar file to appear under {}",
+                "timed out after {:?} waiting for a .dar.age file to appear under {}",
                 timeout,
                 staging_dir.display()
             );
@@ -1230,7 +1232,7 @@ fn sigkill(pid: u32) {
 
 /// Test A (issue #98): a stage crashed by SIGKILL is detected as such by
 /// the next `db::open()` sweep — its row moves 'staging' -> 'failed' — and
-/// `staging clean` then removes the plaintext it left behind.
+/// `staging clean` then removes the half-written slice it left behind.
 #[test]
 fn crashed_stage_is_detected_and_then_cleanable() {
     let home = TempDir::new().expect("home tempdir");
@@ -1252,9 +1254,9 @@ fn crashed_stage_is_detected_and_then_cleanable() {
     // Precondition 1: the row exists and is 'staging' — proves the INSERT
     // + flock + COMMIT sequence has happened.
     poll_stage_set_status(&db_path, "staging", std::time::Duration::from_secs(60));
-    // Precondition 2: dar has actually produced plaintext output — gives
-    // `staging clean`'s prefix scan something real to find and remove.
-    let dar_file = poll_for_any_dar_file(staging_dir.path(), std::time::Duration::from_secs(60));
+    // Precondition 2: dar has actually produced output — gives `staging
+    // clean`'s prefix scan something real to find and remove.
+    let dar_file = poll_for_any_slice_file(staging_dir.path(), std::time::Duration::from_secs(60));
     assert!(dar_file.exists());
 
     sigkill(child.id());
@@ -1295,14 +1297,14 @@ fn crashed_stage_is_detected_and_then_cleanable() {
     );
     assert!(
         !dar_file.exists(),
-        "staging clean must remove the crashed stage's plaintext .dar file"
+        "staging clean must remove the crashed stage's half-written slice"
     );
 }
 
 /// Test B (issue #98) — the safety property: a LIVE stage (still running,
 /// lock held) must NOT be disturbed by a concurrent read-only command's
-/// `db::open()` sweep. Its row must stay 'staging' and its plaintext files
-/// must stay on disk.
+/// `db::open()` sweep. Its row must stay 'staging' and its files must stay
+/// on disk.
 #[test]
 fn live_stage_is_not_disturbed_by_a_concurrent_read_only_command() {
     let home = TempDir::new().expect("home tempdir");
@@ -1322,7 +1324,7 @@ fn live_stage_is_not_disturbed_by_a_concurrent_read_only_command() {
         .expect("failed to spawn stage create");
 
     poll_stage_set_status(&db_path, "staging", std::time::Duration::from_secs(60));
-    let dar_file = poll_for_any_dar_file(staging_dir.path(), std::time::Duration::from_secs(60));
+    let dar_file = poll_for_any_slice_file(staging_dir.path(), std::time::Duration::from_secs(60));
     assert!(dar_file.exists());
 
     // The live stage is still running (never killed) — run a read-only
@@ -1351,7 +1353,7 @@ fn live_stage_is_not_disturbed_by_a_concurrent_read_only_command() {
     );
     assert!(
         dar_file.exists(),
-        "a live stage's plaintext files must not be touched by a concurrent sweep"
+        "a live stage's files must not be touched by a concurrent sweep"
     );
 
     // Clean up: this test never needs the child to finish, and must not
@@ -2776,9 +2778,8 @@ fn stage_create_json_is_unchanged_and_its_session_is_logged() {
         "session start: stage create unit1",
         "phase start: validate",
         "phase end: validate",
-        "phase start: dar",
+        "phase start: archive",
         "phase end: catalog",
-        "phase end: encrypt",
         "phase end: finalize",
         "session end after",
     ] {
@@ -2891,18 +2892,17 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
 // --- issue #404: signals stop a long run cleanly; dar dies with tapectl ---
 
 /// A stand-in for dar whose archive step never finishes on its own: on
-/// `-c` it records its pid next to itself and becomes `sleep 60` (same
-/// pid, so the death signal set before exec still applies); everything
-/// else (`--version`, `-V`) is the real dar.
+/// `-c -` (the archive, on standard output since issue #370) it records its
+/// pid next to itself and becomes `sleep 60` (same pid, so the death signal
+/// set before exec still applies); everything else (`--version`, the slice
+/// template's `-c <file>`, the catalogue's `-C`) is the real dar.
 fn slow_dar(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let script = dir.join("slow-dar");
     std::fs::write(
         &script,
         "#!/bin/sh\n\
-         for a in \"$@\"; do\n\
-           if [ \"$a\" = -c ]; then echo $$ > \"$0.pid.tmp\"; mv \"$0.pid.tmp\" \"$0.pid\"; exec sleep 60; fi\n\
-         done\n\
+         if [ \"$1\" = -c ] && [ \"$2\" = - ]; then echo $$ > \"$0.pid.tmp\"; mv \"$0.pid.tmp\" \"$0.pid\"; exec sleep 60; fi\n\
          exec dar \"$@\"\n",
     )
     .unwrap();

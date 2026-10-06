@@ -1,6 +1,7 @@
 pub mod create;
 #[allow(dead_code)]
 pub mod restore;
+pub mod slice;
 pub mod version;
 
 use std::ffi::OsStr;

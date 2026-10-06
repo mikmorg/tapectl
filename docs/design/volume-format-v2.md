@@ -131,6 +131,17 @@ and all content metadata live only inside the encrypted envelopes and the catalo
 which itself rides each volume encrypted (the operator envelope's catalog snapshot,
 #83) and survives the machine via the Heir Kit (#69).
 
+**How a data slice is made (2026-10-06, ADR-0012 amendment item 4).** dar writes
+its archive to standard output (`dar -c - … --retry-on-change 0`); tapectl cuts
+that stream into dar slices of `slice_size` and age-encrypts each one in memory,
+so the staging directory only ever holds ciphertext. Each slice is a dar slice
+exactly as dar frames its own: dar's slice header (read from a slice the
+installed dar wrote at the same `-s`, with this archive's two labels), the
+payload, and the one-byte `N`/`T` trailer, as `dar_xform -s <size> - base`
+would cut the same stream. So `age -d` still yields a `base.N.dar` that
+`dar -t`/`-x` read with no tapectl, and nothing in this document changes. The
+recorded `dar_command` says so.
+
 **Self-describing — what that promises (normative, 2026-09-11).** The phrase
 is used throughout this repo and was defined nowhere; #136 was the first
 attempt to reconstruct the *operator's* view from tape, which is how the

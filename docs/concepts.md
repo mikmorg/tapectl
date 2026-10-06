@@ -310,10 +310,12 @@ also current. Neither a prompt nor `--yes` accepts it; only an explicit
 ### Stage set and slices
 
 A **stage set** is one snapshot turned into encrypted, checksummed files in the
-staging directory. `stage create` runs `dar`, which cuts the archive into
-**slices** of at most `slice_size` (default `1G`). Each slice is then encrypted
-with age to the unit's tenant, the operator, and the escrow recipient. A slice
-is the unit of tape I/O: one slice becomes one file on tape.
+staging directory. `stage create` runs `dar` with its archive on standard
+output, and tapectl cuts the archive into **slices** of at most `slice_size`
+(default `1G`), each a dar slice exactly as dar itself would cut it. Each slice
+is encrypted with age, as it is cut, to the unit's tenant, the operator, and
+the escrow recipient, so only ciphertext is ever written to the staging
+directory. A slice is the unit of tape I/O: one slice becomes one file on tape.
 
 For each slice, tapectl records the sha256 of the plaintext `dar` slice and of
 the encrypted file. The encrypted hash is later printed in plaintext on the tape

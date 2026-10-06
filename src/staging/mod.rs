@@ -1,10 +1,11 @@
 pub mod clean;
 pub mod exclude;
+mod files;
 pub mod lock;
 pub mod validate;
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection};
@@ -16,7 +17,6 @@ use crate::db::busy::{self, BusyPolicy};
 use crate::db::{events, models, queries};
 use crate::error::{Result, TapectlError};
 use crate::progress;
-use crate::util::{HashingReader, HashingWriter};
 
 /// Outcome of `snapshot_create_detailed` (issue #159 / ADR-0012): whether a
 /// new version was actually minted, and which row — new or reused — the
@@ -358,9 +358,7 @@ pub(crate) fn incomplete_set_remedy(
 /// non-interactive run refuses. What remains to fail after dar is the work
 /// itself.
 ///
-/// Thin wrapper around `stage_create_inner` mirroring
-/// `encrypt_file_streaming`'s "wrapper does cleanup on `Err`" pattern
-/// (issue #54): on failure, best-effort cleanup runs before the original
+/// Thin wrapper around `stage_create_inner` (issue #54): on failure, best-effort cleanup runs before the original
 /// error is returned unchanged — cleanup never masks the real error.
 pub fn stage_create(
     conn: &Connection,
@@ -453,8 +451,8 @@ pub(crate) fn stage_create_reporting(
 /// they are kept.
 ///
 /// - A busy catalog (issue #377) is not a failed stage. Every slice written
-///   so far is either recorded or still in plaintext
-///   (`record_encrypted_slice`), so keeping the files loses nothing, and
+///   so far is recorded (`record_encrypted_slice` removes one it cannot
+///   record), so keeping the files loses nothing, and
 ///   this command does not delete finished work over a lock wait. The next
 ///   open marks the set `failed` (its lock is free once `stage_create`
 ///   returns), and `staging clean` reclaims it.
@@ -558,7 +556,7 @@ fn stage_create_inner(
     let all_pubkeys = queries::recipient_list_with_escrow(conn, all_pubkeys)?;
     // Parse every recipient now, for the same reason: a malformed public key
     // in the database would otherwise surface from the first slice's
-    // `encrypt_file_streaming`, after dar. The encryptor itself is rebuilt
+    // encryption, after dar had started. The encryptor itself is rebuilt
     // per slice (age draws a fresh file key each time); this one is only the
     // check.
     build_encryptor(&all_pubkeys)?;
@@ -584,9 +582,10 @@ fn stage_create_inner(
     // here — before the INSERT, the sha256 pass and dar. Whether it is big
     // enough is known now only when it plainly is; otherwise the sha256
     // pass below measures what dar must store, and the refusal comes then,
-    // still before dar.
+    // still before dar. `staging` is the only way this stage creates a file
+    // there, and the only files it can create are ciphertext (issue #370).
     let staging_dir = Path::new(&config.staging.directory);
-    prepare_staging_dir(staging_dir)?;
+    let staging = files::StagingDir::prepare(staging_dir)?;
     let space = StagingSpaceInputs {
         staging_dir,
         unit_name: &unit.name,
@@ -684,11 +683,7 @@ fn stage_create_inner(
     // identically-named `.age` files and silently overwrite each other.
     // `cleanup_failed_stage_set`'s prefix derivation below must move in
     // lockstep with this — both go through `archive_base_name`.
-    let archive_base = staging_dir.join(archive_base_name(
-        &unit.uuid,
-        snapshot.version,
-        stage_set_id,
-    ));
+    let archive_base = archive_base_name(&unit.uuid, snapshot.version, stage_set_id);
 
     // Issue #49 items 2/5: dar's -X masks must see BOTH layers of
     // "effective excludes" — config.defaults.global_excludes (today's only
@@ -729,28 +724,35 @@ fn stage_create_inner(
     }
     crate::config::secure_path(&catalog_dir, 0o700);
 
-    // dar is a subprocess, so no byte of its work passes through tapectl:
-    // the phase's count is the size of the slices it has written so far,
-    // polled from the staging directory, against the source's non-zero
-    // bytes (compression makes the total an upper bound, not a promise).
-    let phase = progress::phase("dar", Some(nonzero_bytes.max(0) as u64));
+    // Step 2: dar, slices and encryption in one pass, with no plaintext on
+    // the staging device (issue #370; ADR-0012, 2026-10-06 amendment item
+    // 4). dar writes its archive to standard output; `dar::slice::cut_stream`
+    // frames it into dar slices exactly as dar frames its own (what
+    // `dar_xform -s` makes of the same stream), and each slice is encrypted
+    // in memory straight into its `.age` (`files::StagingDir`). Memory is a
+    // 1 MiB read buffer and age's 64 KiB chunk, whatever the slice size.
+    // The slice header is dar's own: from a tiny archive of an empty
+    // directory at the same `-s`, made in the tapectl home, never staging.
+    let template = {
+        let work = tempfile::Builder::new()
+            .prefix(".dar-slice-template-")
+            .tempdir_in(&paths.home)
+            .map_err(|e| staging_io_error("cannot make a work directory in", &paths.home, e))?;
+        dar::slice::template(&config.dar.binary, &slice_size, work.path())?
+    };
+
+    // fingerprint == public_key by construction for every key in this system
+    // (see crypto::keys::generate_keypair and `key import`), so the recorded
+    // fingerprints are exactly the (now escrow-augmented) recipient list —
+    // keeping this audit record honest about who can actually decrypt the
+    // slices it describes, rather than a second, silently-divergent list.
+    let key_fingerprints = all_pubkeys.clone();
+
+    let phase = progress::phase("archive", Some(nonzero_bytes.max(0) as u64));
     phase.item(unit.name.clone());
-    {
-        let dir = staging_dir.to_path_buf();
-        let prefix = format!(
-            "{}.",
-            archive_base
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        );
-        phase.poll(move || Some(dar_output_bytes(&dir, &prefix)));
-    }
-    let dar_result = dar::create::create_archive(&dar::create::DarCreateParams {
+    let mut dar_run = dar::create::spawn_archive(&dar::create::DarCreateParams {
         dar_binary: &config.dar.binary,
         source_path: Path::new(&snapshot.source_path),
-        archive_base: &archive_base,
-        slice_size: &slice_size,
         compression: &compression,
         exclude_patterns: &dar_masks.exclude,
         exclude_paths: &dar_masks.prune,
@@ -758,14 +760,88 @@ fn stage_create_inner(
         preserve_fsa: resolved.preserve_fsa,
         on_fly_catalogue: &on_fly_base,
     })?;
-
-    phase.done();
-    info!(slices = dar_result.num_slices, "dar archive created");
-
+    // MANIFEST.toml carries this to tape. The slicing is tapectl's, so the
+    // record says so, in terms an heir can reproduce with dar's own tools.
+    let dar_command = format!(
+        "{} | tapectl cuts the archive into dar slices of -s {slice_size} \
+         (the framing `dar_xform -s {slice_size} - <base>` gives) and age-encrypts each",
+        dar_run.dar_command
+    );
     conn.execute(
         "UPDATE stage_sets SET dar_version = ?1, dar_command = ?2 WHERE id = ?3",
-        params![dar_result.dar_version, dar_result.dar_command, stage_set_id],
+        params![dar_run.dar_version, dar_command, stage_set_id],
     )?;
+
+    let mut total_dar_size: i64 = 0;
+    let mut total_encrypted_size: i64 = 0;
+    let mut streamed: u64 = 0;
+    let stdout = dar_run.take_stdout();
+    let cut = dar::slice::cut_stream(
+        stdout,
+        &template,
+        |n| {
+            phase.item(format!("{} slice {n}", unit.name));
+            staging.create_slice(&archive_base, n, &all_pubkeys)
+        },
+        |n, slice| {
+            let path = slice.path().to_path_buf();
+            let info = slice.finish()?;
+            record_encrypted_slice(
+                conn,
+                BusyPolicy::DEFAULT,
+                stage_set_id,
+                i64::from(n),
+                &path,
+                &info,
+            )?;
+            total_dar_size += info.plain_size;
+            total_encrypted_size += info.encrypted_size;
+            info!(
+                slice = n,
+                plain_mb = info.plain_size / (1024 * 1024),
+                encrypted_mb = info.encrypted_size / (1024 * 1024),
+                "staged slice"
+            );
+            Ok(())
+        },
+        |bytes| {
+            progress::add_bytes(bytes.saturating_sub(streamed));
+            streamed = bytes;
+            // Issue #404: a stop is honoured within one read of the stream
+            // (and, while dar is silent, within `DarOutput`'s poll).
+            crate::signal::check(|| stopped_archiving(&snapshot.source_path))
+        },
+    );
+    let summary = match cut {
+        Ok(summary) => summary,
+        Err(e) => {
+            // dar's own failure, if it had one, is the cause to report: a
+            // short archive is how it reaches the slicer.
+            let dar_failed = dar_run.abort();
+            if crate::signal::is_interrupted() {
+                return Err(TapectlError::Interrupted(stopped_archiving(
+                    &snapshot.source_path,
+                )));
+            }
+            return Err(dar_failed.unwrap_or(e));
+        }
+    };
+    if let dar::create::DarFinish::FilesChanged { detail } = dar_run.finish()? {
+        return Err(TapectlError::Other(format!(
+            "DIRTY: a source file of unit \"{}\" changed while dar was reading it \
+             (dar exit 11). tapectl runs dar with --retry-on-change 0, so a file \
+             caught mid-change is refused rather than archived half-changed. dar \
+             said:\n{detail}\nNothing was staged. Stage again once the source is \
+             quiet; if the change is real, take a new snapshot (`tapectl snapshot \
+             create {}`) and stage that.",
+            unit.name, unit.name
+        )));
+    }
+    phase.done();
+    info!(slices = summary.slices, "dar archive staged");
+
+    #[cfg(test)]
+    failpoint::note_staging(staging_dir);
     #[cfg(test)]
     failpoint::hit(failpoint::AFTER_DAR)?;
 
@@ -789,88 +865,6 @@ fn stage_create_inner(
         params![catalog_base.to_string_lossy().to_string(), stage_set_id],
     )?;
     phase.done();
-
-    // Step 4: Encrypt slices, to the recipient list built (and checked)
-    // before dar ran.
-    info!("encrypting slices");
-
-    // fingerprint == public_key by construction for every key in this system
-    // (see crypto::keys::generate_keypair and `key import`), so the recorded
-    // fingerprints are exactly the (now escrow-augmented) recipient list —
-    // keeping this audit record honest about who can actually decrypt the
-    // slices it describes, rather than a second, silently-divergent list.
-    let key_fingerprints = all_pubkeys.clone();
-
-    let mut total_dar_size: i64 = 0;
-    let mut total_encrypted_size: i64 = 0;
-
-    let plain_total: u64 = dar_result
-        .slice_paths
-        .iter()
-        .filter_map(|p| fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum();
-    let phase = progress::phase("encrypt", Some(plain_total));
-    let slice_count = dar_result.slice_paths.len();
-    for (i, slice_path) in dar_result.slice_paths.iter().enumerate() {
-        let slice_num = (i + 1) as i64;
-        phase.item(format!("{} slice {slice_num} of {slice_count}", unit.name));
-        // Issue #404: between slices — one slice is at most a minute or two.
-        crate::signal::check(|| {
-            format!("stopped before encrypting slice {slice_num} of {slice_count}")
-        })?;
-
-        // Streams the plaintext slice straight to its `.age` file, hashing
-        // both sides as they flow — peak RAM is the copy buffer, never the
-        // slice size (H9 fix, issue #35; see `encrypt_file_streaming`).
-        let encrypted_path = PathBuf::from(format!("{}.age", slice_path.display()));
-        let info = encrypt_file_streaming(slice_path, &encrypted_path, &all_pubkeys)?;
-
-        record_encrypted_slice(
-            conn,
-            BusyPolicy::DEFAULT,
-            stage_set_id,
-            slice_num,
-            slice_path,
-            &encrypted_path,
-            &info,
-        )?;
-
-        total_dar_size += info.plain_size;
-        total_encrypted_size += info.encrypted_size;
-
-        info!(
-            slice = slice_num,
-            plain_mb = info.plain_size / (1024 * 1024),
-            encrypted_mb = info.encrypted_size / (1024 * 1024),
-            "encrypted slice"
-        );
-    }
-    phase.done();
-
-    // Also remove any leftover sha512 hash files. dar no longer creates
-    // these (create.rs dropped `-3`/`--hash sha512`, issues #50/#51 — the
-    // files were never read, pure wasted I/O), but a staging dir can still
-    // hold `.sha512` files left behind by archives created before that
-    // change, so this cleanup path must keep matching them.
-    if let Some(parent) = archive_base.parent() {
-        if let Ok(entries) = fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                // The trailing dot is load-bearing: dar names every slice
-                // `{base}.{N}.dar`, so `{base}.` is the real prefix. Matching
-                // on the bare base makes `..._v1` a prefix of `..._v10.1.dar`.
-                // `archive_base` is per-stage-set (issue #53) so this is
-                // already narrower than "per-unit-version", but the trailing
-                // dot still matters against sibling stage-set ids (`_s1` vs
-                // `_s10`). Same convention as `volume::build::catalog_file_paths`.
-                let prefix = format!("{}.", archive_base.file_name().unwrap().to_string_lossy());
-                if name.ends_with(".sha512") && name.starts_with(&prefix) {
-                    let _ = fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
 
     // Issue #54: finalization only, not the whole pipeline, runs inside a
     // transaction — matching the `conn.unchecked_transaction()` pattern
@@ -907,7 +901,7 @@ fn stage_create_inner(
              total_encrypted_size = ?3, key_fingerprints = ?4, staged_at = datetime('now')
              WHERE id = ?5",
             params![
-                dar_result.num_slices as i64,
+                i64::from(summary.slices),
                 total_dar_size,
                 total_encrypted_size,
                 serde_json::to_string(&key_fingerprints).unwrap(),
@@ -988,20 +982,15 @@ fn stage_create_inner(
     Ok(stage_set_id)
 }
 
-/// Record one encrypted slice, then delete its plaintext — in that order
-/// (issue #377). `cleanup_failed_stage_set` finds `.age` files only through
-/// their `stage_slices` rows and plaintext `.dar` files by prefix, so at
-/// every instant each file on disk is findable: before the row lands, the
-/// plaintext is still there and the `.age` is removed again if the row
-/// cannot be written; after it lands, the row names the `.age`. The INSERT
-/// is retried on a busy catalog for `policy`'s budget — the encryption it
-/// records may have taken an hour.
+/// Record one encrypted slice: its `stage_slices` row (issue #377). The
+/// INSERT is retried on a busy catalog for `policy`'s budget. If it cannot be
+/// written, the `.age` is removed again: no row would ever name it. There is
+/// no plaintext slice to delete (issue #370) — only ciphertext was written.
 fn record_encrypted_slice(
     conn: &Connection,
     policy: BusyPolicy,
     stage_set_id: i64,
     slice_num: i64,
-    slice_path: &Path,
     encrypted_path: &Path,
     info: &EncryptedSliceInfo,
 ) -> Result<()> {
@@ -1022,20 +1011,11 @@ fn record_encrypted_slice(
         )?)
     });
     if let Err(e) = recorded {
-        // No row names this `.age`, so nothing could ever find it again;
-        // its plaintext is still on disk for the prefix-keyed cleanup.
         let _ = fs::remove_file(encrypted_path);
         return Err(e);
     }
     #[cfg(test)]
     durability::note(durability::Event::Recorded(encrypted_path.to_path_buf()));
-
-    // Remove unencrypted slice. Safe only because `encrypt_file_streaming`
-    // synced the `.age` before returning (issue #409).
-    fs::remove_file(slice_path)
-        .map_err(|e| staging_io_error("cannot remove plaintext slice", slice_path, e))?;
-    #[cfg(test)]
-    durability::note(durability::Event::Unlinked(slice_path.to_path_buf()));
     Ok(())
 }
 
@@ -1063,6 +1043,11 @@ pub(crate) fn archive_base_prefix(unit_uuid: &str, version: i64, stage_set_id: i
     format!("{}.", archive_base_name(unit_uuid, version, stage_set_id))
 }
 
+/// What a stop during the archive pass says (issue #404).
+fn stopped_archiving(source: &str) -> String {
+    format!("dar was stopped while archiving {source}")
+}
+
 /// The base name dar's on-the-fly catalogue (`-@`) is written under, inside
 /// [`stage_set_catalogue_dir`]; removed once it is re-isolated.
 const ON_FLY_CATALOGUE: &str = "onfly";
@@ -1085,32 +1070,21 @@ pub(crate) fn stage_set_catalogue_dir(
 /// Best-effort cleanup of a `stage_set` that `stage_create` failed to
 /// finish, run from the `stage_create` wrapper's `Err` path (issue #54).
 ///
-/// Two different discovery strategies are used deliberately, for two
-/// different classes of leftover file:
+/// Two discovery strategies, both kept:
 ///
-/// - **Plaintext `.dar`/`.sha512` are found by filesystem prefix, NOT by DB
-///   rows.** `dar -c` creates every slice up front; the encryption loop
-///   only inserts a slice's `stage_slices` row and then deletes its `.dar`
-///   *after* writing its `.age` (`record_encrypted_slice`, issue #377: row
-///   first, so no `.age` ever exists without a row once its plaintext is
-///   gone). So a failure partway through the encryption loop
-///   — or any failure before it even starts, e.g. the zero-active-keys
-///   refusal — leaves plaintext `.dar` files with no `stage_slices` row at
-///   all. Iterating `stage_slices` would find exactly the files that are
-///   already safe (already encrypted, already deleted) and miss every one
-///   that actually matters. `archive_base_name` (issue #53) carries
-///   `stage_set_id`, so it is unique per stage set, not just per snapshot —
-///   a prefix scan of `staging_dir` for `{archive_base_prefix}*.dar` /
-///   `*.sha512` can never collide with a sibling stage set of the same
-///   snapshot, which is what makes this safe.
+/// - **By filesystem prefix.** The `.dar.age` being written when the stage
+///   failed has no `stage_slices` row yet (a slice is recorded once it is
+///   complete and synced; issue #370 writes it straight from dar's stream).
+///   [`files::SliceWriter`] removes its own file when dropped unfinished,
+///   so this catches only what that could not. Plaintext `.dar`/`.sha512`
+///   are matched too: tapectl no longer writes them, but a staging
+///   directory can still hold them from a version that did.
+///   `archive_base_name` (issue #53) carries `stage_set_id`, so the
+///   dot-terminated prefix is unique per stage set and can never match a
+///   sibling stage set of the same snapshot.
 ///
-/// - **`.age` files are found by DB row (`stage_slices.staging_path`), NOT
-///   by prefix.** This is strictly more precise than a prefix scan and
-///   doesn't depend on the prefix reasoning above at all — deleting only
-///   the rows this specific `stage_set_id` owns keeps the blast radius
-///   correct regardless of how `archive_base` is shaped. Left unchanged by
-///   issue #53; do not "simplify" it into a prefix scan just because one
-///   would now be safe.
+/// - **By DB row (`stage_slices.staging_path`).** Every recorded `.age`,
+///   whatever its name — precise, and independent of the prefix rule.
 ///
 /// The `stage_sets` row itself is deliberately left alone — not deleted,
 /// not re-statused. Leaving it `status='staging'` is exactly what lets
@@ -1153,12 +1127,14 @@ fn cleanup_failed_stage_set(
 
     let mut removed = 0u64;
 
-    // Plaintext .dar / dar's .sha512 — prefix-keyed (see doc comment above).
+    // Prefix-keyed (see the doc comment above).
     if let Ok(entries) = fs::read_dir(staging_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with(&prefix)
-                && (name.ends_with(".dar") || name.ends_with(".sha512"))
+                && (name.ends_with(".dar.age")
+                    || name.ends_with(".dar")
+                    || name.ends_with(".sha512"))
                 && fs::remove_file(entry.path()).is_ok()
             {
                 removed += 1;
@@ -1437,25 +1413,6 @@ fn staging_io_error(operation: &str, path: &Path, e: std::io::Error) -> TapectlE
     TapectlError::Other(format!("{operation} {}: {e}", path.display()))
 }
 
-/// Make sure `stage create` can use `staging_dir` at all: create it if it is
-/// missing, then prove it is writable by creating (and at once removing) a
-/// file in it (issue #354).
-///
-/// Writability is tested by doing the write, the way `config check`'s
-/// `policy::depth_check::check_staging` does, because mode bits lie under
-/// root, ACLs and read-only mounts. Without the probe an unwritable
-/// directory passed every check here and failed inside dar — after the
-/// whole sha256 validation pass over the source.
-fn prepare_staging_dir(staging_dir: &Path) -> Result<()> {
-    fs::create_dir_all(staging_dir)
-        .map_err(|e| staging_io_error("cannot create staging directory", staging_dir, e))?;
-    let probe = staging_dir.join(format!(".tapectl-stage-probe-{}", std::process::id()));
-    fs::write(&probe, b"tapectl stage create probe")
-        .map_err(|e| staging_io_error("cannot write to staging directory", staging_dir, e))?;
-    let _ = fs::remove_file(&probe);
-    Ok(())
-}
-
 /// dar's per-entry overhead in an archive: each entry's inline header plus
 /// its record in the catalog dar appends at the end. Measured at ~290 bytes
 /// per file on dar 2.7.13 (2,001 files, `compression = none`); rounded up,
@@ -1707,8 +1664,8 @@ fn staging_free_bytes(dir: &Path) -> std::result::Result<u64, nix::Error> {
 
 /// Build an `age::Encryptor` for the given recipient public keys — shared by
 /// `encrypt_data` (small, buffered payloads: envelopes/manifests in
-/// `src/volume/build.rs`) and `encrypt_file_streaming` (large, streamed
-/// slices; H9 fix, issue #35), so the recipient parsing/boxing dance lives
+/// `src/volume/build.rs`) and `files::StagingDir::create_slice` (large,
+/// streamed slices; H9 fix, issue #35), so the recipient parsing/boxing dance lives
 /// in exactly one place. Pure extraction: same errors, same messages, same
 /// order of operations as before — `age::Encryptor` doesn't retain any
 /// reference into `pubkey_strings` or the intermediate boxed recipients
@@ -1737,7 +1694,7 @@ pub(crate) fn build_encryptor(pubkey_strings: &[String]) -> Result<age::Encrypto
 
 /// Whole-buffer age encryption: holds the full plaintext AND full ciphertext
 /// in RAM at once. Superseded on all production paths by
-/// `encrypt_file_streaming` (slices, H9/#35) and `volume::build`'s streaming
+/// `files::SliceWriter` (slices, H9/#35 and #370) and `volume::build`'s streaming
 /// envelope path (H9 residual, #87). Retained as a small, easy-to-audit
 /// reference implementation for tests that want a one-shot encrypt/decrypt
 /// round trip without standing up a file-backed streaming pipeline —
@@ -1774,89 +1731,16 @@ pub fn encrypt_data(data: &[u8], pubkey_strings: &[String]) -> Result<Vec<u8>> {
     Ok(encrypted)
 }
 
-/// Fixed-size copy buffer for streaming slice encryption (H9 fix, issue
-/// #35) — matches `volume::layout_model::hash_file`'s existing 128 KiB
-/// streaming-hash convention. Peak RAM for `encrypt_file_streaming` is this
-/// buffer, plus age's own constant ~64 KiB STREAM chunk buffer
-/// (`age::primitives::stream::CHUNK_SIZE`) on both the plaintext and
-/// ciphertext side, plus O(recipient count) for the header — never the
-/// size of the file being encrypted.
-const STREAM_COPY_BUFFER: usize = 128 * 1024;
-
-/// Sizes and hashes recorded for one slice encrypted by
-/// `encrypt_file_streaming` — the same four values `stage_create` used to
-/// get from a `fs::read` + `encrypt_data` + `fs::write` sequence, now
-/// produced without ever holding the whole slice in RAM.
+/// Sizes and hashes recorded for one staged slice
+/// ([`files::SliceWriter::finish`]): the plaintext dar slice's size and
+/// sha256, and its `.age` file's. Only the plaintext pair is a pure function
+/// of the content — age draws a fresh key, nonce and grease stanza for
+/// every file.
 pub struct EncryptedSliceInfo {
     pub plain_size: i64,
     pub sha256_plain: String,
     pub encrypted_size: i64,
     pub sha256_encrypted: String,
-}
-
-/// Stream-encrypt `input_path` straight to `output_path` as an age file,
-/// hashing plaintext and ciphertext as each streams through — peak RAM is
-/// `STREAM_COPY_BUFFER` plus age's own constant-size STREAM chunk buffer,
-/// never the size of `input_path` (H9 fix, issue #35: the buffered
-/// predecessor held the whole plaintext *and* the whole ciphertext in RAM
-/// at once, which OOMs at the ratified 10G slice default —
-/// `docs/design/v2-open-questions.md` §1.3 — on any machine with less than
-/// ~20 GB free).
-///
-/// Neither `sha256_encrypted` nor `encrypted_size` — nor the raw ciphertext
-/// bytes — are reproducible across separate calls with identical inputs:
-/// `age::Encryptor` draws a fresh ephemeral key and nonce every time (see
-/// `src/volume/build.rs`'s envelope-backup comment for the same fact,
-/// confirmed empirically there), *and* every non-passphrase header carries
-/// an extra randomly-shaped "grease" recipient stanza
-/// (`age_core::format::grease_the_joint`) whose length also varies from
-/// call to call. Only `sha256_plain` and `plain_size` are pure functions of
-/// the plaintext and thus deterministic.
-///
-/// On any error, best-effort removes `output_path` rather than leaving a
-/// partial `.age` file in staging (the buffered predecessor could never
-/// produce one, since it only ever wrote after the full ciphertext existed
-/// in memory) — this is not an integrity concern either way, since
-/// `Layout::validate`'s `check_staged_slices` re-hashes from disk before
-/// ever trusting a staged slice, and a retried `stage_create` truncates via
-/// `File::create` regardless.
-pub fn encrypt_file_streaming(
-    input_path: &Path,
-    output_path: &Path,
-    pubkey_strings: &[String],
-) -> Result<EncryptedSliceInfo> {
-    let result = encrypt_file_streaming_inner(input_path, output_path, pubkey_strings);
-    if result.is_err() {
-        let _ = fs::remove_file(output_path);
-    }
-    // Issue #354: an io failure here (ENOSPC writing the `.age` into
-    // staging is the likely one) names both files and the operation, once.
-    result.map_err(|e| match e {
-        TapectlError::Io(io) => TapectlError::Other(format!(
-            "cannot encrypt {} to {}: {io}",
-            input_path.display(),
-            output_path.display()
-        )),
-        other => other,
-    })
-}
-
-fn encrypt_file_streaming_inner(
-    input_path: &Path,
-    output_path: &Path,
-    pubkey_strings: &[String],
-) -> Result<EncryptedSliceInfo> {
-    let encryptor = build_encryptor(pubkey_strings)?;
-    let input = fs::File::open(input_path)?;
-    let output = fs::File::create(output_path)?;
-    let info = encrypt_stream(encryptor, input, &output)?;
-    // Issue #409: on stable storage before anything trusts it. The caller
-    // records the slice and then DELETES its plaintext; with the `.age`
-    // still dirty in the page cache, a power loss inside the writeback
-    // window left a short (or zero-filled) slice and no plaintext to
-    // re-encrypt it from. One flush per slice (~10 GiB) costs nothing.
-    make_durable(&output, output_path)?;
-    Ok(info)
 }
 
 /// Force `file`'s bytes, then the directory entry that names it, to stable
@@ -1901,10 +1785,9 @@ fn sync_catalogue(catalog_base: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Test-only: what the staging pipeline made durable, recorded and
-/// unlinked, in order, on this thread (issue #409) — how a test asserts
-/// that every `.age` is synced before its row is written and its plaintext
-/// deleted.
+/// Test-only: what the staging pipeline made durable and recorded, in
+/// order, on this thread (issue #409) — how a test asserts that every `.age`
+/// is synced before its row is written.
 #[cfg(test)]
 pub(crate) mod durability {
     use std::cell::RefCell;
@@ -1916,8 +1799,6 @@ pub(crate) mod durability {
         Synced(PathBuf),
         /// The `stage_slices` row naming this `.age` was inserted.
         Recorded(PathBuf),
-        /// This plaintext slice was deleted.
-        Unlinked(PathBuf),
     }
 
     thread_local! {
@@ -1962,82 +1843,38 @@ pub(crate) mod failpoint {
         }
         Ok(())
     }
-}
 
-/// The body of [`encrypt_file_streaming`] over any reader and writer — the
-/// seam a test drives a writer that fails partway through.
-fn encrypt_stream(
-    encryptor: age::Encryptor,
-    input: impl Read,
-    output: impl Write,
-) -> Result<EncryptedSliceInfo> {
-    let mut reader = HashingReader::new(input);
-    let hashing_output = HashingWriter::new(output);
-    // Issue #354: both `wrap_output` (which writes the age header) and
-    // `finish` (which writes the last chunk) fail only by failing to write,
-    // so their errors stay io errors — `encrypt_file_streaming` then names
-    // the slice and its `.age`. As `Encryption` strings they used to pass
-    // through it pathless: an ENOSPC in staging read "encryption error:
-    // finish failed: No space left on device (os error 28)".
-    let mut writer = encryptor.wrap_output(hashing_output)?;
-
-    let plain_size = stream_copy(&mut reader, &mut writer)?;
-    let sha256_plain = reader.finalize_hex();
-
-    // Mandatory: without this, the STREAM's final chunk (the one carrying
-    // the "last chunk" flag) is never written, producing a file that
-    // hashes fine but cannot be decrypted (age's own doc comment on
-    // `StreamWriter::finish` says exactly this). Reached only once
-    // `stream_copy` has streamed the *entire* plaintext without error — an
-    // error above returns via `?` and never reaches this line, so a
-    // partial stream is never finished into a falsely-valid file.
-    let hashing_output = writer.finish()?;
-    let sha256_encrypted = hashing_output.finalize_hex();
-    let encrypted_size = hashing_output.bytes_written() as i64;
-
-    Ok(EncryptedSliceInfo {
-        plain_size: plain_size as i64,
-        sha256_plain,
-        encrypted_size,
-        sha256_encrypted,
-    })
-}
-
-/// Copy every byte from `reader` to `writer` through a fixed-size buffer —
-/// never allocates more than `STREAM_COPY_BUFFER`, regardless of how much
-/// data flows through. Returns the total bytes copied.
-fn stream_copy<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<u64> {
-    let mut buf = [0u8; STREAM_COPY_BUFFER];
-    let mut total = 0u64;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n])?;
-        total += n as u64;
-        progress::add_bytes(n as u64);
+    thread_local! {
+        static STAGING_AFTER_DAR: std::cell::RefCell<Option<Vec<String>>> =
+            const { std::cell::RefCell::new(None) };
     }
-    Ok(total)
-}
 
-/// The bytes dar has written so far for one archive: every `{prefix}N.dar`
-/// in `dir`. Polled by the `dar` phase's progress (issue #386); a directory
-/// that cannot be read counts as nothing yet.
-fn dar_output_bytes(dir: &Path, prefix: &str) -> u64 {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with(prefix) && name.ends_with(".dar")
-        })
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
+    /// Record the staging directory's file names when dar has finished,
+    /// on this thread's next stage.
+    pub(crate) fn observe_staging_after_dar() {
+        STAGING_AFTER_DAR.with(|o| *o.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(crate) fn note_staging(dir: &std::path::Path) {
+        STAGING_AFTER_DAR.with(|o| {
+            if let Some(names) = o.borrow_mut().as_mut() {
+                let mut found: Vec<String> = std::fs::read_dir(dir)
+                    .map(|rd| {
+                        rd.flatten()
+                            .map(|e| e.file_name().to_string_lossy().into_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                found.sort();
+                *names = found;
+            }
+        });
+    }
+
+    /// What [`note_staging`] recorded, clearing it.
+    pub(crate) fn staging_after_dar() -> Option<Vec<String>> {
+        STAGING_AFTER_DAR.with(|o| o.borrow_mut().take())
+    }
 }
 
 /// The stage report's "Phase timings" section (issue #386): one line per
@@ -2439,49 +2276,8 @@ struct ManifestEntry {
 
 #[cfg(test)]
 mod tests {
-    //! Tests for the H9 fix (issue #35): `encrypt_file_streaming` must
-    //! behave equivalently to the old buffered `encrypt_data` +
-    //! `fs::write` pair it replaces in `stage_create`'s slice loop, while
-    //! never holding a whole slice's plaintext or ciphertext in RAM.
-    //!
-    //! Two nuances drive the assertions below, both about `age`, not about
-    //! this crate's code:
-    //!   - `age::Encryptor` draws a fresh ephemeral key and nonce on
-    //!     *every* call (`protocol.rs`'s `Nonce::random()`/`new_file_key()`;
-    //!     confirmed empirically too, and already assumed elsewhere in this
-    //!     codebase — `src/volume/build.rs`'s operator-envelope backup
-    //!     comment clones ciphertext bytes rather than re-encrypting,
-    //!     precisely because re-encryption "would NOT reproduce the same
-    //!     bytes").
-    //!   - Less obviously: **ciphertext *length* is not deterministic
-    //!     either.** Every non-passphrase `age` header gets an extra
-    //!     "grease" recipient stanza with a randomly chosen tag, arg count,
-    //!     and body length (`age-core::format::grease_the_joint`, "Keep the
-    //!     joint well oiled!") — anti-fingerprinting padding, by design.
-    //!     Measured empirically here: encrypting the same plaintext to the
-    //!     same single recipient 8 times in a row produced ciphertexts
-    //!     ranging 53739–53863 bytes, a ~124-byte spread. So neither
-    //!     `sha256_encrypted` nor `encrypted_size` can be asserted equal
-    //!     across the buffered and streaming paths (or across any two
-    //!     calls at all) — only `sha256_plain` and `plain_size` are pure
-    //!     functions of the plaintext and thus safe to compare cross-path.
-    //!
-    //! What must hold for the encrypted side instead is *self-consistency*:
-    //! the recorded `sha256_encrypted`/`encrypted_size` equal an
-    //! independent re-hash/re-measure of the bytes that actually landed on
-    //! disk (exactly what `Layout::validate`'s `check_staged_slices` —
-    //! sacred invariant 2 — recomputes via `hash_file` before ever trusting
-    //! a slice), and the file actually decrypts back to the original
-    //! plaintext.
     use super::*;
-    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
-
-    fn direct_hash(data: &[u8]) -> String {
-        let mut h = Sha256::new();
-        h.update(data);
-        format!("{:x}", h.finalize())
-    }
 
     /// Register the permanent escrow recipient (ADR-0005) on a throwaway
     /// holder tenant. `stage_create` refuses without one (issue #115), so
@@ -2508,265 +2304,6 @@ mod tests {
         .unwrap();
         kp.public_key
     }
-
-    /// Real age decryption of a file on disk, mirroring the pattern used by
-    /// `tests/failure_modes.rs`'s `decrypt_with` — this is what fails if a
-    /// `StreamWriter` is ever left un-`finish()`ed (a truncated STREAM with
-    /// no final chunk), which no hash-only check would catch.
-    fn decrypt_file(path: &Path, secret_key: &str) -> Vec<u8> {
-        let identity: age::x25519::Identity = secret_key.parse().unwrap();
-        let ct_file = fs::File::open(path).unwrap();
-        let decryptor = age::Decryptor::new(ct_file).unwrap();
-        let mut reader = decryptor
-            .decrypt(std::iter::once(&identity as &dyn age::Identity))
-            .expect("decrypt must succeed — a missing .finish() truncates the STREAM");
-        let mut out = Vec::new();
-        reader.read_to_end(&mut out).unwrap();
-        out
-    }
-
-    #[test]
-    fn streaming_matches_buffered_on_plaintext_and_is_self_consistent_on_ciphertext() {
-        let kp = crate::crypto::keys::generate_keypair();
-        let pubkeys = vec![kp.public_key.clone()];
-
-        let plaintext = b"some slice content, repeated to be a bit larger than one line \
-                           so this isn't a degenerate single-byte case; "
-            .repeat(500);
-
-        // The old buffered primitive (still used elsewhere for small
-        // envelope/manifest payloads) as a semantic reference: it must
-        // decrypt to the same plaintext as the streaming path, even though
-        // — see the module doc comment — its ciphertext bytes and even
-        // length are never reproducible across calls, buffered or
-        // streaming, so there is nothing byte-level to compare it against.
-        let buffered_identity: age::x25519::Identity = kp.secret_key.parse().unwrap();
-        let buffered_ct = encrypt_data(&plaintext, &pubkeys).unwrap();
-        let buffered_decryptor = age::Decryptor::new(&buffered_ct[..]).unwrap();
-        let mut buffered_reader = buffered_decryptor
-            .decrypt(std::iter::once(&buffered_identity as &dyn age::Identity))
-            .unwrap();
-        let mut buffered_plaintext = Vec::new();
-        buffered_reader
-            .read_to_end(&mut buffered_plaintext)
-            .unwrap();
-        assert_eq!(buffered_plaintext, plaintext);
-
-        let expected_sha_plain = direct_hash(&plaintext);
-
-        let tmp = TempDir::new().unwrap();
-        let input_path = tmp.path().join("slice.1.dar");
-        let output_path = tmp.path().join("slice.1.dar.age");
-        fs::write(&input_path, &plaintext).unwrap();
-
-        let info = encrypt_file_streaming(&input_path, &output_path, &pubkeys).unwrap();
-
-        // Deterministic — must match the buffered path exactly (pure
-        // functions of the plaintext bytes, no randomness involved).
-        assert_eq!(info.plain_size, plaintext.len() as i64);
-        assert_eq!(info.sha256_plain, expected_sha_plain);
-
-        // NOT comparable cross-path (age's per-call ephemeral key/nonce
-        // plus its randomized "grease" stanza mean neither the ciphertext
-        // bytes nor even its length are reproducible — see the module doc
-        // comment). Self-consistency instead: the recorded hash/size must
-        // match the bytes that actually landed on disk, which is what
-        // `Layout::validate`'s `check_staged_slices` independently
-        // recomputes via `hash_file` before ever trusting a slice.
-        let on_disk = fs::read(&output_path).unwrap();
-        assert_eq!(on_disk.len() as i64, info.encrypted_size);
-        assert_eq!(info.sha256_encrypted, direct_hash(&on_disk));
-
-        // And it must actually decrypt back to the original plaintext.
-        assert_eq!(decrypt_file(&output_path, &kp.secret_key), plaintext);
-    }
-
-    #[test]
-    fn streamed_age_file_round_trips_through_real_decryption() {
-        let kp = crate::crypto::keys::generate_keypair();
-        let pubkeys = vec![kp.public_key.clone()];
-        // Several times age's own 64 KiB STREAM chunk size, so this
-        // exercises more than one chunk boundary, not just a toy example.
-        let plaintext = b"round-trip content, needs to exceed one age STREAM chunk to \
-                           prove multi-chunk streaming, not just a single-write toy case. "
-            .repeat(2000);
-
-        let tmp = TempDir::new().unwrap();
-        let input_path = tmp.path().join("slice.dar");
-        let output_path = tmp.path().join("slice.dar.age");
-        fs::write(&input_path, &plaintext).unwrap();
-
-        let info = encrypt_file_streaming(&input_path, &output_path, &pubkeys).unwrap();
-        assert_eq!(info.plain_size, plaintext.len() as i64);
-        assert_eq!(info.sha256_plain, direct_hash(&plaintext));
-
-        assert_eq!(decrypt_file(&output_path, &kp.secret_key), plaintext);
-    }
-
-    #[test]
-    fn copy_buffer_is_a_small_fixed_constant_independent_of_input_length() {
-        // Structural guarantee behind the constant-memory claim: the copy
-        // loop's only per-iteration allocation is this stack buffer, sized
-        // once, never resized — so peak RAM for `encrypt_file_streaming`
-        // cannot scale with the size of the file being encrypted (H9,
-        // issue #35). Matches `volume::layout_model::hash_file`'s existing
-        // 128 KiB streaming-hash convention in this codebase. Pinning the
-        // exact value here (rather than just an upper bound) means any
-        // future change to it is a deliberate, visible edit to this test,
-        // not a silent drift back toward whole-slice buffering.
-        assert_eq!(STREAM_COPY_BUFFER, 128 * 1024);
-    }
-
-    #[test]
-    fn encrypts_an_input_many_times_larger_than_the_copy_buffer() {
-        // ~16 MiB: >125x STREAM_COPY_BUFFER and >250x age's own 64 KiB
-        // STREAM chunk — enough to force many loop iterations and many
-        // STREAM chunks without materializing anything close to a real
-        // 10G slice (keeps the ungated suite fast; do not stage a 10G file
-        // in a unit test).
-        let kp = crate::crypto::keys::generate_keypair();
-        let pubkeys = vec![kp.public_key.clone()];
-
-        let tmp = TempDir::new().unwrap();
-        let input_path = tmp.path().join("big.dar");
-        let output_path = tmp.path().join("big.dar.age");
-
-        // Build the input by streaming chunks to disk (not one big Vec)
-        // and hash as we go, so even test setup doesn't allocate a
-        // slice-sized buffer.
-        let mut f = fs::File::create(&input_path).unwrap();
-        let mut expected_hasher = Sha256::new();
-        let mut total_len: u64 = 0;
-        for i in 0..256u64 {
-            // Vary content per block so this isn't just N copies of one
-            // block — a stronger check that hashing/streaming sees the
-            // *whole* input in order, not just its first buffer's worth.
-            let mut block = [0xABu8; 64 * 1024];
-            block[0] = (i % 256) as u8;
-            block[1] = ((i / 256) % 256) as u8;
-            f.write_all(&block).unwrap();
-            expected_hasher.update(block);
-            total_len += block.len() as u64;
-        }
-        drop(f);
-        let expected_sha_plain = format!("{:x}", expected_hasher.finalize());
-
-        let info = encrypt_file_streaming(&input_path, &output_path, &pubkeys).unwrap();
-        assert_eq!(info.plain_size, total_len as i64);
-        assert_eq!(info.sha256_plain, expected_sha_plain);
-
-        // Round-trip the whole thing back, streaming the comparison too.
-        let identity: age::x25519::Identity = kp.secret_key.parse().unwrap();
-        let ct_file = fs::File::open(&output_path).unwrap();
-        let decryptor = age::Decryptor::new(ct_file).unwrap();
-        let mut reader = decryptor
-            .decrypt(std::iter::once(&identity as &dyn age::Identity))
-            .unwrap();
-        let mut actual_hasher = Sha256::new();
-        let mut buf = [0u8; 64 * 1024];
-        let mut decrypted_len: u64 = 0;
-        loop {
-            let n = reader.read(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            actual_hasher.update(&buf[..n]);
-            decrypted_len += n as u64;
-        }
-        assert_eq!(decrypted_len, total_len);
-        assert_eq!(
-            format!("{:x}", actual_hasher.finalize()),
-            expected_sha_plain
-        );
-    }
-
-    #[test]
-    fn stream_copy_surfaces_a_mid_stream_reader_error_instead_of_finishing() {
-        // The precondition `encrypt_file_streaming` relies on to keep
-        // `.finish()` from ever running on a partial stream: `stream_copy`
-        // must propagate a reader error via `?` rather than treating a
-        // failed read as EOF. A fixture `Read` impl that fails after its
-        // first chunk (the same "injectable failure, not real fault
-        // injection" style `MemStore`'s simulated ENOSPC already uses in
-        // `src/store.rs` to make the tape ENOSPC abort path unit-testable
-        // with no hardware) stands in for any real mid-file I/O error.
-        struct FlakyReader {
-            served: bool,
-        }
-        impl Read for FlakyReader {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if !self.served {
-                    self.served = true;
-                    let n = buf.len().min(4096);
-                    for b in &mut buf[..n] {
-                        *b = 0x42;
-                    }
-                    Ok(n)
-                } else {
-                    Err(std::io::Error::other("simulated mid-stream I/O failure"))
-                }
-            }
-        }
-
-        let kp = crate::crypto::keys::generate_keypair();
-        let pubkeys = vec![kp.public_key.clone()];
-        let tmp = TempDir::new().unwrap();
-        let output_path = tmp.path().join("partial.dar.age");
-
-        let encryptor = build_encryptor(&pubkeys).unwrap();
-        let hashing_output = HashingWriter::new(fs::File::create(&output_path).unwrap());
-        let mut writer = encryptor.wrap_output(hashing_output).unwrap();
-        let result = stream_copy(&mut FlakyReader { served: false }, &mut writer);
-
-        assert!(
-            result.is_err(),
-            "flaky reader's error must propagate, not be swallowed"
-        );
-        // `writer` (and its `.finish()`) is never reached here, by
-        // construction — `result` came back via `?` inside `stream_copy`
-        // before control could ever return to a `.finish()` call site.
-        // `encrypt_file_streaming` is structured the same way: `?` on
-        // `stream_copy`'s result runs before the single `.finish()` call
-        // in the function, so an error here always skips finish rather
-        // than finishing a partial STREAM into a falsely-valid file.
-    }
-
-    #[test]
-    fn a_bad_recipient_key_errors_before_any_output_file_is_created() {
-        // Recipient parsing happens before the input is even opened, so a
-        // malformed pubkey must fail cleanly with nothing written to
-        // `output_path` — mirrors `encrypt_data`'s existing
-        // `encrypt_rejects_malformed_pubkey` behavior (tests/failure_modes.rs)
-        // for the streaming path.
-        let tmp = TempDir::new().unwrap();
-        let input_path = tmp.path().join("slice.dar");
-        let output_path = tmp.path().join("slice.dar.age");
-        fs::write(&input_path, b"irrelevant content").unwrap();
-
-        let result =
-            encrypt_file_streaming(&input_path, &output_path, &["not-an-age-key".to_string()]);
-
-        assert!(result.is_err(), "malformed pubkey must error");
-        assert!(
-            !output_path.exists(),
-            "no output file should be created before recipients are validated"
-        );
-    }
-
-    // --- walk_directory: symlinks and special files (issue #33/H7) --------
-    //
-    // `walk_directory` used to record every non-directory entry as an
-    // undifferentiated "file": for a symlink, `entry.metadata()` (never
-    // follows — `WalkDir::follow_links(false)`) reports `size = len(target
-    // string)`, not any real content size, and `is_dir = false`. The
-    // validator (`staging::validate::check_source_size`) then compared that
-    // recorded size against `std::fs::metadata`'s *followed* size — a
-    // symlink whose target-string length differs from its target's content
-    // size produced a false DIRTY (the mhvtl gate's exact fixture:
-    // `target.txt` is 7 bytes, `link-ok`'s target string "target.txt" is 10
-    // characters). The fix classifies each entry by filesystem type so the
-    // validator can filter on that recorded fact instead of re-deriving
-    // (and potentially re-disagreeing on) type information of its own.
 
     #[test]
     fn walk_directory_records_symlink_file_type_target_and_excludes_it_from_total_size() {
@@ -3251,10 +2788,11 @@ mod tests {
 
     // ── issue #54: stage failure hygiene ──
 
-    /// Proves the leak: a failure *after* `dar -c` has written every
-    /// plaintext `.dar` slice but *before* the encryption loop starts — the
-    /// worst case, where every slice is orphaned as plaintext. Before the
-    /// change-2 fix, those `.dar` files are never cleaned up.
+    /// A failure after dar has finished — every slice written and recorded,
+    /// the stage not yet finalized — leaves nothing in staging. Before issue
+    /// #54 the plaintext `.dar` slices dar had written then were never
+    /// cleaned up; since issue #370 there are none, and the recorded `.age`
+    /// slices are what the cleanup must remove.
     ///
     /// The failure is injected right after dar (`failpoint::AFTER_DAR`).
     /// It used to be injected with a tenant that had no active keys, until
@@ -3263,7 +2801,7 @@ mod tests {
     /// catalogue directory before dar (dar writes the catalogue into it).
     /// The cleanup also removes that directory.
     #[test]
-    fn stage_create_failure_orphans_plaintext_dar_slices() {
+    fn a_failure_after_dar_leaves_nothing_in_staging() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
@@ -3288,7 +2826,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::write(
             src.join("f.txt"),
-            b"content that will be orphaned as plaintext",
+            b"content that will be orphaned unless cleaned up",
         )
         .unwrap();
 
@@ -3306,6 +2844,7 @@ mod tests {
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         // The injected post-dar failure (see the doc comment).
         failpoint::arm(failpoint::AFTER_DAR);
+        failpoint::observe_staging_after_dar();
         let result = stage_create(&conn, &paths, &config, snap_id, false);
 
         assert!(
@@ -3313,10 +2852,8 @@ mod tests {
             "expected stage_create to fail at the injected point, got {result:?}"
         );
 
-        // Positive control: the failure must have come AFTER dar, or there
-        // were never any plaintext slices to leak and the assertion below
-        // would pass vacuously. `dar_command` is recorded right after a
-        // successful `dar -c`.
+        // Positive control: the failure must have come AFTER dar, with its
+        // slices written, or the assertion below would pass vacuously.
         let dar_ran: bool = conn
             .query_row(
                 "SELECT dar_command IS NOT NULL FROM stage_sets WHERE snapshot_id = ?1",
@@ -3328,21 +2865,20 @@ mod tests {
             dar_ran,
             "the injected failure must land after dar -c, got: {result:?}"
         );
+        assert_eq!(
+            failpoint::staging_after_dar().map(|names| names.len()),
+            Some(1),
+            "positive control: one slice was in staging when the failure hit"
+        );
 
         let leaked: Vec<_> = fs::read_dir(&staging_dir)
             .unwrap()
             .flatten()
-            .filter(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                name.ends_with(".dar") || name.ends_with(".sha512")
-            })
+            .map(|e| e.file_name())
             .collect();
-
         assert!(
             leaked.is_empty(),
-            "expected the change-2 cleanup fix to have removed every orphaned \
-             plaintext .dar/.sha512 file — found: {:?}",
-            leaked.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+            "the failed stage set's files are all removed — found: {leaked:?}"
         );
 
         // Issue #419: dar wrote this stage set's on-the-fly catalogue into its
@@ -3443,7 +2979,17 @@ mod tests {
         let failed_slice = staging_dir.join(format!("{base12}_v1_s{failed_set}.1.dar"));
         let sibling_slice = staging_dir.join(format!("{base12}_v1_s{sibling_set}.1.dar"));
         let sibling_hash = staging_dir.join(format!("{base12}_v1_s{sibling_set}.1.dar.sha512"));
-        for f in [&failed_slice, &sibling_slice, &sibling_hash] {
+        // Issue #370: the `.dar.age` being written has no row yet, so it is
+        // found by the same prefix rule.
+        let failed_age = staging_dir.join(format!("{base12}_v1_s{failed_set}.1.dar.age"));
+        let sibling_age = staging_dir.join(format!("{base12}_v1_s{sibling_set}.1.dar.age"));
+        for f in [
+            &failed_slice,
+            &sibling_slice,
+            &sibling_hash,
+            &failed_age,
+            &sibling_age,
+        ] {
             fs::write(f, b"x").unwrap();
         }
 
@@ -3463,14 +3009,21 @@ mod tests {
             sibling_hash.exists(),
             "the sibling's hash file must survive this cleanup for the same reason"
         );
+        assert!(
+            !failed_age.exists(),
+            "the failed set's unrecorded .age is removed"
+        );
+        assert!(
+            sibling_age.exists(),
+            "a sibling stage set's slice being written survives"
+        );
     }
 
-    /// Issue #377: a file-backed catalog with one `staging` stage set, a
-    /// plaintext slice and its freshly written `.age` — the state
-    /// `record_encrypted_slice` is called in. Returns
-    /// `(tmp, db_path, conn, config, stage_set_id, dar, age)`.
+    /// Issue #377: a file-backed catalog with one `staging` stage set and a
+    /// freshly written `.age` — the state `record_encrypted_slice` is called
+    /// in. Returns `(tmp, db_path, conn, config, stage_set_id, age)`.
     #[allow(clippy::type_complexity)]
-    fn slice_being_recorded() -> (TempDir, PathBuf, Connection, Config, i64, PathBuf, PathBuf) {
+    fn slice_being_recorded() -> (TempDir, PathBuf, Connection, Config, i64, PathBuf) {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("tapectl.db");
         let conn = crate::db::open(&db_path).unwrap();
@@ -3489,11 +3042,9 @@ mod tests {
                  VALUES (1, 1024, 'none', 1);"
         ))
         .unwrap();
-        let dar = staging_dir.join(format!("{}.1.dar", archive_base_name(uuid, 1, 1)));
-        let age = PathBuf::from(format!("{}.age", dar.display()));
-        fs::write(&dar, b"plaintext").unwrap();
+        let age = staging_dir.join(format!("{}.1.dar.age", archive_base_name(uuid, 1, 1)));
         fs::write(&age, b"ciphertext").unwrap();
-        (tmp, db_path, conn, config, 1, dar, age)
+        (tmp, db_path, conn, config, 1, age)
     }
 
     fn slice_info() -> EncryptedSliceInfo {
@@ -3516,37 +3067,31 @@ mod tests {
         max_pause: std::time::Duration::from_millis(50),
     };
 
-    /// Issue #377 item 1: the row is recorded BEFORE the plaintext goes, so
-    /// a busy INSERT can never leave an `.age` that no row names. With the
-    /// write lock held past the retry budget, the `.age` is removed and the
-    /// plaintext kept (the prefix-keyed cleanup finds it); released — the
-    /// positive control — the same call records the row and only then
-    /// deletes the plaintext.
+    /// Issue #377 item 1: a busy INSERT can never leave an `.age` that no
+    /// row names. With the write lock held past the retry budget, the `.age`
+    /// is removed; released — the positive control — the same call records
+    /// the row.
     #[test]
     fn a_busy_slice_insert_leaves_no_age_file_without_a_row() {
-        let (_tmp, db_path, conn, _config, stage_set_id, dar, age) = slice_being_recorded();
+        let (_tmp, db_path, conn, _config, stage_set_id, age) = slice_being_recorded();
         conn.pragma_update(None, "busy_timeout", 20).unwrap();
         let holder = Connection::open(&db_path).unwrap();
         holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-        let err = record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &dar, &age, &slice_info())
-            .unwrap_err();
+        let err =
+            record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &age, &slice_info()).unwrap_err();
         assert!(matches!(err, TapectlError::CatalogBusy(_)), "{err:?}");
         assert_eq!(slice_rows(&conn), 0);
         assert!(
             !age.exists(),
             "an .age no row names must not be left behind"
         );
-        assert!(
-            dar.exists(),
-            "the plaintext stays for the prefix-keyed cleanup"
-        );
 
         holder.execute_batch("ROLLBACK").unwrap();
         fs::write(&age, b"ciphertext").unwrap();
-        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &dar, &age, &slice_info()).unwrap();
+        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &age, &slice_info()).unwrap();
         assert_eq!(slice_rows(&conn), 1);
-        assert!(age.exists() && !dar.exists());
+        assert!(age.exists());
     }
 
     /// Issue #377 item 2: a lock error after slices are encrypted never
@@ -3555,9 +3100,9 @@ mod tests {
     /// does clean them up.
     #[test]
     fn a_busy_error_keeps_the_stage_sets_files_and_any_other_error_cleans_them() {
-        let (tmp, _db_path, conn, config, stage_set_id, dar, age) = slice_being_recorded();
+        let (tmp, _db_path, conn, config, stage_set_id, age) = slice_being_recorded();
         let paths = TapectlPaths::new(tmp.path().join("home"));
-        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &dar, &age, &slice_info()).unwrap();
+        record_encrypted_slice(&conn, QUICK, stage_set_id, 1, &age, &slice_info()).unwrap();
 
         let busy_err = TapectlError::CatalogBusy("the stage set's finalization".into());
         after_failed_stage(&conn, &paths, &config, stage_set_id, &busy_err);
@@ -3854,130 +3399,6 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0, "refused before the stage_sets INSERT");
-    }
-
-    /// Issue #354 (a), the encryption half: the `.age` file is written into
-    /// the staging directory, and a failure there (ENOSPC is the likely one
-    /// in practice) must name both slice paths and the operation, once.
-    #[test]
-    fn a_slice_encryption_io_failure_names_the_paths_once() {
-        let tmp = TempDir::new().unwrap();
-        let input = tmp.path().join("slice.1.dar");
-        fs::write(&input, b"plaintext slice").unwrap();
-        let output = tmp.path().join("no-such-dir").join("slice.1.dar.age");
-        let kp = crate::crypto::keys::generate_keypair();
-
-        let Err(err) = encrypt_file_streaming(&input, &output, &[kp.public_key]) else {
-            panic!("encrypting into a directory that does not exist must fail");
-        };
-        let msg = as_operator_sees_it(err);
-        assert!(
-            msg.contains(&*output.to_string_lossy()) && msg.contains(&*input.to_string_lossy()),
-            "the error must name the slice and its .age: {msg}"
-        );
-        assert!(msg.contains("cannot encrypt"), "names the operation: {msg}");
-        assert_eq!(os_error_mentions(&msg), 1, "printed once: {msg}");
-    }
-
-    /// Issue #354 (a): the staging filesystem filling up WHILE the `.age` is
-    /// written — not at `File::create` — must name the paths too. The age
-    /// header is written by `wrap_output`, and the last (for a slice under
-    /// 64 KiB, the only) chunk by `finish`; both used to surface as
-    /// `Encryption` strings naming neither file — `encryption error:
-    /// wrap_output failed: failed to write header: ...` and `encryption
-    /// error: finish failed: No space left on device (os error 28)`.
-    ///
-    /// The output is a symlink to `/dev/full`, where every write is ENOSPC.
-    /// Never the device itself: on failure `encrypt_file_streaming` removes
-    /// its output path, which would unlink `/dev/full` under root.
-    #[test]
-    fn a_full_staging_filesystem_while_encrypting_names_the_paths_once() {
-        if !Path::new("/dev/full").exists() {
-            eprintln!("skipping: no /dev/full");
-            return;
-        }
-        let tmp = TempDir::new().unwrap();
-        let input = tmp.path().join("slice.1.dar");
-        fs::write(&input, b"plaintext slice").unwrap();
-        let output = tmp.path().join("slice.1.dar.age");
-        std::os::unix::fs::symlink("/dev/full", &output).unwrap();
-        let kp = crate::crypto::keys::generate_keypair();
-
-        let Err(err) = encrypt_file_streaming(&input, &output, &[kp.public_key]) else {
-            panic!("every write to /dev/full fails");
-        };
-        let msg = as_operator_sees_it(err);
-        assert!(
-            msg.contains(&*output.to_string_lossy()) && msg.contains(&*input.to_string_lossy()),
-            "the error must name the slice and its .age: {msg}"
-        );
-        assert!(
-            msg.contains("cannot encrypt") && !msg.contains("wrap_output failed"),
-            "names the operation, in the operator's terms: {msg}"
-        );
-        // age writes the header itself and flattens the io error into its
-        // own text ("failed to write header: IoError(Os { .. })"), so the
-        // cause is there in age's words, not as "(os error 28)" — once.
-        assert_eq!(
-            msg.matches("No space left on device").count(),
-            1,
-            "the cause, printed once: {msg}"
-        );
-        assert!(
-            Path::new("/dev/full").exists(),
-            "the device itself is untouched"
-        );
-    }
-
-    /// A writer that accepts `budget` bytes in all, then fails with ENOSPC —
-    /// a staging filesystem filling up partway through one `.age`.
-    struct FillsUpAfter {
-        budget: usize,
-        accepted: usize,
-    }
-    impl Write for FillsUpAfter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if self.accepted + buf.len() > self.budget {
-                return Err(std::io::Error::from_raw_os_error(
-                    nix::errno::Errno::ENOSPC as i32,
-                ));
-            }
-            self.accepted += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// The `finish` half of the test above: the header fits, then the final
-    /// chunk does not. The failure must come out as an io error, which
-    /// `encrypt_file_streaming` rewrites to name both paths — not as an
-    /// `Encryption` string it passes through without them.
-    #[test]
-    fn running_out_of_space_at_the_final_chunk_is_an_io_error() {
-        let kp = crate::crypto::keys::generate_keypair();
-        let plaintext = vec![7u8; 8 * 1024]; // under one 64 KiB STREAM chunk
-        let mut out = FillsUpAfter {
-            budget: 4096,
-            accepted: 0,
-        };
-
-        let err = encrypt_stream(
-            build_encryptor(&[kp.public_key]).unwrap(),
-            &plaintext[..],
-            &mut out,
-        )
-        .err()
-        .expect("8 KiB of ciphertext cannot fit a 4 KiB budget");
-        assert!(
-            out.accepted > 0,
-            "fixture: the header must have been written, so the failure is finish's"
-        );
-        assert!(
-            matches!(err, TapectlError::Io(_)),
-            "an ENOSPC in finish must reach the path-naming wrapper as io: {err:?}"
-        );
     }
 
     /// The complement of the refusal above, and the ordering story issue
@@ -5287,8 +4708,10 @@ mod tests {
     }
 
     /// Issue #386: inside a progress session, `stage create` records its
-    /// five phases in order against the stage set and writes them into the
-    /// stage report; validate and encrypt count the bytes they read.
+    /// phases in order against the stage set and writes them into the stage
+    /// report; validate counts the source bytes it reads, and archive (dar,
+    /// slicing and encryption in one pass since issue #370) the bytes of
+    /// dar's stream.
     #[test]
     fn stage_create_records_its_phases_in_the_catalog_and_the_report() {
         let tmp = TempDir::new().unwrap();
@@ -5302,7 +4725,7 @@ mod tests {
 
         let rows = crate::db::phase_timings::latest_for_stage_set(&conn, stage_set_id).unwrap();
         let names: Vec<&str> = rows.iter().map(|r| r.phase.as_str()).collect();
-        assert_eq!(names, ["validate", "dar", "catalog", "encrypt", "finalize"]);
+        assert_eq!(names, ["validate", "archive", "catalog", "finalize"]);
         assert!(rows
             .iter()
             .all(|r| r.outcome == "ok" && r.operation == "stage create"));
@@ -5313,8 +4736,8 @@ mod tests {
             rows[0]
         );
         assert!(
-            rows[3].bytes.unwrap_or(0) > 0,
-            "encrypt counts the plaintext it reads"
+            rows[1].bytes.unwrap_or(0) > 0,
+            "archive counts the stream it reads"
         );
 
         let report = fs::read_dir(&paths.stage_reports_dir)
@@ -5331,31 +4754,197 @@ mod tests {
         }
     }
 
-    /// Issue #409: every `.age` reaches stable storage BEFORE its
-    /// `stage_slices` row is written and its plaintext deleted, and the
-    /// isolated dar catalogue is synced right after `dar -C`, before any
-    /// slice is encrypted. Nothing was synced before: a power loss inside
-    /// the writeback window left a short slice and no plaintext. Driven
-    /// through a real stage (real dar) cut into several slices; the order is
-    /// read off the pipeline's own durability log.
+    /// Issue #370: dar writes nothing under the staging directory. When dar
+    /// has finished, the staging directory holds only `.age` ciphertext —
+    /// before, it held the whole plaintext archive as `.dar` slices until
+    /// each was encrypted and deleted.
     #[test]
-    fn every_slice_is_synced_before_it_is_recorded_and_its_plaintext_deleted() {
-        use durability::Event;
-
+    fn when_dar_finishes_staging_holds_only_ciphertext() {
         let tmp = TempDir::new().unwrap();
         let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
         config.defaults.slice_size = "64K".to_string();
-        // Incompressible, so dar's slicing is not undone by compression.
+        fs::write(src.join("noise.bin"), noise(200 * 1024)).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        failpoint::observe_staging_after_dar();
+        stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+        let names = failpoint::staging_after_dar().expect("the stage reached dar's end");
+        assert!(
+            names.len() >= 2,
+            "positive control: several slices exist when dar ends: {names:?}"
+        );
+        for name in &names {
+            assert!(
+                name.ends_with(".dar.age"),
+                "only ciphertext may be in staging when dar ends, found {name}: {names:?}"
+            );
+        }
+    }
+
+    /// Issue #370: the recorded dar command (MANIFEST.toml's `dar_command`)
+    /// is dar's archive on standard output, with retry-on-change off and the
+    /// on-the-fly catalogue, and names no path under the staging directory.
+    #[test]
+    fn the_recorded_dar_command_writes_to_stdout_and_names_no_staging_path() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("f.txt"), b"command content").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+        let cmd: String = conn
+            .query_row(
+                "SELECT dar_command FROM stage_sets WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(cmd.contains(r#""-c" "-""#), "{cmd}");
+        assert!(cmd.contains(r#""--retry-on-change" "0""#), "{cmd}");
+        assert!(cmd.contains(r#""-@""#), "{cmd}");
+        assert!(
+            cmd.contains(&src.to_string_lossy().into_owned()),
+            "positive control: the source is named: {cmd}"
+        );
+        let staging = Path::new(&config.staging.directory);
+        for spelling in [staging.to_path_buf(), staging.canonicalize().unwrap()] {
+            assert!(
+                !cmd.contains(&*spelling.to_string_lossy()),
+                "dar is given no path under the staging directory: {cmd}"
+            );
+        }
+    }
+
+    /// Issue #370: a source file that changes while dar reads it refuses the
+    /// stage as DIRTY (dar runs with `--retry-on-change 0` and exits 11),
+    /// and no slice is left in staging. Before, dar retried the file and a
+    /// change that outlasted the retries failed as a bare dar error.
+    #[test]
+    fn a_file_changing_while_dar_reads_it_refuses_the_stage_as_dirty() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        let busy = src.join("busy.bin");
+        fs::write(&busy, noise(48 << 20)).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        // Touch the file without changing its size or content, as fast as
+        // possible, for as long as the stage runs.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toucher = {
+            let stop = stop.clone();
+            let busy = busy.clone();
+            std::thread::spawn(move || {
+                let f = fs::File::options().write(true).open(&busy).unwrap();
+                let mut t = std::time::SystemTime::now();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    t += std::time::Duration::from_millis(1);
+                    let _ = f.set_modified(t);
+                }
+            })
+        };
+        let result = stage_create(&conn, &paths, &config, snap_id, false);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        toucher.join().unwrap();
+
+        let err = result.expect_err("a file changing under dar refuses the stage");
+        assert!(err.to_string().contains("DIRTY"), "{err}");
+        let left: Vec<_> = fs::read_dir(&config.staging.directory)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "nothing is left in staging: {left:?}");
+    }
+
+    /// Issue #370: slices cut from dar's stream are dar slices. Decrypted
+    /// (what an heir does with `age -d`), `dar -t` accepts them, and
+    /// `dar -x` restores the source exactly — the path RESTORE.sh takes,
+    /// unchanged. Several slices, a subdirectory, a symlink and an empty file.
+    #[test]
+    fn streamed_slices_restore_with_dar_alone() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        config.defaults.slice_size = "64K".to_string();
+        fs::create_dir_all(src.join("sub/deeper")).unwrap();
+        fs::write(src.join("noise.bin"), noise(300 * 1024)).unwrap();
+        fs::write(src.join("sub/deeper/text.txt"), b"some text\n".repeat(500)).unwrap();
+        fs::write(src.join("sub/empty"), b"").unwrap();
+        std::os::unix::fs::symlink("deeper/text.txt", src.join("sub/link")).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+
+        let archive = decrypt_staged_set(&conn, &paths, id, &tmp.path().join("plain"));
+        assert!(
+            tmp.path().join("plain/arch.3.dar").exists(),
+            "positive control: several slices"
+        );
+        let dar = |args: &[&std::ffi::OsStr]| {
+            let out = std::process::Command::new("dar")
+                .args(args)
+                .output()
+                .expect("dar must be on PATH (tests/test_dependencies.rs)");
+            assert!(
+                out.status.success(),
+                "dar {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        dar(&["-t".as_ref(), archive.as_os_str(), "-Q".as_ref()]);
+        let restored = tmp.path().join("restored");
+        fs::create_dir_all(&restored).unwrap();
+        dar(&[
+            "-x".as_ref(),
+            archive.as_os_str(),
+            "-R".as_ref(),
+            restored.as_os_str(),
+            "-O".as_ref(),
+            "-Q".as_ref(),
+        ]);
+        for rel in [
+            "noise.bin",
+            "sub/deeper/text.txt",
+            "sub/empty",
+            ".tapectl-unit.toml",
+        ] {
+            assert_eq!(
+                fs::read(restored.join(rel)).unwrap(),
+                fs::read(src.join(rel)).unwrap(),
+                "{rel} restored exactly"
+            );
+        }
+        assert_eq!(
+            fs::read_link(restored.join("sub/link")).unwrap(),
+            Path::new("deeper/text.txt")
+        );
+    }
+
+    /// Incompressible bytes, deterministic.
+    fn noise(len: usize) -> Vec<u8> {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        let noise: Vec<u8> = (0..200 * 1024)
+        (0..len)
             .map(|_| {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
                 x as u8
             })
-            .collect();
-        fs::write(src.join("noise.bin"), &noise).unwrap();
+            .collect()
+    }
+
+    /// Issue #409: every `.age` reaches stable storage BEFORE its
+    /// `stage_slices` row is written, and the isolated dar catalogue is
+    /// synced once it is re-isolated. Driven through a real stage (real dar)
+    /// cut into several slices; the order is read off the pipeline's own
+    /// durability log. Since issue #370 there is no plaintext slice to
+    /// delete: none is ever written (`when_dar_finishes_staging_holds_only_ciphertext`).
+    #[test]
+    fn every_slice_is_synced_before_it_is_recorded() {
+        use durability::Event;
+
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        config.defaults.slice_size = "64K".to_string();
+        // Incompressible, so the archive spans several slices.
+        fs::write(src.join("noise.bin"), noise(200 * 1024)).unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
 
         let _ = durability::take();
@@ -5383,21 +4972,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("{e:?} is not in the durability log: {log:?}"))
         };
         for age in &ages {
-            // `{base}.N.dar.age` -> `{base}.N.dar`, the plaintext it came from.
-            let plain = age.with_extension("");
             let synced = at(&Event::Synced(age.clone()));
             let recorded = at(&Event::Recorded(age.clone()));
-            let unlinked = at(&Event::Unlinked(plain.clone()));
             assert!(
-                synced < recorded && recorded < unlinked,
-                "{}: synced at {synced}, recorded at {recorded}, plaintext unlinked at \
-                 {unlinked} — the sync must come first: {log:?}",
+                synced < recorded,
+                "{}: synced at {synced}, recorded at {recorded} — the sync must come \
+                 first: {log:?}",
                 age.display()
-            );
-            assert!(
-                !plain.exists(),
-                "the plaintext is gone: {}",
-                plain.display()
             );
         }
 
@@ -5408,17 +4989,11 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        let catalogue_synced = log
-            .iter()
-            .position(|e| {
-                matches!(e, Event::Synced(p)
-                    if p.to_string_lossy().starts_with(&format!("{catalogue}."))
-                        && p.to_string_lossy().ends_with(".dar"))
-            })
-            .unwrap_or_else(|| panic!("the dar catalogue was never synced: {log:?}"));
         assert!(
-            catalogue_synced < at(&Event::Synced(ages[0].clone())),
-            "the catalogue is synced after `dar -C`, before the slices are encrypted: {log:?}"
+            log.iter().any(|e| matches!(e, Event::Synced(p)
+                if p.to_string_lossy().starts_with(&format!("{catalogue}."))
+                    && p.to_string_lossy().ends_with(".dar"))),
+            "the dar catalogue was never synced: {log:?}"
         );
     }
 

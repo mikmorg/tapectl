@@ -1,15 +1,23 @@
-use std::path::{Path, PathBuf};
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
+use std::path::Path;
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tracing::info;
 
 use crate::error::{Result, TapectlError};
 
 /// Parameters for a dar archive creation.
+///
+/// There is no archive path: dar writes its archive to standard output
+/// (`-c -`) and tapectl frames and encrypts it (`dar::slice`,
+/// `staging::files`; issue #370). Nothing here names the staging directory,
+/// so dar has no way to write there.
 pub struct DarCreateParams<'a> {
     pub dar_binary: &'a str,
     pub source_path: &'a Path,
-    pub archive_base: &'a Path,
-    pub slice_size: &'a str,
     pub compression: &'a str,
     pub exclude_patterns: &'a [String],
     pub exclude_paths: &'a [String],
@@ -26,22 +34,19 @@ pub struct DarCreateParams<'a> {
     pub on_fly_catalogue: &'a Path,
 }
 
-/// Result of a dar archive creation.
-pub struct DarCreateResult {
-    pub dar_version: String,
-    pub dar_command: String,
-    pub slice_paths: Vec<PathBuf>,
-    pub num_slices: usize,
-}
+/// dar's exit code when "some saved files have changed while dar was
+/// reading them" (`man dar`, EXIT CODES) — with `--retry-on-change 0`, a
+/// file that changed during its read is saved once, marked dirty.
+const EXIT_FILES_CHANGED: i32 = 11;
 
-/// Create a dar archive.
-pub fn create_archive(params: &DarCreateParams) -> Result<DarCreateResult> {
-    let ver = super::version::check(params.dar_binary)?;
-
+/// The `dar -c -` command for `params`.
+pub fn create_command(params: &DarCreateParams) -> Command {
     let mut cmd = super::command(params.dar_binary);
-    cmd.arg("-c").arg(params.archive_base);
+    // The archive goes to standard output (issue #370). dar refuses `-s`
+    // there ("Slicing (-s option), is not compatible with archive on
+    // standard output"), so the slicing is tapectl's (`dar::slice`).
+    cmd.arg("-c").arg("-");
     cmd.arg("-R").arg(params.source_path);
-    cmd.arg("-s").arg(params.slice_size);
 
     if params.compression != "none" {
         // dar's `-z` takes an OPTIONAL argument, so getopt only sees it when
@@ -91,132 +96,246 @@ pub fn create_archive(params: &DarCreateParams) -> Result<DarCreateResult> {
     for path in params.exclude_paths {
         cmd.arg("-P").arg(path);
     }
+    // A file that changes while dar reads it is saved once, marked dirty,
+    // and dar exits 11, which stage create refuses as DIRTY (ADR-0012,
+    // 2026-10-06 amendment item 4). dar's default retries it — on a pipe by
+    // appending the file again, so the bytes of every failed attempt would
+    // ride to tape as waste.
+    cmd.arg("--retry-on-change").arg("0");
     cmd.arg("-@").arg(params.on_fly_catalogue);
+    cmd
+}
 
-    let command_str = format!("{cmd:?}");
-    info!(command = %command_str, "running dar");
+/// A running `dar -c -`: its archive is read from [`DarStream::take_stdout`]
+/// as it is produced.
+///
+/// The `Child` is waited on by the thread that spawned it, which holds this
+/// value — dar's parent-death signal is tied to that thread
+/// ([`super::command`], issue #404). Dropping a `DarStream` that was not
+/// [`finish`](DarStream::finish)ed stops dar.
+pub struct DarStream {
+    child: Option<Child>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<JoinHandle<Vec<u8>>>,
+    /// `dar --version`'s version line.
+    pub dar_version: String,
+    /// The command as run, for `stage_sets.dar_command`.
+    pub dar_command: String,
+}
 
-    // Issue #404: hours on a large unit, so a signal stops dar rather than
-    // waiting for it.
-    let output = super::run_interruptible(&mut cmd, || {
-        format!(
-            "dar was stopped while archiving {}",
-            params.source_path.display()
-        )
-    })?;
+/// How a `dar -c -` that ran to the end of its archive exited.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DarFinish {
+    /// Exit 0: every file was read unchanged.
+    Complete,
+    /// Exit 11: at least one file changed while dar read it. The archive
+    /// is whole, but the file is saved as it was mid-change.
+    FilesChanged {
+        /// What dar said about it, a few lines of its stderr.
+        detail: String,
+    },
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(TapectlError::Dar(format!(
-            "dar -c failed (exit {}): {}",
-            output.status,
-            stderr.lines().take(5).collect::<Vec<_>>().join("\n")
-        )));
-    }
-
-    let slices = list_slices(params.archive_base)?;
-    let num_slices = slices.len();
-
-    Ok(DarCreateResult {
+/// Start `dar -c -` for `params`, its archive on a pipe.
+pub fn spawn_archive(params: &DarCreateParams) -> Result<DarStream> {
+    let ver = super::version::check(params.dar_binary)?;
+    let mut cmd = create_command(params);
+    let dar_command = format!("{cmd:?}");
+    info!(command = %dar_command, "running dar");
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| TapectlError::Dar(format!("cannot run dar: {e}")))?;
+    let stdout = child.stdout.take();
+    let stderr = super::drain(child.stderr.take());
+    Ok(DarStream {
+        child: Some(child),
+        stdout,
+        stderr: Some(stderr),
         dar_version: ver.full_string,
-        dar_command: command_str,
-        slice_paths: slices,
-        num_slices,
+        dar_command,
     })
 }
 
-/// Parses `name` as a dar slice filename for `stem`, matching exactly
-/// `{stem}.<digits>.dar` — anchored on both ends via `strip_prefix`/
-/// `strip_suffix` rather than a substring/prefix test, so lookalikes don't
-/// slip through: `{stem}_old.dar` and `{stem}2.4.dar` (a longer, different
-/// stem) fail at the mandatory separating dot; `{stem}.backup.dar` and
-/// `{stem}.notanumber.dar` fail at the numeric parse. Returns `None` for
-/// anything that isn't an exact match; `list_slices` treats `None` as "not
-/// a slice of this archive," not an error.
-fn parse_slice_number(name: &str, stem: &str) -> Option<u32> {
-    let rest = name.strip_prefix(stem)?;
-    let rest = rest.strip_prefix('.')?;
-    let digits = rest.strip_suffix(".dar")?;
-    digits.parse().ok()
+/// The first few lines of dar's stderr, for an error message.
+fn excerpt(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// List dar slice files for an archive base path.
-///
-/// Matches only dar's own exact naming, `{stem}.<N>.dar` — dar numbers
-/// slices from 1 (confirmed against the dar man page:
-/// docs/research/2026-07-21-ontape-format-and-write-design.md §F1) — and
-/// returns them ordered by the *parsed* integer N, not lexicographic
-/// filename order. Lexicographic order sorts "base.10.dar" before
-/// "base.2.dar", desyncing from dar's real numbering once an archive
-/// reaches 10 slices; every individual slice still passes its own
-/// checksum, so the corruption this produces downstream is entirely
-/// silent (issue #34/H8).
-///
-/// The returned Vec's *position*, not just its order, is load-bearing:
-/// `staging::stage_create` derives each `stage_slices.slice_number` as
-/// `index + 1` against this Vec (src/staging/mod.rs), rather than
-/// re-parsing the filename itself. That means this function must return a
-/// clean `1..=N` run — no gap, no duplicate, no stray zero (dar counts
-/// from 1, so a `.0.` slice is already out of range) — or the index-based
-/// slice_number the caller records silently stops matching dar's real
-/// slice index. Any deviation errors loudly instead of guessing an order:
-/// proceeding quietly is exactly the failure mode #34 exists to close. An
-/// empty result (nothing matched at all) errors the same way rather than
-/// reporting a silent zero-slice archive — this function is only ever
-/// called right after a successful `dar -c`, which always emits >=1 slice,
-/// so finding none means something upstream is already wrong.
-pub fn list_slices(archive_base: &Path) -> Result<Vec<PathBuf>> {
-    let dir = archive_base
-        .parent()
-        .ok_or_else(|| TapectlError::Dar("invalid archive base path".to_string()))?;
-    let stem = archive_base
-        .file_name()
-        .ok_or_else(|| TapectlError::Dar("invalid archive base path".to_string()))?
-        .to_string_lossy();
+/// dar's standard output, read so that a signal to tapectl is noticed even
+/// while dar writes nothing (issue #404): each read waits for data at most
+/// [`STOP_POLL_MS`] at a time, checking for a stop in between. A stop ends
+/// the read with [`STOPPED`].
+pub struct DarOutput {
+    inner: ChildStdout,
+}
 
-    let mut numbered: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter_map(|p| {
-            let name = p.file_name()?.to_string_lossy();
-            let n = parse_slice_number(&name, &stem)?;
-            Some((n, p))
-        })
-        .collect();
+/// How long one wait for dar's output lasts before tapectl checks for a stop.
+const STOP_POLL_MS: i32 = 100;
 
-    numbered.sort_by_key(|(n, _)| *n);
+/// The error text a [`DarOutput`] read ends with when tapectl is asked to
+/// stop. Not `ErrorKind::Interrupted`, which readers retry.
+pub const STOPPED: &str = "stopped by a signal while reading dar's archive";
 
-    if numbered.is_empty() {
-        return Err(TapectlError::Dar(format!(
-            "no dar slices found for archive \"{stem}\" in {} — expected at \
-             least \"{stem}.1.dar\"",
-            dir.display()
-        )));
+impl Read for DarOutput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if crate::signal::is_interrupted() {
+                return Err(io::Error::other(STOPPED));
+            }
+            let mut fd = nix::libc::pollfd {
+                fd: self.inner.as_raw_fd(),
+                events: nix::libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd for an fd this value owns.
+            let ready = unsafe { nix::libc::poll(&mut fd, 1, STOP_POLL_MS) };
+            if ready < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if ready > 0 {
+                // Data, or the writer closed the pipe (read returns 0).
+                return self.inner.read(buf);
+            }
+        }
     }
+}
 
-    for (i, (n, _)) in numbered.iter().enumerate() {
-        let expected = (i + 1) as u32;
-        if *n != expected {
-            let found: Vec<u32> = numbered.iter().map(|(n, _)| *n).collect();
-            return Err(TapectlError::Dar(format!(
-                "dar slice numbering for archive \"{stem}\" is not a clean \
-                 1..={total} run: expected slice {expected} at position \
-                 {position} (1-based), found slice {n} instead — all parsed \
-                 slice numbers: {}. Refusing to guess an order: a \
-                 gap, duplicate, or out-of-range slice number means dar did \
-                 not produce what tapectl expected.",
-                found
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                total = numbered.len(),
-                position = i + 1,
-            )));
+impl DarStream {
+    /// dar's standard output: the archive. Taken once.
+    pub fn take_stdout(&mut self) -> DarOutput {
+        DarOutput {
+            inner: self.stdout.take().expect("dar's stdout is taken once"),
         }
     }
 
-    Ok(numbered.into_iter().map(|(_, p)| p).collect())
+    /// The operating-system process id of dar.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    fn stderr(&mut self) -> Vec<u8> {
+        self.stderr
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default()
+    }
+
+    /// Wait for dar to exit, once its archive has been read to the end. A
+    /// signal to tapectl meanwhile stops dar (issue #404).
+    pub fn finish(mut self) -> Result<DarFinish> {
+        drop(self.stdout.take());
+        let mut child = self.child.take().expect("dar is waited on once");
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if crate::signal::is_interrupted() {
+                super::terminate(&mut child);
+                let _ = self.stderr();
+                return Err(TapectlError::Interrupted(
+                    "dar was stopped while finishing its archive".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let stderr = self.stderr();
+        match status.code() {
+            Some(0) => Ok(DarFinish::Complete),
+            Some(EXIT_FILES_CHANGED) => Ok(DarFinish::FilesChanged {
+                detail: excerpt(&stderr),
+            }),
+            _ if crate::signal::is_interrupted() => Err(TapectlError::Interrupted(
+                "dar was stopped while archiving".into(),
+            )),
+            _ => Err(TapectlError::Dar(format!(
+                "dar -c failed (exit {status}): {}",
+                excerpt(&stderr)
+            ))),
+        }
+    }
+
+    /// Stop dar because the archive's consumer failed. If dar had already
+    /// failed on its own — a short archive is how its failure reaches the
+    /// consumer — that failure is returned, as the one to report.
+    pub fn abort(mut self) -> Option<TapectlError> {
+        // Closing the pipe first lets a dar blocked on a write fail with
+        // EPIPE instead of waiting out the grace period.
+        drop(self.stdout.take());
+        let mut child = self.child.take()?;
+        let failed = match child.try_wait() {
+            Ok(Some(status)) if !status.success() => Some(status),
+            Ok(Some(_)) => None,
+            _ => {
+                super::terminate(&mut child);
+                None
+            }
+        };
+        let stderr = self.stderr();
+        failed.map(|status| {
+            TapectlError::Dar(format!(
+                "dar -c failed (exit {status}): {}",
+                excerpt(&stderr)
+            ))
+        })
+    }
+}
+
+impl Drop for DarStream {
+    fn drop(&mut self) {
+        drop(self.stdout.take());
+        if let Some(mut child) = self.child.take() {
+            super::terminate(&mut child);
+        }
+        let _ = self.stderr();
+    }
+}
+
+/// Test-only: archive `params` into plaintext dar slices `{base}.N.dar` of
+/// `slice_size` — the staging pipeline's dar run and framing, minus the
+/// encryption — returning the slice count. For tests that read an archive
+/// back with `dar -l`/`-x`.
+#[cfg(test)]
+pub(crate) fn archive_to_files(
+    params: &DarCreateParams,
+    base: &Path,
+    slice_size: &str,
+) -> Result<u32> {
+    let work = tempfile::tempdir()?;
+    let template = super::slice::template(params.dar_binary, slice_size, work.path())?;
+    let mut dar = spawn_archive(params)?;
+    let stdout = dar.take_stdout();
+    let cut = super::slice::cut_stream(
+        stdout,
+        &template,
+        |n| {
+            Ok(std::fs::File::create(format!(
+                "{}.{n}.dar",
+                base.display()
+            ))?)
+        },
+        |_, _| Ok(()),
+        |_| Ok(()),
+    );
+    match cut {
+        Ok(summary) => match dar.finish()? {
+            DarFinish::Complete => Ok(summary.slices),
+            DarFinish::FilesChanged { detail } => Err(TapectlError::Dar(detail)),
+        },
+        Err(e) => Err(dar.abort().unwrap_or(e)),
+    }
 }
 
 /// Run dar -t (test archive integrity).
@@ -268,188 +387,41 @@ pub fn reisolate_catalogue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::process::Command;
 
-    /// Touches `dir/name` as an empty file. `list_slices` only inspects
-    /// filenames, so fixture content is irrelevant — this lets these tests
-    /// pin down slice ordering/matching at 11+ slices without invoking dar.
-    fn touch(dir: &Path, name: &str) {
-        File::create(dir.join(name)).unwrap();
-    }
-
-    fn names_of(slices: &[PathBuf]) -> Vec<String> {
-        slices
-            .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
-            .collect()
-    }
-
-    #[test]
-    fn parse_slice_number_matches_the_exact_pattern_only() {
-        assert_eq!(parse_slice_number("base.1.dar", "base"), Some(1));
-        assert_eq!(parse_slice_number("base.42.dar", "base"), Some(42));
-        assert_eq!(parse_slice_number("base.007.dar", "base"), Some(7));
-        assert_eq!(parse_slice_number("base_old.dar", "base"), None);
-        assert_eq!(parse_slice_number("base.backup.dar", "base"), None);
-        assert_eq!(parse_slice_number("base2.4.dar", "base"), None);
-        assert_eq!(parse_slice_number("base.notanumber.dar", "base"), None);
-        assert_eq!(parse_slice_number("base.dar", "base"), None);
-        assert_eq!(parse_slice_number("base..dar", "base"), None);
-    }
-
-    // --- issue #34/H8: list_slices used to sort lexicographically and
-    // match by prefix. Lexicographic sort desyncs from dar's real slice
-    // index once an archive reaches 10 slices ("base.10.dar" < "base.2.dar"
-    // as strings), and prefix matching lets foreign leftover files ride
-    // along as if they were slices of this archive. Both defects are
-    // checksum-invisible: every individual slice still hashes correctly,
-    // so the corruption only surfaces when dar tries to reassemble slices
-    // in an order it never produced.
-    //
-    // The tests below call only `list_slices` (not any private helper) so
-    // they compile and run unmodified against the pre-fix body too.
-
-    #[test]
-    fn slice_number_matches_dars_numeric_index_at_eleven_slices() {
-        // The regression test issue #34 names by name: staging::mod's
-        // `stage_create` derives `stage_slices.slice_number` as
-        // `vec_position + 1` (see src/staging/mod.rs), so position i in
-        // this Vec MUST be dar's own slice (i+1) or the recorded
-        // slice_number silently stops matching the real file.
-        let tmp = tempfile::tempdir().unwrap();
-        let stem = "base";
-        for n in 1..=11 {
-            touch(tmp.path(), &format!("{stem}.{n}.dar"));
-        }
-
-        let slices = list_slices(&tmp.path().join(stem)).unwrap();
-        assert_eq!(slices.len(), 11);
-        for (i, path) in slices.iter().enumerate() {
-            let expected_name = format!("{stem}.{}.dar", i + 1);
-            let actual_name = path.file_name().unwrap().to_str().unwrap();
-            assert_eq!(
-                actual_name,
-                expected_name,
-                "position {i} (would be recorded as slice_number {}) must be \
-                 dar's slice {expected_name}, found {actual_name} instead",
-                i + 1
-            );
+    fn params<'a>(src: &'a Path, on_fly: &'a Path) -> DarCreateParams<'a> {
+        DarCreateParams {
+            dar_binary: "dar",
+            source_path: src,
+            compression: "none",
+            exclude_patterns: &[],
+            exclude_paths: &[],
+            preserve_xattrs: true,
+            preserve_fsa: true,
+            on_fly_catalogue: on_fly,
         }
     }
 
+    /// Issue #370: the archive goes to standard output, a file changing
+    /// mid-read is not retried, and the catalogue is isolated on the fly.
+    /// No slice size is passed: dar refuses `-s` with `-c -`.
     #[test]
-    fn ordering_is_numeric_not_lexicographic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let stem = "base";
-        for n in 1..=10 {
-            touch(tmp.path(), &format!("{stem}.{n}.dar"));
-        }
-
-        let names = names_of(&list_slices(&tmp.path().join(stem)).unwrap());
-        let pos_2 = names.iter().position(|n| n == "base.2.dar").unwrap();
-        let pos_10 = names.iter().position(|n| n == "base.10.dar").unwrap();
-        assert!(
-            pos_2 < pos_10,
-            "base.2.dar must precede base.10.dar numerically, got order {names:?}"
-        );
-    }
-
-    #[test]
-    fn foreign_lookalike_files_are_excluded() {
-        let tmp = tempfile::tempdir().unwrap();
-        let stem = "base";
-        touch(tmp.path(), &format!("{stem}.1.dar"));
-        touch(tmp.path(), &format!("{stem}.2.dar"));
-        touch(tmp.path(), &format!("{stem}_old.dar")); // no separating dot
-        touch(tmp.path(), &format!("{stem}.backup.dar")); // non-numeric middle
-        touch(tmp.path(), &format!("{stem}2.4.dar")); // different stem entirely
-        touch(tmp.path(), &format!("{stem}.notanumber.dar")); // non-numeric middle
-
-        let names = names_of(&list_slices(&tmp.path().join(stem)).unwrap());
-        assert_eq!(
-            names,
-            vec!["base.1.dar".to_string(), "base.2.dar".to_string()],
-            "foreign leftovers must not be treated as slices of this archive"
-        );
-    }
-
-    #[test]
-    fn a_gap_in_slice_numbers_errors_loudly_naming_stem_and_found_numbers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let stem = "base";
-        touch(tmp.path(), &format!("{stem}.1.dar"));
-        touch(tmp.path(), &format!("{stem}.2.dar"));
-        // .3.dar deliberately missing
-        touch(tmp.path(), &format!("{stem}.4.dar"));
-
-        let err = list_slices(&tmp.path().join(stem)).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains(stem), "error must name the stem: {msg}");
-        assert!(
-            msg.contains("expected slice 3"),
-            "error must name the missing/expected index: {msg}"
-        );
-        assert!(
-            msg.contains('4'),
-            "error must surface what was actually found: {msg}"
-        );
-        // Issue #357: the list in words, not Rust's `{:?}` of a Vec — the
-        // Debug form `[1, 2, 4]` contains "1, 2, 4" too, so the period that
-        // follows the list is what tells them apart.
-        assert!(
-            msg.contains("all parsed slice numbers: 1, 2, 4."),
-            "the parsed slice numbers, listed plainly: {msg}"
-        );
-        assert!(!msg.contains('['), "no Debug rendering of the list: {msg}");
-    }
-
-    #[test]
-    fn a_duplicate_slice_number_errors_loudly() {
-        let tmp = tempfile::tempdir().unwrap();
-        let stem = "base";
-        touch(tmp.path(), &format!("{stem}.1.dar"));
-        touch(tmp.path(), &format!("{stem}.2.dar"));
-        touch(tmp.path(), &format!("{stem}.02.dar")); // leading zero: also parses to 2
-        touch(tmp.path(), &format!("{stem}.3.dar"));
-
-        let err = list_slices(&tmp.path().join(stem)).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains(stem), "error must name the stem: {msg}");
-    }
-
-    #[test]
-    fn a_zero_slice_number_errors_loudly() {
-        // dar numbers slices from 1 (confirmed against the dar man page:
-        // docs/research/2026-07-21-ontape-format-and-write-design.md §F1),
-        // so a `.0.` slice is out of dar's range and must not be silently
-        // accepted as if it were slice 1.
-        let tmp = tempfile::tempdir().unwrap();
-        let stem = "base";
-        touch(tmp.path(), &format!("{stem}.0.dar"));
-        touch(tmp.path(), &format!("{stem}.1.dar"));
-        touch(tmp.path(), &format!("{stem}.2.dar"));
-
-        let err = list_slices(&tmp.path().join(stem)).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains(stem), "error must name the stem: {msg}");
-    }
-
-    #[test]
-    fn zero_matching_slices_errors_loudly_instead_of_reporting_an_empty_archive() {
-        // list_slices is only ever called right after a successful `dar -c`
-        // (see create_archive above), which always emits >=1 slice (dar
-        // numbers from 1). Finding nothing that matches after a successful
-        // dar run means something is fundamentally wrong (wrong directory,
-        // stem mismatch) -- silently returning Ok(vec![]) would let
-        // create_archive report num_slices=0 with no error at all, which is
-        // exactly the silent-proceed failure class #34 exists to close.
-        let tmp = tempfile::tempdir().unwrap();
-        touch(tmp.path(), "unrelated.txt");
-
-        let err = list_slices(&tmp.path().join("base")).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("base"), "error must name the stem: {msg}");
+    fn dar_archives_to_stdout_without_retries_or_slicing() {
+        let cmd = create_command(&params(Path::new("/src"), Path::new("/home/cat/onfly")));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[..2], ["-c", "-"], "{args:?}");
+        let after = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+        };
+        assert_eq!(after("--retry-on-change").as_deref(), Some("0"));
+        assert_eq!(after("-@").as_deref(), Some("/home/cat/onfly"));
+        assert_eq!(after("-R").as_deref(), Some("/src"));
+        assert!(!args.iter().any(|a| a == "-s"), "{args:?}");
     }
 
     /// `dar -l -alist-ea` for the archive at `base`: one line per entry,
@@ -475,18 +447,16 @@ mod tests {
     fn archive_with(src: &Path, out: &Path, preserve_xattrs: bool, preserve_fsa: bool) -> String {
         std::fs::create_dir_all(out).unwrap();
         let base = out.join("arch");
-        create_archive(&DarCreateParams {
-            dar_binary: "dar",
-            source_path: src,
-            archive_base: &base,
-            slice_size: "10G",
-            compression: "none",
-            exclude_patterns: &[],
-            exclude_paths: &[],
-            preserve_xattrs,
-            preserve_fsa,
-            on_fly_catalogue: &out.join("onfly"),
-        })
+        let on_fly = out.join("onfly");
+        archive_to_files(
+            &DarCreateParams {
+                preserve_xattrs,
+                preserve_fsa,
+                ..params(src, &on_fly)
+            },
+            &base,
+            "1G",
+        )
         .unwrap();
         dar_listing(&base)
     }

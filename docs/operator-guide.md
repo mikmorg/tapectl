@@ -414,8 +414,8 @@ of every staged slice under `--prewrite-hash`, a size check otherwise),
 seal marker at the end, one rewind, then every file in a single forward pass)
 and `health-sweep`; a resume has `drive-open`, `revalidate`, `identify` (the File 0
 and seal checks) and `positioning` in place of the build and pre-write steps,
-and the log names each file as it is written. `stage create` has `validate`, `dar`, `catalog`,
-`encrypt` and `finalize`.
+and the log names each file as it is written. `stage create` has `validate`, `archive` (dar,
+slicing and encryption in one pass), `catalog` and `finalize`.
 
 Every such command also writes a **session log**, whether or not anything
 was shown: `<home>/logs/<UTC start>-<command>-<label>-<pid>.log` (mode 0600,

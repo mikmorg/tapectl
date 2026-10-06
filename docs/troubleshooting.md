@@ -835,11 +835,10 @@ costs nothing more. A refusal after it has cost the sha256 pass: the hard
 refusal, and with `compression = "none"` also an `N` at the prompt or a
 non-interactive refusal. It leaves the attempt's stage set for the next
 tapectl command to mark `failed`, and a `WARN` line says so each time. If the disk fills
-anyway, the failure comes from dar (`dar error: dar -c failed …`) or from
-encryption:
+anyway, the failure names the slice being written:
 
 ```text
-error: cannot encrypt <directory>/<slice>.dar to <directory>/<slice>.dar.age: No space left on device (os error 28)
+error: cannot write staged slice <directory>/<slice>.dar.age: No space left on device (os error 28)
 ```
 
 The half-built stage set's files are removed either way.
@@ -858,6 +857,21 @@ error: BITROT suspected: <path> — sha256 differs at an unchanged size (<n> byt
 current=<sha>. Refusing to stage; investigate before re-staging (`tapectl unit check-integrity <unit>` checks
 every file against its recorded baseline).
 ```
+
+A file that changes while dar is reading it refuses the stage too. tapectl
+runs dar with `--retry-on-change 0`, so dar saves no half-changed copy and
+exits 11, which `stage create` reports as:
+
+```text
+error: DIRTY: a source file of unit "<unit>" changed while dar was reading it (dar exit 11). tapectl runs dar
+with --retry-on-change 0, so a file caught mid-change is refused rather than archived half-changed. dar said:
+<dar's lines>
+Nothing was staged. Stage again once the source is quiet; if the change is real, take a new snapshot (`tapectl
+snapshot create <unit>`) and stage that.
+```
+
+Stop whatever is writing to the source (a sync client, a download, an
+editor's autosave), then stage again.
 
 For a real edit or a deleted file, take a new snapshot and stage that:
 
