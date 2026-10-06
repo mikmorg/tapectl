@@ -1935,6 +1935,24 @@ the second run's slices. For such a unit:
 - a normal restore (tapectl or RESTORE.sh) is unaffected: it reads the
   catalogue inside the last slice.
 
+### `catalog rebuild`: `the catalog's stage set is not the one on this tape`
+
+```text
+error: slice <n> of stage set <id>: the catalog records ciphertext sha256 <sha> but this tape carries
+<sha> — the catalog's stage set is not the one on this tape; the rebuild was rolled back
+```
+
+A Version staged twice (for example, re-staged for a later copy) has two stage
+sets, and because each staging encrypts afresh, their slices differ byte for
+byte even though the content is the same. `catalog rebuild` tells them apart by
+the first slice's ciphertext hash: a tape whose first slice matches no stage
+set of that Version gets a stage set of its own. This refusal means the first
+slice matched but a later one did not, so the catalog's record of that stage set
+contradicts the tape. No catalog row is added or changed; only the drive
+contact is recorded. Verify the tape (`tapectl volume verify <label>`), which
+checks the tape against its own front index; if it passes, the catalog's rows
+are the ones in doubt.
+
 ---
 
 ## Audit findings

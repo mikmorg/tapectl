@@ -18,7 +18,7 @@ use std::path::Path;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
-use tapectl::crypto::keys::generate_keypair;
+use tapectl::crypto::keys::{generate_keypair, GeneratedKeypair};
 use tapectl::db;
 use tapectl::staging;
 use tapectl::store::{MemStore, Tier};
@@ -87,7 +87,14 @@ enum CatalogDb {
 }
 
 struct SealedVolume {
+    /// File 0's label — [`LABEL`] unless the test wrote a second tape.
+    label: String,
     store: MemStore,
+    /// The catalog that WROTE this tape, kept open (issue #379: a rebuild
+    /// into a live catalog that still holds the stage set). Declared before
+    /// its directory so it closes first.
+    source_conn: rusqlite::Connection,
+    _source_dir: tempfile::TempDir,
     operator_secret: String,
     escrow_secret: String,
     escrow_public: String,
@@ -98,14 +105,18 @@ struct SealedVolume {
     expected_plain_hashes: Vec<(String, String)>,
 }
 
-fn insert_tenant(conn: &rusqlite::Connection, name: &str, is_operator: bool) -> TenantFixture {
+fn insert_tenant_keyed(
+    conn: &rusqlite::Connection,
+    name: &str,
+    is_operator: bool,
+    kp: GeneratedKeypair,
+) -> TenantFixture {
     conn.execute(
         "INSERT INTO tenants (name, is_operator, status) VALUES (?1, ?2, 'active')",
         rusqlite::params![name, is_operator as i64],
     )
     .unwrap();
     let tenant_id = conn.last_insert_rowid();
-    let kp = generate_keypair();
     conn.execute(
         "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
          VALUES (?1, ?2, ?3, ?4, 'primary', 1)",
@@ -155,17 +166,78 @@ fn build_sealed_volume_full(
     mam_serial: &str,
     cartridge_identity_source: Option<&str>,
 ) -> SealedVolume {
+    build_tape(TapeSpec {
+        catalog_db,
+        mam_serial,
+        cartridge_identity_source,
+        label: LABEL,
+        volume_uuid: VOL_UUID,
+        keys: &FixtureKeys::fresh(),
+    })
+}
+
+/// The four keypairs one fixture tape is written with. Two tapes of the same
+/// catalog (issue #379) share one set, so one operator key opens both.
+struct FixtureKeys {
+    operator: GeneratedKeypair,
+    alpha: GeneratedKeypair,
+    bravo: GeneratedKeypair,
+    escrow: GeneratedKeypair,
+}
+
+fn copy_keypair(kp: &GeneratedKeypair) -> GeneratedKeypair {
+    GeneratedKeypair {
+        public_key: kp.public_key.clone(),
+        secret_key: kp.secret_key.clone(),
+        fingerprint: kp.fingerprint.clone(),
+    }
+}
+
+impl FixtureKeys {
+    fn fresh() -> Self {
+        FixtureKeys {
+            operator: generate_keypair(),
+            alpha: generate_keypair(),
+            bravo: generate_keypair(),
+            escrow: generate_keypair(),
+        }
+    }
+}
+
+/// Everything [`build_tape`] varies.
+struct TapeSpec<'a> {
+    catalog_db: CatalogDb,
+    mam_serial: &'a str,
+    cartridge_identity_source: Option<&'a str>,
+    label: &'a str,
+    volume_uuid: &'a str,
+    keys: &'a FixtureKeys,
+}
+
+/// Run the production write session for [`UNITS`] at version 7 into a
+/// `MemStore`, in a catalog of its own. Each call stages afresh, so two
+/// calls write the same content under different ciphertext — exactly what
+/// re-staging a Version for a later copy produces (issue #379).
+fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
+    let TapeSpec {
+        catalog_db,
+        mam_serial,
+        cartridge_identity_source,
+        label,
+        volume_uuid,
+        keys,
+    } = spec;
     let db_dir = tempfile::tempdir().unwrap();
     let conn = db::open(&db_dir.path().join("src.db")).unwrap();
 
-    let operator = insert_tenant(&conn, "operator", true);
-    let alpha = insert_tenant(&conn, "alpha", false);
-    let bravo = insert_tenant(&conn, "bravo", false);
+    let operator = insert_tenant_keyed(&conn, "operator", true, copy_keypair(&keys.operator));
+    let alpha = insert_tenant_keyed(&conn, "alpha", false, copy_keypair(&keys.alpha));
+    let bravo = insert_tenant_keyed(&conn, "bravo", false, copy_keypair(&keys.bravo));
 
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
          VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'active')",
-        rusqlite::params![LABEL],
+        rusqlite::params![label],
     )
     .unwrap();
     let volume_id = conn.last_insert_rowid();
@@ -173,7 +245,7 @@ fn build_sealed_volume_full(
     // ADR-0005's permanent escrow recipient — a recipient of every SLICE
     // and every envelope, so attestation (trial-decrypting a slice header
     // with the escrow key) has something true to find.
-    let escrow = generate_keypair();
+    let escrow = copy_keypair(&keys.escrow);
 
     let slices_dir = tempfile::tempdir().unwrap();
     let mut build_units = Vec::new();
@@ -327,8 +399,8 @@ fn build_sealed_volume_full(
 
     let tenants = [alpha, bravo];
     let inputs = BuildInputs {
-        label: LABEL.to_string(),
-        volume_uuid: VOL_UUID.to_string(),
+        label: label.to_string(),
+        volume_uuid: volume_uuid.to_string(),
         media_type: "LTO-6".to_string(),
         tapectl_version: "0.1.0-test".to_string(),
         created_at: "2026-09-11T00:00:00Z".to_string(),
@@ -417,7 +489,10 @@ fn build_sealed_volume_full(
     }
 
     SealedVolume {
+        label: label.to_string(),
         store,
+        source_conn: conn,
+        _source_dir: db_dir,
         operator_secret: operator.secret_key,
         escrow_secret: escrow.secret_key,
         escrow_public: escrow.public_key,
@@ -514,7 +589,7 @@ fn rebuild_observing(
         conn,
         &mut vol.store,
         &[identity],
-        Some(LABEL),
+        Some(&vol.label),
         "recovered",
         Some("lto0"),
         scratch,
@@ -2638,5 +2713,226 @@ fn a_rebuild_does_not_call_a_still_covered_unit_zero() {
     assert!(
         !detail.contains("ZERO copies"),
         "nothing went to zero here: {detail}"
+    );
+}
+
+// ── Issue #379: two stage sets of one Version on two tapes ───────────────
+
+const LABEL_B: &str = "REBUILD02";
+const VOL_UUID_B: &str = "66666666-7777-8888-9999-000000000000";
+
+/// Version 7 of every unit, staged and written to tape A, then staged AGAIN
+/// and written to tape B — what re-staging a Version for a later copy
+/// produces. Same content, same unit uuids, same keys; fresh age file keys,
+/// so different ciphertext. Different chip serials: these are two
+/// cartridges, and one serial would make tape B's rebuild displace tape A.
+fn two_tapes_of_one_version() -> (SealedVolume, SealedVolume) {
+    let keys = FixtureKeys::fresh();
+    let a = build_tape(TapeSpec {
+        catalog_db: CatalogDb::New,
+        mam_serial: "SERIAL-A",
+        cartridge_identity_source: Some("mam"),
+        label: LABEL,
+        volume_uuid: VOL_UUID,
+        keys: &keys,
+    });
+    let b = build_tape(TapeSpec {
+        catalog_db: CatalogDb::New,
+        mam_serial: "SERIAL-B",
+        cartridge_identity_source: Some("mam"),
+        label: LABEL_B,
+        volume_uuid: VOL_UUID_B,
+        keys: &keys,
+    });
+    (a, b)
+}
+
+/// Restore's own selection for every unit on `vol`, then restore's own
+/// ciphertext check on every slice it selects: read the tape file at the
+/// catalog's position, bound it to the catalog's `encrypted_bytes`, and
+/// compare its sha256 with the catalog's `sha256_encrypted` — what
+/// `volume::restore`'s `read_slice_inner` does before anything is
+/// decrypted. A catalog whose rows belong to another tape fails here exactly
+/// as a restore from that tape would.
+fn assert_restorable_from(conn: &rusqlite::Connection, vol: &mut SealedVolume) {
+    use tapectl::store::Store;
+    for (unit_name, _, _) in UNITS {
+        let selection =
+            tapectl::volume::restore::select_write_positions(conn, unit_name, &vol.label, None)
+                .unwrap_or_else(|e| {
+                    panic!("restore cannot resolve {unit_name} on {}: {e}", vol.label)
+                });
+        assert_eq!(selection.version, 7);
+        assert_eq!(selection.positions.len(), 2, "{unit_name} on {}", vol.label);
+        for p in &selection.positions {
+            let mut bytes = Vec::new();
+            vol.store
+                .read_file(p.position.parse().unwrap(), &mut bytes)
+                .unwrap();
+            bytes.truncate(p.encrypted_bytes as usize);
+            assert_eq!(
+                sha256_hex(&bytes),
+                p.sha256_encrypted,
+                "{unit_name} slice {} on {}: the tape's ciphertext does not match the catalog's \
+                 hash, so a restore would refuse it as corrupt",
+                p.slice_number,
+                vol.label
+            );
+        }
+    }
+}
+
+fn unit_id(conn: &rusqlite::Connection, unit_name: &str) -> i64 {
+    conn.query_row(
+        "SELECT id FROM units WHERE name = ?1",
+        rusqlite::params![unit_name],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// The unit's copy count through the one shared expression (per Version:
+/// a unit is as covered as its least-covered live version).
+fn copies(conn: &rusqlite::Connection, unit_name: &str) -> i64 {
+    let sql = format!(
+        "SELECT {}",
+        tapectl::policy::coverage::copy_count_expr(
+            &tapectl::policy::coverage::CoverageQuery::current_unit("?1")
+        )
+    );
+    conn.query_row(&sql, rusqlite::params![unit_id(conn, unit_name)], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+fn stage_sets_of_v7(conn: &rusqlite::Connection, unit_name: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+         WHERE s.unit_id = ?1 AND s.version = 7",
+        rusqlite::params![unit_id(conn, unit_name)],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn assert_two_tapes_rebuilt(
+    conn: &rusqlite::Connection,
+    a: &mut SealedVolume,
+    b: &mut SealedVolume,
+) {
+    assert_restorable_from(conn, a);
+    assert_restorable_from(conn, b);
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(
+            stage_sets_of_v7(conn, unit_name),
+            2,
+            "{unit_name}: each tape carries its own stage set of v7"
+        );
+        assert_eq!(
+            copies(conn, unit_name),
+            2,
+            "{unit_name}: v7 is on two tapes"
+        );
+    }
+}
+
+/// Issue #379: the catalog is lost and rebuilt from both tapes, tape A
+/// first. Keyed on the snapshot alone, tape B's positions attached to tape
+/// A's slice rows, and every slice of tape B then failed its ciphertext
+/// hash against the catalog.
+#[test]
+fn two_stage_sets_of_one_version_rebuild_apart_a_then_b() {
+    let (mut a, mut b) = two_tapes_of_one_version();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = a.operator_secret.clone();
+
+    rebuild(&conn, &mut a, &secret, scratch.path()).expect("rebuild tape A");
+    let report = rebuild(&conn, &mut b, &secret, scratch.path()).expect("rebuild tape B");
+    assert_eq!(
+        report.stage_sets,
+        UNITS.len(),
+        "tape B's stage sets are new: {report:?}"
+    );
+    assert_two_tapes_rebuilt(&conn, &mut a, &mut b);
+
+    // And a re-run of either tape is still a no-op: the key that told the
+    // two stage sets apart also finds each one again.
+    assert!(rebuild(&conn, &mut a, &secret, scratch.path())
+        .unwrap()
+        .is_noop());
+    assert!(rebuild(&conn, &mut b, &secret, scratch.path())
+        .unwrap()
+        .is_noop());
+}
+
+/// The same, tape B first.
+#[test]
+fn two_stage_sets_of_one_version_rebuild_apart_b_then_a() {
+    let (mut a, mut b) = two_tapes_of_one_version();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = a.operator_secret.clone();
+
+    rebuild(&conn, &mut b, &secret, scratch.path()).expect("rebuild tape B");
+    rebuild(&conn, &mut a, &secret, scratch.path()).expect("rebuild tape A");
+    assert_two_tapes_rebuilt(&conn, &mut a, &mut b);
+}
+
+/// Issue #379: tape B rebuilt into the LIVE catalog that wrote tape A and
+/// still holds tape A's stage set of the same Version.
+#[test]
+fn a_second_stage_set_rebuilds_beside_the_live_one_it_shares_a_version_with() {
+    let (mut a, mut b) = two_tapes_of_one_version();
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = a.operator_secret.clone();
+    // Tape A's live catalog, as the real write session and confirm left it.
+    let live = std::mem::replace(
+        &mut a.source_conn,
+        rusqlite::Connection::open_in_memory().unwrap(),
+    );
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(stage_sets_of_v7(&live, unit_name), 1);
+    }
+
+    let report = rebuild(&live, &mut b, &secret, scratch.path()).expect("rebuild tape B");
+    assert_eq!(report.stage_sets, UNITS.len(), "{report:?}");
+    assert_two_tapes_rebuilt(&live, &mut a, &mut b);
+}
+
+/// Issue #379's second criterion: a slice row whose number matches but
+/// whose ciphertext does not is never silently reused. Here the catalog's
+/// stage set is tape A's (found by its first slice), but its second slice
+/// row has been altered — the rebuild refuses and changes nothing.
+#[test]
+fn a_slice_row_with_the_same_number_but_other_ciphertext_is_refused() {
+    let (mut a, _) = two_tapes_of_one_version();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = a.operator_secret.clone();
+    rebuild(&conn, &mut a, &secret, scratch.path()).expect("first rebuild");
+
+    conn.execute(
+        "UPDATE stage_slices SET sha256_encrypted = 'feedface' WHERE slice_number = 2",
+        [],
+    )
+    .unwrap();
+    let before = row_counts(&conn);
+
+    let err = rebuild(&conn, &mut a, &secret, scratch.path())
+        .expect_err("a slice row with other ciphertext must not be reused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("feedface") && msg.contains("rolled back"),
+        "the refusal names both hashes: {msg}"
+    );
+    assert_eq!(
+        before,
+        row_counts(&conn),
+        "a refused rebuild changes nothing"
     );
 }

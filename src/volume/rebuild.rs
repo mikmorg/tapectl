@@ -668,15 +668,26 @@ fn attest_escrow(
     firsts.sort_by_key(|(_, first)| first.tape_position);
 
     for (unit, first) in firsts {
+        // The stage set whose first slice IS the one about to be read (issue
+        // #379): a Version can have several stage sets, and attesting one
+        // from another's slice header would record a claim no slice of it
+        // demonstrated.
         let stage_set_id: Option<i64> = tx
             .query_row(
                 "SELECT ss.id FROM stage_sets ss
                  JOIN snapshots s ON s.id = ss.snapshot_id
                  JOIN units u ON u.id = s.unit_id
+                 JOIN stage_slices sl ON sl.stage_set_id = ss.id
                  WHERE u.name = ?1 AND s.version = ?2
+                   AND sl.slice_number = ?3 AND sl.sha256_encrypted = ?4
                    AND ss.origin = 'rebuilt' AND ss.key_fingerprints IS NULL
                  LIMIT 1",
-                params![unit.name, unit.snapshot_version],
+                params![
+                    unit.name,
+                    unit.snapshot_version,
+                    first.number,
+                    first.sha256_encrypted
+                ],
                 |r| r.get(0),
             )
             .optional()?;
@@ -1226,12 +1237,33 @@ fn ensure_stage_set(
 ) -> Result<i64> {
     // The manifest's `stage_set_id` is an id in the DB that WROTE the tape
     // and means nothing here; reusing it would collide with live rows. The
-    // stable key is the snapshot.
-    if let Some(id) = existing_id(
-        tx,
-        "SELECT id FROM stage_sets WHERE snapshot_id = ?1 ORDER BY id LIMIT 1",
-        params![snapshot_id],
-    )? {
+    // snapshot (unit uuid + version) narrows it to one Version, but a
+    // Version can have several stage sets (issue #379): re-staged for a
+    // later copy, each staging encrypts under fresh age file keys, so two
+    // tapes carrying identical content carry different ciphertext. What
+    // tells them apart is the ciphertext itself, so the key is the snapshot
+    // plus the first slice's `sha256_encrypted` — keyed on the snapshot
+    // alone, tape B's positions attached to tape A's slice rows and tape B
+    // then read as corrupt against them.
+    let first = unit.slices.iter().min_by_key(|s| s.number);
+    let existing = match first {
+        Some(first) => existing_id(
+            tx,
+            "SELECT ss.id FROM stage_sets ss
+             JOIN stage_slices sl ON sl.stage_set_id = ss.id
+             WHERE ss.snapshot_id = ?1 AND sl.slice_number = ?2 AND sl.sha256_encrypted = ?3
+             ORDER BY ss.id LIMIT 1",
+            params![snapshot_id, first.number, first.sha256_encrypted],
+        )?,
+        // A unit with no slices carries no ciphertext to tell its stage
+        // sets apart, and no slice row a mismatch could corrupt.
+        None => existing_id(
+            tx,
+            "SELECT id FROM stage_sets WHERE snapshot_id = ?1 ORDER BY id LIMIT 1",
+            params![snapshot_id],
+        )?,
+    };
+    if let Some(id) = existing {
         return Ok(id);
     }
     let slice_size = supplement
@@ -1275,11 +1307,29 @@ fn ensure_slice(
     stage_set_id: i64,
     report: &mut RebuildReport,
 ) -> Result<i64> {
-    if let Some(id) = existing_id(
-        tx,
-        "SELECT id FROM stage_slices WHERE stage_set_id = ?1 AND slice_number = ?2",
-        params![stage_set_id, slice.number],
-    )? {
+    let existing: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT id, sha256_encrypted FROM stage_slices
+             WHERE stage_set_id = ?1 AND slice_number = ?2",
+            params![stage_set_id, slice.number],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((id, sha256_encrypted)) = existing {
+        // Issue #379: a slice row is reused only when it is the SAME
+        // ciphertext. A matching number with a different hash means the
+        // catalog and this tape disagree about what the stage set holds;
+        // attaching the tape's position to the catalog's row would make the
+        // tape read as corrupt against it. Refused, and the transaction
+        // leaves the catalog as it was.
+        if sha256_encrypted != slice.sha256_encrypted {
+            return Err(TapectlError::Other(format!(
+                "slice {} of stage set {stage_set_id}: the catalog records ciphertext \
+                 sha256 {} but this tape carries {} — the catalog's stage set is not the \
+                 one on this tape; the rebuild was rolled back",
+                slice.number, sha256_encrypted, slice.sha256_encrypted
+            )));
+        }
         return Ok(id);
     }
     // `staging_path` stays NULL: the slice is on tape, not in staging, and a
