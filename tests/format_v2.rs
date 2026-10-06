@@ -1125,3 +1125,43 @@ fn keyed_heir_restore_matches_original_plaintext_exactly() {
         );
     }
 }
+
+/// ADR-0012 amendment item 15: a seal marker that requires a feature this
+/// tapectl does not know stops `Store::confirm` as inconclusive, naming the
+/// feature — never a misread, and never evidence that the medium is bad
+/// (which would quarantine a sound cartridge a newer tapectl wrote). A key
+/// nobody requires is read past, and the tape still confirms.
+#[test]
+fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
+    let h = shared_harness();
+    let last = h.store.files.len() - 1;
+    let seal = String::from_utf8_lossy(&h.store.files[last]).to_string();
+    assert!(seal.contains("\nrequires = []\n"), "a 1.1.0 seal states it");
+
+    let with = |s: String| {
+        let mut store = MemStore::new(BS as usize);
+        store.files = h.store.files.clone();
+        let mut bytes = s.into_bytes();
+        bytes.resize(h.store.files[last].len(), 0);
+        store.files[last] = bytes;
+        store
+            .confirm(&h.layout, Tier::Integrity)
+            .expect("Store::confirm reports via Evidence, never Err")
+    };
+
+    let evidence = with(seal.replacen("requires = []", "requires = [\"short-seal\"]", 1));
+    assert!(
+        evidence
+            .mismatches
+            .iter()
+            .any(|m| m.kind == MismatchKind::SealUnreadable && m.actual.contains("\"short-seal\"")),
+        "{:?}",
+        evidence.mismatches
+    );
+    assert!(!evidence.proves_medium_bad(), "{:?}", evidence.mismatches);
+
+    // Control: an unknown key that is not required changes nothing (the
+    // padded seal bytes are not hashed by anything on the tape).
+    let evidence = with(seal.replacen("requires = []", "requires = []\nended_after = 7", 1));
+    assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
+}

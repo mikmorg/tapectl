@@ -445,6 +445,8 @@ fn rebuild_contacted(
     let mut thunk = Vec::new();
     store.read_file(0, &mut thunk)?;
     let thunk_text = String::from_utf8_lossy(&thunk).to_string();
+    // Before anything else of it is interpreted (ADR-0012 item 15).
+    format::check_id_thunk_readable(&thunk_text)?;
     let ident = format::parse_id_thunk_identity(&thunk_text)?;
     let pointers = format::parse_id_thunk_layout_pointers(&thunk_text)?;
     let meta = format::parse_id_thunk_volume_meta(&thunk_text)?;

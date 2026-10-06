@@ -112,6 +112,18 @@ pos=$(cat "$T/pos")
 count=$(ls "$T/tape" | wc -l)
 case "$op" in
   rewind) echo 0 >"$T/pos" ;;
+  eod | eom) [ -z "${FAKE_MT_NO_EOD:-}" ] || exit 2; echo "$count" >"$T/pos" ;;
+  bsfm)
+    # Back over n filemarks, then forward over the last: the start of the
+    # file n-1 before this one (from inside a file, n-1 before it).
+    case "$pos" in
+      *+) p=${pos%+} ;;
+      *[!0-9]*) echo "?" >"$T/pos"; exit 1 ;;
+      *) p=$pos ;;
+    esac
+    to=$(( p - n + 1 ))
+    if [ "$to" -lt 0 ]; then echo 0 >"$T/pos"; exit 1; fi
+    echo "$to" >"$T/pos" ;;
   fsf)
     case "$pos" in
       *+) to=$(( ${pos%+} + n )) ;;
@@ -152,7 +164,13 @@ exit 0
 const FAKE_DD: &str = r#"#!/bin/sh
 T="$FAKE_TAPE"
 of=""
-for a in "$@"; do case "$a" in of=*) of=${a#of=} ;; esac; done
+count=""
+for a in "$@"; do
+  case "$a" in
+    of=*) of=${a#of=} ;;
+    count=*) count=${a#count=} ;;
+  esac
+done
 pos=$(cat "$T/pos")
 echo "dd $pos" >>"$T/ops"
 case "$pos" in
@@ -169,6 +187,12 @@ if [ "${FAKE_DD_FAIL:-none}" = "$pos" ]; then
 fi
 f="$T/tape/$pos"
 if [ ! -f "$f" ]; then echo "?" >"$T/pos"; exit 0; fi
+if [ -n "$count" ] && [ "$(wc -c <"$f")" -gt $((count * 524288)) ]; then
+  # A bounded read that stops inside the file.
+  if [ -n "$of" ]; then head -c $((count * 524288)) "$f" >"$of"; else head -c $((count * 524288)) "$f"; fi
+  echo "$pos+" >"$T/pos"
+  exit 0
+fi
 if [ -n "$of" ]; then
   cat "$f" >"$of" || { echo "?" >"$T/pos"; exit 1; }
 elif ! cat "$f"; then
@@ -1543,4 +1567,135 @@ fn path_restores_one_file_reading_only_its_slices_and_the_last() {
         .filter(|p| photos.positions.contains(p))
         .count();
     assert_eq!(slices, 0, "{:#?}", h.ops());
+}
+
+// ---- forward compatibility (ADR-0012 amendment item 15; #384) ----
+
+/// Rewrite a plaintext zone (File 0 or the seal marker) in place: `edit`
+/// maps its NUL-stripped text to new text, which is padded again.
+fn edit_text_file(h: &Heir, pos: i64, edit: impl Fn(&str) -> String) {
+    let f = h.dir.join("tape").join(pos.to_string());
+    let raw = std::fs::read(&f).unwrap();
+    let text = String::from_utf8(raw.into_iter().filter(|b| *b != 0).collect()).unwrap();
+    let new = edit(&text);
+    assert_ne!(new, text, "the edit changed nothing");
+    std::fs::write(&f, padded(new.into_bytes())).unwrap();
+}
+
+/// A 1.1.0 tape says what it requires, and requires nothing.
+#[test]
+fn a_new_tape_states_an_empty_requires_in_file_0_and_the_seal() {
+    let t = template();
+    let f0 = std::fs::read_to_string(t.dir.join("tape/0")).unwrap();
+    let seal = std::fs::read_to_string(t.dir.join(format!("tape/{}", t.total_files - 1))).unwrap();
+    assert!(f0.contains("\nrequires = []\n"), "File 0");
+    assert!(seal.contains("\nrequires = []\n"), "seal marker");
+}
+
+/// A tape that requires a feature this script does not know is refused,
+/// naming the feature and the way to a script that does, before anything
+/// else of it is interpreted. Never a misread.
+#[test]
+fn a_tape_requiring_an_unknown_feature_is_refused_by_name() {
+    let h = Heir::new();
+    edit_text_file(&h, 0, |t| {
+        t.replace("requires = []", "requires = [\"short-seal\"]")
+    });
+    for mode in [vec!["--info"], vec!["--verify"]] {
+        let (code, text) = h.run(&mode);
+        assert_ne!(code, 0, "{mode:?}: {text}");
+        assert!(text.contains("short-seal"), "{mode:?}: names it:\n{text}");
+        assert!(text.contains("newer"), "{mode:?}: {text}");
+        assert!(
+            text.contains("fsf 2"),
+            "{mode:?}: the way to the tape's own script:\n{text}"
+        );
+    }
+
+    // The seal marker's requires is honoured the same way.
+    let h = Heir::new();
+    let seal = template().total_files as i64 - 1;
+    edit_text_file(&h, seal, |t| {
+        t.replace("requires = []", "requires = [\"short-seal\"]")
+    });
+    let (code, text) = h.run(&["--info"]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("short-seal"), "{text}");
+}
+
+/// Keys the script does not know are ignored unless `requires` names them:
+/// a future tape may add fields, and a 1.1.0 reader must still read it.
+#[test]
+fn unknown_keys_that_are_not_required_are_ignored() {
+    let h = Heir::new();
+    let seal = template().total_files as i64 - 1;
+    edit_text_file(&h, 0, |t| {
+        t.replace("requires = []", "requires = []\nfuture_key = \"x\"")
+    });
+    edit_text_file(&h, seal, |t| {
+        t.replace("requires = []", "requires = []\nended_after = 7")
+    });
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Verdict: SEALED"), "{text}");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+}
+
+/// The seal marker is found by spacing to the end of data and stepping back
+/// one file; File 0's pointer is only a cross-check. A wrong pointer is
+/// named, and the seal is still found.
+#[test]
+fn the_seal_is_found_at_end_of_data_when_file_0_points_elsewhere() {
+    let h = Heir::new();
+    let total = template().total_files;
+    edit_text_file(&h, 0, |t| {
+        t.replace(
+            &format!("seal_marker = {}", total - 1),
+            &format!("seal_marker = {}", total - 3),
+        )
+    });
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Verdict: SEALED"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "File 0 says the seal marker is file {}",
+            total - 3
+        )),
+        "the disagreement is named:\n{text}"
+    );
+    assert!(h.ops().iter().any(|l| l == "mt eod"), "{:#?}", h.ops());
+
+    // Control: an mt that cannot space to end of data falls back to File 0's
+    // pointer, which on an intact tape finds the seal.
+    let h = Heir::new();
+    let (code, text) = h.run_env(&["--info"], &[("FAKE_MT_NO_EOD", "1")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Verdict: SEALED"), "{text}");
+}
+
+/// An unsealed tape ends in a data slice, which can be 10 GiB: reading "the
+/// last file" for the seal must not copy all of it into /tmp.
+#[test]
+fn an_unsealed_tape_is_not_read_whole_into_tmp_looking_for_a_seal() {
+    let h = Heir::new();
+    let seal = template().total_files as i64 - 1;
+    std::fs::remove_file(h.dir.join("tape").join(seal.to_string())).unwrap();
+    // Make the new last file (a slice) larger than the bound: 80 blocks.
+    let last = h.dir.join("tape").join((seal - 1).to_string());
+    let mut bytes = std::fs::read(&last).unwrap();
+    bytes.resize(80 * 524_288, 0);
+    std::fs::write(&last, bytes).unwrap();
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Verdict: UNSEALED"), "{text}");
 }

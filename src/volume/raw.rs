@@ -89,6 +89,8 @@ pub fn restore_raw(
     let mut thunk_bytes = Vec::new();
     store.read_file(0, &mut thunk_bytes)?;
     let thunk_text = String::from_utf8_lossy(&thunk_bytes).to_string();
+    // Before anything else of it is interpreted (ADR-0012 item 15).
+    format::check_id_thunk_readable(&thunk_text)?;
     let identity = format::parse_id_thunk_identity(&thunk_text)?;
     let pointers = format::parse_id_thunk_layout_pointers(&thunk_text)?;
 
@@ -353,6 +355,37 @@ pub(crate) mod tests {
         assert_eq!(slice_result.verified, Some(false));
         // Kept as forensic evidence, not deleted.
         assert!(slice_result.path.exists());
+    }
+
+    /// ADR-0012 amendment item 15: a tape whose File 0 requires a feature
+    /// this tapectl does not know is refused by name before anything is
+    /// dumped — and a key it does not know, not required, is ignored.
+    #[test]
+    fn a_file_0_requiring_an_unknown_feature_is_refused_before_dumping() {
+        let data = b"some plaintext".to_vec();
+        let mut store = build_synthetic_tape("RAWFC", &data);
+        let f0 = String::from_utf8(store.files[0].clone()).unwrap();
+        store.files[0] = f0
+            .replace("requires = []", "requires = [\"short-seal\"]")
+            .into_bytes();
+        let tmp = TempDir::new().unwrap();
+        let err = restore_raw(&mut store, tmp.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"short-seal\""), "{err}");
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            0,
+            "nothing dumped"
+        );
+
+        // Control: an unknown key nobody requires is read past.
+        let mut store = build_synthetic_tape("RAWFC", &data);
+        store.files[0] = f0
+            .replace("requires = []", "requires = []\nfuture_key = 1")
+            .into_bytes();
+        let tmp = TempDir::new().unwrap();
+        restore_raw(&mut store, tmp.path(), None).unwrap();
     }
 
     #[test]

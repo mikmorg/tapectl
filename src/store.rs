@@ -542,6 +542,22 @@ where
                 };
             }
         };
+        // A seal this tapectl must not read (a feature it does not know,
+        // ADR-0012 item 15) stops the walk as inconclusive — never a
+        // misread, and never evidence against the medium.
+        if let Some(why) = seal.refusal() {
+            mismatches.push(Mismatch {
+                position: seal_pos,
+                kind: MismatchKind::SealUnreadable,
+                expected: "a seal marker this tapectl can read".to_string(),
+                actual: why,
+            });
+            break 'walk Evidence {
+                tier,
+                files_checked,
+                mismatches,
+            };
+        }
 
         // Integrity only: read the files ahead of File 3 now, from BOT, so
         // the rest of the walk is one forward pass (issue #389). Held, not

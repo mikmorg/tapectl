@@ -143,6 +143,7 @@ magic = "tapectl-volume-v2"
 label = "{label}"
 uuid = "{uuid}"
 layout_version = 2
+requires = []
 tapectl_version = "{tapectl_version}"
 media_type = "{media_type}"
 nominal_capacity_bytes = {nominal_capacity}
@@ -1010,6 +1011,8 @@ bootstrap_thunk() {
   sed -n '/^\[volume\]/,$p' "$WORK/id_thunk.txt" >"$WORK/thunk.toml"
 
   check_layout_version "$(toml_val "$WORK/thunk.toml" layout_version)"
+  check_magic "$(toml_val "$WORK/thunk.toml" magic)"
+  check_requires "File 0" "$WORK/thunk.toml"
 
   FRONT_INDEX=$(toml_val "$WORK/thunk.toml" front_index)
   SEAL_MARKER=$(toml_val "$WORK/thunk.toml" seal_marker)
@@ -1044,6 +1047,53 @@ check_layout_version() { # <layout_version as File 0 states it>
        that reads it, at file 2:
          mt -f $DEVICE rewind && mt -f $DEVICE fsf 2
          dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE.sh"
+}
+
+# The features this script knows how to read (volume-format-v2.md, "How v2
+# extends"). A tape whose File 0 or seal marker names anything else under
+# `requires` is refused by name: a later tapectl that changes something a
+# reader must understand says so there, and this script must stop rather than
+# misread it. An absent `requires` (every tape before 1.1.0) requires nothing,
+# and any key a table carries that this script does not know is ignored
+# unless `requires` names it.
+KNOWN_FEATURES=""
+
+die_newer_needed() { # <what> <detail>
+  die "$2
+       This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely, and
+       will not guess. Use the RESTORE.sh stored on THIS tape — every tape
+       carries the script that reads it, at file 2:
+         mt -f $DEVICE rewind && mt -f $DEVICE fsf 2
+         dd if=$DEVICE bs=512k | tr -d '\\0' > RESTORE.sh
+       or a newer tapectl ($1 names what it needs)."
+}
+
+check_magic() { # <magic as File 0 states it>
+  local m=$1
+  [ -z "$m" ] && return 0
+  [ "$m" = "tapectl-volume-v2" ] && return 0
+  die_newer_needed "File 0" "this tape's File 0 says magic = $(safe_str "$m"), not tapectl-volume-v2."
+}
+
+check_requires() { # <what> <toml file>
+  local what=$1 file=$2 raw list f unknown=""
+  raw=$(toml_val "$file" requires)
+  [ -z "$raw" ] && return 0
+  case "$raw" in
+  \[*\]) ;;
+  *) die_newer_needed "$what" "$what states requires = $(safe_str "$raw"), which this script cannot parse." ;;
+  esac
+  list=$(printf '%s' "$raw" | tr -d '[]",' | tr -s ' ' ' ')
+  for f in $list; do
+    case " $KNOWN_FEATURES " in
+    *" $f "*) ;;
+    *) unknown="$unknown $(safe_str "$f")" ;;
+    esac
+  done
+  [ -z "$unknown" ] && return 0
+  die_newer_needed "$what" "this tape requires feature(s)${unknown}, which this script does not know
+       ($what states requires = $(safe_str "$raw")). It was written by a newer
+       tapectl (File 0: tapectl_version $(safe_str "$(toml_val "$WORK/thunk.toml" tapectl_version)"))."
 }
 
 # Always say which device was read and what was found there. A silent default
@@ -1097,21 +1147,66 @@ try_front_index() {
 
 # On success sets SEAL_FRONT_INDEX_SHA256, SEAL_FILE_COUNT, SEAL_SEALED_AT and
 # leaves the parsed, validated embedded copy at $WORK/files_from_seal.txt.
-# Never exits — callers test it with `if` or `&&`.
+# Returns 1 when there is no usable seal; exits only for a seal that requires
+# a feature this script does not know, which must never read as unsealed.
 try_seal_copy() {
-  try_read_tape_raw "$SEAL_MARKER" "$WORK/seal.raw" || return 1
-  tr -d '\0' <"$WORK/seal.raw" >"$WORK/seal.stripped"
-  grep -q '^\[seal\]' "$WORK/seal.stripped" || return 1
+  local at="" n
+  if read_last_file "$WORK/seal.raw" && seal_parses "$WORK/seal.raw"; then
+    at=$((SEAL_FILE_COUNT - 1))
+    if [ "$SEAL_MARKER" != "$at" ]; then
+      echo "WARNING: File 0 says the seal marker is file $SEAL_MARKER, but the last file on the tape is" >&2
+      echo "         a seal marker for $SEAL_FILE_COUNT files (file $at). Using the last file." >&2
+    fi
+  else
+    # No end-of-data route (an mt without eod, or the last file is not a
+    # seal): File 0's pointer, read with the same bound.
+    seek_to "$SEAL_MARKER" || return 1
+    read_bounded "$WORK/seal.raw" || return 1
+    seal_parses "$WORK/seal.raw" || return 1
+  fi
+  check_requires "the seal marker" "$WORK/seal.toml"
+  parse_front_index_entries "$WORK/seal.toml" >"$WORK/files_from_seal.txt"
+  [ -s "$WORK/files_from_seal.txt" ] || return 1
+  check_file_list_consistency "$WORK/files_from_seal.txt" "$SEAL_FILE_COUNT" || return 1
+  return 0
+}
+
+# Read at most STASH_MAX bytes of the file under the head into $1: enough
+# for any seal marker, and it never copies a 10 GiB data slice into /tmp.
+# The head is left unknown (it may stop inside the file). Returns 1 if
+# nothing was read.
+read_bounded() { # <out>
+  CUR=""
+  dd if="$DEVICE" of="$1" bs="$BLOCK" count=$((STASH_MAX / BLOCK)) 2>"$WORK/dd.err" || {
+    echo "NOTE: reading the last file failed: $(dd_detail "$WORK/dd.err")" >&2
+    return 1
+  }
+  [ -s "$1" ]
+}
+
+# The last file on the tape, found the way the seal marker is defined — the
+# last file — rather than by File 0's pointer alone (#384): space to the end
+# of data, then back over two filemarks to the start of the file before
+# them. mt-st calls end of data `eod`, GNU mt `eom`. Returns 1 if mt cannot.
+read_last_file() { # <out>
+  CUR=""
+  "$MT" -f "$DEVICE" eod 2>/dev/null || "$MT" -f "$DEVICE" eom 2>/dev/null || return 1
+  "$MT" -f "$DEVICE" bsfm 2 2>/dev/null || return 1
+  read_bounded "$1"
+}
+
+# Does $1 hold a seal marker this script can use? Sets SEAL_FRONT_INDEX_SHA256,
+# SEAL_FILE_COUNT, SEAL_SEALED_AT and $WORK/seal.toml.
+seal_parses() { # <raw file>
+  tr -d '\0' <"$1" >"$WORK/seal.stripped"
+  grep '^\[seal\]' "$WORK/seal.stripped" >/dev/null 2>&1 || return 1
   sed -n '/^\[seal\]/,$p' "$WORK/seal.stripped" >"$WORK/seal.toml"
   SEAL_FRONT_INDEX_SHA256=$(toml_val "$WORK/seal.toml" front_index_sha256)
   SEAL_FILE_COUNT=$(toml_val "$WORK/seal.toml" file_count)
   SEAL_SEALED_AT=$(toml_val "$WORK/seal.toml" sealed_at)
   [ -n "$SEAL_FRONT_INDEX_SHA256" ] || return 1
   is_uint "$SEAL_FILE_COUNT" || return 1
-  parse_front_index_entries "$WORK/seal.toml" >"$WORK/files_from_seal.txt"
-  [ -s "$WORK/files_from_seal.txt" ] || return 1
-  check_file_list_consistency "$WORK/files_from_seal.txt" "$SEAL_FILE_COUNT" || return 1
-  return 0
+  [ "$SEAL_FILE_COUNT" -gt 0 ]
 }
 
 # ---- rung 3: nothing left to parse ----
@@ -2328,6 +2423,7 @@ verify any entry by hashing the file it describes.
 [seal]
 volume = "{label}"
 layout_version = 2
+requires = []
 file_count = {file_count}
 sealed_at = "{now}"
 front_index_sha256 = "{front_index_sha256}"
@@ -3137,7 +3233,13 @@ mod tests {
         // bytes must still be the pre-field output, so nothing else moved.
         let good = "tr -d '\\0' > GUIDE.md";
         assert_eq!(rendered.matches(good).count(), 2, "{rendered}");
-        let pre_fix = rendered.replace(good, "tr -d '\\\\0' > GUIDE.md");
+        // 1.1.0 (ADR-0012 amendment item 15): File 0 states `requires = []`,
+        // one line after layout_version. Undo exactly that line too.
+        let requires = "layout_version = 2\nrequires = []\n";
+        assert_eq!(rendered.matches(requires).count(), 1, "{rendered}");
+        let pre_fix = rendered
+            .replace(good, "tr -d '\\\\0' > GUIDE.md")
+            .replace(requires, "layout_version = 2\n");
         let mut h = Sha256::new();
         h.update(pre_fix.as_bytes());
         let digest = format!("{:x}", h.finalize());

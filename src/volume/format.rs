@@ -37,7 +37,24 @@ pub struct ParsedSeal {
     pub file_count: i32,
     pub sealed_at: String,
     pub front_index_sha256: String,
+    /// The features a reader must know to read this tape (ADR-0012
+    /// amendment item 15). Absent on every tape before 1.1.0 = none.
+    pub requires: Vec<String>,
     pub files: Vec<ParsedIndexEntry>,
+}
+
+impl ParsedSeal {
+    /// Why this reader must not read the tape this seal marker ends, if it
+    /// must not: see [`FormatClaims::refusal`].
+    pub fn refusal(&self) -> Option<String> {
+        FormatClaims {
+            magic: None,
+            layout_version: Some(self.layout_version),
+            requires: self.requires.clone(),
+            tapectl_version: None,
+        }
+        .refusal("the seal marker")
+    }
 }
 
 // --- serde-facing shapes -----------------------------------------------
@@ -70,7 +87,6 @@ impl From<FileEntryToml> for ParsedIndexEntry {
 struct IndexHeader {
     #[allow(dead_code)]
     volume: String,
-    #[allow(dead_code)]
     layout_version: i64,
 }
 
@@ -89,6 +105,8 @@ struct SealHeader {
     file_count: i64,
     sealed_at: String,
     front_index_sha256: String,
+    #[serde(default)]
+    requires: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +136,14 @@ pub fn parse_front_index(raw: &str) -> Result<Vec<ParsedIndexEntry>> {
     let body = toml_body(raw, "[index]", "front index")?;
     let doc: FrontIndexDoc = toml::from_str(body)
         .map_err(|e| TapectlError::Other(format!("front index: TOML parse failed: {e}")))?;
+    if doc.index.layout_version != LAYOUT_VERSION {
+        return Err(TapectlError::Other(format!(
+            "front index: layout_version {} — this tapectl ({}) reads layout {LAYOUT_VERSION} only; \
+             read the tape with a newer tapectl or the RESTORE.sh at its file 2",
+            doc.index.layout_version,
+            env!("CARGO_PKG_VERSION"),
+        )));
+    }
     Ok(doc.files.into_iter().map(Into::into).collect())
 }
 
@@ -136,8 +162,127 @@ pub fn parse_seal_marker(raw: &str) -> Result<ParsedSeal> {
         file_count: doc.seal.file_count as i32,
         sealed_at: doc.seal.sealed_at,
         front_index_sha256: doc.seal.front_index_sha256,
+        requires: doc.seal.requires,
         files: doc.files.into_iter().map(Into::into).collect(),
     })
+}
+
+/// The layout this tapectl reads (File 0's `layout_version`).
+pub const LAYOUT_VERSION: i64 = 2;
+/// File 0's `magic` for layout 2.
+pub const MAGIC: &str = "tapectl-volume-v2";
+/// The features this tapectl knows how to read (ADR-0012 amendment item 15,
+/// `volume-format-v2.md` "How v2 extends"). A tape whose File 0 or seal
+/// marker lists anything else under `requires` is refused by name. Empty in
+/// 1.1.0: no tape yet requires anything.
+pub const KNOWN_FEATURES: &[&str] = &[];
+
+/// What a tape says about the reader it needs: File 0's `magic`,
+/// `layout_version` and `requires` (the seal marker repeats the last two).
+/// Every Rust reader of a tape checks [`FormatClaims::refusal`] before it
+/// interprets anything else, so a tape a later tapectl wrote with a feature
+/// this one does not know is refused, never misread. Absent fields are
+/// ABSENT, not defaulted to something refusable: every tape before 1.1.0
+/// has no `requires`, and a damaged File 0 may lack the others; neither may
+/// be turned away for it (the same rule RESTORE.sh keeps).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FormatClaims {
+    pub magic: Option<String>,
+    pub layout_version: Option<i64>,
+    pub requires: Vec<String>,
+    /// The writer's version, for the message only.
+    pub tapectl_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimsToml {
+    magic: Option<String>,
+    layout_version: Option<i64>,
+    #[serde(default)]
+    requires: Vec<String>,
+    tapectl_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimsDoc {
+    volume: ClaimsToml,
+}
+
+/// Parse File 0's `[volume]` claims. Unknown keys are ignored (they are
+/// allowed by the extension rule); a `requires` that is not a list of
+/// strings is an `Err`, which callers treat as a refusal.
+pub fn parse_id_thunk_claims(raw: &str) -> Result<FormatClaims> {
+    let body = toml_body(raw, "[volume]", "id thunk")?;
+    let doc: ClaimsDoc = toml::from_str(body)
+        .map_err(|e| TapectlError::Other(format!("id thunk: TOML parse failed: {e}")))?;
+    Ok(FormatClaims {
+        magic: doc.volume.magic,
+        layout_version: doc.volume.layout_version,
+        requires: doc.volume.requires,
+        tapectl_version: doc.volume.tapectl_version,
+    })
+}
+
+impl FormatClaims {
+    /// `None` when this tapectl can read a tape making these claims;
+    /// otherwise the sentence that says why not, naming what it would need.
+    pub fn refusal(&self, what: &str) -> Option<String> {
+        let ours = env!("CARGO_PKG_VERSION");
+        let writer = self
+            .tapectl_version
+            .as_deref()
+            .map(|v| format!(" (it was written by tapectl {v})"))
+            .unwrap_or_default();
+        if let Some(m) = &self.magic {
+            if m != MAGIC {
+                return Some(format!(
+                    "{what} says magic = \"{m}\", not \"{MAGIC}\": this tapectl ({ours}) \
+                     cannot read it{writer}. Read it with a newer tapectl, or with the \
+                     RESTORE.sh at the tape's own file 2"
+                ));
+            }
+        }
+        if let Some(v) = self.layout_version {
+            if v != LAYOUT_VERSION {
+                return Some(format!(
+                    "{what} says layout_version = {v}: this tapectl ({ours}) reads layout \
+                     {LAYOUT_VERSION} only{writer}. Read it with a newer tapectl, or with the \
+                     RESTORE.sh at the tape's own file 2"
+                ));
+            }
+        }
+        let unknown: Vec<&str> = self
+            .requires
+            .iter()
+            .map(String::as_str)
+            .filter(|f| !KNOWN_FEATURES.contains(f))
+            .collect();
+        if !unknown.is_empty() {
+            return Some(format!(
+                "this tape requires {} that this tapectl ({ours}) does not know ({what} \
+                 states requires = {:?}){writer}: it needs a newer tapectl, or the RESTORE.sh \
+                 at the tape's own file 2. Nothing has been read past it",
+                unknown
+                    .iter()
+                    .map(|f| format!("\"{f}\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.requires,
+            ));
+        }
+        None
+    }
+}
+
+/// Refuse File 0 `raw` if it claims a format this tapectl cannot read. A
+/// File 0 whose claims do not parse (say, a `requires` that is not a list)
+/// is refused too: it cannot be shown to be readable.
+pub fn check_id_thunk_readable(raw: &str) -> Result<()> {
+    let claims = parse_id_thunk_claims(raw)?;
+    match claims.refusal("File 0") {
+        Some(why) => Err(TapectlError::Other(why)),
+        None => Ok(()),
+    }
 }
 
 /// The two identity fields of the ID thunk (File 0) that resume compares
@@ -505,6 +650,111 @@ pub fn validate_consistency(entries: &[ParsedIndexEntry]) -> Vec<ConsistencyViol
     }
 
     violations
+}
+
+#[cfg(test)]
+mod forward_compat_tests {
+    use super::*;
+    use crate::volume::layout::{
+        generate_id_thunk_v2, generate_seal_marker, FrontIndexFile, IdThunkV2Params,
+    };
+
+    fn thunk() -> String {
+        generate_id_thunk_v2(&IdThunkV2Params {
+            label: "FC01",
+            uuid: "u",
+            media_type: "LTO-6",
+            tapectl_version: "1.1.0",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: 6,
+            mam_manufacturer: "m",
+            mam_serial: "s",
+            mam_length: 1,
+            mam_loads: 1,
+            created_at: "2026-10-06T00:00:00Z",
+            cartridge_identity_source: None,
+        })
+    }
+
+    fn seal() -> String {
+        let files = vec![FrontIndexFile {
+            position: 0,
+            type_label: "seal_marker",
+            size_bytes: None,
+            sha256_encrypted: None,
+        }];
+        generate_seal_marker("FC01", 1, "h", &files)
+    }
+
+    /// ADR-0012 amendment item 15: a 1.1.0 tape states `requires = []` in
+    /// File 0 and the seal marker, and this tapectl reads it.
+    #[test]
+    fn a_new_tape_requires_nothing_and_is_readable() {
+        let t = thunk();
+        assert!(t.contains("\nrequires = []\n"));
+        check_id_thunk_readable(&t).unwrap();
+        let s = parse_seal_marker(&seal()).unwrap();
+        assert!(s.requires.is_empty());
+        assert_eq!(s.refusal(), None);
+    }
+
+    /// Every tape before 1.1.0 (L6-0001 among them) has no `requires`:
+    /// absent means none required.
+    #[test]
+    fn a_tape_without_requires_is_readable() {
+        let t = thunk().replace("requires = []\n", "");
+        assert!(!t.contains("requires"));
+        check_id_thunk_readable(&t).unwrap();
+        let s = parse_seal_marker(&seal().replace("requires = []\n", "")).unwrap();
+        assert_eq!(s.refusal(), None);
+    }
+
+    /// An unknown required feature is refused, by name, in File 0 and in
+    /// the seal marker; the message says what would read it.
+    #[test]
+    fn an_unknown_required_feature_is_refused_by_name() {
+        let t = thunk().replace("requires = []", "requires = [\"short-seal\"]");
+        let err = check_id_thunk_readable(&t).unwrap_err().to_string();
+        assert!(err.contains("\"short-seal\""), "{err}");
+        assert!(err.contains("newer tapectl"), "{err}");
+        assert!(err.contains("tapectl 1.1.0"), "names the writer: {err}");
+
+        let s = parse_seal_marker(&seal().replace("requires = []", "requires = [\"short-seal\"]"))
+            .expect("the seal still PARSES: a write-path contact check must see it as sealed");
+        let why = s.refusal().expect("refused");
+        assert!(why.contains("\"short-seal\""), "{why}");
+    }
+
+    /// Keys this tapectl does not know are ignored unless `requires` names
+    /// them (the extension rule), in File 0 and the seal marker.
+    #[test]
+    fn unknown_keys_that_are_not_required_are_ignored() {
+        let t = thunk().replace("requires = []", "requires = []\nfuture_key = \"x\"");
+        check_id_thunk_readable(&t).unwrap();
+        parse_id_thunk_identity(&t).unwrap();
+        let s =
+            parse_seal_marker(&seal().replace("requires = []", "requires = []\nended_after = 7"))
+                .unwrap();
+        assert_eq!(s.refusal(), None);
+    }
+
+    /// Another layout or magic is refused with a named error (#384).
+    #[test]
+    fn another_layout_or_magic_is_refused() {
+        let t = thunk().replace("layout_version = 2", "layout_version = 3");
+        let err = check_id_thunk_readable(&t).unwrap_err().to_string();
+        assert!(err.contains("layout_version = 3"), "{err}");
+        let t = thunk().replace("tapectl-volume-v2", "tapectl-volume-v3");
+        let err = check_id_thunk_readable(&t).unwrap_err().to_string();
+        assert!(err.contains("tapectl-volume-v3"), "{err}");
+        let fi = "[index]\nvolume = \"X\"\nlayout_version = 3\n";
+        let err = parse_front_index(fi).unwrap_err().to_string();
+        assert!(err.contains("layout_version 3"), "{err}");
+        let s =
+            parse_seal_marker(&seal().replace("layout_version = 2", "layout_version = 3")).unwrap();
+        assert!(s.refusal().unwrap().contains("layout_version = 3"));
+    }
 }
 
 #[cfg(test)]
