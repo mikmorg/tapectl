@@ -2735,7 +2735,7 @@ fn finish_session(
             // ADR-0012's 2026-09-21 correction "the seal is RECORDED, not
             // inferred" (issue #277, migration 018): the moment `seal()`
             // returns `Ok`, that fact must become durable state, because
-            // `seal_marker_parses_at`'s read-error/no-marker conflation
+            // `ContactFacts::probe_seal`'s read-error/no-marker conflation
             // (correct and deliberate for a fresh write to a blank tape)
             // cannot be un-inferred later on resume -- an unreadable seal
             // position is exactly what an `Inconclusive` confirm leaves

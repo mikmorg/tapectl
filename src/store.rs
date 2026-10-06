@@ -128,6 +128,11 @@ pub struct ConfirmPlan<'a> {
     /// goes (a file skipped on `resume`'s word included) — never for File 3
     /// or the seal, which are read on every walk.
     pub on_passed: Option<&'a dyn Fn(Checkpoint<'_>)>,
+    /// The seal marker's on-tape bytes, when the caller already read them
+    /// in this same contact (issue #403: a resume's contact check reads the
+    /// seal, and the walk used to locate it and read it again). The walk
+    /// takes the seal from here and reads every other file from the medium.
+    pub seal: Option<&'a [u8]>,
 }
 
 impl std::fmt::Debug for ConfirmPlan<'_> {
@@ -137,6 +142,7 @@ impl std::fmt::Debug for ConfirmPlan<'_> {
             .field("order", &self.order)
             .field("resume", &self.resume.map(|r| r.passed.len()))
             .field("on_passed", &self.on_passed.is_some())
+            .field("seal", &self.seal.map(<[u8]>::len))
             .finish()
     }
 }
@@ -149,6 +155,7 @@ impl<'a> ConfirmPlan<'a> {
             order: ReadOrder::SealFirst,
             resume: None,
             on_passed: None,
+            seal: None,
         }
     }
 
@@ -161,6 +168,13 @@ impl<'a> ConfirmPlan<'a> {
     /// `resume` (issue #410).
     pub fn resuming(self, resume: Option<&'a Checkpoints>) -> Self {
         Self { resume, ..self }
+    }
+
+    /// The same plan, taking the seal marker from `seal` — bytes this
+    /// contact already read at the seal position (issue #403) — instead of
+    /// the medium.
+    pub fn with_seal(self, seal: Option<&'a [u8]>) -> Self {
+        Self { seal, ..self }
     }
 
     /// The same plan, reporting every file read back clean to `on_passed`.
@@ -489,7 +503,20 @@ pub trait Store {
         // progress phase (`confirm`, `verify`), and the file being read is
         // its current item. No-ops with no progress session.
         let files = layout.entries.len();
+        let seal_pos = layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .map(|e| e.position as u32);
+        let mut cached = plan.seal;
         chain_walk(layout, plan, |position, sink| {
+            if Some(position) == seal_pos {
+                if let Some(bytes) = cached.take() {
+                    sink.write_all(bytes)
+                        .map_err(|e| TapectlError::Other(format!("sink write: {e}")))?;
+                    return Ok(bytes.len() as u64);
+                }
+            }
             crate::progress::item(format!("file {position} of {files}"));
             let mut counted = crate::progress::CountingWriter(sink);
             self.read_file(position, &mut counted)
@@ -584,6 +611,21 @@ pub trait Store {
     /// recording, and is what makes the resume cursor rule unit-testable
     /// with no tape anywhere.
     fn reposition_for_resume(&mut self, file_index: u32) -> Result<()>;
+
+    /// [`Self::reposition_for_resume`] to `file_index`, or to the end of
+    /// what the medium really holds if that comes first — returning the
+    /// file index the next `execute` writes (issue #403). A resumed write
+    /// must continue from what is ON the tape: every file but the seal ends
+    /// with an immediate filemark, so after a power loss or a bus reset the
+    /// tape can hold fewer files than the catalog recorded written. Never
+    /// moves past `file_index`.
+    ///
+    /// The default trusts `file_index` — a store with no way to count what
+    /// it holds.
+    fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+        self.reposition_for_resume(file_index)?;
+        Ok(file_index)
+    }
 
     /// Whether the medium is PROVABLY blank: end of data at the beginning
     /// of the tape (issue #400). Asked only after File 0 could not be read,
@@ -1636,6 +1678,34 @@ impl Store for TapeStore {
         Ok(())
     }
 
+    /// Rewind and space `file_index` filemarks. When the space fails, st's
+    /// own count says why: END OF DATA (`GMT_EOD`) at file `m` below
+    /// `file_index` means the tape holds `m` whole files, and the head is
+    /// re-placed at the START of file `m` (rewind, space `m`) — a power
+    /// loss can leave part of a file after the last filemark, and writing
+    /// at end of data would append to it. Any other failure, or a count st
+    /// has lost (`-1`) or that does not fall short of `file_index`, is the
+    /// original error: no guess about where to write.
+    fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+        let spaced = self.reposition_for_resume(file_index);
+        let Err(original) = spaced else {
+            return Ok(file_index);
+        };
+        self.cursor = FileCursor::Unknown;
+        let st = self.dev.position()?;
+        let held = match u32::try_from(st.file_number) {
+            Ok(m) if st.at_eod && m < file_index => m,
+            _ => return Err(original),
+        };
+        tracing::warn!(
+            wanted = file_index,
+            on_medium = held,
+            "the medium ends before the resume cursor"
+        );
+        self.reposition_for_resume(held)?;
+        Ok(held)
+    }
+
     /// Rewind and space forward one filemark. A filemark found means
     /// something is recorded. A space that fails is blank only when st says
     /// it stopped at END OF DATA (`GMT_EOD`: the drive answered BLANK CHECK,
@@ -1767,6 +1837,13 @@ impl Store for MemStore {
         self.files.truncate(file_index as usize);
         self.syncs.truncate(file_index as usize);
         Ok(())
+    }
+
+    /// The files recorded, up to `file_index`.
+    fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+        let held = file_index.min(self.files.len() as u32);
+        self.reposition_for_resume(held)?;
+        Ok(held)
     }
 
     /// Nothing recorded at all.
