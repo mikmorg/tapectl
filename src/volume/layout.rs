@@ -2007,6 +2007,9 @@ do_list() {
   local want_version=${1:-} manifest u base
   set_age_ids
   establish_files
+  # No unit named: the envelope listing the most units, as --all chooses
+  # (with an operator or escrow key, the operator envelope: every unit).
+  [ ${#RESTORE_UNITS[@]} -gt 0 ] || RESTORE_ALL=1
   walk_envelopes pick_for_restore
   local wanted="${RESTORE_UNITS[*]-}"
   [ -n "$CHOSEN_ENV" ] || die_no_envelope "${wanted// /, }"

@@ -1699,3 +1699,19 @@ fn an_unsealed_tape_is_not_read_whole_into_tmp_looking_for_a_seal() {
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("Verdict: UNSEALED"), "{text}");
 }
+
+/// With an operator or escrow key and no --unit, --list uses the envelope
+/// that lists the most units (the operator envelope: all of them), as --all
+/// does, not whichever tenant's envelope happens to open first.
+#[test]
+fn list_with_the_escrow_key_lists_every_unit() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--list", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    for u in ["photos/2019", "docs", "ledgers"] {
+        assert!(
+            text.contains(&format!("=== {u}, snapshot version")),
+            "{u}:\n{text}"
+        );
+    }
+}
