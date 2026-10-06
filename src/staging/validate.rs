@@ -231,6 +231,11 @@ pub(crate) struct ReadAhead {
     hasher_done: AtomicBool,
     hasher_failed: AtomicBool,
     stop: AtomicBool,
+    /// dar's process id, once it runs (0 before): the hasher reads dar's
+    /// own read count itself while it waits, so a file dar reads but barely
+    /// writes out (zeros it stores as holes, data that compresses well)
+    /// does not leave the hasher waiting on a stale position.
+    dar_pid: AtomicU64,
 }
 
 impl ReadAhead {
@@ -243,7 +248,13 @@ impl ReadAhead {
             hasher_done: AtomicBool::new(false),
             hasher_failed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            dar_pid: AtomicU64::new(0),
         }
+    }
+
+    /// dar is running as `pid`.
+    pub(crate) fn dar_started(&self, pid: u32) {
+        self.dar_pid.store(u64::from(pid), Ordering::Release);
     }
 
     /// No dar to keep pace with: the hasher reads freely.
@@ -263,7 +274,7 @@ impl ReadAhead {
     /// the lead ahead of the hasher (dar, its pipe full, waits too), and
     /// returns early on a stop or a failed hasher.
     pub(crate) fn dar_has_read(&self, bytes: u64) {
-        self.dar_read.store(bytes, Ordering::Release);
+        self.dar_read.fetch_max(bytes, Ordering::AcqRel);
         while bytes
             > self
                 .hashed
@@ -307,6 +318,14 @@ impl ReadAhead {
                         .saturating_add(self.lead)
             {
                 return true;
+            }
+            let pid = self.dar_pid.load(Ordering::Acquire);
+            if let Some(read) = u32::try_from(pid)
+                .ok()
+                .filter(|&p| p != 0)
+                .and_then(crate::dar::create::bytes_read)
+            {
+                self.dar_read.fetch_max(read, Ordering::AcqRel);
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -354,7 +373,6 @@ fn hash_all(base: &Path, plan: &SourcePlan, ahead: &ReadAhead) -> Result<Hashed>
         }
         let full_path = base.join(&planned.rel_path);
         let hashed = hash_one(&full_path, planned, ahead)?;
-        ahead.hashed.fetch_add(hashed.seen.size, Ordering::AcqRel);
         #[cfg(test)]
         hash_hook::fire(&full_path);
         files.push(hashed);
@@ -422,7 +440,10 @@ fn hash_one(full_path: &Path, planned: &PlannedFile, ahead: &ReadAhead) -> Resul
     let mut buf = vec![0u8; VALIDATE_STREAM_BUFFER];
     let mut streamed: i64 = 0;
     loop {
-        if ahead.stopped() {
+        // Paced per buffer, not per file (issue #364): a unit is often one
+        // large file, and per-file pacing would let the hasher read all of
+        // it alone and dar then read it again from disk.
+        if !ahead.hasher_may_read() {
             return Err(TapectlError::Other("the source check was stopped".into()));
         }
         let n = reader.read(&mut buf)?;
@@ -430,6 +451,7 @@ fn hash_one(full_path: &Path, planned: &PlannedFile, ahead: &ReadAhead) -> Resul
             break;
         }
         streamed += n as i64;
+        ahead.hashed.fetch_add(n as u64, Ordering::AcqRel);
     }
     let hex = reader.finalize_hex();
     let after = reader.into_inner().metadata()?;
@@ -846,6 +868,51 @@ mod tests {
         let hasher = std::thread::spawn(move || shared.hasher_may_read());
         ahead.stop();
         assert!(!hasher.join().unwrap());
+    }
+
+    /// Issue #364: the lead holds inside a file, not only between files. A
+    /// unit is often one large file; paced per file, the hasher would read
+    /// all of it alone while dar waited, and dar then read it again from
+    /// disk once it outgrew the page cache — the double read this exists to
+    /// remove.
+    #[test]
+    fn the_hasher_keeps_its_lead_inside_one_large_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("big.bin"), vec![7u8; 1 << 20]).unwrap();
+        let (conn, sid) = setup_conn_with_snapshot(&[("big.bin", 1 << 20, None)]);
+        let base = tmp.path().to_path_buf();
+        let plan = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap();
+        let ahead = std::sync::Arc::new(ReadAhead::new(64 << 10));
+        let shared = ahead.clone();
+        let hasher = std::thread::spawn(move || hash_files(&base, &plan, &shared).map(|_| ()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !hasher.is_finished(),
+            "dar has read nothing: the hasher may not read the whole file alone"
+        );
+        let hashed = ahead.hashed.load(Ordering::Acquire);
+        assert!(
+            hashed <= (64 << 10) + VALIDATE_STREAM_BUFFER as u64,
+            "the hasher stays within one buffer of its lead: {hashed}"
+        );
+        ahead.dar_finished();
+        hasher.join().unwrap().unwrap();
+    }
+
+    /// A waiting hasher reads dar's own read count, so a stretch dar reads
+    /// but barely writes out (holes, compressible data) does not leave it
+    /// waiting on a stale position. This process stands in for dar: it has
+    /// read far more than 60 bytes.
+    #[test]
+    fn a_waiting_hasher_reads_how_far_dar_has_read_itself() {
+        let ahead = ReadAhead::new(10);
+        ahead.hashed.store(50, Ordering::Release);
+        ahead.dar_started(std::process::id());
+        assert!(
+            crate::dar::create::bytes_read(std::process::id()).is_some(),
+            "fixture: the kernel reports a read count"
+        );
+        assert!(ahead.hasher_may_read(), "the hasher goes on without a tick");
     }
 
     /// Issue #364: a file written again after it was hashed — its change

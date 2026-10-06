@@ -765,6 +765,9 @@ fn stage_create_inner(
     let mut total_encrypted_size: i64 = 0;
     let mut streamed: u64 = 0;
     let dar_pid = dar_run.pid();
+    if let Some(pid) = dar_pid {
+        hashing.ahead().dar_started(pid);
+    }
     let mut last_pace = std::time::Instant::now();
     let stdout = dar_run.take_stdout();
     let cut = dar::slice::cut_stream(
@@ -822,13 +825,13 @@ fn stage_create_inner(
             // short archive is how it reaches the slicer. A refusal from
             // the source check outranks both.
             let dar_failed = dar_run.abort();
-            if hashing.ahead().hasher_failed() {
-                hashing.finish()?;
-            }
             if crate::signal::is_interrupted() {
                 return Err(TapectlError::Interrupted(stopped_archiving(
                     &snapshot.source_path,
                 )));
+            }
+            if hashing.ahead().hasher_failed() {
+                hashing.finish()?;
             }
             return Err(dar_failed.unwrap_or(e));
         }
