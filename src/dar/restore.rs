@@ -232,6 +232,7 @@ impl SequentialExtract {
             // -O is `--comparison-field` (ignore-owner): see `extract`.
             "-O".into(),
             "-Q".into(),
+            "-N".into(), // no darrc: see `extract_reported` (#412 item 9)
         ];
         if overwrite {
             args.push("-w".into());
@@ -355,6 +356,7 @@ pub fn entry_slices(
         .arg("-g")
         .arg(file_path)
         .arg("-Q")
+        .arg("-N") // no darrc (#412 item 9)
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| TapectlError::Dar(e.to_string()))?;
@@ -776,6 +778,24 @@ All displayed files have their data in slice range [1,4-5]
             String::from_utf8_lossy(&report.stdout)
         );
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"A");
+    }
+
+    /// Issue #412 item 9: the streaming extract (#411) reads no darrc either.
+    /// `true` stands in for dar: only the argv it was handed is under test.
+    #[test]
+    fn the_sequential_extract_passes_dash_n() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let x = SequentialExtract::spawn(
+            "true",
+            &tmp.path().join("restore"),
+            &tmp.path().join("cat"),
+            &tmp.path().join("dest"),
+            false,
+        )
+        .unwrap();
+        let (report, _) = x.finish();
+        let argv = report.expect("it ran").argv;
+        assert!(argv.iter().any(|a| a == "-N"), "{argv:?}");
     }
 
     /// The failure path keeps the report too — the whole point (issue #306:
