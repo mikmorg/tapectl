@@ -254,10 +254,20 @@ Rules that hold in every path:
   diff the front index against the Layout (navigable tier); hash each file
   against the front index's `sha256_encrypted` (integrity tier). The exact
   cryptographic chain is fixed in `volume-format-v2.md` §4–5. On tape that is
-  one locate to the seal marker, one rewind, then Files 0, 1, 2, 3 and every
-  content file in position order (#389): Files 0–2 are held in memory until
-  File 3 says what they hash to, and judged in its order, so the verdict is
-  the one a file-by-file walk gives. `TapeStore` tracks which file the head
+  one rewind, then Files 0, 1, 2, 3 and every content file in position order
+  (#389): Files 0–2 are held in memory until File 3 says what they hash to,
+  and judged in its order, so the verdict is the one a file-by-file walk
+  gives. Where the seal marker is *read* depends on what is known of it
+  (#397): straight after the session wrote it (or `volume resume` just parsed
+  it), it is read last, at the end of the same forward pass — no locate out
+  to it from BOT and back; on a tape whose seal nothing has just seen
+  (`volume verify`, a resume whose recorded seal did not read) it is read
+  first and alone, so an unsealed tape stops at one read. The navigable tier
+  always reads File 3, then spaces forward to the seal: one rewind, two
+  forward spaces. Wherever it is read, the seal is *judged* first (§2.5's
+  precedence): a seal that is absent, unparseable or refused is the whole
+  verdict and whatever was read after it is discarded, so both orders reach
+  the same evidence. `TapeStore` tracks which file the head
   is at and only spaces forward to a file ahead of it, rewinding only for one
   behind it or after anything that leaves the position uncertain (an error, a
   write, a read that returns nothing, or st's own count disagreeing). Before

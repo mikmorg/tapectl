@@ -75,7 +75,7 @@ use rusqlite::{params, Connection};
 use crate::db::busy::{self, BusyPolicy};
 use crate::error::{Result, TapectlError};
 use crate::pipeline::{self, BufferPool, Verdict};
-use crate::store::{Evidence, Store, Tier};
+use crate::store::{ConfirmPlan, Evidence, ReadOrder, Store, Tier};
 
 use super::build::{BuildUnit, BuiltLayout};
 use super::format;
@@ -1241,6 +1241,10 @@ impl InterruptedSession {
                         built: self.built,
                         volume_id: self.volume_id,
                         write_ids: self.write_ids,
+                        // The seal is recorded but did not read just now:
+                        // the gate goes first, so an unreadable seal is
+                        // found at one read, not after the whole pass.
+                        seal_order: ReadOrder::SealFirst,
                     }));
                 }
                 // sealed_at is NULL: the seal is still genuinely owed.
@@ -1296,6 +1300,10 @@ impl InterruptedSession {
                         built: self.built,
                         volume_id: self.volume_id,
                         write_ids: self.write_ids,
+                        // `resume_reconfirm_eligible` has just parsed a seal
+                        // marker at this session's own seal position, so it
+                        // is read last, in the forward pass (issue #397).
+                        seal_order: ReadOrder::SealLast,
                     }));
                 }
 
@@ -1465,6 +1473,10 @@ impl ReadyToSeal {
             built: self.built,
             volume_id: self.volume_id,
             write_ids: self.write_ids,
+            // Just written, with a synchronous filemark: the head is at end
+            // of data, and the confirm reads the seal last, at the end of
+            // its one forward pass (issue #397).
+            seal_order: ReadOrder::SealLast,
         })
     }
 }
@@ -1475,6 +1487,9 @@ pub struct SealedPending {
     built: BuiltLayout,
     volume_id: i64,
     write_ids: Vec<(i64, i64)>,
+    /// Where confirm reads the seal marker (issue #397): last when this
+    /// session has just written or just read it, first otherwise.
+    seal_order: ReadOrder,
 }
 
 impl SealedPending {
@@ -1527,7 +1542,10 @@ impl SealedPending {
         // Issue #386: the readback — hours on a full cartridge — is its own
         // phase, counted byte by byte through `Store::confirm`.
         let phase = crate::progress::phase("confirm", self.built.layout.on_tape_bytes().ok());
-        let evidence = store.confirm(&self.built.layout, tier)?;
+        let evidence = store.confirm_with(
+            &self.built.layout,
+            ConfirmPlan::new(tier).with_order(self.seal_order),
+        )?;
         phase.done();
         let passed = evidence.mismatches.is_empty();
         // ADR-0012's 2026-09-18 amendment: a mismatch alone is not a
@@ -2370,10 +2388,10 @@ mod tests {
         fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
             self.inner.reposition_for_resume(file_index)
         }
-        fn confirm(
+        fn confirm_with(
             &mut self,
             layout: &crate::volume::layout_model::Layout,
-            tier: Tier,
+            plan: ConfirmPlan,
         ) -> Result<Evidence> {
             self.conn
                 .execute(
@@ -2381,7 +2399,7 @@ mod tests {
                     params![self.volume_id],
                 )
                 .unwrap();
-            self.inner.confirm(layout, tier)
+            self.inner.confirm_with(layout, plan)
         }
     }
 
@@ -6018,5 +6036,66 @@ mod tests {
             .unwrap();
         assert_eq!((wp_status.as_str(), wp_hash), ("failed", None));
         assert_eq!(store.inner.files.len(), position);
+    }
+
+    // ── issue #397: the confirm after a write reads the seal without a long
+    // locate. Driven over the REAL `TapeStore` on `tape::fake::FakeTape`,
+    // which logs every motion, through the session's own seal -> confirm.
+
+    use crate::store::TapeStore;
+    use crate::tape::fake::{FakeTape, Op};
+
+    /// Write this fixture's whole session (seal included) onto a fake tape,
+    /// then clear the motion log: what is logged after this is the confirm.
+    fn sealed_on_a_fake_tape(f: Fixture) -> (Connection, SealedPending, TapeStore, FakeTape, u32) {
+        let seal = (f.built.layout.entries.len() - 1) as u32;
+        let fake = FakeTape::with_files(Vec::new(), BS as usize);
+        let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path fake-tape run"),
+        };
+        let pending = ready.seal(&mut store).unwrap();
+        fake.clear_ops();
+        (f.conn, pending, store, fake, seal)
+    }
+
+    /// A full confirm straight after the seal: one rewind and one forward
+    /// pass that reads the seal last — no locate out to the seal and back
+    /// (before #397: rewind, space to the seal, read it, rewind again).
+    #[test]
+    fn a_full_confirm_right_after_the_seal_is_one_rewind_and_one_forward_pass() {
+        let (conn, pending, mut store, fake, seal) = sealed_on_a_fake_tape(make_fixture());
+        let outcome = pending.confirm(&conn, &mut store, Tier::Integrity).unwrap();
+        assert!(matches!(outcome, ConfirmOutcome::Sealed(_)));
+        let mut expected = vec![Op::Rewind];
+        expected.extend((0..=seal).map(Op::Read));
+        assert_eq!(fake.ops(), expected);
+        assert_eq!(fake.rewinds(), 1);
+        assert_eq!(fake.spaces(), 0, "no locate to the seal");
+    }
+
+    /// The quick confirm straight after the seal: File 3, then a relative
+    /// forward space to the seal — one rewind (before #397: two).
+    #[test]
+    fn a_quick_confirm_right_after_the_seal_reads_file_3_then_the_seal() {
+        let (conn, pending, mut store, fake, seal) = sealed_on_a_fake_tape(make_fixture());
+        let outcome = pending.confirm(&conn, &mut store, Tier::Navigable).unwrap();
+        assert!(matches!(outcome, ConfirmOutcome::Sealed(_)));
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(3),
+                Op::Read(3),
+                Op::Space(seal - 4),
+                Op::Read(seal),
+            ]
+        );
     }
 }

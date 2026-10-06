@@ -62,6 +62,60 @@ impl Default for Tier {
     }
 }
 
+/// The order `confirm` reads the seal marker in (issue #397). Only the
+/// physical order changes: the verdict is always judged in §5's order, seal
+/// first (`v2-open-questions.md` §2.5's precedence), so a confirm reaches
+/// the same [`Evidence`] in either.
+///
+/// The navigable tier ignores this and always reads File 3 and then the
+/// seal: one small read before the gate costs nothing on an unsealed tape,
+/// and on a sealed one it saves a rewind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadOrder {
+    /// The seal marker first and alone — the precedence gate, so an unsealed
+    /// tape stops at one read. For a tape whose seal nothing has just seen:
+    /// `volume verify`, and a resume whose recorded seal did not read.
+    #[default]
+    SealFirst,
+    /// The seal marker last, at the end of the single forward pass — for a
+    /// tape whose seal this session has just written or just read. After a
+    /// write the head is at end of data, and reading the seal first cost a
+    /// locate out to it and a second rewind back (~1–3 min on a half-full
+    /// LTO-6); read last, the pass reaches it with no extra motion. An
+    /// unreadable seal is then found only at the end of the pass — the case
+    /// a seal written moments ago with a synchronous filemark makes rare —
+    /// and the verdict is the same.
+    ///
+    /// Chosen over stepping back to the seal from end of data (`MTBSFM 2`):
+    /// that needs a backward move the cursor has never made, whose st and
+    /// drive behaviour at end of data cannot be exercised off the drive,
+    /// while this needs no motion the cursor does not already make.
+    SealLast,
+}
+
+/// How [`Store::confirm_with`] walks a tape: the tier, and the order the
+/// seal marker is read in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfirmPlan {
+    pub tier: Tier,
+    pub order: ReadOrder,
+}
+
+impl ConfirmPlan {
+    /// `tier`, seal first — what [`Store::confirm`] runs.
+    pub fn new(tier: Tier) -> Self {
+        Self {
+            tier,
+            order: ReadOrder::SealFirst,
+        }
+    }
+
+    /// The same plan, reading the seal in `order`.
+    pub fn with_order(self, order: ReadOrder) -> Self {
+        Self { order, ..self }
+    }
+}
+
 /// What kind of disagreement a [`Mismatch`] reports. Each variant maps to a
 /// distinct step of the `volume-format-v2.md` §5 chain walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,11 +394,19 @@ pub trait Store {
     /// deposit receipt, `layout-session.md`'s Store seam) — TapeStore and
     /// MemStore both take the default.
     fn confirm(&mut self, layout: &Layout, tier: Tier) -> Result<Evidence> {
+        self.confirm_with(layout, ConfirmPlan::new(tier))
+    }
+
+    /// [`Self::confirm`] with the rest of the plan spelled out: the read
+    /// order (issue #397). The one method a store overrides to change how it
+    /// confirms — [`Self::confirm`] only delegates here, and the write
+    /// session calls this.
+    fn confirm_with(&mut self, layout: &Layout, plan: ConfirmPlan) -> Result<Evidence> {
         // Issue #386: every byte read back counts toward the caller's
         // progress phase (`confirm`, `verify`), and the file being read is
         // its current item. No-ops with no progress session.
         let files = layout.entries.len();
-        chain_walk(layout, tier, |position, sink| {
+        chain_walk(layout, plan, |position, sink| {
             crate::progress::item(format!("file {position} of {files}"));
             let mut counted = crate::progress::CountingWriter(sink);
             self.read_file(position, &mut counted)
@@ -464,25 +526,34 @@ pub trait Store {
 /// to the front index's claimed `size_bytes` as the bytes arrive exactly
 /// like `restore.rs::restore_one_slice_inner`'s ciphertext pass does.
 ///
-/// **Read order (issue #389).** The seal marker is read first and alone — it
-/// is the precedence gate (§2.5: absent or unparseable means unsealed, and
-/// the walk stops there) — and everything after it is read in ascending
-/// position order: at the Integrity tier the files ahead of File 3 (0, 1, 2:
-/// the ID thunk, system guide and RESTORE.sh), then File 3, then every
-/// content file after it. On a tape that is one locate to the seal, one
-/// rewind, and the single forward pass from BOP `volume-format-v2.md` §5
-/// describes, where it used to be a rewind and locate per file. The files
-/// ahead of File 3 cannot be checked until File 3 says what they should
-/// hash to, so they are HELD — they are the small generated front-zone
-/// files, bounded by [`AHEAD_OF_INDEX_CAP`] — and checked in step 4 in the
-/// front index's own order, so every mismatch, its kind, its order and
-/// `files_checked` are exactly what reading them in step 4 would give. A
-/// file the Layout does not list ahead of File 3, or one too large to hold,
-/// is simply read in step 4 as before.
-fn chain_walk<F>(layout: &Layout, tier: Tier, mut read: F) -> Result<Evidence>
+/// **Read order (issues #389, #397).** Everything except the seal marker is
+/// read in ascending position order: at the Integrity tier the files ahead
+/// of File 3 (0, 1, 2: the ID thunk, system guide and RESTORE.sh), then
+/// File 3, then every content file after it — on a tape, the single forward
+/// pass from BOP `volume-format-v2.md` §5 describes, where it used to be a
+/// rewind and locate per file. The files ahead of File 3 cannot be checked
+/// until File 3 says what they should hash to, so they are HELD — they are
+/// the small generated front-zone files, bounded by [`AHEAD_OF_INDEX_CAP`]
+/// — and checked in step 4 in the front index's own order, so every
+/// mismatch, its kind, its order and `files_checked` are exactly what
+/// reading them in step 4 would give. A file the Layout does not list ahead
+/// of File 3, or one too large to hold, is simply read in step 4 as before.
+///
+/// The seal marker is read where [`ConfirmPlan::order`] says: first and
+/// alone ([`ReadOrder::SealFirst`]: one locate to it, then a rewind for the
+/// pass), or last ([`ReadOrder::SealLast`], and always at the navigable
+/// tier: the pass reaches it with no extra motion). Wherever it is READ, it
+/// is JUDGED first — the precedence gate (§2.5: absent, unparseable or
+/// refused means unsealed, and that alone is the verdict). So the walk is
+/// split in two: [`walk_from_index`] reads and judges everything the seal
+/// does not decide, and [`judge`] puts the seal's verdict in front of it —
+/// or, for a seal that fails the gate, in place of it, discarding whatever
+/// was read after it. The [`Evidence`] is identical in either order.
+fn chain_walk<F>(layout: &Layout, plan: ConfirmPlan, mut read: F) -> Result<Evidence>
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
 {
+    let tier = plan.tier;
     let seal_entry = layout
         .entries
         .iter()
@@ -502,292 +573,390 @@ where
     };
     let fi_true_len = fi_true_len as usize;
 
-    let mut mismatches: Vec<Mismatch> = Vec::new();
-    let mut files_checked: u32 = 0;
+    // Step 1 (§5.1), when it is read first: the gate, before anything else
+    // moves. An unsealed tape stops here, at one read.
+    let seal_first = tier == Tier::Integrity && plan.order == ReadOrder::SealFirst;
+    let early = if seal_first {
+        match read_seal(seal_pos, &mut read) {
+            SealRead::Refused {
+                files_checked,
+                mismatch,
+            } => {
+                return Ok(Evidence {
+                    tier,
+                    files_checked,
+                    mismatches: vec![mismatch],
+                })
+            }
+            bound => Some(bound),
+        }
+    } else {
+        None
+    };
 
-    let evidence = 'walk: {
-        // Step 1 (§5.1): read + parse the seal marker (the last file). It is
-        // parsed as TOML, so its true bytes are genuinely needed — small and
-        // bounded, so buffering into a `Vec` here is correct (issue #86).
-        // Absent or unparseable is the normal unsealed signal, never an Err.
-        let mut seal_bytes = Vec::new();
-        if let Err(e) = read(seal_pos, &mut seal_bytes) {
-            mismatches.push(Mismatch {
+    let rest = walk_from_index(layout, tier, fi_pos, seal_pos, fi_true_len, &mut read)?;
+
+    let seal = match early {
+        Some(seal) => seal,
+        None => read_seal(seal_pos, &mut read),
+    };
+    Ok(judge(tier, fi_pos, seal, rest))
+}
+
+/// What reading the seal marker (step 1, §5.1) found.
+enum SealRead {
+    /// The gate failed — absent, unreadable, unparseable, or a seal this
+    /// tapectl must not read (ADR-0012 item 15). This mismatch is the walk's
+    /// whole verdict; `files_checked` counts the seal itself when its bytes
+    /// came back.
+    Refused {
+        files_checked: u32,
+        mismatch: Mismatch,
+    },
+    /// A seal marker this tapectl can read, binding File 3 to this hash.
+    Bound { front_index_sha256: String },
+}
+
+/// Step 1 (§5.1): read + parse the seal marker (the last file). It is parsed
+/// as TOML, so its true bytes are genuinely needed — small and bounded, so
+/// buffering into a `Vec` here is correct (issue #86). Absent or
+/// unparseable is the normal unsealed signal, never an Err.
+fn read_seal<F>(seal_pos: u32, read: &mut F) -> SealRead
+where
+    F: FnMut(u32, &mut dyn Write) -> Result<u64>,
+{
+    let mut seal_bytes = Vec::new();
+    if let Err(e) = read(seal_pos, &mut seal_bytes) {
+        return SealRead::Refused {
+            files_checked: 0,
+            mismatch: Mismatch {
                 position: seal_pos,
                 kind: MismatchKind::SealUnreadable,
                 expected: "seal marker present and readable".to_string(),
                 actual: format!("read failed: {e}"),
-            });
-            break 'walk Evidence {
-                tier,
-                files_checked,
-                mismatches,
-            };
-        }
-        files_checked += 1;
-        let seal_str = String::from_utf8_lossy(&seal_bytes);
-        let seal = match format::parse_seal_marker(&seal_str) {
-            Ok(s) => s,
-            Err(e) => {
-                mismatches.push(Mismatch {
+            },
+        };
+    }
+    let seal_str = String::from_utf8_lossy(&seal_bytes);
+    let seal = match format::parse_seal_marker(&seal_str) {
+        Ok(s) => s,
+        Err(e) => {
+            return SealRead::Refused {
+                files_checked: 1,
+                mismatch: Mismatch {
                     position: seal_pos,
                     kind: MismatchKind::SealUnreadable,
                     expected: "seal marker parses".to_string(),
                     actual: format!("parse failed: {e}"),
-                });
-                break 'walk Evidence {
-                    tier,
-                    files_checked,
-                    mismatches,
-                };
+                },
             }
-        };
-        // A seal this tapectl must not read (a feature it does not know,
-        // ADR-0012 item 15) stops the walk as inconclusive — never a
-        // misread, and never evidence against the medium.
-        if let Some(why) = seal.refusal() {
-            mismatches.push(Mismatch {
+        }
+    };
+    // A seal this tapectl must not read (a feature it does not know,
+    // ADR-0012 item 15) stops the walk as inconclusive — never a misread,
+    // and never evidence against the medium.
+    if let Some(why) = seal.refusal() {
+        return SealRead::Refused {
+            files_checked: 1,
+            mismatch: Mismatch {
                 position: seal_pos,
                 kind: MismatchKind::SealUnreadable,
                 expected: "a seal marker this tapectl can read".to_string(),
                 actual: why,
-            });
-            break 'walk Evidence {
-                tier,
-                files_checked,
-                mismatches,
-            };
-        }
-
-        // Integrity only: read the files ahead of File 3 now, from BOT, so
-        // the rest of the walk is one forward pass (issue #389). Held, not
-        // judged — nothing here touches `mismatches` or `files_checked`;
-        // step 4 judges them in the front index's order.
-        let held = if tier == Tier::Integrity {
-            hold_files_ahead_of_index(layout, fi_pos, &mut read)
-        } else {
-            HashMap::new()
+            },
         };
+    }
+    SealRead::Bound {
+        front_index_sha256: seal.front_index_sha256,
+    }
+}
 
-        // Step 2 (§5.2): hash File 3's TRUE bytes; compare to the seal's
-        // binding. File 3 is also parsed as TOML in step 3 below, so its
-        // true bytes are genuinely needed too — same bounded-size reasoning
-        // as the seal marker (issue #86).
-        let mut fi_bytes = Vec::new();
-        if let Err(e) = read(fi_pos, &mut fi_bytes) {
-            mismatches.push(Mismatch {
-                position: fi_pos,
-                kind: MismatchKind::FrontIndexUnreadable,
-                expected: "front index present and readable".to_string(),
-                actual: format!("read failed: {e}"),
-            });
-            break 'walk Evidence {
-                tier,
-                files_checked,
-                mismatches,
-            };
-        }
-        files_checked += 1;
-        if fi_true_len > fi_bytes.len() {
-            mismatches.push(Mismatch {
-                position: fi_pos,
-                kind: MismatchKind::FrontIndexUnreadable,
-                expected: format!("{fi_true_len} on-tape bytes"),
-                actual: format!("only {} bytes read back", fi_bytes.len()),
-            });
-            break 'walk Evidence {
-                tier,
-                files_checked,
-                mismatches,
-            };
-        }
-        let fi_true_bytes = &fi_bytes[..fi_true_len];
-        let fi_hash = sha256_hex(fi_true_bytes);
-        if fi_hash != seal.front_index_sha256 {
-            mismatches.push(Mismatch {
-                position: fi_pos,
-                kind: MismatchKind::FrontIndexDivergesFromSeal,
-                expected: seal.front_index_sha256.clone(),
-                actual: fi_hash,
-            });
-            // Divergence is quarantine-grade (§2.5), but the walk continues
-            // so one confirm call surfaces every disagreement rather than
-            // stopping at the first (report, not fail-fast).
-        }
+/// Everything the walk reads and judges apart from the seal marker: steps
+/// 2–4 less step 2's comparison with the seal, which needs the seal and is
+/// [`judge`]'s.
+struct FromIndex {
+    /// Files read back in full, the seal not included.
+    files_checked: u32,
+    /// sha256 of File 3's true bytes, when they came back in full — what
+    /// step 2 compares with the seal's binding.
+    front_index_sha256: Option<String>,
+    /// Every disagreement after step 2's, in walk order.
+    mismatches: Vec<Mismatch>,
+}
 
-        // Step 3 (§5.3): parse File 3, run the §2.5 self-consistency checks,
-        // then diff every entry against the Layout = Navigable tier.
-        let fi_str = String::from_utf8_lossy(fi_true_bytes);
-        let parsed_fi = match format::parse_front_index(&fi_str) {
-            Ok(v) => v,
-            Err(e) => {
-                mismatches.push(Mismatch {
-                    position: fi_pos,
-                    kind: MismatchKind::FrontIndexUnreadable,
-                    expected: "front index parses".to_string(),
-                    actual: format!("parse failed: {e}"),
-                });
-                break 'walk Evidence {
-                    tier,
-                    files_checked,
-                    mismatches,
-                };
-            }
-        };
+/// Steps 2–4 (§5.2–§5.4) without the seal: read File 3 (holding the files
+/// ahead of it first, at the Integrity tier), hash it, parse it, run the
+/// §2.5 self-consistency checks, diff it against the Layout, and at the
+/// Integrity tier hash every content file against it. An `Err` only for a
+/// signal between content files (issue #404).
+fn walk_from_index<F>(
+    layout: &Layout,
+    tier: Tier,
+    fi_pos: u32,
+    seal_pos: u32,
+    fi_true_len: usize,
+    read: &mut F,
+) -> Result<FromIndex>
+where
+    F: FnMut(u32, &mut dyn Write) -> Result<u64>,
+{
+    let mut mismatches: Vec<Mismatch> = Vec::new();
+    let mut files_checked: u32 = 0;
 
-        for violation in format::validate_consistency(&parsed_fi) {
-            mismatches.push(Mismatch {
-                position: fi_pos,
-                kind: MismatchKind::FrontIndexInconsistent,
-                expected: "front index entries are self-consistent (§2.5)".to_string(),
-                actual: violation.to_string(),
-            });
-        }
+    // Integrity only: read the files ahead of File 3 now, from BOT, so the
+    // rest of the walk is one forward pass (issue #389). Held, not judged —
+    // nothing here touches `mismatches` or `files_checked`; step 4 judges
+    // them in the front index's order.
+    let held = if tier == Tier::Integrity {
+        hold_files_ahead_of_index(layout, fi_pos, read)
+    } else {
+        HashMap::new()
+    };
 
-        for entry in &layout.entries {
-            let position = entry.position as u32;
-            let Some(claim) = parsed_fi.iter().find(|p| p.position == entry.position) else {
-                mismatches.push(Mismatch {
-                    position,
-                    kind: MismatchKind::NavigationDisagreement,
-                    expected: format!("front index lists position {}", entry.position),
-                    actual: "missing from front index".to_string(),
-                });
-                continue;
-            };
-            if claim.type_label != entry.kind.type_label() {
-                mismatches.push(Mismatch {
-                    position,
-                    kind: MismatchKind::NavigationDisagreement,
-                    expected: entry.kind.type_label().to_string(),
-                    actual: claim.type_label.clone(),
-                });
-            }
-            // Both File 3's own entry and the seal marker's entry may
-            // legitimately omit size_bytes (self-reference / not-yet-known
-            // at File-3-build-time — an exclusion rule that may evolve;
-            // this diff only flags an outright disagreement, never a bare
-            // omission on either side).
-            if let (Some(a), Some(b)) = (claim.size_bytes, entry.size_bytes) {
-                if a != b {
-                    mismatches.push(Mismatch {
-                        position,
-                        kind: MismatchKind::NavigationDisagreement,
-                        expected: format!("size_bytes {b}"),
-                        actual: format!("size_bytes {a}"),
-                    });
-                }
-            }
-        }
-
-        if tier == Tier::Navigable {
-            break 'walk Evidence {
-                tier,
-                files_checked,
-                mismatches,
-            };
-        }
-
-        // Step 4 (§5.4, Integrity tier only): every file except File 3 and
-        // the seal marker, truncated to the front index's claimed size,
-        // hashed and compared to the front index's sha256_encrypted.
-        for claim in &parsed_fi {
-            let position = claim.position as u32;
-            if position == fi_pos || position == seal_pos {
-                continue;
-            }
-            // Issue #404: the readback is hours on a full cartridge, so a
-            // signal stops it between files. An `Err`, never a mismatch: a
-            // stop says nothing about the medium. Confirm's caller leaves
-            // the session for `volume resume`; verify reports inconclusive.
-            crate::signal::check(|| {
-                format!(
-                    "stopped reading the tape back before file {position} ({files_checked} \
-                     files checked)"
-                )
-            })?;
-            let (Some(want_hash), Some(want_size)) = (&claim.sha256_encrypted, claim.size_bytes)
-            else {
-                mismatches.push(Mismatch {
-                    position,
-                    kind: MismatchKind::NavigationDisagreement,
-                    expected: "front index carries size_bytes + sha256_encrypted".to_string(),
-                    actual: "one or both missing for a content file".to_string(),
-                });
-                continue;
-            };
-
-            // Content files are only ever hashed, never otherwise
-            // inspected — so unlike the seal marker/front index above, this
-            // never buffers the file. `TruncatingWriter` trims to `want_size`
-            // (the front index's claimed true length) as bytes arrive,
-            // wrapping a `HashingWriter` that discards into `io::sink()` —
-            // the same composition `restore.rs::restore_one_slice_inner`
-            // uses for its ciphertext pass, just with a sink that has no use
-            // for the bytes themselves (issue #86).
-            let mut sink = TruncatingWriter::new(HashingWriter::new(io::sink()), want_size);
-            // A file held from the pass ahead of File 3 is fed through the
-            // identical sink, as `MemStore::read_file` would feed it.
-            let read_result = match held.get(&position) {
-                Some(Held::Bytes { bytes, read }) => sink
-                    .write_all(bytes)
-                    .map(|()| *read)
-                    .map_err(|e| TapectlError::Other(format!("sink write: {e}")).to_string()),
-                Some(Held::Failed(e)) => Err(e.clone()),
-                None => read(position, &mut sink).map_err(|e| e.to_string()),
-            };
-            let hashing = sink.into_inner();
-
-            let n_read = match read_result {
-                Ok(n) => n,
-                Err(e) => {
-                    // Issue #239: a raw I/O or transport error. NOT a hash
-                    // disagreement — no hash was ever computed — so it is
-                    // not `ContentHashMismatch` and does not quarantine.
-                    mismatches.push(Mismatch {
-                        position,
-                        kind: MismatchKind::ContentUnreadable,
-                        expected: "file readable".to_string(),
-                        actual: format!("read failed: {e}"),
-                    });
-                    continue;
-                }
-            };
-            files_checked += 1;
-
-            if want_size > n_read {
-                // Issue #239: a short read. Ambiguous between a truncated
-                // write and a drive giving up early, and the count alone
-                // cannot separate them, so it takes the same side
-                // `FrontIndexUnreadable` already takes for the identical
-                // event one position over.
-                mismatches.push(Mismatch {
-                    position,
-                    kind: MismatchKind::ContentUnreadable,
-                    expected: format!("{want_size} on-tape bytes"),
-                    actual: format!("only {n_read} bytes read back"),
-                });
-                continue;
-            }
-            let actual_hash = hashing.finalize_hex();
-            if &actual_hash != want_hash {
-                mismatches.push(Mismatch {
-                    position,
-                    kind: MismatchKind::ContentHashMismatch,
-                    expected: want_hash.clone(),
-                    actual: actual_hash,
-                });
-            }
-        }
-
-        Evidence {
-            tier,
+    // Step 2 (§5.2): hash File 3's TRUE bytes, for `judge` to compare with
+    // the seal's binding. File 3 is also parsed as TOML in step 3 below, so
+    // its true bytes are genuinely needed too — same bounded-size reasoning
+    // as the seal marker (issue #86).
+    let mut fi_bytes = Vec::new();
+    if let Err(e) = read(fi_pos, &mut fi_bytes) {
+        mismatches.push(Mismatch {
+            position: fi_pos,
+            kind: MismatchKind::FrontIndexUnreadable,
+            expected: "front index present and readable".to_string(),
+            actual: format!("read failed: {e}"),
+        });
+        return Ok(FromIndex {
             files_checked,
+            front_index_sha256: None,
             mismatches,
+        });
+    }
+    files_checked += 1;
+    if fi_true_len > fi_bytes.len() {
+        mismatches.push(Mismatch {
+            position: fi_pos,
+            kind: MismatchKind::FrontIndexUnreadable,
+            expected: format!("{fi_true_len} on-tape bytes"),
+            actual: format!("only {} bytes read back", fi_bytes.len()),
+        });
+        return Ok(FromIndex {
+            files_checked,
+            front_index_sha256: None,
+            mismatches,
+        });
+    }
+    let fi_true_bytes = &fi_bytes[..fi_true_len];
+    let fi_hash = sha256_hex(fi_true_bytes);
+
+    // Step 3 (§5.3): parse File 3, run the §2.5 self-consistency checks,
+    // then diff every entry against the Layout = Navigable tier.
+    let fi_str = String::from_utf8_lossy(fi_true_bytes);
+    let parsed_fi = match format::parse_front_index(&fi_str) {
+        Ok(v) => v,
+        Err(e) => {
+            mismatches.push(Mismatch {
+                position: fi_pos,
+                kind: MismatchKind::FrontIndexUnreadable,
+                expected: "front index parses".to_string(),
+                actual: format!("parse failed: {e}"),
+            });
+            return Ok(FromIndex {
+                files_checked,
+                front_index_sha256: Some(fi_hash),
+                mismatches,
+            });
         }
     };
 
-    Ok(evidence)
+    for violation in format::validate_consistency(&parsed_fi) {
+        mismatches.push(Mismatch {
+            position: fi_pos,
+            kind: MismatchKind::FrontIndexInconsistent,
+            expected: "front index entries are self-consistent (§2.5)".to_string(),
+            actual: violation.to_string(),
+        });
+    }
+
+    for entry in &layout.entries {
+        let position = entry.position as u32;
+        let Some(claim) = parsed_fi.iter().find(|p| p.position == entry.position) else {
+            mismatches.push(Mismatch {
+                position,
+                kind: MismatchKind::NavigationDisagreement,
+                expected: format!("front index lists position {}", entry.position),
+                actual: "missing from front index".to_string(),
+            });
+            continue;
+        };
+        if claim.type_label != entry.kind.type_label() {
+            mismatches.push(Mismatch {
+                position,
+                kind: MismatchKind::NavigationDisagreement,
+                expected: entry.kind.type_label().to_string(),
+                actual: claim.type_label.clone(),
+            });
+        }
+        // Both File 3's own entry and the seal marker's entry may
+        // legitimately omit size_bytes (self-reference / not-yet-known at
+        // File-3-build-time — an exclusion rule that may evolve; this diff
+        // only flags an outright disagreement, never a bare omission on
+        // either side).
+        if let (Some(a), Some(b)) = (claim.size_bytes, entry.size_bytes) {
+            if a != b {
+                mismatches.push(Mismatch {
+                    position,
+                    kind: MismatchKind::NavigationDisagreement,
+                    expected: format!("size_bytes {b}"),
+                    actual: format!("size_bytes {a}"),
+                });
+            }
+        }
+    }
+
+    if tier == Tier::Navigable {
+        return Ok(FromIndex {
+            files_checked,
+            front_index_sha256: Some(fi_hash),
+            mismatches,
+        });
+    }
+
+    // Step 4 (§5.4, Integrity tier only): every file except File 3 and the
+    // seal marker, truncated to the front index's claimed size, hashed and
+    // compared to the front index's sha256_encrypted.
+    for claim in &parsed_fi {
+        let position = claim.position as u32;
+        if position == fi_pos || position == seal_pos {
+            continue;
+        }
+        // Issue #404: the readback is hours on a full cartridge, so a
+        // signal stops it between files. An `Err`, never a mismatch: a stop
+        // says nothing about the medium. Confirm's caller leaves the
+        // session for `volume resume`; verify reports inconclusive.
+        crate::signal::check(|| {
+            format!(
+                "stopped reading the tape back before file {position} ({files_checked} files \
+                 checked besides the seal)"
+            )
+        })?;
+        let (Some(want_hash), Some(want_size)) = (&claim.sha256_encrypted, claim.size_bytes) else {
+            mismatches.push(Mismatch {
+                position,
+                kind: MismatchKind::NavigationDisagreement,
+                expected: "front index carries size_bytes + sha256_encrypted".to_string(),
+                actual: "one or both missing for a content file".to_string(),
+            });
+            continue;
+        };
+
+        // Content files are only ever hashed, never otherwise inspected —
+        // so unlike the seal marker/front index above, this never buffers
+        // the file. `TruncatingWriter` trims to `want_size` (the front
+        // index's claimed true length) as bytes arrive, wrapping a
+        // `HashingWriter` that discards into `io::sink()` — the same
+        // composition `restore.rs::restore_one_slice_inner` uses for its
+        // ciphertext pass, just with a sink that has no use for the bytes
+        // themselves (issue #86).
+        let mut sink = TruncatingWriter::new(HashingWriter::new(io::sink()), want_size);
+        // A file held from the pass ahead of File 3 is fed through the
+        // identical sink, as `MemStore::read_file` would feed it.
+        let read_result = match held.get(&position) {
+            Some(Held::Bytes { bytes, read }) => sink
+                .write_all(bytes)
+                .map(|()| *read)
+                .map_err(|e| TapectlError::Other(format!("sink write: {e}")).to_string()),
+            Some(Held::Failed(e)) => Err(e.clone()),
+            None => read(position, &mut sink).map_err(|e| e.to_string()),
+        };
+        let hashing = sink.into_inner();
+
+        let n_read = match read_result {
+            Ok(n) => n,
+            Err(e) => {
+                // Issue #239: a raw I/O or transport error. NOT a hash
+                // disagreement — no hash was ever computed — so it is not
+                // `ContentHashMismatch` and does not quarantine.
+                mismatches.push(Mismatch {
+                    position,
+                    kind: MismatchKind::ContentUnreadable,
+                    expected: "file readable".to_string(),
+                    actual: format!("read failed: {e}"),
+                });
+                continue;
+            }
+        };
+        files_checked += 1;
+
+        if want_size > n_read {
+            // Issue #239: a short read. Ambiguous between a truncated write
+            // and a drive giving up early, and the count alone cannot
+            // separate them, so it takes the same side
+            // `FrontIndexUnreadable` already takes for the identical event
+            // one position over.
+            mismatches.push(Mismatch {
+                position,
+                kind: MismatchKind::ContentUnreadable,
+                expected: format!("{want_size} on-tape bytes"),
+                actual: format!("only {n_read} bytes read back"),
+            });
+            continue;
+        }
+        let actual_hash = hashing.finalize_hex();
+        if &actual_hash != want_hash {
+            mismatches.push(Mismatch {
+                position,
+                kind: MismatchKind::ContentHashMismatch,
+                expected: want_hash.clone(),
+                actual: actual_hash,
+            });
+        }
+    }
+
+    Ok(FromIndex {
+        files_checked,
+        front_index_sha256: Some(fi_hash),
+        mismatches,
+    })
+}
+
+/// The verdict, in §5's order whatever order the files were read in: the
+/// seal's gate first — a refused seal is the whole verdict, and anything
+/// read after it is discarded — then step 2's binding (File 3's hash
+/// against the seal's), then everything else in walk order.
+fn judge(tier: Tier, fi_pos: u32, seal: SealRead, rest: FromIndex) -> Evidence {
+    match seal {
+        SealRead::Refused {
+            files_checked,
+            mismatch,
+        } => Evidence {
+            tier,
+            files_checked,
+            mismatches: vec![mismatch],
+        },
+        SealRead::Bound { front_index_sha256 } => {
+            let mut mismatches = Vec::with_capacity(rest.mismatches.len() + 1);
+            if let Some(fi_hash) = rest.front_index_sha256 {
+                if fi_hash != front_index_sha256 {
+                    // Divergence is quarantine-grade (§2.5), but the walk
+                    // continued so one confirm call surfaces every
+                    // disagreement rather than stopping at the first
+                    // (report, not fail-fast).
+                    mismatches.push(Mismatch {
+                        position: fi_pos,
+                        kind: MismatchKind::FrontIndexDivergesFromSeal,
+                        expected: front_index_sha256,
+                        actual: fi_hash,
+                    });
+                }
+            }
+            mismatches.extend(rest.mismatches);
+            Evidence {
+                tier,
+                files_checked: 1 + rest.files_checked,
+                mismatches,
+            }
+        }
+    }
 }
 
 /// The most on-tape bytes `chain_walk` will hold for one file ahead of
@@ -2661,10 +2830,11 @@ mod tests {
         assert_eq!(fake.spaces(), 1);
     }
 
-    /// The write session's confirm: the writes leave the cursor unknown, so
-    /// the seal read rewinds too — still two rewinds for the whole confirm.
+    /// Seal first straight after the writes: the writes leave the cursor
+    /// unknown, so the seal read rewinds too — two rewinds and a locate out
+    /// to the seal, which is why the write session reads it last (#397).
     #[test]
-    fn a_confirm_straight_after_the_writes_rewinds_twice() {
+    fn a_seal_first_confirm_straight_after_the_writes_rewinds_twice() {
         let (layout, mem) = build_confirm_fixture_with(None, 8);
         let seal = 4 + 8;
         let (mut store, fake) = tape_over(Vec::new());
@@ -2682,25 +2852,115 @@ mod tests {
         assert_eq!(fake.ops(), expected);
     }
 
+    /// Issue #397: seal last straight after the writes is one rewind and one
+    /// forward pass that ends on the seal — no locate out to it.
     #[test]
-    fn a_navigable_confirm_reads_the_seal_then_file_3() {
+    fn a_seal_last_confirm_straight_after_the_writes_is_one_forward_pass() {
+        let (layout, mem) = build_confirm_fixture_with(None, 8);
+        let seal = 4 + 8;
+        let (mut store, fake) = tape_over(Vec::new());
+        for file in &mem.files {
+            store
+                .execute(&mut Cursor::new(file.clone()), file.len() as u64, false)
+                .unwrap();
+        }
+        fake.clear_ops();
+
+        let plan = ConfirmPlan::new(Tier::Integrity).with_order(ReadOrder::SealLast);
+        let evidence = store.confirm_with(&layout, plan).unwrap();
+        assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
+        assert_eq!(evidence.files_checked, seal + 1);
+        let mut expected = vec![Op::Rewind];
+        expected.extend((0..=seal).map(Op::Read));
+        assert_eq!(fake.ops(), expected);
+    }
+
+    /// Issue #397: the navigable tier reads File 3 and then spaces forward
+    /// to the seal — the open's rewind and two forward spaces, whatever
+    /// order is asked for (before: a locate to the seal, then a rewind back
+    /// to File 3).
+    #[test]
+    fn a_navigable_confirm_reads_file_3_then_the_seal() {
         let (layout, mem) = build_confirm_fixture_with(None, 5);
         let seal = 4 + 5;
-        let (mut store, fake) = tape_over(mem.files);
-        let evidence = store.confirm(&layout, Tier::Navigable).unwrap();
-        assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
-        assert_eq!(evidence.files_checked, 2);
-        assert_eq!(
-            fake.ops(),
-            vec![
-                Op::Rewind,
-                Op::Space(seal),
-                Op::Read(seal),
-                Op::Rewind,
-                Op::Space(3),
-                Op::Read(3),
-            ]
-        );
+        for order in [ReadOrder::SealFirst, ReadOrder::SealLast] {
+            let (mut store, fake) = tape_over(mem.files.clone());
+            let plan = ConfirmPlan::new(Tier::Navigable).with_order(order);
+            let evidence = store.confirm_with(&layout, plan).unwrap();
+            assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
+            assert_eq!(evidence.files_checked, 2);
+            assert_eq!(
+                fake.ops(),
+                vec![
+                    Op::Rewind,
+                    Op::Space(3),
+                    Op::Read(3),
+                    Op::Space(seal - 4),
+                    Op::Read(seal),
+                ],
+                "{order:?}"
+            );
+            assert_eq!(fake.rewinds(), 1);
+        }
+    }
+
+    /// Issue #397's other acceptance criterion: the read order changes the
+    /// motion, never the verdict. Every shape of failure the walk knows —
+    /// no seal, a garbage seal, a seal bound to another index, an index
+    /// that contradicts itself or the Layout, a corrupt slice, a corrupt
+    /// front-zone file, a read fault — gives the identical `Evidence`
+    /// (mismatch kinds, order, text, `files_checked`) seal first and seal
+    /// last, at both tiers, on the position-addressed `MemStore` and on the
+    /// fake tape alike.
+    #[test]
+    fn the_read_order_never_changes_the_verdict() {
+        type Damage = fn(&mut Layout, &mut MemStore);
+        let cases: Vec<(&str, Option<&str>, Damage)> = vec![
+            ("clean", None, |_, _| {}),
+            ("seal absent", None, |_, s| {
+                s.files.pop();
+            }),
+            ("seal garbage", None, |_, s| {
+                let last = s.files.len() - 1;
+                s.files[last] = vec![0xFFu8; BS as usize];
+            }),
+            ("seal bound elsewhere", Some("0000"), |_, _| {}),
+            ("slice corrupt", None, |_, s| s.files[5][100] ^= 0xFF),
+            ("guide corrupt", None, |_, s| s.files[1][3] ^= 0xFF),
+            ("index unparseable", None, |_, s| s.files[3][0] = b'['),
+            ("layout disagrees", None, |l, _| {
+                l.entries[4].size_bytes = Some(7);
+            }),
+            ("seal and slice both bad", None, |_, s| {
+                s.files[5][100] ^= 0xFF;
+                let last = s.files.len() - 1;
+                s.files[last] = vec![0u8; BS as usize];
+            }),
+        ];
+        for (name, seal_override, damage) in cases {
+            let bound = seal_override.map(|h| h.repeat(16));
+            let (mut layout, mut mem) = build_confirm_fixture_with(bound.as_deref(), 3);
+            damage(&mut layout, &mut mem);
+            for tier in [Tier::Navigable, Tier::Integrity] {
+                let first = ConfirmPlan::new(tier);
+                let last = first.with_order(ReadOrder::SealLast);
+                let want = mem.confirm_with(&layout, first).unwrap();
+                assert_eq!(
+                    mem.confirm_with(&layout, last).unwrap(),
+                    want,
+                    "{name}, {tier:?}: MemStore"
+                );
+                // The fake tape compared with itself: an absent seal reads
+                // as "nothing" at end of data there, not as a failed read
+                // (issue #327), so its verdict differs from MemStore's by
+                // design — but never between the two orders.
+                let on_tape = |plan| {
+                    let (mut store, _fake) = tape_over(mem.files.clone());
+                    store.confirm_with(&layout, plan).unwrap()
+                };
+                assert_eq!(on_tape(last), on_tape(first), "{name}, {tier:?}: fake tape");
+            }
+        }
     }
 
     /// The files held ahead of File 3 are judged in step 4, in the front
