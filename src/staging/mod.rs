@@ -738,7 +738,13 @@ fn stage_create_inner(
     // The source's sha256s, read beside dar and within
     // `validate::READ_AHEAD_BYTES` of it, so each file leaves the disk once
     // (issue #364). Stopped and joined on every way out.
-    let hashing = validate::ConcurrentHash::spawn(PathBuf::from(&snapshot.source_path), plan)?;
+    // `[staging] hash_threads` files at once (issue #366), handed out in dar's
+    // read order and recorded in it.
+    let hashing = validate::ConcurrentHash::spawn(
+        PathBuf::from(&snapshot.source_path),
+        plan,
+        validate::hash_threads(config.staging.hash_threads),
+    )?;
     let mut dar_run = dar::create::spawn_archive(&dar::create::DarCreateParams {
         dar_binary: &config.dar.binary,
         source_path: Path::new(&snapshot.source_path),

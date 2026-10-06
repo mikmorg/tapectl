@@ -518,6 +518,16 @@ impl Default for DefaultsConfig {
 pub struct StagingConfig {
     #[serde(default = "default_staging_dir")]
     pub directory: String,
+    /// How many source files one `stage create` hashes at once (issue
+    /// #366), at most the host's cores. Each thread reads its own file, so
+    /// on a single spinning disk more threads can mean more seeking; 1 is
+    /// the serial pass.
+    #[serde(default = "default_hash_threads")]
+    pub hash_threads: usize,
+}
+
+fn default_hash_threads() -> usize {
+    crate::staging::validate::DEFAULT_HASH_THREADS
 }
 
 /// Issue #140: this was `/mnt/staging`, a path that does not exist on a
@@ -543,6 +553,7 @@ impl Default for StagingConfig {
     fn default() -> Self {
         Self {
             directory: default_staging_dir(),
+            hash_threads: default_hash_threads(),
         }
     }
 }
@@ -1061,6 +1072,18 @@ impl Config {
                  live plus reclaimable archive data, which never exceeds 1.0; 0 or negative \
                  silently disables compaction-candidate detection)",
                 path.display()
+            ));
+        }
+        // `[staging] hash_threads` (issue #366): 0 would hash nothing, and a
+        // count past any host's cores is a typo, not a plan.
+        let threads = self.staging.hash_threads;
+        if !(1..=crate::staging::validate::MAX_HASH_THREADS).contains(&threads) {
+            problems.push(format!(
+                "{}: staging.hash_threads = {threads} must be between 1 and {} (how many \
+                 source files `stage create` hashes at once; it never runs more than the \
+                 host's cores)",
+                path.display(),
+                crate::staging::validate::MAX_HASH_THREADS
             ));
         }
         // `[host_check]`: a load threshold of 0 or below would make every
@@ -2823,6 +2846,23 @@ mod tests {
         let err = Config::load(&path).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("compaction.utilization_threshold"), "{msg}");
+    }
+
+    /// Issue #366: `[staging] hash_threads` is 1 to 64; 0 would hash nothing.
+    #[test]
+    fn config_load_takes_hash_threads_and_refuses_zero() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[staging]\nhash_threads = 0\n").unwrap();
+        let msg = Config::load(&path).unwrap_err().to_string();
+        assert!(msg.contains("staging.hash_threads = 0"), "{msg}");
+        std::fs::write(&path, "[staging]\nhash_threads = 2\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().staging.hash_threads, 2);
+        std::fs::write(&path, "[staging]\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().staging.hash_threads,
+            crate::staging::validate::DEFAULT_HASH_THREADS
+        );
     }
 
     #[test]

@@ -509,6 +509,7 @@ mod tests {
         let mut config = Config {
             staging: crate::config::StagingConfig {
                 directory: dir.to_string_lossy().to_string(),
+                ..Default::default()
             },
             ..Default::default()
         };

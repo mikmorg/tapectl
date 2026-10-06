@@ -403,7 +403,8 @@ fn init_config_show_roundtrip_exits_zero_with_no_deleted_keys() {
         "[labels]",
         "strategy",
         "fill_threshold",
-        "hash",
+        // The key `hash`, not `[staging] hash_threads` (issue #366).
+        "\nhash =",
     ] {
         assert!(
             !shown.contains(dead),

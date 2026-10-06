@@ -48,6 +48,28 @@ Single run — treat the numbers as rough.
 | large_file (500 MiB)     | init_unit + snapshot_create | 0.59 s   |                           |
 | large_file (500 MiB)     | stage_create                | 26.21 s  | 19.1 MiB/s end-to-end     |
 
+### 2026-10-06 — the source hash across files (issue #366)
+
+Environment: `vm-desk1` (16 vCPU, 9 GiB RAM, shared with other jobs), a
+**debug** build, the tree in the page cache. The tree is 1,500 random files of
+256 KiB (375 MiB) in 119 directories. The hash pass alone is `hash_files` with
+no dar beside it; `stage create` is the whole command.
+
+| step | `hash_threads` | time |
+|---|---|---|
+| hash pass alone | 1 | 4.47 s, 3.11 s |
+| hash pass alone | 4 | 0.84 s, 0.75 s |
+| hash pass alone | 8 | 0.41 s |
+| `stage create` | 1 | 189.8 s, 110.1 s |
+| `stage create` | 4 | 117.1 s, 105.1 s |
+
+The hash pass scales with the threads (about 4x at 4). The whole stage
+barely moves here because a debug build's age encryption, about 3.5 MiB/s,
+is the slowest part. On home2's release binary the single-core sha256
+(~123–163 MB/s) is what holds dar back, so that is where the gain shows.
+The figure #366 asks for, a many-file unit on home2 at 1/2/4/8 threads, is
+still owed.
+
 ### Observations
 
 - **Snapshot creation for many-files is surprisingly expensive** (~32 s

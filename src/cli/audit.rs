@@ -2967,6 +2967,7 @@ mod tests {
         let config = Config {
             staging: crate::config::StagingConfig {
                 directory: tmp.path().to_string_lossy().to_string(),
+                ..Default::default()
             },
             ..Default::default()
         };

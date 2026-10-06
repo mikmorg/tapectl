@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rusqlite::{params, Connection};
@@ -332,10 +332,39 @@ impl ReadAhead {
     }
 }
 
-/// Hash every file of `plan` under `base`, in order, keeping pace with dar
-/// through `ahead` (issue #364: the source is read once from disk — dar
-/// and this hasher each read a file within `ahead`'s lead of the other, so
-/// the second read comes from the page cache).
+/// How many source files the hasher reads at once when nothing says
+/// otherwise (issue #366): `[staging] hash_threads`' default, before the
+/// clamp to the cores the host has ([`hash_threads`]).
+pub const DEFAULT_HASH_THREADS: usize = 4;
+
+/// The most `[staging] hash_threads` may say (issue #366).
+pub const MAX_HASH_THREADS: usize = 64;
+
+/// The number of hasher threads to run for `requested`: at least 1, and no
+/// more than the host's cores (issue #366: sha256 is CPU-bound, so threads
+/// past the cores only add contention).
+pub(crate) fn hash_threads(requested: usize) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    requested.clamp(1, MAX_HASH_THREADS).min(cores).max(1)
+}
+
+/// Hash every file of `plan` under `base`, keeping pace with dar through
+/// `ahead` (issue #364: the source is read once from disk — dar and this
+/// hasher each read a file within `ahead`'s lead of the other, so the
+/// second read comes from the page cache).
+///
+/// `threads` files are hashed at once (issue #366: one core's sha256 was
+/// the ceiling of the whole stage). Files are handed out in `plan`'s order —
+/// dar's read order — so the hashers together stay inside one lead of dar,
+/// whose `hashed` count they share; the results are collected in that same
+/// order, so every recorded sha256 and every refusal is the serial pass's.
+/// The refusal reported is the first in that order, never whichever thread
+/// happened to fail first: a failure at file `i` stops files after `i` from
+/// being started, while every file before it is still read to the end, so a
+/// refusal earlier in the order still wins. One thread is the serial pass
+/// exactly, on the calling thread.
 ///
 /// For each file: stat, open, `fstat`, hash, `fstat` again. A file at
 /// another size than the snapshot's is DIRTY; one whose size, times or
@@ -345,8 +374,13 @@ impl ReadAhead {
 ///
 /// On a refusal or an error it marks `ahead` failed, so dar's consumer stops
 /// dar, and returns the error.
-pub(crate) fn hash_files(base: &Path, plan: &SourcePlan, ahead: &ReadAhead) -> Result<Hashed> {
-    let result = hash_all(base, plan, ahead);
+pub(crate) fn hash_files(
+    base: &Path,
+    plan: &SourcePlan,
+    ahead: &ReadAhead,
+    threads: usize,
+) -> Result<Hashed> {
+    let result = hash_all(base, plan, ahead, threads);
     match &result {
         Ok(_) => ahead.hasher_done.store(true, Ordering::Release),
         Err(_) => ahead.hasher_failed.store(true, Ordering::Release),
@@ -354,28 +388,82 @@ pub(crate) fn hash_files(base: &Path, plan: &SourcePlan, ahead: &ReadAhead) -> R
     result
 }
 
-fn hash_all(base: &Path, plan: &SourcePlan, ahead: &ReadAhead) -> Result<Hashed> {
+fn hash_all(base: &Path, plan: &SourcePlan, ahead: &ReadAhead, threads: usize) -> Result<Hashed> {
     let total_files = plan.files.len();
+    let threads = threads.clamp(1, total_files.max(1));
     info!(
         files = total_files,
         total_mb = plan.total_bytes() / (1024 * 1024),
+        threads,
         "hashing source files"
     );
-    let mut files = Vec::with_capacity(total_files);
-    for (done, planned) in plan.files.iter().enumerate() {
-        // Issue #404: hours on a large unit, so a signal stops it between
-        // files.
-        crate::signal::check(|| {
-            format!("stopped while checking the source ({done} of {total_files} files hashed)")
-        })?;
-        if !ahead.hasher_may_read() {
-            return Err(TapectlError::Other("the source check was stopped".into()));
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    // The lowest index that failed so far; no file after it is started.
+    let first_failure = AtomicUsize::new(usize::MAX);
+    let slots: Vec<std::sync::OnceLock<Result<HashedFile>>> = (0..total_files)
+        .map(|_| std::sync::OnceLock::new())
+        .collect();
+    let worker = || loop {
+        let i = next.fetch_add(1, Ordering::AcqRel);
+        if i >= total_files || i > first_failure.load(Ordering::Acquire) {
+            break;
         }
-        let full_path = base.join(&planned.rel_path);
-        let hashed = hash_one(&full_path, planned, ahead)?;
-        #[cfg(test)]
-        hash_hook::fire(&full_path);
-        files.push(hashed);
+        let planned = &plan.files[i];
+        let result = (|| {
+            // Issue #404: hours on a large unit, so a signal stops it
+            // between files.
+            crate::signal::check(|| {
+                format!(
+                    "stopped while checking the source ({} of {total_files} files hashed)",
+                    done.load(Ordering::Acquire)
+                )
+            })?;
+            if !ahead.hasher_may_read() {
+                return Err(TapectlError::Other("the source check was stopped".into()));
+            }
+            let full_path = base.join(&planned.rel_path);
+            #[cfg(test)]
+            let _active = hash_hook::Active::enter(&full_path);
+            let hashed = hash_one(&full_path, planned, ahead)?;
+            #[cfg(test)]
+            hash_hook::fire(&full_path);
+            Ok(hashed)
+        })();
+        if result.is_err() {
+            first_failure.fetch_min(i, Ordering::AcqRel);
+        } else {
+            done.fetch_add(1, Ordering::AcqRel);
+        }
+        let _ = slots[i].set(result);
+    };
+    std::thread::scope(|s| {
+        for n in 1..threads {
+            let spawned = std::thread::Builder::new()
+                .name(format!("tapectl-source-hash-{n}"))
+                .spawn_scoped(s, worker);
+            if spawned.is_err() {
+                // Fewer threads is slower, never wrong: the calling thread
+                // below hashes whatever the others do not.
+                break;
+            }
+        }
+        worker();
+    });
+
+    let mut files = Vec::with_capacity(total_files);
+    for slot in slots {
+        match slot.into_inner() {
+            Some(Ok(hashed)) => files.push(hashed),
+            Some(Err(e)) => return Err(e),
+            // Not started: an earlier file failed, and is reported first.
+            None => break,
+        }
+    }
+    if files.len() != total_files {
+        return Err(TapectlError::Other(
+            "the source check stopped before every file was hashed".into(),
+        ));
     }
     info!(files = files.len(), "source files hashed");
     Ok(Hashed { files })
@@ -494,13 +582,17 @@ pub(crate) struct ConcurrentHash {
 }
 
 impl ConcurrentHash {
-    /// Start hashing `plan`'s files under `base`.
-    pub(crate) fn spawn(base: std::path::PathBuf, plan: SourcePlan) -> Result<Self> {
+    /// Start hashing `plan`'s files under `base`, `threads` at a time.
+    pub(crate) fn spawn(
+        base: std::path::PathBuf,
+        plan: SourcePlan,
+        threads: usize,
+    ) -> Result<Self> {
         let ahead = std::sync::Arc::new(ReadAhead::new(READ_AHEAD_BYTES));
         let shared = ahead.clone();
         let handle = std::thread::Builder::new()
             .name("tapectl-source-hash".into())
-            .spawn(move || hash_files(&base, &plan, &shared))?;
+            .spawn(move || hash_files(&base, &plan, &shared, threads))?;
         Ok(Self {
             ahead,
             handle: Some(handle),
@@ -604,7 +696,12 @@ pub fn validate_source(
     let plan = plan(conn, snapshot_id, source_path, global_excludes)?;
     crate::progress::set_total(plan.total_bytes());
     let base = Path::new(source_path);
-    let hashed = hash_files(base, &plan, &ReadAhead::alone())?;
+    let hashed = hash_files(
+        base,
+        &plan,
+        &ReadAhead::alone(),
+        hash_threads(DEFAULT_HASH_THREADS),
+    )?;
     recheck(base, &hashed)?;
     Ok(SourceValidation {
         checksums: hashed.checksums(),
@@ -750,6 +847,64 @@ pub(crate) mod hash_hook {
             }
         }
     }
+
+    /// `(files being hashed now, the most at once)` per tracked source root
+    /// (issue #366): how a test sees that files are hashed in parallel.
+    static ACTIVE: Mutex<Option<HashMap<PathBuf, (usize, usize)>>> = Mutex::new(None);
+
+    /// Count how many files under `root` are hashed at once, until
+    /// [`untrack`].
+    pub(crate) fn track(root: &Path) {
+        ACTIVE
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(root.to_path_buf(), (0, 0));
+    }
+
+    /// The most files under `root` that were hashed at once; stops tracking.
+    pub(crate) fn untrack(root: &Path) -> usize {
+        ACTIVE
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|m| m.remove(root))
+            .map_or(0, |(_, most)| most)
+    }
+
+    /// One file being hashed, for the length of the guard.
+    pub(crate) struct Active(Option<PathBuf>);
+
+    impl Active {
+        pub(crate) fn enter(path: &Path) -> Self {
+            let mut active = ACTIVE.lock().unwrap();
+            let root = active.as_mut().and_then(|m| {
+                m.iter_mut()
+                    .find(|(root, _)| path.starts_with(root))
+                    .map(|(root, (now, most))| {
+                        *now += 1;
+                        *most = (*most).max(*now);
+                        root.clone()
+                    })
+            });
+            Self(root)
+        }
+    }
+
+    impl Drop for Active {
+        fn drop(&mut self) {
+            if let Some(root) = self.0.take() {
+                if let Some((now, _)) = ACTIVE
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .and_then(|m| m.get_mut(&root))
+                {
+                    *now -= 1;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -884,7 +1039,7 @@ mod tests {
         let plan = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap();
         let ahead = std::sync::Arc::new(ReadAhead::new(64 << 10));
         let shared = ahead.clone();
-        let hasher = std::thread::spawn(move || hash_files(&base, &plan, &shared).map(|_| ()));
+        let hasher = std::thread::spawn(move || hash_files(&base, &plan, &shared, 1).map(|_| ()));
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             !hasher.is_finished(),
@@ -924,13 +1079,173 @@ mod tests {
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
         let base = tmp.path();
         let plan = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap();
-        let hashed = hash_files(base, &plan, &ReadAhead::alone()).unwrap();
+        let hashed = hash_files(base, &plan, &ReadAhead::alone(), 1).unwrap();
         recheck(base, &hashed).expect("unchanged: passes");
 
         std::thread::sleep(Duration::from_millis(20));
         std::fs::write(base.join("a.txt"), b"HELLO").unwrap();
         let err = recheck(base, &hashed).unwrap_err().to_string();
         assert!(err.contains("DIRTY") && err.contains("a.txt"), "{err}");
+    }
+
+    /// A tree of `n` files in nested directories, sizes varied, every one
+    /// in the snapshot with `baseline` (by file index) as its recorded
+    /// sha256. Returns the tree, the catalog and the snapshot id.
+    fn tree_of(
+        n: usize,
+        size: impl Fn(usize) -> usize,
+        baseline: impl Fn(usize, &[u8]) -> Option<String>,
+    ) -> (TempDir, Connection, i64) {
+        let tmp = TempDir::new().unwrap();
+        let mut rows: Vec<(String, i64, Option<String>)> = Vec::new();
+        for i in 0..n {
+            let rel = format!("d{}/e{}/f{i:03}.bin", i % 3, i % 5);
+            let full = tmp.path().join(&rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            let data: Vec<u8> = (0..size(i))
+                .map(|j| ((i * 31 + j * 7) % 251) as u8)
+                .collect();
+            std::fs::write(&full, &data).unwrap();
+            rows.push((rel, data.len() as i64, baseline(i, &data)));
+        }
+        let borrowed: Vec<(&str, i64, Option<&str>)> = rows
+            .iter()
+            .map(|(p, s, b)| (p.as_str(), *s, b.as_deref()))
+            .collect();
+        let (conn, sid) = setup_conn_with_snapshot(&borrowed);
+        (tmp, conn, sid)
+    }
+
+    fn hash_with(base: &Path, plan: &SourcePlan, threads: usize) -> Result<Vec<(String, String)>> {
+        hash_files(base, plan, &ReadAhead::alone(), threads).map(|h| h.checksums())
+    }
+
+    /// Issue #366 acceptance: hashing several files at once records exactly
+    /// what the serial pass records — every sha256, in dar's order — and
+    /// refuses exactly what it refuses, with the same text: a file changed
+    /// at its recorded size (BITROT against its baseline) and a file gone
+    /// since the plan (missing).
+    #[test]
+    fn parallel_hashing_records_and_refuses_exactly_what_the_serial_pass_does() {
+        let (tmp, conn, sid) = tree_of(60, |i| (i * 7919) % 300_000, |_, _| None);
+        let base = tmp.path();
+        let planned = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap();
+        let serial = hash_with(base, &planned, 1).unwrap();
+        assert_eq!(serial.len(), 60);
+        for threads in [2, 4, 8, 64] {
+            assert_eq!(
+                hash_with(base, &planned, threads).unwrap(),
+                serial,
+                "{threads}"
+            );
+        }
+        let walk: Vec<&str> = planned.files.iter().map(|f| f.rel_path.as_str()).collect();
+        let recorded: Vec<&str> = serial.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(recorded, walk, "recorded in dar's read order");
+
+        // A changed file (same size, other bytes, against a baseline) and a
+        // missing one.
+        let (tmp, conn, sid) = tree_of(
+            40,
+            |i| 1000 + i * 50,
+            |_, data| Some(format!("{:x}", Sha256::digest(data))),
+        );
+        let base = tmp.path();
+        let planned2 = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap();
+        let changed = planned2.files[25].rel_path.clone();
+        let missing = planned2.files[11].rel_path.clone();
+        let len = std::fs::metadata(base.join(&changed)).unwrap().len() as usize;
+        std::fs::write(base.join(&changed), vec![0xEEu8; len]).unwrap();
+        let only_changed = hash_with(base, &planned2, 1).unwrap_err().to_string();
+        assert!(
+            only_changed.contains("BITROT suspected") || only_changed.contains("DIRTY"),
+            "{only_changed}"
+        );
+        std::fs::remove_file(base.join(&missing)).unwrap();
+        let serial = hash_with(base, &planned2, 1).unwrap_err().to_string();
+        assert!(
+            serial.contains("source file missing") && serial.contains(&missing),
+            "the earlier file in dar's order is the one reported: {serial}"
+        );
+        for threads in [2, 4, 8] {
+            assert_eq!(
+                hash_with(base, &planned2, threads).unwrap_err().to_string(),
+                serial,
+                "{threads} threads"
+            );
+        }
+    }
+
+    /// Issue #366: files really are hashed at once — `threads` of them in
+    /// flight, not one after another.
+    #[test]
+    fn several_files_are_hashed_at_once() {
+        let (tmp, conn, sid) = tree_of(24, |_| 4096, |_, _| None);
+        let base = tmp.path();
+        let plan = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap();
+        hash_hook::track(base);
+        // Each file stays "in flight" a little after its hash, so threads
+        // that run at all overlap.
+        hash_hook::set(base, |_| std::thread::sleep(Duration::from_millis(15)));
+        let result = hash_with(base, &plan, 4);
+        hash_hook::clear(base);
+        let most = hash_hook::untrack(base);
+        result.unwrap();
+        assert!(most >= 2, "at most {most} file(s) hashed at once");
+        assert!(most <= 4, "never more than the threads: {most}");
+    }
+
+    /// Issue #366: the refusal reported is the first in dar's order, not
+    /// whichever thread failed first. The early file is large and only
+    /// fails once its whole hash is read (BITROT); a later file fails at
+    /// once (its size moved since the plan). Threads that raced would report
+    /// the later one.
+    #[test]
+    fn the_first_refusal_in_dar_order_is_the_one_reported() {
+        let (tmp, conn, sid) = tree_of(
+            30,
+            |_| 2048,
+            |_, data| Some(format!("{:x}", Sha256::digest(data))),
+        );
+        let base = tmp.path();
+        // The first file in dar's order becomes large, with a baseline of
+        // its own content, then rots by one byte at the end.
+        let first = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap().files[0]
+            .rel_path
+            .clone();
+        let mut bytes: Vec<u8> = (0..24u32 << 20).map(|j| (j % 253) as u8).collect();
+        conn.execute(
+            "UPDATE files SET size_bytes = ?1, sha256 = ?2 WHERE path = ?3",
+            params![
+                bytes.len() as i64,
+                format!("{:x}", Sha256::digest(&bytes)),
+                first
+            ],
+        )
+        .unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(base.join(&first), &bytes).unwrap();
+        let planned = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap();
+        assert_eq!(planned.files[0].rel_path, first);
+        let later = planned.files.last().unwrap().rel_path.clone();
+        std::fs::write(base.join(&later), b"grown longer").unwrap();
+        let big_path = first;
+        for threads in [1, 4] {
+            let err = hash_with(base, &planned, threads).unwrap_err().to_string();
+            assert!(
+                err.contains("BITROT suspected") && err.contains(&big_path),
+                "{threads} threads: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn hash_threads_are_at_least_one_and_at_most_the_cores() {
+        let cores = std::thread::available_parallelism().unwrap().get();
+        assert_eq!(hash_threads(0), 1);
+        assert_eq!(hash_threads(1), 1);
+        assert_eq!(hash_threads(10_000), cores.min(MAX_HASH_THREADS));
     }
 
     #[test]
