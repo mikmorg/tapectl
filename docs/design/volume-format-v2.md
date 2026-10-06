@@ -110,6 +110,59 @@ later drive reads its MAM cleanly. Corroborating the loaded medium against that
 record at each contact is a separate concern, and belongs to the catalog rather
 than to these bytes.
 
+### 1.2 How v2 extends: `requires`, and keys a reader does not know (normative)
+
+Ruled 2026-10-06 (ADR-0012 amendment item 15); closes #384. Tapes written by
+tapectl 1.1.0 and later state, in File 0's `[volume]` and in the seal
+marker's `[seal]`, one line after `layout_version`:
+
+```toml
+requires = []
+```
+
+`requires` lists the features a reader must understand to read this tape
+correctly. 1.1.0 knows none, and requires none. The rules every reader keeps
+— tapectl's (`format::FormatClaims`, checked by `restore raw-volume`,
+`catalog rebuild`, the confirm/verify chain walk) and RESTORE.sh's
+(`check_magic`, `check_requires`):
+
+1. **Refuse what you do not know, by name.** A tape whose File 0 or seal
+   marker lists a feature the reader does not know, or states a `magic`
+   other than `tapectl-volume-v2` or a `layout_version` other than 2, is
+   refused before anything else of it is interpreted. The refusal names the
+   feature and the way to a reader that knows it: a newer tapectl, or the
+   RESTORE.sh at the tape's own file 2. A refusal is never a misread, and in
+   the chain walk it is inconclusive (`SealUnreadable`), never evidence that
+   the medium is bad.
+2. **Absent means none.** No tape before 1.1.0 (L6-0001 among them) carries
+   `requires`; it requires nothing. An absent `magic` or `layout_version`
+   (a damaged File 0) is warned about, not refused — the case an heir most
+   needs this script for must never become a hard stop.
+3. **Ignore keys you do not know, unless `requires` names them.** A later
+   writer may add keys to any table; a reader that does not know one reads
+   on. A writer that adds anything a 1.1.0 reader would *misread* — not
+   merely not know — lists a feature for it in `requires` (the short seal,
+   #420, will be `requires = ["short-seal"]` with an `ended_after` field). A
+   change no `requires` can fence (a different byte layout of the slices,
+   say #370's "tapectl cuts the slices") bumps `layout_version` and `magic`.
+4. **A key's meaning never changes.** New meaning, new key.
+5. **New keys in File 0 go in a trailing table** (§1.1), with one exception:
+   `requires` sits in `[volume]`, because it must be read before anything
+   else is trusted and no other table uses the name. A v3 File 0 must not
+   carry `front_index`/`seal_marker` as bare integers a v2 RESTORE.sh could
+   read and follow.
+6. **The seal marker is the last file, found as such.** Readers locate it by
+   spacing to end of data and back two filemarks (`mt eod`, `mt bsfm 2`;
+   GNU mt spells end of data `eom`), and use File 0's `seal_marker` as a
+   cross-check and a fallback, never the only route. RESTORE.sh does; a
+   disagreement is named. The Rust chain walk takes the seal's position from
+   the catalog's own Layout, which is authoritative for a tape this catalog
+   wrote; the write path's contact check still follows File 0's pointer
+   (open item, `docs/design/v2-open-questions.md` §10).
+
+Unknown front-index `type`s are not refused by the 1.1.0 readers: a future
+file type arrives with a `requires`, which is refused first.
+
 ## 2. Plaintext vs encrypted, and the isolation invariant
 
 | Zone | On tape | Why |
@@ -318,25 +371,44 @@ basis of the seal.
 ## 6. Heir path — end to end with only `mt`, `dd`, `age`, `dar`, `sha256sum`
 
 No database, no tapectl, no operator. This is the normative Heir Path (CONTEXT.md);
-RESTORE.sh and the system guide implement it literally.
+RESTORE.sh and the system guide implement it literally. **The tape is read
+forward from one rewind** (#396, 1.1.0): a read leaves the head at the start of
+the next file, so a reader spaces forward from where it is and rewinds only for
+a file behind it (RESTORE.sh keeps a cursor and checks it against `mt status`;
+any doubt is a rewind). The manual steps below read in that order.
 
-1. `mt -f /dev/nst0 rewind && dd if=/dev/nst0 bs=64k` → File 0: identity + "the map
-   is File 3."
-2. `mt -f /dev/nst0 fsf 3 && dd if=/dev/nst0 bs=512k` → **front index**: every
+1. `mt -f /dev/nst0 setblk 524288 && mt -f /dev/nst0 rewind && dd if=/dev/nst0 bs=512k`
+   → File 0: identity, `requires` (§1.2), and "the map is File 3."
+2. `mt -f /dev/nst0 fsf 2 && dd if=/dev/nst0 bs=512k` → **front index**: every
    file's position, type, size, and ciphertext hash.
-3. *(completeness)* space to the last file and read the **seal marker**; check
-   `file_count` and that `front_index_sha256` matches File 3's hash. Absent or
-   mismatched ⇒ the tape is unsealed or damaged — proceed knowing some trailing
-   *slices* may be missing (the front index still says exactly which). If File 3
-   itself is unreadable, the seal marker's **embedded copy** provides the same
-   map (validate its per-file hashes against the files themselves before trust).
-4. For each envelope position: `dd` it out, `age -d -i KEY` — the one that decrypts
-   is yours ⇒ `MANIFEST.toml` + `RECOVERY.md` + `catalogs/`.
-5. For each slice position in your manifest: `dd bs=512k` it out; `sha256sum` vs the
-   front index's `sha256_encrypted` (**keyless** integrity) and/or the envelope's
-   value; `head -c size_bytes` to trim padding; `age -d -i KEY` → `base.N.dar`;
-   optionally `sha256sum` vs the envelope's `sha256_plain`.
-6. `dar -x base -R /dest` (dar reassembles `base.1.dar … base.N.dar`).
+3. *(completeness)* space to the last file (`mt eod`, `mt bsfm 2`, §1.2 rule 6)
+   and read the **seal marker**; check `file_count` and that `front_index_sha256`
+   matches File 3's hash. Absent or mismatched ⇒ the tape is unsealed or damaged —
+   proceed knowing some trailing *slices* may be missing (the front index still
+   says exactly which). If File 3 itself is unreadable, the seal marker's
+   **embedded copy** provides the same map (validate its per-file hashes against
+   the files themselves before trust). RESTORE.sh `--verify` reads the seal last,
+   at the end of its one ascending pass.
+4. For each envelope position: `dd` it out, check its hash against the front
+   index, `age -d -i KEY` — the one that decrypts is yours ⇒ `MANIFEST.toml` +
+   `RECOVERY.md` + `catalogs/` (each unit's isolated dar catalogue,
+   `<uuid8>_v<version>.1.dar`: `dar -l` lists the unit's files and `-T slice`
+   which slice holds each, with no slice read; #418). age's "no identity
+   matched" means the key is not a recipient; any other failure after a key
+   matched means the envelope is damaged.
+5. For each slice position in your manifest, in order: `dd bs=512k` it out;
+   `head -c size_bytes` to trim padding; `sha256sum` vs the front index's
+   `sha256_encrypted` (**keyless** integrity) and/or the envelope's value;
+   `age -d -i KEY` → `base.N.dar`. RESTORE.sh streams this: `dd | head | tee
+   (sha256sum) | age -d > FIFO`, with every key given to age at once, so nothing
+   decrypted is written to disk but the restored files.
+6. `dar -x base -R /dest -O -Q -N` into an empty directory (`-N`: no darrc on
+   the heir's machine changes what is restored; dar keeps an existing file and
+   reports success, so a re-run over a stopped restore needs `-w`). RESTORE.sh
+   runs dar with `--sequential-read` over the FIFOs, refuses a non-empty `--to`
+   unless `--overwrite`, and fails on dar's "not restored (user choice)".
+   For one file, `--path` reads only the slices the catalogue names for it and
+   the last.
 
 ## 7. Block mode
 

@@ -238,14 +238,27 @@ The easiest way to recover is the RESTORE.sh script (File 2):
     # no key needed, works even without your envelope
     ./RESTORE.sh --verify
 
-    # Find your encrypted envelope
+    # Find your encrypted envelope (an operator or escrow key opens
+    # every envelope, and the units of each are listed)
     ./RESTORE.sh --find-envelope --key your-key.age.key
 
-    # Full restore to a directory. Every slice of the unit is decrypted
-    # to disk before dar extracts it, so /destination needs about twice
-    # the unit's size free, plus one slice (--scratch DIR puts the
-    # decrypted slices on another disk). The script checks first.
+    # List a unit's files, from the dar catalogue in the envelope
+    # (no data slice is read)
+    ./RESTORE.sh --list --key your-key.age.key --unit UNIT
+
+    # Full restore to an EMPTY directory. Each slice streams from the
+    # tape through age into dar, so /destination needs about the unit's
+    # size free. The script checks first. --all restores every unit,
+    # each into /destination/UNIT; --overwrite finishes a restore that
+    # stopped part way.
     ./RESTORE.sh --restore --key your-key.age.key --to /destination
+
+    # Just one file or folder: reads only the slices that hold it
+    ./RESTORE.sh --restore --key your-key.age.key --unit UNIT \
+        --path some/file --to /destination
+
+The script reads the tape forward from one rewind, and says what it
+needs if it meets a tape newer than itself (`requires` in File 0).
 
 ## Manual Recovery Steps
 
@@ -256,7 +269,9 @@ If RESTORE.sh is not available, follow these steps:
    and tells you which file is the seal marker (the last file on tape)
 3. Read File 3, the front index, for exact byte sizes and ciphertext
    hashes for every file on the tape
-4. Read the seal marker (the last file) and check that its
+4. Read the seal marker (the last file: `mt -f /dev/nst0 eod` then
+   `mt -f /dev/nst0 bsfm 2` puts the tape at its start; File 0's
+   `seal_marker` is the same position) and check that its
    `front_index_sha256` matches the sha256 of File 3's bytes (trailing
    zero padding stripped). If the seal marker is missing, or the two
    hashes disagree, treat the tape as unsealed/damaged: trailing data
@@ -265,11 +280,16 @@ If RESTORE.sh is not available, follow these steps:
 5. Read and trial-decrypt tenant envelopes (File 3 lists their
    positions as type `tenant_envelope`) with your key
 6. Parse the MANIFEST.toml in your envelope for slice positions
-7. For each slice: read from tape, trim to the exact size given in
-   File 3 (block padding breaks age decryption), verify its sha256
-   against File 3's `sha256_encrypted`, decrypt with age. Work on a
-   disk with room for all of the unit's decrypted slices at once
-   (about the unit's size), not in /tmp, which is RAM on many systems
+7. For each slice, in order (rewind once, space to the first slice;
+   each read leaves the tape at the next file): read from tape, trim
+   to the exact size given in File 3 (block padding breaks age
+   decryption), verify its sha256 against File 3's `sha256_encrypted`,
+   decrypt with age, and remove the encrypted copy. Work on a disk
+   with room for all of the unit's decrypted slices at once (about the
+   unit's size), not in /tmp, which is RAM on many systems. Your
+   envelope's RECOVERY.md writes these commands out for your units,
+   and its `catalogs/` holds each unit's dar catalogue
+   (`dar -l catalogs/NAME -N -Q` lists the files without the tape)
 8. Reassemble dar slices into an EMPTY directory:
    `dar -x restore -R /destination -O -Q -N`. dar keeps any file already
    there and still reports success, so to finish an earlier restore that

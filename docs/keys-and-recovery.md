@@ -634,13 +634,26 @@ envelope has been read and decrypted.
    specify one with --unit NAME` (exit 1). Run it again with `--unit`.
    Each slice is checked against the front index's hash before it is decrypted.
 
-   **Disk space.** Every slice of the unit is decrypted to disk before dar
-   extracts them, into a scratch directory inside `--to` that is removed
-   afterwards. With both on one disk, a unit needs about twice its size free
-   there, plus one slice. The script measures this before it reads any slice and
-   stops with `not enough disk space` if it will not fit. Choose a larger disk
-   with `--to`, or put the decrypted slices on another disk with
-   `--scratch DIR`. Do not restore into `/tmp`, which is RAM on many systems.
+   **Disk space.** On tapes written by tapectl 1.1.0 and later each slice
+   streams from the tape through age into dar, so `--to` needs about the
+   unit's size free; nothing decrypted waits on disk. (A 1.0.x tape's script
+   decrypts every slice to disk first and needs about twice the unit, plus
+   one slice; `--scratch DIR` puts those slices on another disk.) The script
+   measures this before it reads any slice and stops with
+   `not enough disk space` if it will not fit. Do not restore into `/tmp`,
+   which is RAM on many systems.
+
+   **`--to` must be empty or new.** dar keeps a file that already exists and
+   still reports success, so the script refuses a directory with anything in
+   it. To finish a restore that stopped part way, run the same command again
+   with `--overwrite`.
+
+   **Several units, or one file.** `--all` restores every unit of the
+   envelope, and `--unit` may repeat; each goes to `--to/UNIT`, in one pass
+   along the tape. `--list --key … --unit UNIT` prints a unit's files from the
+   dar catalogue in the envelope without reading any slice, and
+   `--restore … --unit UNIT --path some/file` restores just that file, reading
+   only the slices that hold it.
 
 The same steps work with the operator key or the escrow secret, which open every
 tenant's envelope. `--unit` then picks the right one.

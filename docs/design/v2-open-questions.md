@@ -677,6 +677,38 @@ agree on a good tape and both catch one injected corruption.
   seal marker's embedded copy (rung 2, automated); both ends gone → print the
   guide's zero-strip manual procedure (rung 3, documented not automated).
 
+**1.1.0 additions (2026-10-06; #396, #405, #412, #418, ADR-0012 item 15).**
+The modes above stand; RESTORE.sh also:
+
+- reads the tape **forward from one rewind**, with a cursor checked against
+  `mt status` (any doubt is a rewind); `--verify` keeps Files 0-2 as it
+  passes them and reads the seal marker last;
+- `--restore` **streams** each slice `dd | head | tee (sha256sum) | age -d`
+  into a FIFO that `dar -x --sequential-read -N` reads: no decrypted slice on
+  disk, and the space check asks for the unit's size, not twice it. Every
+  `--key` goes to age at once (a streamed slice cannot be re-read per key);
+- refuses a non-empty `--to` before reading the tape unless `--overwrite`
+  (dar `-w`), and fails on dar's "not restored (user choice)";
+- `--all` and repeated `--unit`: one combined space check, one ascending
+  pass, each unit into `--to/UNIT`;
+- `--list` prints a unit's files from the envelope's dar catalogue
+  (`catalogs/<uuid8>_v<N>.1.dar`) with no slice read; `--restore --path P`
+  reads only the slices `dar -l -T slice` names for P, plus the last, into
+  scratch (`--scratch DIR`), and extracts P;
+- `--find-envelope` opens every envelope a key can and lists each one's
+  units; an envelope a key matched but cannot decrypt is reported DAMAGED,
+  not as a wrong key;
+- prefers `mt-st`, names GNU cpio's `mt` (no `setblk`) and reads on in the
+  drive's own mode, and keeps dd's own error text;
+- checks File 0's and the seal's `magic`/`layout_version`/`requires` and
+  finds the seal at end of data (`volume-format-v2.md` §1.2);
+- passes dar `-N` everywhere; the rung-3 zero-strip recipe strips only the
+  trailing padding (the old `tr -d '\0'` destroyed ciphertext).
+
+Open: a backup copy of each tenant envelope (#412 item 6, research R2) is not
+built; the write path's contact check (session.rs) still locates a foreign
+tape's seal by File 0's pointer, not by end of data.
+
 ---
 
 ## 11. Library design — completed (2026-07-22; finishes the §7 sketch)

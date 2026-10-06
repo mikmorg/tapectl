@@ -1783,22 +1783,62 @@ FATAL: not enough disk space in /restore to restore this unit:
        No slice has been read yet. ...
 ```
 
-The heir script off the tape (`RESTORE.sh --restore`) decrypts every slice of
-the unit to disk before dar extracts them, so with the scratch space and
-`--to` on one disk a unit needs about twice its size free, plus one slice. It
+The heir script off tapes written by tapectl 1.1.0 and later
+(`RESTORE.sh --restore`) streams each slice from the tape through age into
+dar, so `--to` needs about the unit's size free and nothing decrypted waits on
+disk. `--restore --path` keeps the few slices it reads in a scratch directory
+inside `--to` (or `--scratch DIR`), so it asks for those as well. The script
 measures this after it has picked the version and before it reads any slice,
-and prints what it needs either way (`Disk space: needs about …`). Free space,
-choose a larger disk with `--to`, or put the decrypted slices on another disk
-with `--scratch DIR`. `--no-space-check` skips the check, for a compressed or
-thin-provisioned filesystem that holds more than `df` reports.
+and prints what it needs either way (`Disk space: needs about …`). Free space
+or choose a larger disk with `--to`. `--no-space-check` skips the check, for a
+compressed or thin-provisioned filesystem that holds more than `df` reports.
 
 If the disk fills anyway, the message says `OUT OF DISK SPACE in <dir>` and
-names the step (`reading tape file N` or `decrypting slice N`). That is not a
-tape or key problem: free space and run the same command again. Tapes written
-before tapectl 1.0.0 carry an older RESTORE.sh that put the slices in `/tmp`,
-which is RAM on many systems, and stopped with no message or blamed the keys
-when it filled. For such a tape, use the RESTORE.sh from a newer tape (the
-script reads any layout-v2 tape) or `tapectl restore`.
+names the step (`reading tape file N`, `decrypting slice N` or
+`dar extraction failed`). That is not a tape or key problem: free space and
+run the same command again with `--overwrite`, since `--to` now holds part of
+the unit. Tapes written by tapectl 1.0.x carry a RESTORE.sh that decrypted
+every slice to disk first and needed about twice the unit's size; tapes before
+1.0.0 put the slices in `/tmp`. Any layout-v2 tape can be read with the
+RESTORE.sh from a newer tape, or with `tapectl restore`.
+
+### RESTORE.sh: `--to … is not empty`
+
+```text
+FATAL: --to /restore is not empty.
+       dar keeps a file that is already there and still reports success, ...
+```
+
+dar under `-Q` answers "no" to every overwrite and exits 0, so a restore over
+an earlier one that stopped part way would leave its truncated files and
+report success. Restore into an empty or new directory; to finish an earlier
+restore of the same unit, run the same command with `--overwrite` (dar `-w`).
+A leftover `.tapectl-restore.*` directory is named and refused even with
+`--overwrite`: a killed `--path` restore may have left decrypted slices in it.
+Remove it and run again. If dar still declines a file, the restore fails as
+`INCOMPLETE` and names it.
+
+### RESTORE.sh: `this tape requires feature(s) …`
+
+```text
+FATAL: this tape requires feature(s) short-seal, which this script does not know
+```
+
+A tape written by a newer tapectl says in File 0 (and its seal marker) what a
+reader must understand, as `requires = [...]`. A RESTORE.sh or tapectl that
+does not know a feature refuses rather than misread the tape. Use the
+RESTORE.sh on that tape (file 2), which knows, or a newer tapectl. tapectl
+itself refuses the same way (`restore raw-volume`, `catalog rebuild`), and
+`volume verify` reports the seal as unreadable — inconclusive, never a reason
+to quarantine the cartridge.
+
+### RESTORE.sh: an envelope is `DAMAGED`
+
+A key matched the envelope (age got past its header) but the payload would
+not decrypt, or the envelope's bytes do not match the front index. That is
+damage, not a wrong key: another key will not help. The operator envelope has
+a backup copy on every tape, which an operator or escrow key opens
+(`--find-envelope` tries it); otherwise use another copy of the volume.
 
 ### RESTORE.sh: `this tape is layout_version N`
 
