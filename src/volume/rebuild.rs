@@ -765,13 +765,19 @@ fn tenant_key_refusal_message() -> String {
         2,
         crate::volume::layout_model::ZoneKind::RestoreSh.type_label()
     );
+    // Issue #417: `--only restore_sh` — the bare command dumps every file,
+    // a terabyte on a full cartridge, to fetch a 50 KB script. File 1's own
+    // two-line `mt`/`dd` recipe needs no tapectl at all.
     format!(
         "this key cannot open the operator envelope, so it is neither an \
          operator key nor the escrow key.\n\n\
          A tenant key restores that tenant's own data without a catalog at \
          all: run RESTORE.sh from tape file 2 —\n\n    \
-         tapectl restore raw-volume --device DEV --to DIR\n    \
+         tapectl restore raw-volume --device DEV --to DIR --only restore_sh\n    \
          bash DIR/{restore_sh} --restore --unit UNIT --key KEYFILE --to DIR\n\n\
+         or, with no tapectl, as the tape's own guide (file 1) says:\n\n    \
+         mt -f DEV rewind && mt -f DEV fsf 2\n    \
+         dd if=DEV bs=512k | tr -d '\\0' > RESTORE.sh\n\n\
          `catalog rebuild` reconstructs the operator's catalog and needs the \
          operator's view of the tape."
     )
@@ -2387,6 +2393,17 @@ mod tests {
         assert!(
             !err.contains("--dest"),
             "--dest is not a flag on any restore subcommand: {err}"
+        );
+        // Issue #417: the recipe fetches RESTORE.sh alone, not the whole
+        // tape, and names File 1's no-tapectl route.
+        assert!(
+            err.contains("--only restore_sh"),
+            "the recipe must dump only RESTORE.sh: {err}"
+        );
+        assert!(err.contains("fsf 2"), "File 1's mt/dd route: {err}");
+        assert!(
+            crate::volume::raw::RAW_TYPES.contains(&label),
+            "--only accepts the label the recipe names"
         );
     }
 

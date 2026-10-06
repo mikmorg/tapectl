@@ -229,6 +229,10 @@ impl SliceWriter {
                 .into_inner()
                 .map_err(|e| slice_io_error(&self.path, e.into_error()))?;
             make_durable(&file, &self.path)?;
+            // Issue #417: synced, so its pages are clean; the next read of
+            // this slice is a tape write, possibly hours away, and a stage
+            // writes a cartridge's worth of them through the page cache.
+            crate::util::drop_cached(&file, &self.path);
             Ok(EncryptedSliceInfo {
                 plain_size: self.plain_len as i64,
                 sha256_plain: plain.finish(),
@@ -319,6 +323,21 @@ mod tests {
             1,
             "the probe is gone; only the slice remains"
         );
+    }
+
+    /// Issue #417: a finished slice — synced, so clean — is dropped from the
+    /// page cache; its next reader is a tape write, maybe hours away.
+    #[test]
+    fn a_finished_slice_is_dropped_from_the_page_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = StagingDir::prepare(tmp.path()).unwrap();
+        let (_id, recipients) = recipient();
+        let mut w = dir.create_slice("abc_v1_s1", 1, &recipients).unwrap();
+        w.write_all(b"slice bytes").unwrap();
+        let path = w.path().to_path_buf();
+        crate::util::page_cache_log::take();
+        w.finish().unwrap();
+        assert_eq!(crate::util::page_cache_log::take(), [path]);
     }
 
     #[test]

@@ -117,7 +117,22 @@ pub fn assess(
             })
         }
     };
+    superseding_verdict(conn, config, unit, superseding, freeable)
+}
 
+/// Preconditions 2 and on, for a release whose superseding snapshot is
+/// `superseding` (`(id, version)`): whether that snapshot is covered as the
+/// unit's policy requires. Nothing here depends on the version being
+/// released — only on the unit and the snapshot that supersedes it — so
+/// [`candidates`] asks once per unit, not once per superseded snapshot
+/// (issue #417). `freeable` is carried into the verdict as given.
+fn superseding_verdict(
+    conn: &Connection,
+    config: &Config,
+    unit: &Unit,
+    superseding: (i64, i64),
+    freeable: i64,
+) -> Result<ReclaimVerdict> {
     // Precondition 2: Superseding snapshot meets policy
     let resolved = super::resolve(conn, config, unit)?;
     let mut required_copies = resolved.min_copies;
@@ -239,28 +254,85 @@ pub fn assess(
 /// Nothing here demotes anything — `reclaimable` stays the operator's
 /// sole, manual demotion (CONTEXT.md **Current**). This only reports.
 pub fn candidates(conn: &Connection, config: &Config) -> Result<Vec<Candidate>> {
-    let mut stmt = conn.prepare(
-        "SELECT u.name, s.version
+    // Issue #417: one statement for every candidate — its unit, its own
+    // freeable bytes ([`freeable_bytes`]'s figure) and the snapshot that
+    // supersedes it, which for every candidate of a unit is that unit's
+    // highest `current` snapshot (precondition 1's query, answered for all
+    // of them at once). Then the policy half of [`assess`] once per unit:
+    // it depends on the unit and that snapshot, never on the version being
+    // released. Before, every candidate cost a unit lookup and all of
+    // `assess` (a dozen statements and a dotfile read).
+    let sql = format!(
+        "SELECT u.id, u.uuid, u.name, u.tenant_id, u.archive_set_id, u.current_path,
+                u.checksum_mode, u.encrypt, u.status, u.created_at, u.last_scanned, u.notes,
+                s.version, top.id, top.version, {}
          FROM units u
          JOIN snapshots s ON s.unit_id = u.id AND s.status = 'current'
-         WHERE s.version < (SELECT MAX(s2.version) FROM snapshots s2
-                            WHERE s2.unit_id = u.id AND s2.status = 'current')
+         JOIN snapshots top ON top.unit_id = u.id AND top.status = 'current'
+              AND top.version = (SELECT MAX(s2.version) FROM snapshots s2
+                                 WHERE s2.unit_id = u.id AND s2.status = 'current')
+         WHERE s.version < top.version
          ORDER BY u.name, s.version",
-    )?;
-    let rows: Vec<(String, i64)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        freeable_bytes_expr("s.id")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<(Unit, i64, (i64, i64), i64)> = stmt
+        .query_map([], |row| {
+            Ok((
+                Unit {
+                    id: row.get(0)?,
+                    uuid: row.get(1)?,
+                    name: row.get(2)?,
+                    tenant_id: row.get(3)?,
+                    archive_set_id: row.get(4)?,
+                    current_path: row.get(5)?,
+                    checksum_mode: row.get(6)?,
+                    encrypt: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                    last_scanned: row.get(10)?,
+                    notes: row.get(11)?,
+                },
+                row.get(12)?,
+                (row.get(13)?, row.get(14)?),
+                row.get(15)?,
+            ))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (unit_name, version) in rows {
-        // `queries::get_unit_by_name` rather than a by-id helper: the
-        // latter does not exist, and `db/queries.rs` is out of scope.
-        let Some(unit) = crate::db::queries::get_unit_by_name(conn, &unit_name)? else {
-            continue;
+    // The unit whose verdict was last asked, and that verdict. Rows come
+    // ordered by unit name, so each unit's candidates are adjacent.
+    let mut asked: Option<(i64, ReclaimVerdict)> = None;
+    for (unit, version, superseding, freeable) in rows {
+        let verdict = match &asked {
+            Some((id, v)) if *id == unit.id => v.clone(),
+            _ => {
+                let v = superseding_verdict(conn, config, &unit, superseding, 0)?;
+                asked = Some((unit.id, v.clone()));
+                v
+            }
         };
-        let verdict = assess(conn, config, &unit, version)?;
+        let verdict = match verdict {
+            ReclaimVerdict::Releasable {
+                superseding_version,
+                ..
+            } => ReclaimVerdict::Releasable {
+                superseding_version,
+                freeable_bytes: freeable,
+            },
+            ReclaimVerdict::Blocked {
+                superseding_version,
+                reason,
+                ..
+            } => ReclaimVerdict::Blocked {
+                superseding_version,
+                freeable_bytes: freeable,
+                reason,
+            },
+        };
         out.push(Candidate {
-            unit_name,
+            unit_name: unit.name,
             version,
             verdict,
         });
@@ -282,19 +354,26 @@ pub fn candidates(conn: &Connection, config: &Config) -> Result<Vec<Candidate>> 
 /// for the same reason the copy count is: a retired or erased volume's
 /// space is not the operator's to reclaim here.
 fn freeable_bytes(conn: &Connection, snapshot_id: i64) -> Result<i64> {
-    let sql = format!(
-        "SELECT COALESCE(SUM(sl.encrypted_bytes), 0)
-         FROM stage_sets ss
-         JOIN stage_slices sl ON sl.stage_set_id = ss.id
-         WHERE ss.snapshot_id = ?1
-           AND EXISTS (SELECT 1 FROM writes w
-                       JOIN volumes v ON v.id = w.volume_id
-                       WHERE w.stage_set_id = ss.id AND w.status = 'completed'
-                         AND {})",
-        super::coverage::eligible("v")
-    );
+    let sql = format!("SELECT {}", freeable_bytes_expr("?1"));
     let bytes: i64 = conn.query_row(&sql, params![snapshot_id], |row| row.get(0))?;
     Ok(bytes)
+}
+
+/// [`freeable_bytes`] as a scalar subquery over the snapshot whose id is
+/// `snapshot_id_expr` — one expression, so [`candidates`]' single statement
+/// and [`assess`]'s per-snapshot lookup cannot drift apart.
+fn freeable_bytes_expr(snapshot_id_expr: &str) -> String {
+    format!(
+        "(SELECT COALESCE(SUM(sl.encrypted_bytes), 0)
+          FROM stage_sets ss
+          JOIN stage_slices sl ON sl.stage_set_id = ss.id
+          WHERE ss.snapshot_id = {snapshot_id_expr}
+            AND EXISTS (SELECT 1 FROM writes w
+                        JOIN volumes v ON v.id = w.volume_id
+                        WHERE w.stage_set_id = ss.id AND w.status = 'completed'
+                          AND {}))",
+        super::coverage::eligible("v")
+    )
 }
 
 #[cfg(test)]
@@ -431,6 +510,65 @@ pub(crate) mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].unit_name, "sup-ok");
         assert_eq!(found[0].version, 1);
+    }
+
+    /// Issue #417: `report supersedable` asked the whole of `assess` — a
+    /// unit lookup and a dozen statements — for every superseded snapshot.
+    /// The statements `candidates` prepares are counted through SQLite's
+    /// authorizer (one `SELECT` action per SELECT prepared) for a unit with
+    /// 3 versions and one with 9: they must not grow with the snapshots.
+    /// And every candidate's verdict must still be exactly `assess`'s, the
+    /// gate's own (both a releasable unit and a blocked one).
+    #[test]
+    fn candidates_ask_per_unit_not_per_snapshot_and_agree_with_assess() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let count = |conn: &Connection| -> (usize, Vec<Candidate>) {
+            let n = Arc::new(AtomicUsize::new(0));
+            let counter = n.clone();
+            conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(ctx.action, rusqlite::hooks::AuthAction::Select) {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                rusqlite::hooks::Authorization::Allow
+            }))
+            .unwrap();
+            let found = candidates(conn, &Config::default()).unwrap();
+            conn.authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .unwrap();
+            (n.load(Ordering::SeqCst), found)
+        };
+
+        for second in ["sealed", "quarantined"] {
+            let (few_conn, few_unit) = setup("sup-few", 3, second, "active");
+            let (many_conn, many_unit) = setup("sup-many", 9, second, "active");
+            let (few, few_found) = count(&few_conn);
+            let (many, many_found) = count(&many_conn);
+            assert_eq!(few_found.len(), 2);
+            assert_eq!(many_found.len(), 8);
+            assert!(few > 0, "positive control: the authorizer counts SELECTs");
+            assert_eq!(
+                few, many,
+                "{second}: candidates must prepare the same statements for 2 superseded \
+                 snapshots as for 8"
+            );
+            for (conn, unit, found) in [
+                (&few_conn, &few_unit, &few_found),
+                (&many_conn, &many_unit, &many_found),
+            ] {
+                for c in found {
+                    assert_eq!(
+                        c.verdict,
+                        assess(conn, &Config::default(), unit, c.version).unwrap(),
+                        "{second}: v{} must be judged exactly as the gate judges it",
+                        c.version
+                    );
+                }
+            }
+        }
     }
 
     /// (c) The #89 / ADR-0004 interaction: the superseding snapshot's

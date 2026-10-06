@@ -66,7 +66,6 @@
 //! identity check's quarantine branch) — see the module's test section.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -1920,7 +1919,10 @@ fn run_entries(
         // after, as every file used to be).
         let entry_started = std::time::Instant::now();
         let expected_hash = entry.sha256.as_deref();
-        let (verdict, waits) = match File::open(path) {
+        // Issue #417: read once and not again soon (the next read of a
+        // staged slice is the next copy's write), so behind the cursor the
+        // pages are dropped instead of filling the host's page cache.
+        let (verdict, waits) = match crate::util::DropBehind::open(path) {
             Err(e) => (
                 Verdict::Failed(TapectlError::Other(format!(
                     "execute: open entry at position {}: {e}",
@@ -2510,6 +2512,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unwritten, 0, "every slice's cursor row must be recorded");
+    }
+
+    /// Issue #417: execute reads every staged file through `DropBehind`,
+    /// so a cartridge's worth of slices does not fill the host's page cache
+    /// on the way to the tape. Before, a plain `File::open`.
+    #[test]
+    fn execute_reads_the_staged_files_through_drop_behind() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let slices: Vec<std::path::PathBuf> = f
+            .units
+            .iter()
+            .flat_map(|u| u.slices.iter().map(|s| s.staging_path.clone()))
+            .collect();
+        assert!(
+            !slices.is_empty(),
+            "positive control: the fixture stages slices"
+        );
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        crate::util::page_cache_log::take();
+        match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(_) => {}
+            _ => panic!("expected Ready"),
+        }
+        let read = crate::util::page_cache_log::take();
+        for slice in &slices {
+            assert!(
+                read.contains(slice),
+                "{} was not read through DropBehind: {read:?}",
+                slice.display()
+            );
+        }
     }
 
     // --- behavior 1: happy path over MemStore ends Sealed ----------------

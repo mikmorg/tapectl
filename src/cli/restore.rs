@@ -159,7 +159,9 @@ pub enum RestoreCommands {
     },
 
     /// Dump every file off a tape verbatim, using only what is on the tape
-    /// itself (no database needed) — the emergency/heir path
+    /// itself (no database needed) — the emergency/heir path. --positions
+    /// and --only narrow it to the files named (a full cartridge is a
+    /// terabyte; RESTORE.sh alone is `--only restore_sh`)
     RawVolume {
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
@@ -172,6 +174,17 @@ pub enum RestoreCommands {
         /// guard) — not a database lookup
         #[arg(long = "from")]
         from: Option<String>,
+        /// Dump only the files at these tape positions (comma-separated or
+        /// repeated; File 0 is the ID thunk, 2 RESTORE.sh, 3 the front
+        /// index). With --only, a file either names is dumped
+        #[arg(long, value_delimiter = ',', value_name = "N")]
+        positions: Vec<i32>,
+        /// Dump only the files of these front-index types (comma-separated
+        /// or repeated): id_thunk, system_guide, restore_sh, front_index,
+        /// tenant_envelope, operator_envelope, operator_envelope_backup,
+        /// data_slice, seal_marker
+        #[arg(long, value_delimiter = ',', value_name = "TYPE")]
+        only: Vec<String>,
     },
 }
 
@@ -384,7 +397,19 @@ pub fn run(
             }
         }
 
-        RestoreCommands::RawVolume { device, to, from } => {
+        RestoreCommands::RawVolume {
+            device,
+            to,
+            from,
+            positions,
+            only,
+        } => {
+            let selection = volume::raw::RawSelection {
+                positions: positions.clone(),
+                types: only.clone(),
+            };
+            // A misspelt type is refused before the drive is opened.
+            selection.check_types()?;
             // Issue #241: the emergency/heir path — there is no catalog
             // to consult, so knowing what would be dumped means opening
             // the drive and reading the tape's own front index, which is
@@ -428,8 +453,14 @@ pub fn run(
                 crate::tape::contact::Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
             )
             .with_mam_reads(&reads);
-            let report =
-                volume::restore::restore_raw_volume(conn, &mut store, dest, from.as_deref(), site)?;
+            let report = volume::restore::restore_raw_volume_selected(
+                conn,
+                &mut store,
+                dest,
+                from.as_deref(),
+                &selection,
+                site,
+            )?;
 
             if json_output {
                 let files: Vec<_> = report

@@ -735,13 +735,33 @@ pub fn restore_raw_volume(
     expect_label: Option<&str>,
     site: ContactSite<'_>,
 ) -> Result<crate::volume::raw::RawRestoreReport> {
+    restore_raw_volume_selected(
+        conn,
+        store,
+        dest,
+        expect_label,
+        &crate::volume::raw::RawSelection::all(),
+        site,
+    )
+}
+
+/// [`restore_raw_volume`] dumping only the files `selection` names
+/// (`--positions`, `--only`; issue #417).
+pub fn restore_raw_volume_selected(
+    conn: &Connection,
+    store: &mut dyn Store,
+    dest: &Path,
+    expect_label: Option<&str>,
+    selection: &crate::volume::raw::RawSelection,
+    site: ContactSite<'_>,
+) -> Result<crate::volume::raw::RawRestoreReport> {
     let started_at = restore_record::now_sqlite();
     let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, None);
     phase.done();
     let contact_id = guard.id();
     let phase = progress::phase("dump", None);
-    let r = crate::volume::raw::restore_raw(store, dest, expect_label);
+    let r = crate::volume::raw::restore_raw_selected(store, dest, expect_label, selection);
     if r.is_ok() {
         phase.done();
     } else {

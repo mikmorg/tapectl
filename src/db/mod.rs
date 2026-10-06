@@ -415,6 +415,12 @@ fn migrations() -> Migrations<'static> {
         // `.foreign_key_check()`; both subject keys are `ON DELETE SET
         // NULL` so a snapshot delete never trips on them. See the header.
         M::up(include_str!("migrations/028_phase_timings.sql")),
+        // 033 indexes `events(action, timestamp)` (issue #417): `audit`'s
+        // Heir Kit check (`MAX(timestamp) ... WHERE action = ?`) walked the
+        // whole table. Index only, no rows touched, so no
+        // `.foreign_key_check()`. Numbered 033 by its batch's assignment;
+        // 029-032 belong to work landing beside it.
+        M::up(include_str!("migrations/033_events_action_index.sql")),
     ])
 }
 
@@ -4134,7 +4140,13 @@ mod tests {
         };
 
         let conn = open(&path).unwrap();
-        assert_eq!(user_version(&conn), 28, "027 and then 028 (issue #386)");
+        let latest = user_version(&open_memory().unwrap());
+        assert!(latest >= 28);
+        assert_eq!(
+            user_version(&conn),
+            latest,
+            "027, then 028 (issue #386) and every later migration"
+        );
         let freelist: i64 = conn
             .query_row("PRAGMA freelist_count", [], |r| r.get(0))
             .unwrap();
@@ -4145,6 +4157,37 @@ mod tests {
         assert!(
             pages < size_before,
             "the dropped tables' pages were returned: {pages} >= {size_before}"
+        );
+    }
+
+    /// Issue #417: `audit`'s Heir Kit check — the newest event of one action
+    /// — walked all of `events`. Migration 033's index on `(action,
+    /// timestamp)` makes it one seek. The plan is read before and after the
+    /// migration, so the "before" half is the old behaviour, seen.
+    #[test]
+    fn the_newest_event_of_an_action_is_an_index_seek() {
+        const Q: &str = "EXPLAIN QUERY PLAN \
+            SELECT MAX(timestamp) FROM events WHERE action = 'escrow_kit_generated'";
+        let plan = |conn: &Connection| -> String {
+            let mut stmt = conn.prepare(Q).unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.join("; ")
+        };
+        let mut conn = open_memory_at_version(28);
+        let before = plan(&conn);
+        assert!(
+            !before.contains("idx_events_action_timestamp"),
+            "positive control, before 033: {before}"
+        );
+        migrate_to(&mut conn, None).unwrap();
+        let after = plan(&conn);
+        assert!(
+            after.contains("USING COVERING INDEX idx_events_action_timestamp"),
+            "after 033: {after}"
         );
     }
 }
