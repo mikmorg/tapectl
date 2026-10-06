@@ -1799,7 +1799,7 @@ impl Store for MemStore {
         if let Some(budget) = self.enospc_after_bytes {
             let already_written: u64 = self.files.iter().map(|f| f.len() as u64).sum();
             if already_written + padded_len > budget {
-                return Err(TapectlError::Other(format!(
+                return Err(TapectlError::MediumFull(format!(
                     "MemStore: simulated ENOSPC — writing {padded_len} more bytes would exceed \
                      the {budget}-byte budget ({already_written} already recorded)"
                 )));
@@ -1808,9 +1808,9 @@ impl Store for MemStore {
         let mut buf = Vec::with_capacity(len as usize);
         src.take(len)
             .read_to_end(&mut buf)
-            .map_err(|e| TapectlError::Other(format!("read source: {e}")))?;
+            .map_err(|e| TapectlError::SourceIo(format!("read source: {e}")))?;
         if (buf.len() as u64) < len {
-            return Err(TapectlError::Other(format!(
+            return Err(TapectlError::SourceIo(format!(
                 "source exhausted after {} of {len} declared bytes",
                 buf.len()
             )));

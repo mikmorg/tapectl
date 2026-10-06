@@ -1558,6 +1558,33 @@ Output to a pipe whose reader has gone (`tapectl … | head`, or a `| tee`
 killed by the same Ctrl-C) is dropped rather than ending the command: it
 finishes, and exits with its own status.
 
+### A read or drive error during the write
+
+```text
+error: volume "<label>" write interrupted: execute stopped at position <n>: staged source read error: read source: <OS error>. The
+tape is left unsealed and the session is `interrupted`, not aborted: ...
+```
+
+```text
+error: volume "<label>" write interrupted: execute stopped at position <n>: tape I/O error: write: Input/output error (os error 5). ...
+```
+
+A staged file the disk could not read, or a drive error other than a full
+tape, stops the write the way Ctrl-C does: the files before position `<n>`
+are whole on the tape, and the session stays resumable. A `staged source read
+error` is the staging disk (check `dmesg`, the RAID, the mount); a `tape I/O
+error` is the drive or the cartridge (clean the drive, reseat the cartridge).
+Fix the cause, keep the same cartridge loaded, and run:
+
+```bash
+tapectl volume resume <label> --device "$TAPE"
+```
+
+Resume writes position `<n>` again from its start. If the tape turns out to
+hold fewer files than the catalog recorded (a power loss can lose the last
+few), resume continues from what the tape holds and says so in the session
+log. Through 1.0.7 both errors aborted the session for good.
+
 ### A real end of tape during the write
 
 If the drive reports that it is out of space, the session ends as a clean
@@ -1568,11 +1595,13 @@ means the drive itself flagged the medium, and the cartridge should not be writt
 again. Write the same staged data to another cartridge. The error reads:
 
 ```text
-error: volume "<label>" write aborted: execute failed at position <n>: tape I/O error: write: <OS error, e.g. No space left on device (os error 28)>
+error: volume "<label>" write aborted: execute failed at position <n>: tape full: write: No space left on device (os error 28)
 ```
 
-The same shape covers any other failure while streaming a file, and a slice
-whose hash no longer matches staging (`hash mismatch at position <n>: …`).
+The same shape covers a slice whose hash no longer matches staging
+(`hash mismatch at position <n>: …`). Any other failure while streaming a
+file interrupts the write instead
+([above](#a-read-or-drive-error-during-the-write)).
 
 That hash-mismatch abort is now **how a slice that rotted in staging is
 caught**. Since 1.0.3 the write no longer reads every staged slice in full

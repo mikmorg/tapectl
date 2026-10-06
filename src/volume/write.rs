@@ -2825,7 +2825,7 @@ fn finish_session(
             confirm_tier,
         ),
         ResumeOutcome::Quarantined(q) => Err(quarantine_error(label, &q.reason)),
-        ResumeOutcome::Interrupted(_) => {
+        ResumeOutcome::Interrupted(i) => {
             events::log_event(
                 conn,
                 "volume",
@@ -2835,15 +2835,27 @@ fn finish_session(
                 None,
                 None,
                 None,
-                None,
+                i.reason(),
                 None,
             )?;
-            Err(TapectlError::Interrupted(format!(
-                "volume \"{label}\" write interrupted — the tape is left unsealed, and \
-                 the session's `writes`/`write_positions` rows are in the `interrupted` state. \
-                 Reload the same cartridge and run `tapectl volume resume {label}` to continue \
-                 from where it stopped."
-            )))
+            // Issue #408: a staged-file read error or a drive error other
+            // than a full medium stops the write resumably, and says which.
+            Err(match i.reason() {
+                None => TapectlError::Interrupted(format!(
+                    "volume \"{label}\" write interrupted — the tape is left unsealed, and \
+                     the session's `writes`/`write_positions` rows are in the `interrupted` state. \
+                     Reload the same cartridge and run `tapectl volume resume {label}` to continue \
+                     from where it stopped."
+                )),
+                Some(reason) => TapectlError::Other(format!(
+                    "volume \"{label}\" write interrupted: {reason}. The tape is left unsealed and \
+                     the session is `interrupted`, not aborted: the files before this one are \
+                     whole, and resume writes this one again from its start. Fix the cause — a \
+                     staged source error is the staging disk, a tape I/O error the drive or the \
+                     cartridge (clean the drive, reseat it) — then, with the same cartridge \
+                     loaded, run `tapectl volume resume {label}`."
+                )),
+            })
         }
         ResumeOutcome::Aborted(a) => {
             events::log_event(

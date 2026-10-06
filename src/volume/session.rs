@@ -455,6 +455,10 @@ pub struct InterruptedSession {
     /// turns any path that would reach the write phase into a hard refusal
     /// rather than trusting that it is unreachable (ADR-0003).
     adopted_from_aborted: bool,
+    /// Why execution stopped, when it was not SIGINT: a staged file or the
+    /// drive failed mid-write (issue #408). `None` for an interrupt and for
+    /// a session rehydrated from the catalog.
+    reason: Option<String>,
 }
 
 /// Terminal, not resumable: the tape is not a copy
@@ -1230,6 +1234,13 @@ impl InterruptedSession {
     /// process learns which tenants' keys to require (there is no staged
     /// batch to derive them from), and the post-confirm bookkeeping needs the
     /// slice entries.
+    /// Why execution stopped, when it was not an interrupt (issue #408): a
+    /// staged file that could not be read, or a drive error other than a
+    /// full medium. `None` for SIGINT.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
     pub fn layout(&self) -> &super::layout_model::Layout {
         &self.built.layout
     }
@@ -1415,6 +1426,7 @@ impl InterruptedSession {
             write_ids,
             slice_write_id,
             adopted_from_aborted: status == "aborted",
+            reason: None,
         }))
     }
 
@@ -2207,9 +2219,9 @@ impl SealedPending {
 /// entry — that is `ReadyToSeal::seal`'s job alone (sacred invariant 1).
 ///
 /// Status: cycles 1-3 landed (happy path; tri-layer L2 hash verification
-/// with a clean abort on mismatch; a `store.execute` error — ENOSPC being
-/// the expected one, but any of them — is caught and produces the same
-/// clean abort, never a hard `Err` out of the whole session). Still
+/// with a clean abort on mismatch; a `store.execute` error is caught, never
+/// a hard `Err` out of the whole session — a full medium is the same clean
+/// abort, any other failure an `interrupted` session, issue #408). Still
 /// pending: cycle 4's `is_interrupted` check (currently unused — accepted
 /// but not called, since the public `execute_checking`/`resume_checking`
 /// signatures are already the final ones the four behaviors need).
@@ -2310,6 +2322,7 @@ fn run_entries(
                     write_ids,
                     slice_write_id,
                     adopted_from_aborted: false,
+                    reason: None,
                 }));
             }
         }
@@ -2352,6 +2365,7 @@ fn run_entries(
                 write_ids,
                 slice_write_id,
                 adopted_from_aborted: false,
+                reason: None,
             }));
         }
 
@@ -2368,11 +2382,12 @@ fn run_entries(
         // (issue #390): a reader thread reads the staged file, a hasher
         // thread hashes it, and the store's `execute` writes it here, on this
         // thread — three stages overlapped, where they used to take turns.
-        // Any store-level failure — ENOSPC being the expected one, but this
-        // treats any of them alike (device gone, I/O error, ...) — is caught
-        // rather than propagated: a full medium has no salvage path
-        // (ADR-0007), so it becomes the same clean abort as a hash mismatch,
-        // not a hard `Err` out of the whole session.
+        // Any store-level failure is caught rather than propagated: a full
+        // medium has no salvage path (ADR-0007), so it becomes the same clean
+        // abort as a hash mismatch; any other failure — a staged file the
+        // disk cannot read, a drive error that is not ENOSPC — becomes an
+        // `interrupted` session (issue #408, `Stop` below). Neither is a hard
+        // `Err` out of the whole session.
         //
         // Tri-layer L2 (`v2-open-questions.md` §2.4): the hash is of the very
         // bytes the store takes, and a mismatch is a clean abort. This is what
@@ -2391,8 +2406,8 @@ fn run_entries(
         // pages are dropped instead of filling the host's page cache.
         let (verdict, waits) = match crate::util::DropBehind::open(path) {
             Err(e) => (
-                Verdict::Failed(TapectlError::Other(format!(
-                    "execute: open entry at position {}: {e}",
+                Verdict::Failed(TapectlError::SourceIo(format!(
+                    "open entry at position {}: {e}",
                     entry.position
                 ))),
                 None,
@@ -2409,17 +2424,28 @@ fn run_entries(
             }
         };
 
-        let abort_reason = match &verdict {
+        // Issue #408: only a full medium and a tri-layer L2 mismatch end
+        // the session `aborted` — the two ADR-0007 and §2.4 name. Any other
+        // failure (a staged file the disk could not read, a drive error that
+        // is not ENOSPC) leaves the tape exactly where a crash leaves it: the
+        // files before this one whole, this one partial. That is the
+        // `interrupted` state resume already repositions from, so the
+        // session stays resumable once the cause is fixed.
+        let stop = match &verdict {
             Verdict::Written(_) => None,
-            Verdict::Mismatch(actual_hash) => Some(format!(
+            Verdict::Mismatch(actual_hash) => Some(Stop::Abort(format!(
                 "hash mismatch at position {}: expected {}, got {actual_hash}",
                 entry.position,
                 expected_hash.unwrap_or("no recorded hash")
-            )),
-            Verdict::Failed(e) => Some(format!(
+            ))),
+            Verdict::Failed(e @ TapectlError::MediumFull(_)) => Some(Stop::Abort(format!(
                 "execute failed at position {}: {e}",
                 entry.position
-            )),
+            ))),
+            Verdict::Failed(e) => Some(Stop::Interrupt(format!(
+                "execute stopped at position {}: {e}",
+                entry.position
+            ))),
         };
 
         if let ZoneKind::Slice { stage_slice_id } = entry.kind {
@@ -2450,11 +2476,17 @@ fn run_entries(
                     }
                     Verdict::Failed(_) => {
                         // Never streamed in full (open failed or store.execute
-                        // errored) — no sha256_on_volume to record.
+                        // errored) — no sha256_on_volume to record. `failed`
+                        // when the session aborts; `pending` when it stays
+                        // resumable, since resume writes it again (#408).
+                        let status = match &stop {
+                            Some(Stop::Interrupt(_)) => "pending",
+                            _ => "failed",
+                        };
                         conn.execute(
-                            "UPDATE write_positions SET status = 'failed'
-                             WHERE write_id = ?1 AND stage_slice_id = ?2",
-                            params![write_id, stage_slice_id],
+                            "UPDATE write_positions SET status = ?1
+                             WHERE write_id = ?2 AND stage_slice_id = ?3",
+                            params![status, write_id, stage_slice_id],
                         )?;
                     }
                 }
@@ -2484,18 +2516,33 @@ fn run_entries(
                 ),
                 None => String::new(),
             },
-            match &abort_reason {
-                Some(_) => " — ABORTED",
+            match &stop {
+                Some(Stop::Abort(_)) => " — ABORTED",
+                Some(Stop::Interrupt(_)) => " — INTERRUPTED",
                 None => "",
             }
         ));
 
-        if let Some(reason) = abort_reason {
-            mark_writes(conn, &write_ids, "aborted")?;
-            return Ok(ExecuteOutcome::Aborted(AbortedSession {
-                volume_id,
-                reason,
-            }));
+        match stop {
+            None => {}
+            Some(Stop::Abort(reason)) => {
+                mark_writes(conn, &write_ids, "aborted")?;
+                return Ok(ExecuteOutcome::Aborted(AbortedSession {
+                    volume_id,
+                    reason,
+                }));
+            }
+            Some(Stop::Interrupt(reason)) => {
+                mark_writes(conn, &write_ids, "interrupted")?;
+                return Ok(ExecuteOutcome::Interrupted(InterruptedSession {
+                    built,
+                    volume_id,
+                    write_ids,
+                    slice_write_id,
+                    adopted_from_aborted: false,
+                    reason: Some(reason),
+                }));
+            }
         }
     }
 
@@ -2505,6 +2552,14 @@ fn run_entries(
         volume_id,
         write_ids,
     }))
+}
+
+/// How one entry's write ended the session, when it did (issue #408).
+enum Stop {
+    /// A full medium or an L2 mismatch: `aborted`, never resumed.
+    Abort(String),
+    /// Any other failure: `interrupted`, resumable once the cause is fixed.
+    Interrupt(String),
 }
 
 fn entry_path(entry: &LayoutEntry) -> Result<&Path> {
@@ -6920,6 +6975,9 @@ mod tests {
         inner: MemStore,
         calls: Vec<std::result::Result<u64, String>>,
         fail_on: Option<(usize, usize)>,
+        /// The error a `fail_on` call returns: a full medium unless set to
+        /// a plain drive error (issue #408).
+        fail_eio: bool,
     }
 
     impl Recording {
@@ -6928,6 +6986,7 @@ mod tests {
                 inner: MemStore::new(BS as usize),
                 calls: Vec::new(),
                 fail_on: None,
+                fail_eio: false,
             }
         }
     }
@@ -6941,9 +7000,13 @@ mod tests {
                 Some((call, take)) if call == self.calls.len() => {
                     let mut some = vec![0u8; take];
                     src.read_exact(&mut some).unwrap();
-                    Err(TapectlError::TapeIo(
-                        "write: No space left on device (os error 28)".into(),
-                    ))
+                    Err(if self.fail_eio {
+                        TapectlError::TapeIo("write: Input/output error (os error 5)".into())
+                    } else {
+                        TapectlError::MediumFull(
+                            "write: No space left on device (os error 28)".into(),
+                        )
+                    })
                 }
                 _ => self.inner.execute(src, len, sync),
             };
@@ -7126,7 +7189,7 @@ mod tests {
             aborted.reason,
             format!(
                 "execute failed at position {position}: {}",
-                TapectlError::TapeIo("write: No space left on device (os error 28)".into())
+                TapectlError::MediumFull("write: No space left on device (os error 28)".into())
             )
         );
         let (wp_status, wp_hash): (String, Option<String>) = f
@@ -7479,5 +7542,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue #408: a drive error partway through a file that is NOT a full
+    /// medium — an EIO, a bus reset — leaves the session `interrupted`, not
+    /// aborted: the files before it are whole, exactly the state a crash
+    /// leaves and resume already repositions from. The slice goes back to
+    /// `pending`, and `resume` writes it again and the session seals. It
+    /// used to be a terminal abort.
+    #[test]
+    fn a_drive_error_mid_file_interrupts_and_resume_completes() {
+        let f = make_fixture();
+        let mut store = Recording::new();
+        let slice = f.units[0].slices[0].clone();
+        let position = slice_position(&f, slice.slice_id);
+        store.fail_on = Some((position, 10));
+        store.fail_eio = true;
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let interrupted = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Interrupted(i) => i,
+            ExecuteOutcome::Aborted(a) => panic!("a drive error must not abort: {}", a.reason),
+            ExecuteOutcome::Ready(_) => panic!("expected Interrupted"),
+        };
+        let reason = interrupted.reason().unwrap().to_string();
+        assert!(
+            reason.contains("tape I/O error") && reason.contains(&format!("position {position}")),
+            "{reason}"
+        );
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["interrupted"]);
+        let wp: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM write_positions WHERE stage_slice_id = ?1",
+                params![slice.slice_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wp, "pending");
+
+        store.fail_on = None;
+        let ready = match interrupted
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+            .unwrap()
+        {
+            ResumeOutcome::Ready(r) => r,
+            _ => panic!("expected the resume to finish the write"),
+        };
+        match ready
+            .seal(&mut store)
+            .unwrap()
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Sealed(_) => {}
+            _ => panic!("expected Sealed"),
+        }
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
+    }
+
+    /// Issue #408: a STAGED file that cannot be read mid-write (here: the
+    /// path now names a directory, so every read fails with EISDIR — a
+    /// stand-in for an EIO from a failing staging disk) leaves the session
+    /// `interrupted`, the error named as the source's, not the tape's. Once
+    /// the file is back, `resume` completes the write. It used to abort the
+    /// session for good and blame the tape.
+    #[test]
+    fn a_staged_file_read_error_interrupts_and_resume_completes() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let path = f.units[0].slices[1].staging_path.clone();
+        let good = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let interrupted = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Interrupted(i) => i,
+            ExecuteOutcome::Aborted(a) => {
+                panic!("a staged-file read error must not abort: {}", a.reason)
+            }
+            ExecuteOutcome::Ready(_) => panic!("expected Interrupted"),
+        };
+        let reason = interrupted.reason().unwrap().to_string();
+        assert!(reason.contains("staged source read error"), "{reason}");
+        assert!(!reason.contains("tape I/O error"), "{reason}");
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["interrupted"]);
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &good).unwrap();
+        let ready = match interrupted
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+            .unwrap()
+        {
+            ResumeOutcome::Ready(r) => r,
+            _ => panic!("expected the resume to finish the write"),
+        };
+        match ready
+            .seal(&mut store)
+            .unwrap()
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Sealed(_) => {}
+            _ => panic!("expected Sealed"),
+        }
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
     }
 }

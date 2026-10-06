@@ -248,7 +248,7 @@ impl TapeOps for FakeTape {
         let mut bytes = Vec::with_capacity(len as usize);
         src.take(len)
             .read_to_end(&mut bytes)
-            .map_err(|e| TapectlError::TapeIo(format!("read source: {e}")))?;
+            .map_err(|e| TapectlError::SourceIo(format!("read source: {e}")))?;
         let bs = s.block_size.max(1);
         bytes.resize(bytes.len().div_ceil(bs) * bs, 0);
         let padded = bytes.len() as u64;
