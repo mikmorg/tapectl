@@ -23,6 +23,7 @@ exists.
 | `perf_many_files_*`      | `TAPECTL_PERF_FILES`        | 5000    |
 | `perf_many_units_audit`  | `TAPECTL_PERF_UNITS`        | 500     |
 | `perf_large_single_file` | `TAPECTL_PERF_LARGE_MB`     | 500     |
+| `perf_fresh_catalog_*`   | `TAPECTL_PERF_CATALOG_FILES`| 184552  |
 
 The large-file scenario caps at 500 MiB because this dev VM's /scratch
 partition holds 100 GiB — the 2+ TB figure in the design doc's M7
@@ -59,6 +60,28 @@ Single run — treat the numbers as rough.
   should do materially better; confirm on LTO-6 when available.
 - **Audit scales linearly and is cheap** — 500 units takes 60 ms. The
   design's "500+ units" target is nowhere near the DB's limits.
+
+### 2026-10-06 — branch `schema` (issue #413), vm-desk1, release build
+
+`perf_fresh_catalog_takes_a_184k_file_version` (knob
+`TAPECTL_PERF_CATALOG_FILES`, default 184,552, L6-0001's file count): one
+version's file list into a catalog fresh from `db::open`, the write a DR
+`catalog rebuild` and a new install's first `snapshot create` both make
+through `db::files::insert_version`. Its ceiling is 10 s at the default size.
+
+| scenario                 | step                        | time     | notes                     |
+|--------------------------|-----------------------------|----------|---------------------------|
+| fresh catalog (184,552)  | file list insert            | 5.6–8.3 s | one `INSERT … SELECT` from a TEMP table; the VM was shared with other builds |
+| fresh catalog (184,552)  | `catalog.db` build          | 1.41 s   |                           |
+| fresh catalog (184,552)  | `catalog.db` read           | 0.37 s   |                           |
+
+The same insert row by row (one statement per row, as before #413), measured
+on the same schema: 4.86 s at 50,000 rows and 157.7 s at 184,552, against
+1.20 s and 5.55 s in one statement. Each per-row statement opened a savepoint
+at which FTS5 flushed its pending index, so every path became its own index
+segment plus merges. Deleting the `paths_fts_data` row `PRAGMA optimize`
+leaves in `sqlite_stat1` made no difference to the one-statement insert
+(5.9–6.5 s either way).
 
 When you add a new baseline row, keep the date and the short commit
 context so future regressions have something to diff against.

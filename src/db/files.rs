@@ -202,38 +202,76 @@ fn unit_of(conn: &Connection, snapshot_id: i64) -> Result<i64> {
 /// the version's unit. A (version, path) already present is left as it is
 /// and not counted — `catalog rebuild` may run twice over one tape. Returns
 /// the rows written. Run it inside the caller's transaction.
+///
+/// Issue #413: the rows are gathered in a TEMP table first, then written by
+/// one `INSERT … SELECT` into `paths` and one into `file_versions`. Row by
+/// row, every statement opened a savepoint and FTS5 flushed its pending
+/// index at each one, so every path became its own index segment plus
+/// merges: 306 s for 184k rows on a fresh catalog. One statement flushes the
+/// search index once. The same path twice in `entries` is refused by
+/// `paths`' UNIQUE constraint, as it always was by `files`'.
 pub fn insert_version(
     conn: &Connection,
     snapshot_id: i64,
     entries: impl IntoIterator<Item = Result<FileEntry>>,
 ) -> Result<usize> {
     let unit_id = unit_of(conn, snapshot_id)?;
-    let mut intern = conn.prepare(
-        "INSERT INTO paths (unit_id, path) VALUES (?1, ?2)
-         ON CONFLICT (unit_id, path) DO NOTHING",
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS version_files_in (
+             seq         INTEGER PRIMARY KEY,
+             path        TEXT NOT NULL,
+             kind        INTEGER NOT NULL,
+             size_bytes  INTEGER NOT NULL,
+             mtime_ns    INTEGER,
+             sha256      BLOB,
+             link_target TEXT
+         );
+         DELETE FROM temp.version_files_in;",
     )?;
-    let mut path_id = conn.prepare("SELECT id FROM paths WHERE unit_id = ?1 AND path = ?2")?;
-    let mut member = conn.prepare(
-        "INSERT INTO file_versions (snapshot_id, path_id, kind, size_bytes, mtime_ns, sha256,
-                                    link_target)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT (snapshot_id, path_id) DO NOTHING",
-    )?;
-    let mut written = 0;
-    for entry in entries {
-        let e = entry?;
-        intern.execute(params![unit_id, e.path])?;
-        let pid: i64 = path_id.query_row(params![unit_id, e.path], |r| r.get(0))?;
-        written += member.execute(params![
-            snapshot_id,
-            pid,
-            e.kind,
-            e.size_bytes,
-            e.mtime_ns,
-            e.sha256.as_ref().map(|h| h.as_slice()),
-            e.link_target,
-        ])?;
-    }
+    let written = (|| -> Result<usize> {
+        {
+            let mut gather = conn.prepare(
+                "INSERT INTO temp.version_files_in
+                     (path, kind, size_bytes, mtime_ns, sha256, link_target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for entry in entries {
+                let e = entry?;
+                gather.execute(params![
+                    e.path,
+                    e.kind,
+                    e.size_bytes,
+                    e.mtime_ns,
+                    e.sha256.as_ref().map(|h| h.as_slice()),
+                    e.link_target,
+                ])?;
+            }
+        }
+        conn.execute(
+            "INSERT INTO paths (unit_id, path)
+             SELECT ?1, t.path FROM temp.version_files_in t
+              WHERE NOT EXISTS (SELECT 1 FROM paths p WHERE p.unit_id = ?1 AND p.path = t.path)
+              ORDER BY t.seq",
+            params![unit_id],
+        )?;
+        Ok(conn.execute(
+            "INSERT INTO file_versions (snapshot_id, path_id, kind, size_bytes, mtime_ns,
+                                        sha256, link_target)
+             SELECT ?1, p.id, t.kind, t.size_bytes, t.mtime_ns, t.sha256, t.link_target
+               FROM temp.version_files_in t
+               JOIN paths p ON p.unit_id = ?2 AND p.path = t.path
+              WHERE NOT EXISTS (SELECT 1 FROM file_versions fv
+                                 WHERE fv.snapshot_id = ?1 AND fv.path_id = p.id)
+              ORDER BY t.seq",
+            params![snapshot_id, unit_id],
+        )?)
+    })();
+    // Emptied on every outcome: the TEMP table lives as long as the
+    // connection, and a failed batch must not leak into the next one.
+    // The batch's own error, if any, is the one reported.
+    let cleared = conn.execute("DELETE FROM temp.version_files_in", []);
+    let written = written?;
+    cleared?;
     Ok(written)
 }
 
@@ -464,6 +502,79 @@ mod tests {
         assert_eq!(
             mtime_ns_to_rfc3339(-1_000_000_000).as_deref(),
             Some("1969-12-31T23:59:59+00:00")
+        );
+    }
+
+    /// Issue #413: a version's file list reaches the search index in ONE
+    /// flush. Written row by row, every statement opened a savepoint and
+    /// FTS5 flushed its pending index on each, so every path became its own
+    /// segment plus merges: superlinear, 306 s for 184k rows on a fresh
+    /// catalog. Counted, not timed: the writes to `paths_fts_data` (the
+    /// index's segments), on a catalog `db::open` created, which is the
+    /// shape (and the `PRAGMA optimize` statistics) a DR rebuild meets.
+    #[test]
+    fn a_version_reaches_the_search_index_in_one_flush() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const N: usize = 3_000;
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("tapectl.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 1, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id) VALUES (1, 'u', 'u', 1);
+             INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (1, 1, 1, '/s');",
+        )
+        .unwrap();
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&writes);
+        conn.update_hook(Some(
+            move |_: rusqlite::hooks::Action, _: &str, table: &str, _: i64| {
+                if table == "paths_fts_data" {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ))
+        .unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let written = insert_version(
+            &tx,
+            1,
+            (0..N).map(|i| {
+                Ok(FileEntry {
+                    path: format!("album{}/photo_{i:05}.jpg", i % 7),
+                    kind: FileKind::Regular,
+                    size_bytes: i as i64,
+                    mtime_ns: Some(i as i64),
+                    sha256: None,
+                    link_target: None,
+                })
+            }),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        conn.update_hook(None::<fn(rusqlite::hooks::Action, &str, &str, i64)>)
+            .unwrap();
+
+        assert_eq!(written, N, "positive control: every row written");
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM paths_fts WHERE paths_fts MATCH 'photo*'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            indexed, N as i64,
+            "positive control: every path is searchable"
+        );
+        let n = writes.load(Ordering::SeqCst);
+        assert!(n > 0, "positive control: the hook sees the index's writes");
+        assert!(
+            n < N / 20,
+            "{n} writes to the search index for {N} paths: it must be flushed once, \
+             not once per row"
         );
     }
 }

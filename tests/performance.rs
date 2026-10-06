@@ -350,3 +350,73 @@ fn perf_large_single_file() {
         stage_elapsed
     );
 }
+
+/// Issue #413: a fresh catalog takes a 184k-file version — L6-0001's size —
+/// in seconds. This is the write `catalog rebuild` makes after a DR `init`,
+/// and the first big `snapshot create` on a new install, through the one
+/// function both use. Row by row it went superlinear (306 s measured):
+/// each statement flushed the search index. Then the version goes on tape
+/// in the `catalog.db` shape and comes back, both timed.
+#[test]
+#[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
+fn perf_fresh_catalog_takes_a_184k_file_version() {
+    if !perf_enabled() {
+        eprintln!("skip: TAPECTL_PERF_TESTS not set");
+        return;
+    }
+    // L6-0001's file count by default; the 10 s ceiling is for that size.
+    let files: usize = std::env::var("TAPECTL_PERF_CATALOG_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(184_552);
+    let root = TempDir::new().unwrap();
+    // `db::open`, not an in-memory catalog: the migrations and the
+    // `PRAGMA optimize` statistics a DR `init` leaves are part of the case.
+    let conn = db::open(&root.path().join("tapectl.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 1, 'active');
+         INSERT INTO units (id, uuid, name, tenant_id) VALUES (1, 'u', 'u', 1);
+         INSERT INTO snapshots (id, unit_id, version, status, source_path)
+              VALUES (1, 1, 1, 'staged', '/s');
+         INSERT INTO stage_sets (id, snapshot_id, status, slice_size) VALUES (1, 1, 'staged', 1);",
+    )
+    .unwrap();
+    let entries = (0..files).map(|i| {
+        Ok(db::files::FileEntry {
+            path: format!("{}/{}/IMG_{i:06}.jpg", i % 97, i % 13),
+            kind: db::files::FileKind::Regular,
+            size_bytes: i as i64,
+            mtime_ns: Some(1_700_000_000_000_000_000 + i as i64 * 1_000_000_000),
+            sha256: Some([(i % 251) as u8; 32]),
+            link_target: None,
+        })
+    });
+
+    let start = Instant::now();
+    let tx = db::busy::immediate_tx(&conn).unwrap();
+    let written = db::files::insert_version(&tx, 1, entries).unwrap();
+    tx.commit().unwrap();
+    let insert = start.elapsed();
+    assert_eq!(written, files);
+    report("fresh catalog insert", &format!("{files} rows"), insert);
+
+    let out = root.path().join("catalog.db");
+    let start = Instant::now();
+    db::ontape_catalog::write(&conn, &[1], &out).unwrap();
+    report(
+        "catalog.db build",
+        &format!("{files} rows"),
+        start.elapsed(),
+    );
+
+    let start = Instant::now();
+    let rows = db::ontape_catalog::read(&out).unwrap().files.len();
+    assert_eq!(rows, files);
+    report("catalog.db read", &format!("{files} rows"), start.elapsed());
+
+    assert!(
+        files > 184_552 || insert < Duration::from_secs(10),
+        "a {files}-file version into a fresh catalog took {insert:?}: issue #413's \
+         superlinear insert is back"
+    );
+}
