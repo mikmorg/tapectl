@@ -207,6 +207,13 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
 - `sha256sum` (coreutils) — integrity verification
 - `head`, `truncate` (coreutils) — trimming block padding to exact sizes
 - `tar` — unpacking your decrypted envelope (it is a tar archive)
+- `gpg` (package gnupg) — only if your `dar` was built with GPG support,
+  as Debian's and Ubuntu's is: such a dar refuses to start without it
+  ("INITIALIZATION FAILED FOR GPGME"). RESTORE.sh checks and says so.
+- dar 2.7.9 or later streams a restore with no disk space for slices;
+  an older one, or a unit without its catalogue on a dar before 2.7.21,
+  is restored by decrypting the slices to disk first (RESTORE.sh
+  chooses, and checks the space either way)
 
 ## Which device?
 
@@ -469,7 +476,7 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #   ./RESTORE.sh --find-envelope --key KEYFILE [--key K2 ...] Decrypt your envelope
 #   ./RESTORE.sh --restore --key KEYFILE [--key K2 ...] --to DIR
 #                [--unit U [--unit U2 ...] | --all] [--version N]
-#                [--no-space-check] [--overwrite]
+#                [--no-space-check] [--overwrite] [--scratch DIR]
 #   ./RESTORE.sh --restore --key KEYFILE --to DIR --unit U --path P [--path P2 ...]
 #                [--version N] [--scratch DIR]                One file or folder
 #   ./RESTORE.sh --list --key KEYFILE [--unit U] [--version N]  A unit's files
@@ -488,8 +495,12 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #
 # Disk space: --restore streams each slice from the tape through age into dar,
 # so nothing decrypted is written to disk but the restored files themselves:
-# --to needs about the unit's size free. The script measures this before it
-# reads any slice.
+# --to needs about the unit's size free. dar is given the unit's catalogue
+# from the envelope (dar 2.7.13 loses a file's tail streaming without one).
+# Where streaming is not safe (no usable catalogue and a dar before 2.7.21,
+# or a dar before 2.7.9) the slices are decrypted to disk first, as 1.0.x
+# did, in a scratch directory inside --to or --scratch DIR. The script
+# measures the space before it reads any slice.
 #
 # Requirements: mt (mt-st), dd, age, dar, sha256sum, head, truncate, tar, mkfifo, tee
 # Total files on tape: __TOTAL_FILES__
@@ -519,6 +530,7 @@ KEYS=()
 # one mode that keeps slices on disk (--path, which reads only a few), a
 # directory created inside --to or --scratch once its size is known.
 SCRATCH=""
+SCRATCH_PARENT=""
 SKIP_SPACE_CHECK=0
 OVERWRITE=0
 
@@ -769,6 +781,41 @@ die_if_dar_skipped() { # <dar output> <destination>
        are still in place, so they are NOT what is on tape. Skipped:
 $skipped
        Restore into an empty directory, or run again with --overwrite."
+}
+
+# The dar on this machine: its version, and whether it can start at all.
+# A dar built with GPG support asks, at startup, whether to carry on when
+# the gpg program is missing; under -Q it answers no and aborts. `dar -V`
+# meets the same question, so asking it first names the problem before the
+# tape is read rather than after every slice has been.
+DAR_VERSION=""
+dar_check() {
+  local out
+  out=$(dar -V -Q -N 2>&1 </dev/null || true)
+  if printf '%s\n' "$out" | grep -i 'INITIALIZATION FAILED FOR GPGME' >/dev/null; then
+    die "dar cannot start here: it was built with GPG support and needs the gpg
+       program on PATH (package gnupg; on Debian/Ubuntu: apt install gnupg).
+       dar's own words: $(printf '%s\n' "$out" | grep -i 'INITIALIZATION FAILED FOR GPGME' | head -n 1)
+       Nothing has been read from tape."
+  fi
+  DAR_VERSION=$(printf '%s\n' "$out" | sed -n 's/.*dar version \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1)
+  if [ -z "$DAR_VERSION" ]; then
+    echo "WARNING: cannot tell which dar this is (dar -V said nothing usable); restoring the" >&2
+    echo "         safe way, decrypting each unit's slices to disk before dar reads them." >&2
+  fi
+}
+
+# Is this dar at least version $1 (X.Y.Z)? False when the version is unknown.
+dar_at_least() {
+  [ -n "$DAR_VERSION" ] || return 1
+  awk -v have="$DAR_VERSION" -v want="$1" 'BEGIN {
+    split(have, a, "."); split(want, b, ".")
+    for (i = 1; i <= 3; i++) {
+      if (a[i] + 0 > b[i] + 0) exit 0
+      if (a[i] + 0 < b[i] + 0) exit 1
+    }
+    exit 0
+  }'
 }
 
 # ---- prerequisite check ----
@@ -1691,11 +1738,20 @@ wait_feed() { # <pid>
   return 0
 }
 
-# dar is gone: say why, with its own words.
+# dar is gone: say why, with its own words. One exit is not an error: dar
+# refusing the envelope's catalogue as not this archive's (a re-staged
+# snapshot, #419), which it does before writing anything. That sets
+# STREAM_REFUSED and returns, and the caller restores another way.
+STREAM_REFUSED=0
 die_dar() { # <destination>
   local rc=0
   wait "$DAR_PID" 2>/dev/null || rc=$?
   DAR_PID=""
+  CUR=""
+  if grep 'do not correspond to the same data' "$WORK/extract.log" >/dev/null 2>&1; then
+    STREAM_REFUSED=1
+    return 0
+  fi
   cat "$WORK/extract.log" >&2 2>/dev/null || true
   if grep -i 'no space left' "$WORK/extract.log" >/dev/null 2>&1; then
     die_io "dar extraction failed" "$WORK/extract.log" "$1"
@@ -1711,8 +1767,9 @@ die_dar() { # <destination>
 # index, and age authenticates every 64 KiB as it decrypts, so damaged bytes
 # stop the restore rather than reach dar. Whatever fails first is named: dar
 # (its own output), the tape read (dd's), or age (a missing key, or damage).
-stream_unit() { # <slices file: num|pos|size|sha per line> <destination>
-  local list=$1 destdir=$2 fifos="$WORK/stream" i n
+stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalogue]
+  local list=$1 destdir=$2 cat=${3:-} fifos="$WORK/stream" i n
+  STREAM_REFUSED=0
   local -a nums=() poss=() sizes=() shas=()
   local num tpos size sha
   while IFS='|' read -r num tpos size sha; do
@@ -1730,6 +1787,11 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination>
 
   local -a dar_opts=(-O -Q -N --sequential-read)
   [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
+  # The isolated catalogue, when there is one: dar 2.7.13 (Debian's and
+  # Ubuntu's) reading sliced FIFOs sequentially without it cuts short a file
+  # that runs into the last slice, for most slice sizes; with it the restore
+  # is exact (measured with #411; fixed in dar 2.7.21).
+  [ -z "$cat" ] || dar_opts+=(-A "$cat")
   dar -x "$fifos/restore" -R "$destdir" "${dar_opts[@]}" >"$WORK/extract.log" 2>&1 </dev/null &
   DAR_PID=$!
   BG_PIDS+=("$DAR_PID")
@@ -1738,7 +1800,10 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination>
   for ((i = 0; i < n; i++)); do
     num=${nums[$i]} tpos=${poss[$i]} size=${sizes[$i]} sha=${shas[$i]}
     info "Slice $((i + 1))/$n — tape file $tpos"
-    kill -0 "$DAR_PID" 2>/dev/null || die_dar "$destdir"
+    if ! kill -0 "$DAR_PID" 2>/dev/null; then
+      die_dar "$destdir"
+      return 0
+    fi
     seek_to "$tpos" || die "cannot position the tape at file $tpos ($MT failed)"
     CUR=""
     sha256sum <"$fifos/cipher" >"$WORK/slice.sha" 2>/dev/null &
@@ -1769,6 +1834,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination>
       wait "$hpid" 2>/dev/null || true
       kill -KILL "$opener" 2>/dev/null || true
       die_dar "$destdir"
+      return 0
     fi
     wait "$wpid" 2>/dev/null || true
     wait "$hpid" 2>/dev/null || true
@@ -1778,8 +1844,11 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination>
       die_io "reading tape file $tpos failed" "$WORK/dd.err" "$WORK"
     fi
     if [ "${st[3]:-1}" != 0 ]; then
+      if ! kill -0 "$DAR_PID" 2>/dev/null; then
+        die_dar "$destdir"
+        return 0
+      fi
       cat "$WORK/age.err" >&2 || true
-      kill -0 "$DAR_PID" 2>/dev/null || die_dar "$destdir"
       if grep 'no identity matched' "$WORK/age.err" >/dev/null 2>&1; then
         die_slice_keys "$num"
       fi
@@ -1787,7 +1856,10 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination>
        damaged. Files already restored to $destdir from this unit may be incomplete."
     fi
     if [ "${st[1]:-1}" != 0 ] || [ "${st[2]:-1}" != 0 ]; then
-      kill -0 "$DAR_PID" 2>/dev/null || die_dar "$destdir"
+      if ! kill -0 "$DAR_PID" 2>/dev/null; then
+        die_dar "$destdir"
+        return 0
+      fi
       die "slice $num (tape file $tpos) could not be passed to dar (status ${st[*]})"
     fi
     CUR=$((tpos + 1))
@@ -1803,6 +1875,10 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination>
   local rc=0
   wait "$DAR_PID" 2>/dev/null || rc=$?
   DAR_PID=""
+  if [ "$rc" != 0 ] && grep 'do not correspond to the same data' "$WORK/extract.log" >/dev/null 2>&1; then
+    STREAM_REFUSED=1
+    return 0
+  fi
   cat "$WORK/extract.log"
   if [ "$rc" != 0 ]; then
     if grep -i 'no space left' "$WORK/extract.log" >/dev/null 2>&1; then
@@ -1811,6 +1887,73 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination>
     die "dar extraction failed (exit $rc) — dar's own message is above"
   fi
   die_if_dar_skipped "$WORK/extract.log" "$destdir"
+}
+
+# Read, check and decrypt the slices listed in $1 into SCRATCH, as
+# restore.N.dar, one encrypted slice on disk at a time.
+spool_slices() { # <slices file>
+  local num tpos size sha actual i=0 n
+  n=$(wc -l <"$1")
+  while IFS='|' read -r num tpos size sha; do
+    i=$((i + 1))
+    info "Slice $num ($i/$n) — tape file $tpos"
+    read_tape_raw "$tpos" "$SCRATCH/slice.enc"
+    truncate -s "$size" "$SCRATCH/slice.enc"
+    actual=$(sha256sum "$SCRATCH/slice.enc" | awk '{print $1}')
+    [ "$actual" = "$sha" ] ||
+      die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${actual:0:16}…)"
+    info "  checksum verified against front index"
+    decrypt_slice "$SCRATCH/slice.enc" "$SCRATCH/restore.$num.dar" "$num"
+    rm -f "$SCRATCH/slice.enc"
+  done <"$1"
+}
+
+# The way 1.0.x restored, for a dar that cannot stream a unit safely: every
+# slice decrypted to disk first, then dar reads them directly (not
+# sequentially), which needs no catalogue. Needs room for the slices as well
+# as the files, checked before the first slice is read.
+spool_unit() { # <slices file> <destination>
+  local list=$1 destdir=$2 bytes=0 num tpos size sha
+  while IFS='|' read -r num tpos size sha; do
+    bytes=$((bytes + size))
+  done <"$list"
+  check_space "$destdir" "$SCRATCH_PARENT" "$bytes" "$((bytes + BLOCK))"
+  SCRATCH="$(mktemp -d "$SCRATCH_PARENT/.tapectl-restore.XXXXXX")" ||
+    die "cannot create a scratch directory in $SCRATCH_PARENT"
+  spool_slices "$list"
+  local -a dar_opts=(-O -Q -N)
+  [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
+  dar -x "$SCRATCH/restore" -R "$destdir" "${dar_opts[@]}" 2>&1 | tee "$WORK/extract.log" ||
+    die "dar extraction failed — dar's own message is above (No space left on device means $destdir is full)"
+  die_if_dar_skipped "$WORK/extract.log" "$destdir"
+  rm -rf "$SCRATCH"
+  SCRATCH=""
+}
+
+# Restore one unit the best way this dar allows. Streaming needs the unit's
+# isolated catalogue from the envelope with dar 2.7.9 or later (sliced
+# sequential reading with a catalogue works from there), or no catalogue with
+# dar 2.7.21 or later (which fixed reading without one). A catalogue dar
+# refuses (#419) is dropped, and anything else is restored from slices
+# decrypted to disk first.
+restore_unit() { # <slices file> <destination> <unit> <version>
+  local list=$1 destdir=$2 unit=$3 ver=$4 cat
+  cat=$(catalogue_path "$CHOSEN_ENV" "$unit" "$ver")
+  if [ -n "$cat" ] && dar_at_least 2.7.9; then
+    stream_unit "$list" "$destdir" "$cat"
+    [ "$STREAM_REFUSED" = 1 ] || return 0
+    echo "NOTE: dar refused the envelope's catalogue for '$unit': it belongs to another" >&2
+    echo "      staging run of the same snapshot (#419). Nothing was written; restoring" >&2
+    echo "      '$unit' without it." >&2
+  fi
+  if dar_at_least 2.7.21; then
+    stream_unit "$list" "$destdir" ""
+    [ "$STREAM_REFUSED" = 0 ] || die "dar refused to read '$unit' — see its message above"
+    return 0
+  fi
+  info "dar ${DAR_VERSION:-(unknown version)} cannot stream '$unit' safely without its catalogue;"
+  info "  decrypting the slices to disk first (dar 2.7.21 or later would stream it)"
+  spool_unit "$list" "$destdir"
 }
 
 # The envelope --restore uses (walk_envelopes calls this for each that
@@ -1890,7 +2033,9 @@ do_restore() {
 
   [ -n "$scratch_parent" ] || scratch_parent=$destdir
   check_destination "$destdir" "$scratch_parent"
+  dar_check
   mkdir -p "$destdir" "$scratch_parent"
+  SCRATCH_PARENT=$scratch_parent
   set_age_ids
 
   establish_files
@@ -1943,10 +2088,11 @@ do_restore() {
   # read. Always say which version: a volume can hold several, and silently
   # picking one is how an heir restores the wrong data believing it current.
   local i total=0 first
-  local -a order_lines=()
+  local -a order_lines=() versions=()
   for ((i = 0; i < ${#targets[@]}; i++)); do
     info "Parsing slices for unit: ${targets[$i]}"
     pick_slices "$manifest" "${targets[$i]}" "$WORK/slices.$i" "$want_version"
+    versions[$i]=$PICKED_VERSION
     info "Restoring '${targets[$i]}' snapshot version ${PICKED_VERSION:-unknown} ($(wc -l <"$WORK/slices.$i") slice(s))"
     total=$((total + PICKED_BYTES))
     first=$(head -n 1 "$WORK/slices.$i" | cut -d'|' -f2)
@@ -1969,7 +2115,7 @@ do_restore() {
       mkdir -p "$dest_i"
     fi
     info "Extracting '${targets[$i]}' to $dest_i ..."
-    stream_unit "$WORK/slices.$i" "$dest_i"
+    restore_unit "$WORK/slices.$i" "$dest_i" "${targets[$i]}" "${versions[$i]}"
     done_lines+=("Unit '${targets[$i]}' restored to: $dest_i")
   done < <(printf '%s\n' "${order_lines[@]}" | sort -t'|' -k1,1n)
 
@@ -1986,6 +2132,14 @@ do_restore() {
 # unit it lists, named <first 8 of the unit uuid>_v<snapshot version>. With
 # it dar lists a unit's files, and says which slice holds each, without
 # reading the tape. Prints the catalogue's base path, or dies.
+catalogue_path() { # <envelope dir> <unit> <version>: the base path, or nothing
+  local env=$1 unit=$2 ver=$3 uuid
+  uuid=$(awk -v unit="$unit" -v want="$ver" '__AWK_UNIT_UUID__' "$env/MANIFEST.toml")
+  [ -n "$uuid" ] || return 0
+  [ -f "$env/catalogs/${uuid:0:8}_v$ver.1.dar" ] || return 0
+  echo "$env/catalogs/${uuid:0:8}_v$ver"
+}
+
 catalogue_for() { # <envelope dir> <unit> <version>
   local env=$1 unit=$2 ver=$3 uuid base
   uuid=$(awk -v unit="$unit" -v want="$ver" '__AWK_UNIT_UUID__' "$env/MANIFEST.toml")
@@ -2006,6 +2160,7 @@ units_of_envelope() { # <manifest>
 do_list() {
   local want_version=${1:-} manifest u base
   set_age_ids
+  dar_check
   establish_files
   # No unit named: the envelope listing the most units, as --all chooses
   # (with an operator or escrow key, the operator envelope: every unit).
@@ -2025,8 +2180,13 @@ do_list() {
   fi
   for u in "${targets[@]}"; do
     pick_slices "$manifest" "$u" "$WORK/list.slices" "$want_version"
-    base=$(catalogue_for "$CHOSEN_ENV" "$u" "$PICKED_VERSION")
+    base=$(catalogue_path "$CHOSEN_ENV" "$u" "$PICKED_VERSION")
     echo ""
+    if [ -z "$base" ]; then
+      echo "=== $u, snapshot version $PICKED_VERSION — no dar catalogue in this envelope ==="
+      echo "    (it can still be restored whole; --list and --path need the catalogue)"
+      continue
+    fi
     echo "=== $u, snapshot version $PICKED_VERSION — catalogs/${base##*/} ==="
     dar -l "$base" -N -Q || die "dar could not list the catalogue of '$u'"
   done
@@ -2074,19 +2234,7 @@ restore_paths() { # <slices file> <envelope dir> <unit> <version> <destination> 
   check_space "$destdir" "$scr" "$total" "$total"
   SCRATCH="$(mktemp -d "$scr/.tapectl-restore.XXXXXX")" ||
     die "cannot create a scratch directory in $scr"
-  local actual i=0
-  while IFS='|' read -r num tpos size sha; do
-    i=$((i + 1))
-    info "Slice $num ($i/$n) — tape file $tpos"
-    read_tape_raw "$tpos" "$SCRATCH/slice.enc"
-    truncate -s "$size" "$SCRATCH/slice.enc"
-    actual=$(sha256sum "$SCRATCH/slice.enc" | awk '{print $1}')
-    [ "$actual" = "$sha" ] ||
-      die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${actual:0:16}…)"
-    info "  checksum verified against front index"
-    decrypt_slice "$SCRATCH/slice.enc" "$SCRATCH/restore.$num.dar" "$num"
-    rm -f "$SCRATCH/slice.enc"
-  done <"$WORK/path.slices"
+  spool_slices "$WORK/path.slices"
   local -a dar_opts=(-O -Q -N)
   [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
   info "Extracting ${RESTORE_PATHS[*]} to $destdir ..."
@@ -2168,9 +2316,6 @@ case "${1:-}" in
   if [ "$RESTORE_ALL" = 1 ] && [ ${#RESTORE_UNITS[@]} -gt 0 ]; then
     die "--all restores every unit; give it without --unit"
   fi
-  if [ -n "$scratch" ] && [ ${#RESTORE_PATHS[@]} -eq 0 ]; then
-    die "--scratch is for --path; a full restore streams its slices and needs no scratch space"
-  fi
   require_key_files
   [ -z "$want" ] || require_uint version "$want"
   do_restore "$dest" "$want" "$scratch"
@@ -2232,7 +2377,11 @@ case "${1:-}" in
   echo ""
   echo "  Disk space: each slice streams from the tape through age into dar,"
   echo "      so --to needs room for the restored files only, about the unit's"
-  echo "      size. The script checks before it reads any slice."
+  echo "      size. The script checks before it reads any slice. Where this"
+  echo "      dar cannot stream a unit safely (no catalogue in the envelope and"
+  echo "      dar older than 2.7.21, or dar older than 2.7.9) its slices are"
+  echo "      decrypted to disk first, in --scratch DIR (default: inside --to)."
+  echo "  A dar built with GPG support needs gpg (package gnupg) to start."
   echo "  --no-space-check   Skip that check (a compressed or thin-provisioned"
   echo "      filesystem can hold more than df reports)."
   echo "  --overwrite   --to must otherwise be empty or new: dar keeps a file"
@@ -4640,8 +4789,11 @@ sha256_encrypted = \"bbb\"
             .find("snapshot version ${PICKED_VERSION:-unknown}")
             .unwrap();
         let first_read = s
-            .find("stream_unit \"$WORK/slices.$i\"")
+            .find("restore_unit \"$WORK/slices.$i\"")
             .expect("slice read");
+        // dar is given the envelope's catalogue when it streams: dar 2.7.13
+        // loses a file's tail streaming without one.
+        assert!(s.contains("[ -z \"$cat\" ] || dar_opts+=(-A \"$cat\")"));
         assert!(
             picked < check && check < first_read,
             "order: version, space, slices"

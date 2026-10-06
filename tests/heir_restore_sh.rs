@@ -240,8 +240,21 @@ echo "age: error: no identity matched any of the recipients" >&2
 exit 1
 "#;
 
+/// Which dar catalogue a unit's envelope carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cat {
+    /// The isolated catalogue of the very dar run whose slices are on tape.
+    Matched,
+    /// One from a second dar run of the same content, as a re-staged
+    /// snapshot carries (#419): dar refuses it against these slices.
+    FromAnotherRun,
+    /// None at all.
+    Absent,
+}
+
 /// One unit as staged: its files, and the dar slices built from them.
 struct UnitSpec {
+    cat: Cat,
     name: &'static str,
     uuid: &'static str,
     version: i64,
@@ -296,6 +309,7 @@ fn template() -> &'static Template {
                 units: vec![
                     UnitSpec {
                         name: "photos/2019",
+                        cat: Cat::Matched,
                         uuid: "11111111-2222-3333-4444-555555555555",
                         version: 2,
                         seed: 1,
@@ -304,6 +318,7 @@ fn template() -> &'static Template {
                     },
                     UnitSpec {
                         name: "docs",
+                        cat: Cat::Matched,
                         uuid: "22222222-3333-4444-5555-666666666666",
                         version: 1,
                         seed: 2,
@@ -316,12 +331,36 @@ fn template() -> &'static Template {
                 name: "bob",
                 units: vec![UnitSpec {
                     name: "ledgers",
+                    cat: Cat::Matched,
                     uuid: "33333333-4444-5555-6666-777777777777",
                     version: 3,
                     seed: 3,
                     files: 2,
                     file_len: 130_000,
                 }],
+            },
+            TenantSpec {
+                name: "carol",
+                units: vec![
+                    UnitSpec {
+                        name: "restaged",
+                        cat: Cat::FromAnotherRun,
+                        uuid: "44444444-5555-6666-7777-888888888888",
+                        version: 4,
+                        seed: 4,
+                        files: 3,
+                        file_len: 120_000,
+                    },
+                    UnitSpec {
+                        name: "nocat",
+                        cat: Cat::Absent,
+                        uuid: "55555555-6666-7777-8888-999999999999",
+                        version: 1,
+                        seed: 5,
+                        files: 3,
+                        file_len: 110_000,
+                    },
+                ],
             },
         ];
         build_template(&tenants)
@@ -335,7 +374,7 @@ fn build_template(tenants: &[TenantSpec]) -> Template {
     for sub in ["tape", "src", "keys", "work"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
-    for k in ["alice", "bob", "op", "esc", "stranger"] {
+    for k in ["alice", "bob", "carol", "op", "esc", "stranger"] {
         std::fs::write(dir.join("keys").join(format!("{k}.key")), k).unwrap();
     }
 
@@ -344,7 +383,7 @@ fn build_template(tenants: &[TenantSpec]) -> Template {
         tenant: &'static str,
         unit: ManifestUnit,
         slices: Vec<Vec<u8>>,
-        catalogue: Vec<u8>,
+        catalogue: Option<Vec<u8>>,
         src: PathBuf,
     }
     let mut staged: Vec<Staged> = Vec::new();
@@ -374,16 +413,35 @@ fn build_template(tenants: &[TenantSpec]) -> Template {
                 "-R",
                 src.to_str().unwrap(),
                 "-s",
-                "200k",
+                // A size at which dar 2.7.13 cuts short a file that runs into
+                // the last slice when it reads sequentially without -A.
+                "100k",
                 "-Q",
                 "-N",
             ]);
             let cat = work.join(format!("{}_v{}", &u.uuid[..8], u.version));
+            let cat_of = if u.cat == Cat::FromAnotherRun {
+                // A second dar run of the same content: a new data label.
+                let again = work.join("again");
+                run_dar(&[
+                    "-c",
+                    again.to_str().unwrap(),
+                    "-R",
+                    src.to_str().unwrap(),
+                    "-s",
+                    "100k",
+                    "-Q",
+                    "-N",
+                ]);
+                again
+            } else {
+                base.clone()
+            };
             run_dar(&[
                 "-C",
                 cat.to_str().unwrap(),
                 "-A",
-                base.to_str().unwrap(),
+                cat_of.to_str().unwrap(),
                 "-Q",
                 "-N",
             ]);
@@ -395,8 +453,9 @@ fn build_template(tenants: &[TenantSpec]) -> Template {
                 }
                 slices.push(std::fs::read(p).unwrap());
             }
-            let catalogue =
-                std::fs::read(work.join(format!("{}_v{}.1.dar", &u.uuid[..8], u.version))).unwrap();
+            let catalogue = (u.cat != Cat::Absent).then(|| {
+                std::fs::read(work.join(format!("{}_v{}.1.dar", &u.uuid[..8], u.version))).unwrap()
+            });
             staged.push(Staged {
                 tenant: t.name,
                 unit: ManifestUnit {
@@ -454,14 +513,16 @@ fn build_template(tenants: &[TenantSpec]) -> Template {
         add("MANIFEST.toml", manifest.as_bytes());
         add("RECOVERY.md", recovery.as_bytes());
         for s in which {
-            add(
-                &format!(
-                    "catalogs/{}_v{}.1.dar",
-                    &s.unit.uuid[..8],
-                    s.unit.snapshot_version
-                ),
-                &s.catalogue,
-            );
+            if let Some(cat) = &s.catalogue {
+                add(
+                    &format!(
+                        "catalogs/{}_v{}.1.dar",
+                        &s.unit.uuid[..8],
+                        s.unit.snapshot_version
+                    ),
+                    cat,
+                );
+            }
         }
         stub_encrypt(recipients, "", &tar.into_inner().unwrap())
     };
@@ -1310,6 +1371,10 @@ fn a_restore_streams_slices_into_dar_without_decrypting_to_disk() {
     let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
     assert!(args.contains("--sequential-read"), "{args}");
     assert!(args.contains("-N"), "{args}");
+    assert!(
+        args.contains("-A ") && args.contains("catalogs/11111111_v2"),
+        "dar is given the envelope's catalogue: {args}"
+    );
     let kinds = std::fs::read_to_string(h.dir.join("dar.slices")).unwrap();
     assert_eq!(
         kinds.lines().collect::<Vec<_>>(),
@@ -1714,4 +1779,146 @@ fn list_with_the_escrow_key_lists_every_unit() {
             "{u}:\n{text}"
         );
     }
+}
+
+// ---- dar 2.7.13's sequential-read tail loss, and the fallbacks ----
+
+/// dar 2.7.13 (Debian's and Ubuntu's) reading a sliced archive with
+/// --sequential-read and no isolated catalogue cuts short a file that runs
+/// into the last slice, for most slice sizes (the template's 100 KiB among
+/// them), and then asks for a slice after the last. With the catalogue as -A
+/// the same slices restore identically (measured; fixed in dar 2.7.21).
+/// So the streaming restore gives dar the envelope's catalogue. This is the
+/// installed dar, not a stub: the restore must come back byte for byte.
+#[test]
+fn a_streamed_restore_on_dar_2_7_13_keeps_the_tail_of_the_last_file() {
+    let h = Heir::new();
+    // `docs`, at the template's 100 KiB slices, is a layout dar 2.7.13 cuts
+    // short without -A (photos/2019 happens not to be).
+    let docs = unit("docs");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&docs.src, Path::new(&dest)), "{text}");
+}
+
+/// A re-staged snapshot's envelope can carry the catalogue of a different
+/// dar run (#419), which dar refuses, fatally, before it writes anything.
+/// The restore falls back: on a dar older than 2.7.21 (this one) to
+/// decrypting the slices to disk and extracting directly, which needs no
+/// catalogue. It says so, and restores the unit byte for byte.
+#[test]
+fn a_catalogue_dar_refuses_falls_back_to_slices_on_disk() {
+    let h = Heir::with_stubs(&[("dar", DAR_SPY)]);
+    let u = unit("restaged");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("carol"),
+        "--unit",
+        "restaged",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&u.src, Path::new(&dest)), "{text}");
+    assert!(text.contains("refused the envelope's catalogue"), "{text}");
+    assert!(text.contains("decrypting the slices to disk"), "{text}");
+    let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
+    let calls: Vec<&str> = args.lines().filter(|l| l.starts_with("-x")).collect();
+    assert_eq!(calls.len(), 2, "{args}");
+    assert!(
+        calls[0].contains("--sequential-read") && calls[0].contains("-A "),
+        "{args}"
+    );
+    assert!(
+        !calls[1].contains("--sequential-read"),
+        "direct read: {args}"
+    );
+}
+
+/// An envelope with no catalogue for the unit: dar 2.7.13 cannot stream it
+/// safely, so the slices are decrypted to disk first, with the space check
+/// that implies (the slices and the files).
+#[test]
+fn no_catalogue_on_an_old_dar_restores_from_slices_on_disk() {
+    let h = Heir::with_stubs(&[("dar", DAR_SPY)]);
+    let u = unit("nocat");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("carol"),
+        "--unit",
+        "nocat",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&u.src, Path::new(&dest)), "{text}");
+    assert!(text.contains("decrypting the slices to disk"), "{text}");
+    assert!(text.contains("(slices read, then the files)"), "{text}");
+    let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
+    assert!(!args.contains("--sequential-read"), "{args}");
+}
+
+/// dar 2.7.21 and later read sequentially without a catalogue correctly, so
+/// there the unit streams even with none. (The version is claimed by a
+/// wrapper: only the choice is under test.)
+#[test]
+fn no_catalogue_on_dar_2_7_21_still_streams() {
+    let dar =
+        "#!/bin/sh\ncase \"$*\" in -V*) echo ' dar version 2.7.21, Copyright'; exit 0 ;; esac\n\
+               echo \"$*\" >>\"$FAKE_TAPE/dar.args\"\nexec \"$FAKE_TAPE/hostbin/dar\" \"$@\"\n";
+    let h = Heir::with_stubs(&[("dar", dar)]);
+    let _ = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("carol"),
+        "--unit",
+        "nocat",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    let args = std::fs::read_to_string(h.dir.join("dar.args")).unwrap();
+    assert!(args.contains("--sequential-read"), "{args}");
+    assert!(!args.contains("-A "), "{args}");
+}
+
+/// A dar built with GPG support aborts under -Q when no `gpg` is on PATH
+/// ("INITIALIZATION FAILED FOR GPGME"). The script asks dar first and names
+/// the cause and the fix, before reading the tape, instead of failing at the
+/// extract after the slices were read.
+#[test]
+fn a_dar_that_needs_gpg_is_named_before_the_tape_is_read() {
+    let dar = "#!/bin/sh\necho 'Aborting program. User refused to continue while asking: \
+               INITIALIZATION FAILED FOR GPGME, missing gpg binary? Retry initializing without \
+               gpgme support' >&2\nexit 4\n";
+    let h = Heir::with_stubs(&[("dar", dar)]);
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("gpg"), "{text}");
+    assert!(text.contains("gnupg"), "names the package:\n{text}");
+    assert!(
+        !h.ops().iter().any(|l| l.starts_with("dd ")),
+        "{:#?}",
+        h.ops()
+    );
 }

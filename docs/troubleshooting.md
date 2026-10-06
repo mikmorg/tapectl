@@ -1802,6 +1802,22 @@ every slice to disk first and needed about twice the unit's size; tapes before
 1.0.0 put the slices in `/tmp`. Any layout-v2 tape can be read with the
 RESTORE.sh from a newer tape, or with `tapectl restore`.
 
+### RESTORE.sh: `dar cannot start here: it was built with GPG support`
+
+The machine's dar (Debian's and Ubuntu's among them) was built with GPG
+support and asks, at startup, whether to carry on without the `gpg` program;
+under `-Q` it answers no and aborts ("INITIALIZATION FAILED FOR GPGME"). The
+script asks dar first and stops before the tape is read. Install gnupg
+(`apt install gnupg`) and run it again.
+
+### RESTORE.sh: `dar refused the envelope's catalogue`
+
+The unit's dar catalogue in the envelope came from another staging run of the
+same snapshot (a re-staged snapshot, #419), and dar will not use it with these
+slices. Nothing was written; the script restores the unit without it: streamed
+on dar 2.7.21 or later, otherwise from slices decrypted to disk first, which
+needs room for them as well as the files.
+
 ### RESTORE.sh: `--to … is not empty`
 
 ```text

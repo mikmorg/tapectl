@@ -643,6 +643,13 @@ envelope has been read and decrypted.
    `not enough disk space` if it will not fit. Do not restore into `/tmp`,
    which is RAM on many systems.
 
+   If the envelope holds no usable dar catalogue for the unit and the
+   machine's dar is older than 2.7.21 (Debian's and Ubuntu's is 2.7.13),
+   the script decrypts the slices to disk first instead, and says so; that
+   needs room for the slices as well (`--scratch DIR` puts them elsewhere).
+   A dar built with GPG support will not start without `gpg` (package
+   `gnupg`); the script checks before it reads the tape.
+
    **`--to` must be empty or new.** dar keeps a file that already exists and
    still reports success, so the script refuses a directory with anything in
    it. To finish a restore that stopped part way, run the same command again
