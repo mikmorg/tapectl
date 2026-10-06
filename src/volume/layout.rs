@@ -432,7 +432,7 @@ padding can be defeated without knowing the exact size:
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
         AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
-        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNIT_LIST,
+        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST,
     };
 
     let script = r#"#!/usr/bin/env bash
@@ -1312,17 +1312,27 @@ do_verify() {
   fi
 }
 
-# ---- --find-envelope ----
+# ---- envelopes ----
 
 # The three "no envelope opened" exits share one shape (issues #288, #291):
 # which keys were tried, what tape is actually in the drive, and the rotation
 # fact that makes a correct-looking key fail on a correct tape. They live here,
 # in one function, because the --unit exit — the one an heir is most likely to
-# hit — had already drifted into a bare one-liner with none of it.
+# hit — had already drifted into a bare one-liner with none of it. When an
+# envelope a key DID match turned out damaged (#412), that is said instead of
+# the rotation hint: it is not a key problem.
 die_no_envelope() { # [unit]
   local headline="no envelope matched $(keys_phrase)"
   if [ -n "${1:-}" ]; then
     headline="no envelope for unit '$1' matched $(keys_phrase)"
+  fi
+  if [ "$DAMAGED_ENVELOPES" -gt 0 ]; then
+    die "$headline that could be opened.
+       $DAMAGED_ENVELOPES envelope(s) on this tape are DAMAGED (see the WARNING
+       lines above): a key matched, so this is not a wrong key. Another copy of
+       this volume, or the operator or escrow key (which open the operator
+       envelope and its backup), can still recover the data.
+       Keys tried: $(keys_list)"
   fi
   die "$headline
        Tape in $DEVICE identifies as '${TAPE_LABEL:-<unreadable>}'; this script is for '$LABEL'.
@@ -1334,50 +1344,136 @@ die_no_envelope() { # [unit]
        Keys tried: $(keys_list)"
 }
 
+# Read the envelope at tape file $1 and try each key on it, on its own
+# (#288). Returns 0 when a key opened it (ENV_KEY names the key; the files
+# are in $WORK/env), 1 when no key matched it, 2 when it is DAMAGED: a key
+# matched but the payload would not decrypt or unpack (#412). age names the
+# difference — "no identity matched" is a key that is not a recipient — and
+# the front index's keyless hash says so before any key is tried.
+ENV_KEY=""
+DAMAGED_ENVELOPES=0
+try_envelope() { # <position>
+  local pos=$1 esize ehash actual keyfile mismatch=0
+  ENV_KEY=""
+  read_tape_raw "$pos" "$WORK/envelope.enc"
+  esize=$(file_size_at "$pos" "$FILES_TXT")
+  ehash=$(file_hash_at "$pos" "$FILES_TXT")
+  if [ -n "$esize" ]; then
+    require_uint "size_bytes(@$pos)" "$esize"
+    [ "$esize" -gt 0 ] && truncate -s "$esize" "$WORK/envelope.enc"
+  fi
+  if [ -n "$ehash" ]; then
+    actual=$(sha256sum "$WORK/envelope.enc" | awk '{print $1}')
+    if [ "$actual" != "$ehash" ]; then
+      mismatch=1
+      echo "WARNING: the envelope at file $pos does not match the front index: it is DAMAGED" >&2
+      echo "         (sha256 ${actual:0:16}..., the front index says ${ehash:0:16}...). Trying it anyway." >&2
+    fi
+  fi
+  for keyfile in ${KEYS[@]+"${KEYS[@]}"}; do
+    rm -rf "$WORK/env" && mkdir -p "$WORK/env"
+    if age -d -i "$keyfile" <"$WORK/envelope.enc" 2>"$WORK/age.err" |
+      tar xf - -C "$WORK/env/" 2>"$WORK/tar.err"; then
+      ENV_KEY=$keyfile
+      return 0
+    fi
+    if grep 'no identity matched' "$WORK/age.err" >/dev/null 2>&1; then
+      info "  key $keyfile did not open the envelope at file $pos"
+      continue
+    fi
+    # The key matched (age got past the header), so no other key can do
+    # better: these bytes are damaged.
+    DAMAGED_ENVELOPES=$((DAMAGED_ENVELOPES + 1))
+    echo "WARNING: key $keyfile matched the envelope at file $pos, but the envelope is DAMAGED:" >&2
+    cat "$WORK/age.err" "$WORK/tar.err" 2>/dev/null | sed 's/^/         /' >&2 || true
+    return 2
+  done
+  if [ "$mismatch" = 1 ]; then
+    DAMAGED_ENVELOPES=$((DAMAGED_ENVELOPES + 1))
+    return 2
+  fi
+  return 1
+}
+
+# Walk the envelopes in tape order — forward only — trying the keys on each,
+# and call "$1 <position>" for each that opens; it returns 1 to stop the
+# walk. A file whose bytes equal one already tried (an envelope's backup, by
+# its front-index hash) is skipped unless that one was damaged.
+walk_envelopes() { # <on-open callback>
+  local cb=$1 pos h rc seen=" "
+  while IFS= read -r pos; do
+    require_uint envelope_position "$pos"
+    h=$(file_hash_at "$pos" "$FILES_TXT")
+    case "$seen" in
+    *" $h "*)
+      [ -z "$h" ] || {
+        info "File $pos holds the same bytes as an envelope already tried (its backup): skipped"
+        continue
+      }
+      ;;
+    esac
+    info "Trying envelope at file $pos..."
+    rc=0
+    try_envelope "$pos" || rc=$?
+    [ "$rc" = 2 ] || [ -z "$h" ] || seen="$seen$h "
+    if [ "$rc" = 0 ]; then
+      rm -rf "$WORK/opened.$pos"
+      mv "$WORK/env" "$WORK/opened.$pos"
+      "$cb" "$pos" || break
+    fi
+  done < <(envelope_positions "$FILES_TXT")
+}
+
+# One line per unit an envelope lists: unit, versions, slices, size.
+units_table() { # <MANIFEST.toml>
+  printf "    %-32s  %-10s  %6s  %10s\n" "Unit" "Versions" "Slices" "Size"
+  awk '__AWK_UNITS_TABLE__' "$1" | while IFS='|' read -r name versions nslices bytes; do
+    printf "    %-32s  %-10s  %6s  %10s\n" "$name" "$versions" "$nslices" "$(size_str "$bytes")"
+  done
+}
+
+# ---- --find-envelope ----
+
+FOUND_ENVELOPES=()
+found_envelope() { # <position>
+  local pos=$1 m="$WORK/opened.$1/MANIFEST.toml" who
+  FOUND_ENVELOPES+=("$pos")
+  who=$(safe_str "$(toml_val "$m" tenant 2>/dev/null)")
+  echo ""
+  info "Decrypted envelope at file $pos${who:+ (tenant: $who)}"
+  info "  opened with key $ENV_KEY"
+  if [ -f "$m" ]; then
+    units_table "$m"
+  fi
+  return 0
+}
+
 do_find_envelope() {
   establish_files
 
-  local found=0 pos keyfile
-  while IFS= read -r pos; do
-    require_uint envelope_position "$pos"
-    info "Trying envelope at file $pos..."
-    read_tape_raw "$pos" "$WORK/envelope.enc"
+  # Every envelope, not just the first that opens (#412): an operator or
+  # escrow key opens them all, and the operator envelope lists every unit.
+  walk_envelopes found_envelope
+  [ "${#FOUND_ENVELOPES[@]}" -gt 0 ] || die_no_envelope
 
-    local esize
-    esize=$(file_size_at "$pos" "$FILES_TXT")
-    if [ -n "$esize" ]; then
-      require_uint "size_bytes(@$pos)" "$esize"
-      [ "$esize" -gt 0 ] && truncate -s "$esize" "$WORK/envelope.enc"
+  if [ "${#FOUND_ENVELOPES[@]}" -eq 1 ]; then
+    local d="$WORK/opened.${FOUND_ENVELOPES[0]}"
+    if [ -f "$d/MANIFEST.toml" ]; then
+      echo ""
+      echo "--- MANIFEST.toml ---"
+      cat "$d/MANIFEST.toml"
     fi
-
-    for keyfile in ${KEYS[@]+"${KEYS[@]}"}; do
-      rm -rf "$WORK/env" && mkdir -p "$WORK/env"
-      if age -d -i "$keyfile" <"$WORK/envelope.enc" 2>/dev/null |
-        tar xf - -C "$WORK/env/" 2>/dev/null; then
-        found=1
-        echo ""
-        info "Decrypted envelope at file $pos"
-        info "  opened with key $keyfile"
-        if [ -f "$WORK/env/MANIFEST.toml" ]; then
-          echo ""
-          echo "--- MANIFEST.toml ---"
-          cat "$WORK/env/MANIFEST.toml"
-        fi
-        if [ -f "$WORK/env/RECOVERY.md" ]; then
-          echo ""
-          echo "--- RECOVERY.md ---"
-          cat "$WORK/env/RECOVERY.md"
-        fi
-        break
-      fi
-      info "  key $keyfile did not open the envelope at file $pos"
-    done
-    if [ "$found" -eq 1 ]; then
-      break
+    if [ -f "$d/RECOVERY.md" ]; then
+      echo ""
+      echo "--- RECOVERY.md ---"
+      cat "$d/RECOVERY.md"
     fi
-  done < <(envelope_positions "$FILES_TXT")
-
-  [ "$found" -eq 1 ] || die_no_envelope
+  else
+    echo ""
+    echo "${#FOUND_ENVELOPES[@]} envelopes opened. The operator envelope (an operator or escrow"
+    echo "key opens it) lists every unit on this tape; --restore --unit NAME finds the"
+    echo "envelope that holds NAME, and --all restores every unit of the largest one."
+  fi
   echo ""
   echo "To restore, run:"
   echo "  $0 --restore $(keys_args) --to /your/destination"
@@ -1434,6 +1530,22 @@ decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number>
        --key once per key."
 }
 
+# The envelope --restore uses: the first that opens and lists the unit asked
+# for (any, when none was named). Called by walk_envelopes.
+WANT_UNIT=""
+CHOSEN_ENV=""
+pick_for_restore() { # <position>
+  local pos=$1 m="$WORK/opened.$1/MANIFEST.toml"
+  if [ -n "$WANT_UNIT" ] && [ -f "$m" ] && ! manifest_has_unit "$m" "$WANT_UNIT"; then
+    info "Envelope at file $pos decrypts but does not list '$WANT_UNIT'; continuing..."
+    return 0
+  fi
+  CHOSEN_ENV="$WORK/opened.$pos"
+  info "Decrypted envelope at file $pos"
+  info "  opened with key $ENV_KEY"
+  return 1
+}
+
 do_restore() {
   local destdir=$1 target_unit=$2 want_version=${3:-} scratch_parent=${4:-}
 
@@ -1452,51 +1564,13 @@ do_restore() {
   # a different tenant than --unit. When a unit was named, keep searching until
   # an envelope whose manifest actually lists it is found (the operator
   # envelope always does); otherwise the first decryptable envelope wins, as
-  # before. (issue #127)
-  #
-  # Each key is tried independently at each position (#288). Once ONE key has
-  # opened an envelope that does not list --unit, the next key is pointless —
-  # it is the same ciphertext with the same contents — so the search moves to
-  # the next POSITION, preserving #127's behaviour.
-  local found=0 pos keyfile env_key=""
-  while IFS= read -r pos; do
-    require_uint envelope_position "$pos"
-    read_tape_raw "$pos" "$WORK/envelope.enc"
-    local esize
-    esize=$(file_size_at "$pos" "$FILES_TXT")
-    if [ -n "$esize" ]; then
-      require_uint "size_bytes(@$pos)" "$esize"
-      [ "$esize" -gt 0 ] && truncate -s "$esize" "$WORK/envelope.enc"
-    fi
-    local opened=0
-    for keyfile in ${KEYS[@]+"${KEYS[@]}"}; do
-      rm -rf "$WORK/env" && mkdir -p "$WORK/env"
-      if age -d -i "$keyfile" <"$WORK/envelope.enc" 2>/dev/null |
-        tar xf - -C "$WORK/env/" 2>/dev/null; then
-        opened=1
-        env_key=$keyfile
-        break
-      fi
-      info "Key $keyfile did not open the envelope at file $pos"
-    done
-    if [ "$opened" -eq 1 ]; then
-      if [ -n "$target_unit" ] && [ -f "$WORK/env/MANIFEST.toml" ] &&
-        ! manifest_has_unit "$WORK/env/MANIFEST.toml" "$target_unit"; then
-        info "Envelope at file $pos decrypts but does not list '$target_unit'; continuing..."
-        continue
-      fi
-      found=1
-      info "Decrypted envelope at file $pos"
-      info "  opened with key $env_key"
-      break
-    fi
-  done < <(envelope_positions "$FILES_TXT")
-  if [ "$found" -ne 1 ]; then
-    die_no_envelope "$target_unit"
-  fi
-  [ -f "$WORK/env/MANIFEST.toml" ] || die "envelope missing MANIFEST.toml"
+  # before. (issue #127) Each key is tried on its own at each position (#288).
+  WANT_UNIT=$target_unit
+  walk_envelopes pick_for_restore
+  [ -n "$CHOSEN_ENV" ] || die_no_envelope "$target_unit"
+  [ -f "$CHOSEN_ENV/MANIFEST.toml" ] || die "envelope missing MANIFEST.toml"
 
-  local manifest="$WORK/env/MANIFEST.toml"
+  local manifest="$CHOSEN_ENV/MANIFEST.toml"
 
   # Step 2: identify units in manifest
   local -a unit_names
@@ -1741,6 +1815,7 @@ esac
         .replace("__AWK_UNIT_LIST__", AWK_UNIT_LIST)
         .replace("__AWK_SELECT_VERSION__", AWK_SELECT_VERSION)
         .replace("__AWK_MT_POSITION__", AWK_MT_POSITION)
+        .replace("__AWK_UNITS_TABLE__", AWK_UNITS_TABLE)
         .replace("__LABEL__", label)
         .replace("__TOTAL_FILES__", &total_files.to_string());
 
@@ -2061,7 +2136,7 @@ mod tests {
     use super::*;
     use crate::volume::restore_script::{
         AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
-        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNIT_LIST,
+        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST,
     };
 
     #[test]
@@ -3163,6 +3238,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_UNIT_LIST", AWK_UNIT_LIST),
             ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
             ("AWK_MT_POSITION", AWK_MT_POSITION),
+            ("AWK_UNITS_TABLE", AWK_UNITS_TABLE),
         ] {
             assert!(
                 script.contains(fragment),
@@ -3198,6 +3274,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_UNIT_LIST", AWK_UNIT_LIST),
             ("AWK_SELECT_VERSION", AWK_SELECT_VERSION),
             ("AWK_MT_POSITION", AWK_MT_POSITION),
+            ("AWK_UNITS_TABLE", AWK_UNITS_TABLE),
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");
         }

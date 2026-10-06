@@ -216,3 +216,29 @@ pub(crate) const AWK_MT_POSITION: &str = r##"
     }
     END { if (f ~ /^-?[0-9]+$/ && b ~ /^-?[0-9]+$/) print f, b }
   "##;
+
+/// One `unit|versions|slices|bytes` line per unit in an envelope manifest,
+/// in first-seen order (issue #412 item 7): `--find-envelope` prints it as a
+/// table for every envelope it opens, which with an operator or escrow key
+/// is every unit on the tape. A unit stored in several snapshot versions is
+/// one line, its versions joined with commas; slices and bytes are summed
+/// over them.
+pub(crate) const AWK_UNITS_TABLE: &str = r##"
+    /^\[\[units\]\]/ { in_head = 1; cur = ""; next }
+    /^\[\[units\.slices\]\]/ { in_head = 0; if (cur != "") n[cur]++; next }
+    /^\[/ { in_head = 0 }
+    in_head && /^name = / {
+      v = $3; gsub(/"/, "", v); cur = v
+      if (!(cur in seen)) { seen[cur] = 1; order[++k] = cur }
+    }
+    in_head && /^snapshot_version = / && cur != "" {
+      vers[cur] = (vers[cur] == "") ? $3 : vers[cur] "," $3
+    }
+    /^encrypted_bytes = / && cur != "" { b[cur] += $3 }
+    END {
+      for (i = 1; i <= k; i++) {
+        u = order[i]
+        printf "%s|%s|%d|%.0f\n", u, vers[u], n[u], b[u]
+      }
+    }
+  "##;

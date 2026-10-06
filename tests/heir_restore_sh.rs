@@ -1149,3 +1149,93 @@ fn a_darrc_on_the_heirs_machine_does_not_change_the_restore() {
         "a .darrc changed the restore:\n{text}"
     );
 }
+
+// ---- #412 items 6 and 7: which envelope opened, and what is in it ----
+
+/// Overwrite tape file `pos`'s stub-age header in place (same length), as a
+/// damaged envelope: the key still matches, the payload does not decrypt.
+fn damage_envelope(h: &Heir, pos: i64) {
+    let f = h.dir.join("tape").join(pos.to_string());
+    let mut bytes = std::fs::read(&f).unwrap();
+    let hdr = String::from_utf8_lossy(&bytes[..32]).trim_end().to_string();
+    let mut new = format!("{hdr} BAD");
+    while new.len() < 32 {
+        new.push(' ');
+    }
+    bytes[..32].copy_from_slice(new.as_bytes());
+    std::fs::write(&f, bytes).unwrap();
+}
+
+/// An escrow (or operator) key opens every envelope. --find-envelope used to
+/// stop at the first one, a tenant's, and show only that tenant's units;
+/// now it reads every envelope and lists every unit it can see, as a table.
+#[test]
+fn find_envelope_with_the_escrow_key_lists_every_unit() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    for u in ["photos/2019", "docs", "ledgers"] {
+        assert!(
+            text.lines().any(|l| l.trim_start().starts_with(u)),
+            "unit {u} must be listed:\n{text}"
+        );
+    }
+    assert!(text.contains("Unit"), "a table header:\n{text}");
+    assert!(
+        text.contains("operator"),
+        "the operator envelope is named:\n{text}"
+    );
+    // The operator envelope's backup holds the same bytes: not read twice.
+    assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
+}
+
+/// A tenant's own key: one envelope, its units, and its MANIFEST/RECOVERY
+/// as before.
+#[test]
+fn find_envelope_with_a_tenant_key_shows_that_tenants_envelope() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("opened with key"), "{text}");
+    assert!(text.contains("--- MANIFEST.toml ---"), "{text}");
+    assert!(text.contains("--- RECOVERY.md ---"), "{text}");
+    assert!(
+        text.contains("photos/2019") && text.contains("docs"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("ledgers"),
+        "bob's unit is not alice's:\n{text}"
+    );
+}
+
+/// A damaged envelope is not a wrong key. The key matched (age got past the
+/// header) but the payload did not decrypt: the script says DAMAGED, and the
+/// headline no longer tells the heir to try their OTHER keys.
+#[test]
+fn a_damaged_envelope_is_reported_as_damage_not_as_a_wrong_key() {
+    let h = Heir::new();
+    damage_envelope(&h, 4); // alice's tenant envelope
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("alice")]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("DAMAGED"), "{text}");
+    assert!(
+        text.contains("does not match the front index"),
+        "the keyless hash check names it before any key is tried:\n{text}"
+    );
+    assert!(
+        text.contains("failed to decrypt and authenticate payload chunk"),
+        "age's own words:\n{text}"
+    );
+    assert!(
+        !text.contains("try your OTHER keys"),
+        "damage is not a key problem:\n{text}"
+    );
+
+    // Control: a key that matches nothing still gets the rotation hint.
+    let h = Heir::new();
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("stranger")]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("try your OTHER keys"), "{text}");
+    assert!(!text.contains("DAMAGED"), "{text}");
+}
