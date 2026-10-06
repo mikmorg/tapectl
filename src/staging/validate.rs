@@ -473,9 +473,10 @@ pub(crate) fn hash_threads(requested: usize) -> usize {
 /// refusal earlier in the order still wins. One thread is the serial pass
 /// exactly, on the calling thread.
 ///
-/// For each file: stat, open, `fstat`, hash, `fstat` again. A file at
-/// another size than the snapshot's is DIRTY; one whose size, times or
-/// inode moved while it was read is DIRTY; a file whose hash differs from
+/// For each file: stat, open, `fstat`, hash its planned size and no more,
+/// `fstat` again. A file at another size than the snapshot's is DIRTY; one
+/// whose size, times or inode moved while it was read (grown past its
+/// planned size too) is DIRTY; a file whose hash differs from
 /// its baseline at the same size is BITROT suspected. What it saw is kept
 /// for [`recheck`], which ties this read to dar's.
 ///
@@ -651,7 +652,13 @@ fn hash_one(
             before.len()
         )));
     }
-    let mut reader = HashingReader::new(file);
+    // Read no further than the planned size: a lane never passes its own
+    // file's end in dar's order. Read to EOF, a file growing while it was
+    // hashed ran its lane past the next file's offset, which the low-water
+    // mark never passes, and the hasher and dar then waited on each other
+    // for good. Growth is refused below: the second `fstat` sees the new
+    // size and change time.
+    let mut reader = HashingReader::new(file.take(expected_size as u64));
     let mut buf = vec![0u8; VALIDATE_STREAM_BUFFER];
     let mut streamed: i64 = 0;
     loop {
@@ -674,7 +681,7 @@ fn hash_one(
         );
     }
     let hex = reader.finalize_hex();
-    let after = reader.into_inner().metadata()?;
+    let after = reader.into_inner().into_inner().metadata()?;
     let seen = Seen::of(&after);
     if Seen::of(&before) != seen || streamed != expected_size {
         return Err(changed_while_staging(
@@ -1182,6 +1189,87 @@ mod tests {
         );
         ahead.dar_finished();
         hasher.join().unwrap().unwrap();
+    }
+
+    /// A source file that grows past the lead after the hasher opened it is
+    /// refused as changed while it was hashed, never a stage that hangs.
+    /// Read to EOF, the grown file's lane ran past the next file's offset,
+    /// the low-water mark stayed at that offset, and the hasher and dar
+    /// then each waited on the other for good — with one thread too.
+    #[test]
+    fn a_file_growing_past_the_lead_while_hashed_is_refused_not_a_hang() {
+        const LEAD: u64 = 64 << 10;
+        const PLANNED: usize = 256 << 10;
+        const GROWTH: usize = 512 << 10;
+        for threads in [1, 4] {
+            let tmp = TempDir::new().unwrap();
+            let mut rows = vec![("a0.bin".to_string(), PLANNED as i64)];
+            std::fs::write(tmp.path().join("a0.bin"), vec![1u8; PLANNED]).unwrap();
+            for i in 1..4 {
+                let name = format!("a{i}.bin");
+                std::fs::write(tmp.path().join(&name), vec![i as u8; 32 << 10]).unwrap();
+                rows.push((name, 32 << 10));
+            }
+            let borrowed: Vec<(&str, i64, Option<&str>)> =
+                rows.iter().map(|(n, s)| (n.as_str(), *s, None)).collect();
+            let (conn, sid) = setup_conn_with_snapshot(&borrowed);
+            let base = tmp.path().to_path_buf();
+            let plan = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap();
+            assert_eq!(plan.files[0].rel_path, "a0.bin", "fixture: dar's first");
+            let total_after: u64 = plan.total_bytes() + GROWTH as u64;
+            let ahead = std::sync::Arc::new(ReadAhead::new(LEAD));
+
+            let shared = ahead.clone();
+            let root = base.clone();
+            let hasher = std::thread::spawn(move || hash_files(&root, &plan, &shared, threads));
+            // Opened and read from: a0.bin is open, its size checked.
+            let t0 = std::time::Instant::now();
+            while ahead.hashed.load(Ordering::Acquire) == 0 {
+                assert!(t0.elapsed() < Duration::from_secs(10), "hasher never read");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(base.join("a0.bin"))
+                .unwrap();
+            f.write_all(&vec![9u8; GROWTH]).unwrap();
+            drop(f);
+
+            // dar reads the grown source, as it would.
+            let shared = ahead.clone();
+            let dar = std::thread::spawn(move || {
+                let mut pos = 0u64;
+                while pos < total_after && !shared.hasher_failed() && !shared.stopped() {
+                    pos = (pos + (16 << 10)).min(total_after);
+                    shared.dar_has_read(pos);
+                }
+                shared.dar_finished();
+            });
+
+            let t0 = std::time::Instant::now();
+            while !hasher.is_finished() && t0.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let hung = !hasher.is_finished();
+            let (hashed, dar_read) = (
+                ahead.hashed.load(Ordering::Acquire),
+                ahead.dar_read.load(Ordering::Acquire),
+            );
+            // Release both sides either way, so a failure does not hang.
+            ahead.stop();
+            let result = hasher.join().unwrap();
+            dar.join().unwrap();
+            assert!(
+                !hung,
+                "{threads} thread(s): the hasher and dar wait on each other \
+                 (hashed={hashed}, dar_read={dar_read})"
+            );
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("it changed while it was hashed") && err.contains("a0.bin"),
+                "{threads} thread(s): {err}"
+            );
+        }
     }
 
     /// Issue #366 with #364: several hasher threads keep the lead by where
