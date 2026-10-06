@@ -1427,10 +1427,18 @@ fn ensure_files(
     else {
         return Ok(());
     };
+    // Issue #381: `file_type` is derived from `is_directory`, as migration
+    // 005 did, because no generation of the on-tape `catalog.db` carries it.
+    // Left NULL, staging's content validation (`file_type = 'regular'` only)
+    // planned zero files for a rebuilt version re-staged from source. A
+    // symlink or special file on such a tape is therefore rebuilt as
+    // 'regular' — dar's catalogue still holds its real type, and the on-tape
+    // half is ADR-0012 item 7's 1.2.0 change.
     let mut stmt = tx.prepare(
         "INSERT OR IGNORE INTO files (snapshot_id, path, size_bytes, sha256, modified_at,
-                                      is_directory)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                      is_directory, file_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                 CASE ?6 WHEN 0 THEN 'regular' ELSE 'dir' END)",
     )?;
     for f in files {
         let changed = stmt.execute(params![

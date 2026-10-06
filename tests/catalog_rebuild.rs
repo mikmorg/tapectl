@@ -1228,6 +1228,64 @@ fn the_file_index_comes_back_from_the_operator_catalog_db() {
     assert_eq!(source, format!("/src/{}", UNITS[0].0));
 }
 
+/// Issue #381: a rebuilt version re-staged from source content-validates its
+/// regular files. Rebuild used to leave `files.file_type` NULL, and staging
+/// validates only `file_type = 'regular'`, so it planned zero files: the
+/// size check and the sha256 baseline from the tape were both skipped and
+/// the stage went ahead on whatever the source held. Both `catalog.db`
+/// generations carry `is_directory` only, so both are covered.
+#[test]
+fn a_rebuilt_version_restaged_from_source_validates_its_regular_files() {
+    for generation in [CatalogDb::Old, CatalogDb::New] {
+        let mut vol = build_sealed_volume_with(generation);
+        let dir = tempfile::tempdir().unwrap();
+        let conn = fresh_db(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let secret = vol.operator_secret.clone();
+        rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+        let unit = UNITS[0].0;
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT s.id FROM snapshots s JOIN units u ON u.id = s.unit_id
+                 WHERE u.name = ?1",
+                rusqlite::params![unit],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // The source, at the recorded paths and sizes, holding other bytes
+        // than the tape's baseline hashes describe.
+        let src = tempfile::tempdir().unwrap();
+        for n in 0..2u8 {
+            let p = src.path().join(format!("{unit}/file{n}.bin"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![b'x'; 100 + n as usize]).unwrap();
+        }
+
+        let err = staging::validate::validate_source(
+            &conn,
+            snapshot_id,
+            src.path().to_str().unwrap(),
+            &[],
+        )
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "a rebuilt version must be content-validated against the tape's \
+                 sha256 baseline, so changed bytes are refused (catalog.db \
+                 generation {})",
+                generation as u8
+            )
+        })
+        .to_string();
+        assert!(
+            err.contains("BITROT") && err.contains(&format!("{unit}/file")),
+            "the refusal names the file whose bytes changed: {err}"
+        );
+    }
+}
+
 /// A tape written before #83 carries no `catalog.db`. The restore path must
 /// still come back whole — what degrades is the searchable index.
 #[test]
