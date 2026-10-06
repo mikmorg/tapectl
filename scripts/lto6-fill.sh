@@ -7,7 +7,8 @@
 # run once, by dd, unattended. `scripts/lto6-measure.sh` deliberately leaves
 # this drill out ("filling a real LTO-6 cartridge takes hours"), and tapectl's
 # own EOT abort path cannot be driven here -- this host cannot stage 2.5 TB and
-# the pre-flight gate never plans past 92% of the planning figure. So this
+# the pre-flight gate never plans past the fill ceiling (97% of the planning
+# figure by default, 92% when this was written; #391). So this
 # measures the HARDWARE fact only: bytes accepted before the first write error,
 # the errno, the drive's own counters (page 0x0c native-from-BOP-to-EOD,
 # page 0x17 total used native) and MAM remaining, before and after.
