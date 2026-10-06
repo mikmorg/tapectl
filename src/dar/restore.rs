@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::process::Command;
 
 use tracing::warn;
 
@@ -129,9 +128,16 @@ fn run_extract(
     let argv = std::iter::once(dar_binary.to_string())
         .chain(args.iter().map(|a| a.to_string_lossy().into_owned()))
         .collect();
-    let output = match Command::new(dar_binary).args(args).output() {
+    // Issue #404: an extraction can take hours; a signal stops dar.
+    let output = match super::run_interruptible(super::command(dar_binary).args(args), || {
+        format!(
+            "dar was stopped while extracting into {} — what it restored so far is \
+             incomplete; run the restore again",
+            dest.display()
+        )
+    }) {
         Ok(o) => o,
-        Err(e) => return (None, Err(TapectlError::Dar(e.to_string()))),
+        Err(e) => return (None, Err(e)),
     };
     let report = DarReport {
         argv,
@@ -252,6 +258,7 @@ pub fn test(dar_binary: &str, archive_base: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     /// Verbatim capture from dar 2.7.13 (`dar -x arch -R dest -O -Q`, one
     /// colliding file present). Kept literal rather than hand-written:

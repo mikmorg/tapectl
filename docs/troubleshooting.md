@@ -1330,16 +1330,23 @@ When the command has finished, `volume info <label>` shows the same phases
 with their durations and rates (see the operator guide, [Watching a long
 operation](operator-guide.md#watching-a-long-operation-progress-and-the-session-log)).
 
-### You pressed Ctrl-C
+### You pressed Ctrl-C (or the session got SIGTERM or SIGHUP)
 
 ```text
-error: volume "<label>" write interrupted (SIGINT) — the tape is left unsealed, and the session's
+error: stopped by a signal: volume "<label>" write interrupted — the tape is left unsealed, and the session's
 `writes`/`write_positions` rows are in the `interrupted` state. Reload the same cartridge and run `tapectl volume
 resume <label>` to continue from where it stopped.
 ```
 
 Do exactly that. The session carries on from its frozen staging files, so do
 **not** run `staging clean` in between.
+
+Ctrl-C, a SIGTERM (a shutdown) and a SIGHUP (a dropped ssh session) all stop
+any long operation the same way: at the next slice, file or tape entry, with an
+`error: stopped by a signal: …` line saying where it stopped and what to run
+next — `volume resume` after a write or confirm, the same command again after a
+stage, verify, read-slices or restore. A second signal stops at once (exit
+130); the next command's startup recovers the session as after a crash.
 
 ### A real end of tape during the write
 

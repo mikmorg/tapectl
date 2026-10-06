@@ -329,6 +329,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let _progress = match cli::progress_session_name(&cli.command) {
         Some(name) if !cli.dry_run => {
             use std::io::IsTerminal;
+            // Issue #404: a long run over bare ssh dies with the connection;
+            // say so before it starts. A warning, never a refusal.
+            if let Some(warning) = signal::unprotected_ssh_warning(&name, |k| std::env::var(k).ok())
+            {
+                eprintln!("{warning}");
+            }
             let display = tapectl::progress::Display::choose(
                 cli.quiet,
                 std::io::stderr().is_terminal(),

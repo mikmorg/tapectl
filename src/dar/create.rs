@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use tracing::info;
 
@@ -34,7 +33,7 @@ pub struct DarCreateResult {
 pub fn create_archive(params: &DarCreateParams) -> Result<DarCreateResult> {
     let ver = super::version::check(params.dar_binary)?;
 
-    let mut cmd = Command::new(params.dar_binary);
+    let mut cmd = super::command(params.dar_binary);
     cmd.arg("-c").arg(params.archive_base);
     cmd.arg("-R").arg(params.source_path);
     cmd.arg("-s").arg(params.slice_size);
@@ -91,7 +90,14 @@ pub fn create_archive(params: &DarCreateParams) -> Result<DarCreateResult> {
     let command_str = format!("{cmd:?}");
     info!(command = %command_str, "running dar");
 
-    let output = cmd.output().map_err(|e| TapectlError::Dar(e.to_string()))?;
+    // Issue #404: hours on a large unit, so a signal stops dar rather than
+    // waiting for it.
+    let output = super::run_interruptible(&mut cmd, || {
+        format!(
+            "dar was stopped while archiving {}",
+            params.source_path.display()
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -209,7 +215,7 @@ pub fn list_slices(archive_base: &Path) -> Result<Vec<PathBuf>> {
 
 /// Run dar -t (test archive integrity).
 pub fn test_archive(dar_binary: &str, archive_base: &Path) -> Result<()> {
-    let output = Command::new(dar_binary)
+    let output = super::command(dar_binary)
         .arg("-t")
         .arg(archive_base)
         .arg("-Q")
@@ -229,7 +235,7 @@ pub fn extract_catalog(dar_binary: &str, archive_base: &Path, catalog_base: &Pat
         std::fs::create_dir_all(parent)?;
     }
 
-    let output = Command::new(dar_binary)
+    let output = super::command(dar_binary)
         .arg("-C")
         .arg(catalog_base)
         .arg("-A")
@@ -249,6 +255,7 @@ pub fn extract_catalog(dar_binary: &str, archive_base: &Path, catalog_base: &Pat
 mod tests {
     use super::*;
     use std::fs::File;
+    use std::process::Command;
 
     /// Touches `dir/name` as an empty file. `list_slices` only inspects
     /// filenames, so fixture content is irrelevant — this lets these tests

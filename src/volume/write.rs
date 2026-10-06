@@ -2694,28 +2694,33 @@ fn finish_session(
             // state migration 018 exists to name, long enough for an operator
             // or test harness to interrupt it. See `park_after_seal`'s own doc
             // for why this is a PAUSE, never a forced outcome.
-            if let Some(marker) = pause_after_seal_marker_from_env() {
-                if park_after_seal(&marker) {
-                    sealed_pending.mark_interrupted(conn)?;
-                    events::log_event(
-                        conn,
-                        "volume",
-                        volume_id,
-                        Some(label),
-                        "write_confirm_interrupted",
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )?;
-                    return Err(TapectlError::Other(format!(
-                        "volume \"{label}\": interrupted after seal, before confirm -- the \
+            // Issue #404: a signal that arrived during the write or the
+            // seal stops here, at the recorded seal, rather than hours into
+            // the readback — the same stop the test hook parks for.
+            let stop_before_confirm = match pause_after_seal_marker_from_env() {
+                Some(marker) => park_after_seal(&marker),
+                None => crate::signal::is_interrupted(),
+            };
+            if stop_before_confirm {
+                sealed_pending.mark_interrupted(conn)?;
+                events::log_event(
+                    conn,
+                    "volume",
+                    volume_id,
+                    Some(label),
+                    "write_confirm_interrupted",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                return Err(TapectlError::Interrupted(format!(
+                    "volume \"{label}\": interrupted after seal, before confirm -- the \
                          tape IS sealed but its readback never ran, so the catalog cannot \
                          yet count it as a copy. Reload the same cartridge and run `tapectl \
                          volume resume {label}` to re-enter confirm."
-                    )));
-                }
+                )));
             }
 
             finish_confirm(
@@ -2758,8 +2763,8 @@ fn finish_session(
                 None,
                 None,
             )?;
-            Err(TapectlError::Other(format!(
-                "volume \"{label}\" write interrupted (SIGINT) — the tape is left unsealed, and \
+            Err(TapectlError::Interrupted(format!(
+                "volume \"{label}\" write interrupted — the tape is left unsealed, and \
                  the session's `writes`/`write_positions` rows are in the `interrupted` state. \
                  Reload the same cartridge and run `tapectl volume resume {label}` to continue \
                  from where it stopped."
@@ -2868,7 +2873,21 @@ fn finish_confirm(
     block_size: u64,
     sealed_pending: session::SealedPending,
 ) -> Result<()> {
-    match sealed_pending.confirm(conn, store, Tier::default())? {
+    // Issue #404: a signal during the readback stops it between files.
+    // `confirm` returns before recording anything, so its rows keep their
+    // status (`in_progress` is swept to `interrupted` on the next open) and
+    // the seal stays recorded: `volume resume` re-enters confirm.
+    let confirmed = sealed_pending
+        .confirm(conn, store, Tier::default())
+        .map_err(|e| match e {
+            TapectlError::Interrupted(at) => TapectlError::Interrupted(format!(
+                "volume \"{label}\": confirm {at}. The tape IS sealed; the catalog cannot \
+                 count it as a copy until its readback passes. Reload the same cartridge and \
+                 run `tapectl volume resume {label}` to re-enter confirm."
+            )),
+            other => other,
+        })?;
+    match confirmed {
         ConfirmOutcome::Sealed(sealed) => {
             record_write_bookkeeping(conn, volume_id, layout, block_size)?;
             events::log_event(
@@ -4574,6 +4593,15 @@ fn read_slices_contacted(
             "{unit_name} slice {} of {slice_count} (file {pos})",
             slices_read + 1
         ));
+        // Issue #404: between slices. Nothing is promoted until every slice
+        // is read, so a stop leaves the stage set as it was.
+        crate::signal::check(|| {
+            format!(
+                "volume read-slices stopped after {slices_read} of {slice_count} slices of \
+                 \"{unit_name}\"; nothing was promoted for writing. Run `tapectl volume \
+                 read-slices --from {from_label} --unit {unit_name}` again."
+            )
+        })?;
         let slice_path = clone_dir.join(format!("slice_{slice_db_id}.dat"));
 
         match stream_verify_slice_to_staging(
@@ -4779,6 +4807,15 @@ fn compact_read_contacted(
             "slice {} of {slice_count} (file {pos})",
             slices_read + slices_skipped + 1
         ));
+        // Issue #404: between slices, before any set is promoted.
+        crate::signal::check(|| {
+            format!(
+                "volume compact-read stopped after {} of {slice_count} slices of \"{label}\"; \
+                 nothing was promoted for writing. Run `tapectl volume compact-read {label}` \
+                 again.",
+                slices_read + slices_skipped
+            )
+        })?;
         let slice_path = compact_dir.join(format!("slice_{slice_db_id}.dat"));
 
         match stream_verify_slice_to_staging(
@@ -8022,6 +8059,52 @@ mod tests {
         assert!(!staging_path.is_empty());
         let on_disk = fs::read(&staging_path).unwrap();
         assert_eq!(on_disk, data, "staged bytes must be the true plaintext");
+    }
+
+    /// Issue #404: a signal stops `read-slices` between slices with a
+    /// message naming how far it got and the command to run again — before
+    /// this it read every slice regardless.
+    #[test]
+    fn read_slices_stops_between_slices_on_a_signal() {
+        let conn = crate::db::open_memory().unwrap();
+        let data = b"read_slices interrupt fixture. ".repeat(10);
+        let slice_id =
+            seed_one_slice_fixture(&conn, "RSSTOP", "rs-stop", 4, &data, "completed", "staged");
+        conn.execute("UPDATE stage_sets SET status = 'cleaned'", [])
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().to_string_lossy().into_owned();
+        let mut store = mem_store_with_slice_at(4, &data);
+
+        crate::signal::interrupt_this_thread(true);
+        let r = read_slices(
+            &conn,
+            &config,
+            "RSSTOP",
+            "rs-stop",
+            &mut store,
+            site(Operation::VolumeReadSlices),
+        );
+        crate::signal::interrupt_this_thread(false);
+        let err = r.unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, TapectlError::Interrupted(_)), "{msg}");
+        assert!(msg.contains("after 0 of 1 slices"), "{msg}");
+        assert!(
+            msg.contains("tapectl volume read-slices --from RSSTOP --unit rs-stop"),
+            "{msg}"
+        );
+        let (path, status): (Option<String>, String) = conn
+            .query_row(
+                "SELECT sl.staging_path, ss.status FROM stage_slices sl
+                 JOIN stage_sets ss ON ss.id = sl.stage_set_id WHERE sl.id = ?1",
+                params![slice_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, None, "no slice was read");
+        assert_eq!(status, "cleaned", "nothing was promoted for writing");
     }
 
     #[test]

@@ -924,6 +924,15 @@ fn restore_unit_contacted(
             i + 1,
             positions.len()
         ));
+        // Issue #404: between slices — nothing has been extracted into the
+        // destination yet.
+        crate::signal::check(|| {
+            format!(
+                "restore of \"{unit_name}\" stopped after reading {i} of {} slices, before \
+                 anything was extracted; run the restore again",
+                positions.len()
+            )
+        })?;
         info!(
             slice = i + 1,
             total = positions.len(),

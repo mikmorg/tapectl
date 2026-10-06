@@ -1,5 +1,3 @@
-use std::process::Command;
-
 use crate::error::{Result, TapectlError};
 
 /// Minimum required dar version.
@@ -15,7 +13,7 @@ pub struct DarVersion {
 
 /// Check dar version and return parsed version info.
 pub fn check(dar_binary: &str) -> Result<DarVersion> {
-    let output = Command::new(dar_binary)
+    let output = super::command(dar_binary)
         .arg("--version")
         .output()
         .map_err(|_| TapectlError::DarNotFound(dar_binary.to_string()))?;
@@ -135,9 +133,9 @@ pub fn parse_capabilities(version_output: &str) -> DarCapabilities {
 
 /// Run `dar -V` and parse its compiled-in compression capabilities via
 /// [`parse_capabilities`]. Reuses `check()`'s invocation shape — a single
-/// `Command::new(dar_binary)` call — rather than a second implementation.
+/// `super::command(dar_binary)` call — rather than a second implementation.
 pub fn capabilities(dar_binary: &str) -> Result<DarCapabilities> {
-    let output = Command::new(dar_binary)
+    let output = super::command(dar_binary)
         .arg("-V")
         .output()
         .map_err(|_| TapectlError::DarNotFound(dar_binary.to_string()))?;

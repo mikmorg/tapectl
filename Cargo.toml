@@ -27,7 +27,8 @@ glob = "0.3"
 age = { version = "0.11", features = ["cli-common"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
-ctrlc = "3"
+# `termination`: SIGTERM and SIGHUP reach the same handler as SIGINT (issue #404).
+ctrlc = { version = "3", features = ["termination"] }
 nix = { version = "0.29", features = ["ioctl", "fs", "user"] }
 indicatif = "0.17"
 rand = "0.9"

@@ -249,8 +249,12 @@ pub enum TapectlError {
     #[error("already initialized at {0}")]
     AlreadyInitialized(String),
 
-    #[error("operation interrupted")]
-    Interrupted,
+    /// A signal (SIGINT, SIGTERM or SIGHUP) asked the run to stop, and it
+    /// stopped at a point it can be resumed or re-run from (issue #404).
+    /// The text says where it stopped and what to run next
+    /// (`crate::signal::check`).
+    #[error("stopped by a signal: {0}")]
+    Interrupted(String),
 
     /// `transparent`, not `"{0}"`: with `#[from]`, a `"{0}"` Display made the
     /// io error BOTH this variant's text and its `source()`, so the

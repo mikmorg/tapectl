@@ -193,7 +193,13 @@ pub fn validate_source(
     let mut nonzero_bytes: i64 = 0;
     let mut linked_inodes: HashSet<(u64, u64)> = HashSet::new();
 
+    let total_files = files.len();
     for (rel_path, expected_size, baseline_sha) in &files {
+        // Issue #404: the sha256 pass reads every byte of the unit — hours
+        // on a large one — so a signal stops it between files.
+        crate::signal::check(|| {
+            format!("stopped while checking the source ({validated} of {total_files} files hashed)")
+        })?;
         let full_path = base.join(rel_path);
         let expected_size = *expected_size;
 
@@ -457,6 +463,28 @@ mod tests {
             .unwrap();
         }
         (conn, sid)
+    }
+
+    /// Issue #404: the sha256 pass reads every byte of the unit, so a
+    /// signal stops it between files.
+    #[test]
+    fn validate_source_stops_between_files_on_a_signal() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), b"hello").unwrap();
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
+        crate::signal::interrupt_this_thread(true);
+        let r = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[]);
+        crate::signal::interrupt_this_thread(false);
+        match r {
+            Err(TapectlError::Interrupted(at)) => {
+                assert_eq!(
+                    at,
+                    "stopped while checking the source (0 of 1 files hashed)"
+                )
+            }
+            Err(e) => panic!("expected an interruption, got {e:?}"),
+            Ok(_) => panic!("expected an interruption, got Ok"),
+        }
     }
 
     #[test]

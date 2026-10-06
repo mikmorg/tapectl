@@ -680,6 +680,16 @@ where
             if position == fi_pos || position == seal_pos {
                 continue;
             }
+            // Issue #404: the readback is hours on a full cartridge, so a
+            // signal stops it between files. An `Err`, never a mismatch: a
+            // stop says nothing about the medium. Confirm's caller leaves
+            // the session for `volume resume`; verify reports inconclusive.
+            crate::signal::check(|| {
+                format!(
+                    "stopped reading the tape back before file {position} ({files_checked} \
+                     files checked)"
+                )
+            })?;
             let (Some(want_hash), Some(want_size)) = (&claim.sha256_encrypted, claim.size_bytes)
             else {
                 mismatches.push(Mismatch {
@@ -1987,6 +1997,29 @@ mod tests {
         // Seal + File 3 + the 4 remaining content files (id_thunk, guide,
         // restore_sh, slice) are all read during an Integrity pass.
         assert_eq!(evidence.files_checked, 6);
+    }
+
+    /// Issue #404: a signal stops the readback between content files with
+    /// an `Err` — never a mismatch, which would read as evidence about the
+    /// medium. Before this the walk read the whole tape regardless.
+    #[test]
+    fn confirm_stops_between_files_on_a_signal_and_records_no_mismatch() {
+        let (layout, mut store) = build_confirm_fixture(None);
+        crate::signal::interrupt_this_thread(true);
+        let r = store.confirm(&layout, Tier::Integrity);
+        crate::signal::interrupt_this_thread(false);
+        match r {
+            Err(crate::error::TapectlError::Interrupted(at)) => {
+                assert!(at.contains("stopped reading the tape back"), "{at}")
+            }
+            other => panic!("expected an interruption, got {other:?}"),
+        }
+        // Positive control: the same walk unstopped passes.
+        assert!(store
+            .confirm(&layout, Tier::Integrity)
+            .unwrap()
+            .mismatches
+            .is_empty());
     }
 
     #[test]

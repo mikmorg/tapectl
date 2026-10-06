@@ -2887,3 +2887,211 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
         "volume info --json is unchanged by issue #386"
     );
 }
+
+// --- issue #404: signals stop a long run cleanly; dar dies with tapectl ---
+
+/// A stand-in for dar whose archive step never finishes on its own: on
+/// `-c` it records its pid next to itself and becomes `sleep 60` (same
+/// pid, so the death signal set before exec still applies); everything
+/// else (`--version`, `-V`) is the real dar.
+fn slow_dar(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("slow-dar");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         for a in \"$@\"; do\n\
+           if [ \"$a\" = -c ]; then echo $$ > \"$0.pid.tmp\"; mv \"$0.pid.tmp\" \"$0.pid\"; exec sleep 60; fi\n\
+         done\n\
+         exec dar \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// A home staged up to `stage create`, using [`slow_dar`]; returns the
+/// spawned `stage create` child and the fake dar's pid once it is running.
+fn stage_create_parked_in_dar(
+    home: &std::path::Path,
+    staging: &std::path::Path,
+    source: &std::path::Path,
+    bin_dir: &std::path::Path,
+) -> (std::process::Child, u32) {
+    let unit = prepare_home_for_staging(home, source, staging);
+    assert_eq!(unit, "unit1");
+    let script = slow_dar(bin_dir);
+    let config_path = home.join(".tapectl").join("config.toml");
+    let mut cfg = tapectl::config::Config::load(&config_path).unwrap();
+    cfg.dar.binary = script.to_string_lossy().to_string();
+    cfg.save(&config_path).unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["stage", "create", "unit1"])
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn stage create");
+    let pid_file = bin_dir.join("slow-dar.pid");
+    let start = std::time::Instant::now();
+    while !pid_file.exists() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "dar never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let dar_pid: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    (child, dar_pid)
+}
+
+/// Whether `pid` is still a live (not zombie) process.
+fn process_alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            // `pid (comm) S ...` — the state follows the last ')'.
+            let state = stat.rsplit(')').next().unwrap_or("").trim_start();
+            !state.starts_with('Z')
+        }
+        Err(_) => false,
+    }
+}
+
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if start.elapsed() > limit {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Issue #404: SIGINT, SIGTERM and SIGHUP sent to `stage create` while dar
+/// runs each stop it within seconds, through the handled path: exit by
+/// status (not by the signal), the message naming where it stopped and
+/// what to run next, dar reaped, and the stage set `failed` so a re-run
+/// starts it over. Before #404 SIGTERM and SIGHUP killed tapectl outright
+/// (leaving dar running), and SIGINT waited for dar to finish.
+fn a_signal_stops_stage_create_cleanly(signal: &str) {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    let home = TempDir::new().unwrap();
+    let staging = TempDir::new().unwrap();
+    let source = TempDir::new().unwrap();
+    std::fs::write(source.path().join("a.txt"), b"some content").unwrap();
+    let bin = TempDir::new().unwrap();
+
+    let (mut child, dar_pid) =
+        stage_create_parked_in_dar(home.path(), staging.path(), source.path(), bin.path());
+    let sent = Command::new("kill")
+        .args([&format!("-{signal}"), &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+
+    let status = wait_with_timeout(&mut child, std::time::Duration::from_secs(20));
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = Command::new("kill")
+            .args(["-KILL", &dar_pid.to_string()])
+            .status();
+        panic!("SIG{signal}: stage create did not stop within 20 s");
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(
+        status.signal(),
+        None,
+        "SIG{signal} must be handled, not kill the process: {status:?}\n{stderr}"
+    );
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("stopped by a signal: stage create unit1: dar was stopped while archiving"),
+        "SIG{signal}: {stderr}"
+    );
+    assert!(
+        stderr.contains("run `tapectl stage create unit1` to stage it again"),
+        "{stderr}"
+    );
+    assert!(!process_alive(dar_pid), "dar must not outlive the stop");
+
+    // As after any failed stage, the next open's sweep marks the set
+    // `failed` (its lock is free), and `stage create` starts it over.
+    let swept = run_tapectl(home.path(), &["staging", "status"]);
+    assert!(swept.status.success());
+    let db = home.path().join(".tapectl").join("tapectl.db");
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let st: String = conn
+        .query_row(
+            "SELECT status FROM stage_sets ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        st, "failed",
+        "the stopped stage set is swept to failed on the next open"
+    );
+}
+
+#[test]
+fn sigint_stops_stage_create_cleanly() {
+    a_signal_stops_stage_create_cleanly("INT");
+}
+
+#[test]
+fn sigterm_stops_stage_create_cleanly() {
+    a_signal_stops_stage_create_cleanly("TERM");
+}
+
+#[test]
+fn sighup_stops_stage_create_cleanly() {
+    a_signal_stops_stage_create_cleanly("HUP");
+}
+
+/// Issue #404: `kill -9` of tapectl takes dar with it (`PR_SET_PDEATHSIG`).
+/// Before, dar kept running, still filling staging.
+#[test]
+fn dar_dies_with_a_killed_tapectl() {
+    let home = TempDir::new().unwrap();
+    let staging = TempDir::new().unwrap();
+    let source = TempDir::new().unwrap();
+    std::fs::write(source.path().join("a.txt"), b"some content").unwrap();
+    let bin = TempDir::new().unwrap();
+
+    let (mut child, dar_pid) =
+        stage_create_parked_in_dar(home.path(), staging.path(), source.path(), bin.path());
+    assert!(process_alive(dar_pid), "positive control: dar is running");
+    sigkill(child.id());
+    let _ = child.wait();
+
+    let start = std::time::Instant::now();
+    while process_alive(dar_pid) {
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            let _ = Command::new("kill")
+                .args(["-KILL", &dar_pid.to_string()])
+                .status();
+            panic!("dar (pid {dar_pid}) outlived the tapectl that started it");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}

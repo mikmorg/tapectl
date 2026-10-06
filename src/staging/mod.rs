@@ -426,6 +426,23 @@ pub(crate) fn stage_create_reporting(
                 );
                 after_failed_stage(conn, config, stage_set_id, &e);
             }
+            // Issue #404: a stop is a clean end, and says what to run next.
+            // Staging resumes by starting the unit over; everything this
+            // run had written for it was just removed.
+            if let TapectlError::Interrupted(at) = e {
+                let unit: String = conn
+                    .query_row(
+                        "SELECT u.name FROM snapshots s JOIN units u ON u.id = s.unit_id
+                         WHERE s.id = ?1",
+                        params![snapshot_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| "<unit>".to_string());
+                return Err(TapectlError::Interrupted(format!(
+                    "stage create {unit}: {at}. The unfinished stage set was discarded; run \
+                     `tapectl stage create {unit}` to stage it again."
+                )));
+            }
             Err(e)
         }
     }
@@ -786,6 +803,10 @@ fn stage_create_inner(
     for (i, slice_path) in dar_result.slice_paths.iter().enumerate() {
         let slice_num = (i + 1) as i64;
         phase.item(format!("{} slice {slice_num} of {slice_count}", unit.name));
+        // Issue #404: between slices — one slice is at most a minute or two.
+        crate::signal::check(|| {
+            format!("stopped before encrypting slice {slice_num} of {slice_count}")
+        })?;
 
         // Streams the plaintext slice straight to its `.age` file, hashing
         // both sides as they flow — peak RAM is the copy buffer, never the
