@@ -1136,3 +1136,49 @@ changes; this is a patch release (1.0.3).
    threat model is loss and inheritance, not a state adversary. Revisit if age adds a
    post-quantum recipient type and it reaches a stable release, or if a cartridge's custody ever
    leaves the operator's control.
+
+### Later on 2026-10-06 — the volume-spanning and resilience handoff
+
+*Ruled by the CTO on 2026-10-06*, after a grilling of an external "volume-set spanning,
+telemetry and cold-storage resilience" handoff.
+
+9. **A late end of tape: a fill ceiling now, a short seal later** (#391, #420). Mid-write
+   handover to a second cartridge (a unit spanning two tapes because the drive ran out) is
+   rejected: it has every cost of a short seal plus partial units across cartridges. For the next
+   tape runs the planner keeps a fill ceiling and warns on worn cartridges (#391). Later, after
+   home2's writes show how much capacity they really use and the drive's behaviour past early
+   warning is measured, a **short seal** (#420): the front index declares the tape may end early,
+   the seal records where it did, every whole unit counts, and the one cut unit is written whole
+   to the next cartridge. Units are never split by the drive.
+10. **Slice size defaults to 1 GiB** (`slice_size = "1G"`, was 10G since 2026-07-22): small
+    enough to finish inside the post-warning zone under #420, and the most a single-file restore
+    or a damage event costs. Existing stage sets keep their size; it is per stage set.
+11. **Cartridge telemetry:** keep the chip's lifetime attributes (#299) and show them, with the
+    drive's rewrite counters, as a worn-cartridge warning in `volume write`'s pre-flight and
+    `cartridge info` (#391). No health-score formula until home2 data sets its thresholds.
+12. **No `scrub` command:** `volume verify` records the growth of corrected read errors and
+    `audit` flags a cartridge whose rate climbs (#421).
+13. **No parity slices** (PAR2/Reed-Solomon) for now: copies on separate cartridges and
+    locations are the defence, and LTO's own ECC covers scattered errors. If ever built, parity
+    is computed over the encrypted slices so repair needs no key. Revisit if a verify finds an
+    unreadable region on a tape whose other copies are also degraded, or if a unit is ever kept
+    in a single copy.
+14. **No plaintext catalogue on tape:** the encrypted per-tenant dar catalogues already in the
+    envelopes are the catalogue copy (#418). **No explicit SCSI cache flush:** the seal's
+    synchronous filemark already flushes the drive's buffer before the catalog records the seal;
+    the power baseline is documented under #394.
+15. **Forward compatibility is built into 1.1.0** (#384). File 0 and the seal carry a
+    `requires = [...]` list of features a reader must understand; every reader checks
+    `layout_version`, the magic and `requires`, and refuses a tape needing a feature it does not
+    know ("this tape needs tapectl ≥ X") rather than misreading it. A reader ignores any key it
+    does not know unless `requires` names it, so fields can be added freely. Readers find the
+    seal by spacing to end of data and stepping back, File 0's pointer being a hint. #420 later
+    adds `requires = ["short-seal"]` and an `ended_after` field; 1.1.0 readers will refuse such
+    a tape cleanly, not read it. An heir is covered regardless: each tape carries the RESTORE.sh
+    of the tapectl that wrote it.
+16. **The fill ceiling defaults to 97%** of the cartridge's capacity (#391), overridable per write
+    with `--fill-ceiling`, to be tuned from home2's recorded capacity use.
+17. **A unit larger than one cartridge is refused** (#395) with a clear message naming the limit
+    for the cartridge generation, at `stage create` and `collection plan`. Planned spanning (the
+    planner splits a unit's slices across a named set of cartridges) is designed once any unit
+    passes about half a cartridge; #15's mechanism lets it arrive without breaking older readers.
