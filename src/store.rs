@@ -2604,6 +2604,83 @@ mod tests {
         }
     }
 
+    /// A `MemStore` whose file at `at` is a gigabyte of one byte — what
+    /// `scripts/lto6-fill.sh` leaves where a small file belongs — streamed a
+    /// mebibyte at a time and generated as it goes, so the test holds none of
+    /// it. Like a tape read, it stops at the first chunk the sink refuses.
+    /// `accepted` is every byte the sink took.
+    struct HugeFileStore {
+        inner: MemStore,
+        at: u32,
+        accepted: u64,
+    }
+
+    impl Store for HugeFileStore {
+        fn capacity(&mut self) -> Result<CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+            self.inner.execute(src, len, sync)
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            if position != self.at {
+                return self.inner.read_file(position, sink);
+            }
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..1024 {
+                sink.write_all(&chunk)
+                    .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
+                self.accepted += chunk.len() as u64;
+            }
+            Ok(self.accepted)
+        }
+        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+            self.inner.reposition_for_resume(file_index)
+        }
+    }
+
+    /// Issue #400, bounded reads in the chain walk: a seal marker or a front
+    /// index far larger than any real one is read no further than
+    /// [`SMALL_FILE_CAP`] and is unreadable — inconclusive, not evidence
+    /// against the medium. Both used to be read whole into a `Vec`.
+    #[test]
+    fn an_oversized_seal_or_front_index_is_read_no_further_than_the_cap() {
+        for (kind, want) in [
+            (ZoneKind::SealMarker, MismatchKind::SealUnreadable),
+            (ZoneKind::FrontIndex, MismatchKind::FrontIndexUnreadable),
+        ] {
+            let (layout, mem) = build_confirm_fixture(None);
+            let at = layout
+                .entries
+                .iter()
+                .find(|e| std::mem::discriminant(&e.kind) == std::mem::discriminant(&kind))
+                .unwrap()
+                .position as u32;
+            let mut store = HugeFileStore {
+                inner: mem,
+                at,
+                accepted: 0,
+            };
+            for tier in [Tier::Navigable, Tier::Integrity] {
+                store.accepted = 0;
+                let evidence = store.confirm(&layout, tier).unwrap();
+                assert!(
+                    store.accepted <= SMALL_FILE_CAP,
+                    "{want:?}/{tier:?}: the walk took {} bytes of the file at {at}",
+                    store.accepted
+                );
+                let m = evidence
+                    .mismatches
+                    .iter()
+                    .find(|m| m.position == at)
+                    .unwrap_or_else(|| panic!("{want:?}/{tier:?}: {:?}", evidence.mismatches));
+                assert_eq!(m.kind, want);
+                assert!(m.actual.contains("larger than 16 MiB"), "{}", m.actual);
+                assert!(!evidence.proves_medium_bad(), "{want:?}/{tier:?}");
+            }
+        }
+    }
+
     #[test]
     fn a_content_read_error_is_content_unreadable_not_a_hash_mismatch() {
         let (layout, mem) = build_confirm_fixture(None);
