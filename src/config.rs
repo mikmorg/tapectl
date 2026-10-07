@@ -1802,7 +1802,9 @@ impl TapectlPaths {
     ///
     /// A group that does not exist, or one the service user is not a member
     /// of (`chgrp` needs that), is a warning, like every chmod here, never a
-    /// failure: `config check` names it.
+    /// failure: `config check` names it. Either way the directory it could
+    /// not give the group stays 0700 — fail closed, never open to the group
+    /// it happened to have.
     pub fn ensure_dirs_shared(&self, ops_group: Option<&str>) -> Result<()> {
         // Before the create loop, or it would create an empty
         // stage-reports/ first and the "both exist" rule below would then
@@ -1826,7 +1828,7 @@ impl TapectlPaths {
             &self.logs_dir,
         ] {
             std::fs::create_dir_all(dir)?;
-            let mode = match gid {
+            let mut mode = match gid {
                 Some(_) if dir == &self.home => 0o710,
                 Some(_) if dir == &self.logs_dir => 0o2750,
                 _ => 0o700,
@@ -1834,6 +1836,16 @@ impl TapectlPaths {
             if let Some(gid) = gid {
                 if mode != 0o700 {
                     share_with_group(dir, gid);
+                    // Fail closed: a `chgrp` that did not happen (the
+                    // service user is not yet a member of the group) would
+                    // open the directory to whatever group it already has
+                    // — a shared `users`, say. Only a directory that really
+                    // is the ops group's gets the group bits.
+                    use std::os::unix::fs::MetadataExt;
+                    let given = std::fs::metadata(dir).is_ok_and(|m| m.gid() == gid.as_raw());
+                    if !given {
+                        mode = 0o700;
+                    }
                 }
             }
             secure_path(dir, mode);
@@ -2068,6 +2080,32 @@ mod tests {
             "the table removed: private again"
         );
         assert_eq!(full_mode(&paths.logs_dir), 0o700);
+    }
+
+    /// Issue #393, failing closed: when the service user cannot give the
+    /// directories the ops group (not a member: `chgrp` is EPERM), the home
+    /// and `logs/` stay 0700 rather than opening to whatever group they
+    /// already carry. `root` is a group this process may not `chgrp` to
+    /// unless it is root or in it, in which case there is nothing to show.
+    #[test]
+    fn an_ops_group_that_cannot_be_given_shares_nothing() {
+        let root = nix::unistd::Gid::from_raw(0);
+        let in_root = nix::unistd::geteuid().is_root()
+            || nix::unistd::getegid() == root
+            || nix::unistd::getgroups().is_ok_and(|g| g.contains(&root));
+        if in_root {
+            eprintln!("skipping: this process may chgrp to root");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join(".tapectl"));
+        paths.ensure_dirs().unwrap();
+        let name = nix::unistd::Group::from_gid(root).unwrap().unwrap().name;
+
+        paths.ensure_dirs_shared(Some(&name)).unwrap();
+        let full_mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(full_mode(&paths.home), 0o700, "the home stays closed");
+        assert_eq!(full_mode(&paths.logs_dir), 0o700, "logs/ stays closed");
     }
 
     #[test]

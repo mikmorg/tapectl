@@ -484,7 +484,9 @@ group = "tapectl-ops"
 | `group` | group name | *(no table: the home stays private)* | Every command run as the service user keeps the home at 0710 and `logs/` at 2750 (setgid), both owned by this group, and writes each session log 0640. Every other entry of the home — `config.toml`, the catalog, the keys, `catalogs/`, `stage-reports/`, `locks/`, `tmp/`, a `staging/` inside it, whatever else is there — has its group and other bits removed on every command, so a member can open none of them even by name. |
 
 The service user must be a member of the group itself: giving a directory a
-group (`chgrp`) is limited to one's own groups. A member then runs
+group (`chgrp`) is limited to one's own groups, and until it can, the home and
+`logs/` stay 0700 rather than open to whatever group they already have. A
+member then runs
 `tapectl --home <service user's home> status` (or sets `TAPECTL_HOME`): see
 [`status`](cli/status.md) and the operator guide's "Watching from another
 account". Logs written before the table was added stay 0600, and `status` names

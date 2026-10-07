@@ -545,7 +545,9 @@ tapectl-ops tapectl`, and the same for yourself; it takes effect at the next
 login). From then on every command run as the service user keeps the home
 at 0710 and `logs/` at 2750 owned by the group, and writes each log 0640 — the
 group can read the logs and open nothing else: every other entry of the home
-(the catalog, the keys, config.toml, …) is closed to it on every command. `config check` (as the service user) says whether
+(the catalog, the keys, config.toml, …) is closed to it on every command.
+Until the service user is a member, the home and `logs/` stay 0700 rather
+than open to whatever group they already have. `config check` (as the service user) says whether
 the group, the memberships and the modes are as they should be;
 [configuration.md](configuration.md#ops) has the details. `scripts/first-run.sh`
 does all of it in step 7 when the host profile sets `OPS_GROUP` — on an existing
