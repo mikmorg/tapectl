@@ -16,7 +16,7 @@ tapectl db [OPTIONS] <COMMAND>
 - [`fsck`](#tapectl-db-fsck) — Check database integrity
 - [`export`](#tapectl-db-export) — Export database as JSON
 - [`import`](#tapectl-db-import) — Import database from backup
-- [`stats`](#tapectl-db-stats) — Show database statistics
+- [`stats`](#tapectl-db-stats) — Show database statistics, and what each table weighs
 
 ### tapectl db backup
 
@@ -65,7 +65,9 @@ tapectl db import [OPTIONS] <PATH>
 
 ### tapectl db stats
 
-Show database statistics
+Show database statistics, and what each table weighs
+
+The database's size, then every table's row count and size, largest first. The journals (`health_logs`, `verification_results`, `events`, the forensic journals) are never pruned, so this is how their growth is seen. Sizes are measured with SQLite's dbstat table when the build has it (the bundled build does) and estimated otherwise; the output says which (`size_method` in `--json`).
 
 ```text
 tapectl db stats [OPTIONS]

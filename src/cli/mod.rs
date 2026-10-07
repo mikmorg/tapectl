@@ -396,7 +396,14 @@ pub enum DbCommands {
         /// Path to backup file
         path: String,
     },
-    /// Show database statistics
+    /// Show database statistics, and what each table weighs
+    ///
+    /// The database's size, then every table's row count and size, largest
+    /// first. The journals (`health_logs`, `verification_results`, `events`,
+    /// the forensic journals) are never pruned, so this is how their growth
+    /// is seen. Sizes are measured with SQLite's dbstat table when the build
+    /// has it (the bundled build does) and estimated otherwise; the output
+    /// says which (`size_method` in `--json`).
     Stats,
 }
 

@@ -147,7 +147,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`db fsck`](db.md#tapectl-db-fsck) | Check database integrity |
 | &nbsp;&nbsp;[`db export`](db.md#tapectl-db-export) | Export database as JSON |
 | &nbsp;&nbsp;[`db import`](db.md#tapectl-db-import) | Import database from backup |
-| &nbsp;&nbsp;[`db stats`](db.md#tapectl-db-stats) | Show database statistics |
+| &nbsp;&nbsp;[`db stats`](db.md#tapectl-db-stats) | Show database statistics, and what each table weighs |
 | [`config`](config.md) | Configuration management |
 | &nbsp;&nbsp;[`config show`](config.md#tapectl-config-show) | Show current configuration |
 | &nbsp;&nbsp;[`config check`](config.md#tapectl-config-check) | Check configuration validity |
