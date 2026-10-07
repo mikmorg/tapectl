@@ -20,7 +20,7 @@
 #      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
 #      real one.
 #
-# 42 checks as of #400; the `check` lines below are the list.
+# 40 checks (#400 is not exercisable on mhvtl; see its section); the `check` lines below are the list.
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
 # ticketed defects). The gate exits non-zero on any unexpected failure OR any
@@ -1611,162 +1611,15 @@ check tape_alert_surfaced step_tape_alert_surfaced
 check feed_ratio_recorded step_feed_ratio_recorded
 check st_stats_recorded step_st_stats_recorded
 
-# ---------- File 0 unreadable is not consent (issue #400) ----------
-# st fails a read at BOT with the same EIO for a blank tape, a medium error
-# on a recorded tape, and a tape written in another block size. Before #400
-# any File 0 read error was taken as Blank, and Blank is consent to write: one
-# bad read on a drive needing cleaning could put a new File 0 over a live
-# sealed volume, and binding then marked it `erased`. Now an unreadable File 0
-# is Blank only when the medium proves it (end of data at BOT,
-# `Store::blank_at_bot`); otherwise `volume init`/`volume write` refuse, and
-# `--force` is the override -- except when the catalog binds the loaded
-# cartridge's chip serial to a live volume, which no flag overwrites.
-#
-# The fabrication is the third of st's three causes: File 0 rewritten as ONE
-# 64 KiB block (`mt setblk`, lifecycle-suite's primitive, then `dd of=` the
-# gate's own device node), followed by the filemark st writes at close.
-# tapectl reads in fixed 512 KiB blocks, so that read fails with an
-# incorrect-length error, and `fsf 1` finds a filemark, so the tape is not
-# provably blank. A medium error cannot be made on mhvtl, and a BOT write
-# moves end of data, so the seal marker does not survive the fabrication:
-# "sealed" here is the catalog's word for the cartridge (MHVTLR4, sealed by
-# the resume in tier3_floor_unconfirmed, bound by its chip serial) -- which is
-# exactly what `binding::live_volumes_on_serial` asks, and what makes --force
-# inert.
-#
-# Runs AFTER the journals leg and the catalog-only checks above, which assume
-# the gate catalog is final, and BEFORE rust_e2e, which erases and loads its
-# own cartridge. It needs MHVTLR4 live (nothing after tier3_floor_unconfirmed
-# may displace it before this), and it leaves the cartridge holding MHVTLU2 (sealed by the write arm's --force control).
-ULABEL1="MHVTLU1"   # init arm: never created -- every init is refused
-ULABEL2="MHVTLU2"   # write arm: initialised on a blank tape, then File 0 lost
-
-# file0_unreadable: rewrite File 0 as one 64 KiB block, restore the 512 KiB
-# block size the rest of the gate reads with, and prove the fabrication took:
-# a 512 KiB read at BOT must now FAIL. If this mhvtl answers it, every
-# refusal below would be about something else -- inconclusive, never a pass.
-file0_unreadable() {
-    if ! { mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" setblk 65536 \
-        && dd if=/dev/urandom of="$TAPE_DEV" bs=65536 count=1 2>/dev/null; }; then
-        echo "fabrication: writing a 64 KiB File 0 failed"
-        mt -f "$TAPE_DEV" setblk 524288
-        return 1
-    fi
-    if ! { mt -f "$TAPE_DEV" setblk 524288 && mt -f "$TAPE_DEV" rewind; }; then
-        echo "fabrication: could not restore the 512 KiB block size"
-        return 1
-    fi
-    if dd if="$TAPE_DEV" bs=512k count=1 of=/dev/null 2>/dev/null; then
-        echo "fabrication not honoured: a 512 KiB read of the 64 KiB File 0 SUCCEEDED on this mhvtl, \
-so File 0 is readable and nothing below would test #400 -- inconclusive"
-        return 1
-    fi
-    mt -f "$TAPE_DEV" rewind
-    echo "fabricated: File 0 is one 64 KiB block; a 512 KiB read of it fails"
-}
-
-# assert_refused <rc> <out> <what> <needle>...: the command failed, and its
-# text carries every needle. rc 0 is the defect this leg exists for.
-assert_refused() {
-    local rc="$1" out="$2" what="$3" needle
-    shift 3
-    printf '%s\n' "$out"
-    [ "$rc" -ne 0 ] || { echo "$what exited 0 over an unreadable File 0 -- it wrote (issue #400)"; return 1; }
-    for needle in "$@"; do
-        grep -F -- "$needle" >/dev/null <<<"$out" \
-            || { echo "$what refused (rc=$rc) but its text lacks \"$needle\" -- refused for another reason?"; return 1; }
-    done
-    echo "$what refused (rc=$rc), naming: $*"
-}
-
-# The init arm, against the live sealed MHVTLR4. Precondition first, as a
-# failure and not a skip: if the catalog does not bind MHVTLR4 to a cartridge
-# by chip serial, the --force half asserts nothing.
-step_file0_unreadable_init_refused() {
-    local out rc
-    python3 - "$HOME_DIR/tapectl.db" "$RLABEL4" <<'PYU0' || return 1
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1]); label = sys.argv[2]
-rows = c.execute(
-    """SELECT v.status, v.observed_condition, c.serial_number
-       FROM volumes v
-       JOIN cartridge_volumes cv ON cv.volume_id = v.id AND cv.unmounted_at IS NULL
-       JOIN cartridges c ON c.id = cv.cartridge_id
-       WHERE v.label = ?""", (label,)).fetchall()
-assert len(rows) == 1, f"precondition: {label} has {len(rows)} open mounts, want 1"
-status, cond, serial = rows[0]
-assert status == "sealed" and cond == "ok", f"precondition: {label} is {status}/{cond}, want sealed/ok (live)"
-assert serial, f"precondition: {label}'s cartridge has no chip serial -- the --force half would be vacuous"
-print(f"precondition: {label} sealed/ok on the cartridge with chip serial {serial}")
-PYU0
-    file0_unreadable || return 1
-
-    out="$(TCTL volume init "$ULABEL1" --device "$TAPE_DEV" 2>&1)"; rc=$?
-    assert_refused "$rc" "$out" "volume init $ULABEL1" \
-        "could not be read" "\"$RLABEL4\"" "--force cannot override this" || return 1
-    out="$(TCTL volume init "$ULABEL1" --device "$TAPE_DEV" --force 2>&1)"; rc=$?
-    assert_refused "$rc" "$out" "volume init $ULABEL1 --force" \
-        "could not be read" "\"$RLABEL4\"" "--force cannot override this" || return 1
-
-    # Nothing changed: no volume row (it is inserted after the contact
-    # check), MHVTLR4 still sealed on an open mount, and File 0 still the
-    # fabricated block.
-    python3 - "$HOME_DIR/tapectl.db" "$RLABEL4" "$ULABEL1" <<'PYU1' || return 1
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1]); live, new = sys.argv[2], sys.argv[3]
-assert c.execute("SELECT COUNT(*) FROM volumes WHERE label = ?", (new,)).fetchone()[0] == 0, \
-    f"a refused init left a volumes row for {new}"
-row = c.execute(
-    """SELECT v.status, cv.unmounted_at FROM volumes v
-       JOIN cartridge_volumes cv ON cv.volume_id = v.id
-       WHERE v.label = ? ORDER BY cv.id DESC LIMIT 1""", (live,)).fetchone()
-assert row == ("sealed", None), f"{live} after the refusals: {row}, want ('sealed', None)"
-print(f"catalog unchanged: no {new}, {live} sealed and mounted")
-PYU1
-    if dd if="$TAPE_DEV" bs=512k count=1 of=/dev/null 2>/dev/null; then
-        echo "File 0 reads cleanly after the refusals -- something wrote over it"
-        return 1
-    fi
-    mt -f "$TAPE_DEV" rewind
-}
-
-# The write arm: the unbound case, where --force IS the override. A real
-# erase gives a provably blank tape, so `volume init` initialises MHVTLU2 (and
-# displaces MHVTLR4 -- ADR-0010, expected). Then File 0 is lost, and the
-# write must refuse before the tape moves: no `writes` row (minted at plan,
-# after the contact check), the volume still `initialized`. Finally the
-# positive control: the same write with --force goes through and seals, so
-# the refusal was the File 0 one and not some other precondition.
-step_file0_unreadable_write_refused() {
-    local out rc
-    if ! { mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase \
-        && TCTL volume init "$ULABEL2" --device "$TAPE_DEV"; }; then
-        echo "could not initialise $ULABEL2 on an erased tape"
-        return 1
-    fi
-    file0_unreadable || return 1
-
-    out="$(TCTL volume write "$ULABEL2" --device "$TAPE_DEV" --yes 2>&1)"; rc=$?
-    assert_refused "$rc" "$out" "volume write $ULABEL2" \
-        "could not be read" "not provably blank" "re-run with --force" || return 1
-    python3 - "$HOME_DIR/tapectl.db" "$ULABEL2" <<'PYU2' || return 1
-import sqlite3, sys
-c = sqlite3.connect(sys.argv[1]); label = sys.argv[2]
-status = c.execute("SELECT status FROM volumes WHERE label = ?", (label,)).fetchone()
-assert status == ("initialized",), f"{label} after the refused write: {status}, want initialized"
-n = c.execute(
-    "SELECT COUNT(*) FROM writes w JOIN volumes v ON v.id = w.volume_id WHERE v.label = ?",
-    (label,)).fetchone()[0]
-assert n == 0, f"the refused write left {n} writes row(s) for {label}"
-print(f"{label}: still initialized, no writes rows")
-PYU2
-
-    TCTL volume write "$ULABEL2" --device "$TAPE_DEV" --yes --force \
-        || { echo "positive control: volume write --force over the unreadable File 0 failed"; return 1; }
-    assert_sealed "$ULABEL2"
-}
-check file0_unreadable_init_refused  step_file0_unreadable_init_refused
-check file0_unreadable_write_refused step_file0_unreadable_write_refused
+# ---------- File 0 unreadable is not consent (issue #400): NOT on mhvtl ----------
+# #400's refusal (an unreadable File 0 is Blank only when the tape proves it)
+# cannot be exercised here: mhvtl fabricates no File 0 read error. Measured
+# 2026-10-07 on this gate's LTO-8 emulation: File 0 rewritten as one 64 KiB
+# block (`mt setblk 65536` + dd) is answered in full by a fixed 512 KiB read
+# -- no incorrect-length error -- and mhvtl injects no medium error. The
+# refusal arms are proven by the ungated FakeTape tests in src/volume/
+# (EIO with and without blank evidence, --force, a chip serial bound to a live
+# volume); the real drive is the only medium that could show it end to end.
 
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --
