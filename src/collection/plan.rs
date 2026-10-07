@@ -434,7 +434,9 @@ pub fn destination_budget(
         // retained sets of a batch awaiting its next copy — so a destination
         // on the cartridge holding their copy is refused before this run
         // stages anything. The batch's own units are not staged yet; their
-        // versions are checked when `volume_write` plans.
+        // versions are checked when `volume_write` plans. As there, the
+        // cartridge half only fires on an inconsistent catalog: binding the
+        // destination erased any copy on its cartridge at `volume init`.
         let distinct = coverage::copy_distinctness(conn, volume_id, &riding)?;
         if let Some(refusal) = distinct.refusal(label) {
             return Err(TapectlError::Other(refusal));
@@ -1390,6 +1392,12 @@ mod tests {
     /// holds a copy of a stage set that would ride along to it — two copies
     /// on one cartridge are one copy. The same predicate `volume write`
     /// applies (`coverage::copy_distinctness`), so this is never stricter.
+    ///
+    /// The fixture's raw INSERTs leave two open mounts on one cartridge with
+    /// the copy still sealed, a state no tapectl path produces (binding
+    /// erases the volumes it displaces, pinned by
+    /// `coverage::tests::binding_a_destination_onto_the_copys_cartridge_erases_the_copy_first`).
+    /// This pins the guard against an inconsistent catalog.
     #[test]
     fn run_refuses_a_destination_on_the_cartridge_holding_a_riding_copy() {
         let conn = retained_copy_fixture("BC1", "offsite");

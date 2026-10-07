@@ -1071,15 +1071,26 @@ The normal way to make another copy is to write the still-staged data to
 another cartridge (`volume init` + `volume write`, as in
 [A typical write session](#a-typical-write-session)).
 
+Each further copy goes on a different cartridge, because a cartridge holds one
+volume at a time. What stops a second copy landing on copy 1's cartridge is
+`volume init`, not the write. The init's File 0 check refuses a tape that
+carries a sealed volume, with or without `--force` (ADR-0003). Reusing that
+cartridge means saying copy 1 is gone first: `volume retire`, erase the tape in
+the drive, then `cartridge mark-erased`. If the tape was erased some other way
+and its chip serial identifies the cartridge, `volume init` finds it blank and
+goes ahead. It records the displacement, marks
+copy 1's volume `erased`, and warns naming every unit left without a copy
+(ADR-0010, ADR-0012). By then copy 1 is already gone.
+
 Before the tape moves, the write checks each version against the copies it
-already has (ADR-0012, 2026-10-07). If a copy is already on the cartridge
-the destination volume is on, the write is refused, because two copies on one
-cartridge are one copy. Initialise the next copy on a different cartridge. If a
-copy is already at the destination volume's location, the write goes ahead
-with a warning naming that copy. Copies kept in one place are lost together,
-and `audit` still reports any required location with no copy. `collection run`
-makes the same check before it stages anything, for the staged sets that will
-ride along, and `--dry-run` prints the warning.
+already has (ADR-0012, 2026-10-07). If a copy is already at the destination
+volume's location, the write goes ahead with a warning naming that copy.
+Copies kept in one place are lost together, and `audit` still reports any
+required location with no copy. The write also refuses a destination that
+shares its cartridge with a live copy, but only an inconsistent catalog can
+reach that: tapectl never records two live volumes on one cartridge.
+`collection run` makes the same check before it stages anything, for the
+staged sets that will ride along, and `--dry-run` prints the warning.
 
 Once staging has been
 cleaned, copy from an existing tape instead: read its encrypted slices back

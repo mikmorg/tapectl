@@ -1177,7 +1177,10 @@ fn volume_write_contacted<'c>(
     // #144), from the catalog alone, before a backend, the MAM or the drive
     // is touched: a version already copied to this volume's cartridge is
     // refused (one cartridge is one copy, not two); one already at this
-    // volume's location is named in a warning and written (ADR-0004).
+    // volume's location is named in a warning and written (ADR-0004). The
+    // cartridge half only ever fires on an inconsistent catalog: binding
+    // this volume to a cartridge erased any copy on it at `volume init`
+    // (ADR-0010 displacement, `Distinctness::same_cartridge`).
     // Every write path inherits it — `collection run`, `quick-archive` and
     // `volume compact-write` reach the tape only through here.
     //
@@ -10205,6 +10208,12 @@ mod tests {
     /// from the catalog alone, before a backend, the MAM or the drive is
     /// touched (no backend is configured here, so getting past the check
     /// would fail at backend resolution instead).
+    ///
+    /// The fixture's two open mounts on one cartridge, the copy still
+    /// sealed, are a state no tapectl path produces: every binding erases
+    /// the volumes it displaces (`binding::mount_and_record`, pinned by
+    /// `coverage::tests::binding_a_destination_onto_the_copys_cartridge_erases_the_copy_first`).
+    /// This pins the guard against an inconsistent catalog.
     #[test]
     fn volume_write_refuses_a_second_copy_on_the_copys_own_cartridge() {
         let conn = crate::db::open_memory().unwrap();
