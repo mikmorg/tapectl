@@ -272,6 +272,9 @@ pub enum Commands {
         /// See `volume write --prewrite-hash`.
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --fill-ceiling`: this command's write only.
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
         /// See `volume write --full-confirm`.
         #[arg(long)]
         full_confirm: bool,

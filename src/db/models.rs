@@ -210,6 +210,9 @@ pub struct Write {
     pub snapshot_id: i64,
     pub volume_id: i64,
     pub status: String,
+    /// "This write was fully read back" (ADR-0012 2026-10-06 item 24):
+    /// set by an Integrity-tier confirm that passes and by a passing full
+    /// `volume verify` of the volume; a quick confirm leaves it unset.
     pub write_verified: bool,
     pub eot_recovery: Option<String>,
     pub sacrificed_slice_id: Option<i64>,

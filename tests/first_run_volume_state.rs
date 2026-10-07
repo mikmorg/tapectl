@@ -22,6 +22,20 @@ fn state_of(json: &str) -> String {
     state_of_file(&f)
 }
 
+/// Run `volume_aborted_seal_recorded <file>` and return what it printed.
+fn aborted_seal_recorded_of_file(f: &Path) -> String {
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(". scripts/lib/volume-state.sh; volume_aborted_seal_recorded \"$1\"")
+        .arg("bash")
+        .arg(f)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("bash must be available");
+    assert!(out.status.success(), "the function itself must not fail");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 fn state_of_file(f: &Path) -> String {
     let out = Command::new("bash")
         .arg("-c")
@@ -180,6 +194,142 @@ fn the_real_volume_info_json_of_an_unwritten_volume_reads_fresh() {
         "first-run.sh greps this text: {}",
         String::from_utf8_lossy(&missing.stderr)
     );
+}
+
+/// `tapectl volume info <label> --json` for `home`, written to a file.
+fn real_volume_info(home: &Path, label: &str) -> std::path::PathBuf {
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["--home"])
+        .arg(home)
+        .args(["volume", "info", label, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "volume info: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let f = home.join(format!("info-{label}.json"));
+    std::fs::write(&f, &out.stdout).unwrap();
+    f
+}
+
+/// The classifier's `writes[].status` key, and the seal helper's
+/// `sealed_at`, pinned against the real binary: a volume with an
+/// `interrupted` session reads `resume`; once that session is `aborted` it
+/// reads `other`, and whether its seal is recorded decides what step 13's
+/// `other` branch tells the operator (ADR-0012 2026-09-23: a clean full
+/// verify, then `volume resume`, re-confirms an aborted session whose seal
+/// is recorded).
+#[test]
+fn the_real_volume_info_json_of_a_written_volume_classifies() {
+    let home = TempDir::new().unwrap();
+    let init = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["--home"])
+        .arg(home.path())
+        .args(["init", "--operator", "op", "--no-escrow"])
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let conn = rusqlite::Connection::open(home.path().join("tapectl.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('acme', 0, 'active');
+         INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('uuid-1', 'unit1', (SELECT id FROM tenants WHERE name = 'acme'),
+                     '/tmp/unit1', 'active');
+         INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES ((SELECT id FROM units WHERE name = 'unit1'), 1, 'staged', '/tmp/unit1', 1, 32);
+         INSERT INTO stage_sets (snapshot_id, status, slice_size)
+             VALUES ((SELECT id FROM snapshots), 'staged', 524288);
+         INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'lto0', 2500000000000, 'initialized');
+         INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES ((SELECT id FROM stage_sets), (SELECT id FROM snapshots),
+                     (SELECT id FROM volumes), 'interrupted');",
+    )
+    .unwrap();
+    let f = real_volume_info(home.path(), "L6-0001");
+    assert_eq!(state_of_file(&f), "resume");
+    assert_eq!(aborted_seal_recorded_of_file(&f), "no", "not aborted");
+
+    conn.execute("UPDATE writes SET status = 'aborted'", [])
+        .unwrap();
+    let f = real_volume_info(home.path(), "L6-0001");
+    assert_eq!(state_of_file(&f), "other");
+    assert_eq!(
+        aborted_seal_recorded_of_file(&f),
+        "no",
+        "aborted before its seal: nothing to re-confirm"
+    );
+
+    conn.execute("UPDATE volumes SET sealed_at = datetime('now')", [])
+        .unwrap();
+    let f = real_volume_info(home.path(), "L6-0001");
+    assert_eq!(state_of_file(&f), "other");
+    assert_eq!(aborted_seal_recorded_of_file(&f), "yes");
+}
+
+/// Step 13's `other` branch: an aborted session whose seal is recorded is
+/// sent to `volume verify --full` and then `volume resume` (ADR-0012
+/// 2026-09-23), not to a new label — that cartridge is sealed and would
+/// still count once re-confirmed.
+#[test]
+fn an_aborted_session_with_its_seal_recorded_is_sent_to_verify_then_resume() {
+    let script =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/first-run.sh"))
+            .unwrap();
+    let other = script
+        .split("\n    *)\n")
+        .nth(1)
+        .and_then(|s| s.split(";;").next())
+        .expect("step 13 has an `other` branch");
+    assert!(
+        other.contains("volume_aborted_seal_recorded \"$VINFO\""),
+        "{other}"
+    );
+    let verify_at = other
+        .find("tapectl volume verify $LABEL --device $DEVICE --full")
+        .expect("names the full verify");
+    let resume_at = other
+        .find("tapectl volume resume $LABEL --device $DEVICE")
+        .expect("then the resume");
+    assert!(verify_at < resume_at, "verify first: {other}");
+}
+
+/// The post-write verify: a refusal that the loaded tape is not this
+/// volume (`binding::corroborate_volume`'s "wrong tape:"/"wrong
+/// cartridge:") says a different cartridge is loaded — checked before the
+/// failure is classified, so it is never told to clean the drive.
+#[test]
+fn a_wrong_cartridge_at_the_post_write_verify_is_named_not_blamed_on_the_drive() {
+    let script =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/first-run.sh"))
+            .unwrap();
+    let after_verify = script
+        .split("tc volume verify \"$LABEL\"")
+        .nth(1)
+        .expect("the post-write verify");
+    let wrong_at = after_verify
+        .find("grep -E \"wrong (tape|cartridge):\" \"$VERIFY_ERR\"")
+        .expect("the verify's stderr is checked for a wrong tape");
+    let classify_at = after_verify.find("VERIFY_QUAR=").expect("then classified");
+    assert!(wrong_at < classify_at);
+    assert!(
+        after_verify[wrong_at..classify_at].contains("a different cartridge"),
+        "{}",
+        &after_verify[wrong_at..classify_at]
+    );
+    // And the wording it greps is what the binary says.
+    let binding = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/volume/binding.rs"),
+    )
+    .unwrap();
+    assert!(binding.contains("\"wrong tape: this command names volume"));
+    assert!(binding.contains("\"wrong cartridge: volume"));
 }
 
 /// The `planned` branch's remedy must lead somewhere. `volume abort` turns

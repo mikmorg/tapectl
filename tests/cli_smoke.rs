@@ -26,6 +26,54 @@ fn cli_debug_assert() {
     Cli::command().debug_assert();
 }
 
+/// Issue #391 follow-up: `capacity_refusal_note` tells the operator to
+/// raise the ceiling "for this write with --fill-ceiling", so every write
+/// planned afresh takes that flag, as `volume write` does. `volume resume`
+/// re-uses its frozen plan, whose budget was fixed when it was planned, and
+/// takes no such flag.
+#[test]
+fn every_write_planned_afresh_takes_fill_ceiling() {
+    for args in [
+        vec!["tapectl", "volume", "write", "L", "--fill-ceiling", "99%"],
+        vec![
+            "tapectl",
+            "volume",
+            "compact-write",
+            "--destination",
+            "L",
+            "--fill-ceiling",
+            "99%",
+        ],
+        vec![
+            "tapectl",
+            "volume",
+            "compact",
+            "S",
+            "--to",
+            "L",
+            "--fill-ceiling",
+            "0.99",
+        ],
+        vec![
+            "tapectl",
+            "quick-archive",
+            "/src",
+            "--tenant",
+            "t",
+            "--volume",
+            "L",
+            "--fill-ceiling",
+            "99%",
+        ],
+    ] {
+        Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+    }
+    assert!(
+        Cli::try_parse_from(["tapectl", "volume", "resume", "L", "--fill-ceiling", "99%"]).is_err(),
+        "a resume's plan is frozen"
+    );
+}
+
 #[test]
 fn parses_bare_init() {
     let cli = Cli::try_parse_from(["tapectl", "init"]).expect("init should parse");
@@ -2742,14 +2790,16 @@ fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings(
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("report health --json stdout did not parse as one JSON document: {e}\n{stdout:?}")
     });
-    let rows = parsed.as_array().expect("an array of readings");
+    let rows = parsed["readings"]
+        .as_array()
+        .expect("an array of readings under `readings`");
     assert_eq!(
         rows.len(),
         3,
         "positive control: every seeded reading is present"
     );
 
-    let expected = serde_json::json!([
+    let readings = serde_json::json!([
         {
             "volume": "V-FULL", "operation": "write", "at": "2026-09-22 03:00:00",
             "bytes": 4096, "corrected": 2, "uncorrected": 1, "tape_alerts": 0,
@@ -2769,6 +2819,13 @@ fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings(
             "drive_serial": null, "cartridge_barcode": null
         }
     ]);
+    // No verify recorded read errors here, so no trend; the factor is the
+    // `[health]` default.
+    let expected = serde_json::json!({
+        "readings": readings,
+        "read_error_trends": [],
+        "read_error_rise_factor": tapectl::tape::read_errors::DEFAULT_RISE_FACTOR,
+    });
     assert_eq!(parsed, expected, "the whole --json document");
 }
 
@@ -2885,6 +2942,51 @@ fn stage_create_json_is_unchanged_and_its_session_is_logged() {
     }
 }
 
+/// `stage create --json` prints nothing on stdout when its one unit fails:
+/// the refusal goes to stderr and the exit is non-zero, as before #368 —
+/// not an empty `[]` a script would read as "staged nothing, fine". The
+/// failure here is the missing escrow recipient (`init --no-escrow`), which
+/// is refused inside the stage, before dar.
+#[test]
+fn stage_create_json_prints_nothing_when_its_one_unit_fails() {
+    let home = TempDir::new().expect("home tempdir");
+    let source_dir = TempDir::new().expect("source tempdir");
+    std::fs::write(source_dir.path().join("a.txt"), b"x").unwrap();
+    for args in [
+        vec!["init", "--no-escrow"],
+        vec!["tenant", "add", "acme"],
+        vec![
+            "unit",
+            "init",
+            source_dir.path().to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "unit1",
+        ],
+        vec!["snapshot", "create", "unit1"],
+    ] {
+        let out = run_tapectl(home.path(), &args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = run_tapectl(home.path(), &["--json", "stage", "create", "unit1"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the stage must fail: {stderr}");
+    assert!(
+        stderr.contains("no escrow recipient"),
+        "positive control: the stage itself refused: {stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "nothing on stdout for a failed stage"
+    );
+}
+
 /// Issue #386: `--quiet` keeps progress off stderr entirely, and the
 /// session log is still written. `volume info --json` keeps its exact key
 /// set while the human output shows the recorded phase timings.
@@ -2959,6 +3061,7 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
             "location",
             "media_type",
             "notes",
+            "sealed_at",
             "status",
             "tenants",
             "unit_count",
@@ -2969,7 +3072,8 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
             "verifications",
             "writes",
         ],
-        "volume info --json is unchanged by issue #386"
+        "volume info --json is unchanged by issue #386 (sealed_at was added after it, \
+         for first-run.sh step 13)"
     );
 }
 

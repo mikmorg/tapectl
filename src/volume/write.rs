@@ -4483,6 +4483,15 @@ fn verify_contacted(
     // any given run -- `quarantine_on_medium_evidence` needs a mismatch that
     // proves the medium bad, this one needs no mismatches at all.
     let cleared = clear_condition_on_clean_full_verify(&tx, volume_id, label, tier, &evidence)?;
+    // ADR-0012 2026-10-06 item 24 (#392): a full readback that passed —
+    // continued from an interrupted one (#410) or not — has read back every
+    // completed write on this volume. A quick verify reads none of them.
+    if tier == Tier::Integrity && evidence.mismatches.is_empty() {
+        tx.execute(
+            "UPDATE writes SET write_verified = 1 WHERE volume_id = ?1 AND status = 'completed'",
+            params![volume_id],
+        )?;
+    }
     tx.commit()?;
 
     for m in &evidence.mismatches {
@@ -6758,6 +6767,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome, "passed");
+        // ADR-0012 2026-10-06 item 24: three runs between them read the
+        // whole tape back clean, so the write on it was fully read back.
+        let verified: bool = conn
+            .query_row(
+                "SELECT write_verified FROM writes WHERE volume_id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            verified,
+            "a continued full verify that passes marks the write"
+        );
+    }
+
+    /// ADR-0012 2026-10-06 item 24 (#392): a full `volume verify` that
+    /// passes marks every completed write on the volume `write_verified`
+    /// ("this write was fully read back"); a quick verify, which reads File
+    /// 0, the front index and the seal only, does not.
+    #[test]
+    fn a_passing_full_verify_marks_the_volumes_writes_verified_and_a_quick_one_does_not() {
+        use crate::tape::fake::FakeTape;
+
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"intact slice bytes, repeated a few times. ".repeat(4);
+        seed_one_slice_fixture(&conn, "VR-WV", "wv-unit", 4, &good, "completed", "staged");
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'VR-WV'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mem = mem_store_v2_tape("VR-WV", &good, &good);
+        let verified = || -> Vec<bool> {
+            conn.prepare("SELECT write_verified FROM writes WHERE volume_id = ?1")
+                .unwrap()
+                .query_map(params![volume_id], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(verified(), vec![false]);
+        for (tier, want) in [(Tier::Navigable, false), (Tier::Integrity, true)] {
+            let fake = FakeTape::with_files(mem.files.clone(), 4096);
+            let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+            let report = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "VR-WV",
+                volume_id,
+                4096,
+                tier,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap();
+            assert_eq!(report.failed, 0, "{tier:?}: {:?}", report.mismatches);
+            assert_eq!(verified(), vec![want], "after a passing {tier:?} verify");
+        }
     }
 
     /// Issue #407: `volume verify` opens the drive READ-ONLY, so a sealed

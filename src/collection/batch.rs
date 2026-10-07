@@ -179,6 +179,7 @@ pub fn execute_batch(
             to_stage.push(crate::staging::jobs::StageJob {
                 unit_name: name.to_string(),
                 snapshot_id,
+                admission: crate::staging::Admission::Unstaged,
             });
         } else {
             crate::staging::stage_create(conn, paths, config, snapshot_id, assume_yes)?;

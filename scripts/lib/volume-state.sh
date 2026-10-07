@@ -67,3 +67,28 @@ else:
     print("other")
 PY
 }
+
+# volume_aborted_seal_recorded — for step 13's `other` branch: prints `yes`
+# when the volume in `tapectl volume info <label> --json` (the file named by
+# $1) is `initialized` with its write session aborted (`aborted` rows and no
+# unfinished one) AFTER its seal was written (`sealed_at` set), else `no`.
+# Such a cartridge is sealed and never written again, but it is not lost:
+# `volume resume` re-confirms the session once a clean full verify is
+# recorded after the abort (ADR-0012, 2026-09-23 amendment). Whatever its
+# `condition`: a clean full verify also clears a quarantine that proved
+# nothing for good.
+volume_aborted_seal_recorded() {
+    python3 - "${1:-}" <<'PY'
+import json, sys
+try:
+    v = json.load(open(sys.argv[1]))
+except Exception:
+    print("no"); sys.exit(0)
+writes = [w.get("status") for w in v.get("writes") or []]
+unfinished = {"interrupted", "planned", "in_progress"}
+print("yes" if v.get("status") == "initialized"
+      and "aborted" in writes
+      and not unfinished.intersection(writes)
+      and v.get("sealed_at") else "no")
+PY
+}

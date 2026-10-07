@@ -1455,6 +1455,15 @@ fn ensure_files(
     // regular — dar's catalogue still holds its real type, and the on-tape
     // half is ADR-0012 item 7's 1.2.0 change.
     //
+    // HAZARD until then: a rebuilt row says `Regular` for what may be a FIFO,
+    // a device or a symlink, so whatever trusts the kind treats it as a file
+    // with data. A reader that opens the source path of every non-directory
+    // row (`kind <> 0`) to hash it or read it blocks forever on a FIFO with
+    // no writer, and fails on a dangling symlink or follows a live one out
+    // of the unit — where the walk's own `Special`/`Symlink` kind would have
+    // told it to skip the row. Remove this caveat when the 1.2.0 on-tape
+    // `catalog.db` carries the kind and this maps it.
+    //
     // Streamed (issue #413): one on-tape row at a time, straight into the
     // bulk insert, never the whole tape's rows in memory.
     let bad = |f: &ontape_catalog::FileRow, e: TapectlError| {

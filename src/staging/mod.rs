@@ -394,6 +394,44 @@ pub(crate) fn stage_create_reporting(
     assume_yes: bool,
     notices: &mut dyn Write,
 ) -> Result<i64> {
+    stage_create_admitting(
+        conn,
+        paths,
+        config,
+        snapshot_id,
+        assume_yes,
+        Admission::Unstaged,
+        notices,
+    )
+}
+
+/// Whether a stage is the version's first, or a deliberate re-stage of it
+/// (`stage create --version`, issue #53) — what admission rechecks under its
+/// lock (issue #368).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Admission {
+    /// The caller picked a snapshot that had not been staged (`stage create`
+    /// with no `--version`, `collection run`, `quick-archive`). A sibling
+    /// that went `staged` between that lookup and admission refuses this
+    /// stage: it would be the same version staged twice.
+    #[default]
+    Unstaged,
+    /// `stage create --version`: the caller has already refused a version
+    /// with live slices, and a `staged` sibling is not rechecked.
+    Restage,
+}
+
+/// [`stage_create_reporting`], with what admission rechecks named
+/// ([`Admission`]).
+pub(crate) fn stage_create_admitting(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    snapshot_id: i64,
+    assume_yes: bool,
+    admission: Admission,
+    notices: &mut dyn Write,
+) -> Result<i64> {
     let stage_set_id_holder: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
     // Holds the stage set's flock guard for the entire lifetime of this
     // function call, success or error (issue #98) — `lock::StageLock`
@@ -408,6 +446,7 @@ pub(crate) fn stage_create_reporting(
         config,
         snapshot_id,
         assume_yes,
+        admission,
         &stage_set_id_holder,
         &lock_holder,
         notices,
@@ -490,6 +529,7 @@ fn stage_create_inner(
     config: &Config,
     snapshot_id: i64,
     assume_yes: bool,
+    admit_as: Admission,
     stage_set_id_holder: &std::cell::Cell<Option<i64>>,
     lock_holder: &std::cell::Cell<Option<lock::StageLock>>,
     notices: &mut dyn Write,
@@ -590,7 +630,7 @@ fn stage_create_inner(
     // time: so the next one sees this unit as staging, and this stage's
     // space as spoken for, before it decides anything of its own.
     let admission = lock::acquire_admission(&paths.db_file)?;
-    refuse_a_unit_already_staging(conn, &paths.db_file, &snapshot, &unit.name)?;
+    refuse_a_unit_already_staging(conn, &paths.db_file, &snapshot, &unit.name, admit_as)?;
     let in_flight = in_flight_staging(conn, &paths.db_file)?;
     check_staging_space(
         &StagingSpaceInputs {
@@ -1438,7 +1478,8 @@ fn check_unit_fits_one_tape(
         "unit \"{unit_name}\" is {size} bytes ({}), {over} bytes ({}) more than one cartridge \
          can take — {}. A unit is never split across cartridges (ADR-0012), so it cannot be \
          written; nothing was staged. A unit this size waits for planned spanning, which is \
-         not built yet.",
+         not built yet. The fill ceiling is the drive's `fill_ceiling` in its \
+         `[[backends.lto]]` entry of config.toml (default 97%).",
         crate::util::format_bytes_binary(i64::try_from(size).unwrap_or(i64::MAX)),
         crate::util::format_bytes_binary(i64::try_from(over).unwrap_or(i64::MAX)),
         limit.describe(),
@@ -1604,27 +1645,44 @@ fn in_flight_staging(conn: &Connection, db_file: &Path) -> Result<InFlight> {
     Ok(in_flight)
 }
 
-/// Refuse to stage a snapshot a live process is staging right now (issue
-/// #368): two stage sets of one snapshot at once would be the same archive
-/// made twice, each with its own catalogue, for one version. A sibling that
-/// is already `staged` is not refused here: whether a second stage set of a
-/// version is wanted is the caller's question (`stage create` refuses it
-/// unless the first was released; `collection run` skips a staged unit).
+/// Refuse, under the admission lock, to stage a snapshot that a live
+/// process is staging right now (issue #368) — or, for an
+/// [`Admission::Unstaged`] stage, that is already `staged`. Two stage sets
+/// of one snapshot made at once would be the same archive made twice, each
+/// with its own catalogue, for one version.
+///
+/// The `staged` half closes a race. A caller with no `--version` picked a
+/// snapshot that had not been staged (`stage create`: the latest `created`
+/// one; `collection run`: a unit not yet staged), but that lookup is not
+/// under this lock: a sibling `stage create` of the same unit could finish
+/// between it and admission, and this stage would make the second copy. A
+/// `--version` re-stage ([`Admission::Restage`], issue #53) has already
+/// refused a version with live slices and is not rechecked here. A crashed
+/// `staging` row is the startup sweep's to fail, not a holder.
 fn refuse_a_unit_already_staging(
     conn: &Connection,
     db_file: &Path,
     snapshot: &models::Snapshot,
     unit_name: &str,
+    admission: Admission,
 ) -> Result<()> {
-    let sets: Vec<i64> = conn
+    let sets: Vec<(i64, String)> = conn
         .prepare(
-            "SELECT id FROM stage_sets
-             WHERE snapshot_id = ?1 AND status = 'staging' ORDER BY id",
+            "SELECT id, status FROM stage_sets
+             WHERE snapshot_id = ?1 AND status IN ('staging', 'staged') ORDER BY id",
         )?
-        .query_map(params![snapshot.id], |r| r.get(0))?
+        .query_map(params![snapshot.id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    for id in sets {
-        if !lock::is_crashed(db_file, id) {
+    for (id, status) in sets {
+        if status == "staged" && admission == Admission::Unstaged {
+            return Err(TapectlError::Other(format!(
+                "unit \"{unit_name}\" v{} is already staged (stage set {id}, most likely by \
+                 another `stage create` that finished while this one waited) — refusing to \
+                 stage it twice; nothing was recorded",
+                snapshot.version
+            )));
+        }
+        if status == "staging" && !lock::is_crashed(db_file, id) {
             return Err(TapectlError::Other(format!(
                 "unit \"{unit_name}\" v{} is being staged right now (stage set {id}, by \
                  another `stage create`) — refusing to stage it twice at once",
@@ -2824,7 +2882,7 @@ mod tests {
         // directly here (bypassing the CLI gate) is deliberate: this test
         // is about `archive_base` collision, not about the gate.
         let stage_set_1 = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
-        let stage_set_2 = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+        let stage_set_2 = restage(&conn, &paths, &config, snap_id).unwrap();
         assert_ne!(stage_set_1, stage_set_2);
 
         let paths_for = |stage_set_id: i64| -> Vec<String> {
@@ -2918,7 +2976,7 @@ mod tests {
         fs::write(src.join("f.txt"), b"restaged content").unwrap();
         let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         let set_1 = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
-        let set_2 = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+        let set_2 = restage(&conn, &paths, &config, snap_id).unwrap();
 
         let catalogue = |id: i64| -> String {
             conn.query_row(
@@ -3291,6 +3349,26 @@ mod tests {
     /// `(conn, paths, config, src_dir)`; the caller writes fixture files
     /// into `src_dir` and drives `snapshot_create`/`stage_create` itself,
     /// since each test needs different file content/timing.
+    /// A second stage of a snapshot already staged, as `stage create
+    /// --version` makes one (issue #53) — the tests that stage one snapshot
+    /// twice model that, not a fresh stage (issue #368's admission).
+    pub(super) fn restage(
+        conn: &Connection,
+        paths: &TapectlPaths,
+        config: &Config,
+        snapshot_id: i64,
+    ) -> Result<i64> {
+        stage_create_admitting(
+            conn,
+            paths,
+            config,
+            snapshot_id,
+            false,
+            Admission::Restage,
+            &mut std::io::stderr(),
+        )
+    }
+
     pub(super) fn setup_unit_with_excludes(
         tmp: &TempDir,
         exclude_patterns: Vec<String>,
@@ -3815,6 +3893,43 @@ mod tests {
             .expect("its holder is gone: staging goes ahead");
     }
 
+    /// Issue #368's never-twice rule, the race it left open: two `stage
+    /// create unit1` both look up v1 while it is still `created`; the first
+    /// finishes (its set `staged`) before the second reaches admission. The
+    /// second must not stage v1 again. Under the admission lock a `staged`
+    /// sibling refuses, as a live `staging` one does — before anything is
+    /// recorded and before dar.
+    #[test]
+    fn a_unit_staged_while_this_stage_waited_is_not_staged_again() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        write_dense_file(&src.join("a.bin"), 64 * 1024);
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        // The sibling's finished stage, as its finalize left it.
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted, status)
+             VALUES (?1, 1048576, 'none', 1, 'staged')",
+            params![snap_id],
+        )
+        .unwrap();
+        let sibling = conn.last_insert_rowid();
+        config.dar.binary = "/nonexistent/dar-must-never-run".to_string();
+
+        let err = stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut Vec::new())
+            .expect_err("v1 is already staged")
+            .to_string();
+        assert!(
+            err.contains("unit \"unit1\" v1 is already staged")
+                && err.contains(&format!("stage set {sibling}")),
+            "{err}"
+        );
+        assert!(!err.contains("dar-must-never-run"), "{err}");
+        let sets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sets, 1, "nothing recorded for the refused stage");
+    }
+
     /// Issue #368 (and #377's rule 3): a stage's writes wait out a catalog
     /// another stage holds past `busy_timeout`, rather than fail — before
     /// dar (recording the stage set, which with `--jobs` would stop the
@@ -4262,7 +4377,7 @@ mod tests {
         // Re-staging the SAME snapshot (a real "stage create" retry) must
         // succeed cleanly — never raise BITROT over content dar was never
         // going to archive.
-        let result = stage_create(&conn, &paths, &config, snap_id, false);
+        let result = restage(&conn, &paths, &config, snap_id);
         assert!(
             result.is_ok(),
             "re-staging must succeed — an excluded file's content drift must \
@@ -4497,7 +4612,7 @@ mod tests {
         // false-BITROT scenario the issue describes.
         fs::write(src.join("Thumbs.db"), b"BBBB").unwrap();
 
-        let result = stage_create(&conn, &paths, &config, snap_id, false);
+        let result = restage(&conn, &paths, &config, snap_id);
         assert!(
             result.is_ok(),
             "re-staging must succeed — a globally-excluded file's content drift \
@@ -5623,6 +5738,10 @@ mod tests {
             "the limit for the generation, and its figures: {msg}"
         );
         assert!(msg.contains("never split"), "{msg}");
+        assert!(
+            msg.contains("`fill_ceiling`") && msg.contains("[[backends.lto]]"),
+            "names the config key that sets the ceiling (stage create has no flag): {msg}"
+        );
         assert!(!msg.contains("dar-must-never-run"), "{msg}");
         let stage_sets: i64 = conn
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))

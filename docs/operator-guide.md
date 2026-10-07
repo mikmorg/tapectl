@@ -537,7 +537,12 @@ recent:
 A running session's progress line is at most one interval (30 s) old, whatever
 its display. A session whose log has no end line and whose process is gone is
 shown as ended with no end line — killed, crashed or power lost — and the phase
-it stopped in; the next tapectl command recovers what it was doing.
+it stopped in; the next tapectl command recovers what it was doing. Another
+account may not see the writer in `/proc` at all (`/proc` mounted with
+`hidepid`, or the service in its own PID namespace), which looks the same as a
+process that is gone: while such a session's log is still being written (its
+last line under two minutes old) it is listed as running, marked "process not
+visible from this account", and only a log quiet for longer reads as ended.
 
 The logs belong to the user tapectl runs as. To let your own account (or an
 agent helping you) run `status` without sudo, name a group in the home's
@@ -1018,7 +1023,7 @@ $ tapectl catalog locate family/letters
 | L8-0002 | sealed | ok        | offsite   | 1        | 1      | 2026-09-29 08:20:05 | yes         | -         | yes    | 0d ago   |
 +---------+--------+-----------+-----------+----------+--------+---------------------+-------------+-----------+--------+----------+
 
-note: "Verified" is this catalog's last-known record of each copy's most recent PASSED `volume verify` — not a check of the tape performed just now. "never" means no passed verification is on record, not that the copy is bad; an aged value does not mean the tape has since failed. Re-run `tapectl volume verify <label>` to refresh it.
+note: "Verified" is this catalog's last-known record of each copy's most recent PASSED full readback (a full `volume verify`, or a write's full confirm; a quick one reads none of the copy's bytes and does not count) — not a check of the tape performed just now. "never" means no passed full readback is on record, not that the copy is bad; an aged value does not mean the tape has since failed. Re-run `tapectl volume verify <label>` to refresh it.
 ```
 
 ## Safety Operations
@@ -1812,6 +1817,13 @@ like.
 [health]
 read_error_rise_factor = 2.0
 ```
+
+`report health --json` carries the same figures: an object whose
+`read_error_trends` holds one entry per cartridge (its verifies, oldest first,
+in `points`, and `rising` set — with the line above as its `message` — when it
+is flagged), beside the `read_error_rise_factor` it was judged against and the
+health readings under `readings`. (Before the trends joined it, the document
+was the readings array alone.)
 
 How to read it:
 

@@ -283,6 +283,9 @@ pub enum VolumeCommands {
         /// See `volume write --prewrite-hash`.
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --fill-ceiling`: this write only.
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
         /// See `volume write --full-confirm`.
         #[arg(long)]
         full_confirm: bool,
@@ -361,6 +364,9 @@ pub enum VolumeCommands {
         /// See `volume write --prewrite-hash` (step 2's write).
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --fill-ceiling` (step 2's write).
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
         /// See `volume write --full-confirm` (step 2's write).
         #[arg(long)]
         full_confirm: bool,
@@ -1345,6 +1351,7 @@ pub fn run(
             device,
             allow_missing_escrow,
             prewrite_hash,
+            fill_ceiling,
             full_confirm,
         } => {
             // Issue #241: same reasoning as `volume write` — a real
@@ -1358,6 +1365,8 @@ pub fn run(
                 ));
             }
             let device = write_device(config, device.as_deref())?;
+            // Issue #391: `--fill-ceiling` for this write only.
+            let config = &config.with_fill_ceiling(*fill_ceiling);
             write::compact_write(
                 conn,
                 paths,
@@ -1418,6 +1427,7 @@ pub fn run(
             device,
             allow_missing_escrow,
             prewrite_hash,
+            fill_ceiling,
             full_confirm,
             force,
         } => {
@@ -1493,7 +1503,8 @@ pub fn run(
             write::compact_write(
                 conn,
                 paths,
-                config,
+                // Issue #391: `--fill-ceiling` for step 2's write only.
+                &config.with_fill_ceiling(*fill_ceiling),
                 dest_label,
                 &device,
                 DEFAULT_BLOCK_SIZE,
@@ -2127,8 +2138,11 @@ struct VolumeRow {
     /// lose this tape, how thin does anything on it get".
     #[tabled(rename = "MIN COPIES", display_with = "display_copies")]
     copies: Option<i64>,
-    /// This volume's own most recent PASSED `verification_sessions` row
-    /// (raw timestamp; `None` = never verified). Deliberately a fresh
+    /// This volume's own most recent PASSED FULL `verification_sessions`
+    /// row (raw timestamp; `None` = never verified). A quick confirm or
+    /// quick verify reads none of the volume's bytes and never counts
+    /// (ADR-0012 2026-10-06 items 1 and 24); `volume info` lists every
+    /// session with its type. Deliberately a fresh
     /// per-volume query rather than `policy::evidence` (see
     /// `remaining_coverage_evidence`'s doc): that module's queries are
     /// scoped to a UNIT's coverage across many volumes and would require a
@@ -2214,7 +2228,8 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
                     WHERE cw2.volume_id = v.id AND cw2.status = 'completed'
                  ) per) AS copies,
                 (SELECT MAX(vs.completed_at) FROM verification_sessions vs
-                  WHERE vs.volume_id = v.id AND vs.outcome = 'passed') AS last_verified
+                  WHERE vs.volume_id = v.id AND vs.outcome = 'passed'
+                    AND vs.verify_type = 'full') AS last_verified
          FROM volumes v
          LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
          LEFT JOIN cartridges c ON c.id = cv.cartridge_id
@@ -2276,8 +2291,8 @@ struct WriteRow {
 }
 
 /// One `verification_sessions` row. Every outcome is shown here (unlike
-/// `VolumeRow::verified`, which is deliberately the latest PASSED session
-/// only) — a dossier's verification history is exactly the place a failed
+/// `VolumeRow::verified`, which is deliberately the latest PASSED full
+/// session only) — a dossier's verification history is exactly the place a failed
 /// or aborted attempt belongs.
 #[derive(Debug, Clone, Serialize)]
 struct VerificationRow {
@@ -2328,6 +2343,13 @@ struct VolumeInfo {
     created_at: String,
     first_write: Option<String>,
     last_write: Option<String>,
+    /// When this volume's own seal was written (`volumes.sealed_at`,
+    /// migration 018): set once by the write session's `seal()` and never
+    /// cleared, so it is set on a volume whose confirm did not finish, or
+    /// whose session was then aborted — the fact `volume resume`'s
+    /// re-confirmation of an aborted session turns on (ADR-0012
+    /// 2026-09-23), and that `scripts/first-run.sh` step 13 reads.
+    sealed_at: Option<String>,
     notes: Option<String>,
     unit_count: i64,
     unit_total_bytes: i64,
@@ -2436,6 +2458,12 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
+    let sealed_at: Option<String> = conn.query_row(
+        "SELECT sealed_at FROM volumes WHERE id = ?1",
+        rusqlite::params![vol_id],
+        |r| r.get(0),
+    )?;
+
     // Units carried: one row per unit, aggregated across every completed
     // write of it that landed on THIS volume. Sorted largest-first so the
     // summary's "top few" is just this list's head.
@@ -2525,7 +2553,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // Verification history: every session, every outcome (unlike
-    // `VolumeRow::verified`, which is the latest PASSED one only).
+    // `VolumeRow::verified`, which is the latest PASSED full one only).
     let mut verify_stmt = conn.prepare(
         "SELECT started_at, completed_at, verify_type, outcome,
                 slices_checked, slices_passed, slices_failed
@@ -2583,6 +2611,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         created_at,
         first_write,
         last_write,
+        sealed_at,
         notes,
         unit_count,
         unit_total_bytes,
@@ -2917,6 +2946,7 @@ mod tests {
                 device: Some(DEV.into()),
                 allow_missing_escrow: false,
                 prewrite_hash: false,
+                fill_ceiling: None,
                 full_confirm: false,
                 force: true,
             };
@@ -3626,6 +3656,44 @@ mod tests {
                 Some("E01001L8_17757943"),
                 "a displaced volume must still name the cartridge it lived on"
             );
+        }
+
+        /// ADR-0012 2026-10-06 items 1 and 24: VERIFIED is the newest FULL
+        /// readback. A quick verify or quick confirm newer than it (L6-0001)
+        /// does not move it, and a volume with only quick ones (L6-0002) was
+        /// never verified — none of its bytes were read.
+        #[test]
+        fn a_quick_readback_does_not_count_as_verified() {
+            let conn = seed();
+            let id = |label: &str| -> i64 {
+                conn.query_row("SELECT id FROM volumes WHERE label = ?1", [label], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+            };
+            let before = volume_rows(&conn, None).unwrap();
+            let full_l6_0001 = before
+                .iter()
+                .find(|r| r.label == "L6-0001")
+                .unwrap()
+                .verified
+                .clone();
+            assert!(
+                full_l6_0001.is_some(),
+                "positive control: seeded full verify"
+            );
+            for label in ["L6-0001", "L6-0002"] {
+                conn.execute(
+                    "INSERT INTO verification_sessions (volume_id, verify_type, outcome, completed_at)
+                     VALUES (?1, 'quick', 'passed', datetime('now'))",
+                    [id(label)],
+                )
+                .unwrap();
+            }
+            let rows = volume_rows(&conn, None).unwrap();
+            let row = |label: &str| rows.iter().find(|r| r.label == label).unwrap();
+            assert_eq!(row("L6-0001").verified, full_l6_0001);
+            assert_eq!(row("L6-0002").verified, None);
         }
 
         /// Rule: `--status` narrows but is never the default filter, and it

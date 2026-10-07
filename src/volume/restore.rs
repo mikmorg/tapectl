@@ -444,8 +444,10 @@ fn catalog_file_size(
         None => Err(TapectlError::Other(format!(
             "unit \"{unit_name}\" version {} has no file \"{file_path}\" in the catalog's record \
              of what it archived, so the tape was not touched. A path is relative to the unit's \
-             root and matched exactly; `tapectl catalog search \"<words of the name>\"` finds one, \
-             and `tapectl catalog ls {unit_name}` lists the newest version's files.",
+             root and matched exactly; `tapectl catalog search \"<words of the name>\" \
+             --all-versions` finds one and names the versions that hold it (without \
+             `--all-versions` it searches each unit's newest version only), and `tapectl \
+             catalog ls {unit_name}` lists the newest version's files.",
             selection.version
         ))),
         Some((true, _)) => Err(TapectlError::Other(format!(
@@ -4813,6 +4815,12 @@ mod tests {
                 assert!(err.contains("has no file \"nope.txt\""), "{err}");
                 assert!(err.contains("tape was not touched"), "{err}");
                 assert!(err.contains("tapectl catalog search"), "{err}");
+                // `catalog search` looks in each unit's NEWEST version only;
+                // the version restored here may be an older one.
+                assert!(
+                    err.contains("tapectl catalog search \"<words of the name>\" --all-versions"),
+                    "{err}"
+                );
 
                 let err = file(
                     &r,

@@ -250,6 +250,19 @@ run_capture_json() {
   "$@" >"$f" 2> >(tee -a "$LOG" >&2)
   return $?
 }
+# run_capture_json_err JSONFILE ERRFILE cmd...: `run_capture_json`, and its
+# stderr kept in ERRFILE as well, for a caller that must read why it failed.
+# Stderr still streams to the terminal and the log as it comes (a full verify
+# runs for hours); the `wait` lets the tee finish ERRFILE before it is read.
+run_capture_json_err() {
+  local f="$1" e="$2"; shift 2
+  printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $*"
+  mkdir -p "$(dirname "$f")"
+  local rc=0
+  "$@" >"$f" 2> >(tee "$e" | tee -a "$LOG" >&2) || rc=$?
+  wait $! 2>/dev/null || true
+  return "$rc"
+}
 # run_nolog: for the one command whose output must never be written to disk
 run_nolog() { printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $* (output NOT logged)"; "$@"; }
 tc() { if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi; }
@@ -1132,6 +1145,15 @@ EOF
 try:
   d=json.load(open(sys.argv[1])); print("%s, condition %s" % (d.get("status","?"), d.get("condition","?")))
 except Exception: print("unknown")' "$VINFO" 2>/dev/null || echo unknown)"
+      if [ "$(volume_aborted_seal_recorded "$VINFO")" = yes ]; then
+        # ADR-0012, 2026-09-23: a session aborted after its seal was written
+        # is re-confirmed, not abandoned. A new label would leave a sealed
+        # cartridge that counts for nothing.
+        explain <<'EOF'
+THIS VOLUME'S WRITE SESSION WAS ABORTED AFTER ITS SEAL WAS WRITTEN. The cartridge is sealed, so it is never written again (ADR-0003) — and it does not need to be: `volume resume` re-confirms an aborted session whose seal is recorded, once a clean FULL verify has been recorded after the abort, and the volume then counts as a copy like any other. Keep its staged slices in place: the resume checks the tape against them. Load the SAME cartridge, run the two commands below, then re-run this step with the same label; it finds the volume sealed and carries on with the steps after the write.
+EOF
+        die "volume $LABEL ($VSTAT): run \`tapectl volume verify $LABEL --device $DEVICE --full\`, then \`tapectl volume resume $LABEL --device $DEVICE\`, then scripts/first-run.sh --from 13 --label $LABEL"
+      fi
       die "volume $LABEL already exists ($VSTAT) and is neither unwritten, interrupted nor sealed — \`tapectl volume info $LABEL\` shows its history. Choose a new label: scripts/first-run.sh --from 13 --label <new>"
       ;;
   esac
@@ -1358,9 +1380,19 @@ fi
   # just decided in one of the two cases, and never mentioned that the other had
   # silently changed the catalog.
   VERIFY_JSON="$(dirname "$LOG")/volume-verify-$LABEL.json"
-  if run_capture_json "$VERIFY_JSON" tc volume verify "$LABEL" --device "$DEVICE" --full --json; then
+  VERIFY_ERR="$(dirname "$LOG")/volume-verify-$LABEL.err"
+  if run_capture_json_err "$VERIFY_JSON" "$VERIFY_ERR" tc volume verify "$LABEL" --device "$DEVICE" --full --json; then
     ok "$LABEL sealed and verified"
   else
+    # The loaded tape is not this volume: verify corroborates the cartridge
+    # before reading anything (src/volume/binding.rs `corroborate_volume`)
+    # and refuses "wrong tape:" / "wrong cartridge:". Nothing was read or
+    # recorded, and neither the drive nor the medium is in question.
+    if grep -E "wrong (tape|cartridge):" "$VERIFY_ERR" >/dev/null 2>&1; then
+      note "The cartridge in $DEVICE is not $LABEL's: the verify refused before reading it (above)."
+      note "This is a different cartridge loaded, not a drive or a medium problem; nothing was recorded."
+      die "load $LABEL's cartridge (\`tapectl volume info $LABEL\` names it), then re-run scripts/first-run.sh --from 13 --label $LABEL"
+    fi
     # `quarantined` is the discriminator (src/cli/volume.rs, `volume verify
     # --json`): true = the medium was proved bad and the volume is now out of
     # service; false = the verify failed without proving anything about the
