@@ -277,19 +277,20 @@ pub fn for_cartridge(
 }
 
 /// The cartridge `volume write` is about to write: the one whose chip
-/// serial was just read, else the one the volume is bound to.
+/// serial was just read. Only when the chip gave no serial is it the one
+/// the volume is bound to: a serial that was read and matches no row is a
+/// cartridge the catalog does not know yet (ADR-0012: a cartridge is known
+/// by its chip serial), and showing the bound cartridge's figures for it
+/// would describe the wrong tape.
 fn cartridge_for_write(conn: &Connection, volume_id: i64, mam: &MamInfo) -> Result<Option<i64>> {
     if let Some(serial) = mam.serial.as_deref() {
-        if let Some(id) = conn
+        return Ok(conn
             .query_row(
                 "SELECT id FROM cartridges WHERE serial_number = ?1",
                 [serial],
                 |r| r.get(0),
             )
-            .optional()?
-        {
-            return Ok(Some(id));
-        }
+            .optional()?);
     }
     Ok(conn
         .query_row(
@@ -516,9 +517,11 @@ mod tests {
 
     /// `volume write`'s pre-flight block: the cartridge is found by the
     /// serial the write just read off the chip, its journalled page 0x17
-    /// warns, and the chip figures are the fresh reading's. A chip serial
-    /// the catalog does not know falls back to the cartridge the volume is
-    /// bound to; with neither, the chip reading alone is shown.
+    /// warns, and the chip figures are the fresh reading's. Only a chip
+    /// whose serial could NOT be read falls back to the cartridge the volume
+    /// is bound to; a serial that was read but is not registered is a
+    /// different cartridge, and never borrows the bound one's figures. With
+    /// neither, the chip reading alone is shown.
     #[test]
     fn preflight_lines_find_the_cartridge_by_its_chip_serial_or_its_binding() {
         let conn = crate::db::open_memory().unwrap();
@@ -564,18 +567,23 @@ mod tests {
             "the fresh chip reading: {text}"
         );
 
-        // An unknown serial: the volume's binding names the cartridge.
-        let mut stranger = chip.clone();
-        stranger.serial = Some("NOT-REGISTERED".into());
-        assert!(!preflight_lines(&conn, 9, &stranger)
-            .join("\n")
-            .contains("WARNING"));
         conn.execute(
             "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (1, 9)",
             [],
         )
         .unwrap();
-        assert!(preflight_lines(&conn, 9, &stranger)
+        // A serial read off the chip but not registered: some other
+        // cartridge is loaded, so the bound one's worn figures are not its.
+        let mut stranger = chip.clone();
+        stranger.serial = Some("NOT-REGISTERED".into());
+        assert!(!preflight_lines(&conn, 9, &stranger)
+            .join("\n")
+            .contains("WARNING"));
+        // No serial readable at all: the volume's binding names the
+        // cartridge, the only evidence of which tape this is.
+        let mut unread = chip.clone();
+        unread.serial = None;
+        assert!(preflight_lines(&conn, 9, &unread)
             .join("\n")
             .contains("WARNING: worn cartridge?"));
 
