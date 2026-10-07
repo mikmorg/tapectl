@@ -2814,9 +2814,11 @@ struct PlanRow {
 /// unit falls short of its policy on the audit's own terms
 /// (`coverage::Shortfall`: too few copies, a required location with no
 /// copy) come first, each carrying the shortfall, and the rest after, the
-/// size order kept within each group. It orders a listing: `volume write`
-/// selects every staged set regardless (`find_staged_data`), so here there
-/// is no selection for the flag to change.
+/// size order kept within each group; a unit whose policy cannot be
+/// resolved is in the first group, the error its finding. It orders a
+/// listing: `volume write` selects every staged set regardless
+/// (`find_staged_data`), so here there is no selection for the flag to
+/// change.
 fn staged_plan_rows(
     conn: &Connection,
     config: &Config,
@@ -2844,9 +2846,19 @@ fn staged_plan_rows(
     if policy_aware {
         for row in &mut rows {
             if let Some(unit) = crate::db::queries::get_unit_by_name(conn, &row.unit)? {
-                let short = crate::policy::coverage::unit_shortfall(conn, config, &unit)?;
-                if short.any() {
-                    row.finding = Some(short.describe());
+                // One unit's unresolvable policy (a bad `[policy]` value,
+                // say) is that row's finding, as `audit` reports it — not
+                // an abort of the whole listing.
+                match crate::policy::coverage::unit_shortfall(conn, config, &unit) {
+                    Ok(short) => {
+                        if short.any() {
+                            row.finding = Some(short.describe());
+                        }
+                    }
+                    Err(e @ crate::error::TapectlError::PolicyUnresolvable { .. }) => {
+                        row.finding = Some(format!("policy unresolvable: {e}"));
+                    }
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -2894,6 +2906,59 @@ mod tests {
         assert_eq!(units(&aware), ["small", "big"]);
         assert_eq!(aware[0].finding.as_deref(), Some("0 of 2 copies"));
         assert_eq!(aware[1].finding, None);
+    }
+
+    /// Issue #144 review: one staged unit whose dotfile `[policy]` cannot be
+    /// resolved (edited after staging) must not abort the whole
+    /// `volume plan --policy-aware` listing. Like `audit`, the row is shown
+    /// with the error as its finding, in the first group.
+    #[test]
+    fn plan_rows_show_an_unresolvable_policy_as_a_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".tapectl-unit.toml"),
+            "[unit]\nuuid = \"u-bad\"\nname = \"bad\"\ncreated = \"2026-01-01T00:00:00Z\"\n\
+             tenant = \"t\"\n\n[policy]\ncompression = \"bogus\"\n",
+        )
+        .unwrap();
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
+             INSERT INTO units (uuid, name, tenant_id, status) VALUES ('u-big', 'big', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, snapshot_type, status, source_path) VALUES
+                 (1, 1, 1, 'full', 'current', '/b'), (2, 1, 2, 'full', 'staged', '/b');
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size, total_encrypted_size) VALUES
+                 (1, 1, 'cleaned', 524288, 50), (2, 2, 'staged', 524288, 100);
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status) VALUES
+                 (1, 'S1', 'lto', 'p', 1, 'sealed'), (2, 'S2', 'lto', 'p', 1, 'sealed');
+             INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status) VALUES
+                 (1, 1, 1, 'completed'), (1, 1, 2, 'completed');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('u-bad', 'bad', 1, ?1, 'active')",
+            [dir.path().to_string_lossy().to_string()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO snapshots (id, unit_id, version, snapshot_type, status, source_path) VALUES
+                 (3, 2, 1, 'full', 'staged', '/s');
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size, total_encrypted_size) VALUES
+                 (3, 3, 'staged', 524288, 10);",
+        )
+        .unwrap();
+
+        let rows = staged_plan_rows(&conn, &Config::default(), true)
+            .expect("one unit's policy fault must not abort the listing");
+        let units: Vec<&str> = rows.iter().map(|r| r.unit.as_str()).collect();
+        assert_eq!(units, ["bad", "big"], "the unresolvable unit sorts first");
+        let finding = rows[0].finding.as_deref().unwrap();
+        assert!(
+            finding.starts_with("policy unresolvable: ") && finding.contains("compression"),
+            "the finding names the fault: {finding}"
+        );
+        assert_eq!(rows[1].finding, None);
     }
 
     /// Issue #146: `volume compact`'s destination-label prompt had no

@@ -295,7 +295,7 @@ fn refused_json(refused: &[RefusedUnit]) -> Vec<serde_json::Value> {
 fn print_refused_plain(refused: &[RefusedUnit]) {
     for r in refused {
         println!(
-            "  REFUSED (not archived): unit \"{}\" — its dotfile could not be parsed: {}",
+            "  REFUSED (not archived): unit \"{}\" — its dotfile was refused: {}",
             r.unit_name, r.reason
         );
     }

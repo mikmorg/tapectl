@@ -74,7 +74,7 @@ A few commands finish their work and then report a verdict through the exit code
 | [`host check`](cli/host.md#tapectl-host-check) | host is quiet | something tripped | an error |
 | [`config check`](cli/config.md#tapectl-config-check) | config valid | never used | config invalid (or an error) |
 | [`db fsck`](cli/db.md#tapectl-db-fsck) | clean | problems found (repaired or not) | database integrity is broken (or an error) |
-| [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed, or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; or (`sync`, `status`) a file, symlink or symlinked folder under the root belongs to no unit (an `OUTSIDE ANY UNIT` line names each); the rest ran, and each failure is an `error:` line | an error |
+| [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed (or, under `--policy-aware`, holds a `[policy]` value that does not resolve), or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; or (`sync`, `status`) a file, symlink or symlinked folder under the root belongs to no unit (an `OUTSIDE ANY UNIT` line names each); the rest ran, and each failure is an `error:` line | an error |
 
 Apart from `volume verify` and a busy catalog, every other command exits 0 on
 success and 2 on error.

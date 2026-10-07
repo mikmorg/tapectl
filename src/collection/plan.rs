@@ -34,7 +34,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::{CollectionConfig, Config};
-use crate::error::{Result, TapectlError};
+use crate::error::{PolicyLayer, Result, TapectlError};
 use crate::policy::coverage;
 
 use super::fingerprint::RefusedUnit;
@@ -74,7 +74,9 @@ const BLOCK_SIZE: u64 = 512 * 1024;
 /// `location_presence` predicates — are packed first
 /// (`selector::plan_batches_prioritised`). A never-archived unit always
 /// falls short; a changed unit whose current version already meets its
-/// policy does not, and waits behind the ones that do.
+/// policy does not, and waits behind the ones that do. A unit whose own
+/// dotfile `[policy]` cannot be resolved for that ranking is refused, not
+/// fatal to the plan.
 fn batches_for_budget(
     conn: &Connection,
     config: &Config,
@@ -83,13 +85,51 @@ fn batches_for_budget(
     limit: &str,
     policy_aware: bool,
 ) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
-    let scan = super::fingerprint::pending_units_for_collection(
+    let mut scan = super::fingerprint::pending_units_for_collection(
         conn,
         lib,
         &config.defaults.global_excludes,
     )?;
-    let synthetic: Vec<selector::PendingUnit> = scan
-        .pending
+
+    // Ranking resolves each pending unit's policy, which the scan above
+    // never did (it reads only `[excludes]`). A unit whose OWN dotfile
+    // fails to resolve — an invalid `[policy]` value — is refused here like
+    // any other dotfile fault (ADR-0012 2026-09-22: it refuses that unit,
+    // not the collection) and left out of every batch. Only the dotfile
+    // layer: a `[defaults]` or archive-set fault is not one unit's, and
+    // still aborts the plan.
+    let mut prioritised = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(scan.pending.len());
+    for p in std::mem::take(&mut scan.pending) {
+        if policy_aware {
+            match coverage::unit_shortfall(conn, config, &p.unit) {
+                Ok(short) => {
+                    if short.any() {
+                        prioritised.insert(p.unit.name.clone());
+                    }
+                }
+                Err(
+                    e @ TapectlError::PolicyUnresolvable {
+                        layer: PolicyLayer::Dotfile,
+                        ..
+                    },
+                ) => {
+                    scan.refused.push(RefusedUnit {
+                        unit_name: p.unit.name.clone(),
+                        path: std::path::Path::new(p.unit.current_path.as_deref().unwrap_or(""))
+                            .join(".tapectl-unit.toml")
+                            .display()
+                            .to_string(),
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        kept.push(p);
+    }
+    let synthetic: Vec<selector::PendingUnit> = kept
         .iter()
         .map(|p| selector::PendingUnit {
             name: p.unit.name.clone(),
@@ -98,12 +138,6 @@ fn batches_for_budget(
         .collect();
 
     let planned = if policy_aware {
-        let mut prioritised = std::collections::HashSet::new();
-        for p in &scan.pending {
-            if coverage::unit_shortfall(conn, config, &p.unit)?.any() {
-                prioritised.insert(p.unit.name.clone());
-            }
-        }
         selector::plan_batches_prioritised(synthetic, &prioritised, budget, BLOCK_SIZE)
     } else {
         selector::plan_batches(synthetic, budget, BLOCK_SIZE)
@@ -1866,5 +1900,103 @@ pattern = ["*.tmp"]
             "alpha and gamma must still be planned, got {planned_names:?}"
         );
         assert!(!planned_names.iter().any(|n| n == "testlib/beta"));
+    }
+
+    /// Issue #144 review: `--policy-aware` resolves every pending unit's
+    /// policy to rank it, and an invalid `[policy]` value in one unit's
+    /// dotfile (here a `compression` outside the closed set — the pending
+    /// scan lets it through, since it reads only `[excludes]`) used to abort
+    /// the whole plan. ADR-0012's 2026-09-22 ruling: a unit dotfile fault
+    /// refuses that unit, not the collection — so it is refused, named with
+    /// its dotfile, left out of every batch, and the other unit is planned,
+    /// on both `collection plan` and `collection run`'s planners.
+    #[test]
+    fn policy_aware_refuses_a_unit_whose_dotfile_policy_is_unresolvable() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 'media'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        for name in ["alpha", "beta"] {
+            let dir = root_path.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 1024]).unwrap();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                 VALUES (?1, ?2, ?3, ?4, 'active')",
+                params![
+                    format!("u-{name}"),
+                    format!("testlib/{name}"),
+                    tenant_id,
+                    dir.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let beta_dotfile = root_path.join("beta/.tapectl-unit.toml");
+        std::fs::write(
+            &beta_dotfile,
+            r#"
+[unit]
+uuid = "u-beta"
+name = "testlib/beta"
+created = "2026-01-01T00:00:00Z"
+tenant = "media"
+
+[policy]
+compression = "bogus"
+"#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('L1', 'lto', 'p', 4000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root_path.to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let config = config_with_tiny_backend();
+
+        let check = |batches: &[Batch], refused: &[RefusedUnit]| {
+            assert_eq!(refused.len(), 1, "exactly one unit refused: {refused:?}");
+            assert_eq!(refused[0].unit_name, "testlib/beta");
+            assert_eq!(
+                refused[0].path,
+                beta_dotfile.to_string_lossy().to_string(),
+                "must name the dotfile's own path"
+            );
+            assert!(
+                refused[0].reason.contains("compression"),
+                "the reason must carry the policy error: {}",
+                refused[0].reason
+            );
+            let planned: Vec<&str> = batches.iter().flat_map(|b| b.unit_names()).collect();
+            assert_eq!(planned, ["testlib/alpha"], "alpha batched, beta never");
+        };
+
+        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None, true)
+            .expect("one unit's [policy] fault must not abort `collection plan --policy-aware`");
+        check(&batches, &refused);
+
+        let label = ["L1".to_string()];
+        let (batches, _, refused) = plan_for_run(&conn, &config, &lib, "/dev/null", &label, true)
+            .expect("one unit's [policy] fault must not abort `collection run --policy-aware`");
+        check(&batches, &refused);
     }
 }
