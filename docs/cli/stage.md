@@ -20,13 +20,19 @@ tapectl stage [OPTIONS] <COMMAND>
 
 Create staged slices (validate → dar → encrypt → checksums)
 
+Several units may be named; `--jobs` stages that many at once.
+
 ```text
-tapectl stage create [OPTIONS] <NAME>
+tapectl stage create [OPTIONS] <NAME>...
 ```
 
 **Arguments**
 
-- `<NAME>` — Unit name
+- `<NAME>` — Unit name(s). Each unit's latest unstaged snapshot is staged (or `--version`'s, with one unit). Every name is checked before any unit is staged
+
+**Options**
+
+- `--jobs <JOBS>` — How many units to stage at once (1 to 16). Defaults to `[staging] jobs`, itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host's available memory cannot hold that many (each keeps up to 1 GiB of its source in the page cache)
 
 ### tapectl stage list
 

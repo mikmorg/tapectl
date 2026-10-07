@@ -73,6 +73,61 @@ pub fn acquire(db_file: &Path, stage_set_id: i64) -> Result<StageLock> {
     }
 }
 
+/// The staging admission lock (issue #368), held while one `stage create`
+/// checks staging space and records its stage set. Unlocks on drop.
+#[allow(dead_code)]
+pub struct AdmissionLock(Flock<File>);
+
+/// `<db_parent>/locks/stage-admission.lock` (issue #368). Never reclaimed:
+/// it is one fixed path every stage shares, and unlinking it under a holder
+/// would let a second stage lock a fresh inode at the same path.
+pub fn admission_lock_path(db_file: &Path) -> PathBuf {
+    let dir = db_file.parent().unwrap_or_else(|| Path::new("."));
+    dir.join("locks").join("stage-admission.lock")
+}
+
+/// Take the admission lock, waiting for it (issue #368). Two stages
+/// admitted at once could each see the other's unit as not yet staging and
+/// the other's space as not yet spoken for; under this lock the second
+/// sees the first's stage set, committed and locked, before it decides.
+/// It is held for milliseconds, except while a stage asks the operator
+/// about staging space — then the next stage waits for the answer rather
+/// than asking over it.
+pub fn acquire_admission(db_file: &Path) -> Result<AdmissionLock> {
+    let path = admission_lock_path(db_file);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| {
+            TapectlError::Other(format!(
+                "could not open the staging admission lockfile {}: {e}",
+                path.display()
+            ))
+        })?;
+    let mut file = file;
+    let mut _wait = None;
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => return Ok(AdmissionLock(flock)),
+            Err((back, _)) => file = back,
+        }
+        if _wait.is_none() {
+            _wait = Some(crate::progress::wait(|| {
+                "another stage create checking staging space".into()
+            }));
+        }
+        // Blocking would not notice a signal; a short sleep between tries
+        // does, and the lock is held for milliseconds.
+        crate::signal::check(|| "stopped while waiting to start staging".into())?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Probe whether `stage_set_id`'s lock is currently free — i.e. no live
 /// process holds it — WITHOUT leaving any lock held afterward.
 ///

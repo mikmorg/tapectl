@@ -399,7 +399,7 @@ pub fn progress_session_name(command: &Commands) -> Option<String> {
     Some(match command {
         Commands::Stage {
             command: S::Create { name, .. },
-        } => format!("stage create {name}"),
+        } => format!("stage create {}", name.join(" ")),
         Commands::QuickArchive { volume, .. } => format!("quick-archive {volume}"),
         Commands::Collection {
             command: C::Run { collection, .. },

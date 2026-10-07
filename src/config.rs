@@ -691,6 +691,25 @@ impl Default for DefaultsConfig {
 pub struct StagingConfig {
     #[serde(default = "default_staging_dir")]
     pub directory: String,
+    /// How many source files one `stage create` hashes at once (issue
+    /// #366), at most the host's cores. Each thread reads its own file, so
+    /// on a single spinning disk more threads can mean more seeking; 1 is
+    /// the serial pass.
+    #[serde(default = "default_hash_threads")]
+    pub hash_threads: usize,
+    /// How many units `stage create`, `collection run` and first-run stage
+    /// at once (issue #368); `stage create --jobs` and `collection run
+    /// --jobs` override it. 1 stages one unit after another.
+    #[serde(default = "default_stage_jobs")]
+    pub jobs: usize,
+}
+
+fn default_stage_jobs() -> usize {
+    crate::staging::jobs::DEFAULT_JOBS
+}
+
+fn default_hash_threads() -> usize {
+    crate::staging::validate::DEFAULT_HASH_THREADS
 }
 
 /// Issue #140: this was `/mnt/staging`, a path that does not exist on a
@@ -716,6 +735,8 @@ impl Default for StagingConfig {
     fn default() -> Self {
         Self {
             directory: default_staging_dir(),
+            hash_threads: default_hash_threads(),
+            jobs: default_stage_jobs(),
         }
     }
 }
@@ -1272,6 +1293,28 @@ impl Config {
                  is flagged when its corrected read errors per GiB rise by more than this \
                  factor between two verifies)",
                 path.display()
+            ));
+        }
+        // `[staging] hash_threads` (issue #366): 0 would hash nothing, and a
+        // count past any host's cores is a typo, not a plan.
+        let threads = self.staging.hash_threads;
+        if !(1..=crate::staging::validate::MAX_HASH_THREADS).contains(&threads) {
+            problems.push(format!(
+                "{}: staging.hash_threads = {threads} must be between 1 and {} (how many \
+                 source files `stage create` hashes at once; it never runs more than the \
+                 host's cores)",
+                path.display(),
+                crate::staging::validate::MAX_HASH_THREADS
+            ));
+        }
+        // `[staging] jobs` (issue #368).
+        let jobs = self.staging.jobs;
+        if !(1..=crate::staging::jobs::MAX_JOBS).contains(&jobs) {
+            problems.push(format!(
+                "{}: staging.jobs = {jobs} must be between 1 and {} (how many units \
+                 `stage create` and `collection run` stage at once)",
+                path.display(),
+                crate::staging::jobs::MAX_JOBS
             ));
         }
         // `[host_check]`: a load threshold of 0 or below would make every
@@ -3152,6 +3195,39 @@ mod tests {
         let err = Config::load(&path).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("compaction.utilization_threshold"), "{msg}");
+    }
+
+    /// Issue #368: `[staging] jobs` is 1 to 16, 1 by default.
+    #[test]
+    fn config_load_takes_staging_jobs_and_refuses_zero() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[staging]\njobs = 0\n").unwrap();
+        let msg = Config::load(&path).unwrap_err().to_string();
+        assert!(msg.contains("staging.jobs = 0"), "{msg}");
+        std::fs::write(&path, "[staging]\njobs = 17\n").unwrap();
+        assert!(Config::load(&path).is_err());
+        std::fs::write(&path, "[staging]\njobs = 3\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().staging.jobs, 3);
+        std::fs::write(&path, "[staging]\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().staging.jobs, 1);
+    }
+
+    /// Issue #366: `[staging] hash_threads` is 1 to 64; 0 would hash nothing.
+    #[test]
+    fn config_load_takes_hash_threads_and_refuses_zero() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[staging]\nhash_threads = 0\n").unwrap();
+        let msg = Config::load(&path).unwrap_err().to_string();
+        assert!(msg.contains("staging.hash_threads = 0"), "{msg}");
+        std::fs::write(&path, "[staging]\nhash_threads = 2\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().staging.hash_threads, 2);
+        std::fs::write(&path, "[staging]\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().staging.hash_threads,
+            crate::staging::validate::DEFAULT_HASH_THREADS
+        );
     }
 
     #[test]

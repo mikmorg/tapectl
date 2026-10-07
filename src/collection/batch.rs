@@ -164,19 +164,37 @@ pub fn execute_batch(
     // whole batch regardless, so a batch of 40 where 3 hit either no-op
     // still reported "40 unit(s) staged". Count only the arms that actually
     // call `stage_create`, and report that instead.
+    //
+    // Issue #368: with `[staging] jobs` above 1, every unit's snapshot is
+    // taken first and the units to stage are then staged that many at once
+    // (`staging::jobs::stage_many`). With 1, each unit is staged as soon as
+    // its snapshot is taken, as before.
+    let parallel = config.staging.jobs > 1;
+    let mut to_stage: Vec<crate::staging::jobs::StageJob> = Vec::new();
+    let mut stage = |name: &str, snapshot_id: i64| -> Result<()> {
+        if parallel {
+            to_stage.push(crate::staging::jobs::StageJob {
+                unit_name: name.to_string(),
+                snapshot_id,
+            });
+        } else {
+            crate::staging::stage_create(conn, paths, config, snapshot_id, assume_yes)?;
+        }
+        Ok(())
+    };
     let mut units_staged = 0usize;
     for u in &batch.units {
         let outcome = crate::staging::snapshot_create_detailed(conn, &u.name, config)?;
         match (outcome.minted, outcome.status.as_str()) {
             // A fresh version was minted — always needs staging.
             (true, _) => {
-                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id, assume_yes)?;
+                stage(&u.name, outcome.snapshot_id)?;
                 units_staged += 1;
             }
             // Existing but never-staged content (ADR-0012 reuse, Change 3)
             // — the row already exists, but its slices don't yet.
             (false, "created") => {
-                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id, assume_yes)?;
+                stage(&u.name, outcome.snapshot_id)?;
                 units_staged += 1;
             }
             // Already staged: a stage_set with live slices exists for this
@@ -206,10 +224,23 @@ pub fn execute_batch(
                     status = other,
                     "unminted snapshot with an unexpected status — staging anyway"
                 );
-                crate::staging::stage_create(conn, paths, config, outcome.snapshot_id, assume_yes)?;
+                stage(&u.name, outcome.snapshot_id)?;
                 units_staged += 1;
             }
         }
+    }
+    if !to_stage.is_empty() {
+        let outcomes = crate::staging::jobs::stage_many(
+            conn,
+            paths,
+            config,
+            &to_stage,
+            config.staging.jobs,
+            assume_yes,
+            &mut std::io::stderr(),
+            &crate::progress::stderr_println,
+        )?;
+        crate::staging::jobs::first_failure(outcomes)?;
     }
 
     // Session per copy — sequential, abort-on-first-failure (see doc
@@ -509,6 +540,7 @@ mod tests {
         let mut config = Config {
             staging: crate::config::StagingConfig {
                 directory: dir.to_string_lossy().to_string(),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -885,6 +917,76 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<_, _>>()
             .unwrap()
+    }
+
+    /// Issue #368: with `[staging] jobs = 2`, `collection run` stages the
+    /// batch's units two at a time, and each is staged exactly as one at a
+    /// time would stage it.
+    #[test]
+    fn execute_batch_stages_jobs_units_at_once() {
+        let (conn, paths, mut config, tmp, device) = stageable_batch_fixture();
+        // A second unit, beside `unit1`; both large enough to overlap.
+        let src2 = tmp.path().join("src2");
+        std::fs::create_dir_all(&src2).unwrap();
+        for (dir, n) in [(tmp.path().join("src"), 6), (src2.clone(), 6)] {
+            for f in 0..n {
+                let data: Vec<u8> = (0..400_000usize)
+                    .map(|j| ((j * 7 + f) % 251) as u8)
+                    .collect();
+                std::fs::write(dir.join(format!("big{f}.bin")), data).unwrap();
+            }
+        }
+        crate::unit::init_unit(
+            &conn,
+            &paths,
+            src2.to_str().unwrap(),
+            "alice",
+            Some("unit2"),
+            &[],
+            None,
+        )
+        .unwrap();
+        config.staging.jobs = 2;
+        config.defaults.compression = "none".to_string();
+        crate::staging::jobs::MEMORY_OVERRIDE.with(|m| m.set(Some(1 << 40)));
+        let batch = Batch {
+            units: ["unit1", "unit2"]
+                .iter()
+                .map(|n| PendingUnit {
+                    name: (*n).into(),
+                    size_bytes: 10,
+                })
+                .collect(),
+            total_bytes: 20,
+            padded_bytes: 20,
+        };
+        let err = execute_batch(
+            &conn,
+            &paths,
+            &config,
+            &batch,
+            &["VOL-B".to_string()],
+            &device,
+            512 * 1024,
+            false,
+            true,
+        )
+        .expect_err("the sealed destination is not a write target");
+        assert!(
+            matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+            "both units staged, then the write: {err}"
+        );
+        assert_eq!(
+            stage_set_statuses(&conn),
+            vec!["staged".to_string(), "staged".to_string()]
+        );
+        assert_eq!(
+            crate::staging::jobs::in_flight::most(
+                &crate::staging::lock::db_file_of(&conn).unwrap()
+            ),
+            2,
+            "the two units were staged at once"
+        );
     }
 
     /// Issue #354 (b): `execute_batch` carries the global `--yes` to

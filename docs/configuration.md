@@ -185,6 +185,8 @@ by" names the commands whose behaviour the key changes.
 | Key | Type | Default | What it does | Read by |
 |---|---|---|---|---|
 | `directory` | string (path) | `<home>/staging` as written by `init` | Where `stage create` puts the encrypted slices waiting for tape, and where write sessions keep their working files. It must be writable and, ideally, big enough for a full cartridge. `config check` warns when it is not. | [`stage create`](cli/stage.md#tapectl-stage-create), [`volume write`](cli/volume.md#tapectl-volume-write), [`volume read-slices`](cli/volume.md#tapectl-volume-read-slices), [`volume compact-read`](cli/volume.md#tapectl-volume-compact-read), [`staging status/clean`](cli/staging.md), [`collection run`](cli/collection.md#tapectl-collection-run) |
+| `hash_threads` | integer, 1 to 64 | `4` | How many source files one `stage create` reads and hashes at once, beside dar. Files are handed out in dar's read order and their hashes recorded in that order, so the result is the same at any setting; only the speed changes. It never runs more threads than the host has cores. Every file is still read within 1 GiB of where dar reads (the source leaves its disk once), so threads run at once only over files that fit in that window: a unit of many small files gains, one of a few large files is hashed about a file at a time. Each thread reads its own file, so on a single spinning disk more threads can mean more seeking: if a stage reads the source slower than before, try `2` or `1` (the one-file-at-a-time pass). | [`stage create`](cli/stage.md#tapectl-stage-create), [`collection run`](cli/collection.md#tapectl-collection-run), [`quick-archive`](cli/quick-archive.md) |
+| `jobs` | integer, 1 to 16 | `1` | How many units are staged at once when several are staged together: `stage create` with several unit names, `collection run`, and first-run's staging step. `--jobs` on `stage create` and `collection run` overrides it for one run. The largest units start first, each prints a line as it starts and ends, and after a failure no further unit is started (the ones running finish). Each stage in flight keeps up to 1 GiB of its source in the page cache, so fewer run when the host's available memory cannot hold that many, and it says so. The stages share the cores: each hashes with its share of `hash_threads`. | [`stage create`](cli/stage.md#tapectl-stage-create), [`collection run`](cli/collection.md#tapectl-collection-run) |
 
 `init` always writes the real path. If you delete the key while using a
 non-default home, the fallback is `$HOME/.tapectl/staging`, not `<home>/staging`,
@@ -198,7 +200,9 @@ for each file, for which the check allows up to 1 KiB a file. When the free spac
 below that, the stage only *may* not fit (with compression on, how far dar shrinks the
 data cannot be known in advance, and dar stores runs of zeros and hard-linked files in
 less space), so you are asked on a terminal. `--yes` proceeds, and a non-interactive run
-without `--yes` refuses.
+without `--yes` refuses. Other stages running at the same time, in this command
+or another, count against the free space: what each may still write is set
+aside before this unit is checked.
 
 ### `[defaults]`
 

@@ -572,7 +572,26 @@ staging, never the plaintext archive: dar writes its archive to standard
 output, and tapectl cuts and encrypts it in memory. At its peak staging holds
 the unit's slices, about the unit's size. The source is read once: each file
 is hashed within 1 GiB of dar reading it, so the second read comes from the
-page cache.
+page cache. `[staging] hash_threads` files are hashed at once (4 by default,
+never more than the cores) when they fit in that 1 GiB, as many small files do;
+on a single spinning disk, fewer may read faster.
+
+**Several units at once.** `stage create` takes several unit names, and
+`--jobs N` (or `[staging] jobs` in `config.toml`) stages N of them at a time,
+the largest first:
+
+```bash
+tapectl stage create family/letters family/photos family/video --jobs 2
+```
+
+Each unit prints a line as it starts and ends, and the `staged:` lines follow;
+while several run there is no live progress line.
+Every name is checked before anything is staged. If one unit fails, no further
+unit is started; the ones already running finish and stay staged, and the error
+names what was staged, what failed and what was not started. `collection run
+--jobs N` and first-run's staging step stage the same way. A unit is never
+staged twice at once: a second `stage create` of a unit that is being staged
+right now is refused.
 
 Before reading anything, it compares the free space with the unit's size (plus
 dar's records). If free space is below that, the unit may or may not fit

@@ -1,6 +1,7 @@
 pub mod clean;
 pub mod exclude;
 mod files;
+pub mod jobs;
 pub mod lock;
 #[cfg(test)]
 mod plaintext_audit;
@@ -587,6 +588,13 @@ fn stage_create_inner(
     // there, and the only files it can create are ciphertext (issue #370).
     let staging_dir = Path::new(&config.staging.directory);
     let staging = files::StagingDir::prepare(staging_dir)?;
+    // Issue #368: stages may run at once (`stage create --jobs`, or two
+    // commands). From here to the stage set's commit below, one stage at a
+    // time: so the next one sees this unit as staging, and this stage's
+    // space as spoken for, before it decides anything of its own.
+    let admission = lock::acquire_admission(&paths.db_file)?;
+    refuse_a_unit_already_staging(conn, &paths.db_file, &snapshot, &unit.name)?;
+    let in_flight = in_flight_staging(conn, &paths.db_file)?;
     check_staging_space(
         &StagingSpaceInputs {
             staging_dir,
@@ -594,6 +602,7 @@ fn stage_create_inner(
             snapshot: &snapshot,
             compression: &compression,
             assume_yes,
+            in_flight,
         },
         notices,
     )?;
@@ -634,19 +643,29 @@ fn stage_create_inner(
     // so this does not reintroduce the long-running-transaction problem the
     // rest of this function's comments warn about (the dar run below stays
     // entirely outside any transaction, exactly as before).
-    let insert_tx = conn.unchecked_transaction()?;
-    insert_tx.execute(
-        "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
-         VALUES (?1, ?2, ?3, 1)",
-        params![snapshot_id, resolved.slice_size, compression],
-    )?;
-    let stage_set_id = insert_tx.last_insert_rowid();
+    #[cfg(test)]
+    failpoint::hit(failpoint::BEFORE_RECORD)?;
+    //
+    // Issue #368: other stages may hold the catalog meanwhile, so the whole
+    // sequence is retried under the busy policy (#377); an attempt that
+    // fails rolls back and drops its lock.
+    let (stage_set_id, stage_lock) = busy::retry(BusyPolicy::DEFAULT, "the new stage set", || {
+        let insert_tx = busy::immediate_tx(conn)?;
+        insert_tx.execute(
+            "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
+                 VALUES (?1, ?2, ?3, 1)",
+            params![snapshot_id, resolved.slice_size, compression],
+        )?;
+        let stage_set_id = insert_tx.last_insert_rowid();
+        let stage_lock = lock::acquire(&paths.db_file, stage_set_id)?;
+        insert_tx.commit()?;
+        Ok((stage_set_id, stage_lock))
+    })?;
     stage_set_id_holder.set(Some(stage_set_id));
-
-    let stage_lock = lock::acquire(&paths.db_file, stage_set_id)?;
     lock_holder.set(Some(stage_lock));
-
-    insert_tx.commit()?;
+    // The stage set is committed and locked: the next stage to be admitted
+    // sees it.
+    drop(admission);
 
     // Step 1: the source against the snapshot, by metadata alone (issue
     // #364). A missing file or one at another size still refuses before dar.
@@ -739,7 +758,13 @@ fn stage_create_inner(
     // The source's sha256s, read beside dar and within
     // `validate::READ_AHEAD_BYTES` of it, so each file leaves the disk once
     // (issue #364). Stopped and joined on every way out.
-    let hashing = validate::ConcurrentHash::spawn(PathBuf::from(&snapshot.source_path), plan)?;
+    // `[staging] hash_threads` files at once (issue #366), handed out in dar's
+    // read order and recorded in it.
+    let hashing = validate::ConcurrentHash::spawn(
+        PathBuf::from(&snapshot.source_path),
+        plan,
+        validate::hash_threads(config.staging.hash_threads),
+    )?;
     let mut dar_run = dar::create::spawn_archive(&dar::create::DarCreateParams {
         dar_binary: &config.dar.binary,
         source_path: Path::new(&snapshot.source_path),
@@ -757,10 +782,15 @@ fn stage_create_inner(
          (the framing `dar_xform -s {slice_size} - <base>` gives) and age-encrypts each",
         dar_run.dar_command
     );
-    conn.execute(
-        "UPDATE stage_sets SET dar_version = ?1, dar_command = ?2 WHERE id = ?3",
-        params![dar_run.dar_version, dar_command, stage_set_id],
-    )?;
+    // Issue #368: other stages may hold the catalog for a moment; a stage
+    // records its progress through the busy policy (#377), never failing on
+    // a five-second wait.
+    busy::retry(BusyPolicy::DEFAULT, "the stage set's dar command", || {
+        Ok(conn.execute(
+            "UPDATE stage_sets SET dar_version = ?1, dar_command = ?2 WHERE id = ?3",
+            params![dar_run.dar_version, dar_command, stage_set_id],
+        )?)
+    })?;
 
     let mut total_dar_size: i64 = 0;
     let mut total_encrypted_size: i64 = 0;
@@ -866,10 +896,12 @@ fn stage_create_inner(
     // 11 above. Only then is the source validated.
     let phase = progress::phase("recheck", None);
     validate::recheck(Path::new(&snapshot.source_path), &hashed)?;
-    conn.execute(
-        "UPDATE stage_sets SET source_validated_at = datetime('now') WHERE id = ?1",
-        params![stage_set_id],
-    )?;
+    busy::retry(BusyPolicy::DEFAULT, "the source check", || {
+        Ok(conn.execute(
+            "UPDATE stage_sets SET source_validated_at = datetime('now') WHERE id = ?1",
+            params![stage_set_id],
+        )?)
+    })?;
     let checksums = hashed.checksums();
     phase.done();
 
@@ -888,10 +920,12 @@ fn stage_create_inner(
     secure_catalog_files(&catalog_dir);
     // ...and nor did it sync it (issue #409).
     sync_catalogue(&catalog_base)?;
-    conn.execute(
-        "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
-        params![catalog_base.to_string_lossy().to_string(), stage_set_id],
-    )?;
+    busy::retry(BusyPolicy::DEFAULT, "the stage set's catalogue", || {
+        Ok(conn.execute(
+            "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
+            params![catalog_base.to_string_lossy().to_string(), stage_set_id],
+        )?)
+    })?;
     phase.done();
 
     // Issue #54: finalization only, not the whole pipeline, runs inside a
@@ -1518,6 +1552,90 @@ struct StagingSpaceInputs<'a> {
     /// Tier-2 consent given in advance (the global `--yes`) for a stage
     /// that may not fit (issue #354).
     assume_yes: bool,
+    /// What the other stages running now may still write (issue #368).
+    in_flight: InFlight,
+}
+
+/// The other stages running now, and the most they may still write to
+/// staging (issue #368): each one's upper bound less the slices it has
+/// already written. Without it, stages started together each saw the whole
+/// free space as theirs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InFlight {
+    stages: usize,
+    bytes: i64,
+}
+
+/// The most a stage of a snapshot of `total_size` bytes in `file_count`
+/// files writes to staging with `compression = none` (see
+/// [`StagingSpaceInputs::upper`]).
+fn stage_upper_bound(total_size: Option<i64>, file_count: Option<i64>) -> i64 {
+    StagingSpaceInputs::peak(
+        total_size.unwrap_or(0).saturating_add(
+            file_count
+                .unwrap_or(0)
+                .saturating_mul(DAR_ENTRY_OVERHEAD_BYTES),
+        ),
+    )
+}
+
+/// Every stage set being staged by a live process right now (its lock is
+/// held; issue #98), and what it may still write (issue #368).
+fn in_flight_staging(conn: &Connection, db_file: &Path) -> Result<InFlight> {
+    let rows: Vec<(i64, Option<i64>, Option<i64>, i64)> = conn
+        .prepare(
+            "SELECT ss.id, sn.total_size, sn.file_count,
+                    (SELECT COALESCE(SUM(sl.encrypted_bytes), 0) FROM stage_slices sl
+                     WHERE sl.stage_set_id = ss.id)
+             FROM stage_sets ss JOIN snapshots sn ON sn.id = ss.snapshot_id
+             WHERE ss.status = 'staging'",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut in_flight = InFlight::default();
+    for (id, total_size, file_count, written) in rows {
+        if lock::is_crashed(db_file, id) {
+            continue;
+        }
+        in_flight.stages += 1;
+        in_flight.bytes = in_flight.bytes.saturating_add(
+            stage_upper_bound(total_size, file_count)
+                .saturating_sub(written)
+                .max(0),
+        );
+    }
+    Ok(in_flight)
+}
+
+/// Refuse to stage a snapshot a live process is staging right now (issue
+/// #368): two stage sets of one snapshot at once would be the same archive
+/// made twice, each with its own catalogue, for one version. A sibling that
+/// is already `staged` is not refused here: whether a second stage set of a
+/// version is wanted is the caller's question (`stage create` refuses it
+/// unless the first was released; `collection run` skips a staged unit).
+fn refuse_a_unit_already_staging(
+    conn: &Connection,
+    db_file: &Path,
+    snapshot: &models::Snapshot,
+    unit_name: &str,
+) -> Result<()> {
+    let sets: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM stage_sets
+             WHERE snapshot_id = ?1 AND status = 'staging' ORDER BY id",
+        )?
+        .query_map(params![snapshot.id], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for id in sets {
+        if !lock::is_crashed(db_file, id) {
+            return Err(TapectlError::Other(format!(
+                "unit \"{unit_name}\" v{} is being staged right now (stage set {id}, by \
+                 another `stage create`) — refusing to stage it twice at once",
+                snapshot.version
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl StagingSpaceInputs<'_> {
@@ -1534,13 +1652,7 @@ impl StagingSpaceInputs<'_> {
     /// recorded size — the sum of its regular files' apparent sizes — plus
     /// [`DAR_ENTRY_OVERHEAD_BYTES`] a file.
     fn upper(&self) -> i64 {
-        let files = self.snapshot.file_count.unwrap_or(0);
-        Self::peak(
-            self.snapshot
-                .total_size
-                .unwrap_or(0)
-                .saturating_add(files.saturating_mul(DAR_ENTRY_OVERHEAD_BYTES)),
-        )
+        stage_upper_bound(self.snapshot.total_size, self.snapshot.file_count)
     }
 
     fn free(&self, notices: &mut dyn Write) -> Option<i64> {
@@ -1581,9 +1693,21 @@ fn check_staging_space(inputs: &StagingSpaceInputs, notices: &mut dyn Write) -> 
         return Ok(());
     };
     let upper = inputs.upper();
-    if free >= upper {
+    // Issue #368: what the stages running beside this one may still write
+    // is not free for this one.
+    let spoken_for = inputs.in_flight.bytes;
+    if free.saturating_sub(spoken_for) >= upper {
         return Ok(());
     }
+    let in_flight = if inputs.in_flight.stages > 0 {
+        format!(
+            " ({} of it may still be written by {} other stage(s) running now)",
+            fmt(spoken_for),
+            inputs.in_flight.stages
+        )
+    } else {
+        String::new()
+    };
     let how = if inputs.compression == "none" {
         "dar stores runs of zeros as holes and a hard-linked file once".to_string()
     } else {
@@ -1595,9 +1719,9 @@ fn check_staging_space(inputs: &StagingSpaceInputs, notices: &mut dyn Write) -> 
     ask_to_stage_anyway(
         inputs,
         format!(
-            "staging directory {} may be too small for unit \"{}\": {} free, and staging it \
-             needs up to {}, its encrypted slices at the snapshot's full size (less if {how}); \
-             {STAGING_RUNS_OUT}",
+            "staging directory {} may be too small for unit \"{}\": {} free{in_flight}, and \
+             staging it needs up to {}, its encrypted slices at the snapshot's full size (less \
+             if {how}); {STAGING_RUNS_OUT}",
             inputs.staging_dir.display(),
             inputs.unit_name,
             fmt(free),
@@ -1631,7 +1755,9 @@ fn ask_to_stage_anyway(
 
 /// What happens to a stage that proceeds and then runs out of staging.
 const STAGING_RUNS_OUT: &str =
-    "if it runs out, the stage stops there and its partial slices are removed";
+    "if it runs out, the stage stops there and its partial slices are removed. \
+     `tapectl staging status` shows what staging holds; a bare `tapectl staging clean` \
+     frees what failed stages left and what is already on tape";
 
 #[cfg(test)]
 thread_local! {
@@ -1842,6 +1968,9 @@ pub(crate) mod failpoint {
     /// Right after dar has finished and its command is recorded.
     pub(crate) const AFTER_DAR: &str = "after dar";
 
+    /// Just before the stage set is recorded.
+    pub(crate) const BEFORE_RECORD: &str = "before the stage set is recorded";
+
     thread_local! {
         static ARMED: Cell<Option<&'static str>> = const { Cell::new(None) };
     }
@@ -1851,7 +1980,32 @@ pub(crate) mod failpoint {
         ARMED.with(|a| a.set(Some(point)));
     }
 
+    /// A failure point and what to run when it is reached.
+    type Hook = (&'static str, Box<dyn FnOnce()>);
+
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `hook` the next time `point` is reached on this thread.
+    pub(crate) fn on(point: &'static str, hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some((point, Box::new(hook))));
+    }
+
     pub(crate) fn hit(point: &'static str) -> Result<()> {
+        let hook = HOOK.with(|h| {
+            let mut h = h.borrow_mut();
+            match h.take() {
+                Some((p, f)) if p == point => Some(f),
+                other => {
+                    *h = other;
+                    None
+                }
+            }
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
         if ARMED.with(|a| a.get()) == Some(point) {
             ARMED.with(|a| a.set(None));
             return Err(TapectlError::Other(format!("injected failure: {point}")));
@@ -3577,6 +3731,148 @@ mod tests {
         );
     }
 
+    /// Issue #368: a stage counts what the stages running beside it may still
+    /// write. Free space enough for this unit alone, but not for it and the
+    /// other stage's remaining slices, is asked about — refused without
+    /// consent — while the other stage's lock is held; once that stage is
+    /// gone (its lock free), the same space is this one's.
+    #[test]
+    fn staging_space_counts_the_stages_running_beside_it() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        write_dense_file(&src.join("a.bin"), 64 * 1024);
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let snapshot = get_snapshot(&conn, snap_id).unwrap();
+
+        // Another stage in flight: a 10 MiB snapshot, 4 MiB of it written.
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path,
+                                    total_size, file_count)
+             VALUES (?1, 2, 'full', 'created', '/elsewhere', ?2, 1)",
+            params![snapshot.unit_id, 10i64 << 20],
+        )
+        .unwrap();
+        let other_snap = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
+             VALUES (?1, 1048576, 'none', 1)",
+            params![other_snap],
+        )
+        .unwrap();
+        let other = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, ?2, ?2, 'p', 'e', '/elsewhere/s.1.dar.age')",
+            params![other, 4i64 << 20],
+        )
+        .unwrap();
+        let other_lock = lock::acquire(&paths.db_file, other).unwrap();
+
+        let still_to_write = stage_upper_bound(Some(10 << 20), Some(1)) - (4 << 20);
+        let free = upper_bound(&snapshot) + still_to_write / 2;
+        let _free = FreeSpaceOverride::set(free as u64);
+
+        let mut notices = Vec::new();
+        let err = stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut notices)
+            .expect_err("this unit and the other stage's rest do not both fit")
+            .to_string();
+        assert!(
+            err.contains("may be too small for unit \"unit1\"")
+                && err.contains("may still be written by 1 other stage(s) running now")
+                && err.contains("refused"),
+            "{err}"
+        );
+
+        drop(other_lock);
+        stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut Vec::new())
+            .expect("the other stage is gone: the space is this unit's");
+    }
+
+    /// Issue #368: a unit is never staged twice at once. While another
+    /// process stages this snapshot (its stage set `staging`, its lock
+    /// held), a second stage of it is refused before it records anything;
+    /// once that holder is gone the row is a crashed stage, and staging
+    /// goes ahead.
+    #[test]
+    fn a_unit_being_staged_right_now_is_not_staged_again() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        write_dense_file(&src.join("a.bin"), 64 * 1024);
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
+             VALUES (?1, 1048576, 'none', 1)",
+            params![snap_id],
+        )
+        .unwrap();
+        let other = conn.last_insert_rowid();
+        let other_lock = lock::acquire(&paths.db_file, other).unwrap();
+
+        let err = stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut Vec::new())
+            .expect_err("the same snapshot is being staged")
+            .to_string();
+        assert!(
+            err.contains("unit \"unit1\" v1 is being staged right now")
+                && err.contains(&format!("stage set {other}")),
+            "{err}"
+        );
+        let sets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sets, 1, "nothing recorded for the refused stage");
+
+        drop(other_lock);
+        stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut Vec::new())
+            .expect("its holder is gone: staging goes ahead");
+    }
+
+    /// Issue #368 (and #377's rule 3): a stage's writes wait out a catalog
+    /// another stage holds past `busy_timeout`, rather than fail — before
+    /// dar (recording the stage set, which with `--jobs` would stop the
+    /// run) and after it (a finished archive). Another connection takes the
+    /// write lock at that point and keeps it for longer than the 5-second
+    /// wait.
+    #[test]
+    fn a_catalog_held_past_busy_timeout_is_waited_out_before_dar() {
+        catalog_held_past_busy_timeout_is_waited_out_at(failpoint::BEFORE_RECORD);
+    }
+
+    #[test]
+    fn a_catalog_held_past_busy_timeout_is_waited_out_after_dar() {
+        catalog_held_past_busy_timeout_is_waited_out_at(failpoint::AFTER_DAR);
+    }
+
+    fn catalog_held_past_busy_timeout_is_waited_out_at(point: &'static str) {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        write_dense_file(&src.join("a.bin"), 64 * 1024);
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let db = paths.db_file.clone();
+        failpoint::on(point, move || {
+            let (held, taken) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let other = rusqlite::Connection::open(&db).unwrap();
+                other.execute_batch("BEGIN IMMEDIATE").unwrap();
+                held.send(()).unwrap();
+                // `db::open`'s busy_timeout is 5 s.
+                std::thread::sleep(std::time::Duration::from_secs(7));
+                other.execute_batch("COMMIT").unwrap();
+            });
+            taken.recv().unwrap();
+        });
+        let id = stage_create_reporting(&conn, &paths, &config, snap_id, false, &mut Vec::new())
+            .expect("the lock is waited out");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM stage_sets WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "staged");
+    }
+
     /// A hard-linked file is one inode, which dar stores once, while the
     /// snapshot's recorded size counts every link — so the figure overstates
     /// the need, and a unit that fits must not be turned away: asked about,
@@ -3760,6 +4056,12 @@ mod tests {
             "the refusal carries the figures: {msg}"
         );
         assert!(!msg.contains("dar-must-never-run"), "before dar: {msg}");
+        // Issue #409: it names the fix, since what fills staging is often a
+        // failed stage's files or slices already on tape.
+        assert!(
+            msg.contains("`tapectl staging status`") && msg.contains("`tapectl staging clean`"),
+            "names what frees staging: {msg}"
+        );
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
             .unwrap();

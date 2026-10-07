@@ -218,6 +218,7 @@ fn setup_mhvtl(name: &str) -> Harness {
     config.dar.binary = find_dar();
     config.staging = StagingConfig {
         directory: staging_dir.to_string_lossy().into_owned(),
+        ..Default::default()
     };
     config.defaults.slice_size = "50M".into();
     config.defaults.compression = "none".into();
