@@ -35,7 +35,8 @@
 //! come from home2's data). One provisional, configurable factor
 //! (`[health] read_error_rise_factor`, default [`DEFAULT_RISE_FACTOR`]): a
 //! cartridge whose newest verify corrected more errors per GiB than the
-//! factor times its previous verify's is flagged by `audit` and `report
+//! factor times its previous verify's — and more than [`RISE_FLOOR_PER_GIB`]
+//! in all (ADR-0012 2026-10-07 item 7) — is flagged by `audit` and `report
 //! health`, with the remedy — copy it to a fresh cartridge.
 
 use rusqlite::{Connection, OptionalExtension};
@@ -57,6 +58,15 @@ pub const EVENT_FIELD: &str = "corrected_per_gib";
 /// starting point to be replaced from home2's recorded verifies, not a
 /// measured threshold.
 pub const DEFAULT_RISE_FACTOR: f64 = 2.0;
+
+/// The absolute floor under a rise (ADR-0012 2026-10-07 item 7): a
+/// cartridge is flagged as rising only when its newest rate is also above
+/// this many corrected errors per GiB read. Without it, any first non-zero
+/// reading after a zero one is a rise past every factor; with it, a
+/// cartridge correcting under one error per GiB is not an alarm whatever
+/// its previous verify read. Fixed, not a config key: the factor is the
+/// provisional, tunable half.
+pub const RISE_FLOOR_PER_GIB: f64 = 1.0;
 
 /// Cartridge statuses whose trend is no longer reported: the operator has
 /// retired it, or its last live volume is gone and it waits to be erased.
@@ -247,13 +257,17 @@ pub struct Rise {
 
 impl CartridgeTrend {
     /// The two newest verifies that have a rate, when the newer one's is
-    /// more than `factor` times the older one's. A previous rate of 0
-    /// rising to anything above 0 is a rise past any factor.
+    /// more than `factor` times the older one's **and** above
+    /// [`RISE_FLOOR_PER_GIB`] (ADR-0012 2026-10-07 item 7). A previous rate
+    /// of 0 rising to anything above 0 is a rise past any factor, so the
+    /// floor is what keeps a first non-zero reading after zero from being an
+    /// alarm.
     pub fn rising(&self, factor: f64) -> Option<Rise> {
         let mut rated = self.points.iter().filter_map(|p| p.corrected_per_gib).rev();
         let newest = rated.next()?;
         let previous = rated.next()?;
-        (newest > previous * factor).then_some(Rise { previous, newest })
+        (newest > previous * factor && newest > RISE_FLOOR_PER_GIB)
+            .then_some(Rise { previous, newest })
     }
 
     /// `0.012 -> 0.030 -> 0.950 corrected/GiB over 3 verifies (uncorrected 0, 0, 1)`
@@ -361,12 +375,13 @@ pub fn trends(conn: &Connection) -> Result<Vec<CartridgeTrend>> {
 pub fn rise_message(trend: &CartridgeTrend, rise: Rise, factor: f64) -> String {
     format!(
         "corrected read errors per GiB rose from {:.3} to {:.3} between its last two verifies, \
-         more than the {}x rise factor (`[health] read_error_rise_factor`, provisional): {}. \
-         The data still verified; the drive's error correction is working harder. Copy it to a \
-         fresh cartridge while it reads",
+         more than the {}x rise factor (`[health] read_error_rise_factor`, provisional) and \
+         above the floor of {} per GiB: {}. The data still verified; the drive's error \
+         correction is working harder. Copy it to a fresh cartridge while it reads",
         rise.previous,
         rise.newest,
         factor,
+        RISE_FLOOR_PER_GIB,
         trend.render(),
     )
 }
@@ -523,8 +538,24 @@ pub(crate) mod tests {
         // Falling, or a single verify, is not a rise.
         assert_eq!(trend(&[Some(3.0), Some(1.0)]).rising(2.0), None);
         assert_eq!(trend(&[Some(3.0)]).rising(2.0), None);
-        // From zero to anything is a rise past any factor.
-        assert!(trend(&[Some(0.0), Some(0.01)]).rising(100.0).is_some());
+        // ADR-0012 2026-10-07 item 7: from zero, a rise past any factor is
+        // flagged only above the absolute floor of 1 corrected error per GiB,
+        // so a first non-zero reading after zero is not an alarm.
+        assert_eq!(trend(&[Some(0.0), Some(0.5)]).rising(2.0), None);
+        assert_eq!(trend(&[Some(0.0), Some(0.01)]).rising(100.0), None);
+        assert_eq!(
+            trend(&[Some(0.0), Some(2.0)]).rising(2.0),
+            Some(Rise {
+                previous: 0.0,
+                newest: 2.0
+            })
+        );
+        // At the floor is not above it; past both the floor and the factor is.
+        assert_eq!(
+            trend(&[Some(0.2), Some(RISE_FLOOR_PER_GIB)]).rising(2.0),
+            None
+        );
+        assert!(trend(&[Some(0.2), Some(1.01)]).rising(2.0).is_some());
         assert_eq!(
             trend(&[Some(1.0), Some(2.1), None]).render(),
             "1.000 -> 2.100 -> - corrected/GiB over 3 verifies (uncorrected 0, 0, 0)"

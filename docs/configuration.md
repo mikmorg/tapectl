@@ -337,7 +337,7 @@ written to the database, and each has a matching `archive-set create`/`edit` fla
 | `compression` | closed set, as in `[defaults]` | Overrides `[defaults] compression`. | `--compression` |
 | `checksum_mode` | closed set, as in `[defaults]` | Overrides `[defaults] checksum_mode` for units registered into this set. Units already registered keep their mode. | `--checksum-mode` |
 | `slice_size` | size (binary) | Overrides `[defaults] slice_size`. | `--slice-size` |
-| `verify_interval_days` | integer | `audit` warns (`verify_age`) when a unit with copies has had no passing `volume verify` within this many days. There is no system-wide default: without it, verify age is not checked. | `--verify-interval-days` |
+| `verify_interval_days` | integer | `audit` warns (`verify_age`) when a unit with copies has had no passing `volume verify` within this many days. There is no system-wide default: without it, verify age is not checked. It also bounds how old an interrupted full readback may be and still be continued: a full verify or `--full-confirm` does not continue one whose oldest read is older than the shortest interval among the units on that volume, and reads everything again (ADR-0012, 2026-10-07). Nothing yet refuses a value below 1: at 0 or below, no interrupted readback is continued. | `--verify-interval-days` |
 | `preserve_xattrs`, `preserve_acls`, `preserve_fsa` | bool | Override their `[defaults]` namesakes for this set's units, with the same effect. `preserve_acls` still has no effect of its own. | `--preserve-xattrs`, `--preserve-acls`, `--preserve-fsa` (each `true\|false`) |
 | `dirty_on_metadata_change` | bool | Stored and resolved, but read by nothing, as in `[defaults]`. `config check` names it when `true`. | `--dirty-on-metadata-change true\|false` |
 
@@ -479,7 +479,7 @@ the table, every key takes its default. See
 
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
-| `read_error_rise_factor` | float | `2.0` | at least 1 | A cartridge is flagged (`audit`'s `read_error_trend`, `RISING` in `report health`) when its newest `volume verify` corrected more read errors per GiB than this many times its previous verify's. **Provisional**: the default is a starting point, to be set from the production host's recorded verifies (ADR-0012, 2026-10-06). |
+| `read_error_rise_factor` | float | `2.0` | at least 1 | A cartridge is flagged (`audit`'s `read_error_trend`, `RISING` in `report health`) when its newest `volume verify` corrected more read errors per GiB than this many times its previous verify's, **and** more than 1 corrected error per GiB in all. That floor is fixed, not a key (ADR-0012, 2026-10-07): it keeps a first non-zero reading after a zero one, a rise past any factor, from being an alarm. **Provisional**: the factor's default is a starting point, to be set from the production host's recorded verifies (ADR-0012, 2026-10-06). |
 
 ### `[ops]`
 

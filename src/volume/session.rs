@@ -901,6 +901,13 @@ impl Continuation {
 /// actually read ([`record_checkpoint`]), so this holds down a chain of
 /// interruptions too.
 ///
+/// Nor is one whose oldest read is older than the volume's resolved
+/// `verify_interval_days` ([`crate::policy::volume_verify_interval_days`];
+/// ADR-0012 2026-10-07 item 1): the readback that concludes is dated from
+/// that read ([`STARTED_AT_FROM_CHECKPOINTS`]), and must not be one the
+/// policy already calls overdue. With no interval on the volume, there is
+/// no age limit.
+///
 /// Shared by the write's confirm and `volume verify` (both record their
 /// readbacks in `verification_sessions`), so either continues the other's
 /// interrupted readback: the checkpoints are anchored to File 3's bytes,
@@ -942,6 +949,52 @@ pub(crate) fn interrupted_readback(
     }
     if let Some(aborted_at) = recorded_abort_time(conn, volume_id)? {
         if rows.iter().any(|(_, _, _, at)| *at <= aborted_at) {
+            return Ok(None);
+        }
+    }
+    // ADR-0012 2026-10-07 item 1: a continuation carries its oldest read
+    // into the readback that concludes (its `started_at`,
+    // [`STARTED_AT_FROM_CHECKPOINTS`]), so one whose oldest read is already
+    // older than the volume's verify interval would conclude a verify the
+    // policy calls overdue. It is not continued: everything is read again.
+    // "Older than" is exact (`now - N days`), not `audit`'s whole days.
+    let oldest = rows
+        .iter()
+        .map(|(_, _, _, at)| at.as_str())
+        .min()
+        .expect("rows is not empty: front_index_sha256 came from its first");
+    //
+    // The gate is total over any stored interval (nothing bounds
+    // `archive_sets.verify_interval_days`): 0 or below makes every read
+    // already too old, as `audit` reads it (always overdue); one reaching
+    // past any date is no limit; and a `checked_at` that does not parse is
+    // read again — never an error, which would block every full confirm and
+    // verify of the volume until the set was edited.
+    if let Some(days) = crate::policy::volume_verify_interval_days(conn, volume_id)? {
+        let cutoff = chrono::Duration::try_days(days.max(0))
+            .and_then(|d| chrono::Utc::now().naive_utc().checked_sub_signed(d));
+        let too_old = match (
+            cutoff,
+            chrono::NaiveDateTime::parse_from_str(oldest, "%Y-%m-%d %H:%M:%S"),
+        ) {
+            (None, _) => false,
+            (Some(cutoff), Ok(oldest)) => oldest < cutoff,
+            (Some(_), Err(e)) => {
+                tracing::warn!(
+                    oldest_read = oldest,
+                    error = %e,
+                    "a readback checkpoint's checked_at does not parse; every file is read again"
+                );
+                true
+            }
+        };
+        if too_old {
+            tracing::info!(
+                oldest_read = oldest,
+                verify_interval_days = days,
+                "not continuing the interrupted full readback: its oldest read is older than \
+                 the volume's verify interval, so every file is read again"
+            );
             return Ok(None);
         }
     }
@@ -989,6 +1042,25 @@ pub(crate) fn record_checkpoint(
         );
     }
 }
+
+/// The `SET` clause that dates a concluding full readback from its oldest
+/// read (ADR-0012 2026-10-07 item 1): `started_at` becomes the oldest
+/// `checked_at` among the readback's checkpoints when one predates it — a
+/// file it skipped on a continued readback's word keeps the time it was
+/// actually read ([`record_checkpoint`]), so this is the oldest skipped
+/// file's read; a file read now is never older than the session's start.
+/// A readback that continued nothing keeps its own start, as does a quick
+/// one (it keeps no checkpoints). So freshness never overstates what was
+/// read when. Stays strictly after a recorded write abort, because
+/// [`interrupted_readback`] continues nothing read at or before one.
+///
+/// One clause for both writers of a concluding readback — the write's
+/// confirm and `volume verify` — appended to their completing `UPDATE
+/// verification_sessions ... SET`.
+pub(crate) const STARTED_AT_FROM_CHECKPOINTS: &str = "started_at = MIN(started_at, COALESCE(
+         (SELECT MIN(c.checked_at) FROM readback_checkpoints c
+           WHERE c.session_id = verification_sessions.id),
+         started_at))";
 
 // ── `volume resume` adopts an aborted, sealed, cleared session (#280) ──
 
@@ -2022,10 +2094,13 @@ impl SealedPending {
             "the confirm's verification session",
             || {
                 Ok(conn.execute(
-                    "UPDATE verification_sessions
+                    &format!(
+                        "UPDATE verification_sessions
                  SET completed_at = datetime('now'), outcome = ?1,
-                     slices_checked = ?2, slices_passed = ?3, slices_failed = ?4
-                 WHERE id = ?5",
+                     slices_checked = ?2, slices_passed = ?3, slices_failed = ?4,
+                     {STARTED_AT_FROM_CHECKPOINTS}
+                 WHERE id = ?5"
+                    ),
                     params![
                         if passed { "passed" } else { "failed" },
                         evidence.files_checked as i64,
@@ -7351,6 +7426,17 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(checkpointed, vec![0, 1, 2, 4, 5]);
+        // ADR-0012 2026-10-07 item 1: date the reads, so the continued
+        // readback's `started_at` can be checked against them below. A day
+        // ago: inside any verify interval, and this volume's units name none.
+        let read_at: String = conn
+            .query_row("SELECT datetime('now', '-1 day')", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "UPDATE readback_checkpoints SET checked_at = ?1",
+            params![read_at],
+        )
+        .unwrap();
 
         // What the startup sweep does for a process that stopped mid-confirm.
         conn.execute(
@@ -7388,6 +7474,17 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, "passed");
         assert_eq!((checked, passed), ((seal + 1) as i64, (seal + 1) as i64));
+        // ADR-0012 2026-10-07 item 1: a continued readback is dated from the
+        // oldest read it carried, not from when the continuation began.
+        let started_at: String = conn
+            .query_row(
+                "SELECT started_at FROM verification_sessions
+                 WHERE volume_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(started_at, read_at, "dated from its oldest checkpoint");
         // ADR-0012 2026-10-06 item 24: the continued readback read the
         // whole tape between its two runs, so the write was read back.
         let verified: bool = conn
@@ -7481,6 +7578,186 @@ mod tests {
             None,
             "a read in the abort's second is not after it"
         );
+    }
+
+    /// ADR-0012 2026-10-07 item 1: a continuation whose oldest checkpoint
+    /// is older than the volume's resolved `verify_interval_days` (the
+    /// tightest among the archive sets of the units written to it) is not
+    /// continued — everything is read again, so a readback never carries a
+    /// read older than the policy allows any verify to be.
+    #[test]
+    fn a_readback_whose_oldest_read_is_older_than_the_verify_interval_is_not_continued() {
+        let f = make_fixture();
+        let conn = &f.conn;
+        let u = &f.units[0];
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'interrupted')",
+            params![u.stage_set_id, u.snapshot_id, f.volume_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'aborted')",
+            params![f.volume_id],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        let read_days_ago = |days: i64| {
+            conn.execute("DELETE FROM readback_checkpoints", [])
+                .unwrap();
+            for (p, d) in [(4, days), (5, 0)] {
+                conn.execute(
+                    "INSERT INTO readback_checkpoints
+                         (session_id, position, sha256, front_index_sha256, checked_at)
+                     VALUES (?1, ?2, 'aa', 'bb', datetime('now', ?3))",
+                    params![id, p, format!("-{d} days")],
+                )
+                .unwrap();
+            }
+        };
+
+        // No archive set names an interval: no limit (the positive control).
+        read_days_ago(400);
+        assert!(
+            interrupted_readback(conn, f.volume_id).unwrap().is_some(),
+            "with no verify interval, any interrupted readback is continued"
+        );
+
+        conn.execute(
+            "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('loose', 90)",
+            [],
+        )
+        .unwrap();
+        let loose = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('tight', 30)",
+            [],
+        )
+        .unwrap();
+        let tight = conn.last_insert_rowid();
+        let set_of_unit = |set: i64| {
+            conn.execute(
+                "UPDATE units SET archive_set_id = ?1 WHERE name = 'unit-alpha'",
+                params![set],
+            )
+            .unwrap();
+        };
+        set_of_unit(loose);
+        read_days_ago(31);
+        assert!(
+            interrupted_readback(conn, f.volume_id).unwrap().is_some(),
+            "31 days is inside a 90-day interval"
+        );
+        // A second unit on the same volume, in the tighter set: the
+        // volume's interval is the tightest of its units'.
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, archive_set_id, status)
+             SELECT 'unit-uuid-2', 'unit-beta', tenant_id, ?1, 'active'
+               FROM units WHERE name = 'unit-alpha'",
+            params![tight],
+        )
+        .unwrap();
+        let beta = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp/unit-beta', 1, 32)",
+            params![beta],
+        )
+        .unwrap();
+        let beta_snap = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![beta_snap],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'interrupted')",
+            params![conn.last_insert_rowid(), beta_snap, f.volume_id],
+        )
+        .unwrap();
+        assert_eq!(
+            interrupted_readback(conn, f.volume_id).unwrap(),
+            None,
+            "the oldest read (31 days) is older than the volume's 30-day interval"
+        );
+        read_days_ago(29);
+        assert!(
+            interrupted_readback(conn, f.volume_id).unwrap().is_some(),
+            "29 days is inside it"
+        );
+    }
+
+    /// Nothing bounds `archive_sets.verify_interval_days`: `archive-set
+    /// create/edit` and `sync` store any integer. The age gate is total over
+    /// them — a value of 0 or below means every read is already too old
+    /// (as `audit` reads it: always overdue), and one too large for any
+    /// date means no limit — rather than an error that blocks every full
+    /// confirm and verify of the volume until the set is edited.
+    #[test]
+    fn the_readback_age_gate_is_total_over_any_verify_interval() {
+        let f = make_fixture();
+        let conn = &f.conn;
+        let u = &f.units[0];
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'interrupted')",
+            params![u.stage_set_id, u.snapshot_id, f.volume_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'aborted')",
+            params![f.volume_id],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        for p in [4, 5] {
+            conn.execute(
+                "INSERT INTO readback_checkpoints
+                     (session_id, position, sha256, front_index_sha256, checked_at)
+                 VALUES (?1, ?2, 'aa', 'bb', datetime('now', '-1 days'))",
+                params![id, p],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('odd', NULL)",
+            [],
+        )
+        .unwrap();
+        let set = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE units SET archive_set_id = ?1 WHERE name = 'unit-alpha'",
+            params![set],
+        )
+        .unwrap();
+        let with_interval = |days: i64| {
+            conn.execute(
+                "UPDATE archive_sets SET verify_interval_days = ?1 WHERE id = ?2",
+                params![days, set],
+            )
+            .unwrap();
+            interrupted_readback(conn, f.volume_id)
+                .unwrap_or_else(|e| panic!("verify_interval_days = {days}: {e:#}"))
+        };
+
+        for days in [-1, 0] {
+            assert_eq!(
+                with_interval(days),
+                None,
+                "verify_interval_days = {days}: every read is already too old"
+            );
+        }
+        for days in [5_000_000, i64::MAX] {
+            assert!(
+                with_interval(days).is_some(),
+                "verify_interval_days = {days}: past any date, so no limit"
+            );
+        }
+        // The positive control: an ordinary interval still decides.
+        assert!(with_interval(2).is_some(), "1 day is inside 2");
     }
 
     /// Issue #397's other order: a resume whose seal is RECORDED but does

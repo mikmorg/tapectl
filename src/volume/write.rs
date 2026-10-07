@@ -4451,11 +4451,17 @@ fn verify_contacted(
     // crash leaves the row `in_progress`, which the next open's sweep marks
     // `aborted`: no outcome is ever claimed without its detail.)
     let tx = conn.unchecked_transaction()?;
+    // ADR-0012 2026-10-07 item 1: a continued readback is dated from its
+    // oldest read, not from when this verify began.
     tx.execute(
-        "UPDATE verification_sessions
+        &format!(
+            "UPDATE verification_sessions
          SET outcome = ?1, completed_at = datetime('now'),
-             slices_checked = ?2, slices_passed = ?3, slices_failed = ?4
+             slices_checked = ?2, slices_passed = ?3, slices_failed = ?4,
+             {}
          WHERE id = ?5",
+            session::STARTED_AT_FROM_CHECKPOINTS
+        ),
         params![
             outcome,
             evidence.files_checked as i64,
@@ -6767,6 +6773,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome, "passed");
+        // ADR-0012 2026-10-07 item 1: the verify that concluded is dated from
+        // the oldest read it carried (the first readback's), so freshness
+        // never overstates when the tape was read.
+        let started_at: String = conn
+            .query_row(
+                "SELECT started_at FROM verification_sessions WHERE id = ?1",
+                params![third],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(started_at, "2026-01-01 00:00:00");
         // ADR-0012 2026-10-06 item 24: three runs between them read the
         // whole tape back clean, so the write on it was fully read back.
         let verified: bool = conn
@@ -6780,6 +6797,105 @@ mod tests {
             verified,
             "a continued full verify that passes marks the write"
         );
+    }
+
+    /// ADR-0012 2026-10-07 item 1: an interrupted readback whose oldest
+    /// checkpoint is older than the volume's resolved `verify_interval_days`
+    /// is not continued — the next full verify reads every file again, and
+    /// is dated from its own start.
+    #[test]
+    fn a_full_verify_reads_everything_again_when_the_interrupted_readback_is_older_than_the_interval(
+    ) {
+        use crate::tape::fake::{FakeTape, Op};
+
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"intact slice bytes, repeated a few times. ".repeat(4);
+        seed_one_slice_fixture(&conn, "VR-OLD", "vo-unit", 4, &good, "completed", "staged");
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'VR-OLD'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('monthly', 30)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE units SET archive_set_id = ?1 WHERE name = 'vo-unit'",
+            params![conn.last_insert_rowid()],
+        )
+        .unwrap();
+        let mem = mem_store_v2_tape("VR-OLD", &good, &good);
+
+        // An earlier full readback stopped after Files 0-2, months ago.
+        let fi_text = String::from_utf8_lossy(&mem.files[3]).to_string();
+        let fi_true = fi_text.trim_end_matches('\0');
+        let fi_hash = direct_hash(fi_true.as_bytes());
+        let claims = format::parse_front_index(fi_true).unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'aborted')",
+            params![volume_id],
+        )
+        .unwrap();
+        let first = conn.last_insert_rowid();
+        for p in [0u32, 1, 2] {
+            let claim = claims.iter().find(|c| c.position == p as i32).unwrap();
+            conn.execute(
+                "INSERT INTO readback_checkpoints
+                     (session_id, position, sha256, front_index_sha256, checked_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now', '-31 days'))",
+                params![
+                    first,
+                    p,
+                    claim.sha256_encrypted.as_deref().unwrap(),
+                    fi_hash
+                ],
+            )
+            .unwrap();
+        }
+
+        let fake = FakeTape::with_files(mem.files.clone(), 4096);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "VR-OLD",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap();
+        assert_eq!(report.failed, 0, "mismatches: {:?}", report.mismatches);
+        let walked = fake.ops();
+        for p in [1, 2] {
+            assert!(
+                walked.contains(&Op::Read(p)),
+                "file {p} must be read again: {walked:?}"
+            );
+        }
+        let session = report.session_id.unwrap();
+        let (started_at, stale): (String, i64) = conn
+            .query_row(
+                "SELECT started_at,
+                        (SELECT COUNT(*) FROM readback_checkpoints
+                          WHERE session_id = ?1 AND checked_at < datetime('now', '-1 day'))
+                   FROM verification_sessions WHERE id = ?1",
+                params![session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "no read from the old readback is carried");
+        let recent: bool = conn
+            .query_row(
+                "SELECT ?1 >= datetime('now', '-1 hour')",
+                params![started_at],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(recent, "dated from its own start: {started_at}");
     }
 
     /// ADR-0012 2026-10-06 item 24 (#392): a full `volume verify` that

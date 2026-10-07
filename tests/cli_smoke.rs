@@ -2820,11 +2820,13 @@ fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings(
         }
     ]);
     // No verify recorded read errors here, so no trend; the factor is the
-    // `[health]` default.
+    // `[health]` default, and the floor the fixed one (ADR-0012 2026-10-07
+    // item 7).
     let expected = serde_json::json!({
         "readings": readings,
         "read_error_trends": [],
         "read_error_rise_factor": tapectl::tape::read_errors::DEFAULT_RISE_FACTOR,
+        "read_error_rise_floor_per_gib": tapectl::tape::read_errors::RISE_FLOOR_PER_GIB,
     });
     assert_eq!(parsed, expected, "the whole --json document");
 }

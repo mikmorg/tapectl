@@ -314,8 +314,13 @@ Rules that hold in every path:
   interruptions accumulates. A readback that finished, passed or failed, is
   never continued, nor one holding a file read at or before the volume's
   recorded write abort (the 2026-09-23 adoption rule wants a full readback
-  wholly after it), and the quick tier neither records nor skips anything.
-  `volume verify` takes part the same way: it records its session
+  wholly after it), nor one whose oldest read is older than the volume's
+  resolved `verify_interval_days` — the tightest among the archive sets of the
+  units written to it; no limit when none sets one (ADR-0012 2026-10-07 item
+  1) — and the quick tier neither records nor skips anything. A continued
+  readback that concludes records as its `started_at` the oldest `checked_at`
+  among the files it skipped, so freshness never overstates what was read
+  when. `volume verify` takes part the same way: it records its session
   `in_progress` from the start and leaves it `aborted` when stopped, so
   re-running it continues; each continues the volume's latest readback,
   whichever command took it.

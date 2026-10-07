@@ -396,6 +396,21 @@ media root — a [Collection](cli/collection.md) (`collection sync`,
 `quick-archive` registers, snapshots, stages and writes a single directory
 onto a volume you have already initialised.
 
+**`collection run` releases staging as soon as its copies are confirmed.**
+Each copy's write ends with the default quick confirm (the front index and the
+seal marker, not the data), and once every unit of the batch has the copies its
+`min_copies` asks for, the run releases those units' staged slices straight
+away (ADR-0012, 2026-10-07). So on this path no full readback of the data
+precedes the release. The `volume verify` that steps 3–5 above run before
+`staging clean` comes only after the staged slices are gone, and a copy it finds
+bad is rewritten from another copy (`volume read-slices`), not from staging.
+When the data matters, have at least one copy read back in full before the
+release. `collection run --full-confirm` does that for every copy the run
+writes, each taking about as long as its write (~2.3 h on a full LTO-6); this
+path has no per-copy choice. To read back one copy only, stage and write that
+batch by hand (steps 1–5 above) and pass `--full-confirm` to the first
+`volume write` alone.
+
 A collection archives only its units: the real folders at exactly
 `unit_depth` below its root, and everything inside them. Anything else under
 the root down to that depth is in no unit and never reaches a tape: a loose
@@ -484,8 +499,7 @@ hash or the drive. Read them together:
 - `tape waited` high and `queue full` high: the hash set the pace (the
   reader is ahead of it, the drive behind it) — the CPU is the limit.
 - `tape waited` high and `queue full` near zero: reading the staged file set
-  the pace — the staging disk is the limit. Nothing prunes `logs/`; a session log is a few kilobytes plus about one
-line per interval.
+  the pace — the staging disk is the limit.
 
 The durations are kept in the catalog too. `volume info` ends with the phase
 timings of the last session recorded against the volume (write, resume,
@@ -509,6 +523,21 @@ they are in the `phase_timings` table (migration 028) for scripts.
 Each session log now ends with how the command ended — `session result: ok`,
 or `session result: failed — <the error>` — just before its `session end` line
 (a `volume verify` that exits 2 or 3 logs `session exit with code N` instead).
+
+**tapectl never prunes session logs or stage reports** (ADR-0012, 2026-10-07):
+they are evidence — what each long command did and when, and the hash of every
+slice as it was staged — so how long to keep them is your call. They grow
+slowly. A session log starts at about 1.5 KB (a small `stage create` writes
+1.6 KB) and adds about 20 KB per hour the command runs (one `progress:` line
+every 30 seconds), plus about 130 bytes per file a write puts on tape and
+about 100 bytes per slice a stage produces. A stage report is about 600 bytes
+plus about 200 bytes per slice. At the default 1 GiB slice, a full LTO-6's
+worth of data (about 2,300 slices) comes to roughly 0.3 MB of stage logs and
+0.5 MB of stage reports, about 0.5 MB for each copy's write log, and under
+0.1 MB for each full verify: about 2 MB for two copies, and around 100 MB a
+year at a cartridge a week. Pruning `logs/` loses nothing the catalog needs,
+but `tapectl status --last N` reads only the logs that are there; the phase
+timings are kept in the catalog regardless.
 
 ### Watching from another account
 
@@ -675,7 +704,8 @@ went ahead does run out of room, it stops and the partial slices are removed.
 Each stage set also leaves a short stage report (unit, tenant, snapshot, and
 every slice's size and hash) in `<home>/stage-reports/`. A home initialised
 before 2026-09-29 kept these in `receipts/`; the first command run on it moves
-the directory.
+the directory. Nothing prunes them; see
+[how fast they and the session logs grow](#watching-a-long-operation-progress-and-the-session-log).
 
 **`volume write` writes everything still staged, not just what you staged in
 this sitting** — and it says so before it touches the drive:
@@ -755,7 +785,9 @@ costs about as long as the write itself (~2.3 h on a full LTO-6); the same six
 commands take it. A full readback that is interrupted (Ctrl-C, a dropped ssh
 session, a reboot) keeps what it has read back clean: `tapectl volume resume
 <label> --full-confirm` continues it from there rather than from the first
-file.
+file — unless what it kept is older than the volume's `verify_interval_days`,
+in which case it reads everything again (see
+[the verify section](#monthly--verify-a-rotating-slice-of-the-library)).
 
 `staging clean` releases every unit that has met its policy's `min_copies` and
 **retains** the ones that have not, naming them (ADR-0012). So a unit still
@@ -1731,7 +1763,10 @@ $ tapectl report verify-status
 front index and the seal marker unless you passed `--full-confirm`, so a new
 volume has had none of its data read back. Give it a full `volume verify`
 soon after the write — best before `staging clean` releases its units, while
-the staged slices can still rewrite a bad copy cheaply. `report
+the staged slices can still rewrite a bad copy cheaply. `collection run` gives
+no such window: it releases staging right after its quick confirms, so use its
+`--full-confirm` when the data matters (see
+[A typical write session](#a-typical-write-session)). `report
 verify-status` ends with the volumes still owed one:
 
 ```text
@@ -1779,8 +1814,13 @@ is recorded `aborted` with every file it had read back clean. Run the same
 `volume verify` again and it continues: it reads File 0, File 3 and the seal
 marker as always, skips the files already read back clean, and reads the
 rest. It continues only the volume's latest readback (a write's interrupted
-`--full-confirm` included), and only while the front index on the tape is the
-one those files were checked against; otherwise it reads everything.
+`--full-confirm` included), only while the front index on the tape is the
+one those files were checked against, and only while the oldest of those reads
+is within the volume's `verify_interval_days` (the shortest set by the archive
+sets of the units on it; no limit when none sets one); otherwise it reads
+everything. A verify that continues is recorded as started when its oldest
+carried read was made, not when you re-ran it — `report verify-status` and
+`volume info` show that time (ADR-0012, 2026-10-07).
 
 `volume verify` opens the drive read-only, so leave a sealed cartridge's
 write-protect tab set: it verifies without sliding the tab. So does a
@@ -1802,16 +1842,20 @@ scrub.
 ```text
 $ tapectl report health
 Corrected read errors per GiB, by cartridge, verify over verify:
-  EW7VWMVKF6: 0.012 -> 0.015 -> 0.044 corrected/GiB over 3 verifies (uncorrected 0, 0, 0)
-    ** RISING — corrected read errors per GiB rose from 0.015 to 0.044 between its last two verifies, ... **
+  EW7VWMVKF6: 0.120 -> 0.450 -> 1.800 corrected/GiB over 3 verifies (uncorrected 0, 0, 0)
+    ** RISING — corrected read errors per GiB rose from 0.450 to 1.800 between its last two verifies, ... **
 ```
 
 A cartridge is flagged when its newest verify corrected more than
-`read_error_rise_factor` times as many errors per GiB as the verify before it,
-and `tapectl audit` warns on it (`read_error_trend`). The factor lives in
-`config.toml` and is **provisional**: 2.0 is a starting point, not a measured
-threshold, to be set once home2's verifies show what a healthy cartridge looks
-like.
+`read_error_rise_factor` times as many errors per GiB as the verify before it
+**and** more than 1 corrected error per GiB, and `tapectl audit` warns on it
+(`read_error_trend`). The factor lives in `config.toml` and is
+**provisional**: 2.0 is a starting point, not a measured threshold, to be set
+once home2's verifies show what a healthy cartridge looks like. The floor of 1
+per GiB is fixed (ADR-0012, 2026-10-07): from a verify that corrected nothing,
+any later figure is a rise past every factor, so without it a cartridge's first
+corrected error would be an alarm. A cartridge going from 0 to 0.5 per GiB is
+not flagged; one going from 0 to 2 per GiB is.
 
 ```toml
 [health]
@@ -1821,8 +1865,9 @@ read_error_rise_factor = 2.0
 `report health --json` carries the same figures: an object whose
 `read_error_trends` holds one entry per cartridge (its verifies, oldest first,
 in `points`, and `rising` set — with the line above as its `message` — when it
-is flagged), beside the `read_error_rise_factor` it was judged against and the
-health readings under `readings`. (Before the trends joined it, the document
+is flagged), beside the `read_error_rise_factor` and
+`read_error_rise_floor_per_gib` it was judged against and the health readings
+under `readings`. (Before the trends joined it, the document
 was the readings array alone.)
 
 How to read it:
