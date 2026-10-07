@@ -7,7 +7,8 @@ use thiserror::Error;
 /// Mirrors the convention `audit` already established (`src/cli/audit.rs`):
 /// 0=clean, 1=warning, 2=violation. `db fsck` (src/main.rs) computes its exit
 /// code against these same constants — see `fsck_exit_code` (issue #45/H10).
-/// `volume verify` has its own three, below (issue #356).
+/// `volume verify` has its own three, below (issue #356), and `audit`'s
+/// errors exit [`EXIT_AUDIT_ERROR`] (issue #408).
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_WARNING: i32 = 1;
 pub const EXIT_ERROR: i32 = 2;
@@ -45,6 +46,62 @@ pub const EXIT_VERIFY_INCONCLUSIVE: i32 = 3;
 /// `volume verify` keeps its own contract instead (every error is
 /// [`EXIT_VERIFY_INCONCLUSIVE`], which already means "try again").
 pub const EXIT_CATALOG_BUSY: i32 = 75;
+
+/// `audit`: the audit stopped on an ERROR and reached no verdict (ADR-0012,
+/// the 2026-10-07 amendment, item 19; issue #408). 70 is sysexits'
+/// `EX_SOFTWARE`. Until then every error exited 2, the code that means "at
+/// least one violation", so a scheduled wrapper paged violations for an
+/// audit that never ran. Now 2 is reachable from `audit` only through a
+/// violation — as #356 made `volume verify`'s 2 reachable only through a
+/// quarantine. A busy catalog keeps [`EXIT_CATALOG_BUSY`].
+pub const EXIT_AUDIT_ERROR: i32 = 70;
+
+/// How a command's ERRORS map to an exit code — decided from the parsed
+/// command before it runs, so the errors raised before the command's own
+/// module is reached (the database, the config, an uninitialised home) map
+/// the same way as its own. `main` asks [`ErrorContract::exit_code`] once,
+/// with whatever error the invocation returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorContract {
+    /// Every command without a contract of its own: [`EXIT_ERROR`], or
+    /// [`EXIT_CATALOG_BUSY`] when the catalog was busy.
+    Ordinary,
+    /// `volume verify` (issue #356): every error is
+    /// [`EXIT_VERIFY_INCONCLUSIVE`], a busy catalog included — "no verdict,
+    /// try again" is already what 3 means.
+    Verify,
+    /// `audit` (issue #408): every error is [`EXIT_AUDIT_ERROR`], except a
+    /// busy catalog, which keeps [`EXIT_CATALOG_BUSY`] so the scheduled
+    /// wrapper's "retry later, no fail ping" arm still sees it.
+    Audit,
+}
+
+impl ErrorContract {
+    /// The exit code for `err`, an error this contract's command returned.
+    pub fn exit_code(self, err: &anyhow::Error) -> i32 {
+        let busy = || crate::db::busy::is_catalog_busy(err);
+        match self {
+            ErrorContract::Verify => EXIT_VERIFY_INCONCLUSIVE,
+            ErrorContract::Audit if busy() => EXIT_CATALOG_BUSY,
+            ErrorContract::Audit => EXIT_AUDIT_ERROR,
+            ErrorContract::Ordinary if busy() => EXIT_CATALOG_BUSY,
+            ErrorContract::Ordinary => EXIT_ERROR,
+        }
+    }
+
+    /// The exit code for a command line under this contract that did not
+    /// PARSE (clap's usage error), or `None` to keep clap's own (2). A
+    /// verify or an audit whose command line is wrong has read nothing and
+    /// reached no verdict, so it must not exit with the code its verdict
+    /// table gives 2 (issues #356, #408).
+    pub fn usage_error_code(self) -> Option<i32> {
+        match self {
+            ErrorContract::Verify => Some(EXIT_VERIFY_INCONCLUSIVE),
+            ErrorContract::Audit => Some(EXIT_AUDIT_ERROR),
+            ErrorContract::Ordinary => None,
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 #[allow(dead_code)]
@@ -389,6 +446,45 @@ mod tests {
     fn a_custom_io_error_reaches_the_operator_once() {
         let err: TapectlError = std::io::Error::other("staging disk went away").into();
         assert_eq!(as_operator_sees_it(err), "staging disk went away");
+    }
+
+    /// Issue #408 (ADR-0012, 2026-10-07 item 19): each contract's errors,
+    /// busy and not. `audit`'s errors exit 70 so 2 is only ever a
+    /// violation, but a busy catalog keeps 75 there (the scheduled wrapper's
+    /// "retry later" arm); `volume verify` folds both into its 3.
+    #[test]
+    fn each_error_contract_maps_an_error_and_a_busy_catalog() {
+        let plain = anyhow::Error::from(TapectlError::UnitNotFound("u".into()));
+        let busy = anyhow::Error::from(TapectlError::CatalogBusy("the seal".into()));
+        let cases = [
+            (ErrorContract::Ordinary, EXIT_ERROR, EXIT_CATALOG_BUSY),
+            (ErrorContract::Audit, EXIT_AUDIT_ERROR, EXIT_CATALOG_BUSY),
+            (
+                ErrorContract::Verify,
+                EXIT_VERIFY_INCONCLUSIVE,
+                EXIT_VERIFY_INCONCLUSIVE,
+            ),
+        ];
+        for (contract, on_error, on_busy) in cases {
+            assert_eq!(contract.exit_code(&plain), on_error, "{contract:?}");
+            assert_eq!(contract.exit_code(&busy), on_busy, "{contract:?} busy");
+        }
+        assert_eq!(EXIT_AUDIT_ERROR, 70, "sysexits' EX_SOFTWARE");
+    }
+
+    /// A command line that does not parse: the two verdict commands take
+    /// their "no verdict" code, everything else keeps clap's.
+    #[test]
+    fn usage_errors_keep_clap_s_code_except_for_the_verdict_commands() {
+        assert_eq!(
+            ErrorContract::Verify.usage_error_code(),
+            Some(EXIT_VERIFY_INCONCLUSIVE)
+        );
+        assert_eq!(
+            ErrorContract::Audit.usage_error_code(),
+            Some(EXIT_AUDIT_ERROR)
+        );
+        assert_eq!(ErrorContract::Ordinary.usage_error_code(), None);
     }
 
     /// Issue #363: `Database` had the shape `Io` had before #354 — the

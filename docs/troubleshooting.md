@@ -47,8 +47,9 @@ A few conventions:
 ## Exit codes
 
 Any command that fails prints `error: <message>` on stderr and exits **2**.
-There are two exceptions. `volume verify` exits **3** on every error
-([below](#volume-verify-0-2-or-3)). A **busy catalog** exits **75**
+There are three exceptions. `volume verify` exits **3** on every error
+([below](#volume-verify-0-2-or-3)), and `audit` exits **70**
+([below](#audit-0-1-2-or-70)). A **busy catalog** exits **75**
 ([below](#75-catalog-busy)). When one failure caused another, the
 message is the whole chain, joined by `: `. For example, a bad config file
 prints:
@@ -57,27 +58,28 @@ prints:
 error: failed to load config: configuration error: <path>/config.toml: TOML parse error at line 68, column 1
 ```
 
-A mistyped command or flag (clap's usage error) also exits 2, with one
-exception: when the parse has already reached `volume verify`, an error in
-what follows exits 3. That covers a missing label, an unknown flag after
-`verify`, `--full` together with `--quick`, and a flag with no value. An error
-that comes before `verify` is an ordinary usage error and still exits 2: a
-mistyped subcommand such as `volume verfy`, or an unknown flag in front of
-`verify` (`tapectl --hme <dir> volume verify <label>`,
+A mistyped command or flag (clap's usage error) also exits 2, with two
+exceptions: when the parse has already reached `volume verify`, an error in
+what follows exits 3, and when it has reached `audit`, 70. That covers a
+missing label, an unknown flag after `verify` or `audit`, `--full` together
+with `--quick`, and a flag with no value. An error that comes before `verify`
+is an ordinary usage error and still exits 2: a mistyped subcommand such as
+`volume verfy` or `audt`, or an unknown flag in front of `verify`
+(`tapectl --hme <dir> volume verify <label>`,
 `tapectl volume --bogus verify <label>`). `--help` exits 0 everywhere.
 
 A few commands finish their work and then report a verdict through the exit code:
 
 | Command | 0 | 1 | 2 |
 |---|---|---|---|
-| [`audit`](cli/audit.md#tapectl-audit) | clean | warnings only | at least one violation (or an error) |
+| [`audit`](cli/audit.md#tapectl-audit) | clean | warnings only | at least one violation, and nothing else: an error exits 70 ([below](#audit-0-1-2-or-70)) |
 | [`host check`](cli/host.md#tapectl-host-check) | host is quiet | something tripped | an error |
 | [`config check`](cli/config.md#tapectl-config-check) | config valid | never used | config invalid (or an error) |
 | [`db fsck`](cli/db.md#tapectl-db-fsck) | clean | problems found (repaired or not) | database integrity is broken (or an error) |
 | [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed, or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; or (`sync`, `status`) a file, symlink or symlinked folder under the root belongs to no unit (an `OUTSIDE ANY UNIT` line names each); the rest ran, and each failure is an `error:` line | an error |
 
-Apart from `volume verify` and a busy catalog, every other command exits 0 on
-success and 2 on error.
+Apart from `volume verify`, `audit` and a busy catalog, every other command
+exits 0 on success and 2 on error.
 
 ### 75: catalog busy
 
@@ -100,6 +102,24 @@ backup` run while another command writes.
 `volume verify` keeps its own contract: a busy catalog is one more way to
 reach no verdict, so it exits 3. The `contrib/` timer wrappers log 75 as
 "catalog busy" and do not ping `/fail`.
+
+### `audit`: 0, 1, 2 or 70
+
+`audit` reports its verdict through the exit code, and 2 means one thing only
+(ADR-0012, the 2026-10-07 amendment, item 19):
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | clean | nothing |
+| 1 | warnings only | read them; the audit is advisory (ADR-0004) |
+| 2 | at least one **violation** | the findings name each one; `--action-plan` adds the fix |
+| 70 | **no verdict**: the audit stopped on an error (a database or config error, an unknown `--unit`, an uninitialised home, a command line that does not parse after `audit`) | read the `error:` line, fix it, run the audit again |
+| 75 | no verdict: the catalog was busy ([above](#75-catalog-busy)) | run it again once the other command has finished |
+
+70 is sysexits' `EX_SOFTWARE`. Older builds exited 2 for an error too, so a
+script could not tell "fix the policy" from "fix the run".
+`contrib/systemd/tapectl-scheduled-audit.sh` logs 70 as "no verdict" and pings
+`/fail`; it never reports it as violations.
 
 ### `volume verify`: 0, 2 or 3
 

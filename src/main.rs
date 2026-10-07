@@ -88,13 +88,15 @@ fn main() {
 
     signal::install_handler();
 
-    // Decided before `run` consumes `cli` (issue #356): `volume verify`'s
-    // exit contract reserves 2 for "the medium is proven bad", so every
-    // error that invocation returns — its own, or the database's or the
-    // config's before it ever ran — exits 3, "inconclusive", instead. (A
-    // verify whose command line did not parse already exited 3 above, in
+    // Decided before `run` consumes `cli` (issue #356): how this
+    // invocation's errors map to an exit code. `volume verify`'s exit
+    // contract reserves 2 for "the medium is proven bad" and `audit`'s for
+    // "at least one violation" (issue #408), so every error those
+    // invocations return — their own, or the database's or the config's
+    // before they ever ran — exits their "no verdict" code instead. (A
+    // command line that did not parse was mapped above, in
     // `parse_error_exit_code`.)
-    let error_code = error_exit_code(&cli.command);
+    let contract = error_contract(&cli.command);
     // Issue #393: the progress session lives here, not in `run`, so its log
     // records how the command ended (`session result:`) before its end line.
     let mut session = None;
@@ -111,63 +113,65 @@ fn main() {
         // Issue #377: a busy catalog is "retry later", not a failure of what
         // the command checks, so it exits 75 — except where a command's own
         // contract already has a code for "no verdict, try again" (`volume
-        // verify`'s 3), which it keeps.
-        let code = if error_code == error::EXIT_ERROR && db::busy::is_catalog_busy(&err) {
-            error::EXIT_CATALOG_BUSY
-        } else {
-            error_code
-        };
-        error::exit_with_error_code(&err, code);
+        // verify`'s 3), which it keeps. `ErrorContract::exit_code` decides.
+        error::exit_with_error_code(&err, contract.exit_code(&err));
     }
 }
 
-/// The exit code for an error from `command` — [`error::EXIT_ERROR`] for
-/// everything except `volume verify` (see `cli::volume::error_exit_code`).
-fn error_exit_code(command: &Commands) -> i32 {
+/// How the errors of `command` map to an exit code —
+/// [`error::ErrorContract::Ordinary`] for everything except `volume verify`
+/// (see `cli::volume::error_contract`) and `audit` (issue #408).
+fn error_contract(command: &Commands) -> error::ErrorContract {
     match command {
-        Commands::Volume { command } => cli::volume::error_exit_code(command),
-        _ => error::EXIT_ERROR,
+        Commands::Volume { command } => cli::volume::error_contract(command),
+        Commands::Audit { .. } => error::ErrorContract::Audit,
+        _ => error::ErrorContract::Ordinary,
     }
 }
 
-/// The exit code for a command line that did not parse (issue #356).
+/// The exit code for a command line that did not parse (issues #356, #408).
 ///
 /// clap's own is 0 for `--help`/`--version` and 2 for a usage error, and 2
-/// is what `volume verify` now reserves for "the medium is proven bad, the
-/// volume is quarantined". A verify whose command line is wrong — a missing
-/// label, a mistyped flag — has read nothing and proved nothing, so it exits
-/// [`error::EXIT_VERIFY_INCONCLUSIVE`], exactly as every other error of a
-/// verify invocation does ([`error_exit_code`]). Every other command keeps
-/// clap's code, and help keeps 0.
+/// is what `volume verify` reserves for "the medium is proven bad, the
+/// volume is quarantined" and `audit` for "at least one violation". A verify
+/// or an audit whose command line is wrong — a missing label, a mistyped
+/// flag — has read nothing and proved nothing, so it exits that command's
+/// "no verdict" code ([`error::ErrorContract::usage_error_code`]), exactly
+/// as every other error of the invocation does ([`error_contract`]). Every
+/// other command keeps clap's code, and help keeps 0.
 ///
 /// A failed parse leaves no [`Cli`] to ask which command it was, so the
 /// same arguments are parsed again leniently (`ignore_errors`), which keeps
 /// the subcommand chain clap had matched before it hit the error. Scanning
 /// argv by hand instead would have to know which global flags take a value
 /// (`--home X volume verify`); the lenient parse knows because it IS the
-/// definition. If even that cannot place the invocation under `volume
-/// verify` — `volume verfy`, say — clap's code stands.
+/// definition. If even that cannot place the invocation — `volume verfy`,
+/// `audt` — clap's code stands.
 fn parse_error_exit_code(err: &clap::Error, args: &[OsString]) -> i32 {
-    if err.use_stderr() && is_volume_verify_invocation(args) {
-        error::EXIT_VERIFY_INCONCLUSIVE
-    } else {
-        err.exit_code()
+    if !err.use_stderr() {
+        return err.exit_code();
     }
+    invocation_contract(args)
+        .usage_error_code()
+        .unwrap_or_else(|| err.exit_code())
 }
 
-/// Whether `args` (argv, program name first) names `volume verify`, whether
-/// or not the rest of it parses.
-fn is_volume_verify_invocation(args: &[OsString]) -> bool {
+/// The error contract of the command `args` (argv, program name first)
+/// names, whether or not the rest of it parses.
+fn invocation_contract(args: &[OsString]) -> error::ErrorContract {
     let Ok(matches) = Cli::command()
         .ignore_errors(true)
         .try_get_matches_from(args)
     else {
-        return false;
+        return error::ErrorContract::Ordinary;
     };
-    matches!(
-        matches.subcommand(),
-        Some(("volume", volume)) if volume.subcommand_name() == Some("verify")
-    )
+    match matches.subcommand() {
+        Some(("volume", volume)) if volume.subcommand_name() == Some("verify") => {
+            error::ErrorContract::Verify
+        }
+        Some(("audit", _)) => error::ErrorContract::Audit,
+        _ => error::ErrorContract::Ordinary,
+    }
 }
 
 /// Install the global tracing subscriber (issue #45/H10 — closes the "no
@@ -559,7 +563,7 @@ fn run(
             // for `Verify` (issue #356: 0 = passed, 2 = the medium proven
             // bad and quarantined, 3 = inconclusive); every other
             // subcommand returns EXIT_SUCCESS. Mirrors the Audit arm below.
-            // A verify's ERRORS exit 3 too — see `error_exit_code` above.
+            // A verify's ERRORS exit 3 too — see `error_contract` above.
             let exit_code =
                 cli::volume::run(&conn, &paths, &cfg, command, cli.json, cli.yes, cli.dry_run)?;
             exit_if_nonzero(exit_code);
@@ -583,10 +587,10 @@ fn run(
             action_plan,
             ref unit,
         } => {
+            // 0 clean, 1 warnings, 2 violations — its ERRORS exit 70
+            // (`error_contract`, issue #408), so 2 is only ever a verdict.
             let exit_code = cli::audit::run(&conn, &cfg, unit.as_deref(), action_plan, cli.json)?;
-            if exit_code > 0 {
-                std::process::exit(exit_code);
-            }
+            exit_if_nonzero(exit_code);
         }
         Commands::Report { ref command } => {
             cli::report::run(&conn, &cfg, command, cli.json)?;

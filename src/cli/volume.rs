@@ -2033,8 +2033,8 @@ fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<se
         .collect()
 }
 
-/// The exit code for an ERROR from `volume <command>` — anything `run`
-/// returns as `Err` (issue #356, CTO ruling 2026-09-28).
+/// How an ERROR from `volume <command>` — anything `run` returns as `Err` —
+/// maps to an exit code (issue #356, CTO ruling 2026-09-28).
 ///
 /// `volume verify`'s exit status is a three-way contract (see
 /// [`verify_exit_code`]) in which 2 means "the medium is proven bad and the
@@ -2052,10 +2052,10 @@ fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<se
 /// before this module is reached (the database, the config) — and not only
 /// those from the verify itself. A verify command line that does not parse
 /// never gets this far; `main`'s `parse_error_exit_code` gives it 3 too.
-pub fn error_exit_code(command: &VolumeCommands) -> i32 {
+pub fn error_contract(command: &VolumeCommands) -> crate::error::ErrorContract {
     match command {
-        VolumeCommands::Verify { .. } => crate::error::EXIT_VERIFY_INCONCLUSIVE,
-        _ => crate::error::EXIT_ERROR,
+        VolumeCommands::Verify { .. } => crate::error::ErrorContract::Verify,
+        _ => crate::error::ErrorContract::Ordinary,
     }
 }
 
@@ -2073,7 +2073,7 @@ pub fn error_exit_code(command: &VolumeCommands) -> i32 {
 ///   them medium evidence — a read or transport failure, "we could not read
 ///   it today", which is not "the bytes are gone". The volume is untouched.
 ///   Remedy: the drive, then verify again. Every ERROR a verify returns
-///   exits 3 as well ([`error_exit_code`]).
+///   exits 3 as well ([`error_contract`]).
 ///
 /// Keyed on `report.quarantine`, the same field that drives the printed
 /// summary and `--json`'s `quarantined`, so the exit code, the message and
@@ -3389,10 +3389,7 @@ mod tests {
             full: false,
             quick: false,
         };
-        assert_eq!(
-            error_exit_code(&verify),
-            crate::error::EXIT_VERIFY_INCONCLUSIVE
-        );
+        assert_eq!(error_contract(&verify), crate::error::ErrorContract::Verify);
         for other in [
             VolumeCommands::Identify { device: None },
             VolumeCommands::Retire { label: "L".into() },
@@ -3404,8 +3401,8 @@ mod tests {
             },
         ] {
             assert_eq!(
-                error_exit_code(&other),
-                crate::error::EXIT_ERROR,
+                error_contract(&other),
+                crate::error::ErrorContract::Ordinary,
                 "{other:?}"
             );
         }

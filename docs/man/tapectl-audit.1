@@ -7,6 +7,8 @@ tapectl\-audit \- Policy compliance audit
 \fBtapectl audit\fR [\fB\-\-action\-plan\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-unit\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Policy compliance audit
+.PP
+Exit status: 0 = clean. 1 = warnings only. 2 = at least one violation — and only that. 70 = the audit stopped on an error and reached no verdict (a database or config error, an unknown \-\-unit, a mistyped command line). 75 = the catalog was busy; run it again.
 .SH OPTIONS
 .TP
 \fB\-\-action\-plan\fR

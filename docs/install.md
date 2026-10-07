@@ -376,7 +376,7 @@ timer whose unit changed, and prints `systemctl list-timers --all 'tapectl-*'`.
 
 | unit | schedule | runs | exit status |
 |---|---|---|---|
-| `tapectl-audit.timer` → `tapectl-audit.service` | **weekly**, Monday 09:00, `Persistent=true`, up to 30 min random delay | `tapectl-scheduled-audit.sh`: `tapectl audit`, then `tapectl report verify-status` | 0 clean, 1 warnings (**success** — ADR-0004, advisory), 2 violations (failure), any other code but 75 no verdict (failure) |
+| `tapectl-audit.timer` → `tapectl-audit.service` | **weekly**, Monday 09:00, `Persistent=true`, up to 30 min random delay | `tapectl-scheduled-audit.sh`: `tapectl audit`, then `tapectl report verify-status` | 0 clean, 1 warnings (**success** — ADR-0004, advisory), 2 violations (failure), 70 the audit's own error and any other code but 75 no verdict (failure) |
 | `tapectl-backup.timer` → `tapectl-backup.service` | **daily**, 03:00, `Persistent=true`, up to 15 min random delay | `tapectl-scheduled-backup.sh`: `tapectl db backup --to <dir>/tapectl-<UTC stamp>.db`, SQLite-header check on the copy, `tapectl db fsck` on the live catalog, prune to the newest **14** | nonzero if the copy is not a database or fsck found problems |
 
 Both services run as the service user with `PrivateDevices=true` (no

@@ -172,6 +172,11 @@ pub enum Commands {
     },
 
     /// Policy compliance audit
+    ///
+    /// Exit status: 0 = clean. 1 = warnings only. 2 = at least one
+    /// violation — and only that. 70 = the audit stopped on an error and
+    /// reached no verdict (a database or config error, an unknown --unit, a
+    /// mistyped command line). 75 = the catalog was busy; run it again.
     Audit {
         /// Show remediation commands
         #[arg(long)]

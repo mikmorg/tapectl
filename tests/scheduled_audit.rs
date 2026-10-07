@@ -104,6 +104,24 @@ fn the_audits_named_codes_keep_their_meaning() {
     assert_eq!(busy.pings, ["/start"]);
 }
 
+/// ADR-0012, 2026-10-07 item 19: `tapectl audit` exits 70 (`EX_SOFTWARE`)
+/// when it stops on an error — the code it used to share with violations.
+/// The wrapper names it as the audit's own error: no verdict, a fail ping,
+/// the code passed through, and never "VIOLATIONS".
+#[test]
+fn exit_70_is_the_audit_s_own_error_not_violations() {
+    let r = run(70);
+    assert_eq!(r.code, 70);
+    assert!(
+        r.output
+            .contains("audit: no verdict (exit 70) — the audit stopped on an error"),
+        "{}",
+        r.output
+    );
+    assert!(!r.output.contains("VIOLATIONS"), "{}", r.output);
+    assert_eq!(r.pings, ["/start", "/fail"]);
+}
+
 /// Any other code is a run that reached no verdict: never reported as
 /// violations, still a failure (a fail ping, the code passed through) so a
 /// broken audit does not go quiet.

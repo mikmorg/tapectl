@@ -1189,8 +1189,10 @@ tapectl audit --action-plan
 tapectl audit --json
 ```
 
-Exit codes: 0 = clean, 1 = warnings, 2 = violations. The audit is advisory: it
-changes the exit code and nothing else, and never blocks a command.
+Exit codes: 0 = clean, 1 = warnings, 2 = violations, and 2 means nothing
+else: an audit that stops on an error exits 70 (75 when the catalog was busy).
+The audit is advisory: it changes the exit code and nothing else, and never
+blocks a command.
 `--action-plan` adds the command that fixes each finding:
 
 ```text
@@ -1249,7 +1251,7 @@ rows put a finding in their exit status:
 
 | command | 0 | 1 | 2 | 3 |
 |---|---|---|---|---|
-| `audit` | clean | warnings only | violations, or an error | — |
+| `audit` | clean | warnings only | violations, and only violations: an error exits 70 | — |
 | `volume verify` | every checked file matched | — | the medium is proven bad: the volume is quarantined and no longer counts as a copy | inconclusive: a drive or transport failure, or any error, including a command line that does not parse |
 | `db fsck` | clean | findings that are not corruption (orphaned rows, repaired or not) | the integrity check failed, or an error | — |
 | `collection sync`, `status`, `plan`, `run` | every unit ran | a unit was refused (its dotfile), or `sync` could not register a folder (invalid name, missing tenant or archive set), or (`sync`, `status`) something under the root belongs to no unit; the rest ran | an error | — |
@@ -1660,6 +1662,7 @@ verify-status`, and its exit status is `audit`'s:
 | 0 | clean | success |
 | 1 | warnings only | **success** (`SuccessExitStatus=1`) |
 | 2 | violations | failure |
+| 70 | no verdict: the audit stopped on an error (its message is in the journal) | failure |
 | 75 | catalog busy: no verdict this run | neither (no `/fail` ping) |
 | anything else | no verdict: the audit did not complete (a crash, say) | failure |
 
