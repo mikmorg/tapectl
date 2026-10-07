@@ -252,12 +252,27 @@ Rules that hold in every path:
 - **Confirm** (#23): a single forward pass from BOP (the index is at the front,
   not the tail — no seek-back). Read the seal marker and verify it binds File 3;
   diff the front index against the Layout (navigable tier); hash each file
-  against the front index's `sha256_encrypted` (integrity tier). The exact
+  against the front index's `sha256_encrypted` (integrity tier). A write's
+  confirm runs the navigable tier by default and the integrity tier only
+  under `--full-confirm` (ADR-0012, amendment 2026-10-06 item 1, #387); a
+  passing navigable confirm seals, and the volume's full readback is then
+  owed to `volume verify` — `audit` and `report verify-status` name every
+  sealed volume without one. The exact
   cryptographic chain is fixed in `volume-format-v2.md` §4–5. On tape that is
-  one locate to the seal marker, one rewind, then Files 0, 1, 2, 3 and every
-  content file in position order (#389): Files 0–2 are held in memory until
-  File 3 says what they hash to, and judged in its order, so the verdict is
-  the one a file-by-file walk gives. `TapeStore` tracks which file the head
+  one rewind, then Files 0, 1, 2, 3 and every content file in position order
+  (#389): Files 0–2 are held in memory until File 3 says what they hash to,
+  and judged in its order, so the verdict is the one a file-by-file walk
+  gives. Where the seal marker is *read* depends on what is known of it
+  (#397): straight after the session wrote it (or `volume resume` just parsed
+  it), it is read last, at the end of the same forward pass — no locate out
+  to it from BOT and back; on a tape whose seal nothing has just seen
+  (`volume verify`, a resume whose recorded seal did not read) it is read
+  first and alone, so an unsealed tape stops at one read. The navigable tier
+  always reads File 3, then spaces forward to the seal: one rewind, two
+  forward spaces. Wherever it is read, the seal is *judged* first (§2.5's
+  precedence): a seal that is absent, unparseable or refused is the whole
+  verdict and whatever was read after it is discarded, so both orders reach
+  the same evidence. `TapeStore` tracks which file the head
   is at and only spaces forward to a file ahead of it, rewinding only for one
   behind it or after anything that leaves the position uncertain (an error, a
   write, a read that returns nothing, or st's own count disagreeing). Before
@@ -281,7 +296,26 @@ Rules that hold in every path:
   outcomes, so one transient SCSI error inside an hours-long full-cartridge
   readback condemned a sound tape. Crash mid-confirm leaves `in_progress` → swept to
   Interrupted → resume revalidates and re-confirms (confirm is idempotent; no
-  dedicated state needed).
+  dedicated state needed). A full (integrity-tier) readback keeps a
+  **checkpoint** per file as it goes (#410, `readback_checkpoints`, migration
+  032): each file that hashed to its front-index claim is recorded with that
+  claim and the hash of File 3's true bytes. A re-entered full confirm whose
+  volume's latest `verification_sessions` row is a full one that never
+  finished (`in_progress` or `aborted`) re-reads the seal marker and File 3 —
+  always — and skips a recorded file only when File 3 hashes as it did then
+  and the file's claim is unchanged, so the seal it judges binds the very
+  claims the skipped files matched; §2.5's precedence is untouched (the seal
+  is still judged first, a refused seal is still the whole verdict). Skipped
+  files count toward `files_checked` and are recorded again under the new
+  session — keeping the time they were actually read — so a chain of
+  interruptions accumulates. A readback that finished, passed or failed, is
+  never continued, nor one holding a file read at or before the volume's
+  recorded write abort (the 2026-09-23 adoption rule wants a full readback
+  wholly after it), and the quick tier neither records nor skips anything.
+  `volume verify` takes part the same way: it records its session
+  `in_progress` from the start and leaves it `aborted` when stopped, so
+  re-running it continues; each continues the volume's latest readback,
+  whichever command took it.
 - **Snapshot lifecycle transitions happen only at Sealed**, inside the same
   transaction that records evidence, and are event-logged (#58).
 

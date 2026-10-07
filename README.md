@@ -34,8 +34,11 @@ flowchart LR
   the encrypted catalog in the printed **Heir Kit** (as of its last refresh), which
   also tells whoever finds it what to do.
 - **Plan first, write once.** The whole tape is planned before the first byte; the
-  write ends with a seal marker, then reads every byte back, and only a tape that
-  passes the read-back is recorded as sealed; a sealed tape is never appended to.
+  write ends with a seal marker, then reads back the front index and the seal marker,
+  and only a tape whose two ends agree with the plan is recorded as sealed; a sealed
+  tape is never appended to. `--full-confirm` reads every byte back at write time;
+  otherwise the `volume verify` that follows is the tape's first full read-back, and
+  `audit` names the tape (`no_full_verify`) until one passes.
 - **It knows where everything is.** Copies, locations, versions and verification
   history are tracked, and `audit` tells you what is short of your policy and the
   exact command that fixes it.
@@ -53,8 +56,8 @@ tapectl unit init-bulk /media/family/photos --tenant family
 tapectl snapshot create family/photos/2019-italy         # fast: what is there
 tapectl stage create family/photos/2019-italy            # dar + sha256 + age, into staging
 tapectl volume init L6-0001 --device "$TAPE"             # reads the cartridge's chip
-tapectl volume write L6-0001 --device "$TAPE"            # plan, write, seal marker, read back
-tapectl volume verify L6-0001 --device "$TAPE" --full
+tapectl volume write L6-0001 --device "$TAPE"            # plan, write, seal marker, confirm the ends
+tapectl volume verify L6-0001 --device "$TAPE" --full    # the first full read-back
 
 tapectl audit --action-plan                              # "has 1 copies, needs 2" — and the fix
 tapectl restore unit --unit family/photos/2019-italy --from L6-0001 --to /tmp/restore --device "$TAPE"

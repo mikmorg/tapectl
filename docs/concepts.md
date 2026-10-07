@@ -69,7 +69,7 @@ flowchart LR
 |---|---|---|---|
 | 1 | [`snapshot create`](cli/snapshot.md#tapectl-snapshot-create) | Walks the unit's directory and records every file's path, size, and mtime in the catalog. Fast, metadata only. | No |
 | 2 | [`stage create`](cli/stage.md#tapectl-stage-create) | Checks the source still matches the snapshot, runs `dar` to cut it into slices, encrypts each slice with age, and records checksums. | No |
-| 3 | [`volume write`](cli/volume.md#tapectl-volume-write) | Builds the complete layout of the tape, checks it fits, writes it, writes the seal marker, then reads the tape back to confirm it. | Yes |
+| 3 | [`volume write`](cli/volume.md#tapectl-volume-write) | Builds the complete layout of the tape, checks it fits, writes it, writes the seal marker, then reads the front index and seal marker back to confirm it (every file with `--full-confirm`; otherwise a later `volume verify` does that). | Yes |
 
 From the session (the other three units were snapshotted and staged the same
 way before the write):

@@ -416,9 +416,15 @@ fn migrations() -> Migrations<'static> {
         // `.foreign_key_check()`; both subject keys are `ON DELETE SET
         // NULL` so a snapshot delete never trips on them. See the header.
         M::up(include_str!("migrations/028_phase_timings.sql")),
-        // 029 is RESERVED for another batch's migration and is empty here;
-        // see its header. Replace it with the real 029 when that lands.
-        M::up(include_str!("migrations/029_reserved.sql")),
+        // 029 creates `readback_checkpoints` (issue #410): one row per file a
+        // full readback (a write's `--full-confirm`, a full `volume verify`)
+        // read back clean, written as the walk goes, so `volume resume
+        // --full-confirm` or the next full verify continues an interrupted
+        // readback instead of re-reading the whole tape. New table, no row
+        // read or converted, plain CREATE, so no `.foreign_key_check()`;
+        // rows cascade with their `verification_sessions` row.
+        // See the header.
+        M::up(include_str!("migrations/029_readback_checkpoints.sql")),
         // 030 stores per-file data once per unit (issue #380 option A,
         // #381; ADR-0012 item 7): `paths` (+ `paths_fts`) and the narrow
         // WITHOUT ROWID `file_versions`, converted from `files` exactly or
@@ -4155,7 +4161,7 @@ mod tests {
         assert_eq!(
             user_version(&conn),
             30,
-            "027 through 030 (issues #386, #380)"
+            "027, 028 (issue #386), 029 (issue #410) and 030 (issue #380)"
         );
         let freelist: i64 = conn
             .query_row("PRAGMA freelist_count", [], |r| r.get(0))
@@ -4490,5 +4496,47 @@ mod tests {
             "{msg}"
         );
         assert_eq!(user_version(&conn), 29, "rolled back");
+    }
+
+    /// Migration 029 (issue #410): `readback_checkpoints` exists on a fresh
+    /// catalog, refuses a second row for one file of one readback, and its
+    /// rows go with their verification session.
+    #[test]
+    fn test_migration_029_readback_checkpoints_cascade_with_their_session() {
+        let conn = open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('CK', 'lto', 'lto0', 'LTO-6', 1, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type) VALUES (?1, 'full')",
+            [volume_id],
+        )
+        .unwrap();
+        let session_id = conn.last_insert_rowid();
+        let insert = |position: i64| {
+            conn.execute(
+                "INSERT INTO readback_checkpoints (session_id, position, sha256, front_index_sha256)
+                 VALUES (?1, ?2, 'aa', 'bb')",
+                rusqlite::params![session_id, position],
+            )
+        };
+        insert(4).unwrap();
+        assert!(insert(4).is_err(), "one row per file per readback");
+        assert!(insert(-1).is_err(), "a position is never negative");
+        conn.execute(
+            "DELETE FROM verification_sessions WHERE id = ?1",
+            [session_id],
+        )
+        .unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM readback_checkpoints", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(left, 0);
     }
 }

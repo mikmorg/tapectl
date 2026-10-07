@@ -326,9 +326,16 @@ volume "L8-0001" moved to "home-rack"
   cartridge "E01001L8_1775794348" moved with it
 ```
 
-`volume write` ends by reading the whole tape back against its front index
-(the write's own full verification appears in `volume info`'s history), so the
-separate `volume verify` is a second, independent read-back. Here `audit`
+`volume write` ends with a quick confirm: it reads the front index and the
+seal marker back and checks them against what it wrote, and a passing confirm
+seals the volume (ADR-0012, 2026-10-06). It does not read the data back, so
+the `volume verify` straight after it is the volume's first full readback —
+every file hashed against the front index, the one check that spans host,
+cable, drive and medium. Until one passes, `audit` names the volume
+(`no_full_verify`) and `report verify-status` lists it. `volume write
+--full-confirm` does the full readback as part of the write instead (hours on
+a full cartridge); `volume verify` afterwards is then a second, independent
+read-back. Here `audit`
 after the first copy correctly reports that every unit is one copy short —
 that is the reminder to write the second:
 
@@ -430,9 +437,10 @@ The phases of a write are `contact-open` (the MAM read, the drive's identity,
 the counters at the contact's open), `build`, `prewrite-check` (the full read
 of every staged slice under `--prewrite-hash`, a size check otherwise),
 `positioning` (opening the drive, the File 0 check, the rewind), `plan`,
-`write`, `seal`, `confirm` (the readback of the whole tape: a locate to the
-seal marker at the end, one rewind, then every file in a single forward pass)
-and `health-sweep`; a resume has `drive-open`, `revalidate`, `identify` (the File 0
+`write`, `seal`, `confirm` (by default the front index and the seal marker
+read back, a minute or two; under `--full-confirm` the readback of the whole
+tape: one rewind, then every file in a single forward pass ending on the seal
+marker) and `health-sweep`; a resume has `drive-open`, `revalidate`, `identify` (the File 0
 and seal checks) and `positioning` in place of the build and pre-write steps,
 and the log names each file as it is written. `stage create` has `check` (the source against
 the snapshot, by metadata), `archive` (dar, slicing, encryption and the source's hashing in one
@@ -673,6 +681,19 @@ flags on the chip, a medium TapeAlert from the drive (`Media`, `Media life`,
 A warning never stops the write. If you see one, write that batch to another
 cartridge and retire this one. A line saying `no reading recorded` means tapectl
 has no figure, not that the figure is good.
+
+**The confirm after sealing.** By default the write reads back the front index
+and the seal marker and checks the seal's binding and the index against what
+it wrote; a passing confirm seals the volume (ADR-0012, 2026-10-06). The data
+is not read back, so the volume has no full readback until `volume verify`
+runs one — see [Monthly — verify a rotating slice of the library](#monthly--verify-a-rotating-slice-of-the-library): `audit`
+names every such volume (`no_full_verify`) and `report verify-status` lists
+it. `--full-confirm` makes the write read every file back and hash it, which
+costs about as long as the write itself (~2.3 h on a full LTO-6); the same six
+commands take it. A full readback that is interrupted (Ctrl-C, a dropped ssh
+session, a reboot) keeps what it has read back clean: `tapectl volume resume
+<label> --full-confirm` continues it from there rather than from the first
+file.
 
 `staging clean` releases every unit that has met its policy's `min_copies` and
 **retains** the ones that have not, naming them (ADR-0012). So a unit still
@@ -1642,8 +1663,25 @@ $ tapectl report verify-status
   L8-0002: full passed, started 2026-09-28 23:14:39, completed 2026-09-28 23:14:39 (13/13/0 checked/passed/failed)
 ```
 
-Pick the N volumes whose newest pass is oldest, such that **every volume gets
-one full pass within your verification interval**. If you hold 24 volumes on a
+**First, every newly written volume.** A write's confirm reads back only the
+front index and the seal marker unless you passed `--full-confirm`, so a new
+volume has had none of its data read back. Give it a full `volume verify`
+soon after the write — best before `staging clean` releases its units, while
+the staged slices can still rewrite a bad copy cheaply. `report
+verify-status` ends with the volumes still owed one:
+
+```text
+  sealed with no full readback recorded — run `tapectl volume verify <label>`:
+    L8-0002
+```
+
+and `audit` warns about each (`no_full_verify`) until a full verify passes. A
+`--quick` verify does not clear it. Until then the volume does count as a copy
+— the quick confirm proved it is sealed and navigable — but `volume resume`
+will not adopt an aborted session on it without a full verify on record.
+
+Then the rotation: pick the N volumes whose newest pass is oldest, such that
+**every volume gets one full pass within your verification interval**. If you hold 24 volumes on a
 12-month interval, that is roughly 2 per month. The interval `audit` checks is
 `verify_interval_days`, which only an archive set carries
 (`tapectl archive-set edit <name> --verify-interval-days N`). For a unit
@@ -1671,6 +1709,14 @@ The exit status says which of three things happened, so a script needs no
 
 An empty drive is refused at once with `no cartridge loaded in <device>`, by
 `volume verify` and by every other command that reads or writes a tape.
+
+A full verify that stops part-way (Ctrl-C, a dropped ssh session, a reboot)
+is recorded `aborted` with every file it had read back clean. Run the same
+`volume verify` again and it continues: it reads File 0, File 3 and the seal
+marker as always, skips the files already read back clean, and reads the
+rest. It continues only the volume's latest readback (a write's interrupted
+`--full-confirm` included), and only while the front index on the tape is the
+one those files were checked against; otherwise it reads everything.
 
 `volume verify` opens the drive read-only, so leave a sealed cartridge's
 write-protect tab set: it verifies without sliding the tab. So does a

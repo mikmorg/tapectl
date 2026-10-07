@@ -2114,6 +2114,7 @@ fn test_volume_write_refuses_over_capacity() {
         false,
         false,
         false,
+        false, // --full-confirm
         true,
     )
     .unwrap_err();
@@ -2343,6 +2344,7 @@ fn test_volume_write_refuses_when_an_unresolved_write_session_already_exists() {
         false,
         false,
         false,
+        false, // --full-confirm
         true,
     )
     .unwrap_err();
@@ -2453,6 +2455,7 @@ fn test_volume_write_refuses_when_a_tenant_has_no_active_key() {
         false,
         false,
         false,
+        false, // --full-confirm
         true,
     )
     .unwrap_err();

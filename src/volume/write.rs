@@ -20,7 +20,7 @@ use crate::tape::log_pages;
 use crate::tape::mam_journal::{Hook, MamReads};
 use crate::util::{HashingWriter, TruncatingWriter};
 
-use crate::store::{OpenMode, Store, TapeStore, Tier};
+use crate::store::{ConfirmPlan, OpenMode, Store, TapeStore, Tier};
 
 use super::binding;
 use super::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
@@ -982,7 +982,13 @@ fn blocking_validation_errors(
 /// L1). Off by default since ADR-0012's 2026-09-30 (later) amendment —
 /// validate then checks only that each slice exists at its recorded size,
 /// and a rotted slice is caught by L2 while streaming (clean abort, no seal).
-#[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow + prewrite_hash + assume_yes
+///
+/// `full_confirm` is `--full-confirm`: the post-seal confirm reads every
+/// file back and hashes it (tri-layer L3). Off by default since ADR-0012's
+/// 2026-10-06 item 1 (issue #387) — the confirm then reads File 3 and the
+/// seal ([`Tier::write_confirm`]), a passing one still seals, and the
+/// volume's full readback is left to `volume verify`.
+#[allow(clippy::too_many_arguments)] // conn/paths/config + label/device/block_size + force + allow_missing_escrow + prewrite_hash + full_confirm + assume_yes
 pub fn volume_write(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -993,6 +999,7 @@ pub fn volume_write(
     force: bool,
     allow_missing_escrow: bool,
     prewrite_hash: bool,
+    full_confirm: bool,
     assume_yes: bool,
 ) -> Result<()> {
     // ONE contact for the whole write, and the one `volume compact-write`,
@@ -1011,6 +1018,7 @@ pub fn volume_write(
         force,
         allow_missing_escrow,
         prewrite_hash,
+        full_confirm,
         assume_yes,
         &mut contact,
         ContactStore::Device,
@@ -1031,6 +1039,7 @@ fn volume_write_contacted<'c>(
     force: bool,
     allow_missing_escrow: bool,
     prewrite_hash: bool,
+    full_confirm: bool,
     assume_yes: bool,
     contact: &mut ContactSlot<'c>,
     store: ContactStore<'_>,
@@ -1270,6 +1279,7 @@ fn volume_write_contacted<'c>(
         force,
         allow_missing_escrow,
         SliceCheck::from_prewrite_hash(prewrite_hash),
+        Tier::write_confirm(full_confirm),
         StagedWrite {
             backend,
             volume_id,
@@ -1416,6 +1426,7 @@ fn volume_write_in_contact<'c>(
     force: bool,
     allow_missing_escrow: bool,
     slice_check: SliceCheck,
+    confirm_tier: Tier,
     staged: StagedWrite<'_>,
     det: &crate::tape::media_detect::Detected,
     contact: &contact::ContactGuard<'c>,
@@ -1721,6 +1732,7 @@ fn volume_write_in_contact<'c>(
         &layout_snapshot,
         block_size as u64,
         execute_outcome.into(),
+        confirm_tier,
     )
     .map(|()| layout_snapshot)
 }
@@ -1755,6 +1767,10 @@ fn volume_write_in_contact<'c>(
 /// `prewrite_hash` is `--prewrite-hash`, as on [`volume_write`]: the resume
 /// revalidation full-hashes every staged slice instead of size-checking it.
 /// The frozen generated zones are re-hashed byte-identical either way.
+///
+/// `full_confirm` is `--full-confirm`, as on [`volume_write`]: the confirm
+/// this resume runs, or re-enters, reads every file back.
+#[allow(clippy::too_many_arguments)]
 pub fn volume_resume(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -1763,6 +1779,7 @@ pub fn volume_resume(
     device: &str,
     block_size: usize,
     prewrite_hash: bool,
+    full_confirm: bool,
 ) -> Result<()> {
     // See [`ContactSlot`]: resume refuses on the volume's status, on its
     // `writes` rows and on a missing backend long before it reads the MAM,
@@ -1776,6 +1793,7 @@ pub fn volume_resume(
         device,
         block_size,
         SliceCheck::from_prewrite_hash(prewrite_hash),
+        Tier::write_confirm(full_confirm),
         &mut contact,
     );
     contact.finish_result(r)
@@ -1791,6 +1809,7 @@ fn volume_resume_contacted<'c>(
     device: &str,
     block_size: usize,
     slice_check: SliceCheck,
+    confirm_tier: Tier,
     contact: &mut ContactSlot<'c>,
 ) -> Result<()> {
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
@@ -1982,6 +2001,7 @@ fn volume_resume_contacted<'c>(
         &layout_snapshot,
         &keys,
         slice_check,
+        confirm_tier,
     );
 
     // ONE post-command sweep per resume contact (issue #342; ADR-0013),
@@ -2049,6 +2069,7 @@ fn volume_resume_in_contact(
     layout_snapshot: &Layout,
     keys: &KeyAvailability,
     slice_check: SliceCheck,
+    confirm_tier: Tier,
 ) -> Result<()> {
     binding::corroborate_volume(
         conn,
@@ -2097,6 +2118,7 @@ fn volume_resume_in_contact(
         layout_snapshot,
         block_size as u64,
         outcome,
+        confirm_tier,
     )
 }
 
@@ -2672,6 +2694,7 @@ fn assemble_session_keys(
 /// `ResumeOutcome::Ready`; it never constructs a seal entry of its own, and
 /// the `Confirming` arm below deliberately does NOT call it — the tape is
 /// already sealed (ADR-0012's 2026-09-21 amendment, issues #260/#267).
+#[allow(clippy::too_many_arguments)]
 fn finish_session(
     conn: &Connection,
     store: &mut dyn Store,
@@ -2680,6 +2703,7 @@ fn finish_session(
     layout: &Layout,
     block_size: u64,
     outcome: ResumeOutcome,
+    confirm_tier: Tier,
 ) -> Result<()> {
     match outcome {
         ResumeOutcome::Ready(ready) => {
@@ -2757,6 +2781,7 @@ fn finish_session(
                 layout,
                 block_size,
                 sealed_pending,
+                confirm_tier,
             )
         }
         // ADR-0012's 2026-09-21 amendment (issues #260/#267): resume found
@@ -2774,6 +2799,7 @@ fn finish_session(
             layout,
             block_size,
             sealed_pending,
+            confirm_tier,
         ),
         ResumeOutcome::Quarantined(q) => Err(quarantine_error(label, &q.reason)),
         ResumeOutcome::Interrupted(_) => {
@@ -2890,6 +2916,7 @@ fn park_after_seal(marker: &str) -> bool {
 /// [`ResumeOutcome::Confirming`] (which never does — the tape is already
 /// sealed). Factored out so the [`ConfirmOutcome`] three-way match exists in
 /// exactly one place — ADR-0012's 2026-09-18 amendment, issues #260/#267.
+#[allow(clippy::too_many_arguments)]
 fn finish_confirm(
     conn: &Connection,
     store: &mut dyn Store,
@@ -2898,18 +2925,28 @@ fn finish_confirm(
     layout: &Layout,
     block_size: u64,
     sealed_pending: session::SealedPending,
+    confirm_tier: Tier,
 ) -> Result<()> {
     // Issue #404: a signal during the readback stops it between files.
     // `confirm` returns before recording anything, so its rows keep their
     // status (`in_progress` is swept to `interrupted` on the next open) and
-    // the seal stays recorded: `volume resume` re-enters confirm.
+    // the seal stays recorded: `volume resume` re-enters confirm. A full
+    // readback keeps what it read back clean as it goes (issue #410), so a
+    // resume that asks for the full readback again continues it.
+    let resume_hint = match confirm_tier {
+        Tier::Integrity => format!(
+            "run `tapectl volume resume {label} --full-confirm` to continue the full readback \
+             (files it already read back clean are not read again)"
+        ),
+        Tier::Navigable => format!("run `tapectl volume resume {label}` to re-enter confirm"),
+    };
     let confirmed = sealed_pending
-        .confirm(conn, store, Tier::default())
+        .confirm(conn, store, confirm_tier)
         .map_err(|e| match e {
             TapectlError::Interrupted(at) => TapectlError::Interrupted(format!(
                 "volume \"{label}\": confirm {at}. The tape IS sealed; the catalog cannot \
                  count it as a copy until its readback passes. Reload the same cartridge and \
-                 run `tapectl volume resume {label}` to re-enter confirm."
+                 {resume_hint}."
             )),
             other => other,
         })?;
@@ -4057,7 +4094,8 @@ pub(crate) fn volume_verify_with_store(
     // rather than silently recording nothing (the DR machine with keys and
     // no `backend add`, ADR-0005: the verify itself is unaffected).
     // `session_id` (issue #295) names the `verification_sessions` row a
-    // completed verify made; a failed one made none.
+    // completed verify made; a failed one names none (one stopped during
+    // its readback leaves its row `aborted`, issue #410).
     let phase = progress::phase("health-sweep", None);
     match health_backend(site.config(), site.device()) {
         Ok(bk) => collect_and_record_health(
@@ -4220,14 +4258,61 @@ fn verify_contacted(
         Tier::Integrity => layout.on_tape_bytes().ok(),
         Tier::Navigable => None,
     };
+    // Issue #410: a full verify keeps a checkpoint per file it reads back
+    // clean, as it goes, and continues an interrupted full readback of this
+    // volume (a verify's or a write's confirm) rather than starting over.
+    // So the session row exists from the start, `in_progress` — inserted
+    // only now, after the corroboration above, so a wrong tape still
+    // records nothing (#164) — and is completed below. A verify stopped
+    // part-way leaves it `aborted`, which is what the next full verify
+    // continues. The continuation is read before the row exists, which
+    // would otherwise be "the latest" itself.
+    let resume = match tier {
+        Tier::Integrity => session::interrupted_readback(conn, volume_id)?,
+        Tier::Navigable => None,
+    };
+    if let Some(r) = &resume {
+        info!(
+            label,
+            files = r.checkpoints.passed.len(),
+            "continuing an interrupted full readback: files it read back clean are not read \
+             again if the front index is unchanged"
+        );
+    }
+    conn.execute(
+        "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+         VALUES (?1, ?2, 'in_progress')",
+        params![volume_id, tier.verify_type()],
+    )?;
+    let session_id = conn.last_insert_rowid();
+    let record = |c: crate::store::Checkpoint<'_>| {
+        session::record_checkpoint(conn, session_id, resume.as_ref(), c)
+    };
+    let plan = ConfirmPlan::new(tier).resuming(session::Continuation::checkpoints(resume.as_ref()));
+    let plan = match tier {
+        Tier::Integrity => plan.checkpointing(&record),
+        Tier::Navigable => plan,
+    };
+
     let phase = progress::phase("verify", total);
-    let evidence = store.confirm(&layout, tier)?;
+    let evidence = match store.confirm_with(&layout, plan) {
+        Ok(evidence) => evidence,
+        Err(e) => {
+            // Stopped (a signal, issue #404) or failed before a verdict:
+            // nothing was concluded, and what was read back clean stays
+            // recorded for the next full verify to continue.
+            if let Err(db) = conn.execute(
+                "UPDATE verification_sessions SET outcome = 'aborted'
+                 WHERE id = ?1 AND outcome = 'in_progress'",
+                params![session_id],
+            ) {
+                warn!(error = %db, "could not mark the stopped verify `aborted` (the next open's sweep will)");
+            }
+            return Err(e);
+        }
+    };
     phase.done();
 
-    let verify_type = match tier {
-        Tier::Integrity => "full",
-        Tier::Navigable => "quick",
-    };
     let outcome = if evidence.mismatches.is_empty() {
         "passed"
     } else {
@@ -4236,15 +4321,16 @@ fn verify_contacted(
     // One transaction (issue #142): the session aggregate and the per-mismatch
     // detail describe the same verify, so a crash between them must leave
     // neither rather than a session claiming "3 failed" with nothing to name
-    // them — which is precisely the state this change exists to end.
+    // them — which is precisely the state this change exists to end. (A
+    // crash leaves the row `in_progress`, which the next open's sweep marks
+    // `aborted`: no outcome is ever claimed without its detail.)
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "INSERT INTO verification_sessions
-            (volume_id, verify_type, outcome, completed_at, slices_checked, slices_passed, slices_failed)
-         VALUES (?1, ?2, ?3, datetime('now'), ?4, ?5, ?6)",
+        "UPDATE verification_sessions
+         SET outcome = ?1, completed_at = datetime('now'),
+             slices_checked = ?2, slices_passed = ?3, slices_failed = ?4
+         WHERE id = ?5",
         params![
-            volume_id,
-            verify_type,
             outcome,
             evidence.files_checked as i64,
             if evidence.mismatches.is_empty() {
@@ -4253,9 +4339,9 @@ fn verify_contacted(
                 0
             },
             evidence.mismatches.len() as i64,
+            session_id,
         ],
     )?;
-    let session_id = tx.last_insert_rowid();
     record_verification_results(&tx, session_id, volume_id, &evidence)?;
     // Issue #234, in the SAME transaction and for the same reason the
     // comment above gives: a `quarantined` status with no
@@ -4952,6 +5038,7 @@ pub fn compact_write(
     block_size: usize,
     allow_missing_escrow: bool,
     prewrite_hash: bool,
+    full_confirm: bool,
     assume_yes: bool,
 ) -> Result<()> {
     // The normal volume_write picks up all staged data. `force` is not
@@ -4969,6 +5056,7 @@ pub fn compact_write(
         false,
         allow_missing_escrow,
         prewrite_hash,
+        full_confirm,
         assume_yes,
     )
 }
@@ -6348,6 +6436,201 @@ mod tests {
                 Op::Read(4),
             ]
         );
+    }
+
+    /// A store that has a signal arrive as it reads File 3 for the
+    /// `nth` time (issue #410's tests: verify reads it once to rebuild its
+    /// Layout and once more in the chain walk).
+    struct SignalOnFrontIndex {
+        inner: TapeStore,
+        nth: u32,
+        seen: u32,
+    }
+
+    impl Store for SignalOnFrontIndex {
+        fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, src: &mut dyn std::io::Read, len: u64, sync: bool) -> Result<u64> {
+            self.inner.execute(src, len, sync)
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn std::io::Write) -> Result<u64> {
+            let r = self.inner.read_file(position, sink);
+            if position == 3 {
+                self.seen += 1;
+                if self.seen == self.nth {
+                    crate::signal::interrupt_this_thread(true);
+                }
+            }
+            r
+        }
+        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+            self.inner.reposition_for_resume(file_index)
+        }
+    }
+
+    fn checkpointed_positions(conn: &Connection, session_id: i64) -> Vec<u32> {
+        conn.prepare(
+            "SELECT position FROM readback_checkpoints WHERE session_id = ?1 ORDER BY position",
+        )
+        .unwrap()
+        .query_map(params![session_id], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Issue #410 for `volume verify`: a full verify continues an
+    /// interrupted full readback of the volume, keeps its own checkpoints as
+    /// it goes, and a verify stopped part-way leaves its session `aborted`
+    /// with what it had — so a chain of interruptions accumulates, and the
+    /// last verify reads only what none of them read back clean (besides
+    /// File 0, File 3 and the seal, read on every contact).
+    #[test]
+    fn a_full_verify_continues_an_interrupted_readback_and_can_itself_be_continued() {
+        use crate::tape::fake::{FakeTape, Op};
+
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"intact slice bytes, repeated a few times. ".repeat(4);
+        seed_one_slice_fixture(&conn, "VR-CONT", "vc-unit", 4, &good, "completed", "staged");
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'VR-CONT'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mem = mem_store_v2_tape("VR-CONT", &good, &good);
+
+        // An earlier full readback (a write's confirm, say) stopped after
+        // Files 0-2: its checkpoints, against this tape's front index.
+        let fi_text = String::from_utf8_lossy(&mem.files[3]).to_string();
+        let fi_true = fi_text.trim_end_matches('\0');
+        let fi_hash = direct_hash(fi_true.as_bytes());
+        let claims = format::parse_front_index(fi_true).unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'aborted')",
+            params![volume_id],
+        )
+        .unwrap();
+        let first = conn.last_insert_rowid();
+        for p in [0u32, 1, 2] {
+            let claim = claims.iter().find(|c| c.position == p as i32).unwrap();
+            conn.execute(
+                "INSERT INTO readback_checkpoints
+                     (session_id, position, sha256, front_index_sha256, checked_at)
+                 VALUES (?1, ?2, ?3, ?4, '2026-01-01 00:00:00')",
+                params![
+                    first,
+                    p,
+                    claim.sha256_encrypted.as_deref().unwrap(),
+                    fi_hash
+                ],
+            )
+            .unwrap();
+        }
+
+        // A verify, stopped before it reads the slice (the signal lands as
+        // the chain walk reads File 3).
+        let fake = FakeTape::with_files(mem.files.clone(), 4096);
+        let mut stopping = SignalOnFrontIndex {
+            inner: crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap(),
+            nth: 2,
+            seen: 0,
+        };
+        let r = volume_verify_with_store(
+            &conn,
+            &mut stopping,
+            "VR-CONT",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        );
+        crate::signal::interrupt_this_thread(false);
+        assert!(
+            matches!(r, Err(TapectlError::Interrupted(_))),
+            "the verify stops on the signal: {:?}",
+            r.err()
+        );
+        let (second, outcome): (i64, String) = conn
+            .query_row(
+                "SELECT id, outcome FROM verification_sessions ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(second, first);
+        assert_eq!(outcome, "aborted", "a stopped verify concludes nothing");
+        assert_eq!(
+            checkpointed_positions(&conn, second),
+            vec![0, 1, 2],
+            "what it skipped on the first one's word, recorded again"
+        );
+        let walked: Vec<Op> = fake.ops();
+        for p in [1, 2] {
+            assert!(
+                !walked.contains(&Op::Read(p)),
+                "file {p} re-read: {walked:?}"
+            );
+        }
+
+        // The next full verify reads the slice and nothing else of the
+        // front zone but File 0's contact check and File 3.
+        let fake = FakeTape::with_files(mem.files.clone(), 4096);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        let report = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "VR-CONT",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap();
+        assert_eq!(report.failed, 0, "mismatches: {:?}", report.mismatches);
+        assert_eq!(report.checked, 6, "the count an uninterrupted verify gives");
+        let reads: Vec<u32> = fake
+            .ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Read(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec![0, 3, 5, 3, 4]);
+        let third = report.session_id.unwrap();
+        assert_eq!(checkpointed_positions(&conn, third), vec![0, 1, 2, 4]);
+        // A checkpoint dates the READ: what was skipped keeps the time the
+        // first readback read it, down the chain; the slice is read now.
+        let read_at: Vec<(u32, String)> = conn
+            .prepare(
+                "SELECT position, checked_at FROM readback_checkpoints
+                 WHERE session_id = ?1 ORDER BY position",
+            )
+            .unwrap()
+            .query_map(params![third], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for (p, at) in &read_at {
+            if *p == 4 {
+                assert_ne!(
+                    at, "2026-01-01 00:00:00",
+                    "the slice was read by this verify"
+                );
+            } else {
+                assert_eq!(at, "2026-01-01 00:00:00", "file {p} keeps its read time");
+            }
+        }
+        let outcome: String = conn
+            .query_row(
+                "SELECT outcome FROM verification_sessions WHERE id = ?1",
+                params![third],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcome, "passed");
     }
 
     /// Issue #407: `volume verify` opens the drive READ-ONLY, so a sealed
@@ -8859,6 +9142,7 @@ mod tests {
             true,  // --force
             false, // --allow-missing-escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes: the host pre-flight is not under test here
         )
         .expect_err("force must not bypass pre-write validation");
@@ -8952,6 +9236,7 @@ mod tests {
                 false, // force
                 false, // allow_missing_escrow
                 false, // --prewrite-hash
+                false, // --full-confirm
                 true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err();
@@ -9054,6 +9339,7 @@ mod tests {
             false, // force
             false, // allow_missing_escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err();
@@ -9134,6 +9420,7 @@ mod tests {
             false, // force
             false, // allow_missing_escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes
         )
         .unwrap_err();
@@ -9207,6 +9494,7 @@ mod tests {
             false,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .unwrap_err();
@@ -9295,6 +9583,7 @@ mod tests {
             false, // force
             false, // allow_missing_escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err();
@@ -9395,6 +9684,7 @@ mod tests {
             "/nonexistent/tapectl-resume-rebuilt-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -9456,6 +9746,7 @@ mod tests {
             false,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .expect_err("no staged data exists, so this must fail at a LATER check");
@@ -9671,6 +9962,7 @@ mod tests {
             false,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .expect_err("no backend is configured, so this must fail at backend resolution");
@@ -9750,6 +10042,7 @@ mod tests {
             "/nonexistent/tapectl-resume-status-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -9840,6 +10133,7 @@ mod tests {
             "/nonexistent/tapectl-resume-planned-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -9898,6 +10192,7 @@ mod tests {
             "/nonexistent/tapectl-resume-inprogress-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -10006,6 +10301,7 @@ mod tests {
                 "/nonexistent/tapectl-resume-live-test-nst",
                 512 * 1024,
                 false,
+                false, // --full-confirm
             )
             .unwrap_err()
         };
@@ -10042,6 +10338,7 @@ mod tests {
             true,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .unwrap_err();
@@ -10098,6 +10395,7 @@ mod tests {
             "/nonexistent/tapectl-resume-interrupted-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
 
@@ -10176,6 +10474,7 @@ mod tests {
             "/nonexistent/tapectl-resume-pm280-test-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err()
     }
@@ -10334,6 +10633,7 @@ mod tests {
                 force,
                 false,
                 false,
+                false, // --full-confirm
                 true,
             )
             .unwrap_err();
@@ -10482,6 +10782,7 @@ mod tests {
             "/nonexistent/tapectl-resume-gencheck-nst",
             512 * 1024,
             false,
+            false, // --full-confirm
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -10557,6 +10858,7 @@ mod tests {
             false,
             false,
             false,
+            false, // --full-confirm
             true,
         )
         .unwrap_err();
@@ -11646,6 +11948,7 @@ mod tests {
                 false, // --force
                 false, // --allow-missing-escrow
                 false, // --prewrite-hash
+                false, // --full-confirm
                 true,  // --yes: the host pre-flight is not under test here
             )
             .expect_err("the escrow gap must refuse before the device is touched");
@@ -13159,6 +13462,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
             )
             .unwrap_err()
@@ -13204,6 +13508,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
             )
             .unwrap_err();
@@ -13247,6 +13552,7 @@ mod tests {
                 512 * 1024,
                 false,
                 false, // --prewrite-hash
+                false, // --full-confirm
                 true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err();
@@ -13300,6 +13606,7 @@ mod tests {
                 GENCHK_DEVICE,
                 512 * 1024,
                 false, // --prewrite-hash
+                false, // --full-confirm
                 true,  // --yes: the host pre-flight is not under test here
             )
             .unwrap_err()
@@ -13446,6 +13753,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
             )
             .unwrap_err();
@@ -14325,6 +14633,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
@@ -14398,6 +14707,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
@@ -14458,6 +14768,215 @@ mod tests {
             );
         }
 
+        /// A `MemStore` that logs which positions were read back since the
+        /// last write — after a session, the confirm's reads.
+        struct ReadLog {
+            inner: MemStore,
+            reads: Vec<u32>,
+        }
+
+        impl Store for ReadLog {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(
+                &mut self,
+                src: &mut dyn std::io::Read,
+                len: u64,
+                sync: bool,
+            ) -> Result<u64> {
+                self.reads.clear();
+                self.inner.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn std::io::Write) -> Result<u64> {
+                self.reads.push(position);
+                self.inner.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+        }
+
+        /// Issue #387 (ADR-0012, 2026-10-06 item 1): a write confirms with
+        /// the quick tier by default — File 3 and the seal read back, no
+        /// content file — records `quick`, and a passing quick confirm
+        /// seals the volume.
+        #[test]
+        fn a_default_write_confirms_quick_and_seals() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-QUICK", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let mut store = ReadLog {
+                inner: MemStore::new(512 * 1024),
+                reads: Vec::new(),
+            };
+
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-QUICK",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                false, // --full-confirm
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            slot.finish_result(r).expect("the write completes");
+            let seal = store.inner.files.len() as u32 - 1;
+            let (status, sessions): (String, Vec<(String, String)>) = (
+                conn.query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+                conn.prepare(
+                    "SELECT verify_type, outcome FROM verification_sessions WHERE volume_id = ?1",
+                )
+                .unwrap()
+                .query_map(params![volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap(),
+            );
+            assert_eq!(status, "sealed", "a passing quick confirm seals");
+            assert_eq!(sessions, vec![("quick".to_string(), "passed".to_string())]);
+            assert_eq!(store.reads, vec![3, seal], "no content file read back");
+        }
+
+        /// The other half of #387: `--full-confirm` reads every file back
+        /// (the seal last, issue #397) and records `full`.
+        #[test]
+        fn full_confirm_reads_every_file_back_and_records_full() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-FULL", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let mut store = ReadLog {
+                inner: MemStore::new(512 * 1024),
+                reads: Vec::new(),
+            };
+
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-FULL",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                true, // --full-confirm
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            slot.finish_result(r).expect("the write completes");
+            let files = store.inner.files.len() as u32;
+            let sessions: Vec<(String, String)> = conn
+                .prepare(
+                    "SELECT verify_type, outcome FROM verification_sessions WHERE volume_id = ?1",
+                )
+                .unwrap()
+                .query_map(params![volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(sessions, vec![("full".to_string(), "passed".to_string())]);
+            assert_eq!(store.reads, (0..files).collect::<Vec<u32>>());
+        }
+
+        /// A `MemStore` that has a signal arrive once the readback after the
+        /// seal has read position 4 (the first file after File 3).
+        struct StopAfterFour {
+            inner: MemStore,
+        }
+
+        impl Store for StopAfterFour {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(
+                &mut self,
+                src: &mut dyn std::io::Read,
+                len: u64,
+                sync: bool,
+            ) -> Result<u64> {
+                self.inner.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn std::io::Write) -> Result<u64> {
+                let r = self.inner.read_file(position, sink);
+                if position == 4 && self.inner.files.len() > 5 {
+                    crate::signal::interrupt_this_thread(true);
+                }
+                r
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+        }
+
+        /// Issue #410: a full confirm stopped by a signal keeps what it read
+        /// back clean, and its error tells the operator to resume WITH
+        /// `--full-confirm` — without it the resume runs the quick confirm
+        /// and the readback is not continued.
+        #[test]
+        fn an_interrupted_full_confirm_says_how_to_continue_it() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-STOP", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let mut store = StopAfterFour {
+                inner: MemStore::new(512 * 1024),
+            };
+
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-STOP",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                true, // --full-confirm
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            crate::signal::interrupt_this_thread(false);
+            let err = slot.finish_result(r).expect_err("the confirm stops");
+            let msg = err.to_string();
+            assert!(matches!(err, TapectlError::Interrupted(_)), "{msg}");
+            assert!(
+                msg.contains("volume resume SW-STOP --full-confirm"),
+                "names the flag that continues the readback: {msg}"
+            );
+            let checkpoints: Vec<u32> = conn
+                .prepare(
+                    "SELECT rc.position FROM readback_checkpoints rc
+                     JOIN verification_sessions vs ON vs.id = rc.session_id
+                     WHERE vs.volume_id = ?1 ORDER BY rc.position",
+                )
+                .unwrap()
+                .query_map(params![volume_id], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(checkpoints, vec![0, 1, 2, 4]);
+        }
+
         /// ADR-0012 2026-10-06 item 4 (issue #370): the filtered
         /// `catalog.db` a write puts in its operator envelopes is plaintext
         /// (paths, sizes, hashes), so it is built in the tapectl home and
@@ -14485,6 +15004,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
@@ -14553,6 +15073,7 @@ mod tests {
                     false,
                     false,
                     prewrite_hash,
+                    false, // --full-confirm
                     true,
                     &mut slot,
                     ContactStore::Injected(&mut store),
@@ -14637,6 +15158,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false, // --full-confirm
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
@@ -14691,6 +15213,7 @@ mod tests {
                     false,
                     false,
                     prewrite_hash,
+                    false, // --full-confirm
                     true,
                     &mut slot,
                     ContactStore::Injected(&mut store),
@@ -15105,6 +15628,7 @@ mod tests {
             force,
             false, // allow_missing_escrow
             false, // --prewrite-hash
+            false, // --full-confirm
             true,  // --yes: the host pre-flight is not under test here
         )
         .unwrap_err()

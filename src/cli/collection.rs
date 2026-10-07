@@ -118,6 +118,10 @@ pub enum CollectionCommands {
         /// `stage create --jobs`. Defaults to `[staging] jobs`, itself 1.
         #[arg(long)]
         jobs: Option<usize>,
+        /// See `volume write --full-confirm`: read every copy this run
+        /// writes back in full after sealing it.
+        #[arg(long)]
+        full_confirm: bool,
     },
 }
 
@@ -183,6 +187,7 @@ pub fn run(
             prewrite_hash,
             fill_ceiling,
             jobs,
+            full_confirm,
         } => cmd_run(
             conn,
             paths,
@@ -193,6 +198,7 @@ pub fn run(
             &crate::cli::write_device(config, device.as_deref())?,
             *prewrite_hash,
             *jobs,
+            *full_confirm,
             json_output,
             global_dry_run,
             assume_yes,
@@ -477,6 +483,7 @@ fn cmd_run(
     device: &str,
     prewrite_hash: bool,
     jobs: Option<usize>,
+    full_confirm: bool,
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
@@ -593,6 +600,7 @@ fn cmd_run(
         device,
         DEFAULT_BLOCK_SIZE,
         prewrite_hash,
+        full_confirm,
         assume_yes,
     )?;
 

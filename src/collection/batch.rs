@@ -121,7 +121,9 @@ pub struct BatchExecutionReport {
 /// be too small (issue #354) for every unit staged.
 ///
 /// `prewrite_hash` is `collection run --prewrite-hash`, handed to every
-/// copy's `volume_write` (ADR-0012, 2026-09-30 later amendment).
+/// copy's `volume_write` (ADR-0012, 2026-09-30 later amendment), and
+/// `full_confirm` is `collection run --full-confirm`, likewise (ADR-0012,
+/// 2026-10-06 item 1).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_batch(
     conn: &Connection,
@@ -132,6 +134,7 @@ pub fn execute_batch(
     device: &str,
     block_size: usize,
     prewrite_hash: bool,
+    full_confirm: bool,
     assume_yes: bool,
 ) -> Result<BatchExecutionReport> {
     if batch.units.is_empty() {
@@ -260,6 +263,7 @@ pub fn execute_batch(
             false,
             false,
             prewrite_hash,
+            full_confirm,
             assume_yes,
         )?;
     }
@@ -1007,6 +1011,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
+            false, // --full-confirm
             true,
         )
         .expect_err("the sealed destination is not a write target");
@@ -1037,6 +1042,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
+            false, // --full-confirm
             false,
         )
         .expect_err("no terminal and no --yes: a stage that may not fit is refused");
@@ -1064,6 +1070,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
+            false, // --full-confirm
             true,
         )
         .expect_err("the sealed destination is not a write target");

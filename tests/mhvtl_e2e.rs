@@ -405,6 +405,7 @@ fn write_volume(name: &str, label: &str, units: &[(&str, &str, usize)]) -> Harne
         true,
         false,
         false,
+        false, // --full-confirm
         true,
     )
     .unwrap();
@@ -465,7 +466,7 @@ fn mhvtl_full_round_trip() {
         label,
         &tape_dev(),
         BLOCK_SIZE,
-        Tier::default(),
+        Tier::Integrity,
     )
     .unwrap();
     assert_eq!(verify.failed, 0, "verify had failures: {verify:?}");
@@ -846,6 +847,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
         true,
         false,
         false,
+        false, // --full-confirm
         true,
     )
     .unwrap();
@@ -1128,7 +1130,7 @@ fn mhvtl_verify_by_id_device_records_drive_health() {
         label,
         &by_id.to_string_lossy(),
         BLOCK_SIZE,
-        Tier::default(),
+        Tier::Integrity,
     )
     .unwrap();
 
@@ -1180,7 +1182,7 @@ fn mhvtl_verify_with_no_backend_says_health_not_collected() {
         label,
         &tape_dev(),
         BLOCK_SIZE,
-        Tier::default(),
+        Tier::Integrity,
     )
     .unwrap();
 
@@ -1333,7 +1335,7 @@ fn mhvtl_restore_sh_verify_agrees_with_rust_on_good_tape() {
         label,
         &tape_dev(),
         BLOCK_SIZE,
-        Tier::default(),
+        Tier::Integrity,
     )
     .expect("volume_verify must not Err on a good tape");
     assert_eq!(

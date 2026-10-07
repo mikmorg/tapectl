@@ -70,12 +70,12 @@ use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::busy::{self, BusyPolicy};
 use crate::error::{Result, TapectlError};
 use crate::pipeline::{self, BufferPool, Verdict};
-use crate::store::{Evidence, Store, Tier};
+use crate::store::{Checkpoint, Checkpoints, ConfirmPlan, Evidence, ReadOrder, Store, Tier};
 
 use super::build::{BuildUnit, BuiltLayout};
 use super::format;
@@ -638,6 +638,130 @@ fn seal_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
         |r| r.get(0),
     )?;
     Ok(sealed_at.is_some())
+}
+
+// ── a full readback continues an interrupted one (#410) ──
+
+/// An interrupted full readback a new one continues (issue #410): which
+/// readback session it was, and what it had read back clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Continuation {
+    /// The `verification_sessions` row being continued.
+    pub session_id: i64,
+    pub checkpoints: Checkpoints,
+}
+
+impl Continuation {
+    /// The checkpoints, for [`ConfirmPlan::resuming`].
+    pub fn checkpoints(this: Option<&Self>) -> Option<&Checkpoints> {
+        this.map(|c| &c.checkpoints)
+    }
+}
+
+/// What the previous readback of this volume read back clean, when it is
+/// one a full readback may continue (issue #410): the volume's latest
+/// `verification_sessions` row is a FULL one that never finished —
+/// `in_progress` (its process died) or `aborted` (a stopped verify, or the
+/// startup sweep's word for a dead one) — with checkpoints all taken
+/// against one front index. A readback that finished, passed or failed, is
+/// never continued: a failed one is re-read whole, so a drive that was
+/// cleaned in between gets to read everything again.
+///
+/// Nor is one any of whose files was read back at or before the volume's
+/// recorded write abort: ADR-0012's 2026-09-23 adoption rule wants a full
+/// readback wholly after the abort ([`aborted_adoption`], by `started_at`),
+/// and a continuation would otherwise let files read before it stand in a
+/// verify that started after it. A skipped file keeps the time it was
+/// actually read ([`record_checkpoint`]), so this holds down a chain of
+/// interruptions too.
+///
+/// Shared by the write's confirm and `volume verify` (both record their
+/// readbacks in `verification_sessions`), so either continues the other's
+/// interrupted readback: the checkpoints are anchored to File 3's bytes,
+/// not to the command that took them.
+pub(crate) fn interrupted_readback(
+    conn: &Connection,
+    volume_id: i64,
+) -> Result<Option<Continuation>> {
+    let latest: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT id, verify_type, outcome FROM verification_sessions
+             WHERE volume_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![volume_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((session_id, verify_type, outcome)) = latest else {
+        return Ok(None);
+    };
+    if verify_type != Tier::Integrity.verify_type()
+        || !matches!(outcome.as_str(), "in_progress" | "aborted")
+    {
+        return Ok(None);
+    }
+    let rows: Vec<(u32, String, String, String)> = conn
+        .prepare(
+            "SELECT position, sha256, front_index_sha256, checked_at FROM readback_checkpoints
+             WHERE session_id = ?1",
+        )?
+        .query_map(params![session_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let Some(front_index_sha256) = rows.first().map(|(_, _, fi, _)| fi.clone()) else {
+        return Ok(None);
+    };
+    if rows.iter().any(|(_, _, fi, _)| *fi != front_index_sha256) {
+        return Ok(None);
+    }
+    if let Some(aborted_at) = recorded_abort_time(conn, volume_id)? {
+        if rows.iter().any(|(_, _, _, at)| *at <= aborted_at) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(Continuation {
+        session_id,
+        checkpoints: Checkpoints {
+            front_index_sha256,
+            passed: rows.into_iter().map(|(p, sha, _, _)| (p, sha)).collect(),
+        },
+    }))
+}
+
+/// Record one file a full readback read back clean, under readback session
+/// `session_id` (issue #410), as the walk goes. A file the readback skipped
+/// on `continuing`'s word keeps the time it was actually read there, not
+/// now: what a checkpoint dates is the read. Best-effort: a row that cannot
+/// be written costs one re-read on a later continuation, never the readback
+/// itself, so a failure is warned about and swallowed.
+pub(crate) fn record_checkpoint(
+    conn: &Connection,
+    session_id: i64,
+    continuing: Option<&Continuation>,
+    c: Checkpoint<'_>,
+) {
+    if let Err(e) = conn.execute(
+        "INSERT OR IGNORE INTO readback_checkpoints
+             (session_id, position, sha256, front_index_sha256, checked_at)
+         VALUES (?1, ?2, ?3, ?4, COALESCE(
+             (SELECT checked_at FROM readback_checkpoints
+              WHERE session_id = ?5 AND position = ?2 AND sha256 = ?3
+                AND front_index_sha256 = ?4),
+             datetime('now')))",
+        params![
+            session_id,
+            c.position,
+            c.sha256,
+            c.front_index_sha256,
+            continuing.map(|k| k.session_id),
+        ],
+    ) {
+        tracing::warn!(
+            position = c.position,
+            error = %e,
+            "could not record a readback checkpoint (an interruption would re-read this file)"
+        );
+    }
 }
 
 // ── `volume resume` adopts an aborted, sealed, cleared session (#280) ──
@@ -1241,6 +1365,10 @@ impl InterruptedSession {
                         built: self.built,
                         volume_id: self.volume_id,
                         write_ids: self.write_ids,
+                        // The seal is recorded but did not read just now:
+                        // the gate goes first, so an unreadable seal is
+                        // found at one read, not after the whole pass.
+                        seal_order: ReadOrder::SealFirst,
                     }));
                 }
                 // sealed_at is NULL: the seal is still genuinely owed.
@@ -1296,6 +1424,10 @@ impl InterruptedSession {
                         built: self.built,
                         volume_id: self.volume_id,
                         write_ids: self.write_ids,
+                        // `resume_reconfirm_eligible` has just parsed a seal
+                        // marker at this session's own seal position, so it
+                        // is read last, in the forward pass (issue #397).
+                        seal_order: ReadOrder::SealLast,
                     }));
                 }
 
@@ -1465,6 +1597,10 @@ impl ReadyToSeal {
             built: self.built,
             volume_id: self.volume_id,
             write_ids: self.write_ids,
+            // Just written, with a synchronous filemark: the head is at end
+            // of data, and the confirm reads the seal last, at the end of
+            // its one forward pass (issue #397).
+            seal_order: ReadOrder::SealLast,
         })
     }
 }
@@ -1475,6 +1611,9 @@ pub struct SealedPending {
     built: BuiltLayout,
     volume_id: i64,
     write_ids: Vec<(i64, i64)>,
+    /// Where confirm reads the seal marker (issue #397): last when this
+    /// session has just written or just read it, first otherwise.
+    seal_order: ReadOrder,
 }
 
 impl SealedPending {
@@ -1495,10 +1634,21 @@ impl SealedPending {
         store: &mut dyn Store,
         tier: Tier,
     ) -> Result<ConfirmOutcome> {
-        let verify_type = match tier {
-            Tier::Integrity => "full",
-            Tier::Navigable => "quick",
+        let verify_type = tier.verify_type();
+        // Issue #410: read before this confirm's own row exists, which
+        // would otherwise be "the latest" itself.
+        let resume = match tier {
+            Tier::Integrity => interrupted_readback(conn, self.volume_id)?,
+            Tier::Navigable => None,
         };
+        if let Some(r) = &resume {
+            tracing::info!(
+                label = %self.built.layout.label,
+                files = r.checkpoints.passed.len(),
+                "continuing an interrupted full readback: files it read back clean are not \
+                 read again if the front index is unchanged"
+            );
+        }
         conn.execute(
             "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
              VALUES (?1, ?2, 'in_progress')",
@@ -1525,16 +1675,34 @@ impl SealedPending {
             .collect::<rusqlite::Result<_>>()?;
 
         // Issue #386: the readback — hours on a full cartridge — is its own
-        // phase, counted byte by byte through `Store::confirm`.
-        let phase = crate::progress::phase("confirm", self.built.layout.on_tape_bytes().ok());
-        let evidence = store.confirm(&self.built.layout, tier)?;
+        // phase, counted byte by byte through `Store::confirm`. A quick
+        // confirm reads no content file, so only a full one has a byte
+        // total (as `volume verify` already does).
+        let total = match tier {
+            Tier::Integrity => self.built.layout.on_tape_bytes().ok(),
+            Tier::Navigable => None,
+        };
+        let phase = crate::progress::phase("confirm", total);
+        // Issue #410: every file read back clean is recorded as the walk
+        // goes, so an interruption (#404) leaves this readback continuable.
+        // Best-effort: a row that cannot be written costs one re-read on a
+        // later resume, never this readback.
+        let record = |c: Checkpoint<'_>| record_checkpoint(conn, vs_id, resume.as_ref(), c);
+        let plan = ConfirmPlan::new(tier)
+            .with_order(self.seal_order)
+            .resuming(Continuation::checkpoints(resume.as_ref()));
+        let plan = match tier {
+            Tier::Integrity => plan.checkpointing(&record),
+            Tier::Navigable => plan,
+        };
+        let evidence = store.confirm_with(&self.built.layout, plan)?;
         phase.done();
         let passed = evidence.mismatches.is_empty();
         // ADR-0012's 2026-09-18 amendment: a mismatch alone is not a
-        // quarantine verdict. `Tier::default()` is `Tier::Integrity`, so a
-        // routine confirm reads back the WHOLE cartridge — hours on a full
-        // LTO-6 — and one transient SCSI error in that window must not
-        // condemn a physically sound tape.
+        // quarantine verdict. A full confirm (`--full-confirm`) reads back
+        // the WHOLE cartridge — hours on a full LTO-6 — and one transient
+        // SCSI error in that window must not condemn a physically sound
+        // tape.
         let proves_medium_bad = evidence.proves_medium_bad();
 
         // Issue #377: recorded after an hours-long readback, so a busy
@@ -2370,10 +2538,10 @@ mod tests {
         fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
             self.inner.reposition_for_resume(file_index)
         }
-        fn confirm(
+        fn confirm_with(
             &mut self,
             layout: &crate::volume::layout_model::Layout,
-            tier: Tier,
+            plan: ConfirmPlan,
         ) -> Result<Evidence> {
             self.conn
                 .execute(
@@ -2381,7 +2549,7 @@ mod tests {
                     params![self.volume_id],
                 )
                 .unwrap();
-            self.inner.confirm(layout, tier)
+            self.inner.confirm_with(layout, plan)
         }
     }
 
@@ -6018,5 +6186,324 @@ mod tests {
             .unwrap();
         assert_eq!((wp_status.as_str(), wp_hash), ("failed", None));
         assert_eq!(store.inner.files.len(), position);
+    }
+
+    // ── issue #397: the confirm after a write reads the seal without a long
+    // locate. Driven over the REAL `TapeStore` on `tape::fake::FakeTape`,
+    // which logs every motion, through the session's own seal -> confirm.
+
+    use crate::store::TapeStore;
+    use crate::tape::fake::{FakeTape, Op};
+
+    /// Write this fixture's whole session (seal included) onto a fake tape,
+    /// then clear the motion log: what is logged after this is the confirm.
+    fn sealed_on_a_fake_tape(f: Fixture) -> (Connection, SealedPending, TapeStore, FakeTape, u32) {
+        let (conn, pending, store, fake, seal, _dirs) = sealed_on_a_fake_tape_keeping_dirs(f);
+        (conn, pending, store, fake, seal)
+    }
+
+    /// [`sealed_on_a_fake_tape`], handing back the fixture's staging and
+    /// session directories too, for a test that goes on to `volume resume`
+    /// (which reads the frozen layout from the session directory).
+    #[allow(clippy::type_complexity)]
+    fn sealed_on_a_fake_tape_keeping_dirs(
+        f: Fixture,
+    ) -> (
+        Connection,
+        SealedPending,
+        TapeStore,
+        FakeTape,
+        u32,
+        (tempfile::TempDir, tempfile::TempDir),
+    ) {
+        let seal = (f.built.layout.entries.len() - 1) as u32;
+        let fake = FakeTape::with_files(Vec::new(), BS as usize);
+        let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path fake-tape run"),
+        };
+        let pending = ready.seal(&mut store).unwrap();
+        fake.clear_ops();
+        (
+            f.conn,
+            pending,
+            store,
+            fake,
+            seal,
+            (f._slices_dir, f._session_dir),
+        )
+    }
+
+    /// A full confirm straight after the seal: one rewind and one forward
+    /// pass that reads the seal last — no locate out to the seal and back
+    /// (before #397: rewind, space to the seal, read it, rewind again).
+    #[test]
+    fn a_full_confirm_right_after_the_seal_is_one_rewind_and_one_forward_pass() {
+        let (conn, pending, mut store, fake, seal) = sealed_on_a_fake_tape(make_fixture());
+        let outcome = pending.confirm(&conn, &mut store, Tier::Integrity).unwrap();
+        assert!(matches!(outcome, ConfirmOutcome::Sealed(_)));
+        let mut expected = vec![Op::Rewind];
+        expected.extend((0..=seal).map(Op::Read));
+        assert_eq!(fake.ops(), expected);
+        assert_eq!(fake.rewinds(), 1);
+        assert_eq!(fake.spaces(), 0, "no locate to the seal");
+    }
+
+    /// The quick confirm straight after the seal: File 3, then a relative
+    /// forward space to the seal — one rewind (before #397: two).
+    #[test]
+    fn a_quick_confirm_right_after_the_seal_reads_file_3_then_the_seal() {
+        let (conn, pending, mut store, fake, seal) = sealed_on_a_fake_tape(make_fixture());
+        let outcome = pending.confirm(&conn, &mut store, Tier::Navigable).unwrap();
+        assert!(matches!(outcome, ConfirmOutcome::Sealed(_)));
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::Rewind,
+                Op::Space(3),
+                Op::Read(3),
+                Op::Space(seal - 4),
+                Op::Read(seal),
+            ]
+        );
+    }
+
+    // ── issue #410: an interrupted full confirm is continued by `volume
+    // resume`, not redone.
+
+    /// A `TapeStore` that has a signal arrive right after it reads `at`.
+    struct SignalAfter {
+        inner: TapeStore,
+        at: u32,
+    }
+
+    impl Store for SignalAfter {
+        fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, src: &mut dyn std::io::Read, len: u64, sync: bool) -> Result<u64> {
+            self.inner.execute(src, len, sync)
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            let r = self.inner.read_file(position, sink);
+            if position == self.at {
+                crate::signal::interrupt_this_thread(true);
+            }
+            r
+        }
+        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+            self.inner.reposition_for_resume(file_index)
+        }
+    }
+
+    /// The acceptance test, through the catalog: a full confirm stopped by a
+    /// signal after file k leaves its checkpoints, and the confirm `volume
+    /// resume` re-enters reads File 3, the files after k and the seal —
+    /// nothing before k — and seals with the counts an uninterrupted
+    /// confirm records.
+    #[test]
+    fn a_resumed_full_confirm_reads_only_what_the_interrupted_one_had_not() {
+        let f = make_fixture();
+        let volume_id = f.volume_id;
+        let keys = f.keys.clone();
+        let (conn, pending, store, fake, seal, _dirs) = sealed_on_a_fake_tape_keeping_dirs(f);
+        let k = 5;
+        let mut stopping = SignalAfter {
+            inner: store,
+            at: k,
+        };
+        let r = pending.confirm(&conn, &mut stopping, Tier::Integrity);
+        crate::signal::interrupt_this_thread(false);
+        assert!(
+            matches!(r, Err(TapectlError::Interrupted(_))),
+            "the first confirm stops on the signal"
+        );
+        let checkpointed: Vec<u32> = conn
+            .prepare("SELECT position FROM readback_checkpoints ORDER BY position")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(checkpointed, vec![0, 1, 2, 4, 5]);
+
+        // What the startup sweep does for a process that stopped mid-confirm.
+        conn.execute(
+            "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        let pending = match InterruptedSession::rehydrate(&conn, volume_id)
+            .unwrap()
+            .expect("resumable")
+            .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+            .unwrap()
+        {
+            ResumeOutcome::Confirming(p) => p,
+            _ => panic!("expected Confirming on this session's own sealed tape"),
+        };
+        fake.clear_ops();
+        let outcome = pending.confirm(&conn, &mut store, Tier::Integrity).unwrap();
+        assert!(matches!(outcome, ConfirmOutcome::Sealed(_)));
+
+        let mut expected = vec![Op::Rewind, Op::Space(3), Op::Read(3), Op::Space(k + 1 - 4)];
+        expected.extend((k + 1..=seal).map(Op::Read));
+        assert_eq!(fake.ops(), expected, "nothing at or before k read again");
+
+        let (outcome, checked, passed): (String, i64, i64) = conn
+            .query_row(
+                "SELECT outcome, slices_checked, slices_passed FROM verification_sessions
+                 WHERE volume_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome, "passed");
+        assert_eq!((checked, passed), ((seal + 1) as i64, (seal + 1) as i64));
+    }
+
+    /// Only an INTERRUPTED readback is continued: one that finished — here
+    /// with a failed (inconclusive) outcome — is read again from the start,
+    /// so a drive cleaned in between reads everything.
+    #[test]
+    fn a_readback_that_finished_is_never_continued() {
+        let f = make_fixture();
+        let conn = &f.conn;
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'failed')",
+            params![f.volume_id],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO readback_checkpoints (session_id, position, sha256, front_index_sha256)
+             VALUES (?1, 4, 'aa', 'bb')",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(interrupted_readback(conn, f.volume_id).unwrap(), None);
+        conn.execute(
+            "UPDATE verification_sessions SET outcome = 'aborted' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        let r = interrupted_readback(conn, f.volume_id).unwrap().unwrap();
+        assert_eq!(r.session_id, id);
+        assert_eq!(r.checkpoints.front_index_sha256, "bb");
+        assert_eq!(r.checkpoints.passed.get(&4).map(String::as_str), Some("aa"));
+        // A quick one, even interrupted, read no content to continue from.
+        conn.execute(
+            "UPDATE verification_sessions SET verify_type = 'quick' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(interrupted_readback(conn, f.volume_id).unwrap(), None);
+    }
+
+    /// ADR-0012's 2026-09-23 adoption rule wants a full readback wholly
+    /// after a write abort, so a readback holding a file read back at or
+    /// before the volume's recorded abort is not continued (issue #410) —
+    /// else a verify started after the abort would carry reads from before
+    /// it, and `volume resume` would adopt on them.
+    #[test]
+    fn a_readback_with_a_file_read_before_the_recorded_abort_is_not_continued() {
+        let f = make_fixture();
+        let conn = &f.conn;
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'aborted')",
+            params![f.volume_id],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO readback_checkpoints
+                 (session_id, position, sha256, front_index_sha256, checked_at)
+             VALUES (?1, 4, 'aa', 'bb', '2026-01-02 00:00:00')",
+            params![id],
+        )
+        .unwrap();
+        let abort_at = |at: &str| {
+            conn.execute(
+                "INSERT INTO events (timestamp, entity_type, entity_id, action)
+                 VALUES (?1, 'volume', ?2, 'write_aborted')",
+                params![at, f.volume_id],
+            )
+            .unwrap();
+        };
+        abort_at("2026-01-01 00:00:00");
+        assert!(
+            interrupted_readback(conn, f.volume_id).unwrap().is_some(),
+            "positive control: every read postdates that abort"
+        );
+        abort_at("2026-01-02 00:00:00");
+        assert_eq!(
+            interrupted_readback(conn, f.volume_id).unwrap(),
+            None,
+            "a read in the abort's second is not after it"
+        );
+    }
+
+    /// Issue #397's other order: a resume whose seal is RECORDED but does
+    /// not read back re-enters confirm seal FIRST, so the unreadable seal
+    /// is found at one read rather than after a forward pass over the whole
+    /// tape. (The seal-last pass is only for a seal this session has just
+    /// written or just parsed.)
+    #[test]
+    fn a_resume_whose_recorded_seal_does_not_read_confirms_seal_first() {
+        let f = make_fixture();
+        let volume_id = f.volume_id;
+        let keys = f.keys.clone();
+        let (conn, _pending, _store, fake, seal, _dirs) = sealed_on_a_fake_tape_keeping_dirs(f);
+        conn.execute(
+            "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        // What `write::finish_session` records once `seal()` returns.
+        conn.execute(
+            "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        // The seal marker no longer parses (one block of garbage).
+        {
+            let mut st = fake.state();
+            let block = st.block_size;
+            st.files[seal as usize] = vec![0xA5; block];
+        }
+        let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        let pending = match InterruptedSession::rehydrate(&conn, volume_id)
+            .unwrap()
+            .expect("resumable")
+            .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+            .unwrap()
+        {
+            ResumeOutcome::Confirming(p) => p,
+            _ => panic!("a recorded seal re-enters confirm"),
+        };
+        fake.clear_ops();
+        let outcome = pending.confirm(&conn, &mut store, Tier::Integrity).unwrap();
+        assert!(
+            matches!(outcome, ConfirmOutcome::Inconclusive(_)),
+            "an unreadable seal is inconclusive, not quarantine"
+        );
+        let reads: Vec<u32> = fake
+            .ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Read(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec![seal], "the seal, and nothing after it");
     }
 }

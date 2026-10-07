@@ -92,6 +92,14 @@ pub enum VolumeCommands {
         /// refuses a layout above the ceiling and names by how much.
         #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
         fill_ceiling: Option<f64>,
+        /// After sealing, read every file back and hash it against the
+        /// front index (tri-layer L3, hours on a full cartridge). Off by
+        /// default (ADR-0012, 2026-10-06): the confirm then reads the front
+        /// index and the seal marker, and a passing one seals the volume
+        /// with no full readback recorded — `audit` and `report
+        /// verify-status` name it until `volume verify` runs one.
+        #[arg(long)]
+        full_confirm: bool,
     },
 
     /// Resume an interrupted write session. Reload the SAME
@@ -137,6 +145,15 @@ pub enum VolumeCommands {
         /// frozen generated files are re-hashed either way.
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --full-confirm`: the confirm this resume
+        /// runs (or re-enters) reads every file back. A full readback that
+        /// was interrupted CONTINUES: the files it already read back clean
+        /// are not read again, as long as the front index on the tape is
+        /// the one they were checked against. Without this flag the resume
+        /// runs the quick confirm and the readback is left to `volume
+        /// verify`.
+        #[arg(long)]
+        full_confirm: bool,
     },
 
     /// Deliberately abandon a volume's unfinished write session:
@@ -172,6 +189,12 @@ pub enum VolumeCommands {
     /// -> content). Default tier is `--full` (integrity: hashes every
     /// content file); `--quick` opts down to navigable (seal binding + front
     /// index self-consistency only, no per-file content hashing).
+    ///
+    /// A full verify that was stopped part-way CONTINUES when run again:
+    /// files the volume's latest readback (this command's or a write's
+    /// `--full-confirm`) already read back clean are not read again, as
+    /// long as the front index on the tape is the one they were checked
+    /// against.
     ///
     /// Exit status: 0 = every checked file matched. 2 = the verify PROVED
     /// THE MEDIUM BAD: the volume is quarantined and no longer counts as a
@@ -260,6 +283,9 @@ pub enum VolumeCommands {
         /// See `volume write --prewrite-hash`.
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --full-confirm`.
+        #[arg(long)]
+        full_confirm: bool,
     },
 
     /// Show bin-packing plan for pending staged data
@@ -335,6 +361,9 @@ pub enum VolumeCommands {
         /// See `volume write --prewrite-hash` (step 2's write).
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --full-confirm` (step 2's write).
+        #[arg(long)]
+        full_confirm: bool,
         /// See `volume compact-finish --force` — step 3's ADR-0008 Tier-2
         /// gate. With this (or the global `--yes`) step 3 asks nothing; the
         /// cartridge swap after step 1 still waits for you.
@@ -635,6 +664,7 @@ pub fn run(
             allow_missing_escrow,
             prewrite_hash,
             fill_ceiling,
+            full_confirm,
         } => {
             // Issue #241: a real preview would have to open the drive and
             // re-derive the whole layout (session build/validate/plan) —
@@ -662,6 +692,7 @@ pub fn run(
                 *force,
                 *allow_missing_escrow,
                 *prewrite_hash,
+                *full_confirm,
                 yes,
             )?;
             if json_output {
@@ -678,6 +709,7 @@ pub fn run(
             label,
             device,
             prewrite_hash,
+            full_confirm,
         } => {
             // Issue #241: same reasoning as `volume write` — resuming
             // reopens the drive and revalidates the frozen staging files
@@ -699,6 +731,7 @@ pub fn run(
                 &device,
                 DEFAULT_BLOCK_SIZE,
                 *prewrite_hash,
+                *full_confirm,
             )?;
             if json_output {
                 println!(
@@ -778,7 +811,7 @@ pub fn run(
             let tier = if *quick {
                 Tier::Navigable
             } else {
-                Tier::default()
+                Tier::Integrity
             };
             let tier_name = if *quick { "quick" } else { "full" };
             let device = read_device(config, device.as_deref())?;
@@ -1312,6 +1345,7 @@ pub fn run(
             device,
             allow_missing_escrow,
             prewrite_hash,
+            full_confirm,
         } => {
             // Issue #241: same reasoning as `volume write` — a real
             // preview would have to open the drive and re-derive the
@@ -1333,6 +1367,7 @@ pub fn run(
                 DEFAULT_BLOCK_SIZE,
                 *allow_missing_escrow,
                 *prewrite_hash,
+                *full_confirm,
                 yes,
             )?;
             if json_output {
@@ -1383,6 +1418,7 @@ pub fn run(
             device,
             allow_missing_escrow,
             prewrite_hash,
+            full_confirm,
             force,
         } => {
             // Issue #241: the interactive 3-step flow opens the drive
@@ -1463,6 +1499,7 @@ pub fn run(
                 DEFAULT_BLOCK_SIZE,
                 *allow_missing_escrow,
                 *prewrite_hash,
+                *full_confirm,
                 yes,
             )?;
             println!("  Write completed");
@@ -2880,6 +2917,7 @@ mod tests {
                 device: Some(DEV.into()),
                 allow_missing_escrow: false,
                 prewrite_hash: false,
+                full_confirm: false,
                 force: true,
             };
             let err = run(&conn, &paths, &config, &cmd, false, true, false)
@@ -3332,6 +3370,7 @@ mod tests {
                 label: "L".into(),
                 device: None,
                 prewrite_hash: false,
+                full_confirm: false,
             },
         ] {
             assert_eq!(
