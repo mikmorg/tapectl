@@ -7,7 +7,8 @@ use thiserror::Error;
 /// Mirrors the convention `audit` already established (`src/cli/audit.rs`):
 /// 0=clean, 1=warning, 2=violation. `db fsck` (src/main.rs) computes its exit
 /// code against these same constants — see `fsck_exit_code` (issue #45/H10).
-/// `volume verify` has its own three, below (issue #356).
+/// `volume verify` has its own three, below (issue #356), and `audit`'s
+/// errors exit [`EXIT_AUDIT_ERROR`] (issue #408).
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_WARNING: i32 = 1;
 pub const EXIT_ERROR: i32 = 2;
@@ -45,6 +46,148 @@ pub const EXIT_VERIFY_INCONCLUSIVE: i32 = 3;
 /// `volume verify` keeps its own contract instead (every error is
 /// [`EXIT_VERIFY_INCONCLUSIVE`], which already means "try again").
 pub const EXIT_CATALOG_BUSY: i32 = 75;
+
+/// `audit`: the audit stopped on an ERROR and reached no verdict (ADR-0012,
+/// the 2026-10-07 amendment, item 19; issue #408). 70 is sysexits'
+/// `EX_SOFTWARE`. Until then every error exited 2, the code that means "at
+/// least one violation", so a scheduled wrapper paged violations for an
+/// audit that never ran. Now 2 is reachable from `audit` only through a
+/// violation — as #356 made `volume verify`'s 2 reachable only through a
+/// quarantine. A busy catalog keeps [`EXIT_CATALOG_BUSY`].
+pub const EXIT_AUDIT_ERROR: i32 = 70;
+
+/// The write family's exit table (ADR-0012, the 2026-10-07 amendment, item
+/// 20; issue #408): `volume write`, `volume resume`, `collection run`,
+/// `quick-archive`, `volume compact-write` and `volume compact` all exit
+///
+/// - 0 sealed and confirmed;
+/// - 2 an error with the medium untouched — refused before anything was
+///   written, or a usage error ([`EXIT_ERROR`]);
+/// - 3 confirm inconclusive, as `volume verify`'s 3
+///   ([`EXIT_WRITE_CONFIRM_INCONCLUSIVE`]);
+/// - 4 interrupted, resumable with `volume resume`
+///   ([`EXIT_WRITE_INTERRUPTED`]);
+/// - 5 aborted, the session cannot resume ([`EXIT_WRITE_ABORTED`]);
+/// - 6 the medium proven bad and quarantined ([`EXIT_WRITE_MEDIUM_BAD`]);
+/// - 75 the catalog busy ([`EXIT_CATALOG_BUSY`]).
+///
+/// Before it, every one of these failures exited 2, and a script driving a
+/// write could not tell "load the right tape" from "resume" from "replace
+/// the cartridge" without parsing the message.
+pub const EXIT_WRITE_CONFIRM_INCONCLUSIVE: i32 = 3;
+/// See [`EXIT_WRITE_CONFIRM_INCONCLUSIVE`]: interrupted, resumable.
+pub const EXIT_WRITE_INTERRUPTED: i32 = 4;
+/// See [`EXIT_WRITE_CONFIRM_INCONCLUSIVE`]: aborted, not resumable.
+pub const EXIT_WRITE_ABORTED: i32 = 5;
+/// See [`EXIT_WRITE_CONFIRM_INCONCLUSIVE`]: the medium proven bad.
+pub const EXIT_WRITE_MEDIUM_BAD: i32 = 6;
+
+/// How a write-family command ended, ordered from best to worst — the
+/// order `collection run` reports "the worst outcome among its copies" by
+/// (6 > 5 > 4 > 3 > 2 > 0, ADR-0012 2026-10-07 item 20). A busy catalog
+/// is not an outcome here: it is decided only when no outcome was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WriteOutcome {
+    /// 0: sealed and confirmed.
+    Sealed,
+    /// 2: an error with the medium untouched.
+    Untouched,
+    /// 3: the seal is on the tape, the confirm reached no verdict.
+    ConfirmInconclusive,
+    /// 4: interrupted; `volume resume` continues the session.
+    Interrupted,
+    /// 5: aborted; the session cannot resume.
+    Aborted,
+    /// 6: the medium proven bad; the volume is quarantined.
+    Quarantined,
+}
+
+impl WriteOutcome {
+    /// This outcome's exit code.
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            WriteOutcome::Sealed => EXIT_SUCCESS,
+            WriteOutcome::Untouched => EXIT_ERROR,
+            WriteOutcome::ConfirmInconclusive => EXIT_WRITE_CONFIRM_INCONCLUSIVE,
+            WriteOutcome::Interrupted => EXIT_WRITE_INTERRUPTED,
+            WriteOutcome::Aborted => EXIT_WRITE_ABORTED,
+            WriteOutcome::Quarantined => EXIT_WRITE_MEDIUM_BAD,
+        }
+    }
+
+    /// The worst of `outcomes` ([`WriteOutcome::Sealed`] for none).
+    pub fn worst(outcomes: impl IntoIterator<Item = WriteOutcome>) -> WriteOutcome {
+        outcomes.into_iter().max().unwrap_or(WriteOutcome::Sealed)
+    }
+
+    /// The outcome an error out of a write-family command stands for: the
+    /// worst one any error in its chain is classified as, or `None` when
+    /// none is — an error before anything was written.
+    pub fn of(err: &anyhow::Error) -> Option<WriteOutcome> {
+        err.chain()
+            .filter_map(|cause| cause.downcast_ref::<TapectlError>())
+            .filter_map(TapectlError::write_outcome)
+            .max()
+    }
+}
+
+/// How a command's ERRORS map to an exit code — decided from the parsed
+/// command before it runs, so the errors raised before the command's own
+/// module is reached (the database, the config, an uninitialised home) map
+/// the same way as its own. `main` asks [`ErrorContract::exit_code`] once,
+/// with whatever error the invocation returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorContract {
+    /// Every command without a contract of its own: [`EXIT_ERROR`], or
+    /// [`EXIT_CATALOG_BUSY`] when the catalog was busy.
+    Ordinary,
+    /// `volume verify` (issue #356): every error is
+    /// [`EXIT_VERIFY_INCONCLUSIVE`], a busy catalog included — "no verdict,
+    /// try again" is already what 3 means.
+    Verify,
+    /// `audit` (issue #408): every error is [`EXIT_AUDIT_ERROR`], except a
+    /// busy catalog, which keeps [`EXIT_CATALOG_BUSY`] so the scheduled
+    /// wrapper's "retry later, no fail ping" arm still sees it.
+    Audit,
+    /// The write family (issue #408, [`WriteOutcome`]): an error the write
+    /// path classified exits its outcome's code; an unclassified one was
+    /// raised before anything was written, so it exits [`EXIT_ERROR`], or
+    /// [`EXIT_CATALOG_BUSY`] when the catalog was busy. A usage error keeps
+    /// clap's 2, which the table gives it.
+    Write,
+}
+
+impl ErrorContract {
+    /// The exit code for `err`, an error this contract's command returned.
+    pub fn exit_code(self, err: &anyhow::Error) -> i32 {
+        let busy = || crate::db::busy::is_catalog_busy(err);
+        match self {
+            ErrorContract::Verify => EXIT_VERIFY_INCONCLUSIVE,
+            ErrorContract::Audit if busy() => EXIT_CATALOG_BUSY,
+            ErrorContract::Audit => EXIT_AUDIT_ERROR,
+            ErrorContract::Write => match WriteOutcome::of(err) {
+                Some(outcome) => outcome.exit_code(),
+                None if busy() => EXIT_CATALOG_BUSY,
+                None => EXIT_ERROR,
+            },
+            ErrorContract::Ordinary if busy() => EXIT_CATALOG_BUSY,
+            ErrorContract::Ordinary => EXIT_ERROR,
+        }
+    }
+
+    /// The exit code for a command line under this contract that did not
+    /// PARSE (clap's usage error), or `None` to keep clap's own (2). A
+    /// verify or an audit whose command line is wrong has read nothing and
+    /// reached no verdict, so it must not exit with the code its verdict
+    /// table gives 2 (issues #356, #408).
+    pub fn usage_error_code(self) -> Option<i32> {
+        match self {
+            ErrorContract::Verify => Some(EXIT_VERIFY_INCONCLUSIVE),
+            ErrorContract::Audit => Some(EXIT_AUDIT_ERROR),
+            ErrorContract::Ordinary | ErrorContract::Write => None,
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 #[allow(dead_code)]
@@ -260,6 +403,31 @@ pub enum TapectlError {
     #[error("no cartridge loaded in {device}")]
     NoCartridgeLoaded { device: String },
 
+    // The write family's classified failures (ADR-0012, 2026-10-07 item 20;
+    // issue #408). Each is raised only once the write path KNOWS which
+    // outcome it is, and carries the full operator text; [`WriteOutcome`]
+    // and [`ErrorContract::Write`] read the variant for the exit code. Any
+    // error a write path raises without one of these was raised before
+    // anything was written.
+    /// Exit 4: the session stopped — a signal, or a drive, staging or
+    /// catalog error mid-session — and `volume resume` continues it.
+    #[error("{0}")]
+    WriteInterrupted(String),
+
+    /// Exit 5: the session aborted and cannot resume (the medium ran out,
+    /// a staged slice changed under the write).
+    #[error("{0}")]
+    WriteAborted(String),
+
+    /// Exit 6: the medium was proven bad and the volume quarantined.
+    #[error("{0}")]
+    WriteQuarantined(String),
+
+    /// Exit 3: the seal is on the tape and the confirm reached no verdict;
+    /// `volume resume` re-enters it.
+    #[error("{0}")]
+    ConfirmInconclusive(String),
+
     // General
     #[error("not initialized — run `tapectl init` first")]
     NotInitialized,
@@ -292,6 +460,38 @@ pub enum TapectlError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl TapectlError {
+    /// The write-family outcome this error was classified as, if any
+    /// (issue #408).
+    pub fn write_outcome(&self) -> Option<WriteOutcome> {
+        match self {
+            TapectlError::WriteInterrupted(_) => Some(WriteOutcome::Interrupted),
+            TapectlError::WriteAborted(_) => Some(WriteOutcome::Aborted),
+            TapectlError::WriteQuarantined(_) => Some(WriteOutcome::Quarantined),
+            TapectlError::ConfirmInconclusive(_) => Some(WriteOutcome::ConfirmInconclusive),
+            _ => None,
+        }
+    }
+
+    /// An error raised once volume `label`'s write session holds state the
+    /// tape and the catalog share — its `writes` rows are planned, or it is
+    /// writing — and that nothing classified more precisely (issue #408).
+    /// The session is resumable: rows left `in_progress` are swept to
+    /// `interrupted` on the next open. So it is [`Self::WriteInterrupted`],
+    /// with its text kept and the resume named; an error already classified
+    /// is returned unchanged.
+    pub fn in_write_session(self, label: &str) -> TapectlError {
+        if self.write_outcome().is_some() {
+            return self;
+        }
+        TapectlError::WriteInterrupted(format!(
+            "{self} — volume \"{label}\"'s write session stopped part-way and is left \
+             resumable: fix the cause, reload the same cartridge and run `tapectl volume \
+             resume {label}`"
+        ))
+    }
 }
 
 impl From<rusqlite::Error> for TapectlError {
@@ -389,6 +589,125 @@ mod tests {
     fn a_custom_io_error_reaches_the_operator_once() {
         let err: TapectlError = std::io::Error::other("staging disk went away").into();
         assert_eq!(as_operator_sees_it(err), "staging disk went away");
+    }
+
+    /// Issue #408 (ADR-0012, 2026-10-07 item 19): each contract's errors,
+    /// busy and not. `audit`'s errors exit 70 so 2 is only ever a
+    /// violation, but a busy catalog keeps 75 there (the scheduled wrapper's
+    /// "retry later" arm); `volume verify` folds both into its 3.
+    #[test]
+    fn each_error_contract_maps_an_error_and_a_busy_catalog() {
+        let plain = anyhow::Error::from(TapectlError::UnitNotFound("u".into()));
+        let busy = anyhow::Error::from(TapectlError::CatalogBusy("the seal".into()));
+        let cases = [
+            (ErrorContract::Ordinary, EXIT_ERROR, EXIT_CATALOG_BUSY),
+            (ErrorContract::Audit, EXIT_AUDIT_ERROR, EXIT_CATALOG_BUSY),
+            (
+                ErrorContract::Verify,
+                EXIT_VERIFY_INCONCLUSIVE,
+                EXIT_VERIFY_INCONCLUSIVE,
+            ),
+        ];
+        for (contract, on_error, on_busy) in cases {
+            assert_eq!(contract.exit_code(&plain), on_error, "{contract:?}");
+            assert_eq!(contract.exit_code(&busy), on_busy, "{contract:?} busy");
+        }
+        assert_eq!(EXIT_AUDIT_ERROR, 70, "sysexits' EX_SOFTWARE");
+    }
+
+    /// ADR-0012, 2026-10-07 item 20 (issue #408): the write family's table,
+    /// code by code, through the contract `main` asks — including through
+    /// an `anyhow` context, which is how a caller's wrapping arrives.
+    #[test]
+    fn the_write_contract_maps_each_classified_outcome_to_its_code() {
+        let code = |e: TapectlError| ErrorContract::Write.exit_code(&anyhow::Error::from(e));
+        assert_eq!(code(TapectlError::VolumeNotFound("L".into())), 2);
+        assert_eq!(code(TapectlError::Interrupted("before the tape".into())), 2);
+        assert_eq!(code(TapectlError::ConfirmInconclusive("c".into())), 3);
+        assert_eq!(code(TapectlError::WriteInterrupted("i".into())), 4);
+        assert_eq!(code(TapectlError::WriteAborted("a".into())), 5);
+        assert_eq!(code(TapectlError::WriteQuarantined("q".into())), 6);
+        assert_eq!(code(TapectlError::CatalogBusy("plan".into())), 75);
+
+        let wrapped =
+            anyhow::Error::from(TapectlError::WriteAborted("a".into())).context("quick-archive");
+        assert_eq!(ErrorContract::Write.exit_code(&wrapped), 5);
+        assert_eq!(ErrorContract::Write.usage_error_code(), None, "clap's 2");
+        assert_eq!(
+            ErrorContract::Ordinary
+                .exit_code(&anyhow::Error::from(TapectlError::WriteAborted("a".into()))),
+            EXIT_ERROR,
+            "only the write family reads the outcome"
+        );
+    }
+
+    /// `collection run` reports the worst outcome among its copies:
+    /// 6 > 5 > 4 > 3 > 2 > 0.
+    #[test]
+    fn the_worst_write_outcome_follows_the_ruled_order() {
+        use WriteOutcome::*;
+        let order = [
+            Sealed,
+            Untouched,
+            ConfirmInconclusive,
+            Interrupted,
+            Aborted,
+            Quarantined,
+        ];
+        assert_eq!(
+            order.map(WriteOutcome::exit_code),
+            [0, 2, 3, 4, 5, 6],
+            "each outcome's code"
+        );
+        for (i, &better) in order.iter().enumerate() {
+            for &worse in &order[i..] {
+                assert_eq!(WriteOutcome::worst([better, worse]), worse);
+                assert_eq!(WriteOutcome::worst([worse, better]), worse);
+            }
+        }
+        assert_eq!(WriteOutcome::worst([]), Sealed);
+    }
+
+    /// An error raised once the session holds shared state is resumable
+    /// unless it was classified already; the text is kept and the resume
+    /// named.
+    #[test]
+    fn an_unclassified_error_in_a_write_session_is_resumable() {
+        let e = TapectlError::TapeIo("seal write failed".into()).in_write_session("L6-1");
+        assert!(matches!(e, TapectlError::WriteInterrupted(_)), "{e:?}");
+        let text = e.to_string();
+        assert!(
+            text.starts_with("tape I/O error: seal write failed"),
+            "{text}"
+        );
+        assert!(text.contains("tapectl volume resume L6-1"), "{text}");
+
+        for kept in [
+            TapectlError::WriteAborted("a".into()),
+            TapectlError::WriteQuarantined("q".into()),
+            TapectlError::ConfirmInconclusive("c".into()),
+            TapectlError::WriteInterrupted("i".into()),
+        ] {
+            let before = kept.write_outcome();
+            let after = kept.in_write_session("L6-1");
+            assert_eq!(after.write_outcome(), before);
+            assert_eq!(after.to_string().len(), 1, "text unchanged");
+        }
+    }
+
+    /// A command line that does not parse: the two verdict commands take
+    /// their "no verdict" code, everything else keeps clap's.
+    #[test]
+    fn usage_errors_keep_clap_s_code_except_for_the_verdict_commands() {
+        assert_eq!(
+            ErrorContract::Verify.usage_error_code(),
+            Some(EXIT_VERIFY_INCONCLUSIVE)
+        );
+        assert_eq!(
+            ErrorContract::Audit.usage_error_code(),
+            Some(EXIT_AUDIT_ERROR)
+        );
+        assert_eq!(ErrorContract::Ordinary.usage_error_code(), None);
     }
 
     /// Issue #363: `Database` had the shape `Io` had before #354 — the

@@ -78,6 +78,12 @@ pub enum CollectionCommands {
     /// single collection (unlike `sync`/`status`/`plan`, which sweep every
     /// configured collection) since a batch write is a real, one-shot tape
     /// action.
+    ///
+    /// Exit status: `volume write`'s, the worst outcome among its copies in
+    /// the order 6 > 5 > 4 > 3 > 2 > 0 (6 quarantined, 5 aborted, 4
+    /// interrupted, 3 confirm inconclusive, 2 nothing written, 0 sealed and
+    /// confirmed); 1 when every copy sealed but a unit was refused for its
+    /// dotfile; 75 when the catalog was busy before anything was written.
     Run {
         /// Collection name.
         #[arg(long)]

@@ -47,9 +47,14 @@ A few conventions:
 ## Exit codes
 
 Any command that fails prints `error: <message>` on stderr and exits **2**.
-There are two exceptions. `volume verify` exits **3** on every error
-([below](#volume-verify-0-2-or-3)). A **busy catalog** exits **75**
-([below](#75-catalog-busy)). When one failure caused another, the
+There are four exceptions. `volume verify` exits **3** on every error
+([below](#volume-verify-0-2-or-3)), and `audit` exits **70**
+([below](#audit-0-1-2-or-70)). The commands that write a tape — `volume
+write`, `volume resume`, `collection run`, `quick-archive`, `volume
+compact-write` and `volume compact` — share one table, and exit **2** only
+when nothing was written ([below](#the-write-family-0-2-3-4-5-6-or-75)). A
+**busy catalog** exits **75** ([below](#75-catalog-busy)). When one failure
+caused another, the
 message is the whole chain, joined by `: `. For example, a bad config file
 prints:
 
@@ -57,27 +62,28 @@ prints:
 error: failed to load config: configuration error: <path>/config.toml: TOML parse error at line 68, column 1
 ```
 
-A mistyped command or flag (clap's usage error) also exits 2, with one
-exception: when the parse has already reached `volume verify`, an error in
-what follows exits 3. That covers a missing label, an unknown flag after
-`verify`, `--full` together with `--quick`, and a flag with no value. An error
-that comes before `verify` is an ordinary usage error and still exits 2: a
-mistyped subcommand such as `volume verfy`, or an unknown flag in front of
-`verify` (`tapectl --hme <dir> volume verify <label>`,
+A mistyped command or flag (clap's usage error) also exits 2, with two
+exceptions: when the parse has already reached `volume verify`, an error in
+what follows exits 3, and when it has reached `audit`, 70. That covers a
+missing label, an unknown flag after `verify` or `audit`, `--full` together
+with `--quick`, and a flag with no value. An error that comes before `verify`
+is an ordinary usage error and still exits 2: a mistyped subcommand such as
+`volume verfy` or `audt`, or an unknown flag in front of `verify`
+(`tapectl --hme <dir> volume verify <label>`,
 `tapectl volume --bogus verify <label>`). `--help` exits 0 everywhere.
 
 A few commands finish their work and then report a verdict through the exit code:
 
 | Command | 0 | 1 | 2 |
 |---|---|---|---|
-| [`audit`](cli/audit.md#tapectl-audit) | clean | warnings only | at least one violation (or an error) |
+| [`audit`](cli/audit.md#tapectl-audit) | clean | warnings only | at least one violation, and nothing else: an error exits 70 ([below](#audit-0-1-2-or-70)) |
 | [`host check`](cli/host.md#tapectl-host-check) | host is quiet | something tripped | an error |
 | [`config check`](cli/config.md#tapectl-config-check) | config valid | never used | config invalid (or an error) |
 | [`db fsck`](cli/db.md#tapectl-db-fsck) | clean | problems found (repaired or not) | database integrity is broken (or an error) |
-| [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed, or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; or (`sync`, `status`) a file, symlink or symlinked folder under the root belongs to no unit (an `OUTSIDE ANY UNIT` line names each); the rest ran, and each failure is an `error:` line | an error |
+| [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed, or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; or (`sync`, `status`) a file, symlink or symlinked folder under the root belongs to no unit (an `OUTSIDE ANY UNIT` line names each); the rest ran, and each failure is an `error:` line | an error (`run`: see [the write family's table](#the-write-family-0-2-3-4-5-6-or-75)) |
 
-Apart from `volume verify` and a busy catalog, every other command exits 0 on
-success and 2 on error.
+Apart from `volume verify`, `audit`, the write family and a busy catalog,
+every other command exits 0 on success and 2 on error.
 
 ### 75: catalog busy
 
@@ -98,8 +104,56 @@ crashed session, so read-only commands such as `report`, `catalog` and `db
 backup` run while another command writes.
 
 `volume verify` keeps its own contract: a busy catalog is one more way to
-reach no verdict, so it exits 3. The `contrib/` timer wrappers log 75 as
-"catalog busy" and do not ping `/fail`.
+reach no verdict, so it exits 3. A write that the busy catalog stops after its
+session began exits by the write table instead (4, or 3 during the confirm).
+The `contrib/` timer wrappers log 75 as "catalog busy" and do not ping
+`/fail`.
+
+### The write family: 0, 2, 3, 4, 5, 6 or 75
+
+`volume write`, `volume resume`, `collection run`, `quick-archive`, `volume
+compact-write` and `volume compact` share one exit table (ADR-0012, the
+2026-10-07 amendment, item 20). The code says what the tape and the session
+are left as, so a script knows what to do next without parsing the message:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | **sealed and confirmed** | nothing (`collection run` exits 1 instead when it also refused a unit, [above](#exit-codes)) |
+| 2 | an error, **the medium untouched**: refused before anything was written, or a usage error. That covers an unknown label or one that is not a write target, the wrong cartridge (the File 0 check), an empty drive, a drive that cannot write the medium, a layout over the fill ceiling, the quiet-host pre-flight, `--dry-run`, a resume whose revalidation failed or whose File 0 would not read, a stage that failed before the write (`collection run`, `quick-archive`), and a signal before the tape moved (`--prewrite-hash`'s full hash, a stage). A session that existed before the command is left as it was | read the `error:` line, fix it, run the command again |
+| 3 | **confirm inconclusive**: the seal is on the tape and recorded, and the readback after it reached no verdict (a read or transport failure, as `volume verify`'s 3) | check the drive, reload the same cartridge, `tapectl volume resume <label>` re-enters the confirm |
+| 4 | **interrupted**: a signal, or a drive, staging-disk or catalog error, stopped the session part-way (writing, sealing, or a full confirm stopped by a signal). The tape is left as the session left it | fix the cause, reload the same cartridge, `tapectl volume resume <label>` (with `--full-confirm` when the message says so) |
+| 5 | **aborted**: the session cannot resume — the medium ran out (end of tape) or a staged slice changed while it was written. The tape is left unsealed | write the label again with `tapectl volume write <label>` once the cause is fixed (a full tape needs a smaller batch or another cartridge) |
+| 6 | **the medium proven bad**: the confirm, or a resume's contact check, found the tape is not what was written; the volume is quarantined and no longer counts as a copy | write the data to another cartridge |
+| 75 | the catalog was busy before anything was written ([above](#75-catalog-busy)) | run the command again once the other one has finished |
+
+`collection run` writes one copy per run, and exits with the worst outcome
+among its copies, in the order 6, 5, 4, 3, 2, 0: a run with any copy
+quarantined exits 6 whatever the others did.
+
+Two failures after a copy is sealed and confirmed still exit 2, because the
+tape needs nothing: `volume compact`'s step 3 (retiring the source) refusing,
+and a catalog error while recording the copy's figures or releasing
+`collection run`'s staging. Read the `error:` line: the copy itself counts.
+
+Older builds exited 2 for every one of these failures.
+
+### `audit`: 0, 1, 2 or 70
+
+`audit` reports its verdict through the exit code, and 2 means one thing only
+(ADR-0012, the 2026-10-07 amendment, item 19):
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | clean | nothing |
+| 1 | warnings only | read them; the audit is advisory (ADR-0004) |
+| 2 | at least one **violation** | the findings name each one; `--action-plan` adds the fix |
+| 70 | **no verdict**: the audit stopped on an error (a database or config error, an unknown `--unit`, an uninitialised home, a command line that does not parse after `audit`) | read the `error:` line, fix it, run the audit again |
+| 75 | no verdict: the catalog was busy ([above](#75-catalog-busy)) | run it again once the other command has finished |
+
+70 is sysexits' `EX_SOFTWARE`. Older builds exited 2 for an error too, so a
+script could not tell "fix the policy" from "fix the run".
+`contrib/systemd/tapectl-scheduled-audit.sh` logs 70 as "no verdict" and pings
+`/fail`; it never reports it as violations.
 
 ### `volume verify`: 0, 2 or 3
 

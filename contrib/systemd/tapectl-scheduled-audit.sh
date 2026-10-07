@@ -12,14 +12,17 @@
 #   tapectl audit  0 = clean       -> success
 #                  1 = warnings    -> success, logged
 #                  2 = violations  -> failure
+#                 70 = the audit's own error -> no verdict, failure (#408)
 #                 75 = catalog busy -> no verdict, logged, no ping (issue #377)
 #           anything else = no verdict -> failure (issue #408)
 #
-# "Anything else" is a run that never reached a verdict: tapectl stopped on
-# an error, panicked (101), or exited a code this script does not know. It is
-# a failure — a broken audit must not go quiet — but it is NOT reported as
-# violations, which would send the operator to the policy when the problem is
-# the run itself.
+# 70 (sysexits' EX_SOFTWARE) is what `tapectl audit` exits when it stops on
+# an error (ADR-0012, 2026-10-07 item 19): before that ruling an error exited
+# 2, the code for violations. "Anything else" is a run that never reached a
+# verdict some other way: tapectl panicked (101), or exited a code this script
+# does not know. Both are a failure — a broken audit must not go quiet — but
+# neither is reported as violations, which would send the operator to the
+# policy when the problem is the run itself.
 #
 # Warnings are deliberately NOT a failure. `audit` warns for ordinary drift
 # (an overdue verification, a unit one copy short of its target) and paging on
@@ -78,6 +81,12 @@ case "$rc" in
 	;;
 2)
 	echo "audit: VIOLATIONS (exit $rc)" >&2
+	ping_hc /fail
+	;;
+70)
+	# ADR-0012, 2026-10-07 item 19: the audit stopped on an error (a database
+	# or config error, say) and reached no verdict. Its error is above.
+	echo "audit: no verdict (exit $rc) — the audit stopped on an error; its error is above" >&2
 	ping_hc /fail
 	;;
 *)

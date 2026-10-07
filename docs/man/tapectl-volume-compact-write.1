@@ -7,6 +7,8 @@ tapectl\-volume\-compact\-write \- Write compaction slices from staging to desti
 \fBtapectl volume compact\-write\fR <\fB\-\-destination\fR> [\fB\-\-json\fR] [\fB\-\-device\fR] [\fB\-\-dry\-run\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Write compaction slices from staging to destination (compaction step 2)
+.PP
+Exit status: `volume write`\*(Aqs (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy).
 .SH OPTIONS
 .TP
 \fB\-\-destination\fR \fI<DESTINATION>\fR

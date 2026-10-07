@@ -54,7 +54,9 @@ tapectl collection plan [OPTIONS]
 
 ### tapectl collection run
 
-Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit's resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action
+Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit's resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one-shot tape action.
+
+Exit status: `volume write`'s, the worst outcome among its copies in the order 6 > 5 > 4 > 3 > 2 > 0 (6 quarantined, 5 aborted, 4 interrupted, 3 confirm inconclusive, 2 nothing written, 0 sealed and confirmed); 1 when every copy sealed but a unit was refused for its dotfile; 75 when the catalog was busy before anything was written.
 
 ```text
 tapectl collection run [OPTIONS] --collection <COLLECTION>

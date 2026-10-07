@@ -62,6 +62,14 @@ pub enum VolumeCommands {
     /// Refuses any volume not left `initialized` by `volume init` — a
     /// sealed, retired, erased or quarantined volume is not a write target
     /// (ADR-0012); no flag overrides it.
+    ///
+    /// Exit status, shared by every command that writes a tape: 0 = sealed
+    /// and confirmed. 2 = an error with the medium untouched: nothing was
+    /// written (or a usage error). 3 = the confirm was inconclusive: the
+    /// tape is sealed, `volume resume` re-enters the confirm. 4 =
+    /// interrupted part-way: `volume resume` continues. 5 = aborted (end of
+    /// tape, a slice that changed): write the label again. 6 = the medium
+    /// was proven bad and the volume quarantined. 75 = the catalog was busy.
     Write {
         /// Volume label
         label: String,
@@ -133,6 +141,11 @@ pub enum VolumeCommands {
     /// quarantined, is not a write target (ADR-0012); no flag overrides it.
     /// That is a different question from whether the loaded TAPE carries a
     /// seal marker, which is what the re-confirm path above is about.
+    ///
+    /// Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing
+    /// written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6
+    /// quarantined, 75 catalog busy). A resume refused before it changed
+    /// the session exits 2 and leaves the session as it was.
     Resume {
         /// Volume label
         label: String,
@@ -268,6 +281,10 @@ pub enum VolumeCommands {
     },
 
     /// Write compaction slices from staging to destination (compaction step 2)
+    ///
+    /// Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing
+    /// written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6
+    /// quarantined, 75 catalog busy).
     CompactWrite {
         /// Destination volume label
         #[arg(long)]
@@ -344,6 +361,12 @@ pub enum VolumeCommands {
     /// destination tape is already written and sealed and nothing is lost:
     /// `volume compact-finish <SOURCE> --force` completes the flow without
     /// re-reading or re-writing anything.
+    ///
+    /// Exit status: `volume write`'s, for step 2's write (0 sealed and
+    /// confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted,
+    /// 5 aborted, 6 quarantined, 75 catalog busy). A step 1 or step 3
+    /// failure exits 2: step 1 writes nothing, and a step 3 refusal leaves
+    /// the destination sealed.
     Compact {
         /// Source volume label
         label: String,
@@ -2033,8 +2056,8 @@ fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<se
         .collect()
 }
 
-/// The exit code for an ERROR from `volume <command>` — anything `run`
-/// returns as `Err` (issue #356, CTO ruling 2026-09-28).
+/// How an ERROR from `volume <command>` — anything `run` returns as `Err` —
+/// maps to an exit code (issue #356, CTO ruling 2026-09-28).
 ///
 /// `volume verify`'s exit status is a three-way contract (see
 /// [`verify_exit_code`]) in which 2 means "the medium is proven bad and the
@@ -2052,10 +2075,16 @@ fn compact_finish_evidence_json(report: &[write::CompactFinishReport]) -> Vec<se
 /// before this module is reached (the database, the config) — and not only
 /// those from the verify itself. A verify command line that does not parse
 /// never gets this far; `main`'s `parse_error_exit_code` gives it 3 too.
-pub fn error_exit_code(command: &VolumeCommands) -> i32 {
+pub fn error_contract(command: &VolumeCommands) -> crate::error::ErrorContract {
     match command {
-        VolumeCommands::Verify { .. } => crate::error::EXIT_VERIFY_INCONCLUSIVE,
-        _ => crate::error::EXIT_ERROR,
+        VolumeCommands::Verify { .. } => crate::error::ErrorContract::Verify,
+        // ADR-0012, 2026-10-07 item 20 (issue #408): the write family's
+        // one exit table. `compact` writes in its step 2.
+        VolumeCommands::Write { .. }
+        | VolumeCommands::Resume { .. }
+        | VolumeCommands::CompactWrite { .. }
+        | VolumeCommands::Compact { .. } => crate::error::ErrorContract::Write,
+        _ => crate::error::ErrorContract::Ordinary,
     }
 }
 
@@ -2073,7 +2102,7 @@ pub fn error_exit_code(command: &VolumeCommands) -> i32 {
 ///   them medium evidence — a read or transport failure, "we could not read
 ///   it today", which is not "the bytes are gone". The volume is untouched.
 ///   Remedy: the drive, then verify again. Every ERROR a verify returns
-///   exits 3 as well ([`error_exit_code`]).
+///   exits 3 as well ([`error_contract`]).
 ///
 /// Keyed on `report.quarantine`, the same field that drives the printed
 /// summary and `--json`'s `quarantined`, so the exit code, the message and
@@ -3393,24 +3422,66 @@ mod tests {
             full: false,
             quick: false,
         };
-        assert_eq!(
-            error_exit_code(&verify),
-            crate::error::EXIT_VERIFY_INCONCLUSIVE
-        );
+        assert_eq!(error_contract(&verify), crate::error::ErrorContract::Verify);
         for other in [
             VolumeCommands::Identify { device: None },
             VolumeCommands::Retire { label: "L".into() },
+            VolumeCommands::CompactRead {
+                label: "L".into(),
+                device: None,
+            },
+        ] {
+            assert_eq!(
+                error_contract(&other),
+                crate::error::ErrorContract::Ordinary,
+                "{other:?}"
+            );
+        }
+    }
+
+    /// ADR-0012, 2026-10-07 item 20 (issue #408): the four volume
+    /// subcommands that write share the write family's exit table.
+    #[test]
+    fn the_volume_writes_take_the_write_family_contract() {
+        for write in [
+            VolumeCommands::Write {
+                label: "L".into(),
+                device: None,
+                force: false,
+                allow_missing_escrow: false,
+                prewrite_hash: false,
+                fill_ceiling: None,
+                full_confirm: false,
+            },
             VolumeCommands::Resume {
                 label: "L".into(),
                 device: None,
                 prewrite_hash: false,
                 full_confirm: false,
             },
+            VolumeCommands::CompactWrite {
+                destination: "L".into(),
+                device: None,
+                allow_missing_escrow: false,
+                prewrite_hash: false,
+                fill_ceiling: None,
+                full_confirm: false,
+            },
+            VolumeCommands::Compact {
+                label: "S".into(),
+                to: None,
+                device: None,
+                allow_missing_escrow: false,
+                prewrite_hash: false,
+                fill_ceiling: None,
+                full_confirm: false,
+                force: false,
+            },
         ] {
             assert_eq!(
-                error_exit_code(&other),
-                crate::error::EXIT_ERROR,
-                "{other:?}"
+                error_contract(&write),
+                crate::error::ErrorContract::Write,
+                "{write:?}"
             );
         }
     }
