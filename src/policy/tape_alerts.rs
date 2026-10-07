@@ -21,12 +21,19 @@
 //!   a quarantined volume is already out of the copy count, where
 //!   `copy_count` takes over — while an `initialized` volume an interrupted
 //!   write left, the next `volume resume` target, stays in.
-//! - **Still news** is "logged after the volume's last PASSED full verify".
-//!   Whether page 0x2E clears on read is unsettled (ADR-0013's hazard), so a
-//!   later clean reading proves nothing; a passed full verify does — every
-//!   byte read back. That makes the remedy the finding names the one that
-//!   resolves it: the verify either passes (the warning goes) or fails and
-//!   quarantines the volume (the warning goes, and the copy checks speak).
+//! - **Still news** is "not logged before the volume's last PASSED full
+//!   readback STARTED". Whether page 0x2E clears on read is unsettled
+//!   (ADR-0013's hazard), so a later clean reading proves nothing; a passed
+//!   full verify does — every byte read back. That makes the remedy the
+//!   finding names the one that resolves it: the verify either passes (the
+//!   warning goes) or fails and quarantines the volume (the warning goes,
+//!   and the copy checks speak). By its START, never its `completed_at`
+//!   (ADR-0012, 2026-10-07 item 30: freshness of a full readback is judged
+//!   by its start): an alert raised during the readback — including by the
+//!   verify's own post-readback sweep, which runs after `completed_at` is
+//!   written and usually logs in the same second — is not something that
+//!   readback can answer. A continued readback is dated from its oldest
+//!   checkpoint (item 1), which only makes this stricter.
 //!
 //! A warning, never a violation (exit 1): the count cannot yet tell
 //! "this medium is failing" from "clean the drive", and the copy is still
@@ -90,15 +97,17 @@ impl VolumeAlerts {
     }
 }
 
-/// Every live volume with a raised TapeAlert since its last passed full
-/// verify, in label order.
+/// Every live volume with a raised TapeAlert not logged before its last
+/// passed full verify started, in label order.
 pub(crate) fn on_live_volumes(conn: &Connection) -> Result<Vec<VolumeAlerts>> {
     let mut by_volume: BTreeMap<String, Vec<TapeAlertSighting>> = BTreeMap::new();
     for sighting in tape_alert_sightings(conn)? {
-        for (label, verified_at) in live_volumes_of(conn, &sighting)? {
-            if verified_at
+        for (label, readback_started) in live_volumes_of(conn, &sighting)? {
+            // Strictly before: a sighting in the readback's first second may
+            // be its own, so it stays news.
+            if readback_started
                 .as_deref()
-                .is_some_and(|v| sighting.at.as_str() <= v)
+                .is_some_and(|started| sighting.at.as_str() < started)
             {
                 continue;
             }
@@ -111,8 +120,8 @@ pub(crate) fn on_live_volumes(conn: &Connection) -> Result<Vec<VolumeAlerts>> {
         .collect())
 }
 
-/// The live volumes `sighting` is about, each with its last passed full
-/// verify's `completed_at`.
+/// The live volumes `sighting` is about, each with the `started_at` of its
+/// last passed full verify.
 fn live_volumes_of(
     conn: &Connection,
     sighting: &TapeAlertSighting,
@@ -145,7 +154,7 @@ fn live_volumes_of(
     }
     let sql = format!(
         "SELECT v.label,
-                (SELECT MAX(vs.completed_at) FROM verification_sessions vs
+                (SELECT MAX(vs.started_at) FROM verification_sessions vs
                   WHERE vs.volume_id = v.id AND vs.verify_type = 'full'
                     AND vs.outcome = 'passed')
            FROM volumes v

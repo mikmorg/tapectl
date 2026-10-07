@@ -1507,7 +1507,7 @@ fn no_full_verify_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 }
 
 // TAPE ALERT (#308). One warning per live volume whose cartridge raised a
-// TapeAlert since its last passed full verify; the rules are in
+// TapeAlert no passed full verify STARTED after; the rules are in
 // `policy::tape_alerts`. A warning, never a violation (ADR-0004): the flags
 // may be the drive's ("clean me"), and the copy still counts.
 fn check_tape_alert(ctx: &Ctx<'_>) -> Result<Findings> {
@@ -3871,11 +3871,14 @@ mod tests {
             )
             .unwrap();
         };
-        let full_verify = |volume_id: i64, completed: &str| {
+        // A passed full readback, by when it STARTED and when it finished:
+        // it answers only an alert logged before it began reading.
+        let full_verify = |volume_id: i64, started: &str, completed: &str| {
             conn.execute(
-                "INSERT INTO verification_sessions (volume_id, verify_type, outcome, completed_at)
-                 VALUES (?1, 'full', 'passed', ?2)",
-                params![volume_id, completed],
+                "INSERT INTO verification_sessions
+                     (volume_id, verify_type, outcome, started_at, completed_at)
+                 VALUES (?1, 'full', 'passed', ?2, ?3)",
+                params![volume_id, started, completed],
             )
             .unwrap();
         };
@@ -3895,10 +3898,20 @@ mod tests {
         health(init, 1, "2026-10-01 10:00:00");
         let answered = vol("A-ANSWERED", "sealed", "ok");
         health(answered, 1, "2026-10-01 10:00:00");
-        full_verify(answered, "2026-10-02 10:00:00");
+        full_verify(answered, "2026-10-02 08:00:00", "2026-10-02 10:00:00");
         let after = vol("A-AFTER", "sealed", "ok");
-        full_verify(after, "2026-09-01 10:00:00");
+        full_verify(after, "2026-09-01 08:00:00", "2026-09-01 10:00:00");
         health(after, 1, "2026-10-01 10:00:00");
+        // The verify's OWN post-readback sweep, logged in the same second
+        // its session completed: that verify cannot answer the alert it
+        // raised.
+        let same = vol("A-SAME", "sealed", "ok");
+        full_verify(same, "2026-10-03 08:00:00", "2026-10-03 11:00:00");
+        health(same, 1, "2026-10-03 11:00:00");
+        // An alert raised while the readback was under way.
+        let during = vol("A-DURING", "sealed", "ok");
+        full_verify(during, "2026-10-03 08:00:00", "2026-10-03 11:00:00");
+        health(during, 1, "2026-10-03 09:30:00");
         // A drive poll's contact names the cartridge, never a volume.
         let cart = vol("A-CART", "sealed", "ok");
         conn.execute(
@@ -3960,8 +3973,10 @@ mod tests {
             vec![
                 ("volume:A-AFTER", "tapectl volume verify A-AFTER"),
                 ("volume:A-CART", "tapectl volume verify A-CART"),
+                ("volume:A-DURING", "tapectl volume verify A-DURING"),
                 ("volume:A-INIT", "tapectl volume verify A-INIT"),
                 ("volume:A-LIVE", "tapectl volume verify A-LIVE"),
+                ("volume:A-SAME", "tapectl volume verify A-SAME"),
             ],
             "{warnings:?}"
         );
