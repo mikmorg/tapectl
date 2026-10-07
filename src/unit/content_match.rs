@@ -237,7 +237,21 @@ pub(crate) fn matches_snapshot(
     fresh: &[FileStamp],
     hash_source_file: impl Fn(&Path, &str) -> Result<(String, i64)>,
 ) -> Result<FingerprintDiff> {
-    let recorded = recorded_stamps(conn, snapshot_id)?;
+    // ADR-0012, 2026-10-07 item 24 (#378): the unit's own dotfile is not
+    // content. It is left out here, on both sides, before either the
+    // mtime_size comparison or the sha256 loop sees it — the one predicate
+    // behind the Dirty scan (`collection::fingerprint::classify`, whose
+    // walk still lists it) and the minting short-circuit
+    // (`staging::snapshot_create_detailed`, which still records it).
+    let not_dotfile = |s: &FileStamp| !crate::unit::dotfile::is_unit_dotfile(&s.path);
+    let mut recorded = recorded_stamps(conn, snapshot_id)?;
+    recorded.retain(not_dotfile);
+    let fresh: std::borrow::Cow<'_, [FileStamp]> = if fresh.iter().all(not_dotfile) {
+        std::borrow::Cow::Borrowed(fresh)
+    } else {
+        std::borrow::Cow::Owned(fresh.iter().filter(|s| not_dotfile(s)).cloned().collect())
+    };
+    let fresh = fresh.as_ref();
     let diff = diff_stamps(&recorded, fresh);
     if !diff.is_empty() || checksum_mode != "sha256" {
         // mtime_size already disagrees (dirty regardless of checksum_mode),

@@ -143,6 +143,22 @@ struct ExcludesSection {
 /// deferring upward forever (issue #263 / ADR-0012 line 185).
 pub(crate) const DOTFILE_TOP_LEVEL_TABLES: [&str; 3] = ["unit", "policy", "excludes"];
 
+/// The unit's own dotfile, as a path relative to the unit's root.
+pub const UNIT_DOTFILE: &str = ".tapectl-unit.toml";
+
+/// Is `rel_path` (relative to the unit's root, as walks and `files` rows
+/// spell it) the unit's own dotfile? ADR-0012, 2026-10-07 item 24 (#378):
+/// that one file is not content. It is left out of every change comparison
+/// on both sides (the Dirty scan and the minting short-circuit through
+/// `unit::content_match`, staging's size, sha256 and NEW checks, and `unit
+/// check-integrity`), and is still recorded and still archived, so a `unit
+/// tag`, `unit rename` or `[policy]` edit mints no Version. Only the
+/// unit-root file: a `.tapectl-unit.toml` deeper in the tree is ordinary
+/// content.
+pub fn is_unit_dotfile(rel_path: &str) -> bool {
+    rel_path == UNIT_DOTFILE
+}
+
 /// Write dotfile to disk in the design-specified TOML format.
 pub fn write_dotfile(path: &Path, data: &UnitDotfile) -> Result<()> {
     let policy = if data.checksum_mode.is_none()
@@ -219,6 +235,13 @@ pub fn read_dotfile(path: &Path) -> Result<UnitDotfile> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn only_the_unit_root_dotfile_is_the_unit_dotfile() {
+        assert!(is_unit_dotfile(".tapectl-unit.toml"));
+        assert!(!is_unit_dotfile("sub/.tapectl-unit.toml"));
+        assert!(!is_unit_dotfile(".tapectl-unit.toml.bak"));
+    }
 
     fn sample() -> UnitDotfile {
         UnitDotfile {

@@ -181,6 +181,13 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // ADR-0012, 2026-10-07 item 24 (#378): the unit's own dotfile is not
+    // content. `unit tag`/`unit rename` rewrite it after it was hashed, so
+    // its recorded hash says nothing about the source's integrity.
+    let staged_files: Vec<_> = staged_files
+        .into_iter()
+        .filter(|(p, ..)| !crate::unit::dotfile::is_unit_dotfile(p))
+        .collect();
 
     let mut report = IntegrityReport {
         unit: unit_name.to_string(),
@@ -4535,6 +4542,47 @@ mod tests {
         unit_check_integrity(&conn, "unit1", true).expect("check-integrity must still succeed");
         let report = check_integrity(&conn, "unit1").unwrap();
         assert_eq!((report.ok, report.bitrot), (0, 1));
+    }
+
+    /// ADR-0012, 2026-10-07 item 24 (#378): the unit's own dotfile is
+    /// rewritten by `unit tag`/`unit rename` and is not content, so its
+    /// recorded size and sha256 drifting from the disk copy is neither
+    /// SIZE_MISMATCH nor BITROT, and its absence is not MISSING.
+    #[test]
+    fn check_integrity_leaves_the_unit_dotfile_out() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            b"[unit]\nname = \"x\"\n",
+        )
+        .unwrap();
+
+        let (conn, sid) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        insert_file(&conn, sid, "f.txt", 5, &direct_old_style_hash(b"hello"));
+        insert_file(
+            &conn,
+            sid,
+            ".tapectl-unit.toml",
+            7,
+            &direct_old_style_hash(b"[unit]\n"),
+        );
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(
+            (
+                report.ok,
+                report.bitrot,
+                report.size_mismatch,
+                report.missing
+            ),
+            (1, 0, 0, 0),
+            "{:?}",
+            report.details
+        );
+
+        std::fs::remove_file(tmp.path().join(".tapectl-unit.toml")).unwrap();
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!((report.ok, report.missing), (1, 0), "{:?}", report.details);
     }
 
     /// Insert version `version` of `unit1` with `status`.
