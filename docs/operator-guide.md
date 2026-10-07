@@ -1775,7 +1775,12 @@ tapectl volume verify L6-0003 --device "$TAPE"   # --full is the default
 
 The report lists every verification session, not one line per volume.
 `never verified` lines come first, then sessions oldest first, so a volume
-verified twice appears twice. Judge each volume by its newest line:
+verified twice appears twice. A full readback is dated by when it *started*:
+one that continued an interrupted readback started, as far as its oldest file
+is concerned, when that file was read, and its `started` time says so. `audit`'s
+`verify_age`, `volume list`'s VERIFIED column and the evidence lines the
+destructive commands print date it the same way (ADR-0012, 2026-10-07). Judge
+each volume by its newest line:
 
 ```text
 $ tapectl report verify-status

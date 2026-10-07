@@ -1256,7 +1256,18 @@ fn verify_status_rows(
     // deterministically: several never-verified volumes all share a NULL
     // `completed_at`, and a report an operator reads twice must not
     // reorder itself between runs.
-    sql.push_str(" ORDER BY (vs.completed_at IS NOT NULL) ASC, vs.completed_at ASC, v.label ASC");
+    //
+    // A completed FULL readback is dated by its START (ADR-0012 2026-10-07
+    // item 30, `policy::evidence::full_readback_date`): a continued one
+    // started at its oldest checkpoint, when some of its files were last
+    // read, so it is older evidence than its completion says. Every other
+    // row keeps its completion: a quick readback is no evidence at any date.
+    sql.push_str(&format!(
+        " ORDER BY (vs.completed_at IS NOT NULL) ASC,
+                   CASE WHEN vs.verify_type = 'full' THEN {dated} ELSE vs.completed_at END ASC,
+                   v.label ASC",
+        dated = crate::policy::evidence::full_readback_date("vs"),
+    ));
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
@@ -2764,8 +2775,20 @@ mod tests {
             assert_eq!(json["completed"], "2026-10-01 18:06:17");
         }
 
-        /// A volume with one completed, passed verification session.
+        /// A volume with one completed, passed full verification session,
+        /// started when it completed.
         fn seed_verified(conn: &rusqlite::Connection, label: &str, completed_at: &str) {
+            seed_verified_dated(conn, label, completed_at, completed_at);
+        }
+
+        /// [`seed_verified`] with the session's start given apart: a
+        /// continued readback's `started_at` is its oldest checkpoint.
+        fn seed_verified_dated(
+            conn: &rusqlite::Connection,
+            label: &str,
+            started_at: &str,
+            completed_at: &str,
+        ) {
             conn.execute(
                 "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
                  VALUES (?1, 'lto', 'lto0', 'LTO-6', 1000, 'sealed')",
@@ -2775,12 +2798,36 @@ mod tests {
             let vol = conn.last_insert_rowid();
             conn.execute(
                 "INSERT INTO verification_sessions
-                    (volume_id, verify_type, outcome, completed_at, slices_checked,
+                    (volume_id, verify_type, outcome, started_at, completed_at, slices_checked,
                      slices_passed, slices_failed)
-                 VALUES (?1, 'full', 'passed', ?2, 3, 3, 0)",
-                params![vol, completed_at],
+                 VALUES (?1, 'full', 'passed', ?2, ?3, 3, 3, 0)",
+                params![vol, started_at, completed_at],
             )
             .unwrap();
+        }
+
+        /// ADR-0012 2026-10-07 item 30: "oldest evidence first" dates a full
+        /// readback by its START. AAA-CONT's continued verify completed in
+        /// 2026, after ZZZ-FRESH's, but it started — by its oldest
+        /// checkpoint — in 2020, so some of its files were last read then
+        /// and it is the older evidence. Labels sort the other way, so the
+        /// order can only come from the start.
+        #[test]
+        fn a_continued_full_readback_sorts_by_its_oldest_checkpoint() {
+            let conn = crate::db::open_memory().unwrap();
+            seed_verified_dated(
+                &conn,
+                "ZZZ-CONT",
+                "2020-01-01 00:00:00",
+                "2026-10-01 00:00:00",
+            );
+            seed_verified(&conn, "AAA-FRESH", "2023-06-01 00:00:00");
+            let rows = verify_status_rows(&conn, None).unwrap();
+            assert_eq!(
+                rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+                vec!["ZZZ-CONT", "AAA-FRESH"],
+                "the readback that started in 2020 is the older evidence"
+            );
         }
 
         /// A volume with no `verification_sessions` row at all — never

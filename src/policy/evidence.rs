@@ -58,7 +58,8 @@ pub struct CoverageEvidence {
 /// The shared query behind [`remaining_coverage_evidence`] and
 /// [`per_volume_verification`]: one row per volume holding a completed
 /// write for `unit_id`, with that volume's most recent PASSED FULL
-/// readback (`None` = never verified; a quick one does not count).
+/// readback, dated by its start ([`full_readback_date`]; `None` = never
+/// verified; a quick one does not count).
 ///
 /// `only_eligible` selects which of the two callers' questions this
 /// answers:
@@ -97,7 +98,7 @@ fn tape_rows(
         String::new()
     };
     let sql = format!(
-        "SELECT v.label, MAX(vs.completed_at) as last_verified
+        "SELECT v.label, MAX({dated}) as last_verified
          FROM writes w
          JOIN stage_sets ss ON ss.id = w.stage_set_id
          JOIN snapshots s ON s.id = ss.snapshot_id
@@ -109,7 +110,8 @@ fn tape_rows(
            {exclude_clause}
            {eligible_clause}
          GROUP BY v.id, v.label
-         ORDER BY v.label"
+         ORDER BY v.label",
+        dated = full_readback_date("vs"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let tape_row = |row: &rusqlite::Row| -> rusqlite::Result<CoverageEvidence> {
@@ -156,6 +158,23 @@ fn tape_rows(
 /// query them.
 pub fn per_volume_verification(conn: &Connection, unit_id: i64) -> Result<Vec<CoverageEvidence>> {
     tape_rows(conn, unit_id, false, None)
+}
+
+/// The column a FULL readback's freshness is judged by, for the
+/// `verification_sessions` row aliased `session_alias`: its `started_at`
+/// (ADR-0012 2026-10-07 item 30). A readback that continues an interrupted
+/// one records, as its start, the oldest `checked_at` among the files it
+/// skipped (item 1, `volume::session::STARTED_AT_FROM_CHECKPOINTS`), so its
+/// start is when its oldest file was last read; its `completed_at` is only
+/// when it finished, and dating by that would overstate what was read when.
+///
+/// The one spelling every freshness reader uses — `audit`'s `verify_age`,
+/// the Tier-1 evidence here ([`remaining_coverage_evidence`],
+/// [`per_volume_verification`]), `report verify-status`'s order and `volume
+/// list`'s VERIFIED. Each still reads full readbacks only: a quick one reads
+/// none of a volume's bytes, so it is no evidence at any date.
+pub fn full_readback_date(session_alias: &str) -> String {
+    format!("{session_alias}.started_at")
 }
 
 /// The labels of every volume that counts as a copy
@@ -685,13 +704,42 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
-             VALUES (?1, '2020-01-01 00:00:00', 'passed')",
+            "INSERT INTO verification_sessions (volume_id, started_at, completed_at, outcome)
+             VALUES (?1, '2020-01-01 00:00:00', '2020-01-01 00:00:00', 'passed')",
             params![v2_id],
         )
         .unwrap();
 
         (conn, unit_id, v1_id, v2_id)
+    }
+
+    /// ADR-0012 2026-10-07 item 30: the Tier-1 evidence dates a full
+    /// readback by its START. V1's continued full verify completed on
+    /// 2026-10-01, but its `started_at` is its oldest checkpoint,
+    /// 2026-06-01, and that is how old the evidence is: some of its files
+    /// were last read then. A quick pass today still does not count.
+    #[test]
+    fn a_continued_full_readback_is_dated_from_its_oldest_checkpoint() {
+        let (conn, unit_id, v1_id, _v2_id) = setup_two_volume_unit();
+        conn.execute(
+            "INSERT INTO verification_sessions
+                 (volume_id, verify_type, started_at, completed_at, outcome)
+             VALUES (?1, 'full', '2026-06-01 00:00:00', '2026-10-01 00:00:00', 'passed'),
+                    (?1, 'quick', '2026-10-02 00:00:00', '2026-10-02 00:00:00', 'passed')",
+            params![v1_id],
+        )
+        .unwrap();
+        for evidence in [
+            remaining_coverage_evidence(&conn, unit_id, None).unwrap(),
+            per_volume_verification(&conn, unit_id).unwrap(),
+        ] {
+            let v1 = evidence.iter().find(|e| e.volume_label == "V1").unwrap();
+            assert_eq!(
+                v1.last_verified.as_deref(),
+                Some("2026-06-01 00:00:00"),
+                "{evidence:?}"
+            );
+        }
     }
 
     /// `Some(v1)` excludes V1's own coverage row: only V2 remains. This is

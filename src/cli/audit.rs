@@ -812,17 +812,22 @@ fn check_verify_age(
         // A FULL readback only (ADR-0012 2026-10-06 items 1 and 24): a quick
         // confirm or quick verify reads File 0, the front index and the
         // seal — none of the unit's bytes — so it is no evidence they still
-        // read, and must not refresh this clock.
+        // read, and must not refresh this clock. Dated by its START
+        // (ADR-0012 2026-10-07 item 30): a continued readback's start is its
+        // oldest checkpoint, when some of its files were last read.
         let last_verify: Option<String> = ctx
             .conn
             .query_row(
-                "SELECT MAX(vs.completed_at)
-                 FROM verification_sessions vs
-                 JOIN writes w ON w.volume_id = vs.volume_id
-                 JOIN stage_sets ss ON ss.id = w.stage_set_id
-                 JOIN snapshots s ON s.id = ss.snapshot_id
-                 WHERE s.unit_id = ?1 AND vs.outcome = 'passed'
-                   AND vs.verify_type = 'full'",
+                &format!(
+                    "SELECT MAX({dated})
+                     FROM verification_sessions vs
+                     JOIN writes w ON w.volume_id = vs.volume_id
+                     JOIN stage_sets ss ON ss.id = w.stage_set_id
+                     JOIN snapshots s ON s.id = ss.snapshot_id
+                     WHERE s.unit_id = ?1 AND vs.outcome = 'passed'
+                       AND vs.verify_type = 'full'",
+                    dated = policy::evidence::full_readback_date("vs"),
+                ),
                 params![unit.id],
                 |row| row.get(0),
             )
@@ -3656,8 +3661,17 @@ mod tests {
 
         /// Unit `aged` in archive set `monthly` (verify every 30 days), one
         /// current version completed-written to one sealed volume, with the
-        /// given `(verify_type, completed_at)` passed sessions on it.
+        /// given `(verify_type, completed_at)` passed sessions on it, each
+        /// started when it completed.
         fn setup(sessions: &[(&str, &str)]) -> Connection {
+            let dated: Vec<(&str, &str, &str)> =
+                sessions.iter().map(|(t, c)| (*t, *c, *c)).collect();
+            setup_dated(&dated)
+        }
+
+        /// [`setup`] with each session's `(verify_type, started_at,
+        /// completed_at)` given apart.
+        fn setup_dated(sessions: &[(&str, &str, &str)]) -> Connection {
             let conn = crate::db::open_memory().unwrap();
             conn.execute(
                 "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
@@ -3705,11 +3719,12 @@ mod tests {
                 params![ss_id, snap_id, vol_id],
             )
             .unwrap();
-            for (verify_type, completed_at) in sessions {
+            for (verify_type, started_at, completed_at) in sessions {
                 conn.execute(
-                    "INSERT INTO verification_sessions (volume_id, verify_type, outcome, completed_at)
-                     VALUES (?1, ?2, 'passed', ?3)",
-                    params![vol_id, verify_type, completed_at],
+                    "INSERT INTO verification_sessions
+                         (volume_id, verify_type, outcome, started_at, completed_at)
+                     VALUES (?1, ?2, 'passed', ?3, ?4)",
+                    params![vol_id, verify_type, started_at, completed_at],
                 )
                 .unwrap();
             }
@@ -3756,6 +3771,26 @@ mod tests {
         fn a_recent_full_readback_is_fresh() {
             let conn = setup(&[("full", &days_ago(2)), ("quick", &days_ago(1))]);
             assert!(verify_age_messages(&conn).is_empty());
+        }
+
+        /// ADR-0012 2026-10-07 item 30: a full readback is dated by its
+        /// START. A continued one finished yesterday, but its `started_at`
+        /// is its oldest checkpoint, 100 days ago, so it reads as 100 days
+        /// old: some of its files were last read then. A quick readback
+        /// today still does not count (full-only).
+        #[test]
+        fn a_continued_full_readback_is_as_old_as_its_oldest_checkpoint() {
+            let oldest_checkpoint = days_ago(100);
+            let conn = setup_dated(&[
+                ("full", &oldest_checkpoint, &days_ago(1)),
+                ("quick", &days_ago(0), &days_ago(0)),
+            ]);
+            assert_eq!(
+                verify_age_messages(&conn),
+                [format!(
+                    "not verified within 30 days (last: {oldest_checkpoint})"
+                )]
+            );
         }
     }
 

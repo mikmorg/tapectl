@@ -2250,13 +2250,14 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
                     JOIN units cu ON cu.id = cs2.unit_id
                     WHERE cw2.volume_id = v.id AND cw2.status = 'completed'
                  ) per) AS copies,
-                (SELECT MAX(vs.completed_at) FROM verification_sessions vs
+                (SELECT MAX({dated}) FROM verification_sessions vs
                   WHERE vs.volume_id = v.id AND vs.outcome = 'passed'
                     AND vs.verify_type = 'full') AS last_verified
          FROM volumes v
          LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
          LEFT JOIN cartridges c ON c.id = cv.cartridge_id
-         LEFT JOIN locations l ON l.id = v.location_id"
+         LEFT JOIN locations l ON l.id = v.location_id",
+        dated = crate::policy::evidence::full_readback_date("vs"),
     );
     if status.is_some() {
         sql.push_str(" WHERE v.status = ?1");
@@ -3763,6 +3764,34 @@ mod tests {
             let row = |label: &str| rows.iter().find(|r| r.label == label).unwrap();
             assert_eq!(row("L6-0001").verified, full_l6_0001);
             assert_eq!(row("L6-0002").verified, None);
+        }
+
+        /// ADR-0012 2026-10-07 item 30: VERIFIED dates a full readback by
+        /// its START. A continued full verify of L6-0002 that completed
+        /// today started, by its oldest checkpoint, 100 days ago, and the
+        /// column says so: some of its files were last read then.
+        #[test]
+        fn a_continued_full_readback_shows_its_oldest_checkpoint() {
+            let conn = seed();
+            conn.execute(
+                "INSERT INTO verification_sessions
+                     (volume_id, verify_type, outcome, started_at, completed_at)
+                 SELECT id, 'full', 'passed', datetime('now', '-100 days'), datetime('now')
+                 FROM volumes WHERE label = 'L6-0002'",
+                [],
+            )
+            .unwrap();
+            let rows = volume_rows(&conn, None).unwrap();
+            let row = rows.iter().find(|r| r.label == "L6-0002").unwrap();
+            assert_eq!(
+                crate::policy::evidence::compact_age(
+                    row.verified.as_deref(),
+                    chrono::Utc::now().naive_utc()
+                ),
+                "100d ago",
+                "{:?}",
+                row.verified
+            );
         }
 
         /// Rule: `--status` narrows but is never the default filter, and it
