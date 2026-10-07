@@ -45,6 +45,12 @@ pub struct SyncReport {
     /// where a unit folder would be. Never archived;
     /// `cli::collection::cmd_sync` names them and exits non-zero.
     pub outside: Vec<super::outside::OutsideEntry>,
+    /// Known units under the root owned by another tenant than the
+    /// collection's configured `tenant` (#383): `(unit name, its tenant)`.
+    /// A warning, never a refusal and never a change: the catalog keeps
+    /// the owner it has (a collection's `tenant` names who new units go to).
+    /// `cli::collection::cmd_sync` prints them.
+    pub tenant_differs: Vec<(String, String)>,
 }
 
 /// Sync one collection with BUILT-IN defaults (`Config::default()`) plus the
@@ -246,7 +252,7 @@ fn sync_one_directory(
                     {
                         return Err(TapectlError::Other(refusal));
                     }
-                    resolve_existing(conn, &existing, &abs_str, dry_run, report)
+                    resolve_existing(conn, lib, &existing, &abs_str, dry_run, report)
                 }
                 None => {
                     // Dotfile on disk, DB doesn't know it yet — adopt it
@@ -282,7 +288,7 @@ fn sync_one_directory(
         // Path-keyed identity: no dotfile, ever — read-only sources trade
         // away rename robustness for zero on-disk footprint (§11).
         match queries::get_unit_by_path(conn, &abs_str)? {
-            Some(existing) => resolve_existing(conn, &existing, &abs_str, dry_run, report),
+            Some(existing) => resolve_existing(conn, lib, &existing, &abs_str, dry_run, report),
             None => {
                 if !dry_run {
                     insert_path_keyed_unit(conn, config, lib, root, &abs_str)?;
@@ -296,14 +302,32 @@ fn sync_one_directory(
 
 /// A directory resolved to an already-known unit (by uuid or by path):
 /// update its recorded path if it moved, and reactivate it if it was
-/// previously `missing` and has now reappeared.
+/// previously `missing` and has now reappeared. A unit owned by another
+/// tenant than the collection's is named in `tenant_differs` (#383), and
+/// keeps its owner.
 fn resolve_existing(
     conn: &Connection,
+    lib: &CollectionConfig,
     existing: &crate::db::models::Unit,
     abs_str: &str,
     dry_run: bool,
     report: &mut SyncReport,
 ) -> Result<()> {
+    let owner: String = conn.query_row(
+        "SELECT name FROM tenants WHERE id = ?1",
+        params![existing.tenant_id],
+        |r| r.get(0),
+    )?;
+    if owner != lib.tenant {
+        warn!(
+            unit = %existing.name,
+            tenant = %owner,
+            collection_tenant = %lib.tenant,
+            "collection sync: a known unit is owned by another tenant than the collection's"
+        );
+        report.tenant_differs.push((existing.name.clone(), owner));
+    }
+
     if existing.current_path.as_deref() != Some(abs_str) {
         report.moved += 1;
         if !dry_run {
@@ -622,6 +646,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after.current_path, before.current_path, "never repointed");
+    }
+
+    /// #383: a collection whose configured `tenant` changed keeps the old
+    /// owner for the units it already knows; sync names each one, changes
+    /// nothing, and does not fail.
+    #[test]
+    fn a_known_unit_owned_by_another_tenant_is_named_not_changed() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        seed_tenant(&conn, "family");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        sync_collection(
+            &conn,
+            &paths_in(home.path()),
+            &test_lib(root.path(), "media"),
+            false,
+            &[],
+        )
+        .unwrap();
+
+        let lib = test_lib(root.path(), "family");
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            report.tenant_differs,
+            vec![("testlib/alpha".to_string(), "media".to_string())]
+        );
+        let unit = queries::get_unit_by_name(&conn, "testlib/alpha")
+            .unwrap()
+            .unwrap();
+        let owner: String = conn
+            .query_row(
+                "SELECT name FROM tenants WHERE id = ?1",
+                params![unit.tenant_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, "media", "the owner is not changed by sync");
+
+        let (report, _) = sync_collection(
+            &conn,
+            &paths_in(home.path()),
+            &test_lib(root.path(), "media"),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(report.tenant_differs.is_empty());
     }
 
     /// The other half of item 24: two directories in one walk carrying one
