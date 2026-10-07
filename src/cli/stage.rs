@@ -353,14 +353,12 @@ pub fn run(
                 &mut std::io::stderr(),
                 &crate::progress::stderr_println,
             )?;
-            let staged = staging::jobs::first_failure(outcomes);
-            // What was staged is reported even when another unit failed.
-            let done: &[(String, i64)] = match &staged {
-                Ok(done) => done,
-                Err(_) => &[],
-            };
+            // On any failure nothing goes to stdout — no `[]` a script would
+            // read as success — and the error, on stderr, names every unit
+            // that was staged, failed or never started (`first_failure`).
+            let done = staging::jobs::first_failure(outcomes)?;
             let mut rows = Vec::with_capacity(done.len());
-            for (unit_name, stage_set_id) in done {
+            for (unit_name, stage_set_id) in &done {
                 let (num_slices, total_dar, total_enc): (Option<i64>, Option<i64>, Option<i64>) =
                     conn.query_row(
                         "SELECT num_slices, total_dar_size, total_encrypted_size
@@ -394,7 +392,6 @@ pub fn run(
                 };
                 println!("{out}");
             }
-            staged?;
         }
     }
     Ok(())

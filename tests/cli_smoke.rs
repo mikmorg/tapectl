@@ -2933,6 +2933,51 @@ fn stage_create_json_is_unchanged_and_its_session_is_logged() {
     }
 }
 
+/// `stage create --json` prints nothing on stdout when its one unit fails:
+/// the refusal goes to stderr and the exit is non-zero, as before #368 —
+/// not an empty `[]` a script would read as "staged nothing, fine". The
+/// failure here is the missing escrow recipient (`init --no-escrow`), which
+/// is refused inside the stage, before dar.
+#[test]
+fn stage_create_json_prints_nothing_when_its_one_unit_fails() {
+    let home = TempDir::new().expect("home tempdir");
+    let source_dir = TempDir::new().expect("source tempdir");
+    std::fs::write(source_dir.path().join("a.txt"), b"x").unwrap();
+    for args in [
+        vec!["init", "--no-escrow"],
+        vec!["tenant", "add", "acme"],
+        vec![
+            "unit",
+            "init",
+            source_dir.path().to_str().unwrap(),
+            "--tenant",
+            "acme",
+            "--name",
+            "unit1",
+        ],
+        vec!["snapshot", "create", "unit1"],
+    ] {
+        let out = run_tapectl(home.path(), &args);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let out = run_tapectl(home.path(), &["--json", "stage", "create", "unit1"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the stage must fail: {stderr}");
+    assert!(
+        stderr.contains("no escrow recipient"),
+        "positive control: the stage itself refused: {stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "",
+        "nothing on stdout for a failed stage"
+    );
+}
+
 /// Issue #386: `--quiet` keeps progress off stderr entirely, and the
 /// session log is still written. `volume info --json` keeps its exact key
 /// set while the human output shows the recorded phase timings.
