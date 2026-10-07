@@ -270,7 +270,7 @@ One drive (`--device`) serves both the read and the write, so the flow PAUSES af
 
 Step 3 applies `compact-finish`'s ADR-0008 Tier-2 gate and may refuse non-interactively without `--force`. When it does, the destination tape is already written and sealed and nothing is lost: `volume compact-finish <SOURCE> --force` completes the flow without re-reading or re-writing anything.
 
-Exit status: `volume write`'s, for step 2's write (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A step 1 or step 3 failure exits 2: step 1 writes nothing, and a step 3 refusal leaves the destination sealed.
+Exit status: `volume write`'s, for step 2's write (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A step 1 failure exits 2: step 1 writes nothing. A step 3 failure exits 0 with a warning naming `volume compact-finish`: the destination is sealed and confirmed and counts as a copy.
 
 ```text
 tapectl volume compact [OPTIONS] <LABEL>

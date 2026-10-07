@@ -1306,7 +1306,7 @@ The write family goes past 3 (ADR-0012, 2026-10-07; the full table is in
 
 | exit | the tape and the session | next |
 |---|---|---|
-| 0 | sealed and confirmed | nothing |
+| 0 | sealed and confirmed (a step after it that failed is a `warning:` line) | nothing, or the command the warning names |
 | 2 | untouched: refused before anything was written, or a usage error | fix the error, run it again |
 | 3 | sealed; the confirm reached no verdict | `volume resume <label>` |
 | 4 | interrupted part-way (a signal, a drive or disk error) | `volume resume <label>` |

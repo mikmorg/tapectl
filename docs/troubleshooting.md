@@ -130,10 +130,24 @@ are left as, so a script knows what to do next without parsing the message:
 among its copies, in the order 6, 5, 4, 3, 2, 0: a run with any copy
 quarantined exits 6 whatever the others did.
 
-Two failures after a copy is sealed and confirmed still exit 2, because the
-tape needs nothing: `volume compact`'s step 3 (retiring the source) refusing,
-and a catalog error while recording the copy's figures or releasing
-`collection run`'s staging. Read the `error:` line: the copy itself counts.
+A failure after a copy is sealed and confirmed exits **0**, because the copy
+stands and the tape needs nothing (ADR-0012, 2026-10-07, item 33). The command
+prints a `warning:` line naming the step that did not finish, and the command
+that finishes it on its own:
+
+| Step that did not finish | Finish it with |
+|---|---|
+| `volume compact`'s step 3, retiring the source (a consent refusal, or a Tier-3 refusal) | `tapectl volume compact-finish <source>` (`--force` only when the warning names it: the consent refusal) |
+| releasing `collection run`'s staging (a catalog error) | `tapectl staging clean`, which retains whatever is still below its policy |
+| recording the copy's figures (`bytes_written`, `num_data_files`, `last_write`) and its `write_completed` event (a catalog error) | nothing re-records them; the copy is unaffected, and `volume info` shows the figures as unrecorded |
+
+```text
+warning: volume "L6-0002" is sealed and confirmed and counts as a copy, but releasing the batch's staging did
+not finish: database error: disk I/O error. The tape needs nothing. To finish it: tapectl staging clean
+```
+
+`volume compact --json` says `"source_retired": false` and carries the warning;
+`collection run --json` carries it as `release_warning`.
 
 Older builds exited 2 for every one of these failures.
 

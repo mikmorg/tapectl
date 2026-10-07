@@ -652,9 +652,19 @@ fn cmd_run(
                     "copies": p.copies,
                     "min_copies": p.min_copies,
                 })).collect::<Vec<_>>(),
+                "release_warning": report.release_warning,
                 "refused": refused_json(&refused),
             })
         );
+    } else if let Some(warning) = &report.release_warning {
+        // ADR-0012 2026-10-07 item 33: the copies are sealed and confirmed,
+        // so a failed release is a warning and the run exits as before.
+        println!(
+            "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} \
+             copy/copies written; staging NOT released",
+            report.units_staged, report.copies_written,
+        );
+        eprintln!("{warning}");
     } else {
         match &report.cleaned {
             Some(cleaned) => println!(
