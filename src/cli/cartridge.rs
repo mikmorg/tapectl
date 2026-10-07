@@ -259,6 +259,42 @@ struct CartridgeRow {
 /// "unknown", the one spelling used here and in `cartridge info`'s
 /// plain-text render, never as blank (indistinguishable from a stripped 0)
 /// or as `0` (a false claim about wear).
+/// `cartridge info`'s volume history (issue #307): each mount with BOTH its
+/// dates. This printed the word "unmounted" and dropped the timestamp it had
+/// just selected.
+fn volume_history_lines(volumes: &[(String, String, Option<String>)]) -> Vec<String> {
+    volumes
+        .iter()
+        .map(|(label, mounted, unmounted)| match unmounted {
+            Some(u) => format!("    {label} (mounted {mounted}, unmounted {u})"),
+            None => format!("    {label} (current, mounted {mounted})"),
+        })
+        .collect()
+}
+
+/// `cartridge info`'s two dates of use (issue #307): the last bind
+/// (`cartridges.last_use`, which only binding writes — so it is labelled for
+/// what it is) and the last contact of any kind (`cartridge_contacts`).
+fn contact_lines(
+    last_bind: Option<&str>,
+    last_contact: Option<&crate::tape::cartridge_health::LastContact>,
+) -> Vec<String> {
+    vec![
+        format!("  Last bind:    {}", last_bind.unwrap_or("never")),
+        format!(
+            "  Last contact: {}",
+            last_contact
+                .map(|c| format!(
+                    "{} ({}, {})",
+                    c.at,
+                    c.operation,
+                    c.outcome.as_deref().unwrap_or("did not close")
+                ))
+                .unwrap_or_else(|| "none recorded".to_string())
+        ),
+    ]
+}
+
 fn display_opt_i64(v: &Option<i64>) -> String {
     v.map(|n| n.to_string())
         .unwrap_or_else(|| "unknown".to_string())
@@ -524,6 +560,17 @@ pub fn run(
                 )
                 .map_err(|_| TapectlError::Other(format!("cartridge \"{barcode}\" not found")))?;
 
+            // Issue #307: the last BIND (`last_use` — only binding sets it)
+            // and the last CONTACT (`cartridge_contacts`), labelled for what
+            // each is: a tape verified last week but bound six months ago
+            // must not read as untouched for six months.
+            let last_bind: Option<String> = conn.query_row(
+                "SELECT last_use FROM cartridges WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )?;
+            let last_contact = crate::tape::cartridge_health::last_contact(conn, id)?;
+
             // Get volume history
             let mut stmt = conn.prepare(
                 "SELECT v.label, cv.mounted_at, cv.unmounted_at
@@ -554,6 +601,17 @@ pub fn run(
                         "loads": loads, "location": location, "volumes": volumes.len(),
                         "serial_number": serial_number, "operator_serial": operator_serial,
                         "wear": {"lines": wear.lines(), "warnings": wear.warnings()},
+                        // Issue #307, additive: each mount with both ends,
+                        // the last bind and the last contact.
+                        "last_bind": last_bind,
+                        "last_contact": last_contact.as_ref().map(|c| serde_json::json!({
+                            "at": c.at, "operation": c.operation, "outcome": c.outcome,
+                        })),
+                        "volume_history": volumes.iter().map(|(label, mounted, unmounted)| {
+                            serde_json::json!({
+                                "label": label, "mounted_at": mounted, "unmounted_at": unmounted,
+                            })
+                        }).collect::<Vec<_>>(),
                     })
                 );
             } else {
@@ -575,18 +633,16 @@ pub fn run(
                 // just a wrong label (issue #204, class 2).
                 println!("  Capacity: {}", crate::util::format_bytes_decimal(cap));
                 println!("  Created:  {created}");
+                for line in contact_lines(last_bind.as_deref(), last_contact.as_ref()) {
+                    println!("{line}");
+                }
                 if let Some(n) = &notes {
                     println!("  Notes:    {n}");
                 }
                 if !volumes.is_empty() {
                     println!("  Volume history:");
-                    for (label, mounted, unmounted) in &volumes {
-                        let status = if unmounted.is_some() {
-                            "unmounted"
-                        } else {
-                            "current"
-                        };
-                        println!("    {label} ({status}, mounted {mounted})");
+                    for line in volume_history_lines(&volumes) {
+                        println!("{line}");
                     }
                 }
                 println!("  Wear (figures only; ADR-0012 sets no threshold yet):");
@@ -1347,6 +1403,57 @@ fn cartridge_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #307: an unmounted volume shows WHEN, not just the word; the
+    /// positive control is a still-mounted one, which reads `current`.
+    #[test]
+    fn volume_history_shows_both_mount_dates() {
+        let lines = volume_history_lines(&[
+            (
+                "L6-0002".to_string(),
+                "2026-09-20 10:00:00".to_string(),
+                None,
+            ),
+            (
+                "L6-0001".to_string(),
+                "2026-09-01 10:00:00".to_string(),
+                Some("2026-09-20 09:59:00".to_string()),
+            ),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "    L6-0002 (current, mounted 2026-09-20 10:00:00)".to_string(),
+                "    L6-0001 (mounted 2026-09-01 10:00:00, unmounted 2026-09-20 09:59:00)"
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// Issue #307: `last_use` is printed as what it is — the last bind —
+    /// beside the last contact of any kind, and absence is named.
+    #[test]
+    fn info_names_the_last_bind_and_the_last_contact() {
+        let contact = crate::tape::cartridge_health::LastContact {
+            at: "2026-10-01 08:00:00".into(),
+            operation: "volume verify".into(),
+            outcome: Some("ok".into()),
+        };
+        assert_eq!(
+            contact_lines(Some("2026-04-01 00:00:00"), Some(&contact)),
+            vec![
+                "  Last bind:    2026-04-01 00:00:00".to_string(),
+                "  Last contact: 2026-10-01 08:00:00 (volume verify, ok)".to_string(),
+            ]
+        );
+        assert_eq!(
+            contact_lines(None, None),
+            vec![
+                "  Last bind:    never".to_string(),
+                "  Last contact: none recorded".to_string(),
+            ]
+        );
+    }
 
     /// Issue #184: the table (and `cartridge info`'s plain-text render,
     /// which calls this same helper) must not tell a genuinely never-observed

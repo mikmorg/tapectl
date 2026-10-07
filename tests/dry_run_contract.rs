@@ -204,6 +204,7 @@ const TABLE: &[(&[&str], Verdict)] = &[
     ),
     (&["report", "age"], Verdict::ReadOnly),
     (&["report", "capacity"], Verdict::ReadOnly),
+    (&["report", "cartridge-health"], Verdict::ReadOnly),
     (&["report", "compaction-candidates"], Verdict::ReadOnly),
     (&["report", "copies"], Verdict::ReadOnly),
     (&["report", "dirty"], Verdict::ReadOnly),

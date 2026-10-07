@@ -43,6 +43,8 @@ pub enum ReportCommands {
         #[arg(long)]
         volume: Option<String>,
     },
+    /// Every cartridge's health, worst first, and why
+    CartridgeHealth,
     /// Volume capacity utilization
     Capacity {
         /// Per-volume breakdown
@@ -94,6 +96,7 @@ pub fn run(
         ReportCommands::Health { volume } => {
             report_health(conn, config, volume.as_deref(), json_output)
         }
+        ReportCommands::CartridgeHealth => report_cartridge_health(conn, config, json_output),
         ReportCommands::Capacity { per_volume } => report_capacity(conn, *per_volume, json_output),
         ReportCommands::Age { unit } => report_age(conn, unit.as_deref(), json_output),
         ReportCommands::Events { entity, days } => {
@@ -1672,6 +1675,33 @@ fn report_health(
                 ),
                 health_attribution(r.drive_serial.as_deref(), r.cartridge_barcode.as_deref()),
             );
+        }
+    }
+    Ok(())
+}
+
+/// `report cartridge-health` (issue #307): every registered cartridge,
+/// worst first — attention (with each reason), then never examined, then
+/// clean ([`crate::tape::cartridge_health`]). No truncation: the fleet is the
+/// answer to "which of my tapes is worst", and a cartridge left off it would
+/// read as fine.
+fn report_cartridge_health(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
+    let fleet = crate::tape::cartridge_health::fleet(conn, config.health().read_error_rise_factor)?;
+    if json_output {
+        let rows: Vec<serde_json::Value> = fleet
+            .iter()
+            .map(crate::tape::cartridge_health::to_json)
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows).unwrap());
+        return Ok(());
+    }
+    if fleet.is_empty() {
+        println!("no cartridges registered");
+        return Ok(());
+    }
+    for h in &fleet {
+        for line in crate::tape::cartridge_health::render(h) {
+            println!("{line}");
         }
     }
     Ok(())

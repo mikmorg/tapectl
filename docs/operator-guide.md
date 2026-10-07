@@ -744,6 +744,17 @@ A warning never stops the write. If you see one, write that batch to another
 cartridge and retire this one. A line saying `no reading recorded` means tapectl
 has no figure, not that the figure is good.
 
+`tapectl report cartridge-health` ranks every registered cartridge, worst
+first, and says why: `ATTENTION` names each reason (a medium TapeAlert raised on
+one of its contacts, an uncorrected error counted during one, a volume
+quarantined on medium evidence, a volume whose last verify failed, a rising
+read-error rate); `NO_EVIDENCE` is a cartridge with no health reading and no
+verify — never examined, not healthy; `CLEAN` is examined with nothing adverse.
+A drive or cleaning TapeAlert raised while a cartridge was loaded is noted
+against it but is the drive's, and a quarantine from a write-session finding is
+noted, not counted. `cartridge info` shows the last bind and the last contact of
+any kind, and when each volume it carried was mounted and unmounted.
+
 **The confirm after sealing.** By default the write reads back the front index
 and the seal marker and checks the seal's binding and the index against what
 it wrote; a passing confirm seals the volume (ADR-0012, 2026-10-06). The data
@@ -1936,6 +1947,7 @@ tapectl report copies --unit <name>    # does anything depend on this tape alone
 tapectl report verify-status --volume <label>
 tapectl volume move <label> --to <location>
 tapectl cartridge info <barcode>       # physical cartridge, tracked separately
+tapectl report cartridge-health        # is this cartridge fit to be the copy that leaves?
 ```
 
 `--to` must be a **shelf** location. A warehouse destination is refused:
