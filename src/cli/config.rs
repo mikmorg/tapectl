@@ -4,10 +4,14 @@
 //! integration tests import `tapectl::` and cannot reach the binary, so
 //! anything inlined in `main.rs` is untestable from there.
 //!
-//! Every scan below (shadowing, subsumed, decorative keys, unknown
-//! `[defaults]` keys, unsupported compression, and the dar/staging/tape
-//! depth checks) is ADVISORY — it advises, never rewrites operator-owned
-//! files, and never touches the exit code. That contract is load-bearing
+//! `config set`/`add`/`remove` (issue #143) rewrite config.toml by design,
+//! through [`crate::config_edit`], which checks the edited file before it
+//! is written. Everything else here only reads.
+//!
+//! Every `config check` scan below (shadowing, subsumed, decorative keys,
+//! unknown `[defaults]` keys, unsupported compression, and the
+//! dar/staging/tape depth checks) is ADVISORY — it advises, never rewrites
+//! operator-owned files, and never touches the exit code. That contract is load-bearing
 //! (ADR-0004 and the #50/#92 "surface, do not delete" precedent); preserve
 //! it.
 //!
@@ -31,6 +35,7 @@ pub fn run(
     paths: &TapectlPaths,
     command: &ConfigCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<i32> {
     match command {
         ConfigCommands::Show => {
@@ -49,7 +54,7 @@ pub fn run(
         ConfigCommands::Set { .. } | ConfigCommands::Add { .. } | ConfigCommands::Remove { .. } => {
             // `main.rs` dispatches these to `run_edit` before the strict
             // load (#143); reaching here means a caller skipped that.
-            run_edit(paths, command, json_output, false)?;
+            run_edit(paths, command, json_output, dry_run)?;
             Ok(EXIT_SUCCESS)
         }
     }

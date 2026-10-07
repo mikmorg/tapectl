@@ -428,7 +428,8 @@ fn run(
         }
     ) {
         let conn = db::open(&paths.db_file).context("failed to open database")?;
-        let exit_code = cli::config::run(&conn, &paths, &ConfigCommands::Check, cli.json)?;
+        let exit_code =
+            cli::config::run(&conn, &paths, &ConfigCommands::Check, cli.json, cli.dry_run)?;
         exit_if_nonzero(exit_code);
         return Ok(());
     }
@@ -670,7 +671,7 @@ fn run(
         Commands::Config { ref command } => {
             // `Check`, `Set`, `Add` and `Remove` are intercepted above, before
             // the strict `Config::load` (#173, #143); only `Show` reaches here.
-            let exit_code = cli::config::run(&conn, &paths, command, cli.json)?;
+            let exit_code = cli::config::run(&conn, &paths, command, cli.json, cli.dry_run)?;
             exit_if_nonzero(exit_code);
         }
         Commands::Init { .. }
