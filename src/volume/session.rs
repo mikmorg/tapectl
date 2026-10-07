@@ -7484,8 +7484,7 @@ mod tests {
             let f = make_fixture();
             let volume_id = f.volume_id;
             let keys = f.keys.clone();
-            let (conn, _pending, _store, fake, seal, _dirs) =
-                sealed_on_a_fake_tape_keeping_dirs(f);
+            let (conn, _pending, _store, fake, seal, _dirs) = sealed_on_a_fake_tape_keeping_dirs(f);
             conn.execute(
                 "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
                 params![volume_id],

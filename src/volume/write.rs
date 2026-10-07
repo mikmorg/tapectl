@@ -6720,7 +6720,8 @@ mod tests {
             .ops()
             .into_iter()
             .filter_map(|op| match op {
-                Op::Read(p) => Some(p),
+                // File 0 and File 3 are bounded reads, `ReadHead` (#400).
+                Op::Read(p) | Op::ReadHead(p) => Some(p),
                 _ => None,
             })
             .collect();
@@ -14947,6 +14948,11 @@ mod tests {
             fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
                 self.inner.reposition_for_resume(file_index)
             }
+            // A fresh write's contact asks whether an unreadable File 0 is
+            // a blank tape (issue #400); the answer is the inner store's.
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.inner.blank_at_bot()
+            }
         }
 
         /// Issue #387 (ADR-0012, 2026-10-06 item 1): a write confirms with
@@ -15074,6 +15080,11 @@ mod tests {
             }
             fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
                 self.inner.reposition_for_resume(file_index)
+            }
+            // A fresh write's contact asks whether an unreadable File 0 is
+            // a blank tape (issue #400); the answer is the inner store's.
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.inner.blank_at_bot()
             }
         }
 
