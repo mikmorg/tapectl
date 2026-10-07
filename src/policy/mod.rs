@@ -14,6 +14,7 @@ pub mod lenient_config;
 pub mod reclaimable;
 pub mod shadowing;
 pub mod subsumed;
+pub mod tape_alerts;
 pub mod unknown_keys;
 
 /// Resolved policy for a unit after 3-level resolution:

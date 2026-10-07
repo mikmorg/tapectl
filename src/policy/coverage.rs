@@ -121,10 +121,13 @@ pub fn in_service(volume_alias: &str) -> String {
 ///
 /// This exists as its own function rather than as an argument to
 /// [`in_service`] so that nobody later "simplifies" the two into one and
-/// silently drops `initialized`. It has exactly one caller: `report
-/// capacity --per-volume`, whose whole job is to show the operator the
-/// state of each cartridge — including a blank tape standing ready. The
-/// aggregate totals deliberately do NOT use it: an initialized volume
+/// silently drops `initialized`. Its callers: `report capacity
+/// --per-volume`, whose whole job is to show the operator the state of each
+/// cartridge — including a blank tape standing ready; and the TapeAlert
+/// paths (`audit`'s `tape_alert`, `drive poll`'s "the catalog has L6-0001
+/// on it"), which must not drop the `initialized` volume an interrupted
+/// write left — the very tape `volume resume` will write to next (issue
+/// #308). The aggregate totals deliberately do NOT use it: an initialized volume
 /// contributes 0 bytes written, so folding it into the fleet-wide
 /// utilization percentage would dilute that number with media nothing has
 /// been asked to fill yet.

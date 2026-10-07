@@ -301,6 +301,14 @@ const CHECKS: &[Check] = &[
             run: check_no_full_verify,
         },
     },
+    Check {
+        // Issue #308 (ADR-0012, 2026-10-07 item 29): a raised TapeAlert
+        // on a live volume's cartridge (`policy::tape_alerts`).
+        name: "tape_alert",
+        scope: Scope::Archive {
+            run: check_tape_alert,
+        },
+    },
 ];
 
 /// Collect every audit finding for `unit_filter` (or all active units),
@@ -1496,6 +1504,25 @@ fn no_full_verify_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
             })
             .collect(),
     )
+}
+
+// TAPE ALERT (#308). One warning per live volume whose cartridge raised a
+// TapeAlert since its last passed full verify; the rules are in
+// `policy::tape_alerts`. A warning, never a violation (ADR-0004): the flags
+// may be the drive's ("clean me"), and the copy still counts.
+fn check_tape_alert(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: crate::policy::tape_alerts::on_live_volumes(ctx.conn)?
+            .into_iter()
+            .map(|v| AuditFinding {
+                unit: format!("volume:{}", v.label),
+                check: "tape_alert".into(),
+                message: v.message(),
+                action: format!("tapectl volume verify {}", v.label),
+            })
+            .collect(),
+    })
 }
 
 pub(crate) fn copy_count_for_unit(conn: &Connection, unit_id: i64) -> Result<i64> {
@@ -3815,6 +3842,149 @@ mod tests {
         );
     }
 
+    /// Issue #308 (ADR-0012, 2026-10-07 item 29): a raised TapeAlert on a
+    /// live volume — named directly by its health row, or through the
+    /// cartridge a contact (a `drive poll`'s) read — is a WARNING naming the
+    /// volume and the flags. Not for retired or quarantined media, not for
+    /// an alert a later passed full verify answered, not for a clean
+    /// reading; yes for the `initialized` volume an interrupted write left.
+    #[test]
+    fn audit_warns_of_a_raised_tape_alert_on_a_live_volume() {
+        let conn = crate::db::open_memory().unwrap();
+        let vol = |label: &str, status: &str, condition: &str| -> i64 {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, \
+                 capacity_bytes, status, observed_condition)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, ?2, ?3)",
+                params![label, status, condition],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let raised = "=== page 0x2e ===\nTape alert page (ssc-3) [0x2e]\n  Read warning: 0\n  \
+                      Write warning: 0\n  Hard error: 0\n  Media: 1\n";
+        let health = |volume_id: i64, alerts: i64, at: &str| {
+            conn.execute(
+                "INSERT INTO health_logs (volume_id, operation, tape_alerts, raw_log, logged_at)
+                 VALUES (?1, 'verify', ?2, ?3, ?4)",
+                params![volume_id, alerts, raised, at],
+            )
+            .unwrap();
+        };
+        let full_verify = |volume_id: i64, completed: &str| {
+            conn.execute(
+                "INSERT INTO verification_sessions (volume_id, verify_type, outcome, completed_at)
+                 VALUES (?1, 'full', 'passed', ?2)",
+                params![volume_id, completed],
+            )
+            .unwrap();
+        };
+        let live = vol("A-LIVE", "sealed", "ok");
+        health(live, 1, "2026-10-01 10:00:00");
+        let clean = vol("A-CLEAN", "sealed", "ok");
+        conn.execute(
+            "INSERT INTO health_logs (volume_id, operation, tape_alerts) VALUES (?1, 'verify', 0)",
+            params![clean],
+        )
+        .unwrap();
+        let retired = vol("A-RETIRED", "retired", "ok");
+        health(retired, 1, "2026-10-01 10:00:00");
+        let quarantined = vol("A-QUAR", "sealed", "quarantined");
+        health(quarantined, 1, "2026-10-01 10:00:00");
+        let init = vol("A-INIT", "initialized", "ok");
+        health(init, 1, "2026-10-01 10:00:00");
+        let answered = vol("A-ANSWERED", "sealed", "ok");
+        health(answered, 1, "2026-10-01 10:00:00");
+        full_verify(answered, "2026-10-02 10:00:00");
+        let after = vol("A-AFTER", "sealed", "ok");
+        full_verify(after, "2026-09-01 10:00:00");
+        health(after, 1, "2026-10-01 10:00:00");
+        // A drive poll's contact names the cartridge, never a volume.
+        let cart = vol("A-CART", "sealed", "ok");
+        conn.execute(
+            "INSERT INTO cartridges (barcode, media_type, serial_number, nominal_capacity)
+             VALUES ('CART08L6', 'LTO-6', 'SERIAL08', 2500000000000)",
+            [],
+        )
+        .unwrap();
+        let cartridge_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+            params![cartridge_id, cart],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cartridge_contacts (cartridge_id, operation, device)
+             VALUES (?1, 'drive poll', '/dev/nst0')",
+            params![cartridge_id],
+        )
+        .unwrap();
+        let contact = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO log_page_journal (captured_at, contact_id, device_sg, trigger, page_code,
+                                           ok, tool_argv, decoded, tapectl_version)
+             VALUES ('2026-10-05 06:30:00', ?1, '/dev/sg0', 'drive poll', 46, 1, '[]',
+                     'Tape alert page (ssc-3) [0x2e]\n  Read warning: 0\n  Write warning: 0\n  \
+                      Hard error: 0\n  Media: 0\n  Read failure: 1\n', 't')",
+            params![contact],
+        )
+        .unwrap();
+        // A drive-only poll (no cartridge): the drive's, not a copy's.
+        conn.execute(
+            "INSERT INTO cartridge_contacts (operation, device) VALUES ('drive poll', '/dev/nst0')",
+            [],
+        )
+        .unwrap();
+        let empty = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO log_page_journal (captured_at, contact_id, device_sg, trigger, page_code,
+                                           ok, tool_argv, decoded, tapectl_version)
+             VALUES ('2026-10-06 06:30:00', ?1, '/dev/sg0', 'drive poll', 46, 1, '[]',
+                     'Tape alert page (ssc-3) [0x2e]\n  Read warning: 1\n', 't')",
+            params![empty],
+        )
+        .unwrap();
+
+        let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+        assert!(
+            violations.iter().all(|f| f.check != "tape_alert"),
+            "a TapeAlert is a warning, never a violation: {violations:?}"
+        );
+        let found: Vec<(&str, &str)> = warnings
+            .iter()
+            .filter(|f| f.check == "tape_alert")
+            .map(|f| (f.unit.as_str(), f.action.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("volume:A-AFTER", "tapectl volume verify A-AFTER"),
+                ("volume:A-CART", "tapectl volume verify A-CART"),
+                ("volume:A-INIT", "tapectl volume verify A-INIT"),
+                ("volume:A-LIVE", "tapectl volume verify A-LIVE"),
+            ],
+            "{warnings:?}"
+        );
+        let cart_msg = &warnings
+            .iter()
+            .find(|f| f.check == "tape_alert" && f.unit == "volume:A-CART")
+            .unwrap()
+            .message;
+        assert!(
+            cart_msg.contains("5 Read failure")
+                && cart_msg.contains("drive poll")
+                && cart_msg.contains("CART08L6")
+                && cart_msg.contains("2026-10-05 06:30:00"),
+            "names the flag, the contact's command, the cartridge and when: {cart_msg}"
+        );
+        let live_msg = &warnings
+            .iter()
+            .find(|f| f.check == "tape_alert" && f.unit == "volume:A-LIVE")
+            .unwrap()
+            .message;
+        assert!(live_msg.contains("4 Media"), "{live_msg}");
+    }
+
     /// Issue #138 / C4 architecture review: `CHECKS` is now the scope table
     /// that used to be a comment above `collect_findings`. These tests pin
     /// the table's shape and the runner's use of it, independent of any
@@ -3822,7 +3992,7 @@ mod tests {
     mod checks_table {
         use super::*;
 
-        /// The 14 distinct `check` name literals this file's findings can
+        /// The 16 distinct `check` name literals this file's findings can
         /// carry (grep-verified against every `check: "..."` / `check ==
         /// "..."` in this file, non-test code). Every `CHECKS` row name
         /// must be one of these, and every one of these must be covered by
@@ -3843,6 +4013,7 @@ mod tests {
             "escrow_identity_mismatch",
             "read_error_trend",
             "no_full_verify",
+            "tape_alert",
         ];
 
         #[test]
@@ -3858,13 +4029,13 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 8 per-unit checks + 5 archive-wide checks. `policy_unresolvable`
+            // 8 per-unit checks + 6 archive-wide checks. `policy_unresolvable`
             // is not one of them (see below), and `escrow_kit_missing`/
             // `escrow_kit_stale` share one row.
             assert_eq!(
                 names.len(),
-                13,
-                "expected 8 per-unit + 5 archive-wide CHECKS rows, got: {names:?}"
+                14,
+                "expected 8 per-unit + 6 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {
