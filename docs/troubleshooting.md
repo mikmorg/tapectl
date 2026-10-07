@@ -688,32 +688,43 @@ version.
 
 The findings it can name, and what to do about each:
 
-- **A `modified_at` before 1677-09-21 or after 2262-04-11.** This one is not a
-  hand edit. Earlier releases recorded every file's modified time as text, so
-  a file stamped far off -- 1601-01-01, the zero time of an NTFS volume, or a
-  year past 2262 -- was recorded as it was. A year past 9999 was recorded with
-  a leading sign (`+10000-01-01T00:00:00+00:00`) and is named as not being in
-  the spelling below. A nanosecond count cannot hold any of them, and the walk
-  now records no modified time for such a file. Set the value to NULL
-  (`sqlite3 "$DB" "UPDATE files SET modified_at = NULL WHERE id = 4012"`):
-  the next `snapshot create` also records none for that file, so the unit
-  still reads as unchanged.
 - **A `modified_at` not in the spelling every tapectl release writes**
-  (`2026-09-01T12:00:00+00:00`), within that range.
+  (`2026-09-01T12:00:00+00:00`). One case of this is not a hand edit: earlier
+  releases recorded every file's modified time as text, so a file stamped past
+  year 9999 was recorded with a leading sign (`+10000-01-01T00:00:00+00:00`).
+  The walk now records no modified time for such a file; set the value to NULL
+  (`sqlite3 "$DB" "UPDATE files SET modified_at = NULL WHERE id = 4012"`) and
+  the next `snapshot create` also records none for it, so the unit still reads
+  as unchanged.
 - **A sha256 that is not 64 lowercase hex characters.**
 - **An `is_directory` and `file_type` that disagree**, or a `file_type` that
   is not `dir`, `regular`, `symlink` or `special`.
 - **A row whose snapshot no longer exists.** This is the one row to delete:
   it belongs to no version.
 
-Of the last four, tapectl wrote only one case: the signed year above, named
-under the second. Every other row they name was edited by hand.
-A sha256 or an in-range `modified_at` you cannot recover may be set to NULL: a
+Apart from the signed year, every row they name was edited by hand.
+A sha256 or a `modified_at` you cannot recover may be set to NULL: a
 version without a sha256 is baselined again by its next stage, and a file
-whose in-range modified time is NULL reads as changed to the next
+whose modified time is NULL reads as changed to the next
 `snapshot create`, which records a new version. A row with no `file_type` at
 all is not refused: it takes the type its `is_directory` gives, as migration
 005 did.
+
+A `modified_at` in that spelling but before 1677-09-21 or after 2262-04-11 --
+1601-01-01, the zero time of an NTFS volume, say -- is not refused: no
+nanosecond count holds it, so 030 records no modified time for that file,
+which is what the walk records for it today, and the unit still reads as
+unchanged. It says so once, on stderr, naming each row:
+
+```text
+WARN tapectl::db: migration 030 recorded no modified time for 1 file row(s) whose modified_at is outside
+1677-09-21..2262-04-11, the range a nanosecond count holds: files row 4012 (snapshot 31, path id 977, was
+1601-01-01T00:00:00+00:00). A walk records none for such a file either, so these units still read as unchanged;
+nothing else was altered
+```
+
+Nothing needs doing about it. The `files` row is gone once 030 applies; the
+path it named is `sqlite3 "$DB" "SELECT path FROM paths WHERE id = 977"`.
 
 Once 030 applies, the same command compacts the catalog once, as after 027.
 

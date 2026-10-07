@@ -531,7 +531,56 @@ fn migrate_to(conn: &mut Connection, target: Option<usize>) -> Result<()> {
         }
     });
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    result
+    result?;
+    warn_030_nulled_mtimes(conn)
+}
+
+/// ADR-0012 amendment 2026-10-07, item 9: migration 030 converts a
+/// `modified_at` no i64 count of nanoseconds holds (before 1677-09-21 or
+/// after 2262-04-11) to a NULL `mtime_ns` instead of refusing, and leaves the
+/// rows it did that to in the TEMP table `m030_mtime_nulled`. Read once the
+/// migration has committed -- a refusal rolls the table back with
+/// everything else, so a warning is never printed for a conversion that did
+/// not land -- named row by row in one WARN, and dropped. A no-op on every
+/// open that did not apply 030 (the table is TEMP: it exists only on the
+/// connection that ran the migration).
+fn warn_030_nulled_mtimes(conn: &Connection) -> Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_temp_master
+                         WHERE type = 'table' AND name = 'm030_mtime_nulled')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(());
+    }
+    let rows: Vec<String> = conn
+        .prepare(
+            "SELECT files_id, snapshot_id, path_id, modified_at
+               FROM temp.m030_mtime_nulled ORDER BY files_id",
+        )?
+        .query_map([], |r| {
+            Ok(format!(
+                "files row {} (snapshot {}, path id {}, was {})",
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    conn.execute_batch("DROP TABLE temp.m030_mtime_nulled")?;
+    if !rows.is_empty() {
+        warn!(
+            "migration 030 recorded no modified time for {} file row(s) whose modified_at is \
+             outside 1677-09-21..2262-04-11, the range a nanosecond count holds: {}. A walk \
+             records none for such a file either, so these units still read as unchanged; \
+             nothing else was altered",
+            rows.len(),
+            rows.join("; ")
+        );
+    }
+    Ok(())
 }
 
 /// Open the database WITHOUT running migrations — for `db fsck --repair`
@@ -4425,16 +4474,13 @@ mod tests {
                 "modified_at = '2026-09-01 12:00:01'",
                 "modified_at is not YYYY-MM-DDTHH:MM:SS+00:00",
             ),
-            // The walk's own spelling, but past what `mtime_ns` (an i64 of
-            // nanoseconds) can hold: converted, it would overflow to a REAL
-            // that no reader can take back as an integer.
+            // A year past 9999 is spelled with a sign: malformed text, still
+            // refused (ADR-0012 amendment 2026-10-07 item 9). An in-spelling
+            // value outside the nanosecond range is not refused: see
+            // `test_migration_030_writes_null_for_an_mtime_no_nanosecond_count_holds`.
             (
-                "modified_at = '2300-01-01T00:00:00+00:00'",
-                "modified_at is outside 1677-09-21..2262-04-11",
-            ),
-            (
-                "modified_at = '1600-01-01T00:00:00+00:00'",
-                "modified_at is outside 1677-09-21..2262-04-11",
+                "modified_at = '+10000-01-01T00:00:00+00:00'",
+                "modified_at is not YYYY-MM-DDTHH:MM:SS+00:00",
             ),
             ("file_type = 'fifo'", "is_directory/file_type"),
             ("file_type = 'dir'", "is_directory/file_type"),
@@ -4482,6 +4528,113 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, 8, "files intact");
         }
+    }
+
+    /// A `MakeWriter` over a shared buffer, so a test can read what a
+    /// `tracing` event printed.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        /// Run `f` with every `tracing` event at WARN and above written here.
+        fn capture<T>(&self, f: impl FnOnce() -> T) -> T {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, f)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// ADR-0012 amendment 2026-10-07, item 9: a `modified_at` in the walk's
+    /// own spelling but outside 1677-09-21..2262-04-11, which no i64 count
+    /// of nanoseconds holds, converts to a NULL `mtime_ns` -- what the walk
+    /// and the rebuild record for the same file -- and the migration warns,
+    /// naming the row, instead of refusing. Every other value converts as
+    /// before.
+    #[test]
+    fn test_migration_030_writes_null_for_an_mtime_no_nanosecond_count_holds() {
+        for far_off in ["2300-01-01T00:00:00+00:00", "1601-01-01T00:00:00+00:00"] {
+            let mut conn = open_memory_at_version(29);
+            seed_schema_29_files(&conn);
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM files WHERE snapshot_id = 20 AND path = 'docs/a.txt'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE files SET modified_at = ?1 WHERE id = ?2",
+                rusqlite::params![far_off, id],
+            )
+            .unwrap();
+
+            let log = CapturedLog::default();
+            log.capture(|| migrate(&mut conn))
+                .unwrap_or_else(|e| panic!("030 must convert {far_off}, got {e}"));
+            assert!(user_version(&conn) >= 30);
+
+            let mtime = |sid: i64, path: &str| -> Option<i64> {
+                conn.query_row(
+                    "SELECT fv.mtime_ns FROM file_versions fv JOIN paths p ON p.id = fv.path_id
+                     WHERE fv.snapshot_id = ?1 AND p.path = ?2",
+                    rusqlite::params![sid, path],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(mtime(20, "docs/a.txt"), None, "{far_off} becomes NULL");
+            // The positive control: the rows around it keep their mtimes.
+            assert_eq!(
+                mtime(20, "docs").map(files::mtime_ns_to_rfc3339),
+                Some(Some("2026-09-01T12:00:00+00:00".to_string()))
+            );
+            assert_eq!(
+                mtime(21, "docs/a.txt").map(files::mtime_ns_to_rfc3339),
+                Some(Some("2026-09-02T00:00:00+00:00".to_string()))
+            );
+
+            let text = log.text();
+            assert!(text.contains("WARN"), "{text}");
+            assert!(text.contains("migration 030"), "{text}");
+            assert!(text.contains(&format!("files row {id} ")), "{text}");
+            assert!(text.contains(far_off), "{text}");
+            assert!(text.contains("1677-09-21..2262-04-11"), "{text}");
+
+            // The bookkeeping that carried the warning does not outlive it.
+            let leftover: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE 'm030%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(leftover, 0);
+        }
+
+        // And a catalog with nothing to null migrates without a word.
+        let mut conn = open_memory_at_version(29);
+        seed_schema_29_files(&conn);
+        let log = CapturedLog::default();
+        log.capture(|| migrate(&mut conn)).unwrap();
+        assert!(!log.text().contains("migration 030"), "{}", log.text());
     }
 
     /// A `files` row whose snapshot is gone has no unit to intern its path

@@ -1446,8 +1446,8 @@ fn ensure_files(
     // dated before 1677-09-21 or after 2262-04-11, which no nanosecond count
     // holds, comes back as no mtime — what today's walk records for that
     // same file — rather than failing the rebuild of a tape that cannot be
-    // corrected. (Migration 030 refuses the same value in a catalog, which
-    // the operator can correct.)
+    // corrected. (Migration 030 does the same to that value in a catalog,
+    // with a warning naming the row: ADR-0012 amendment 2026-10-07 item 9.)
     //
     // Issue #381: the kind is derived from `is_directory`, as migration 005
     // did, because no generation of the on-tape `catalog.db` carries a file
