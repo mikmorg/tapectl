@@ -111,5 +111,19 @@ segment plus merges. Deleting the `paths_fts_data` row `PRAGMA optimize`
 leaves in `sqlite_stat1` made no difference to the one-statement insert
 (5.9–6.5 s either way).
 
+### 2026-10-07 — branch `schema2` (ADR-0012 amendment 2026-10-07 item 10), vm-desk1
+
+`perf_rebuild_from_a_tape_carrying_a_184k_file_version` (same knob, same
+default): the real write session puts one 184,552-row version on a
+`MemStore` tape, its `catalog.db` (22 MiB) inside the operator envelope, then
+`volume::rebuild::rebuild_from_store` rebuilds it into a fresh catalog with
+the operator key. Its one ceiling is 20 s on the whole rebuild at the default
+size, in the release build the suite runs in.
+
+| scenario                 | step                                   | debug   | release | notes |
+|--------------------------|----------------------------------------|---------|---------|-------|
+| rebuild (184,552)        | fixture: insert + `catalog.db` + write | 23.37 s | 10.98 s | reported, not bounded |
+| rebuild (184,552)        | `rebuild_from_store`, whole            | 17.40 s | 5.26 s  | ceiling 20 s; VM shared with other builds |
+
 When you add a new baseline row, keep the date and the short commit
 context so future regressions have something to diff against.

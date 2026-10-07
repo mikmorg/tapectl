@@ -437,3 +437,259 @@ fn perf_fresh_catalog_takes_a_184k_file_version() {
          superlinear insert is back"
     );
 }
+
+/// ADR-0012 amendment 2026-10-07, item 10 (#413): the whole of `catalog
+/// rebuild` over a tape whose `catalog.db` carries L6-0001's 184,552 file
+/// rows -- the DR path after `init`, end to end. The tape is the real write
+/// session's (build -> validate -> plan -> execute -> seal -> confirm) into a
+/// `MemStore`, so the rebuild decrypts a real operator envelope, opens the
+/// `catalog.db` inside it and streams every row into the shared insert path
+/// (`db::files::insert_version`) the test above times alone. One ceiling,
+/// on `rebuild_from_store` as a whole; the write that makes the tape is
+/// reported, not bounded.
+///
+/// Measured 2026-10-07 on vm-desk1 (see `docs/perf-baselines.md`):
+/// the rebuild took 17.4 s in a debug build and 5.3 s in release, the build
+/// this suite runs in. The ceiling is 20 s: about four times the release
+/// figure, clear of a shared VM's noise, and far under the row-by-row
+/// insert #413 removed (157.7 s for the insert alone).
+#[test]
+#[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
+fn perf_rebuild_from_a_tape_carrying_a_184k_file_version() {
+    use tapectl::crypto::keys::generate_keypair;
+    use tapectl::store::{MemStore, Tier};
+    use tapectl::tape::contact::{ContactSite, Medium, Operation};
+    use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
+    use tapectl::volume::layout_model::{KeyAvailability, SliceCheck};
+    use tapectl::volume::rebuild;
+    use tapectl::volume::session::{ConfirmOutcome, ExecuteOutcome};
+
+    if !perf_enabled() {
+        eprintln!("skip: TAPECTL_PERF_TESTS not set");
+        return;
+    }
+    let files: usize = std::env::var("TAPECTL_PERF_CATALOG_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(184_552);
+    const BS: u64 = 65536;
+    const LABEL: &str = "PERF-REBUILD";
+    const CEILING_SECS: u64 = 20;
+
+    let root = TempDir::new().unwrap();
+    let src = db::open(&root.path().join("src.db")).unwrap();
+    let operator = generate_keypair();
+    let tenant = generate_keypair();
+    let escrow = generate_keypair();
+    src.execute_batch(
+        "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 'operator', 1, 'active');
+         INSERT INTO tenants (id, name, is_operator, status) VALUES (2, 'alpha', 0, 'active');",
+    )
+    .unwrap();
+    for (tenant_id, kp) in [(1, &operator), (2, &tenant)] {
+        src.execute(
+            "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type,
+                                          is_active)
+             VALUES (?1, ?2, ?3, ?4, 'primary', 1)",
+            params![
+                tenant_id,
+                format!("k{tenant_id}"),
+                kp.fingerprint,
+                kp.public_key
+            ],
+        )
+        .unwrap();
+    }
+    let recipients = vec![
+        tenant.public_key.clone(),
+        operator.public_key.clone(),
+        escrow.public_key.clone(),
+    ];
+    src.execute(
+        "INSERT INTO units (id, uuid, name, tenant_id, current_path, status)
+         VALUES (1, 'perf-unit-uuid', 'photos/l6-0001', 2, '/src/photos', 'active')",
+        [],
+    )
+    .unwrap();
+    src.execute(
+        "INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count, total_size)
+         VALUES (1, 1, 1, 'staged', '/src/photos', ?1, ?2)",
+        params![files as i64, files as i64],
+    )
+    .unwrap();
+    src.execute(
+        "INSERT INTO stage_sets (id, snapshot_id, status, slice_size, key_fingerprints)
+         VALUES (1, 1, 'staged', 10485760, ?1)",
+        params![serde_json::to_string(&recipients).unwrap()],
+    )
+    .unwrap();
+    src.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                              status)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+        params![LABEL],
+    )
+    .unwrap();
+    let volume_id = src.last_insert_rowid();
+
+    let start = Instant::now();
+    let entries = (0..files).map(|i| {
+        Ok(db::files::FileEntry {
+            path: format!("{}/{}/IMG_{i:06}.jpg", i % 97, i % 13),
+            kind: db::files::FileKind::Regular,
+            size_bytes: i as i64,
+            mtime_ns: Some(1_700_000_000_000_000_000 + i as i64 * 1_000_000_000),
+            sha256: Some([(i % 251) as u8; 32]),
+            link_target: None,
+        })
+    });
+    let tx = db::busy::immediate_tx(&src).unwrap();
+    assert_eq!(db::files::insert_version(&tx, 1, entries).unwrap(), files);
+    tx.commit().unwrap();
+
+    let slice_dir = root.path().join("slices");
+    fs::create_dir_all(&slice_dir).unwrap();
+    let plaintext = b"perf rebuild payload".to_vec();
+    let encrypted = staging::encrypt_data(&plaintext, &recipients).unwrap();
+    let sha = |b: &[u8]| {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(b))
+    };
+    let slice_path = slice_dir.join("slice_1.age");
+    fs::write(&slice_path, &encrypted).unwrap();
+    src.execute(
+        "INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                   sha256_plain, sha256_encrypted, staging_path)
+         VALUES (1, 1, 1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            plaintext.len() as i64,
+            encrypted.len() as i64,
+            sha(&plaintext),
+            sha(&encrypted),
+            slice_path.to_string_lossy()
+        ],
+    )
+    .unwrap();
+    let units = vec![BuildUnit {
+        stage_set_id: 1,
+        snapshot_id: 1,
+        unit_name: "photos/l6-0001".to_string(),
+        unit_uuid: "perf-unit-uuid".to_string(),
+        tenant_id: 2,
+        dar_version: Some("2.7.20".to_string()),
+        dar_command: None,
+        catalog_path: None,
+        snapshot_version: 1,
+        slices: vec![BuildSlice {
+            slice_id: 1,
+            slice_number: 1,
+            size_bytes: plaintext.len() as i64,
+            encrypted_bytes: encrypted.len() as i64,
+            sha256_plain: sha(&plaintext),
+            sha256_encrypted: sha(&encrypted),
+            staging_path: slice_path,
+        }],
+    }];
+
+    let catalog_db = root.path().join("catalog.db");
+    db::catalog_snapshot::build_catalog_snapshot(&src, &[1], &catalog_db).unwrap();
+    let catalog_db_bytes = fs::metadata(&catalog_db).unwrap().len();
+
+    let inputs = BuildInputs {
+        label: LABEL.to_string(),
+        volume_uuid: "77777777-8888-9999-aaaa-bbbbbbbbbbbb".to_string(),
+        media_type: "LTO-6".to_string(),
+        tapectl_version: "perf".to_string(),
+        created_at: "2026-10-07T00:00:00Z".to_string(),
+        block_size: BS,
+        usable_bytes: 4 * 1024 * 1024 * 1024,
+        enospc_buffer: 1024 * 1024,
+        nominal_capacity: 2_500_000_000_000,
+        mam_capacity: 2_500_000_000_000,
+        mam_manufacturer: "TAPECTL-PERF".to_string(),
+        mam_serial: "PERFSERIAL".to_string(),
+        cartridge_identity_source: Some("mam".to_string()),
+        mam_length: 0,
+        mam_loads: 0,
+        units: units.clone(),
+        tenants: vec![TenantInfo {
+            tenant_id: 2,
+            tenant_name: "alpha".to_string(),
+            public_keys: vec![tenant.public_key.clone()],
+        }],
+        operator_public_keys: vec![operator.public_key.clone()],
+        escrow_public_key: Some(escrow.public_key.clone()),
+        catalog_db_path: Some(catalog_db),
+    };
+    let session_dir = root.path().join("session");
+    fs::create_dir_all(&session_dir).unwrap();
+    let built = build::build(&inputs, &session_dir).expect("build");
+    let keys = KeyAvailability {
+        tenant_ids: [2].into_iter().collect(),
+        tenants_with_active_key: [2].into_iter().collect(),
+        operator_key_present: true,
+        escrow_recipient_present: None,
+        stage_sets_lacking_escrow: None,
+    };
+    let mut store = MemStore::new(BS as usize);
+    let validated = built
+        .into_validated(&keys, SliceCheck::Size, &mut store)
+        .expect("validate");
+    let planned = validated.plan(&src, volume_id, &units).expect("plan");
+    let ready = match planned.execute(&src, &mut store).expect("execute") {
+        ExecuteOutcome::Ready(r) => r,
+        _ => panic!("the write must reach Ready"),
+    };
+    let sealed = ready.seal(&mut store).expect("seal");
+    assert!(matches!(
+        sealed
+            .confirm(&src, &mut store, Tier::Integrity)
+            .expect("confirm"),
+        ConfirmOutcome::Sealed(_)
+    ));
+    report(
+        "rebuild fixture: insert + catalog.db + write",
+        &format!("{files} rows, catalog.db {} MiB", catalog_db_bytes >> 20),
+        start.elapsed(),
+    );
+
+    // The disaster: a fresh catalog, the operator key, and the tape.
+    let dst = db::open(&root.path().join("rebuilt.db")).unwrap();
+    let identity: age::x25519::Identity = operator.secret_key.parse().unwrap();
+    let cfg = Config::default();
+    let site = ContactSite::new(
+        &cfg,
+        Operation::CatalogRebuild,
+        "memstore",
+        Medium::NoBackend,
+    );
+    let scratch = root.path().join("scratch");
+    fs::create_dir_all(&scratch).unwrap();
+
+    let start = Instant::now();
+    let rebuilt = rebuild::rebuild_from_store(
+        &dst,
+        &mut store,
+        &[identity],
+        Some(LABEL),
+        "recovered",
+        Some("lto0"),
+        &scratch,
+        "memstore",
+        site,
+    )
+    .expect("rebuild");
+    let elapsed = start.elapsed();
+    report("catalog rebuild", &format!("{files} rows"), elapsed);
+
+    assert_eq!(rebuilt.units, 1, "{rebuilt:?}");
+    let rows: i64 = dst
+        .query_row("SELECT COUNT(*) FROM file_versions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows as usize, files, "every file row came back");
+    assert!(
+        files > 184_552 || elapsed < Duration::from_secs(CEILING_SECS),
+        "catalog rebuild of a {files}-file version took {elapsed:?}, over the \
+         {CEILING_SECS} s ceiling (ADR-0012 amendment 2026-10-07 item 10)"
+    );
+}
