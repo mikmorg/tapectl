@@ -6,6 +6,7 @@ This document states them. It decides nothing new: every rule here is either
 code that already exists (cited) or a CTO ruling already recorded in ADR-0012
 (cited by amendment and item). If a statement here and the code disagree, the
 code is the bug report and this document the claim to test it against.
+ADR-0012 cites this document (amendment 2026-10-07, item 17).
 
 The normative byte format is `volume-format-v2.md`; the session state machine
 is `layout-session.md`. This document sits beside them and refers to both.

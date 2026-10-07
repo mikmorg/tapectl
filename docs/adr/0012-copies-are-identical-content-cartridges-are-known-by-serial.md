@@ -1212,3 +1212,72 @@ telemetry and cold-storage resilience" handoff.
     confirm of the Integrity tier (every slice's hash checked) completes, and for every completed
     write on a volume when a full `volume verify` passes. A quick confirm, the default after #387,
     leaves it unset.
+
+## Amendment, 2026-10-07 — rulings on the 2026-10-06 batches' questions
+
+*Ruled by the CTO on 2026-10-07* (all recommendations ratified). The batches that raised them
+landed on master in de732a7 and 21f93a3; the questions are in their issues.
+
+1. **A continued full readback is dated from its oldest checkpoint** (#410). A full confirm or
+   verify that continues an interrupted one records, as its `started_at`, the oldest
+   `checked_at` among the files it skipped, so freshness never overstates what was read when. A
+   continuation whose oldest checkpoint is older than the volume's resolved
+   `verify_interval_days` is refused as a continuation and reads everything again.
+2. **`collection run` releases staging after quick confirms**, so on that path no full readback
+   precedes the release. Accepted (item 1 of 2026-10-06); the operator guide says so and
+   recommends `--full-confirm` on one copy when the data matters.
+3. **The 97% fill ceiling replaces the 92% factor** (#391), loosening the gate by 5 points, as
+   intended: the 2026-09-24 fill (2.5020 TB on a fresh LTO-6) supports it.
+4. **home2 deletes `usable_capacity_factor`** from its config.toml when it installs 1.1.0, and
+   takes the 97% default.
+5. **Per-verify read-error figures are an events row** (`verify_read_errors`), not columns on
+   `verification_sessions`: ADR-0013 §3, a derived figure is not stored beside its facts.
+6. **The read-error rate assumes page 0x03 clears at load** (one HP LTO-6 capture). Accepted;
+   checked on home2's first two full verifies, and revisited if a drive keeps the counters.
+7. **A read-error trend has an absolute floor**: a cartridge is flagged as rising only when its
+   newest rate is also above 1 corrected error per GiB, so a first non-zero reading after zero
+   is not an alarm.
+8. **The oversized-unit refusal checks source size** (#395), before compression. It errs toward
+   refusing, and is accepted.
+9. **Migration 030 writes NULL for an mtime no i64 nanosecond count holds** (before 1677-09-21
+   or after 2262-04-11), with a warning naming the row ids, instead of refusing the migration:
+   NULL is what the walk and the rebuild record for the same file, and a refusal blocked every
+   command on the host. Malformed text is still refused.
+10. **#413's performance test stays on the shared insert path**; a full `rebuild_from_store`
+    scenario over a 184k-file MemStore is added beside it, with one ceiling on the whole run.
+11. **#409 stays open as "not until spanning"**: under `dar -c -` (item 4 of 2026-10-06) a failed
+    stage starts over. tapectl does not forge dar's internal names, and does not keep slices
+    after a failed catalogue re-isolation.
+12. **`[staging] hash_threads` defaults to 1** until home2's measurements at 1/2/4/8 are in.
+13. **Session logs and stage reports are never pruned by tapectl**: they are evidence. The
+    operator guide states how fast they grow.
+14. **Stage keeps its own tree walk** even when snapshot and stage run in one process: the
+    stage-time new-file check (design §2.13) is not skipped.
+15. **Named required locations take the tape-only multiplier too** (`snapshot
+    mark-reclaimable`), as the distinct-location count does.
+16. **Volume status `full` is dropped** by the next migration: nothing writes it.
+17. **The threat model is `docs/design/threat-model.md`** (#394), cited from here: it decides
+    nothing new and restates the rules ADR-0012 and the code already hold — the adversary is
+    loss, decay and inheritance, not a party with custody of a cartridge; the device boundaries;
+    power loss; and how the format grows (item 15 of 2026-10-06). Where it and the code disagree,
+    the code is the bug.
+18. **home2.profile sets `OPS_GROUP=tapectl-ops`** (#393).
+19. **`audit` exits 70 (sysexits' `EX_SOFTWARE`) when it errors**, so 2 only ever means
+    violations, as #356 did for `volume verify` (#408).
+20. **The write family shares one exit table** (#408): `volume write`, `volume resume`,
+    `collection run`, `quick-archive` and the `volume compact*` writes exit
+    0 sealed and confirmed · 2 an error with the medium untouched (refused before the tape moved,
+    or a usage error) · 3 confirm inconclusive (as `volume verify`) · 4 interrupted, resumable
+    with `volume resume` · 5 aborted, the session cannot resume · 6 the medium proven bad and
+    quarantined · 75 the catalog busy. `collection run` reports the worst outcome among its
+    copies.
+21. **`report health --json` is an object** `{readings, read_error_trends,
+    read_error_rise_factor}`, no longer a bare array. Accepted; nothing in the repo read it.
+22. **The 2026-10-06 batches ship in 1.1.0**, still untagged.
+23. **Resume continues from min(catalog cursor, files on the medium)** (#403), recorded in
+    `layout-session.md`.
+
+Also ruled: the chip's and the drive's wear figures stay in the journal (ADR-0013) and are not
+copied into columns on `cartridges` (#299). And **a migration file is named for its position**
+in `db::migrations()` — a test refuses one that is not — so two batches that each take "the next
+number" are caught before either lands.

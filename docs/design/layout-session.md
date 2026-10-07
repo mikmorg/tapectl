@@ -210,7 +210,10 @@ Rules that hold in every path:
   byte-identical from the frozen staging files; if **≥1 slice** is written,
   reposition to `front_zone_len + written_slices` (both terms exact: the front
   zone length is fixed by the Layout, the slice count by the cursor rows) and
-  continue. **The absent seal marker does NOT confirm the tape is unsealed**
+  continue. **The medium bounds the cursor** (#403, ADR-0012 2026-10-07 item
+  23): the catalog can record a slice `written` that never reached the tape
+  (power lost after the row, before the drive flushed), so resume continues
+  from **min(catalog cursor, files on the medium)** and rewrites from there. **The absent seal marker does NOT confirm the tape is unsealed**
   — corrected 2026-09-21 (issue #277, ADR-0012's "the seal is RECORDED, not
   inferred"). `seal_marker_parses_at` returns false both when a position
   holds no marker and when the read *errors*, and `MismatchKind::SealUnreadable`
