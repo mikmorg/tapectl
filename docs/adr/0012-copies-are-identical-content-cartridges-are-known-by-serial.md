@@ -1313,6 +1313,29 @@ landed on master in de732a7 and 21f93a3; the questions are in their issues.
     allows `/dev/sg*` and nothing else and runs daily; its wrapper pings the health check as the
     audit's does, and a raised TapeAlert or a drive-reported unrecovered error is a `/fail`. A
     read-to-clear page (0x2E) read by a poll is not lost: the journal holds it.
+30. **Freshness of a full readback is judged by its start** (item 1's reason carried through):
+    `audit`'s `verify_age`, the ADR-0004 Tier-1 evidence (`policy::evidence`), `report
+    verify-status` and `volume list` read a full readback's `started_at`, which a continued
+    readback dates from its oldest checkpoint, so no display or verdict overstates what was read
+    when.
+31. **`collection run --full-confirm-first`** reads back the first copy of a run in full and
+    confirms the others quickly, the one-copy readback item 2 recommends; `--full-confirm` still
+    reads every copy.
+32. **The write family's exit table, as built (#408), is ratified**: a signal before the tape
+    moves exits 2 (nothing was written); `collection run` keeps exit 1 for a unit refused for its
+    dotfile (#285); a busy catalog after a session has begun exits by the table (4, or 3 during
+    the confirm), 75 only when nothing was written; `audit`'s usage errors exit 70.
+33. **A failure after a copy is sealed and confirmed does not exit 2**: the copy stands, so the
+    command exits 0 with a warning naming the step that did not finish (`volume compact`'s
+    retirement of the source, releasing staging, recording what followed) and the command that
+    finishes it on its own.
+34. **Named required locations take the tape-only multiplier everywhere** (item 15 made
+    consistent): `audit`, `unit mark-tape-only`, `snapshot mark-reclaimable` and `report
+    supersedable` share one predicate in `policy::coverage`.
+35. **The never-written cartridge columns are dropped** (`total_bytes_written`,
+    `total_bytes_read`, `error_history`), by the next migration, as 026 and 032 did for dead
+    states. The age gate of item 1 counts every write on the volume, aborted ones included, when
+    it resolves `verify_interval_days`: it errs strict, and is accepted.
 
 Also ruled: the chip's and the drive's wear figures stay in the journal (ADR-0013) and are not
 copied into columns on `cartridges` (#299). And **a migration file is named for its position**
