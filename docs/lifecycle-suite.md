@@ -75,8 +75,10 @@ the journal of everything done).
 ## The restore matrix
 
 Run at the end of most scenarios as `restore_matrix LABEL UNIT TENANT
-SRC_DIR TAG [OTHER_TENANT]`, producing 10 checks named `TAG.<method>`:
-`unit` and `file` (via `tapectl restore`), `restore_sh_dd` (dd the script off
+SRC_DIR TAG [OTHER_TENANT]`, producing 11 checks named `TAG.<method>`:
+`unit` and `file` (via `tapectl restore`), `volume` (`tapectl restore volume
+--unit UNIT`, the one-pass disaster-recovery path, restoring into
+`DIR/<unit name>`), `restore_sh_dd` (dd the script off
 tape, `--info`/`--verify`), `restore_sh_primary`/`restore_sh_backup` (both of
 the tenant's keys), `operator_envelope` (a normal restore path — see
 `envelope_positions()` in `src/volume/layout.rs`), `escrow` (the printed-once escrow secret),

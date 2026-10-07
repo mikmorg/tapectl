@@ -593,7 +593,9 @@ than open to whatever group they already have. `config check` (as the service us
 the group, the memberships and the modes are as they should be;
 [configuration.md](configuration.md#ops) has the details. `scripts/first-run.sh`
 does all of it in step 7 when the host profile sets `OPS_GROUP` — on an existing
-install, `scripts/first-run.sh --profile <profile> --from 7 --to 7`.
+install, `scripts/first-run.sh --profile <profile> --from 7 --to 7`, once the
+installed tapectl is 1.1.0 or later (`tapectl --version`): an older one refuses
+`[ops]` as an unknown key, and step 7 would leave it in `config.toml`.
 
 ### Register units
 
@@ -671,9 +673,10 @@ staging, never the plaintext archive: dar writes its archive to standard
 output, and tapectl cuts and encrypts it in memory. At its peak staging holds
 the unit's slices, about the unit's size. The source is read once: each file
 is hashed within 1 GiB of dar reading it, so the second read comes from the
-page cache. `[staging] hash_threads` files are hashed at once (4 by default,
+page cache. `[staging] hash_threads` files are hashed at once (1 by default,
 never more than the cores) when they fit in that 1 GiB, as many small files do;
-on a single spinning disk, fewer may read faster.
+more threads can speed a unit of many small files, and on a single spinning
+disk they may instead read slower.
 
 **Several units at once.** `stage create` takes several unit names, and
 `--jobs N` (or `[staging] jobs` in `config.toml`) stages N of them at a time,
@@ -2070,8 +2073,9 @@ no compaction candidates (threshold: live data below 50% of the archive data on 
 `snapshot mark-reclaimable` releases an older version once a newer current
 version supersedes it, and first checks that the superseding version is
 covered on its own: `min_copies` copies, and a copy at each of its
-`required_locations` by name (for a tape-only unit, both floors multiplied by
-`[compaction] tape_only_safety_multiplier`). A shortfall goes through the same
+`required_locations` by name (for a tape-only unit, every floor multiplied by
+`[compaction] tape_only_safety_multiplier`: the copies, the number of places,
+and the copies at each named location — two at `offsite` at 2x). A shortfall goes through the same
 Tier-2 consent as `mark-tape-only`: a terminal asks, `--force` or `--yes`
 confirms in advance, and a session with no terminal and neither flag refuses,
 naming it (for example

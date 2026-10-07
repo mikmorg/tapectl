@@ -138,8 +138,9 @@ fn superseding_verdict(
     let mut required_copies = resolved.min_copies;
     // The count floor the named locations imply: one distinct place per
     // distinct name (a name listed twice is one place). The names
-    // themselves are checked below; this count is what the tape-only
-    // multiplier scales.
+    // themselves are checked below; the tape-only multiplier scales this
+    // count, and the copies each name must hold (ADR-0012, 2026-10-07,
+    // item 15).
     let mut required_locations = {
         let mut distinct: Vec<&String> = resolved.required_locations.iter().collect();
         distinct.sort();
@@ -218,6 +219,38 @@ fn superseding_verdict(
                 resolved.required_locations.join(", "),
             ),
         });
+    }
+
+    // ADR-0012, 2026-10-07 amendment, item 15: for a tape-only unit each
+    // named location must hold `multiplier` copies of the superseding
+    // version, as the distinct-location count below is multiplied. One copy
+    // at `offsite` meets `["offsite"]` for an active unit, not at 2x.
+    if let Some(m) = tape_only_multiplier {
+        let short = super::coverage::short_required_locations_for_snapshot(
+            conn,
+            superseding.0,
+            &resolved.required_locations,
+            m,
+        )?;
+        if !short.is_empty() {
+            let held = short
+                .iter()
+                .map(|(name, copies)| {
+                    let noun = if *copies == 1 { "copy" } else { "copies" };
+                    format!("{copies} {noun} at required location {name}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let each = if short.len() == 1 { "" } else { " at each" };
+            return Ok(ReclaimVerdict::Blocked {
+                superseding_version: Some(superseding.1),
+                freeable_bytes: freeable,
+                reason: format!(
+                    "superseding v{} has {held}, needs {m}{each} (tape-only {m}x)",
+                    superseding.1,
+                ),
+            });
+        }
     }
 
     // With every name met, the distinct-location count is at least the
@@ -870,6 +903,103 @@ pub(crate) mod tests {
                 );
             }
             other => panic!("home + garage must not satisfy [home, offsite]: {other:?}"),
+        }
+    }
+
+    /// ADR-0012, 2026-10-07 amendment, item 15: for a tape-only unit the
+    /// multiplier applies to each NAMED required location too, as it does to
+    /// the distinct-location count. `["offsite"]` at 2x asks for two copies of
+    /// the superseding version at `offsite`. Here it has one there and one at
+    /// `home`: two copies (min_copies 1, x2), two places (one name, x2), and
+    /// `offsite` present — every check but this one is met.
+    #[test]
+    fn tape_only_multiplies_the_copies_each_named_location_must_hold() {
+        let (conn, _unit) = setup("sup-named-tape", 2, "sealed", "tape_only");
+        let unit = place_and_require(&conn, "sup-named-tape", "offsite", "home", r#"["offsite"]"#);
+        let mut config = Config::default();
+        config.defaults.min_copies = 1;
+        match assess(&conn, &config, &unit, 1).unwrap() {
+            ReclaimVerdict::Blocked {
+                superseding_version,
+                reason,
+                ..
+            } => {
+                assert_eq!(superseding_version, Some(2));
+                assert!(
+                    reason.contains(
+                        "superseding v2 has 1 copy at required location offsite, needs 2 \
+                         (tape-only 2x)"
+                    ),
+                    "{reason}"
+                );
+            }
+            other => panic!("one copy at offsite must not meet [offsite] at 2x: {other:?}"),
+        }
+
+        // The configured multiplier, not a literal 2 (#215's lesson).
+        config.compaction.tape_only_safety_multiplier = 3;
+        config.defaults.min_copies = 0;
+        match assess(&conn, &config, &unit, 1).unwrap() {
+            ReclaimVerdict::Blocked { reason, .. } => assert!(
+                reason.contains("has 1 copy at required location offsite, needs 3 (tape-only 3x)"),
+                "{reason}"
+            ),
+            other => panic!("expected Blocked at 3x: {other:?}"),
+        }
+    }
+
+    /// The positive half of item 15: two copies of the superseding version at
+    /// `offsite` and a third at `home` meet `["offsite"]` at 2x — the per-name
+    /// count is a count of copies there, tape and warehouse alike.
+    #[test]
+    fn tape_only_named_location_is_met_by_multiplied_copies_there() {
+        let (conn, _unit) = setup("sup-named-tape-ok", 2, "sealed", "tape_only");
+        let unit = place_and_require(
+            &conn,
+            "sup-named-tape-ok",
+            "offsite",
+            "offsite",
+            r#"["offsite"]"#,
+        );
+        // A warehouse deposit of one of the offsite tapes, at `home`: the
+        // second distinct place the 2x count needs, and not a copy at
+        // `offsite`.
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('home', 'shelf')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volume_deposits (volume_id, location_id)
+             SELECT v.id, l.id FROM volumes v, locations l
+             WHERE v.label = 'sup-named-tape-ok-SEALED' AND l.name = 'home'",
+            [],
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.defaults.min_copies = 1;
+        assert_eq!(
+            assess(&conn, &config, &unit, 1).unwrap(),
+            ReclaimVerdict::Releasable {
+                superseding_version: 2,
+                freeable_bytes: 1000,
+            }
+        );
+
+        // The same shape with the deposit AT offsite instead of home is two
+        // tapes and a deposit there: three copies at offsite, but one place.
+        // The distinct-location count still binds (needs 2).
+        conn.execute(
+            "UPDATE volume_deposits SET location_id = (SELECT id FROM locations WHERE name = 'offsite')",
+            [],
+        )
+        .unwrap();
+        match assess(&conn, &config, &unit, 1).unwrap() {
+            ReclaimVerdict::Blocked { reason, .. } => assert!(
+                reason.contains("in 1 locations, needs 2 (tape-only 2x)"),
+                "{reason}"
+            ),
+            other => panic!("one place must not meet the 2x location count: {other:?}"),
         }
     }
 

@@ -1260,7 +1260,9 @@ impl Config {
     /// `tape_only_safety_multiplier` MULTIPLIES the base copy/location
     /// requirement for a `tape_only` unit in
     /// `policy::reclaimable::assess` (`required_copies *= multiplier`,
-    /// `required_locations *= multiplier`) — it never replaces it. `0`
+    /// `required_locations *= multiplier`, and each named required location
+    /// must hold `multiplier` copies — ADR-0012, 2026-10-07, item 15) — it
+    /// never replaces it. `0`
     /// zeroes both requirements outright (the subsequent `copy_count <
     /// required_copies` and `required_locations > 0 && ...` guards both go
     /// vacuous), and a negative value is worse: `required_copies` goes
@@ -3500,6 +3502,20 @@ mod tests {
             Config::load(&path).unwrap().staging.hash_threads,
             crate::staging::validate::DEFAULT_HASH_THREADS
         );
+    }
+
+    /// ADR-0012, 2026-10-07 amendment, item 12: `[staging] hash_threads`
+    /// defaults to 1 (the one-file-at-a-time pass) until home2's
+    /// measurements at 1/2/4/8 are in. A literal, not the constant: a test
+    /// comparing the default to `DEFAULT_HASH_THREADS` passes at any value.
+    #[test]
+    fn hash_threads_defaults_to_one() {
+        assert_eq!(crate::staging::validate::DEFAULT_HASH_THREADS, 1);
+        assert_eq!(StagingConfig::default().hash_threads, 1);
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[staging]\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().staging.hash_threads, 1);
     }
 
     #[test]

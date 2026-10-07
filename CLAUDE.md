@@ -195,7 +195,7 @@ LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was u
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
 open hardware questions are answered there — block size 512 K vs 1 M is a wash, MAM
 over-report is +2 MiB. `scripts/lifecycle-suite.sh` (16 scenarios, `--list` names
-them, x a 10-method restore matrix) is the permutation suite built from it.
+them, x an 11-method restore matrix) is the permutation suite built from it.
 
 ## Build Commands
 

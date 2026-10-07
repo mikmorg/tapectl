@@ -522,9 +522,11 @@ that is irreversible in practice, the command is gated:
 
 Tape-only units stay in every audit check except `dirty`, since their disk copy
 may be gone. Releasing an old version of a tape-only unit with
-`snapshot mark-reclaimable` is held to a stricter bar: the copy requirement and
-the number of required locations are both multiplied by
-`[compaction] tape_only_safety_multiplier` (default 2).
+`snapshot mark-reclaimable` is held to a stricter bar: the copy requirement, the
+number of required locations, and the copies each named required location must
+hold are all multiplied by `[compaction] tape_only_safety_multiplier` (default
+2). At 2x, `required_locations = ["offsite"]` asks for two copies of the newer
+version at `offsite`, and copies in two places.
 
 ## Policy: archive sets and audit
 
