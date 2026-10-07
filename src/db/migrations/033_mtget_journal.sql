@@ -22,16 +22,22 @@
 -- the tape device reads it on its own descriptor: once when it opens
 -- (`point = 'open'`), after a tape command fails (`'failure'`, naming the
 -- command and its errno), and when it closes (`'close'`). MTIOCGET is an
--- ioctl to the st driver, not a SCSI command to the drive: it moves no tape
--- and reads no log page, so it cannot disturb a read-to-clear counter.
+-- ioctl answered by the st driver, not a log-page read: it cannot disturb a
+-- read-to-clear counter. (st flushes any pending write-behind first, as it
+-- does for the position reads tapectl already made.)
 --
 -- THE CONTACT ROW IS THE SPINE
 -- ----------------------------
 -- `contact_id` names the contact the device was open under (ADR-0013 §2),
 -- NULL when that contact's own INSERT failed. Readings are held in memory
 -- by the thread that holds the contact and written when the contact
--- closes; a device closed after its contact has none to name and its close
--- reading is not kept.
+-- closes; a reading taken while no contact is open on the thread is not
+-- kept. That bounds what lands today: the write paths open their store
+-- inside the contact, so their `open` reading is kept; the read paths
+-- (verify, restore, rebuild) open the store BEFORE the contact and drop it
+-- after, so for them only `failure` readings land. Every row that lands
+-- names the right contact; widening the window is a change to the call
+-- sites, not to this table.
 --
 -- VERBATIM, THEN DECODED BESIDE IT
 -- --------------------------------

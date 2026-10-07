@@ -19,12 +19,20 @@
 //! therefore noted on the thread that holds the contact (the write path
 //! calls the store on its own thread, `pipeline::write_verified`) and
 //! written when the contact closes: [`begin`] at the contact's open,
-//! [`note`] from the device, [`finish`] at the close. A device noted with no
-//! contact open on its thread is not kept.
+//! [`note`] from the device, [`take`]/[`record`] at the close. A reading
+//! noted with no contact open on its thread is not kept.
 //!
-//! `MTIOCGET` is an ioctl answered by the st driver from its own state: it
-//! sends no SCSI command, moves no tape and reads no log page, so it cannot
-//! disturb a read-to-clear counter (ADR-0013's hazard).
+//! **What that keeps today.** The write paths open their store inside the
+//! contact, so their `open` reading lands; the read paths (verify, restore,
+//! rebuild) open the store before the contact and drop it after, so for
+//! them only `failure` readings land, and no path keeps a `close` reading
+//! while the store outlives the guard. Every row that lands names the right
+//! contact; capturing more is a change to those call sites.
+//!
+//! `MTIOCGET` is an ioctl answered by the st driver, not a log-page read, so
+//! it cannot disturb a read-to-clear counter (ADR-0013's hazard). st flushes
+//! any pending write-behind first, as it does for the position reads
+//! tapectl already made.
 
 use std::cell::RefCell;
 

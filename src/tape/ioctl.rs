@@ -121,8 +121,8 @@ impl Drop for TapeDevice {
 }
 
 impl TapeDevice {
-    /// The st driver's whole `MTIOCGET` status (issue #344). An ioctl the
-    /// driver answers from its own state: no SCSI command, no tape motion.
+    /// The st driver's whole `MTIOCGET` status (issue #344): an ioctl answered by the st
+    /// driver, not a log-page read (st flushes pending write-behind first).
     pub fn status(&self) -> std::result::Result<crate::tape::mtget_journal::MtStatus, String> {
         let mut m = MtGet::default();
         let rc = unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCGET, &mut m as *mut MtGet) };
