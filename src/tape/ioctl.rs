@@ -50,7 +50,16 @@ pub(crate) struct MtGet {
 pub struct TapePosition {
     pub file_number: i32,
     pub block_number: i32,
+    /// `GMT_EOD` in `mt_gstat`: the st driver last met END OF DATA — a
+    /// space or read that ran into BLANK CHECK (`st.c`: `eof = ST_EOD`).
+    /// After a failed forward space it says the space stopped at the end of
+    /// what is recorded, rather than on a medium or transport error (issues
+    /// #400, #403).
+    pub at_eod: bool,
 }
+
+/// `GMT_EOD(x)` from `<linux/mtio.h>`: `(x) & 0x08000000`.
+const GMT_EOD: i64 = 0x0800_0000;
 
 /// How a read of one tape file ended: what `TapeStore`'s file cursor needs to
 /// know about where the read left the head (issue #389).
@@ -66,6 +75,17 @@ pub enum ReadEnd {
     /// The read stopped before the filemark because its byte budget ran out
     /// ([`TapeDevice::read_file_head`]): the head is inside the file.
     Stopped,
+}
+
+/// A tape write error: ENOSPC — the drive's early-warning point, a full
+/// medium — is [`TapectlError::MediumFull`], the one store failure a write
+/// session aborts on; anything else is [`TapectlError::TapeIo`] (issue #408).
+fn write_error(what: &str, e: &io::Error) -> TapectlError {
+    if e.raw_os_error() == Some(28) {
+        TapectlError::MediumFull(format!("{what}: {e}"))
+    } else {
+        TapectlError::TapeIo(format!("{what}: {e}"))
+    }
 }
 
 /// What an `MTIOCTOP` op does, for the session log's wait lines.
@@ -194,6 +214,7 @@ impl TapeDevice {
         Ok(TapePosition {
             file_number: mtget.mt_fileno,
             block_number: mtget.mt_blkno,
+            at_eod: mtget.mt_gstat & GMT_EOD != 0,
         })
     }
 
@@ -215,11 +236,13 @@ impl TapeDevice {
             let want = remaining.min(bs as u64) as usize;
             let mut got = 0usize;
             while got < want {
+                // Issue #408: the SOURCE failing is the disk's problem, not
+                // the tape's, and is named so.
                 let n = src
                     .read(&mut buf[got..want])
-                    .map_err(|e| TapectlError::TapeIo(format!("read source: {e}")))?;
+                    .map_err(|e| TapectlError::SourceIo(format!("read source: {e}")))?;
                 if n == 0 {
-                    return Err(TapectlError::TapeIo(format!(
+                    return Err(TapectlError::SourceIo(format!(
                         "source exhausted after {got} of {want} bytes wanted \
                          (declared length {len}, {remaining} remaining)"
                     )));
@@ -234,16 +257,26 @@ impl TapeDevice {
             let started = std::time::Instant::now();
             self.file
                 .write_all(&buf[..bs])
-                .map_err(|e| TapectlError::TapeIo(format!("write: {e}")))?;
+                .map_err(|e| write_error("write", &e))?;
             crate::progress::note_if_slow("one tape block write", started.elapsed());
             committed += bs as u64;
             remaining -= want as u64;
         }
 
-        if sync {
-            self.write_filemark_sync()?;
+        let marked = if sync {
+            self.write_filemark_sync()
         } else {
-            self.write_filemark_immediate()?;
+            self.write_filemark_immediate()
+        };
+        // A filemark refused at the early-warning point is a full medium
+        // too (issue #408).
+        if let Err(e) = marked {
+            let full = matches!(&e, TapectlError::TapeIo(m) if m.contains("(os error 28)"));
+            return Err(if full {
+                TapectlError::MediumFull(e.to_string())
+            } else {
+                e
+            });
         }
         Ok(committed)
     }
@@ -388,6 +421,17 @@ mod density_tests {
     fn density_from_dsreg_negative_register_still_extracts_top_byte() {
         // mt_dsreg is signed (i64); a real register value can set high bits.
         assert_eq!(density_from_dsreg(-1i64), Some(0xff));
+    }
+
+    /// Issue #408: ENOSPC on a tape write is a full medium, the one store
+    /// failure a write session aborts on; any other errno is a tape I/O
+    /// error, which leaves the session resumable.
+    #[test]
+    fn a_write_enospc_is_a_full_medium_and_anything_else_a_tape_error() {
+        let full = write_error("write", &io::Error::from_raw_os_error(28));
+        assert!(matches!(full, TapectlError::MediumFull(_)), "{full:?}");
+        let eio = write_error("write", &io::Error::from_raw_os_error(5));
+        assert!(matches!(eio, TapectlError::TapeIo(_)), "{eio:?}");
     }
 
     #[test]

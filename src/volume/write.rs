@@ -493,7 +493,17 @@ fn volume_init_in_contact<'c>(
         ContactStore::Injected(s) => s,
     };
 
-    check_fresh_write_contact(store, label, &candidate_uuid, None, force)?;
+    // Issue #400: what the catalog says is on this cartridge, for the one
+    // outcome it decides — an unreadable File 0.
+    let live_on_cartridge = binding::live_volumes_on_serial(conn, serial)?;
+    check_fresh_write_contact_on(
+        store,
+        label,
+        &candidate_uuid,
+        None,
+        force,
+        &live_on_cartridge,
+    )?;
     // The check above read File 0 (and possibly moved the physical head on
     // real tape); undo that before the real write, which must start at BOT
     // exactly like an untouched fresh session would (`reposition_for_resume`'s
@@ -1662,12 +1672,16 @@ fn volume_write_in_contact<'c>(
         .iter()
         .find(|e| matches!(e.kind, ZoneKind::SealMarker))
         .map(|e| e.position as u32);
-    check_fresh_write_contact(
+    // Issue #400: the live volumes on this cartridge other than the one
+    // being written (an `initialized` volume is never live).
+    let live_on_cartridge = binding::live_volumes_on_serial(conn, det.mam.serial.as_deref())?;
+    check_fresh_write_contact_on(
         store,
         label,
         &layout_snapshot.volume_uuid,
         seal_position,
         force,
+        &live_on_cartridge,
     )?;
     // Undo the position change the read-based check above made (TapeStore's
     // read_file leaves the head after the file it read) — the write below
@@ -2721,7 +2735,7 @@ fn finish_session(
             // ADR-0012's 2026-09-21 correction "the seal is RECORDED, not
             // inferred" (issue #277, migration 018): the moment `seal()`
             // returns `Ok`, that fact must become durable state, because
-            // `seal_marker_parses_at`'s read-error/no-marker conflation
+            // `ContactFacts::probe_seal`'s read-error/no-marker conflation
             // (correct and deliberate for a fresh write to a blank tape)
             // cannot be un-inferred later on resume -- an unreadable seal
             // position is exactly what an `Inconclusive` confirm leaves
@@ -2811,7 +2825,7 @@ fn finish_session(
             confirm_tier,
         ),
         ResumeOutcome::Quarantined(q) => Err(quarantine_error(label, &q.reason)),
-        ResumeOutcome::Interrupted(_) => {
+        ResumeOutcome::Interrupted(i) => {
             events::log_event(
                 conn,
                 "volume",
@@ -2821,15 +2835,27 @@ fn finish_session(
                 None,
                 None,
                 None,
-                None,
+                i.reason(),
                 None,
             )?;
-            Err(TapectlError::Interrupted(format!(
-                "volume \"{label}\" write interrupted — the tape is left unsealed, and \
-                 the session's `writes`/`write_positions` rows are in the `interrupted` state. \
-                 Reload the same cartridge and run `tapectl volume resume {label}` to continue \
-                 from where it stopped."
-            )))
+            // Issue #408: a staged-file read error or a drive error other
+            // than a full medium stops the write resumably, and says which.
+            Err(match i.reason() {
+                None => TapectlError::Interrupted(format!(
+                    "volume \"{label}\" write interrupted — the tape is left unsealed, and \
+                     the session's `writes`/`write_positions` rows are in the `interrupted` state. \
+                     Reload the same cartridge and run `tapectl volume resume {label}` to continue \
+                     from where it stopped."
+                )),
+                Some(reason) => TapectlError::Other(format!(
+                    "volume \"{label}\" write interrupted: {reason}. The tape is left unsealed and \
+                     the session is `interrupted`, not aborted: the files before this one are \
+                     whole, and resume writes this one again from its start. Fix the cause — a \
+                     staged source error is the staging disk, a tape I/O error the drive or the \
+                     cartridge (clean the drive, reseat it) — then, with the same cartridge \
+                     loaded, run `tapectl volume resume {label}`."
+                )),
+            })
         }
         ResumeOutcome::Aborted(a) => {
             events::log_event(
@@ -3741,14 +3767,78 @@ pub(crate) const NEVER_DEGAUSS: &str = "Never degauss or bulk-erase an LTO cartr
 /// erase turns its File 0 blank (`ContactOutcome::Blank`) on the next
 /// attempt, a filemark at BOT turns it EMPTY (`--force` applies) — not a
 /// software override.
+#[cfg(test)]
 fn decide_fresh_write_contact(
     outcome: &ContactOutcome,
     label: &str,
     volume_uuid: &str,
     allow_overwrite: bool,
 ) -> Result<()> {
+    decide_fresh_write_contact_on(outcome, label, volume_uuid, allow_overwrite, &[])
+}
+
+/// [`decide_fresh_write_contact`], knowing `live_on_cartridge`: the live
+/// volumes the catalog binds to the loaded cartridge's chip serial
+/// ([`binding::live_volumes_on_serial`]). They matter to one outcome only,
+/// [`ContactOutcome::FileZeroUnreadable`] (issue #400): an unreadable File 0
+/// on a cartridge the catalog says holds a live volume is that volume, not
+/// a blank, and `--force` is not consulted.
+fn decide_fresh_write_contact_on(
+    outcome: &ContactOutcome,
+    label: &str,
+    volume_uuid: &str,
+    allow_overwrite: bool,
+    live_on_cartridge: &[String],
+) -> Result<()> {
     match outcome {
         ContactOutcome::Blank | ContactOutcome::Matches => Ok(()),
+        // Issue #400: st returns the same EIO for a blank tape, a medium
+        // error on a recorded one and a block-size mismatch, and the medium
+        // did not prove itself blank ([`Store::blank_at_bot`]). ADR-0003
+        // fails closed: refused, `--force` the override — except where the
+        // catalog binds this very cartridge to a live volume, which is then
+        // what could not be read, and no flag overwrites it.
+        ContactOutcome::FileZeroUnreadable { error } => {
+            if !live_on_cartridge.is_empty() {
+                let labels = live_on_cartridge
+                    .iter()
+                    .map(|l| format!("\"{l}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(TapectlError::Other(format!(
+                    "refusing to write volume \"{label}\": File 0 of the loaded cartridge could \
+                     not be read ({error}), and the catalog binds this cartridge (by its medium \
+                     serial) to live volume(s) {labels}. An unreadable File 0 on a cartridge \
+                     that holds a recorded volume is that volume on a drive that cannot read it \
+                     now — a drive needing cleaning, a damaged first block — not a blank tape, \
+                     and --force cannot override this (ADR-0003). Check the drive and the \
+                     cartridge and run the command again. If those bytes are really gone, say \
+                     so first (`tapectl volume retire <label>`, or `tapectl cartridge \
+                     mark-erased <barcode>`); if this cartridge is to be reused, \
+                     {ERASE_IN_THE_DRIVE}. {NEVER_DEGAUSS}"
+                )));
+            }
+            if allow_overwrite {
+                warn!(
+                    label,
+                    volume_uuid,
+                    error = %error,
+                    "--force overriding an unreadable File 0 on a tape not provably blank"
+                );
+                Ok(())
+            } else {
+                Err(TapectlError::Other(format!(
+                    "refusing to write volume \"{label}\" (uuid {volume_uuid}): File 0 of the \
+                     loaded cartridge could not be read ({error}), and the tape is not provably \
+                     blank — it does not end at its beginning. The st driver reports the same \
+                     error for a blank tape, for a recorded tape it cannot read (a medium error, \
+                     a drive that needs cleaning) and for a tape written in another block size, \
+                     so tapectl will not take it as consent to write (ADR-0003). Check the drive \
+                     and the cartridge and try again. If you know what this cartridge holds and \
+                     are deliberately overwriting it, re-run with --force."
+                )))
+            }
+        }
         ContactOutcome::AlreadySealed { seal_position } => Err(TapectlError::Other(format!(
             "refusing to write volume \"{label}\": the loaded cartridge already carries a SEALED \
              volume — a valid seal marker parses at tape position {seal_position}. ADR-0003: \
@@ -3812,6 +3902,7 @@ fn decide_fresh_write_contact(
 /// neither call read File 0 before this fix, so loading the wrong cartridge
 /// (including one already holding a different, SEALED volume) silently
 /// overwrote it. Returns `Ok(())` to proceed; `Err` refuses.
+#[cfg(test)]
 fn check_fresh_write_contact(
     store: &mut dyn Store,
     label: &str,
@@ -3819,8 +3910,34 @@ fn check_fresh_write_contact(
     seal_position: Option<u32>,
     allow_overwrite: bool,
 ) -> Result<()> {
+    check_fresh_write_contact_on(
+        store,
+        label,
+        volume_uuid,
+        seal_position,
+        allow_overwrite,
+        &[],
+    )
+}
+
+/// [`check_fresh_write_contact`] knowing the live volumes on the loaded
+/// cartridge ([`decide_fresh_write_contact_on`], issue #400).
+fn check_fresh_write_contact_on(
+    store: &mut dyn Store,
+    label: &str,
+    volume_uuid: &str,
+    seal_position: Option<u32>,
+    allow_overwrite: bool,
+    live_on_cartridge: &[String],
+) -> Result<()> {
     let outcome = check_tape_contact(store, label, volume_uuid, seal_position);
-    decide_fresh_write_contact(&outcome, label, volume_uuid, allow_overwrite)
+    decide_fresh_write_contact_on(
+        &outcome,
+        label,
+        volume_uuid,
+        allow_overwrite,
+        live_on_cartridge,
+    )
 }
 
 /// Verify a volume via the v2 keyless chain walk
@@ -4207,8 +4324,8 @@ fn verify_contacted(
     // cross-tool byte contract for File 3 specifically
     // (`volume-format-v2.md` §4: "a reader recovering File 3 from a padded
     // tape read obtains the same bytes by stripping trailing NUL padding").
-    let mut fi_raw = Vec::new();
-    store.read_file(3, &mut fi_raw)?;
+    // Bounded (issue #400): read no further than `SMALL_FILE_CAP`.
+    let fi_raw = crate::store::read_small_bytes(store, 3, "front index")?;
     let fi_text = String::from_utf8_lossy(&fi_raw);
     let fi_trimmed = fi_text.trim_end_matches('\0');
     let fi_true_len = fi_trimmed.len() as u64;
@@ -4406,8 +4523,8 @@ fn verify_contacted(
 /// `TapeStore::open_read` (or, in tests, hands in a `MemStore`), so this
 /// function is directly unit-testable with no tape device.
 pub fn volume_identify(store: &mut dyn Store) -> Result<String> {
-    let mut data = Vec::new();
-    store.read_file(0, &mut data)?;
+    // Bounded (issue #400): read no further than `SMALL_FILE_CAP`.
+    let data = crate::store::read_small_bytes(store, 0, "ID thunk")?;
     let text = String::from_utf8_lossy(&data).to_string();
     Ok(text.trim_end_matches('\0').to_string())
 }
@@ -6431,11 +6548,11 @@ mod tests {
         assert_eq!(
             fake.ops(),
             vec![
-                Op::Rewind,   // the open
-                Op::Read(0),  // the contact check
-                Op::Space(2), // forward to File 3
-                Op::Read(3),
-                Op::Space(1), // forward to the seal marker
+                Op::Rewind,      // the open
+                Op::ReadHead(0), // the contact check (bounded, issue #400)
+                Op::Space(2),    // forward to File 3
+                Op::ReadHead(3), // the front index (bounded, issue #400)
+                Op::Space(1),    // forward to the seal marker
                 Op::Read(5),
                 Op::Rewind, // the one rewind of the integrity pass
                 Op::Read(0),
@@ -6603,7 +6720,8 @@ mod tests {
             .ops()
             .into_iter()
             .filter_map(|op| match op {
-                Op::Read(p) => Some(p),
+                // File 0 and File 3 are bounded reads, `ReadHead` (#400).
+                Op::Read(p) | Op::ReadHead(p) => Some(p),
                 _ => None,
             })
             .collect();
@@ -11369,6 +11487,32 @@ mod tests {
         }
     }
 
+    /// Issue #400: an unreadable File 0 on a tape not provably blank is
+    /// refused without `--force`, permitted with it — and refused even
+    /// with it when the catalog binds the loaded cartridge to a live volume.
+    #[test]
+    fn decide_unreadable_file_zero_refuses_unless_forced_and_never_over_a_live_volume() {
+        let outcome = ContactOutcome::FileZeroUnreadable {
+            error: "read: Input/output error (os error 5)".into(),
+        };
+        let err = decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, false, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not provably") && err.contains("--force"),
+            "{err}"
+        );
+        decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, true, &[]).unwrap();
+        let live = vec!["L6-0001".to_string()];
+        let err = decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, true, &live)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("L6-0001") && err.contains("--force cannot override"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn check_fresh_write_contact_empty_file_zero_permits_with_force() {
         let mut store = MemStore::new(FW_BS as usize);
@@ -14804,6 +14948,11 @@ mod tests {
             fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
                 self.inner.reposition_for_resume(file_index)
             }
+            // A fresh write's contact asks whether an unreadable File 0 is
+            // a blank tape (issue #400); the answer is the inner store's.
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.inner.blank_at_bot()
+            }
         }
 
         /// Issue #387 (ADR-0012, 2026-10-06 item 1): a write confirms with
@@ -14932,6 +15081,11 @@ mod tests {
             fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
                 self.inner.reposition_for_resume(file_index)
             }
+            // A fresh write's contact asks whether an unreadable File 0 is
+            // a blank tape (issue #400); the answer is the inner store's.
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.inner.blank_at_bot()
+            }
         }
 
         /// Issue #410: a full confirm stopped by a signal keeps what it read
@@ -15054,6 +15208,155 @@ mod tests {
                 .filter(|p| p.to_string_lossy().contains("catalog_snapshot"))
                 .collect();
             assert!(left.is_empty(), "the home's copy is removed: {left:?}");
+        }
+
+        /// One `volume write` of `label` over `store`, as the CLI runs it.
+        fn write_once(
+            conn: &Connection,
+            config: &Config,
+            paths: &TapectlPaths,
+            label: &str,
+            store: &mut dyn Store,
+        ) -> Result<()> {
+            use crate::tape::log_pages::tests::FixtureSource;
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            let mut slot = ContactSlot::empty()
+                .with_drive_identity(identity_with_serial(Some("XYZZY_A1")))
+                .with_log_source(&src);
+            let r = volume_write_contacted(
+                conn,
+                paths,
+                config,
+                label,
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                false, // --full-confirm
+                true,
+                &mut slot,
+                ContactStore::Injected(store),
+            );
+            slot.finish_result(r).map(|_| ())
+        }
+
+        /// Issue #401, through `volume write` itself: a write aborted by
+        /// tri-layer L2 (a staged slice that rotted in place, same size) is
+        /// followed, once the slice is right again, by a second `volume
+        /// write` of the same label on the same cartridge — and that one
+        /// seals. It used to fail at `plan` with a raw `UNIQUE constraint
+        /// failed`, which is what the abort message and the troubleshooting
+        /// guide both told the operator to run.
+        #[test]
+        fn a_write_aborted_by_l2_is_written_again_and_seals() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-AGAIN", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let slice = tmp.path().join("slices").join("slice_1.age");
+            let good = fs::read(&slice).unwrap();
+            let mut rotted = good.clone();
+            rotted[0] ^= 0xff;
+            fs::write(&slice, &rotted).unwrap();
+
+            let mut store = MemStore::new(512 * 1024);
+            let err = write_once(&conn, &config, &paths, "SW-AGAIN", &mut store)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("hash mismatch"),
+                "positive control: L2 aborted: {err}"
+            );
+
+            fs::write(&slice, &good).unwrap();
+            write_once(&conn, &config, &paths, "SW-AGAIN", &mut store)
+                .expect("issue #401: the second `volume write` of the label seals");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "sealed");
+            let rows: Vec<String> = conn
+                .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+                .unwrap()
+                .query_map(params![volume_id], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(rows, vec!["completed"]);
+        }
+
+        /// Issue #400, through `volume write` itself over the real
+        /// `TapeStore`: the loaded cartridge holds a recording (three files)
+        /// whose File 0 the drive cannot read. That used to be taken as a
+        /// blank tape and written over from BOT; now the write is refused
+        /// before the tape moves forward a single write, and nothing is
+        /// planned.
+        #[test]
+        fn a_write_refuses_an_unreadable_file_zero_on_a_tape_not_provably_blank() {
+            use crate::tape::fake::{FakeTape, Op};
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, _volume_id) = swept_write_fixture("SW-EIO", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let fake = FakeTape::with_files(vec![vec![7u8; 512 * 1024]; 3], 512 * 1024);
+            fake.state().unreadable.push(0);
+            let mut store = crate::store::TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+
+            let err = write_once(&conn, &config, &paths, "SW-EIO", &mut store)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("could not be read") && err.contains("--force"),
+                "{err}"
+            );
+            assert!(
+                !fake.ops().iter().any(|op| matches!(op, Op::Write(_))),
+                "nothing written: {:?}",
+                fake.ops()
+            );
+            let planned: i64 = conn
+                .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(planned, 0);
+        }
+
+        /// Issue #401, the end-of-tape case through `volume write`: the
+        /// medium runs out, and a second `volume write` of the label on the
+        /// same cartridge (here: the same recorded files, with room) seals.
+        #[test]
+        fn a_write_aborted_at_end_of_tape_is_written_again_and_seals() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-EOT", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+
+            let mut short = MemStore::new(512 * 1024).with_enospc_after(2 * 512 * 1024);
+            let err = write_once(&conn, &config, &paths, "SW-EOT", &mut short)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("aborted"),
+                "positive control: the write aborted: {err}"
+            );
+
+            let mut store = MemStore::new(512 * 1024);
+            store.files = short.files.clone();
+            store.syncs = short.syncs.clone();
+            write_once(&conn, &config, &paths, "SW-EOT", &mut store)
+                .expect("issue #401: the second `volume write` of the label seals");
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM volumes WHERE id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "sealed");
         }
 
         /// Issue #386: a MemStore write inside a progress session records

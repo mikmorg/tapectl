@@ -1084,6 +1084,37 @@ being overwritten (ADR-0010).
          *** unit "<unit>" [<unit status>] now has ZERO copies ***
 ```
 
+### File 0 could not be read
+
+```text
+error: refusing to write volume "<label>" (uuid <uuid>): File 0 of the loaded cartridge could not be read (tape
+I/O error: read: Input/output error (os error 5)), and the tape is not provably blank — it does not end at its
+beginning. ...
+```
+
+The drive's driver returns the same I/O error for three different things: a
+blank tape, a recorded tape it cannot read right now (a drive that needs
+cleaning, a damaged first block), and a tape written in another block size
+(LTFS, `tar`). Only the first is safe to write, so tapectl asks the tape
+itself: it spaces forward one filemark from the beginning, and calls the tape
+blank only if the drive answers that the recorded data ends right there.
+`volume init`, `volume write` and `volume resume` all refuse otherwise.
+
+Clean the drive, reseat the cartridge, check it is the one you meant, and run
+the command again. If you know what the cartridge holds and mean to overwrite
+it, `volume init` and `volume write` take `--force`.
+
+`--force` is not accepted when the catalog binds this cartridge (by its chip
+serial) to a live volume: then the unreadable File 0 is that volume's, and the
+message names it. If those bytes really are gone, say so first with
+`tapectl volume retire <label>` or `tapectl cartridge mark-erased <barcode>`;
+to reuse the cartridge, erase it in the drive.
+
+`volume resume` has no `--force`; it refuses, writes nothing, and leaves the
+session `interrupted`, so the same `volume resume` can run again once the
+drive reads. A resume whose seal is already recorded is not refused: it only
+re-runs the read-back.
+
 ### The cartridge already carries a SEALED volume
 
 ```text
@@ -1527,6 +1558,33 @@ Output to a pipe whose reader has gone (`tapectl … | head`, or a `| tee`
 killed by the same Ctrl-C) is dropped rather than ending the command: it
 finishes, and exits with its own status.
 
+### A read or drive error during the write
+
+```text
+error: volume "<label>" write interrupted: execute stopped at position <n>: staged source read error: read source: <OS error>. The
+tape is left unsealed and the session is `interrupted`, not aborted: ...
+```
+
+```text
+error: volume "<label>" write interrupted: execute stopped at position <n>: tape I/O error: write: Input/output error (os error 5). ...
+```
+
+A staged file the disk could not read, or a drive error other than a full
+tape, stops the write the way Ctrl-C does: the files before position `<n>`
+are whole on the tape, and the session stays resumable. A `staged source read
+error` is the staging disk (check `dmesg`, the RAID, the mount); a `tape I/O
+error` is the drive or the cartridge (clean the drive, reseat the cartridge).
+Fix the cause, keep the same cartridge loaded, and run:
+
+```bash
+tapectl volume resume <label> --device "$TAPE"
+```
+
+Resume writes position `<n>` again from its start. If the tape turns out to
+hold fewer files than the catalog recorded (a power loss can lose the last
+few), resume continues from what the tape holds and says so in the session
+log. Releases without issue #408's fix aborted the session for good on both.
+
 ### A real end of tape during the write
 
 If the drive reports that it is out of space, the session ends as a clean
@@ -1537,11 +1595,13 @@ means the drive itself flagged the medium, and the cartridge should not be writt
 again. Write the same staged data to another cartridge. The error reads:
 
 ```text
-error: volume "<label>" write aborted: execute failed at position <n>: tape I/O error: write: <OS error, e.g. No space left on device (os error 28)>
+error: volume "<label>" write aborted: execute failed at position <n>: tape full: write: No space left on device (os error 28)
 ```
 
-The same shape covers any other failure while streaming a file, and a slice
-whose hash no longer matches staging (`hash mismatch at position <n>: …`).
+The same shape covers a slice whose hash no longer matches staging
+(`hash mismatch at position <n>: …`). Any other failure while streaming a
+file interrupts the write instead
+([above](#a-read-or-drive-error-during-the-write)).
 
 That hash-mismatch abort is now **how a slice that rotted in staging is
 caught**. Since 1.0.3 the write no longer reads every staged slice in full
@@ -1578,6 +1638,12 @@ What an abort leaves behind:
   was recorded (`volumes.sealed_at` is empty), so there is no sealed tape to re-confirm, and an unsealed aborted
   session is never resumable. Run `tapectl volume write <label>` to start a new one.
   ```
+- **The next `volume write` replaces it.** When the new session is planned,
+  the aborted session's `writes`/`write_positions` rows and its staging
+  session directory are removed, and a `write_session_superseded` event names
+  them; the abort itself stays in the `write_aborted` event. (Releases without
+  issue #401's fix kept the old rows, and the retry failed with `UNIQUE
+  constraint failed`.)
 - **`volume abort` is not needed.** The session is already aborted.
   [`volume abort`](cli/volume.md#tapectl-volume-abort) is for a `planned`
   session, or an interrupted one you know cannot be resumed.

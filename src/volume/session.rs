@@ -161,46 +161,68 @@ impl ValidatedLayout {
     /// files never get a cursor row, `write_positions.stage_slice_id` is
     /// NOT NULL by schema). Never called on resume: resume reuses the
     /// existing rows (`writes` has `UNIQUE(stage_set_id, volume_id)`).
+    ///
+    /// **One transaction (issue #401).** Every row lands, or none does: a
+    /// failure partway used to leave a `planned` row behind, which then
+    /// blocked the next `volume write` as an "unresolved write session".
+    ///
+    /// **A new attempt replaces an abandoned one (issue #401).** A volume
+    /// whose earlier session ended `aborted` or `failed` before its seal was
+    /// recorded (an end of tape, a tri-layer L2 mismatch, a plan cleared by
+    /// `volume abort`) is written again from the beginning — that is what
+    /// the operator documentation has always told the operator to do. The
+    /// old attempt's rows used to make that impossible: `writes` is
+    /// `UNIQUE(stage_set_id, volume_id)`, so the retry's own INSERT failed
+    /// on them. They describe a recording the new session is about to
+    /// overwrite from BOT and that no command can ever resume (an unsealed
+    /// aborted session is never adopted, ADR-0012 2026-09-23), so they are
+    /// deleted here, in this same transaction, with a `write_session_superseded`
+    /// event saying which rows went; the abort itself stays recorded in the
+    /// `write_aborted` event it already has. A volume's `writes` rows thus
+    /// keep describing ONE session, which `rehydrate`, `adopt_aborted`,
+    /// `volume abort` and `staging clean`'s guard all assume. Their frozen
+    /// session directories are removed after the commit
+    /// ([`supersede_abandoned_attempts`]).
     pub fn plan(
         self,
         conn: &Connection,
         volume_id: i64,
         units: &[BuildUnit],
     ) -> Result<PlannedSession> {
-        let mut write_ids = Vec::with_capacity(units.len());
-        let mut slice_write_id = HashMap::new();
         // The frozen staging directory is recorded here, and only here
         // (migration 006, issue #25): plan is the sole `writes`-row writer,
         // and after a process restart this path is the ONLY way back to the
         // materialized zones a resume must re-hash rather than regenerate.
         let session_dir = self.built.session_dir.to_string_lossy().to_string();
-        for u in units {
-            conn.execute(
-                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
-                 VALUES (?1, ?2, ?3, 'planned', ?4)",
-                params![u.stage_set_id, u.snapshot_id, volume_id, session_dir],
-            )?;
-            let write_id = conn.last_insert_rowid();
-            write_ids.push((write_id, u.snapshot_id));
-            for slice in &u.slices {
-                slice_write_id.insert(slice.slice_id, write_id);
-            }
-        }
+        let entries = &self.built.layout.entries;
+        let (write_ids, slice_write_id, superseded_dirs) =
+            busy::retry(BusyPolicy::DEFAULT, "a write session's plan", || {
+                let tx = busy::immediate_tx(conn)?;
+                let superseded_dirs = supersede_abandoned_attempts(&tx, volume_id)?;
+                let (write_ids, slice_write_id) =
+                    insert_plan_rows(&tx, volume_id, units, entries, &session_dir)?;
+                tx.commit()?;
+                Ok((write_ids, slice_write_id, superseded_dirs))
+            })?;
 
-        for entry in &self.built.layout.entries {
-            if let ZoneKind::Slice { stage_slice_id } = entry.kind {
-                let write_id = *slice_write_id.get(&stage_slice_id).ok_or_else(|| {
-                    TapectlError::Other(format!(
-                        "plan: no unit in `units` owns staged slice {stage_slice_id} \
-                         (Layout position {})",
-                        entry.position
-                    ))
-                })?;
-                conn.execute(
-                    "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
-                     VALUES (?1, ?2, ?3, 'pending')",
-                    params![write_id, stage_slice_id, entry.position.to_string()],
-                )?;
+        // After the commit, never before: a directory removed for rows a
+        // rollback then kept would strand them (the DB-then-filesystem order
+        // `staging::clean` documents). Best-effort — a directory that cannot
+        // be removed is an orphan `staging clean --force` reclaims, never a
+        // reason to fail a write whose rows are already committed.
+        for dir in superseded_dirs {
+            if dir == session_dir {
+                continue;
+            }
+            let path = Path::new(&dir);
+            if path.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(path) {
+                    tracing::warn!(
+                        dir = %path.display(),
+                        error = %e,
+                        "could not remove a superseded write session's staging directory"
+                    );
+                }
             }
         }
 
@@ -211,6 +233,165 @@ impl ValidatedLayout {
             slice_write_id,
         })
     }
+}
+
+/// `plan`'s rows: one `writes` row per unit and one `write_positions` row
+/// per slice entry, on `tx`. Returns the `(write_id, snapshot_id)` pairs and
+/// the `stage_slice_id -> write_id` map the session carries.
+#[allow(clippy::type_complexity)]
+fn insert_plan_rows(
+    tx: &Connection,
+    volume_id: i64,
+    units: &[BuildUnit],
+    entries: &[LayoutEntry],
+    session_dir: &str,
+) -> Result<(Vec<(i64, i64)>, HashMap<i64, i64>)> {
+    let mut write_ids = Vec::with_capacity(units.len());
+    let mut slice_write_id = HashMap::new();
+    for u in units {
+        tx.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, session_dir)
+             VALUES (?1, ?2, ?3, 'planned', ?4)",
+            params![u.stage_set_id, u.snapshot_id, volume_id, session_dir],
+        )?;
+        let write_id = tx.last_insert_rowid();
+        write_ids.push((write_id, u.snapshot_id));
+        for slice in &u.slices {
+            slice_write_id.insert(slice.slice_id, write_id);
+        }
+    }
+
+    for entry in entries {
+        if let ZoneKind::Slice { stage_slice_id } = entry.kind {
+            let write_id = *slice_write_id.get(&stage_slice_id).ok_or_else(|| {
+                TapectlError::Other(format!(
+                    "plan: no unit in `units` owns staged slice {stage_slice_id} \
+                     (Layout position {})",
+                    entry.position
+                ))
+            })?;
+            tx.execute(
+                "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                 VALUES (?1, ?2, ?3, 'pending')",
+                params![write_id, stage_slice_id, entry.position.to_string()],
+            )?;
+        }
+    }
+    Ok((write_ids, slice_write_id))
+}
+
+/// Delete the `writes` rows (and their `write_positions`) of every earlier
+/// session on `volume_id` that ended `aborted` or `failed` before its seal
+/// was recorded, inside `plan`'s transaction (issue #401). Returns the
+/// session directories those rows named that no remaining row names, for
+/// `plan` to remove once the transaction commits.
+///
+/// Does nothing when the volume's seal is recorded: such an `aborted`
+/// session is the one `volume resume` may adopt for re-confirmation
+/// (ADR-0012's 2026-09-23 amendment, #280), and a sealed volume is never
+/// planned again anyway — `volume write` refuses it first.
+///
+/// Refuses, changing nothing, if a `verification_results` row points at
+/// one of those positions: the rows are then evidence about the medium, not
+/// leftovers of an abandoned attempt, and only a person should decide what
+/// becomes of them.
+fn supersede_abandoned_attempts(tx: &Connection, volume_id: i64) -> Result<Vec<String>> {
+    let (label, sealed): (String, bool) = tx.query_row(
+        "SELECT label, sealed_at IS NOT NULL FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if sealed {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(i64, String, Option<String>)> = tx
+        .prepare(
+            "SELECT id, status, session_dir FROM writes
+             WHERE volume_id = ?1 AND status IN ('aborted', 'failed')
+             ORDER BY id",
+        )?
+        .query_map(params![volume_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids = rows
+        .iter()
+        .map(|(id, _, _)| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `ids` is integers this function just read, never input.
+    let evidence: i64 = tx.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM verification_results vr
+             JOIN write_positions wp ON wp.id = vr.write_position_id
+             WHERE wp.write_id IN ({ids})"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if evidence > 0 {
+        return Err(TapectlError::Other(format!(
+            "volume \"{label}\": cannot start a new write session — its earlier, abandoned \
+             session (writes row(s) {ids}) has {evidence} verification result(s) recorded \
+             against its positions, so those rows are evidence about this cartridge and \
+             tapectl will not delete them to make room. Nothing was changed. Inspect them \
+             (`verification_results`, `write_positions` with write_id in {ids}) before \
+             writing this volume again."
+        )));
+    }
+
+    tx.execute(
+        &format!("DELETE FROM write_positions WHERE write_id IN ({ids})"),
+        [],
+    )?;
+    tx.execute(&format!("DELETE FROM writes WHERE id IN ({ids})"), [])?;
+
+    let mut dirs: Vec<String> = rows.iter().filter_map(|(_, _, d)| d.clone()).collect();
+    dirs.sort();
+    dirs.dedup();
+    let statuses = rows
+        .iter()
+        .map(|(id, status, _)| format!("{id} {status}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    crate::db::events::log_event(
+        tx,
+        "volume",
+        volume_id,
+        Some(&label),
+        "write_session_superseded",
+        None,
+        None,
+        None,
+        Some(&format!(
+            "a new write session replaces an earlier unsealed attempt that ended aborted or \
+             failed; its writes rows ({statuses}) and their write_positions were removed; \
+             session dir(s): {}",
+            if dirs.is_empty() {
+                "none recorded".to_string()
+            } else {
+                dirs.join(", ")
+            }
+        )),
+        None,
+    )?;
+
+    let mut orphaned = Vec::new();
+    for dir in dirs {
+        let still_named: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM writes WHERE session_dir = ?1",
+            params![dir],
+            |r| r.get(0),
+        )?;
+        if still_named == 0 {
+            orphaned.push(dir);
+        }
+    }
+    Ok(orphaned)
 }
 
 // ── Executing / ReadyToSeal / Interrupted / Aborted ──
@@ -274,6 +455,10 @@ pub struct InterruptedSession {
     /// turns any path that would reach the write phase into a hard refusal
     /// rather than trusting that it is unreachable (ADR-0003).
     adopted_from_aborted: bool,
+    /// Why execution stopped, when it was not SIGINT: a staged file or the
+    /// drive failed mid-write (issue #408). `None` for an interrupt and for
+    /// a session rehydrated from the catalog.
+    reason: Option<String>,
 }
 
 /// Terminal, not resumable: the tape is not a copy
@@ -377,11 +562,20 @@ pub enum ConfirmOutcome {
 /// itself having diverged from anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContactOutcome {
-    /// File 0 unreadable: nothing recorded there. For resume this is a
-    /// session crashed before File 0 ever landed; for a fresh write it is
-    /// the ordinary shape of a blank cartridge. Either way: safe to
-    /// (re)write from BOT.
+    /// File 0 unreadable AND the medium proved blank: end of data at the
+    /// beginning of the tape ([`Store::blank_at_bot`], issue #400). For
+    /// resume this is a session crashed before File 0 ever landed; for a
+    /// fresh write it is the ordinary shape of a blank cartridge. Either
+    /// way: safe to (re)write from BOT.
     Blank,
+    /// File 0 could not be read, and nothing proved the medium blank (issue
+    /// #400). st fails a read at BOT with the same EIO for a blank tape, a
+    /// medium error on a recorded tape — a live sealed volume on a drive
+    /// that needs cleaning — and a tape written in another block size, so
+    /// the error alone is no consent to write (ADR-0003 fails closed): the
+    /// fresh-write path refuses unless `--force`, resume refuses and leaves
+    /// the session to be resumed again.
+    FileZeroUnreadable { error: String },
     /// File 0 parsed and its identity matches `expected_label`/`expected_uuid`,
     /// and (when a seal position was given) nothing parseable was found
     /// there either — safe to continue.
@@ -439,112 +633,160 @@ pub fn check_tape_contact(
     expected_uuid: &str,
     seal_position: Option<u32>,
 ) -> ContactOutcome {
-    let mut id_thunk_bytes = Vec::new();
-    let file_zero_present = store.read_file(0, &mut id_thunk_bytes).is_ok();
-    if file_zero_present {
-        let text = String::from_utf8_lossy(&id_thunk_bytes);
-        let identity = format::parse_id_thunk_identity(&text);
-        let matches = matches!(
-            &identity,
-            Ok(id) if id.label == expected_label && id.uuid == expected_uuid
-        );
+    contact_report(store, expected_label, expected_uuid, seal_position).0
+}
 
-        // THE TAPE'S OWN seal pointer, consulted whether or not the identity
-        // matched (issue #208, 2026-09-17 pre-production review).
-        //
-        // This used to sit inside the `!matches` arm below, which left the
-        // matching-identity case relying entirely on the CALLER's
-        // `seal_position` argument. For `resume_checking` that is sound --
-        // its layout is rehydrated from the very session that wrote this
-        // tape, so its seal entry is where the seal really is. For
-        // `volume_write` it is not: its layout is freshly built from
-        // whatever is staged NOW, so its seal position matches the tape's
-        // only when the new content happens to lay out identically. Write
-        // different content to a tape the catalog still believes is
-        // `initialized` -- a DB restored from a backup predating the seal,
-        // or a row a rebuild left alone -- and the probe reads a position
-        // with no marker, returns `Matches`, and a SEALED tape is
-        // overwritten. ADR-0003 forbids that outright and `--force` cannot
-        // reach it, so the guard must not depend on the caller guessing the
-        // right position.
-        //
-        // The tape's self-reported `[layout].seal_marker` has no such
-        // problem: it is where THIS tape says its own seal is. Probing it
-        // first is strictly more conservative -- it can only add refusals,
-        // and only for tapes that genuinely carry a parsing seal marker.
-        // Re-initialising a cartridge is unaffected: that path erases the
-        // medium first, so File 0 is gone or unparseable long before here.
-        if let Ok(pointers) = format::parse_id_thunk_layout_pointers(&text) {
-            if pointers.seal_marker >= 0
-                && seal_marker_parses_at(store, pointers.seal_marker as u32)
-            {
-                return ContactOutcome::AlreadySealed {
-                    seal_position: pointers.seal_marker as u32,
-                };
-            }
-        }
+/// What one contact read off the tape, beside [`check_tape_contact`]'s
+/// outcome (issue #403) — so a caller that must re-derive a decision from
+/// the tape's own facts ([`resume_reconfirm_eligible`]) does it from these
+/// reads instead of rewinding and reading File 0 and the seal again, and
+/// `confirm` can start from the seal bytes already in hand.
+#[derive(Debug, Default)]
+pub(crate) struct ContactFacts {
+    /// File 0's identity, when File 0 was read and parsed.
+    identity: Option<format::IdThunkIdentity>,
+    /// File 0's own `[layout] seal_marker` pointer, when it parsed.
+    seal_pointer: Option<i64>,
+    /// Every seal position probed: the bytes read there, or `None` if the
+    /// read failed. Each position is read at most once per contact.
+    seal_reads: HashMap<u32, Option<Vec<u8>>>,
+}
 
-        if !matches {
-            // The sealed case already returned above (issue #208), so a
-            // mismatch reaching here is a genuinely unsealed foreign or
-            // stale tape. That is what `--force` is allowed to overwrite;
-            // issue #27's headline scenario -- a foreign-but-SEALED
-            // cartridge presenting as a plain mismatch the flag could
-            // defeat -- is closed by the hoisted probe, not here.
-            //
-            // Issue #327: `Store::read_file` succeeds with zero bytes when
-            // File 0 is only a filemark (`TapeStore`: the first read
-            // returns 0), and "" fails to parse just as garbage does. The
-            // two are different facts and are reported as such; both
-            // still refuse.
-            if id_thunk_bytes.is_empty() {
-                return ContactOutcome::EmptyFileZero;
+impl ContactFacts {
+    /// Whether `position` holds a parsing seal marker — reading it only the
+    /// first time it is asked about (issue #403: resume used to read the
+    /// same seal position up to three times, each a long locate).
+    fn probe_seal(&mut self, store: &mut dyn Store, position: u32) -> bool {
+        let read = self.seal_reads.entry(position).or_insert_with(|| {
+            // Bounded (issue #400): an oversized file is no seal marker.
+            match crate::store::read_small(store, position) {
+                Ok(crate::store::SmallRead::Bytes(bytes)) => Some(bytes),
+                Ok(crate::store::SmallRead::Oversized) | Err(_) => None,
             }
-            return ContactOutcome::IdentityMismatch {
-                found: identity.ok(),
-            };
-        }
+        });
+        read.as_deref()
+            .is_some_and(|bytes| format::parse_seal_marker(&String::from_utf8_lossy(bytes)).is_ok())
     }
 
-    if let Some(seal_pos) = seal_position {
-        if seal_marker_parses_at(store, seal_pos) {
-            return ContactOutcome::AlreadySealed {
-                seal_position: seal_pos,
-            };
-        }
-    }
-
-    if file_zero_present {
-        ContactOutcome::Matches
-    } else {
-        ContactOutcome::Blank
+    /// The bytes this contact read at `position`, if it read them.
+    fn seal_bytes(&self, position: u32) -> Option<Vec<u8>> {
+        self.seal_reads.get(&position).cloned().flatten()
     }
 }
 
-/// Read `position` and report whether it parses as a seal marker — a read
-/// failure (nothing recorded there) is the expected, safe "not sealed"
-/// case, never an error. Shared by [`check_tape_contact`]'s two seal probes
-/// (the caller-supplied position, and a foreign tape's own self-reported
-/// one) so there is exactly one "does this position hold a seal marker"
-/// check, not two copies that could drift.
-///
-/// That conflation is safe ONLY for a fresh write to a blank tape — it is
-/// exactly what made an unreadable-but-genuinely-sealed position on resume
-/// indistinguishable from "never sealed" (ADR-0012's 2026-09-21 correction
-/// "the seal is RECORDED, not inferred", issue #277). `resume_checking`
-/// no longer relies on this function's answer alone to decide whether IT
-/// owes a seal; it consults `volumes.sealed_at` (migration 018) first. This
-/// function itself is unchanged — the conflation remains correct for the
-/// fresh-write path (`write::check_fresh_write_contact`) and for
-/// [`resume_reconfirm_eligible`]'s defence-in-depth conditions.
-fn seal_marker_parses_at(store: &mut dyn Store, position: u32) -> bool {
-    let mut bytes = Vec::new();
-    if store.read_file(position, &mut bytes).is_ok() {
-        let text = String::from_utf8_lossy(&bytes);
-        format::parse_seal_marker(&text).is_ok()
-    } else {
-        false
+/// [`check_tape_contact`], with the facts it read.
+pub(crate) fn contact_report(
+    store: &mut dyn Store,
+    expected_label: &str,
+    expected_uuid: &str,
+    seal_position: Option<u32>,
+) -> (ContactOutcome, ContactFacts) {
+    let mut facts = ContactFacts::default();
+    // Bounded (issue #400): File 0 is one block by construction. A file
+    // there larger than `SMALL_FILE_CAP` is not an ID thunk — and reading it
+    // whole could exhaust the host's memory — so it is read no further and
+    // treated as the unparseable File 0 it is.
+    let file_zero_error = match crate::store::read_small(store, 0) {
+        Ok(crate::store::SmallRead::Oversized) => {
+            return (ContactOutcome::IdentityMismatch { found: None }, facts)
+        }
+        Ok(crate::store::SmallRead::Bytes(id_thunk_bytes)) => {
+            let text = String::from_utf8_lossy(&id_thunk_bytes);
+            let identity = format::parse_id_thunk_identity(&text);
+            facts.identity = identity.as_ref().ok().cloned();
+            let matches = matches!(
+                &identity,
+                Ok(id) if id.label == expected_label && id.uuid == expected_uuid
+            );
+
+            // THE TAPE'S OWN seal pointer, consulted whether or not the
+            // identity matched (issue #208, 2026-09-17 pre-production review).
+            //
+            // This used to sit inside the `!matches` arm below, which left the
+            // matching-identity case relying entirely on the CALLER's
+            // `seal_position` argument. For `resume_checking` that is sound --
+            // its layout is rehydrated from the very session that wrote this
+            // tape, so its seal entry is where the seal really is. For
+            // `volume_write` it is not: its layout is freshly built from
+            // whatever is staged NOW, so its seal position matches the tape's
+            // only when the new content happens to lay out identically. Write
+            // different content to a tape the catalog still believes is
+            // `initialized` -- a DB restored from a backup predating the seal,
+            // or a row a rebuild left alone -- and the probe reads a position
+            // with no marker, returns `Matches`, and a SEALED tape is
+            // overwritten. ADR-0003 forbids that outright and `--force` cannot
+            // reach it, so the guard must not depend on the caller guessing the
+            // right position.
+            //
+            // The tape's self-reported `[layout].seal_marker` has no such
+            // problem: it is where THIS tape says its own seal is. Probing it
+            // first is strictly more conservative -- it can only add refusals,
+            // and only for tapes that genuinely carry a parsing seal marker.
+            // Re-initialising a cartridge is unaffected: that path erases the
+            // medium first, so File 0 is gone or unparseable long before here.
+            if let Ok(pointers) = format::parse_id_thunk_layout_pointers(&text) {
+                facts.seal_pointer = Some(i64::from(pointers.seal_marker));
+                if pointers.seal_marker >= 0 && facts.probe_seal(store, pointers.seal_marker as u32)
+                {
+                    let seal_position = pointers.seal_marker as u32;
+                    return (ContactOutcome::AlreadySealed { seal_position }, facts);
+                }
+            }
+
+            if !matches {
+                // The sealed case already returned above (issue #208), so a
+                // mismatch reaching here is a genuinely unsealed foreign or
+                // stale tape. That is what `--force` is allowed to overwrite;
+                // issue #27's headline scenario -- a foreign-but-SEALED
+                // cartridge presenting as a plain mismatch the flag could
+                // defeat -- is closed by the hoisted probe, not here.
+                //
+                // Issue #327: `Store::read_file` succeeds with zero bytes when
+                // File 0 is only a filemark (`TapeStore`: the first read
+                // returns 0), and "" fails to parse just as garbage does. The
+                // two are different facts and are reported as such; both
+                // still refuse.
+                if id_thunk_bytes.is_empty() {
+                    return (ContactOutcome::EmptyFileZero, facts);
+                }
+                return (
+                    ContactOutcome::IdentityMismatch {
+                        found: identity.ok(),
+                    },
+                    facts,
+                );
+            }
+            None
+        }
+        Err(e) => Some(e.to_string()),
+    };
+
+    // Issue #400: an unreadable File 0 is blank only on positive evidence,
+    // asked of the medium itself. Asked before the seal probe below, which
+    // stays independent of it: a File-0-unreadable-but-sealed-tail tape is
+    // exactly the front/tail damage asymmetry `volume-format-v2.md` §4
+    // designs for.
+    let blank = file_zero_error.is_some() && store.blank_at_bot().unwrap_or(false);
+
+    // The caller's position — not read again when it is the tape's own
+    // pointer, probed just above (issue #403).
+    if let Some(seal_pos) = seal_position {
+        if facts.probe_seal(store, seal_pos) {
+            return (
+                ContactOutcome::AlreadySealed {
+                    seal_position: seal_pos,
+                },
+                facts,
+            );
+        }
     }
+
+    let outcome = match file_zero_error {
+        None => ContactOutcome::Matches,
+        Some(_) if blank => ContactOutcome::Blank,
+        Some(error) => ContactOutcome::FileZeroUnreadable { error },
+    };
+    (outcome, facts)
 }
 
 /// Whether a resume that met [`ContactOutcome::AlreadySealed`] may skip the
@@ -552,40 +794,33 @@ fn seal_marker_parses_at(store: &mut dyn Store, position: u32) -> bool {
 /// ADR-0012's 2026-09-21 amendment, "`volume resume` re-confirms a tape that
 /// is already sealed" (issues #260/#267).
 ///
-/// All three of the ruling's conditions are re-derived HERE, from scratch,
-/// independently of whichever internal branch of [`check_tape_contact`]
-/// produced the `AlreadySealed` outcome — that function reports the exact
-/// same shape for a genuinely FOREIGN sealed tape (its seal probe runs
-/// "whether or not the identity matched", issue #208) and, even when the
-/// identity DOES match, can report a position it verified only via the
-/// CALLER's own guess rather than the tape's self-reported pointer (sound
-/// for THAT function's own contract — `resume_checking`'s layout is
-/// rehydrated from the very session that wrote this tape — but not a fact
-/// this decision may assume without checking independently):
+/// All three of the ruling's conditions are re-derived HERE from what the
+/// contact READ ([`ContactFacts`]), never from which internal branch of
+/// [`contact_report`] produced the `AlreadySealed` outcome — that function
+/// reports the exact same shape for a genuinely FOREIGN sealed tape (its seal
+/// probe runs "whether or not the identity matched", issue #208) and, even
+/// when the identity DOES match, can report a position it verified only via
+/// the CALLER's own guess rather than the tape's self-reported pointer:
 ///
 /// 1. File 0's identity (label + uuid) matches `expected_label`/
-///    `expected_uuid` — checked here explicitly, never inferred from having
-///    reached this arm rather than `IdentityMismatch`.
+///    `expected_uuid`.
 /// 2. File 0's OWN recorded `[layout] seal_marker` pointer equals
 ///    `expected_seal_position` (this session's own Layout).
-/// 3. That exact position parses as a real seal marker.
+/// 3. The bytes read at that exact position parse as a seal marker.
 ///
-/// Condition 3 is meaningless without condition 2 reading the pointer from
-/// File 0 itself rather than trusting a value `check_tape_contact` already
-/// decided — that trust is exactly what would let the caller-guess fallback
-/// (safe only inside `check_tape_contact`'s own broader contract) leak into
-/// a decision that must never rest on a guess. This is why this function
-/// never calls `check_tape_contact` and never accepts its returned
-/// `seal_position` as an argument: it re-reads File 0 and re-parses its
-/// `[layout]` table itself.
+/// Until issue #403 this re-read File 0 and the seal itself — a rewind and a
+/// second long locate to the end of the tape, on top of the contact's own —
+/// to keep the decision independent of the contact's verdict. The facts
+/// keep it just as independent: they are the raw reads, File 0's own
+/// pointer is condition 2's only source, and the seal bytes are the ones
+/// read at that position in this same contact.
 ///
 /// Any failure — File 0 unreadable, unparseable, a non-matching identity, no
 /// recorded pointer, a pointer that disagrees with this session's Layout, or
-/// a position that does not actually parse as a seal marker — returns
-/// `false`, and the caller keeps today's behaviour: quarantine, never
-/// proceed.
+/// a position that does not parse as a seal marker — returns `false`, and
+/// the caller keeps today's behaviour: quarantine, never proceed.
 fn resume_reconfirm_eligible(
-    store: &mut dyn Store,
+    facts: &ContactFacts,
     expected_label: &str,
     expected_uuid: &str,
     expected_seal_position: Option<u32>,
@@ -593,26 +828,18 @@ fn resume_reconfirm_eligible(
     let Some(expected_seal_position) = expected_seal_position else {
         return false;
     };
-    let mut id_thunk_bytes = Vec::new();
-    if store.read_file(0, &mut id_thunk_bytes).is_err() {
+    let Some(identity) = &facts.identity else {
         return false;
-    }
-    let text = String::from_utf8_lossy(&id_thunk_bytes);
-    let identity = match format::parse_id_thunk_identity(&text) {
-        Ok(id) => id,
-        Err(_) => return false,
     };
     if identity.label != expected_label || identity.uuid != expected_uuid {
         return false;
     }
-    let pointers = match format::parse_id_thunk_layout_pointers(&text) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    if pointers.seal_marker < 0 || pointers.seal_marker as u32 != expected_seal_position {
+    if facts.seal_pointer != Some(i64::from(expected_seal_position)) {
         return false;
     }
-    seal_marker_parses_at(store, expected_seal_position)
+    facts
+        .seal_bytes(expected_seal_position)
+        .is_some_and(|bytes| format::parse_seal_marker(&String::from_utf8_lossy(&bytes)).is_ok())
 }
 
 /// Whether THIS volume's own `seal()` already ran — `volumes.sealed_at`
@@ -624,7 +851,7 @@ fn resume_reconfirm_eligible(
 /// returns `Ok`), and is never cleared afterward by any confirm outcome —
 /// not even an `Inconclusive` confirm's `mark_writes(..., "interrupted")`
 /// (`SealedPending::confirm`). That is what makes its mere presence settle
-/// what `seal_marker_parses_at` cannot: whether an unreadable seal position
+/// what `ContactFacts::probe_seal` cannot: whether an unreadable seal position
 /// means "never sealed" (this volume's `sealed_at` is still NULL — the seal
 /// is genuinely still owed) or "sealed, but this read attempt failed" (this
 /// volume's `sealed_at` is set — the seal must never be attempted again).
@@ -1007,6 +1234,13 @@ impl InterruptedSession {
     /// process learns which tenants' keys to require (there is no staged
     /// batch to derive them from), and the post-confirm bookkeeping needs the
     /// slice entries.
+    /// Why execution stopped, when it was not an interrupt (issue #408): a
+    /// staged file that could not be read, or a drive error other than a
+    /// full medium. `None` for SIGINT.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
     pub fn layout(&self) -> &super::layout_model::Layout {
         &self.built.layout
     }
@@ -1192,6 +1426,7 @@ impl InterruptedSession {
             write_ids,
             slice_write_id,
             adopted_from_aborted: status == "aborted",
+            reason: None,
         }))
     }
 
@@ -1347,13 +1582,17 @@ impl InterruptedSession {
             .find(|e| matches!(e.kind, ZoneKind::SealMarker))
             .map(|e| e.position as u32);
         let phase = crate::progress::phase("identify", None);
-        let contact = check_tape_contact(
+        let (contact, facts) = contact_report(
             store,
             &self.built.layout.label,
             &self.built.layout.volume_uuid,
             seal_position,
         );
         phase.done();
+        // Issue #403: whatever this contact already read at the seal
+        // position goes to confirm, so a re-confirming resume locates the
+        // seal once, not again for the chain walk.
+        let seal_bytes = seal_position.and_then(|p| facts.seal_bytes(p));
         match contact {
             ContactOutcome::Blank | ContactOutcome::Matches => {
                 // ADR-0012's 2026-09-21 correction "the seal is RECORDED,
@@ -1381,11 +1620,44 @@ impl InterruptedSession {
                         // the gate goes first, so an unreadable seal is
                         // found at one read, not after the whole pass.
                         seal_order: ReadOrder::SealFirst,
+                        seal_bytes,
                     }));
                 }
                 // sealed_at is NULL: the seal is still genuinely owed.
                 // Fall through to the two-case cursor rule exactly as
                 // before.
+            }
+            ContactOutcome::FileZeroUnreadable { error } => {
+                // Issue #400. A sealed session only re-enters confirm, which
+                // reads and never writes — the same answer `Blank` gets
+                // above, and the one a resume of a sealed tape with a bad
+                // File 0 always had.
+                if seal_recorded(conn, self.volume_id)? {
+                    return Ok(ResumeOutcome::Confirming(SealedPending {
+                        built: self.built,
+                        volume_id: self.volume_id,
+                        write_ids: self.write_ids,
+                        // Nothing on this tape read just now: the gate goes
+                        // first, as for a recorded seal that did not read.
+                        seal_order: ReadOrder::SealFirst,
+                        seal_bytes,
+                    }));
+                }
+                // An unsealed one would write. A read error is not proof
+                // the tape is blank — it may be this session's own File 0
+                // on a drive that needs cleaning, or another cartridge — and
+                // not proof of divergence either, so neither the rewrite
+                // nor a quarantine: refuse, change nothing, and let the
+                // operator resume again once the drive reads.
+                return Err(TapectlError::Other(format!(
+                    "volume resume: File 0 of the loaded cartridge could not be read ({error}), \
+                     and the tape is not provably blank, so tapectl cannot confirm it is \
+                     volume \"{}\" and will not write to it (ADR-0003). Nothing was written; \
+                     the session stays `interrupted`. Check the drive (clean it, reseat the \
+                     cartridge) and that the right cartridge is loaded, then run `tapectl \
+                     volume resume {}` again.",
+                    self.built.layout.label, self.built.layout.label
+                )));
             }
             contact @ (ContactOutcome::IdentityMismatch { .. } | ContactOutcome::EmptyFileZero) => {
                 // Issue #327: an empty File 0 at resume is divergence too —
@@ -1427,7 +1699,7 @@ impl InterruptedSession {
                 // genuinely FOREIGN sealed tape too (its own seal probe runs
                 // "whether or not the identity matched", issue #208).
                 if resume_reconfirm_eligible(
-                    store,
+                    &facts,
                     &self.built.layout.label,
                     &self.built.layout.volume_uuid,
                     seal_position,
@@ -1440,6 +1712,7 @@ impl InterruptedSession {
                         // marker at this session's own seal position, so it
                         // is read last, in the forward pass (issue #397).
                         seal_order: ReadOrder::SealLast,
+                        seal_bytes,
                     }));
                 }
 
@@ -1494,15 +1767,34 @@ impl InterruptedSession {
             .ok_or_else(|| {
                 TapectlError::Other("resume: layout has no slice entries".to_string())
             })?;
-        let start_index = if written_slices == 0 {
+        let cursor = if written_slices == 0 {
             0
         } else {
             first_slice_index + written_slices
         };
 
+        // Issue #403: the catalog's cursor is not the last word. Every file
+        // but the seal ends with an IMMEDIATE filemark, so a power loss or a
+        // bus reset can leave the tape short of what was recorded `written`.
+        // Resume continues from what the medium really holds when that is
+        // less — never forward of the catalog — and the positions past it
+        // go back to `pending`, to be written again.
         let phase = crate::progress::phase("positioning", None);
-        store.reposition_for_resume(start_index as u32)?;
+        let start_index = store.reposition_at_most(cursor as u32)? as usize;
         phase.done();
+        if start_index < cursor {
+            tracing::warn!(
+                catalog_cursor = cursor,
+                medium_files = start_index,
+                "the tape holds fewer files than the catalog recorded written; resuming from \
+                 the medium's count"
+            );
+            crate::progress::log(&format!(
+                "the tape holds {start_index} file(s) where the catalog recorded {cursor} \
+                 written; resuming from file {start_index}"
+            ));
+            demote_positions_from(conn, &self.write_ids, start_index)?;
+        }
 
         for (write_id, _) in &self.write_ids {
             conn.execute(
@@ -1613,6 +1905,7 @@ impl ReadyToSeal {
             // of data, and the confirm reads the seal last, at the end of
             // its one forward pass (issue #397).
             seal_order: ReadOrder::SealLast,
+            seal_bytes: None,
         })
     }
 }
@@ -1626,6 +1919,10 @@ pub struct SealedPending {
     /// Where confirm reads the seal marker (issue #397): last when this
     /// session has just written or just read it, first otherwise.
     seal_order: ReadOrder,
+    /// The seal marker's on-tape bytes, when this contact already read them
+    /// (a resume's contact check, issue #403) — `confirm` starts from them
+    /// instead of locating the seal a second time. `None` after `seal()`.
+    seal_bytes: Option<Vec<u8>>,
 }
 
 impl SealedPending {
@@ -1707,6 +2004,7 @@ impl SealedPending {
             Tier::Integrity => plan.checkpointing(&record),
             Tier::Navigable => plan,
         };
+        let plan = plan.with_seal(self.seal_bytes.as_deref());
         let evidence = store.confirm_with(&self.built.layout, plan)?;
         phase.done();
         let passed = evidence.mismatches.is_empty();
@@ -1921,9 +2219,9 @@ impl SealedPending {
 /// entry — that is `ReadyToSeal::seal`'s job alone (sacred invariant 1).
 ///
 /// Status: cycles 1-3 landed (happy path; tri-layer L2 hash verification
-/// with a clean abort on mismatch; a `store.execute` error — ENOSPC being
-/// the expected one, but any of them — is caught and produces the same
-/// clean abort, never a hard `Err` out of the whole session). Still
+/// with a clean abort on mismatch; a `store.execute` error is caught, never
+/// a hard `Err` out of the whole session — a full medium is the same clean
+/// abort, any other failure an `interrupted` session, issue #408). Still
 /// pending: cycle 4's `is_interrupted` check (currently unused — accepted
 /// but not called, since the public `execute_checking`/`resume_checking`
 /// signatures are already the final ones the four behaviors need).
@@ -2024,6 +2322,7 @@ fn run_entries(
                     write_ids,
                     slice_write_id,
                     adopted_from_aborted: false,
+                    reason: None,
                 }));
             }
         }
@@ -2066,6 +2365,7 @@ fn run_entries(
                 write_ids,
                 slice_write_id,
                 adopted_from_aborted: false,
+                reason: None,
             }));
         }
 
@@ -2082,11 +2382,12 @@ fn run_entries(
         // (issue #390): a reader thread reads the staged file, a hasher
         // thread hashes it, and the store's `execute` writes it here, on this
         // thread — three stages overlapped, where they used to take turns.
-        // Any store-level failure — ENOSPC being the expected one, but this
-        // treats any of them alike (device gone, I/O error, ...) — is caught
-        // rather than propagated: a full medium has no salvage path
-        // (ADR-0007), so it becomes the same clean abort as a hash mismatch,
-        // not a hard `Err` out of the whole session.
+        // Any store-level failure is caught rather than propagated: a full
+        // medium has no salvage path (ADR-0007), so it becomes the same clean
+        // abort as a hash mismatch; any other failure — a staged file the
+        // disk cannot read, a drive error that is not ENOSPC — becomes an
+        // `interrupted` session (issue #408, `Stop` below). Neither is a hard
+        // `Err` out of the whole session.
         //
         // Tri-layer L2 (`v2-open-questions.md` §2.4): the hash is of the very
         // bytes the store takes, and a mismatch is a clean abort. This is what
@@ -2105,8 +2406,8 @@ fn run_entries(
         // pages are dropped instead of filling the host's page cache.
         let (verdict, waits) = match crate::util::DropBehind::open(path) {
             Err(e) => (
-                Verdict::Failed(TapectlError::Other(format!(
-                    "execute: open entry at position {}: {e}",
+                Verdict::Failed(TapectlError::SourceIo(format!(
+                    "open entry at position {}: {e}",
                     entry.position
                 ))),
                 None,
@@ -2123,17 +2424,28 @@ fn run_entries(
             }
         };
 
-        let abort_reason = match &verdict {
+        // Issue #408: only a full medium and a tri-layer L2 mismatch end
+        // the session `aborted` — the two ADR-0007 and §2.4 name. Any other
+        // failure (a staged file the disk could not read, a drive error that
+        // is not ENOSPC) leaves the tape exactly where a crash leaves it: the
+        // files before this one whole, this one partial. That is the
+        // `interrupted` state resume already repositions from, so the
+        // session stays resumable once the cause is fixed.
+        let stop = match &verdict {
             Verdict::Written(_) => None,
-            Verdict::Mismatch(actual_hash) => Some(format!(
+            Verdict::Mismatch(actual_hash) => Some(Stop::Abort(format!(
                 "hash mismatch at position {}: expected {}, got {actual_hash}",
                 entry.position,
                 expected_hash.unwrap_or("no recorded hash")
-            )),
-            Verdict::Failed(e) => Some(format!(
+            ))),
+            Verdict::Failed(e @ TapectlError::MediumFull(_)) => Some(Stop::Abort(format!(
                 "execute failed at position {}: {e}",
                 entry.position
-            )),
+            ))),
+            Verdict::Failed(e) => Some(Stop::Interrupt(format!(
+                "execute stopped at position {}: {e}",
+                entry.position
+            ))),
         };
 
         if let ZoneKind::Slice { stage_slice_id } = entry.kind {
@@ -2164,11 +2476,17 @@ fn run_entries(
                     }
                     Verdict::Failed(_) => {
                         // Never streamed in full (open failed or store.execute
-                        // errored) — no sha256_on_volume to record.
+                        // errored) — no sha256_on_volume to record. `failed`
+                        // when the session aborts; `pending` when it stays
+                        // resumable, since resume writes it again (#408).
+                        let status = match &stop {
+                            Some(Stop::Interrupt(_)) => "pending",
+                            _ => "failed",
+                        };
                         conn.execute(
-                            "UPDATE write_positions SET status = 'failed'
-                             WHERE write_id = ?1 AND stage_slice_id = ?2",
-                            params![write_id, stage_slice_id],
+                            "UPDATE write_positions SET status = ?1
+                             WHERE write_id = ?2 AND stage_slice_id = ?3",
+                            params![status, write_id, stage_slice_id],
                         )?;
                     }
                 }
@@ -2198,18 +2516,33 @@ fn run_entries(
                 ),
                 None => String::new(),
             },
-            match &abort_reason {
-                Some(_) => " — ABORTED",
+            match &stop {
+                Some(Stop::Abort(_)) => " — ABORTED",
+                Some(Stop::Interrupt(_)) => " — INTERRUPTED",
                 None => "",
             }
         ));
 
-        if let Some(reason) = abort_reason {
-            mark_writes(conn, &write_ids, "aborted")?;
-            return Ok(ExecuteOutcome::Aborted(AbortedSession {
-                volume_id,
-                reason,
-            }));
+        match stop {
+            None => {}
+            Some(Stop::Abort(reason)) => {
+                mark_writes(conn, &write_ids, "aborted")?;
+                return Ok(ExecuteOutcome::Aborted(AbortedSession {
+                    volume_id,
+                    reason,
+                }));
+            }
+            Some(Stop::Interrupt(reason)) => {
+                mark_writes(conn, &write_ids, "interrupted")?;
+                return Ok(ExecuteOutcome::Interrupted(InterruptedSession {
+                    built,
+                    volume_id,
+                    write_ids,
+                    slice_write_id,
+                    adopted_from_aborted: false,
+                    reason: Some(reason),
+                }));
+            }
         }
     }
 
@@ -2219,6 +2552,14 @@ fn run_entries(
         volume_id,
         write_ids,
     }))
+}
+
+/// How one entry's write ended the session, when it did (issue #408).
+enum Stop {
+    /// A full medium or an L2 mismatch: `aborted`, never resumed.
+    Abort(String),
+    /// Any other failure: `interrupted`, resumable once the cause is fixed.
+    Interrupt(String),
 }
 
 fn entry_path(entry: &LayoutEntry) -> Result<&Path> {
@@ -2285,6 +2626,23 @@ fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Res
     Ok(())
 }
 
+/// Move this session's `write_positions` at Layout position `from` or later
+/// back to `pending` (issue #403): the medium does not hold them, whatever
+/// the catalog recorded.
+fn demote_positions_from(conn: &Connection, write_ids: &[(i64, i64)], from: usize) -> Result<()> {
+    for (write_id, _) in write_ids {
+        busy::retry(BusyPolicy::DEFAULT, "a resume's write positions", || {
+            Ok(conn.execute(
+                "UPDATE write_positions
+                 SET status = 'pending', written_at = NULL, sha256_on_volume = NULL
+                 WHERE write_id = ?1 AND CAST(position AS INTEGER) >= ?2",
+                params![write_id, from as i64],
+            )?)
+        })?;
+    }
+    Ok(())
+}
+
 /// The two-case cursor rule's slice count: how many `write_positions` rows
 /// across this session's `writes` rows are already `'written'`. Zero means
 /// restart from BOT; any other value feeds `front_zone_len + written_slices`
@@ -2336,8 +2694,21 @@ mod tests {
         keys: KeyAvailability,
         units: Vec<BuildUnit>,
         volume_id: i64,
+        /// What `built` was built from, so a test can build the same
+        /// volume's session again — a second attempt (issue #401).
+        inputs: BuildInputs,
         _slices_dir: tempfile::TempDir,
         _session_dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        /// The same volume's Layout built again into a fresh session
+        /// directory — what a second `volume write` of the label builds.
+        fn rebuild(&self) -> (BuiltLayout, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let built = build::build(&self.inputs, dir.path()).unwrap();
+            (built, dir)
+        }
     }
 
     fn make_fixture() -> Fixture {
@@ -2477,6 +2848,7 @@ mod tests {
             keys,
             units: vec![build_unit],
             volume_id,
+            inputs,
             _slices_dir: slices_dir,
             _session_dir: session_dir,
         }
@@ -3362,6 +3734,244 @@ mod tests {
         assert_ne!(volume_status, "sealed");
     }
 
+    // --- issue #401: an abandoned attempt never blocks the next one ---
+
+    fn statuses_on(conn: &Connection, volume_id: i64) -> Vec<String> {
+        conn.prepare("SELECT status FROM writes WHERE volume_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map(params![volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// What a second attempt needs from a [`Fixture`] whose `built` the
+    /// first attempt consumed.
+    #[derive(Clone, Copy)]
+    struct Retry<'a> {
+        conn: &'a Connection,
+        keys: &'a KeyAvailability,
+        units: &'a [BuildUnit],
+        volume_id: i64,
+    }
+
+    /// Field by field, so it works on a fixture whose `built` is gone.
+    macro_rules! retry_of {
+        ($f:expr) => {
+            Retry {
+                conn: &$f.conn,
+                keys: &$f.keys,
+                units: &$f.units,
+                volume_id: $f.volume_id,
+            }
+        };
+    }
+
+    /// Run a fresh session for `built` to its end over `store` and say how
+    /// it ended — Sealed must be what a retry reaches.
+    fn run_to_sealed(f: Retry<'_>, built: BuiltLayout, store: &mut MemStore) -> SealedSession {
+        let planned = built
+            .into_validated(f.keys, SliceCheck::Size, store)
+            .unwrap_or_else(|e| panic!("validate: {e:?}"))
+            .plan(f.conn, f.volume_id, f.units)
+            .expect("issue #401: a new attempt plans on the same volume");
+        let ready = match planned.execute(f.conn, store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("the retry's execute did not reach Ready"),
+        };
+        match ready
+            .seal(store)
+            .unwrap()
+            .confirm(f.conn, store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Sealed(s) => s,
+            _ => panic!("the retry did not seal"),
+        }
+    }
+
+    /// Issue #401: after an END OF TAPE abort, the same volume is written
+    /// again from the beginning and seals. The old attempt's rows used to
+    /// make that second `plan` fail on `writes`' `UNIQUE(stage_set_id,
+    /// volume_id)`, wedging the label. The superseded rows are gone, the
+    /// event says which went, and the old attempt's session directory is
+    /// removed with them.
+    #[test]
+    fn an_enospc_abort_is_written_again_on_the_same_volume_and_seals() {
+        let f = make_fixture();
+        let first_dir = f.built.session_dir.clone();
+        let (second, _second_dir) = f.rebuild();
+        let mut short = MemStore::new(BS as usize).with_enospc_after(2 * BS);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut short)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        assert!(matches!(
+            planned.execute(&f.conn, &mut short).unwrap(),
+            ExecuteOutcome::Aborted(_)
+        ));
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["aborted"]);
+        assert!(
+            first_dir.is_dir(),
+            "positive control: the first attempt's dir exists"
+        );
+
+        // The same cartridge reloaded: what the first attempt left on it,
+        // without the simulated end of tape.
+        let mut store = MemStore::new(BS as usize);
+        store.files = short.files.clone();
+        store.syncs = short.syncs.clone();
+        store.reposition_for_resume(0).unwrap();
+        run_to_sealed(retry_of!(f), second, &mut store);
+
+        assert_eq!(
+            statuses_on(&f.conn, f.volume_id),
+            vec!["completed"],
+            "the aborted attempt's row was superseded, not left beside the new one"
+        );
+        let orphan_positions: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM write_positions
+                 WHERE write_id NOT IN (SELECT id FROM writes)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_positions, 0);
+        let detail: String = f
+            .conn
+            .query_row(
+                "SELECT details FROM events WHERE action = 'write_session_superseded'
+                 AND entity_id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .expect("the supersession is recorded");
+        assert!(detail.contains("aborted"), "{detail}");
+        assert!(
+            !first_dir.exists(),
+            "the superseded attempt's session dir is removed: {}",
+            first_dir.display()
+        );
+    }
+
+    /// Issue #401: after a tri-layer L2 abort (a staged slice rotted after
+    /// plan), the slice is put right and the same volume is written again
+    /// from the beginning — the troubleshooting guide's recipe.
+    #[test]
+    fn an_l2_abort_is_written_again_on_the_same_volume_once_the_slice_is_good() {
+        let f = make_fixture();
+        let (second, _second_dir) = f.rebuild();
+        let mut store = MemStore::new(BS as usize);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let slice_path = f.units[0].slices[0].staging_path.clone();
+        let good = std::fs::read(&slice_path).unwrap();
+        rot_in_place(&slice_path);
+        assert!(matches!(
+            planned.execute(&f.conn, &mut store).unwrap(),
+            ExecuteOutcome::Aborted(_)
+        ));
+        std::fs::write(&slice_path, &good).unwrap();
+
+        store.reposition_for_resume(0).unwrap();
+        run_to_sealed(retry_of!(f), second, &mut store);
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
+    }
+
+    /// Issue #401: a session killed between plan and execute leaves
+    /// `planned` rows; `volume abort` turns them `aborted`, and the next
+    /// attempt plans and seals — what `volume resume`'s refusal tells the
+    /// operator to do.
+    #[test]
+    fn a_plan_cleared_by_volume_abort_does_not_block_the_next_attempt() {
+        let f = make_fixture();
+        let (second, _second_dir) = f.rebuild();
+        let mut store = MemStore::new(BS as usize);
+        let _planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        // The kill, then `volume abort`'s own UPDATE.
+        f.conn
+            .execute(
+                "UPDATE writes SET status = 'aborted' WHERE volume_id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+
+        run_to_sealed(retry_of!(f), second, &mut store);
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
+    }
+
+    /// Issue #401: `plan` is one transaction. A failure after the first
+    /// `writes` row used to leave it `planned`, and that stray row then
+    /// refused every later `volume write` as an unresolved session.
+    #[test]
+    fn a_plan_that_fails_partway_leaves_no_rows() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        // A unit that owns none of the Layout's slices: the first INSERT
+        // lands, then the position loop fails.
+        let mut unit = f.units[0].clone();
+        unit.slices.clear();
+        let err = match validated.plan(&f.conn, f.volume_id, &[unit]) {
+            Ok(_) => panic!("plan must fail when no unit owns a slice"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("owns staged slice"), "{err}");
+        let rows: i64 = f
+            .conn
+            .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a failed plan leaves no `writes` row behind");
+    }
+
+    /// Issue #401's limit: a volume whose seal is recorded keeps its
+    /// `aborted` rows — they are the session `volume resume` may adopt for
+    /// re-confirmation (ADR-0012 2026-09-23) — so `plan` touches nothing and
+    /// still fails on the constraint, as `volume write` refuses such a
+    /// volume long before it would get here.
+    #[test]
+    fn a_volume_whose_seal_is_recorded_keeps_its_aborted_rows() {
+        let f = make_fixture();
+        let (second, _second_dir) = f.rebuild();
+        let mut store = MemStore::new(BS as usize).with_enospc_after(2 * BS);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let _ = planned.execute(&f.conn, &mut store).unwrap();
+        f.conn
+            .execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        let mut fresh = MemStore::new(BS as usize);
+        let result = second
+            .into_validated(&f.keys, SliceCheck::Size, &mut fresh)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units);
+        assert!(result.is_err(), "a sealed volume is never planned over");
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["aborted"]);
+    }
+
     // --- behavior 4: SIGINT between entries -> Interrupted + resumable ---
 
     #[test]
@@ -3486,6 +4096,249 @@ mod tests {
             )
             .unwrap();
         assert_eq!(written_positions, 2, "both slices written after resume");
+    }
+
+    /// A fresh session of a fixture's `built`, interrupted between entries
+    /// after slice_1 — the SIGINT test's shape: 8 files recorded (id_thunk
+    /// .. slice_1), slice_1 `written`, slice_2 `pending`, rows
+    /// `interrupted`. For the resume tests below.
+    fn interrupt_after_first_slice(
+        built: BuiltLayout,
+        conn: &Connection,
+        keys: &KeyAvailability,
+        units: &[BuildUnit],
+        volume_id: i64,
+    ) -> (InterruptedSession, MemStore) {
+        let mut store = MemStore::new(BS as usize);
+        let planned = built
+            .into_validated(keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(conn, volume_id, units)
+            .unwrap();
+        let calls = AtomicU32::new(0);
+        let is_interrupted = move || calls.fetch_add(1, Ordering::SeqCst) >= 8;
+        match planned
+            .execute_checking(conn, &mut store, is_interrupted)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => {
+                assert_eq!(store.files.len(), 8);
+                (i, store)
+            }
+            _ => panic!("expected Interrupted"),
+        }
+    }
+
+    /// Issue #400: resume over a tape whose File 0 read fails and which is
+    /// NOT provably blank — here the session's own tape, eight files
+    /// recorded, File 0 unreadable as a drive needing cleaning makes it.
+    /// The read error used to count as a blank tape (`ContactOutcome::Blank`),
+    /// which is consent to write: resume repositioned and wrote on. Now it
+    /// refuses, writes nothing, and leaves the session `interrupted`.
+    #[test]
+    fn resume_refuses_an_unreadable_file_zero_on_a_tape_not_provably_blank() {
+        use crate::tape::fake::{FakeTape, Op};
+        let f = make_fixture();
+        let (interrupted, mem) =
+            interrupt_after_first_slice(f.built, &f.conn, &f.keys, &f.units, f.volume_id);
+        let fake = FakeTape::with_files(mem.files.clone(), BS as usize);
+        fake.state().unreadable.push(0);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+
+        let err = match interrupted.resume_checking(
+            &f.conn,
+            &f.keys,
+            SliceCheck::Size,
+            &mut store,
+            || false,
+        ) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("resume must refuse an unreadable File 0 on a recorded tape"),
+        };
+        assert!(err.contains("could not be read"), "{err}");
+        assert!(
+            !fake.ops().iter().any(|op| matches!(op, Op::Write(_))),
+            "nothing written: {:?}",
+            fake.ops()
+        );
+        assert_eq!(
+            fake.state().files.len(),
+            8,
+            "the tape is as the session left it"
+        );
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["interrupted"]);
+    }
+
+    /// Issue #403: the catalog recorded slice_1 `written` (8 files), but
+    /// the tape holds 7 — the immediate filemark after slice_1 was still in
+    /// the drive's buffer when the power went. Resume used to rewind and
+    /// space 8 filemarks blind, fail at end of data, and leave abort and a
+    /// full rewrite as the only exit. Now it resumes from the medium's 7,
+    /// sets slice_1 back to `pending`, writes it again, and seals.
+    #[test]
+    fn resume_continues_from_the_medium_when_the_tape_is_behind_the_catalog() {
+        use crate::tape::fake::FakeTape;
+        let f = make_fixture();
+        let (interrupted, mem) =
+            interrupt_after_first_slice(f.built, &f.conn, &f.keys, &f.units, f.volume_id);
+        let mut files = mem.files.clone();
+        files.pop(); // slice_1 never reached the tape
+        let fake = FakeTape::with_files(files, BS as usize);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+
+        let ready = match interrupted
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+            .expect("resume continues from what the tape holds")
+        {
+            ResumeOutcome::Ready(r) => r,
+            _ => panic!("expected Ready"),
+        };
+        match ready
+            .seal(&mut store)
+            .unwrap()
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Sealed(_) => {}
+            ConfirmOutcome::Inconclusive(i) => panic!("inconclusive: {:?}", i.evidence.mismatches),
+            ConfirmOutcome::Quarantined(q) => panic!("quarantined: {:?}", q.reason),
+        }
+        assert_eq!(fake.state().files.len(), 10, "9 content files and the seal");
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
+        let written: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM write_positions WHERE status = 'written'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(written, 2);
+    }
+
+    /// Issue #403: a resume that re-enters confirm on a tape sealed by this
+    /// session locates the seal ONCE. It used to read the seal position at
+    /// the tape's own pointer, again at the caller's identical position,
+    /// again in `resume_reconfirm_eligible`, and again at the start of the
+    /// chain walk — four long locates to the end of the tape.
+    #[test]
+    fn a_reconfirming_resume_reads_the_seal_position_once() {
+        use crate::tape::fake::{FakeTape, Op};
+        let f = make_fixture();
+        let seal_pos = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .unwrap()
+            .position as u32;
+        let mut mem = MemStore::new(BS as usize);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut mem)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let ready = match planned.execute(&f.conn, &mut mem).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready"),
+        };
+        // Sealed, then the process died before confirm.
+        let _ = ready.seal(&mut mem).unwrap();
+        f.conn
+            .execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        f.conn
+            .execute(
+                "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+                params![f.volume_id],
+            )
+            .unwrap();
+        let interrupted = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("the interrupted session rehydrates");
+
+        let fake = FakeTape::with_files(mem.files.clone(), BS as usize);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        fake.clear_ops();
+        let pending = match interrupted
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+            .unwrap()
+        {
+            ResumeOutcome::Confirming(p) => p,
+            _ => panic!("expected Confirming"),
+        };
+        match pending
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Sealed(_) => {}
+            _ => panic!("expected Sealed"),
+        }
+        let seal_reads = fake
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::Read(p) | Op::ReadHead(p) if *p == seal_pos))
+            .count();
+        assert_eq!(seal_reads, 1, "ops: {:?}", fake.ops());
+    }
+
+    /// Issue #400 at the contact check itself, through the real
+    /// `TapeStore`: File 0 unreadable on a recorded tape is
+    /// `FileZeroUnreadable` — it used to be `Blank`.
+    #[test]
+    fn check_tape_contact_an_unreadable_file_zero_on_a_recorded_tape_is_not_blank() {
+        use crate::tape::fake::FakeTape;
+        let fake = FakeTape::with_files(vec![vec![7u8; BS as usize]; 3], BS as usize);
+        fake.state().unreadable.push(0);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        match check_tape_contact(&mut store, "L", "U", None) {
+            ContactOutcome::FileZeroUnreadable { error } => {
+                assert!(error.contains("Input/output error"), "{error}")
+            }
+            other => panic!("expected FileZeroUnreadable, got {other:?}"),
+        }
+    }
+
+    /// The positive control: a blank tape — end of data at BOT, so st fails
+    /// the File 0 read with EIO and a forward space with BLANK CHECK at file
+    /// 0 — is `Blank`, through the same real `TapeStore` probe.
+    #[test]
+    fn check_tape_contact_a_blank_tape_is_proved_blank_by_the_medium() {
+        use crate::tape::fake::FakeTape;
+        let fake = FakeTape::with_files(Vec::new(), BS as usize);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        assert_eq!(
+            check_tape_contact(&mut store, "L", "U", Some(9)),
+            ContactOutcome::Blank
+        );
+    }
+
+    /// Issue #400, bounded reads: a File 0 far larger than any ID thunk (the
+    /// fill script leaves 2.5 TB of it) is read no further than
+    /// `SMALL_FILE_CAP` and refused as not an ID thunk. It used to be read
+    /// whole into a `Vec`.
+    #[test]
+    fn check_tape_contact_reads_an_oversized_file_zero_no_further_than_the_cap() {
+        use crate::tape::fake::FakeTape;
+        let cap = crate::store::SMALL_FILE_CAP as usize;
+        let big = vec![b'x'; cap + 8 * BS as usize];
+        let fake = FakeTape::with_files(vec![big], BS as usize);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        assert_eq!(
+            check_tape_contact(&mut store, "L", "U", None),
+            ContactOutcome::IdentityMismatch { found: None }
+        );
+        let read = fake.state().bytes_read;
+        assert!(
+            read <= (cap + BS as usize) as u64,
+            "read {read} bytes of a {}-byte File 0",
+            cap + 8 * BS as usize
+        );
     }
 
     /// Bonus coverage beyond the four required TDD behaviors: the two-case
@@ -4527,7 +5380,7 @@ mod tests {
     // ADR-0012's 2026-09-21 correction to its own preceding amendment. The
     // preceding amendment's `resume_reconfirm_eligible` machinery (tested
     // above) routes every one of its three conditions through
-    // `seal_marker_parses_at`, which cannot distinguish "no marker here"
+    // `ContactFacts::probe_seal`, which cannot distinguish "no marker here"
     // from "a read error at this position" — deliberately, for the
     // fresh-write path. On resume that conflation is fatal: an `Inconclusive`
     // confirm's own `MismatchKind::SealUnreadable` is exactly a read error at
@@ -4575,7 +5428,7 @@ mod tests {
     /// read error, not a parseable-but-different marker and not a short
     /// read — both of those are already covered elsewhere). Before Change 3,
     /// `check_tape_contact` cannot tell "sealed but this read failed" apart
-    /// from "never sealed" (`seal_marker_parses_at` returns `false` for a
+    /// from "never sealed" (`ContactFacts::probe_seal` returns `false` for a
     /// read error exactly as it does for "no marker here"), reports
     /// `Matches`, and resume falls through the (until now empty)
     /// `Blank | Matches` arm straight toward `reposition_for_resume` and a
@@ -6122,6 +6975,9 @@ mod tests {
         inner: MemStore,
         calls: Vec<std::result::Result<u64, String>>,
         fail_on: Option<(usize, usize)>,
+        /// The error a `fail_on` call returns: a full medium unless set to
+        /// a plain drive error (issue #408).
+        fail_eio: bool,
     }
 
     impl Recording {
@@ -6130,6 +6986,7 @@ mod tests {
                 inner: MemStore::new(BS as usize),
                 calls: Vec::new(),
                 fail_on: None,
+                fail_eio: false,
             }
         }
     }
@@ -6143,9 +7000,13 @@ mod tests {
                 Some((call, take)) if call == self.calls.len() => {
                     let mut some = vec![0u8; take];
                     src.read_exact(&mut some).unwrap();
-                    Err(TapectlError::TapeIo(
-                        "write: No space left on device (os error 28)".into(),
-                    ))
+                    Err(if self.fail_eio {
+                        TapectlError::TapeIo("write: Input/output error (os error 5)".into())
+                    } else {
+                        TapectlError::MediumFull(
+                            "write: No space left on device (os error 28)".into(),
+                        )
+                    })
                 }
                 _ => self.inner.execute(src, len, sync),
             };
@@ -6328,7 +7189,7 @@ mod tests {
             aborted.reason,
             format!(
                 "execute failed at position {position}: {}",
-                TapectlError::TapeIo("write: No space left on device (os error 28)".into())
+                TapectlError::MediumFull("write: No space left on device (os error 28)".into())
             )
         );
         let (wp_status, wp_hash): (String, Option<String>) = f
@@ -6509,7 +7370,9 @@ mod tests {
         assert!(matches!(outcome, ConfirmOutcome::Sealed(_)));
 
         let mut expected = vec![Op::Rewind, Op::Space(3), Op::Read(3), Op::Space(k + 1 - 4)];
-        expected.extend((k + 1..=seal).map(Op::Read));
+        // The seal is not read again: this resume's contact check read it,
+        // and confirm starts from those bytes (#403).
+        expected.extend((k + 1..seal).map(Op::Read));
         assert_eq!(fake.ops(), expected, "nothing at or before k read again");
 
         let (outcome, checked, passed): (String, i64, i64) = conn
@@ -6611,54 +7474,193 @@ mod tests {
     /// not read back re-enters confirm seal FIRST, so the unreadable seal
     /// is found at one read rather than after a forward pass over the whole
     /// tape. (The seal-last pass is only for a seal this session has just
-    /// written or just parsed.)
+    /// written or just parsed.) With issue #403: a seal whose bytes this
+    /// resume's contact check already read (they came back, but do not
+    /// parse) is not read again at all; one whose read failed is read once
+    /// more, first.
     #[test]
     fn a_resume_whose_recorded_seal_does_not_read_confirms_seal_first() {
-        let f = make_fixture();
-        let volume_id = f.volume_id;
-        let keys = f.keys.clone();
-        let (conn, _pending, _store, fake, seal, _dirs) = sealed_on_a_fake_tape_keeping_dirs(f);
-        conn.execute(
-            "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
-            params![volume_id],
-        )
-        .unwrap();
-        // What `write::finish_session` records once `seal()` returns.
-        conn.execute(
-            "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
-            params![volume_id],
-        )
-        .unwrap();
-        // The seal marker no longer parses (one block of garbage).
-        {
-            let mut st = fake.state();
-            let block = st.block_size;
-            st.files[seal as usize] = vec![0xA5; block];
+        for eio in [false, true] {
+            let f = make_fixture();
+            let volume_id = f.volume_id;
+            let keys = f.keys.clone();
+            let (conn, _pending, _store, fake, seal, _dirs) = sealed_on_a_fake_tape_keeping_dirs(f);
+            conn.execute(
+                "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+                params![volume_id],
+            )
+            .unwrap();
+            // What `write::finish_session` records once `seal()` returns.
+            conn.execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                params![volume_id],
+            )
+            .unwrap();
+            {
+                let mut st = fake.state();
+                if eio {
+                    // The seal marker fails to read (EIO before a byte).
+                    st.unreadable.push(seal);
+                } else {
+                    // The seal marker no longer parses (one block of garbage).
+                    let block = st.block_size;
+                    st.files[seal as usize] = vec![0xA5; block];
+                }
+            }
+            let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+            let pending = match InterruptedSession::rehydrate(&conn, volume_id)
+                .unwrap()
+                .expect("resumable")
+                .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+                .unwrap()
+            {
+                ResumeOutcome::Confirming(p) => p,
+                _ => panic!("a recorded seal re-enters confirm (eio: {eio})"),
+            };
+            fake.clear_ops();
+            let outcome = pending.confirm(&conn, &mut store, Tier::Integrity).unwrap();
+            assert!(
+                matches!(outcome, ConfirmOutcome::Inconclusive(_)),
+                "an unreadable seal is inconclusive, not quarantine (eio: {eio})"
+            );
+            let reads: Vec<u32> = fake
+                .ops()
+                .into_iter()
+                .filter_map(|op| match op {
+                    Op::Read(p) | Op::ReadHead(p) => Some(p),
+                    _ => None,
+                })
+                .collect();
+            if eio {
+                assert_eq!(reads, vec![seal], "the seal, and nothing after it");
+            } else {
+                assert_eq!(
+                    reads,
+                    Vec::<u32>::new(),
+                    "the seal the contact read is not read again, and nothing after it"
+                );
+            }
         }
-        let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
-        let pending = match InterruptedSession::rehydrate(&conn, volume_id)
+    }
+
+    /// Issue #408: a drive error partway through a file that is NOT a full
+    /// medium — an EIO, a bus reset — leaves the session `interrupted`, not
+    /// aborted: the files before it are whole, exactly the state a crash
+    /// leaves and resume already repositions from. The slice goes back to
+    /// `pending`, and `resume` writes it again and the session seals. It
+    /// used to be a terminal abort.
+    #[test]
+    fn a_drive_error_mid_file_interrupts_and_resume_completes() {
+        let f = make_fixture();
+        let mut store = Recording::new();
+        let slice = f.units[0].slices[0].clone();
+        let position = slice_position(&f, slice.slice_id);
+        store.fail_on = Some((position, 10));
+        store.fail_eio = true;
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
             .unwrap()
-            .expect("resumable")
-            .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let interrupted = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Interrupted(i) => i,
+            ExecuteOutcome::Aborted(a) => panic!("a drive error must not abort: {}", a.reason),
+            ExecuteOutcome::Ready(_) => panic!("expected Interrupted"),
+        };
+        let reason = interrupted.reason().unwrap().to_string();
+        assert!(
+            reason.contains("tape I/O error") && reason.contains(&format!("position {position}")),
+            "{reason}"
+        );
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["interrupted"]);
+        let wp: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM write_positions WHERE stage_slice_id = ?1",
+                params![slice.slice_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wp, "pending");
+
+        store.fail_on = None;
+        let ready = match interrupted
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .unwrap()
         {
-            ResumeOutcome::Confirming(p) => p,
-            _ => panic!("a recorded seal re-enters confirm"),
+            ResumeOutcome::Ready(r) => r,
+            _ => panic!("expected the resume to finish the write"),
         };
-        fake.clear_ops();
-        let outcome = pending.confirm(&conn, &mut store, Tier::Integrity).unwrap();
-        assert!(
-            matches!(outcome, ConfirmOutcome::Inconclusive(_)),
-            "an unreadable seal is inconclusive, not quarantine"
-        );
-        let reads: Vec<u32> = fake
-            .ops()
-            .into_iter()
-            .filter_map(|op| match op {
-                Op::Read(p) => Some(p),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(reads, vec![seal], "the seal, and nothing after it");
+        match ready
+            .seal(&mut store)
+            .unwrap()
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Sealed(_) => {}
+            _ => panic!("expected Sealed"),
+        }
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
+    }
+
+    /// Issue #408: a STAGED file that cannot be read mid-write (here: the
+    /// path now names a directory, so every read fails with EISDIR — a
+    /// stand-in for an EIO from a failing staging disk) leaves the session
+    /// `interrupted`, the error named as the source's, not the tape's. Once
+    /// the file is back, `resume` completes the write. It used to abort the
+    /// session for good and blame the tape.
+    #[test]
+    fn a_staged_file_read_error_interrupts_and_resume_completes() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let planned = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap()
+            .plan(&f.conn, f.volume_id, &f.units)
+            .unwrap();
+        let path = f.units[0].slices[1].staging_path.clone();
+        let good = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let interrupted = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Interrupted(i) => i,
+            ExecuteOutcome::Aborted(a) => {
+                panic!("a staged-file read error must not abort: {}", a.reason)
+            }
+            ExecuteOutcome::Ready(_) => panic!("expected Interrupted"),
+        };
+        let reason = interrupted.reason().unwrap().to_string();
+        assert!(reason.contains("staged source read error"), "{reason}");
+        assert!(!reason.contains("tape I/O error"), "{reason}");
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["interrupted"]);
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &good).unwrap();
+        // What `volume resume` does in a new process: the session comes
+        // back from the catalog and the session directory, not from memory.
+        drop(interrupted);
+        let interrupted = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("the interrupted session is resumable");
+        let ready = match interrupted
+            .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
+            .unwrap()
+        {
+            ResumeOutcome::Ready(r) => r,
+            _ => panic!("expected the resume to finish the write"),
+        };
+        match ready
+            .seal(&mut store)
+            .unwrap()
+            .confirm(&f.conn, &mut store, Tier::Integrity)
+            .unwrap()
+        {
+            ConfirmOutcome::Sealed(_) => {}
+            _ => panic!("expected Sealed"),
+        }
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
     }
 }

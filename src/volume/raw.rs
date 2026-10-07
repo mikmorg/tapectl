@@ -155,8 +155,8 @@ pub fn restore_raw_selected(
     // File 0: the ID thunk. Small and bounded (plain TOML text), so buffering
     // it into a Vec here (like `volume_identify` does) is fine — only the
     // per-content-file loop below needs to stream.
-    let mut thunk_bytes = Vec::new();
-    store.read_file(0, &mut thunk_bytes)?;
+    // Bounded (issue #400): read no further than `SMALL_FILE_CAP`.
+    let thunk_bytes = crate::store::read_small_bytes(store, 0, "ID thunk")?;
     let thunk_text = String::from_utf8_lossy(&thunk_bytes).to_string();
     // Before anything else of it is interpreted (ADR-0012 item 15).
     format::check_id_thunk_readable(&thunk_text)?;
@@ -173,8 +173,8 @@ pub fn restore_raw_selected(
     }
 
     // File 3 (by pointer, but always 3 per format §1): the front index.
-    let mut fi_bytes = Vec::new();
-    store.read_file(pointers.front_index as u32, &mut fi_bytes)?;
+    let fi_bytes =
+        crate::store::read_small_bytes(store, pointers.front_index as u32, "front index")?;
     let fi_text = String::from_utf8_lossy(&fi_bytes).to_string();
     let entries = format::parse_front_index(&fi_text)?;
     for p in &selection.positions {

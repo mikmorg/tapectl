@@ -234,6 +234,20 @@ pub enum TapectlError {
     #[error("tape I/O error: {0}")]
     TapeIo(String),
 
+    /// Issue #408: the medium is full — the drive refused a write with
+    /// ENOSPC (its early-warning point). The one store failure a write
+    /// session ABORTS on (ADR-0007: no salvage, a clean abort to an
+    /// unsealed tape); every other failure leaves it resumable.
+    #[error("tape full: {0}")]
+    MediumFull(String),
+
+    /// Issue #408: reading a STAGED file (the source of a tape write)
+    /// failed — the disk, not the tape. Named apart from [`Self::TapeIo`],
+    /// which it used to be reported as, so the operator looks at the right
+    /// device.
+    #[error("staged source read error: {0}")]
+    SourceIo(String),
+
     /// The drive reported no cartridge in place (`GMT_DR_OPEN`), answered by
     /// the non-blocking probe every tape-touching command runs before its
     /// first blocking open (issue #152 for `volume init`, issue #355 for the

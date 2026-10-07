@@ -5032,7 +5032,8 @@ mod tests {
                 assert_eq!(fs::read(dest.path().join("big.bin")).unwrap(), blob);
                 assert_eq!(fs::read(dest.path().join("small.txt")).unwrap(), b"small");
 
-                let mut expected = vec![Op::Rewind, Op::Read(0), Op::Space(FIRST - 1)];
+                // File 0 is a bounded head read (issue #400).
+                let mut expected = vec![Op::Rewind, Op::ReadHead(0), Op::Space(FIRST - 1)];
                 expected.extend((0..plains.len() as u32).map(|i| Op::Read(FIRST + i)));
                 assert_eq!(fake.ops(), expected);
                 assert_eq!(fake.rewinds(), 1);
@@ -5404,7 +5405,7 @@ mod tests {
                     bytes.iter().all(|(_, b)| *b == 0),
                     "a decrypted slice was on disk while the tape was read: {bytes:?}"
                 );
-                let mut expected = vec![Op::Rewind, Op::Read(0), Op::Space(FIRST - 1)];
+                let mut expected = vec![Op::Rewind, Op::ReadHead(0), Op::Space(FIRST - 1)];
                 expected.extend((0..m.slices() as u32).map(|i| Op::Read(FIRST + i)));
                 assert_eq!(m.fake.ops(), expected, "one forward pass");
             }
@@ -5641,7 +5642,8 @@ mod tests {
                     .ops()
                     .iter()
                     .filter_map(|op| match op {
-                        Op::Read(n) => Some(*n),
+                        // File 0's bounded read is a `ReadHead` (#400).
+                        Op::Read(n) | Op::ReadHead(n) => Some(*n),
                         _ => None,
                     })
                     .collect()
@@ -5906,7 +5908,8 @@ mod tests {
                     .ops()
                     .iter()
                     .filter_map(|op| match op {
-                        Op::Read(n) => Some(*n),
+                        // File 0's bounded read is a `ReadHead` (#400).
+                        Op::Read(n) | Op::ReadHead(n) => Some(*n),
                         _ => None,
                     })
                     .collect()

@@ -128,6 +128,11 @@ pub struct ConfirmPlan<'a> {
     /// goes (a file skipped on `resume`'s word included) — never for File 3
     /// or the seal, which are read on every walk.
     pub on_passed: Option<&'a dyn Fn(Checkpoint<'_>)>,
+    /// The seal marker's on-tape bytes, when the caller already read them
+    /// in this same contact (issue #403: a resume's contact check reads the
+    /// seal, and the walk used to locate it and read it again). The walk
+    /// takes the seal from here and reads every other file from the medium.
+    pub seal: Option<&'a [u8]>,
 }
 
 impl std::fmt::Debug for ConfirmPlan<'_> {
@@ -137,6 +142,7 @@ impl std::fmt::Debug for ConfirmPlan<'_> {
             .field("order", &self.order)
             .field("resume", &self.resume.map(|r| r.passed.len()))
             .field("on_passed", &self.on_passed.is_some())
+            .field("seal", &self.seal.map(<[u8]>::len))
             .finish()
     }
 }
@@ -149,6 +155,7 @@ impl<'a> ConfirmPlan<'a> {
             order: ReadOrder::SealFirst,
             resume: None,
             on_passed: None,
+            seal: None,
         }
     }
 
@@ -161,6 +168,13 @@ impl<'a> ConfirmPlan<'a> {
     /// `resume` (issue #410).
     pub fn resuming(self, resume: Option<&'a Checkpoints>) -> Self {
         Self { resume, ..self }
+    }
+
+    /// The same plan, taking the seal marker from `seal` — bytes this
+    /// contact already read at the seal position (issue #403) — instead of
+    /// the medium.
+    pub fn with_seal(self, seal: Option<&'a [u8]>) -> Self {
+        Self { seal, ..self }
     }
 
     /// The same plan, reporting every file read back clean to `on_passed`.
@@ -489,7 +503,20 @@ pub trait Store {
         // progress phase (`confirm`, `verify`), and the file being read is
         // its current item. No-ops with no progress session.
         let files = layout.entries.len();
+        let seal_pos = layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .map(|e| e.position as u32);
+        let mut cached = plan.seal;
         chain_walk(layout, plan, |position, sink| {
+            if Some(position) == seal_pos {
+                if let Some(bytes) = cached.take() {
+                    sink.write_all(bytes)
+                        .map_err(|e| TapectlError::Other(format!("sink write: {e}")))?;
+                    return Ok(bytes.len() as u64);
+                }
+            }
             crate::progress::item(format!("file {position} of {files}"));
             let mut counted = crate::progress::CountingWriter(sink);
             self.read_file(position, &mut counted)
@@ -584,6 +611,107 @@ pub trait Store {
     /// recording, and is what makes the resume cursor rule unit-testable
     /// with no tape anywhere.
     fn reposition_for_resume(&mut self, file_index: u32) -> Result<()>;
+
+    /// [`Self::reposition_for_resume`] to `file_index`, or to the end of
+    /// what the medium really holds if that comes first — returning the
+    /// file index the next `execute` writes (issue #403). A resumed write
+    /// must continue from what is ON the tape: every file but the seal ends
+    /// with an immediate filemark, so after a power loss or a bus reset the
+    /// tape can hold fewer files than the catalog recorded written. Never
+    /// moves past `file_index`.
+    ///
+    /// The default trusts `file_index` — a store with no way to count what
+    /// it holds.
+    fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+        self.reposition_for_resume(file_index)?;
+        Ok(file_index)
+    }
+
+    /// Whether the medium is PROVABLY blank: end of data at the beginning
+    /// of the tape (issue #400). Asked only after File 0 could not be read,
+    /// because the st driver fails that read with the same EIO for a blank
+    /// tape (BLANK CHECK at BOT), for a medium error on a recorded one, and
+    /// for a tape written in another block size — and only the first is
+    /// consent to write from BOT (ADR-0003 fails closed).
+    ///
+    /// `Ok(false)` is "no evidence", never "not blank": the default, for a
+    /// store that cannot tell, so the caller refuses. Moves the head; the
+    /// next read or write repositions as usual.
+    fn blank_at_bot(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+/// The most bytes a reader holds in memory for one of the small files it
+/// parses — File 0 (the ID thunk), File 3 (the front index), the seal marker
+/// (issue #400). Each is a few kilobytes and one block on tape; a front index
+/// for a full tape is about 54 KB. A file at that position larger than this
+/// is not one of them — `scripts/lto6-fill.sh` leaves a 2.5 TB File 0 in
+/// tapectl's own block size — and reading it whole into a `Vec` would run the
+/// host out of memory, so the read stops at the cap instead.
+pub const SMALL_FILE_CAP: u64 = 16 * 1024 * 1024;
+
+/// What [`read_small`] found at a position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmallRead {
+    /// The whole file, on-tape (block-padded) bytes.
+    Bytes(Vec<u8>),
+    /// More than [`SMALL_FILE_CAP`] bytes: not a tapectl ID thunk, front
+    /// index or seal marker. Nothing past the cap was read.
+    Oversized,
+}
+
+/// Read the small file at `position` whole, holding at most
+/// [`SMALL_FILE_CAP`] + 1 bytes and reading no further than that on a tape
+/// ([`Store::read_file_head`]).
+pub fn read_small(store: &mut dyn Store, position: u32) -> Result<SmallRead> {
+    let mut bytes = Vec::new();
+    store.read_file_head(position, SMALL_FILE_CAP + 1, &mut bytes)?;
+    if bytes.len() as u64 > SMALL_FILE_CAP {
+        Ok(SmallRead::Oversized)
+    } else {
+        Ok(SmallRead::Bytes(bytes))
+    }
+}
+
+/// [`read_small`], with an oversized file as an error naming `what` was
+/// expected there.
+pub fn read_small_bytes(store: &mut dyn Store, position: u32, what: &str) -> Result<Vec<u8>> {
+    match read_small(store, position)? {
+        SmallRead::Bytes(b) => Ok(b),
+        SmallRead::Oversized => Err(oversized(position, what)),
+    }
+}
+
+fn oversized(position: u32, what: &str) -> TapectlError {
+    TapectlError::Other(format!(
+        "tape file {position} is larger than {} MiB, so it is not a tapectl {what}; \
+         stopped reading it there rather than hold it in memory",
+        SMALL_FILE_CAP / (1024 * 1024)
+    ))
+}
+
+/// A sink for one small parsed file inside the chain walk: it keeps up to
+/// [`SMALL_FILE_CAP`] bytes and fails the write past that, which stops a
+/// tape read at its next block (issue #400).
+struct SmallSink<'a> {
+    bytes: &'a mut Vec<u8>,
+}
+
+impl Write for SmallSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if (self.bytes.len() + buf.len()) as u64 > SMALL_FILE_CAP {
+            return Err(io::Error::other(format!(
+                "larger than {} MiB: not a tapectl file",
+                SMALL_FILE_CAP / (1024 * 1024)
+            )));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The §5 chain walk, shared by every `Store` impl's `confirm` so the exact
@@ -709,7 +837,12 @@ where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
 {
     let mut seal_bytes = Vec::new();
-    if let Err(e) = read(seal_pos, &mut seal_bytes) {
+    if let Err(e) = read(
+        seal_pos,
+        &mut SmallSink {
+            bytes: &mut seal_bytes,
+        },
+    ) {
         return SealRead::Refused {
             files_checked: 0,
             mismatch: Mismatch {
@@ -807,7 +940,12 @@ where
     // its true bytes are genuinely needed too — same bounded-size reasoning
     // as the seal marker (issue #86).
     let mut fi_bytes = Vec::new();
-    if let Err(e) = read(fi_pos, &mut fi_bytes) {
+    if let Err(e) = read(
+        fi_pos,
+        &mut SmallSink {
+            bytes: &mut fi_bytes,
+        },
+    ) {
         mismatches.push(Mismatch {
             position: fi_pos,
             kind: MismatchKind::FrontIndexUnreadable,
@@ -1539,6 +1677,57 @@ impl Store for TapeStore {
         self.cursor = FileCursor::AtStart(file_index);
         Ok(())
     }
+
+    /// Rewind and space `file_index` filemarks. When the space fails, st's
+    /// own count says why: END OF DATA (`GMT_EOD`) at file `m` below
+    /// `file_index` means the tape holds `m` whole files, and the head is
+    /// re-placed at the START of file `m` (rewind, space `m`) — a power
+    /// loss can leave part of a file after the last filemark, and writing
+    /// at end of data would append to it. Any other failure, or a count st
+    /// has lost (`-1`) or that does not fall short of `file_index`, is the
+    /// original error: no guess about where to write.
+    fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+        let spaced = self.reposition_for_resume(file_index);
+        let Err(original) = spaced else {
+            return Ok(file_index);
+        };
+        self.cursor = FileCursor::Unknown;
+        let st = self.dev.position()?;
+        let held = match u32::try_from(st.file_number) {
+            Ok(m) if st.at_eod && m < file_index => m,
+            _ => return Err(original),
+        };
+        tracing::warn!(
+            wanted = file_index,
+            on_medium = held,
+            "the medium ends before the resume cursor"
+        );
+        self.reposition_for_resume(held)?;
+        Ok(held)
+    }
+
+    /// Rewind and space forward one filemark. A filemark found means
+    /// something is recorded. A space that fails is blank only when st says
+    /// it stopped at END OF DATA (`GMT_EOD`: the drive answered BLANK CHECK,
+    /// `st.c` sets `eof = ST_EOD`) having spaced over nothing (`mt_fileno`
+    /// 0, from the drive's residual). A medium error, a lost count (`-1`),
+    /// or a count the residual did not bring back to 0 is no evidence.
+    ///
+    /// Blind spot, accepted: a tape whose only content is data with no
+    /// filemark after it also spaces to EOD at file 0. That is never a
+    /// sealed volume of tapectl's (a seal ends with a synchronous filemark), and
+    /// st writes a filemark whenever a written file is closed.
+    fn blank_at_bot(&mut self) -> Result<bool> {
+        self.cursor = FileCursor::Unknown;
+        self.dev.rewind()?;
+        match self.dev.forward_space_file(1) {
+            Ok(()) => Ok(false),
+            Err(_) => {
+                let st = self.dev.position()?;
+                Ok(st.at_eod && st.file_number == 0)
+            }
+        }
+    }
 }
 
 /// An in-memory store: proves the interface is medium-agnostic (the "second
@@ -1610,7 +1799,7 @@ impl Store for MemStore {
         if let Some(budget) = self.enospc_after_bytes {
             let already_written: u64 = self.files.iter().map(|f| f.len() as u64).sum();
             if already_written + padded_len > budget {
-                return Err(TapectlError::Other(format!(
+                return Err(TapectlError::MediumFull(format!(
                     "MemStore: simulated ENOSPC — writing {padded_len} more bytes would exceed \
                      the {budget}-byte budget ({already_written} already recorded)"
                 )));
@@ -1619,9 +1808,9 @@ impl Store for MemStore {
         let mut buf = Vec::with_capacity(len as usize);
         src.take(len)
             .read_to_end(&mut buf)
-            .map_err(|e| TapectlError::Other(format!("read source: {e}")))?;
+            .map_err(|e| TapectlError::SourceIo(format!("read source: {e}")))?;
         if (buf.len() as u64) < len {
-            return Err(TapectlError::Other(format!(
+            return Err(TapectlError::SourceIo(format!(
                 "source exhausted after {} of {len} declared bytes",
                 buf.len()
             )));
@@ -1648,6 +1837,18 @@ impl Store for MemStore {
         self.files.truncate(file_index as usize);
         self.syncs.truncate(file_index as usize);
         Ok(())
+    }
+
+    /// The files recorded, up to `file_index`.
+    fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+        let held = file_index.min(self.files.len() as u32);
+        self.reposition_for_resume(held)?;
+        Ok(held)
+    }
+
+    /// Nothing recorded at all.
+    fn blank_at_bot(&mut self) -> Result<bool> {
+        Ok(self.files.is_empty())
     }
 }
 
@@ -2400,6 +2601,83 @@ mod tests {
         }
         fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
             self.inner.reposition_for_resume(file_index)
+        }
+    }
+
+    /// A `MemStore` whose file at `at` is a gigabyte of one byte — what
+    /// `scripts/lto6-fill.sh` leaves where a small file belongs — streamed a
+    /// mebibyte at a time and generated as it goes, so the test holds none of
+    /// it. Like a tape read, it stops at the first chunk the sink refuses.
+    /// `accepted` is every byte the sink took.
+    struct HugeFileStore {
+        inner: MemStore,
+        at: u32,
+        accepted: u64,
+    }
+
+    impl Store for HugeFileStore {
+        fn capacity(&mut self) -> Result<CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+            self.inner.execute(src, len, sync)
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            if position != self.at {
+                return self.inner.read_file(position, sink);
+            }
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..1024 {
+                sink.write_all(&chunk)
+                    .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
+                self.accepted += chunk.len() as u64;
+            }
+            Ok(self.accepted)
+        }
+        fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+            self.inner.reposition_for_resume(file_index)
+        }
+    }
+
+    /// Issue #400, bounded reads in the chain walk: a seal marker or a front
+    /// index far larger than any real one is read no further than
+    /// [`SMALL_FILE_CAP`] and is unreadable — inconclusive, not evidence
+    /// against the medium. Both used to be read whole into a `Vec`.
+    #[test]
+    fn an_oversized_seal_or_front_index_is_read_no_further_than_the_cap() {
+        for (kind, want) in [
+            (ZoneKind::SealMarker, MismatchKind::SealUnreadable),
+            (ZoneKind::FrontIndex, MismatchKind::FrontIndexUnreadable),
+        ] {
+            let (layout, mem) = build_confirm_fixture(None);
+            let at = layout
+                .entries
+                .iter()
+                .find(|e| std::mem::discriminant(&e.kind) == std::mem::discriminant(&kind))
+                .unwrap()
+                .position as u32;
+            let mut store = HugeFileStore {
+                inner: mem,
+                at,
+                accepted: 0,
+            };
+            for tier in [Tier::Navigable, Tier::Integrity] {
+                store.accepted = 0;
+                let evidence = store.confirm(&layout, tier).unwrap();
+                assert!(
+                    store.accepted <= SMALL_FILE_CAP,
+                    "{want:?}/{tier:?}: the walk took {} bytes of the file at {at}",
+                    store.accepted
+                );
+                let m = evidence
+                    .mismatches
+                    .iter()
+                    .find(|m| m.position == at)
+                    .unwrap_or_else(|| panic!("{want:?}/{tier:?}: {:?}", evidence.mismatches));
+                assert_eq!(m.kind, want);
+                assert!(m.actual.contains("larger than 16 MiB"), "{}", m.actual);
+                assert!(!evidence.proves_medium_bad(), "{want:?}/{tier:?}");
+            }
         }
     }
 
