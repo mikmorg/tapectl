@@ -65,6 +65,8 @@ CONTENDER_UNITS=()
 
 # Issue #393: let mikmorg (and an agent helping) watch sessions without sudo —
 # `tapectl --home /srv/archive_meta/tapectl status`. The group reads logs/ and
-# nothing else in the home. Not yet decided for home2: uncomment to have step 7
-# create the group, add tapectl and mikmorg to it, and write [ops] group.
-# OPS_GROUP=tapectl-ops
+# nothing else in the home. Ruled for home2 (ADR-0012, 2026-10-07 amendment,
+# item 18): step 7 creates the group, adds tapectl and mikmorg to it, and
+# writes [ops] group. home2 is already installed, so it takes effect with
+# `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 7 --to 7`.
+OPS_GROUP=tapectl-ops
