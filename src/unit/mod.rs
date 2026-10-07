@@ -1,6 +1,7 @@
 pub mod content_match;
 pub mod discovery;
 pub mod dotfile;
+pub mod identity;
 pub mod nesting;
 
 use std::path::Path;

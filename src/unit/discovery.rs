@@ -17,6 +17,10 @@ use super::dotfile;
 pub fn discover(conn: &Connection, config: &Config) -> Result<DiscoverReport> {
     let mut report = DiscoverReport::default();
 
+    // The whole scan first, every watch root, so two directories carrying
+    // one uuid are seen before either is resolved (ADR-0012, 2026-10-07
+    // item 24, #378).
+    let mut found: Vec<(std::path::PathBuf, Result<dotfile::UnitDotfile>)> = Vec::new();
     for root in &config.discovery.watch_roots {
         let root_path = Path::new(root);
         if !root_path.is_dir() {
@@ -30,45 +34,70 @@ pub fn discover(conn: &Connection, config: &Config) -> Result<DiscoverReport> {
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            if entry.file_name() != ".tapectl-unit.toml" {
+            if entry.file_name() != dotfile::UNIT_DOTFILE {
                 continue;
             }
+            let dotfile_path = entry.path().to_path_buf();
+            let df = dotfile::read_dotfile(&dotfile_path);
+            found.push((dotfile_path, df));
+        }
+    }
+    let duplicated = super::identity::refused_groups(
+        conn,
+        &found
+            .iter()
+            .filter_map(|(path, df)| {
+                let df = df.as_ref().ok()?;
+                Some((df.uuid.clone(), path.parent()?.to_path_buf()))
+            })
+            .collect::<Vec<_>>(),
+    )?;
 
-            let dotfile_path = entry.path();
-            let unit_dir = match dotfile_path.parent() {
-                Some(p) => p,
-                None => continue,
-            };
+    for (dotfile_path, df) in found {
+        let dotfile_path = dotfile_path.as_path();
+        let unit_dir = match dotfile_path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        if let Ok(df) = &df {
+            if let Some(group) = duplicated.get(&df.uuid) {
+                let refusal = super::identity::duplicate_uuid_refusal(&df.uuid, group);
+                warn!(path = %dotfile_path.display(), "{refusal}");
+                report
+                    .errors
+                    .push(format!("{}: {refusal}", dotfile_path.display()));
+                continue;
+            }
+        }
 
-            match dotfile::read_dotfile(dotfile_path) {
-                Ok(df) => {
-                    let dir_str = unit_dir.to_string_lossy().to_string();
-                    match sync_discovered_unit(conn, config, &df, &dir_str) {
-                        Ok(SyncAction::Created) => {
-                            info!(uuid = %df.uuid, name = %df.name, "discovered new unit");
-                            report.created += 1;
-                        }
-                        Ok(SyncAction::Updated) => {
-                            info!(uuid = %df.uuid, name = %df.name, "updated unit path");
-                            report.updated += 1;
-                        }
-                        Ok(SyncAction::Unchanged) => {
-                            report.unchanged += 1;
-                        }
-                        Err(e) => {
-                            warn!(path = %dotfile_path.display(), error = %e, "failed to sync unit");
-                            report
-                                .errors
-                                .push(format!("{}: {e}", dotfile_path.display()));
-                        }
+        match df {
+            Ok(df) => {
+                let dir_str = unit_dir.to_string_lossy().to_string();
+                match sync_discovered_unit(conn, config, &df, &dir_str) {
+                    Ok(SyncAction::Created) => {
+                        info!(uuid = %df.uuid, name = %df.name, "discovered new unit");
+                        report.created += 1;
+                    }
+                    Ok(SyncAction::Updated) => {
+                        info!(uuid = %df.uuid, name = %df.name, "updated unit path");
+                        report.updated += 1;
+                    }
+                    Ok(SyncAction::Unchanged) => {
+                        report.unchanged += 1;
+                    }
+                    Err(e) => {
+                        warn!(path = %dotfile_path.display(), error = %e, "failed to sync unit");
+                        report
+                            .errors
+                            .push(format!("{}: {e}", dotfile_path.display()));
                     }
                 }
-                Err(e) => {
-                    warn!(path = %dotfile_path.display(), error = %e, "failed to read dotfile");
-                    report
-                        .errors
-                        .push(format!("{}: {e}", dotfile_path.display()));
-                }
+            }
+            Err(e) => {
+                warn!(path = %dotfile_path.display(), error = %e, "failed to read dotfile");
+                report
+                    .errors
+                    .push(format!("{}: {e}", dotfile_path.display()));
             }
         }
     }
@@ -102,6 +131,10 @@ fn sync_discovered_unit(
     if let Some(existing) = queries::get_unit_by_uuid(conn, &df.uuid)? {
         // Unit exists — check if path changed
         if existing.current_path.as_deref() != Some(dir_path) {
+            // ADR-0012, 2026-10-07 item 24 (#378): a copy, not a move.
+            if let Some(refusal) = super::identity::copy_refusal(&existing, dir_path) {
+                return Err(crate::error::TapectlError::Other(refusal));
+            }
             queries::update_unit_path(conn, existing.id, dir_path)?;
             events::log_field_change(
                 conn,
@@ -197,6 +230,73 @@ mod tests {
         };
         dotfile::write_dotfile(&dir.join(".tapectl-unit.toml"), &df).unwrap();
         df
+    }
+
+    fn seed_alice(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('alice', 0, 'active')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// ADR-0012, 2026-10-07 item 24 (#378): a dotfile carrying a known
+    /// unit's uuid, found while the unit's recorded directory still exists,
+    /// is a copy, not a move: refused, and the unit is not repointed.
+    #[test]
+    fn discover_refuses_a_copy_of_a_known_unit() {
+        let conn = fresh_conn();
+        seed_alice(&conn);
+        let tmp = TempDir::new().unwrap();
+        let original = tmp.path().join("original");
+        std::fs::create_dir_all(&original).unwrap();
+        let df = write_test_dotfile(&original, None);
+        let report = discover(&conn, &watching(tmp.path())).unwrap();
+        assert_eq!(report.created, 1, "errors: {:?}", report.errors);
+
+        let copy = tmp.path().join("restored");
+        std::fs::create_dir_all(&copy).unwrap();
+        dotfile::write_dotfile(&copy.join(".tapectl-unit.toml"), &df).unwrap();
+        let report = discover(&conn, &watching(tmp.path())).unwrap();
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(
+            report.errors[0].contains("restored") && report.errors[0].contains("copy"),
+            "{:?}",
+            report.errors
+        );
+        assert_eq!(report.updated, 0);
+        let unit = queries::get_unit_by_uuid(&conn, &df.uuid).unwrap().unwrap();
+        assert_eq!(
+            unit.current_path.as_deref(),
+            Some(original.to_string_lossy().as_ref()),
+            "never repointed to the copy"
+        );
+
+        // A real move (the original gone) is still followed.
+        std::fs::remove_dir_all(&original).unwrap();
+        let report = discover(&conn, &watching(tmp.path())).unwrap();
+        assert_eq!(report.updated, 1, "errors: {:?}", report.errors);
+    }
+
+    /// Two directories in one scan carrying one uuid are both refused.
+    #[test]
+    fn discover_refuses_two_directories_carrying_one_uuid() {
+        let conn = fresh_conn();
+        seed_alice(&conn);
+        let tmp = TempDir::new().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let df = write_test_dotfile(&one, None);
+        dotfile::write_dotfile(&two.join(".tapectl-unit.toml"), &df).unwrap();
+
+        let report = discover(&conn, &watching(tmp.path())).unwrap();
+        assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+        assert_eq!(report.created, 0);
+        assert!(queries::get_unit_by_uuid(&conn, &df.uuid)
+            .unwrap()
+            .is_none());
     }
 
     /// Issue #48 item 3: `sync_discovered_unit` used to never even read
