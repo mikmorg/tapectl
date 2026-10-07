@@ -1260,7 +1260,9 @@ impl Config {
     /// `tape_only_safety_multiplier` MULTIPLIES the base copy/location
     /// requirement for a `tape_only` unit in
     /// `policy::reclaimable::assess` (`required_copies *= multiplier`,
-    /// `required_locations *= multiplier`) — it never replaces it. `0`
+    /// `required_locations *= multiplier`, and each named required location
+    /// must hold `multiplier` copies — ADR-0012, 2026-10-07, item 15) — it
+    /// never replaces it. `0`
     /// zeroes both requirements outright (the subsequent `copy_count <
     /// required_copies` and `required_locations > 0 && ...` guards both go
     /// vacuous), and a negative value is worse: `required_copies` goes

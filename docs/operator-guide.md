@@ -2004,8 +2004,9 @@ no compaction candidates (threshold: live data below 50% of the archive data on 
 `snapshot mark-reclaimable` releases an older version once a newer current
 version supersedes it, and first checks that the superseding version is
 covered on its own: `min_copies` copies, and a copy at each of its
-`required_locations` by name (for a tape-only unit, both floors multiplied by
-`[compaction] tape_only_safety_multiplier`). A shortfall goes through the same
+`required_locations` by name (for a tape-only unit, every floor multiplied by
+`[compaction] tape_only_safety_multiplier`: the copies, the number of places,
+and the copies at each named location — two at `offsite` at 2x). A shortfall goes through the same
 Tier-2 consent as `mark-tape-only`: a terminal asks, `--force` or `--yes`
 confirms in advance, and a session with no terminal and neither flag refuses,
 naming it (for example

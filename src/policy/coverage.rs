@@ -787,6 +787,59 @@ fn names_holding_every(
     Ok(present.unwrap_or_default())
 }
 
+/// The names in `required` at which snapshot `snapshot_id` has FEWER than
+/// `per_name` copies, each with the copies it has there, in `required`'s
+/// order (duplicates collapsed). A name with no copy at all is listed with
+/// 0, so with `per_name` 1 this names exactly what
+/// [`missing_required_locations_for_snapshot`] does.
+///
+/// `snapshot mark-reclaimable` asks it of the superseding version of a
+/// tape-only unit, with `per_name` the tape-only multiplier: ADR-0012's
+/// 2026-10-07 amendment, item 15 — named required locations take the
+/// multiplier too, as the distinct-location count does.
+///
+/// A copy "at" a location is counted on the same terms
+/// [`copy_count_expr`] counts copies and [`location_count_expr`] places
+/// them: a distinct [`eligible`] volume with a completed write, shelved
+/// there, plus each recorded warehouse deposit there of such a volume
+/// (ADR-0006) — unioned, so one volume with several writes of the version
+/// is one copy.
+pub fn short_required_locations_for_snapshot(
+    conn: &Connection,
+    snapshot_id: i64,
+    required: &[String],
+    per_name: i64,
+) -> crate::error::Result<Vec<(String, i64)>> {
+    let wanted = distinct_names(required);
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let q = CoverageQuery {
+        scope: CoverageScope::Snapshot { id_expr: "?1" },
+        exclude_volume: None,
+    };
+    let sql = format!(
+        "SELECT l.name, COUNT(*) FROM (
+            {} AND cv.location_id IS NOT NULL
+            UNION
+            {}
+         ) at_loc
+         JOIN locations l ON l.id = at_loc.loc
+         GROUP BY l.name",
+        eligible_writes(&q, "'v' || cw.volume_id AS copy, cv.location_id AS loc"),
+        scoped_deposits(&q, "'d' || cd.id AS copy, cd.location_id AS loc"),
+    );
+    let held: std::collections::HashMap<String, i64> = conn
+        .prepare(&sql)?
+        .query_map(params![snapshot_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(wanted
+        .into_iter()
+        .map(|name| (name.clone(), held.get(name.as_str()).copied().unwrap_or(0)))
+        .filter(|(_, copies)| *copies < per_name)
+        .collect())
+}
+
 // ── The retire family's floor (ADR-0008 Tier 3 / ADR-0012, issue #147) ──
 
 /// One CURRENT version of a unit whose coverage a retirement is about to
