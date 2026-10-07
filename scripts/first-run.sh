@@ -1103,7 +1103,7 @@ EOF
       die "volume $LABEL has a write session in progress RIGHT NOW (another process is writing it — tapectl turns a crashed session into an interrupted one whenever it opens the catalog). Find that process and let it finish; do not start a second writer"
       ;;
     planned)
-      die "volume $LABEL has a write session that was planned and never reached the tape. Clear it with \`tapectl volume abort $LABEL\`, then re-run scripts/first-run.sh --from 13 --label $LABEL to write it"
+      die "volume $LABEL has a write session that was planned and never reached the tape. Clear it with \`tapectl volume abort $LABEL\`, then re-run under a NEW label: scripts/first-run.sh --from 13 --label <new>. This label cannot be written again once its session is aborted. The cartridge's File 0 still names $LABEL, so the new label's init asks before overwriting it, and marks $LABEL erased"
       ;;
     sealed)
       ok "volume $LABEL is already sealed — going on to the verify, audit, shelf and Heir Kit steps it is still owed"

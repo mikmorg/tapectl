@@ -182,6 +182,53 @@ fn the_real_volume_info_json_of_an_unwritten_volume_reads_fresh() {
     );
 }
 
+/// The `planned` branch's remedy must lead somewhere. `volume abort` turns
+/// the session's rows `aborted`, and a label whose sessions are all aborted
+/// classifies as `other` (asserted in `everything_else_stops`), which step
+/// 13 stops on; and `volume write` on that label could not plan anyway —
+/// `writes` is `UNIQUE(stage_set_id, volume_id)` and the aborted row stays.
+/// So after the abort the operator must re-run with a NEW label: `volume
+/// init` on the same cartridge then displaces the old row to `erased`.
+#[test]
+fn a_planned_session_is_cleared_and_written_under_a_new_label() {
+    // The state the remedy leaves is one step 13 refuses to write again.
+    assert_eq!(state_of(&info("initialized", "ok", &["aborted"])), "other");
+
+    let script =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/first-run.sh"))
+            .unwrap();
+    let planned = script
+        .split("\n    planned)\n")
+        .nth(1)
+        .and_then(|s| s.split(";;").next())
+        .expect("step 13 has a `planned` branch");
+    assert!(
+        planned.contains("tapectl volume abort $LABEL"),
+        "the branch names the abort: {planned}"
+    );
+    assert!(
+        !planned.contains("--label $LABEL"),
+        "re-running with the same label after the abort is a dead end: {planned}"
+    );
+    assert!(
+        planned.contains("--from 13 --label <new>"),
+        "the branch names a new label: {planned}"
+    );
+
+    let install =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/install.md"))
+            .unwrap();
+    let flat = install.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !flat.contains("`tapectl volume abort <label>`, then re-run)"),
+        "docs/install.md §5 must not send the operator back to the same label"
+    );
+    assert!(
+        flat.contains("`tapectl volume abort <label>`, then re-run with a new label"),
+        "docs/install.md §5 names the new label"
+    );
+}
+
 /// Step 13 itself: the resume and sealed branches exist and the write path
 /// is skipped for them. Before #414 the step had no `volume resume` at all
 /// and died on any existing label that was not `initialized`.

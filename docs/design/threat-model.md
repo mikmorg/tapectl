@@ -203,9 +203,12 @@ Each write session writes one cartridge, and each cartridge is complete in
 itself: its own guide, RESTORE.sh, front index, envelopes, slices and seal. No
 tape needs another to be read, and losing one costs exactly its own copies.
 
-A unit larger than one cartridge is refused, at `stage create` and `collection
-plan`, with the limit for the cartridge's generation (ADR-0012, 2026-10-06,
-item 17; #395). Planned spanning — the planner splitting a unit's slices across
+`collection plan` refuses a unit larger than the per-tape budget
+(`collection::selector::OversizedUnit`). The same refusal at `stage create`,
+naming the limit for the cartridge's generation, is ruled (ADR-0012,
+2026-10-06, item 17) and not yet built (#395): today `stage create` stages
+an oversized unit in full, and only `volume write`'s pre-flight capacity gate
+refuses it, before any byte reaches the tape. Planned spanning — the planner splitting a unit's slices across
 a named set of cartridges — is designed once any unit passes about half a
 cartridge, and §4's mechanism lets it arrive without breaking older readers.
 A drive running out mid-unit is not a split: mid-write handover was rejected

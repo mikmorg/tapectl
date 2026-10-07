@@ -23,8 +23,10 @@
 #             crashed session into `interrupted` whenever it opens the catalog
 #             (as `volume info` just did), so this one has a live writer
 #   planned   only a `planned` session: nothing reached the tape; `volume
-#             abort` clears it, then the write runs again (`volume resume`
-#             refuses a planned session and says so)
+#             abort` clears it, then the write runs under a NEW label (the
+#             aborted rows stay, so this label reads `other` from then on and
+#             `writes` is UNIQUE(stage_set_id, volume_id)); `volume resume`
+#             refuses a planned session and says so
 #   sealed    sealed and in service: only the post-write block is left (its
 #             verify --full is run again on a re-entry: a full confirm also
 #             records a full verification, so the JSON cannot tell "the

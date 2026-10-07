@@ -1295,8 +1295,12 @@ tapectl volume resume L6-0003 --device "$TAPE"
 `volume resume` explains itself when there is nothing it can pick up:
 
 - ``has a `planned` write session, not an interrupted one: … nothing was ever
-  written to tape``: clear it with `tapectl volume abort <label>`, then run
-  `volume write` again.
+  written to tape``: clear it with `tapectl volume abort <label>`, then write
+  the batch under a NEW label on the same cartridge (`volume init <new>
+  --force`, then `volume write <new>`). The aborted label cannot be written
+  again: its aborted `writes` rows stay, and `writes` allows one row per stage
+  set and volume. File 0 still names the old label, so init refuses without
+  `--force`; with it, init marks the old volume `erased`.
 - ``has an `in_progress` write session … ANOTHER PROCESS IS WRITING THIS TAPE
   RIGHT NOW``: tapectl turns crashed sessions into `interrupted` whenever it
   opens the database, so a row still `in_progress` means a writer is live.
