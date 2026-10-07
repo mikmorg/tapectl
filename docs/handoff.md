@@ -50,9 +50,12 @@ It answers one question: **which remaining work needs a person, and which does n
 > 6. After the write session, regenerate the Heir Kit (its cover now states the disk space
 >    a restore needs) and back up the catalog.
 >
-> Operator rules until #376/#377/#378 land: one tapectl writer at a time; no
+> Operator rules until #376/#377 land: one tapectl writer at a time; no
 > `volume abort`, `volume resume`, `staging clean --force` or `db import` during a write or
-> confirm; no `unit tag`, `unit rename` or dotfile edit on an archived unit.
+> confirm. The rule against `unit tag`, `unit rename` or a dotfile edit on an archived unit
+> holds only while home2 runs a build without #378: from the build that carries it, the
+> unit's own `.tapectl-unit.toml` is not content and those edits mint no version (ADR-0012,
+> 2026-10-07 item 24).
 
 ## The state, in one paragraph
 
