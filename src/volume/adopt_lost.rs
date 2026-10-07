@@ -1074,6 +1074,53 @@ mod tests {
         assert_refused_untouched(&lost, &verdict);
     }
 
+    /// A slice of this volume the catalog records at a file the front index
+    /// does not list as a slice (here File 1, the system guide): the tape
+    /// does not hold everything the catalog says it does.
+    #[test]
+    fn condition_3_refuses_a_catalog_position_the_front_index_has_no_slice_at() {
+        let mut lost = Lost::ready();
+        lost.conn
+            .execute_batch(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                           sha256_plain, sha256_encrypted)
+                 SELECT stage_set_id, 99, 1, 1, 'p', 'e' FROM stage_slices LIMIT 1;
+                 INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+                 SELECT (SELECT MIN(id) FROM writes), MAX(id), '1', 'written' FROM stage_slices;",
+            )
+            .unwrap();
+        let verdict = lost.adopt();
+        assert!(
+            matches!(&verdict, LostAdoption::NotWhatThisCatalogStaged { why }
+                if why.contains("at file 1") && why.contains("does not list")),
+            "{verdict:?}"
+        );
+        assert_refused_untouched(&lost, &verdict);
+    }
+
+    /// A stage set only partly on this tape: every slice on the tape is one
+    /// the catalog staged, but the catalog staged one more, so the write
+    /// this tape would complete is not whole.
+    #[test]
+    fn condition_3_refuses_a_stage_set_not_whole_on_the_tape() {
+        let mut lost = Lost::ready();
+        lost.conn
+            .execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                           sha256_plain, sha256_encrypted)
+                 SELECT stage_set_id, 99, 1, 1, 'p', 'e' FROM stage_slices LIMIT 1",
+                [],
+            )
+            .unwrap();
+        let verdict = lost.adopt();
+        assert!(
+            matches!(&verdict, LostAdoption::NotWhatThisCatalogStaged { why }
+                if why.contains("staged 3 slice(s), but 2 of them")),
+            "{verdict:?}"
+        );
+        assert_refused_untouched(&lost, &verdict);
+    }
+
     /// The ruling's order: with condition 1 AND condition 2 unmet, the
     /// refusal names condition 1.
     #[test]
