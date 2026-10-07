@@ -8,6 +8,7 @@ use std::time::Duration;
 use rusqlite::{params, Connection};
 use tracing::info;
 
+use crate::db::files::FileKind;
 use crate::error::{Result, TapectlError};
 use crate::util::HashingReader;
 
@@ -79,17 +80,19 @@ pub(crate) fn plan(
     // 'symlink' / 'special'). NEW detection needs every non-directory path,
     // symlink/special included, or a staged symlink would reappear as NEW
     // on every re-stage.
-    let mut stmt = conn.prepare(
-        "SELECT path, size_bytes, sha256, file_type FROM files
-         WHERE snapshot_id = ?1 AND is_directory = 0",
-    )?;
-    let all_entries: Vec<(String, i64, Option<String>, Option<String>)> = stmt
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.path, fv.size_bytes, fv.sha256, fv.kind FROM {}
+         WHERE fv.snapshot_id = ?1 AND fv.kind <> 0
+         ORDER BY fv.path_id",
+        crate::db::files::VERSION_FILES
+    ))?;
+    let all_entries: Vec<(String, i64, Option<String>, FileKind)> = stmt
         .query_map(params![snapshot_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
+                crate::db::files::sha256_column(row.get(2)?),
+                row.get::<_, FileKind>(3)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -127,7 +130,7 @@ pub(crate) fn plan(
     // FIFO with no writer blocks forever: both are recorded, never hashed.
     let mut regular: HashMap<&str, (i64, Option<&String>)> = all_entries
         .iter()
-        .filter(|(_, _, _, file_type)| file_type.as_deref() == Some("regular"))
+        .filter(|(_, _, _, kind)| *kind == FileKind::Regular)
         .map(|(path, size, sha, _)| (path.as_str(), (*size, sha.as_ref())))
         .collect();
 
@@ -144,8 +147,8 @@ pub(crate) fn plan(
     }
     // What the walk did not find, in manifest order: MISSING, or excluded
     // since the snapshot (still hashed; dar skips it).
-    for (path, _, _, file_type) in &all_entries {
-        if file_type.as_deref() != Some("regular") {
+    for (path, _, _, kind) in &all_entries {
+        if *kind != FileKind::Regular {
             continue;
         }
         if let Some((size, baseline)) = regular.remove(path.as_str()) {
@@ -1094,12 +1097,7 @@ mod tests {
             // special rows for the issue #33/H7 tests go through
             // `insert_nonregular_file` instead, which takes file_type
             // explicitly.
-            conn.execute(
-                "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory, file_type)
-                 VALUES (?1, ?2, ?3, ?4, 0, 'regular')",
-                params![sid, path, size, sha],
-            )
-            .unwrap();
+            crate::db::files::fixture::insert(&conn, sid, path, *size, "regular", *sha);
         }
         (conn, sid)
     }
@@ -1664,13 +1662,7 @@ mod tests {
         // Simulate stage_create's backfill step and confirm it actually
         // lands — there is nothing to protect yet, so this must write.
         crate::staging::backfill_checksums(&conn, sid, &checksums).unwrap();
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
-                params![sid],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let stored: Option<String> = crate::db::files::fixture::sha256(&conn, sid, "a.txt");
         assert_eq!(stored.as_deref(), Some(hex.as_str()));
     }
 
@@ -1687,13 +1679,7 @@ mod tests {
         assert_eq!(checksums[0].1, baseline);
 
         crate::staging::backfill_checksums(&conn, sid, &checksums).unwrap();
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
-                params![sid],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let stored: Option<String> = crate::db::files::fixture::sha256(&conn, sid, "a.txt");
         assert_eq!(stored.as_deref(), Some(baseline));
     }
 
@@ -1743,13 +1729,7 @@ mod tests {
         // itself never writes, but assert directly against the DB so this
         // test also guards against a future refactor that calls backfill
         // unconditionally before checking the result.
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
-                params![sid],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let stored: Option<String> = crate::db::files::fixture::sha256(&conn, sid, "a.txt");
         assert_eq!(stored.as_deref(), Some(stale_baseline.as_str()));
     }
 
@@ -1815,47 +1795,29 @@ mod tests {
         // `sha256 IS NULL` guard must still refuse the write. This is what
         // makes the "(first stage only)" comment literally true rather
         // than a promise nothing enforces.
-        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some("original00baseline"))]);
+        let original = "0a".repeat(32);
+        let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, Some(original.as_str()))]);
 
-        crate::staging::backfill_checksums(
-            &conn,
-            sid,
-            &[("a.txt".to_string(), "attemptedoverwrite".to_string())],
-        )
-        .unwrap();
-
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
-                params![sid],
-                |row| row.get(0),
-            )
+        crate::staging::backfill_checksums(&conn, sid, &[("a.txt".to_string(), "0b".repeat(32))])
             .unwrap();
+
+        let stored: Option<String> = crate::db::files::fixture::sha256(&conn, sid, "a.txt");
         assert_eq!(
-            stored.as_deref(),
-            Some("original00baseline"),
-            "backfill must never overwrite an existing files.sha256 baseline"
+            stored,
+            Some(original),
+            "backfill must never overwrite an existing sha256 baseline"
         );
     }
 
     #[test]
     fn backfill_checksums_establishes_a_baseline_when_absent() {
         let (conn, sid) = setup_conn_with_snapshot(&[("a.txt", 5, None)]);
-        crate::staging::backfill_checksums(
-            &conn,
-            sid,
-            &[("a.txt".to_string(), "freshbaseline".to_string())],
-        )
-        .unwrap();
-
-        let stored: Option<String> = conn
-            .query_row(
-                "SELECT sha256 FROM files WHERE snapshot_id = ?1 AND path = 'a.txt'",
-                params![sid],
-                |row| row.get(0),
-            )
+        let fresh = "0c".repeat(32);
+        crate::staging::backfill_checksums(&conn, sid, &[("a.txt".to_string(), fresh.clone())])
             .unwrap();
-        assert_eq!(stored.as_deref(), Some("freshbaseline"));
+
+        let stored: Option<String> = crate::db::files::fixture::sha256(&conn, sid, "a.txt");
+        assert_eq!(stored, Some(fresh));
     }
 
     // --- issue #354: the staging-space lower bound the read yields ---
@@ -1890,18 +1852,8 @@ mod tests {
         )
         .unwrap();
         let sid = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory, file_type)
-             VALUES (?1, 'subdir', 0, 1, 'dir')",
-            [sid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory, file_type)
-             VALUES (?1, 'subdir/f.txt', 1, 0, 'regular')",
-            [sid],
-        )
-        .unwrap();
+        crate::db::files::fixture::insert(&conn, sid, "subdir", 0, "dir", None);
+        crate::db::files::fixture::insert(&conn, sid, "subdir/f.txt", 1, "regular", None);
 
         let result = validate_source(&conn, sid, tmp.path().to_str().unwrap(), &[])
             .unwrap()
@@ -2089,12 +2041,18 @@ mod tests {
         file_type: &str,
         link_target: Option<&str>,
     ) {
-        conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory, file_type, link_target)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
-            params![snapshot_id, path, size, file_type, link_target],
-        )
-        .unwrap();
+        crate::db::files::fixture::insert_entry(
+            conn,
+            snapshot_id,
+            crate::db::files::FileEntry {
+                path: path.to_string(),
+                kind: FileKind::from_name(file_type).unwrap(),
+                size_bytes: size,
+                mtime_ns: None,
+                sha256: None,
+                link_target: link_target.map(str::to_string),
+            },
+        );
     }
 
     #[test]

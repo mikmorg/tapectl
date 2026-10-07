@@ -109,9 +109,9 @@ Accepted by every command, before or after the subcommand.
 | [`audit`](audit.md) | Policy compliance audit |
 | [`catalog`](catalog.md) | Browse and search file catalog |
 | &nbsp;&nbsp;[`catalog ls`](catalog.md#tapectl-catalog-ls) | List files in a unit's latest snapshot |
-| &nbsp;&nbsp;[`catalog search`](catalog.md#tapectl-catalog-search) | Search for files by pattern |
+| &nbsp;&nbsp;[`catalog search`](catalog.md#tapectl-catalog-search) | Search for files by pattern, in each unit's newest version |
 | &nbsp;&nbsp;[`catalog locate`](catalog.md#tapectl-catalog-locate) | Show which volume(s) contain a unit |
-| &nbsp;&nbsp;[`catalog stats`](catalog.md#tapectl-catalog-stats) | Show catalog statistics |
+| &nbsp;&nbsp;[`catalog stats`](catalog.md#tapectl-catalog-stats) | Show catalog statistics. Files and Total are summed over every version that still has a file list: Files counts non-directory entries, Total counts regular-file bytes |
 | &nbsp;&nbsp;[`catalog rebuild`](catalog.md#tapectl-catalog-rebuild) | Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup |
 | [`location`](location.md) | Manage storage locations |
 | &nbsp;&nbsp;[`location add`](location.md#tapectl-location-add) | Add a storage location |

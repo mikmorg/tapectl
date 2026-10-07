@@ -2,6 +2,7 @@ pub mod busy;
 pub mod catalog_snapshot;
 pub mod events;
 pub mod export;
+pub mod files;
 #[allow(dead_code)]
 pub mod models;
 pub mod ontape_catalog;
@@ -415,14 +416,26 @@ fn migrations() -> Migrations<'static> {
         // `.foreign_key_check()`; both subject keys are `ON DELETE SET
         // NULL` so a snapshot delete never trips on them. See the header.
         M::up(include_str!("migrations/028_phase_timings.sql")),
+        // 029 is RESERVED for another batch's migration and is empty here;
+        // see its header. Replace it with the real 029 when that lands.
+        M::up(include_str!("migrations/029_reserved.sql")),
+        // 030 stores per-file data once per unit (issue #380 option A,
+        // #381; ADR-0012 item 7): `paths` (+ `paths_fts`) and the narrow
+        // WITHOUT ROWID `file_versions`, converted from `files` exactly or
+        // refused by row id; `files` and `files_fts` are dropped. The new
+        // tables reference `units`/`snapshots`/`paths`, hence
+        // `.foreign_key_check()`. `migrate()` VACUUMs after it. See the
+        // header.
+        M::up(include_str!("migrations/030_paths_and_file_versions.sql")).foreign_key_check(),
     ])
 }
 
-/// The migration that dropped the manifest tables and the dead indexes
-/// (issue #372). `migrate()` VACUUMs once right after applying it, so the
-/// space those objects held (about half of the production catalog in 2026-09)
-/// goes back to the filesystem.
-const VACUUM_AFTER_VERSION: i64 = 27;
+/// The migrations that free most of a catalog: 027 dropped the manifest
+/// tables and the dead indexes (issue #372, about half of the production
+/// catalog in 2026-09), and 030 replaced `files`/`files_fts` with the
+/// interned shape (issue #380). `migrate()` VACUUMs once right after an open
+/// that applies either, so the space goes back to the filesystem.
+const VACUUM_AFTER_VERSIONS: [i64; 2] = [27, 30];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     let before: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -435,11 +448,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     // process holding the catalog) leaves the space unreclaimed but the
     // schema correct, so it warns rather than failing the command, and the
     // operator can run `sqlite3 tapectl.db VACUUM` later.
-    if before > 0 && before < VACUUM_AFTER_VERSION && after >= VACUUM_AFTER_VERSION {
+    let crossed = VACUUM_AFTER_VERSIONS
+        .iter()
+        .rev()
+        .find(|v| before < **v && after >= **v);
+    if let (true, Some(v)) = (before > 0, crossed) {
         if let Err(e) = conn.execute_batch("VACUUM") {
             warn!(
                 error = %e,
-                "migration 027 applied, but the VACUUM that returns the freed space \
+                "migration {v:03} applied, but the VACUUM that returns the freed space \
                  failed; the catalog is correct, only larger than it needs to be"
             );
         }
@@ -3442,7 +3459,7 @@ mod tests {
              INSERT INTO unit_path_history (id, unit_id, path, observed_at)
                   VALUES (800, 500, '/src/a', '2026-01-06 00:00:00');
              INSERT INTO files (id, snapshot_id, path, size_bytes, sha256, is_directory)
-                  VALUES (801, 600, 'dir/needle.txt', 10, 'ab', 0);
+                  VALUES (801, 600, 'dir/needle.txt', 10, '00ab00ab00ab00ab00ab00ab00ab00ab00ab00ab00ab00ab00ab00ab00ab00ab', 0);
              INSERT INTO manifests (id, snapshot_id, created_at)
                   VALUES (802, 600, '2026-01-06 00:00:01');
              INSERT INTO stage_sets (id, snapshot_id, status, slice_size, num_slices, created_at)
@@ -3881,7 +3898,7 @@ mod tests {
                 tx.execute(
                     "INSERT INTO files (snapshot_id, path, size_bytes, sha256, modified_at,
                                         is_directory, file_type)
-                     VALUES (?1, ?2, ?3, ?4, '2026-01-01T00:00:00Z', 0, 'regular')",
+                     VALUES (?1, ?2, ?3, ?4, '2026-01-01T00:00:00+00:00', 0, 'regular')",
                     rusqlite::params![sid, path, f, sha],
                 )
                 .unwrap();
@@ -4014,7 +4031,8 @@ mod tests {
     /// FTS index alone, and a rename still reaches search.
     #[test]
     fn test_migration_027_fts_update_trigger_fires_on_path_only() {
-        let conn = open_memory().unwrap();
+        // Pinned to schema 27: 030 replaced `files` and its triggers.
+        let conn = open_memory_at_version(27);
         let sql: String = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'files_au'",
@@ -4134,7 +4152,11 @@ mod tests {
         };
 
         let conn = open(&path).unwrap();
-        assert_eq!(user_version(&conn), 28, "027 and then 028 (issue #386)");
+        assert_eq!(
+            user_version(&conn),
+            30,
+            "027 through 030 (issues #386, #380)"
+        );
         let freelist: i64 = conn
             .query_row("PRAGMA freelist_count", [], |r| r.get(0))
             .unwrap();
@@ -4146,5 +4168,327 @@ mod tests {
             pages < size_before,
             "the dropped tables' pages were returned: {pages} >= {size_before}"
         );
+    }
+
+    // --- Migration 030 (issues #380, #381): paths + file_versions ---
+
+    /// A schema-29 catalog with every shape a `files` row takes in
+    /// production: a directory, a hashed regular file, an unhashed one, a
+    /// symlink with its target, the NULL `file_type` rows a pre-#381 rebuild
+    /// wrote (a file and a directory), the same path in two versions of one
+    /// unit, and the same path in another unit. Returns the rows as
+    /// `(unit, version, path, file_type after 030, size, sha256, modified_at,
+    /// link_target)`, in the old vocabulary.
+    #[allow(clippy::type_complexity)]
+    fn seed_schema_29_files(
+        conn: &Connection,
+    ) -> Vec<(
+        String,
+        i64,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        assert_eq!(user_version(conn), 29, "precondition: at schema 29");
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't', 1, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id) VALUES (10, 'u10', 'alpha', 1);
+             INSERT INTO units (id, uuid, name, tenant_id) VALUES (11, 'u11', 'bravo', 1);
+             INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (20, 10, 1, '/a');
+             INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (21, 10, 2, '/a');
+             INSERT INTO snapshots (id, unit_id, version, source_path) VALUES (22, 11, 1, '/b');",
+        )
+        .unwrap();
+        let hash = "0123456789abcdef".repeat(4);
+        let rows: Vec<(
+            i64,
+            &str,
+            i64,
+            Option<&str>,
+            i64,
+            Option<&str>,
+            Option<&str>,
+            Option<&str>,
+        )> = vec![
+            (
+                20,
+                "docs",
+                1,
+                Some("dir"),
+                0,
+                None,
+                Some("2026-09-01T12:00:00+00:00"),
+                None,
+            ),
+            (
+                20,
+                "docs/a.txt",
+                0,
+                Some("regular"),
+                10,
+                Some(&hash),
+                Some("2026-09-01T12:00:01+00:00"),
+                None,
+            ),
+            (
+                20,
+                "link",
+                0,
+                Some("symlink"),
+                10,
+                None,
+                Some("1969-12-31T23:59:59+00:00"),
+                Some("docs/a.txt"),
+            ),
+            (20, "old.bin", 0, None, 7, None, None, None),
+            (20, "olddir", 1, None, 0, None, None, None),
+            (
+                21,
+                "docs",
+                1,
+                Some("dir"),
+                0,
+                None,
+                Some("2026-09-01T12:00:00+00:00"),
+                None,
+            ),
+            (
+                21,
+                "docs/a.txt",
+                0,
+                Some("regular"),
+                11,
+                None,
+                Some("2026-09-02T00:00:00+00:00"),
+                None,
+            ),
+            (
+                22,
+                "docs/a.txt",
+                0,
+                Some("special"),
+                0,
+                None,
+                Some("2026-09-03T00:00:00+00:00"),
+                None,
+            ),
+        ];
+        for (sid, path, is_dir, ft, size, sha, mtime, link) in &rows {
+            conn.execute(
+                "INSERT INTO files (snapshot_id, path, size_bytes, sha256, modified_at,
+                                    is_directory, file_type, link_target)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![sid, path, size, sha, mtime, is_dir, ft, link],
+            )
+            .unwrap();
+        }
+        rows.into_iter()
+            .map(|(sid, path, is_dir, ft, size, sha, mtime, link)| {
+                let (unit, version) = match sid {
+                    20 => ("alpha", 1),
+                    21 => ("alpha", 2),
+                    _ => ("bravo", 1),
+                };
+                let ft = ft.unwrap_or(if is_dir == 1 { "dir" } else { "regular" });
+                (
+                    unit.to_string(),
+                    version,
+                    path.to_string(),
+                    ft.to_string(),
+                    size,
+                    sha.map(str::to_string),
+                    mtime.map(str::to_string),
+                    link.map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    /// THE test for 030: every `files` row comes through as exactly one
+    /// `file_versions` row whose values convert back to the original text,
+    /// each path is stored once per unit, the search index holds distinct
+    /// paths, and the old tables are gone.
+    #[test]
+    fn test_migrate_029_catalog_to_030_converts_every_file_row_exactly() {
+        let mut conn = open_memory_at_version(29);
+        let expected = seed_schema_29_files(&conn);
+
+        migrate_to(&mut conn, Some(30)).expect("030 must convert this catalog");
+        assert_eq!(user_version(&conn), 30);
+
+        let mut got: Vec<_> = conn
+            .prepare(
+                "SELECT u.name, s.version, p.path, fv.kind, fv.size_bytes, fv.sha256,
+                        fv.mtime_ns, fv.link_target
+                 FROM file_versions fv
+                 JOIN paths p ON p.id = fv.path_id
+                 JOIN snapshots s ON s.id = fv.snapshot_id
+                 JOIN units u ON u.id = s.unit_id AND u.id = p.unit_id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, files::FileKind>(3)?.as_str().to_string(),
+                    r.get::<_, i64>(4)?,
+                    files::sha256_column(r.get(5)?),
+                    r.get::<_, Option<i64>>(6)?
+                        .map(|ns| files::mtime_ns_to_rfc3339(ns).unwrap()),
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        got.sort();
+        let mut want = expected;
+        want.sort();
+        assert_eq!(got, want, "every row, converted back, equals the original");
+
+        let paths: i64 = conn
+            .query_row("SELECT COUNT(*) FROM paths", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            paths, 6,
+            "5 distinct paths in alpha's two versions, 1 in bravo"
+        );
+        let txt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM paths_fts WHERE paths_fts MATCH 'txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(txt, 2, "one hit per unit's distinct path, not per version");
+        conn.execute(
+            "INSERT INTO paths_fts(paths_fts) VALUES('integrity-check')",
+            [],
+        )
+        .expect("the search index is consistent");
+
+        for gone in ["files", "files_fts"] {
+            assert!(table_info(&conn, gone).is_empty(), "{gone} must be dropped");
+        }
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "{:?}",
+            report.issues
+        );
+
+        // A new path reaches search through the trigger; a path is never
+        // changed in place.
+        files::fixture::insert(&conn, 21, "new/zebra.txt", 1, "regular", None);
+        let zebra: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM paths_fts WHERE paths_fts MATCH 'zebra'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(zebra, 1);
+        assert!(conn
+            .execute("UPDATE paths SET path = 'renamed' WHERE path = 'link'", [])
+            .is_err());
+    }
+
+    /// Each value 030 cannot convert exactly is refused by row id, and the
+    /// catalog is left at schema 29 with `files` intact.
+    #[test]
+    fn test_migration_030_refuses_what_it_cannot_convert_exactly() {
+        for (column_sql, needle) in [
+            ("sha256 = 'abc'", "sha256 is not 64 lowercase hex"),
+            ("sha256 = upper(sha256)", "sha256 is not 64 lowercase hex"),
+            (
+                "modified_at = '2026-09-01T12:00:01Z'",
+                "modified_at is not YYYY-MM-DDTHH:MM:SS+00:00",
+            ),
+            (
+                "modified_at = '2026-09-01 12:00:01'",
+                "modified_at is not YYYY-MM-DDTHH:MM:SS+00:00",
+            ),
+            // The walk's own spelling, but past what `mtime_ns` (an i64 of
+            // nanoseconds) can hold: converted, it would overflow to a REAL
+            // that no reader can take back as an integer.
+            (
+                "modified_at = '2300-01-01T00:00:00+00:00'",
+                "modified_at is outside 1677-09-21..2262-04-11",
+            ),
+            (
+                "modified_at = '1600-01-01T00:00:00+00:00'",
+                "modified_at is outside 1677-09-21..2262-04-11",
+            ),
+            ("file_type = 'fifo'", "is_directory/file_type"),
+            ("file_type = 'dir'", "is_directory/file_type"),
+        ] {
+            let mut conn = open_memory_at_version(29);
+            seed_schema_29_files(&conn);
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM files WHERE snapshot_id = 20 AND path = 'docs/a.txt'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                &format!("UPDATE files SET {column_sql} WHERE id = ?1"),
+                [id],
+            )
+            .unwrap();
+
+            let err = migrate(&mut conn).expect_err(&format!("030 must refuse {column_sql}"));
+            let msg = match &err {
+                TapectlError::Migration(m) => m.clone(),
+                other => panic!("expected the generic Migration variant, got {other:?}"),
+            };
+            assert!(msg.starts_with("migration 030 cannot run: "), "{msg}");
+            assert!(msg.contains(needle), "{column_sql}: {msg}");
+            assert!(msg.contains(&format!("(id {id})")), "{column_sql}: {msg}");
+            assert!(msg.contains("Nothing has been changed."), "{msg}");
+            // Deleting a non-directory row of a version with a file_count
+            // makes that version unstageable (staging's file-list check)
+            // and reads the file as added to the next `snapshot create`:
+            // the remedy offered is a correction, never a delete.
+            assert!(!msg.contains("delete each"), "{msg}");
+            assert!(
+                msg.contains(
+                    "Correct each named files row (a sha256 or modified_at you cannot \
+                     recover may be set to NULL; delete only a row whose snapshot no \
+                     longer exists)"
+                ),
+                "{msg}"
+            );
+            assert_eq!(user_version(&conn), 29, "rolled back");
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 8, "files intact");
+        }
+    }
+
+    /// A `files` row whose snapshot is gone has no unit to intern its path
+    /// under: refused by id.
+    #[test]
+    fn test_migration_030_refuses_a_row_whose_snapshot_is_gone() {
+        let mut conn = open_memory_at_version(29);
+        seed_schema_29_files(&conn);
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        conn.execute(
+            "INSERT INTO files (id, snapshot_id, path, size_bytes) VALUES (9001, 999, 'x', 1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        let msg = migrate(&mut conn).unwrap_err().to_string();
+        assert!(
+            msg.contains("whose snapshot does not exist (id 9001)"),
+            "{msg}"
+        );
+        assert_eq!(user_version(&conn), 29, "rolled back");
     }
 }

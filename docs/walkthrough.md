@@ -490,7 +490,9 @@ note: "Verified" is this catalog's last-known record of each copy's most recent 
 prefix: `"IMG 101"` finds `IMG_101.jpg`, but `garden` finds nothing
 (`no files matching "garden"`), because no word in any file's path starts with it;
 only the unit is called `2020-garden`. Quote a pattern of several words, since it is
-one argument. `catalog locate` answers "which tape, and where is it?".
+one argument. It searches each unit's newest version, the one `catalog ls` lists, so a
+file kept through many versions is one line; `--all-versions` lists it once per version
+that holds it. `catalog locate` answers "which tape, and where is it?".
 
 ## 11. Restore
 

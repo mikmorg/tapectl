@@ -42,13 +42,13 @@ tapectl\-catalog\-ls(1)
 List files in a unit\*(Aqs latest snapshot
 .TP
 tapectl\-catalog\-search(1)
-Search for files by pattern
+Search for files by pattern, in each unit\*(Aqs newest version
 .TP
 tapectl\-catalog\-locate(1)
 Show which volume(s) contain a unit
 .TP
 tapectl\-catalog\-stats(1)
-Show catalog statistics
+Show catalog statistics. Files and Total are summed over every version that still has a file list: Files counts non\-directory entries, Total counts regular\-file bytes
 .TP
 tapectl\-catalog\-rebuild(1)
 Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup

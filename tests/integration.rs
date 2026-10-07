@@ -745,7 +745,8 @@ fn test_schema_has_all_tables() {
         "unit_tags",
         "unit_path_history",
         "snapshots",
-        "files",
+        "paths",
+        "file_versions",
         "stage_sets",
         "stage_slices",
         "locations",
@@ -847,30 +848,36 @@ fn test_fts5_search() {
     .unwrap();
     let snap_id = conn.last_insert_rowid();
 
-    // Insert files — triggers should populate FTS
-    conn.execute(
-        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-         VALUES (?1, 'season1/episode01.mkv', 5000000000, 0)",
-        [snap_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-         VALUES (?1, 'season1/episode02.mkv', 4500000000, 0)",
-        [snap_id],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-         VALUES (?1, 'extras/behind_scenes.mp4', 1000000000, 0)",
-        [snap_id],
-    )
-    .unwrap();
+    // Insert files — the `paths` triggers should populate FTS
+    tapectl::db::files::fixture::insert(
+        &conn,
+        snap_id,
+        "season1/episode01.mkv",
+        5000000000,
+        "regular",
+        None,
+    );
+    tapectl::db::files::fixture::insert(
+        &conn,
+        snap_id,
+        "season1/episode02.mkv",
+        4500000000,
+        "regular",
+        None,
+    );
+    tapectl::db::files::fixture::insert(
+        &conn,
+        snap_id,
+        "extras/behind_scenes.mp4",
+        1000000000,
+        "regular",
+        None,
+    );
 
     // FTS5 indexes the full path as a token — search for the whole path segment
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH '\"season1/episode01.mkv\"'",
+            "SELECT COUNT(*) FROM paths_fts WHERE paths_fts MATCH '\"season1/episode01.mkv\"'",
             [],
             |r| r.get(0),
         )
@@ -879,14 +886,14 @@ fn test_fts5_search() {
 
     // Total files indexed
     let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files_fts", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM paths_fts", [], |r| r.get(0))
         .unwrap();
     assert_eq!(total, 3);
 
     // Prefix search on path segments
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'season1*'",
+            "SELECT COUNT(*) FROM paths_fts WHERE paths_fts MATCH 'season1*'",
             [],
             |r| r.get(0),
         )
@@ -1574,17 +1581,12 @@ fn test_fts5_path_tokenization() {
         "season1/episode02.mkv",
         "other.txt",
     ] {
-        conn.execute(
-            "INSERT INTO files (snapshot_id, path, size_bytes, is_directory)
-             VALUES (?1, ?2, 1000, 0)",
-            rusqlite::params![snap_id, path],
-        )
-        .unwrap();
+        tapectl::db::files::fixture::insert(&conn, snap_id, path, 1000, "regular", None);
     }
 
     // Two-token prefix query: must match both episodes, not 'other.txt'
     let mut stmt = conn
-        .prepare("SELECT path FROM files_fts WHERE files_fts MATCH ?1 ORDER BY rank")
+        .prepare("SELECT path FROM paths_fts WHERE paths_fts MATCH ?1 ORDER BY rank")
         .unwrap();
     let rows: Vec<String> = stmt
         .query_map(["season* episode*"], |r| r.get::<_, String>(0))

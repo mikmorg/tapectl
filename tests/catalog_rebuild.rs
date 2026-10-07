@@ -142,6 +142,25 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
     })
 }
 
+thread_local! {
+    /// SQL [`build_sealed_volume_editing_catalog_db`] runs against the
+    /// `catalog.db` before it goes into the operator envelope: a stand-in for
+    /// a value an older tapectl wrote that today's catalog cannot hold.
+    static CATALOG_DB_EDIT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`build_sealed_volume_with`], with `sql` run against its `catalog.db`
+/// before the envelope is sealed.
+fn build_sealed_volume_editing_catalog_db(catalog_db: CatalogDb, sql: &str) -> SealedVolume {
+    assert!(
+        catalog_db != CatalogDb::None,
+        "there is no catalog.db to edit"
+    );
+    CATALOG_DB_EDIT.with(|e| *e.borrow_mut() = Some(sql.to_string()));
+    build_sealed_volume_with(catalog_db)
+}
+
 /// Every existing test in this file wants a `mam`-sourced serial and does
 /// not care what it is — `"REBUILDSERIAL"` was always meant to represent one
 /// (issue #165's cartridge-binding tests are the first to need the other
@@ -278,17 +297,14 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         // Two file rows per snapshot, so the `files` assertion has something
         // to count that the manifest alone could never supply.
         for n in 0..2 {
-            conn.execute(
-                "INSERT INTO files (snapshot_id, path, size_bytes, sha256, is_directory)
-                 VALUES (?1, ?2, ?3, ?4, 0)",
-                rusqlite::params![
-                    snapshot_id,
-                    format!("{unit_name}/file{n}.bin"),
-                    100 + n,
-                    sha256_hex(format!("{unit_name}-{n}").as_bytes()),
-                ],
-            )
-            .unwrap();
+            db::files::fixture::insert(
+                &conn,
+                snapshot_id,
+                &format!("{unit_name}/file{n}.bin"),
+                100 + n,
+                "regular",
+                Some(&sha256_hex(format!("{unit_name}-{n}").as_bytes())),
+            );
         }
 
         conn.execute(
@@ -392,6 +408,12 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
                      ALTER TABLE stage_slices DROP COLUMN sha256_plain;",
                 )
                 .unwrap();
+            }
+            if let Some(sql) = CATALOG_DB_EDIT.with(|e| e.borrow_mut().take()) {
+                rusqlite::Connection::open(&p)
+                    .unwrap()
+                    .execute_batch(&sql)
+                    .unwrap();
             }
             Some(p)
         }
@@ -1207,7 +1229,7 @@ fn the_file_index_comes_back_from_the_operator_catalog_db() {
     assert_eq!(report.files, UNITS.len() * 2);
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM files f JOIN snapshots s ON s.id = f.snapshot_id
+            "SELECT COUNT(*) FROM file_versions fv JOIN snapshots s ON s.id = fv.snapshot_id
              JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
             rusqlite::params![UNITS[0].0],
             |r| r.get(0),
@@ -1226,6 +1248,124 @@ fn the_file_index_comes_back_from_the_operator_catalog_db() {
         )
         .unwrap();
     assert_eq!(source, format!("/src/{}", UNITS[0].0));
+}
+
+/// Issue #381: a rebuilt version re-staged from source content-validates its
+/// regular files. Rebuild used to leave `files.file_type` NULL, and staging
+/// validates only `file_type = 'regular'`, so it planned zero files: the
+/// size check and the sha256 baseline from the tape were both skipped and
+/// the stage went ahead on whatever the source held. Both `catalog.db`
+/// generations carry `is_directory` only, so both are covered.
+#[test]
+fn a_rebuilt_version_restaged_from_source_validates_its_regular_files() {
+    for generation in [CatalogDb::Old, CatalogDb::New] {
+        let mut vol = build_sealed_volume_with(generation);
+        let dir = tempfile::tempdir().unwrap();
+        let conn = fresh_db(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let secret = vol.operator_secret.clone();
+        rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+        let unit = UNITS[0].0;
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT s.id FROM snapshots s JOIN units u ON u.id = s.unit_id
+                 WHERE u.name = ?1",
+                rusqlite::params![unit],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // The source, at the recorded paths and sizes, holding other bytes
+        // than the tape's baseline hashes describe.
+        let src = tempfile::tempdir().unwrap();
+        for n in 0..2u8 {
+            let p = src.path().join(format!("{unit}/file{n}.bin"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, vec![b'x'; 100 + n as usize]).unwrap();
+        }
+
+        let err = staging::validate::validate_source(
+            &conn,
+            snapshot_id,
+            src.path().to_str().unwrap(),
+            &[],
+        )
+        .err()
+        .unwrap_or_else(|| {
+            panic!(
+                "a rebuilt version must be content-validated against the tape's \
+                 sha256 baseline, so changed bytes are refused (catalog.db \
+                 generation {})",
+                generation as u8
+            )
+        })
+        .to_string();
+        assert!(
+            err.contains("BITROT") && err.contains(&format!("{unit}/file")),
+            "the refusal names the file whose bytes changed: {err}"
+        );
+    }
+}
+
+/// A tape written before migration 030 can carry a `modified_at` the walk
+/// spelled for a file dated past 2262 (or before 1677), which no nanosecond
+/// count holds. The rebuild records no mtime for it, as a fresh walk of that
+/// file does today, and keeps every other row's; it used to refuse the whole
+/// rebuild over that one value. Text the walk never writes is still refused,
+/// naming the row (and is this test's positive control that the edit reached
+/// the tape).
+#[test]
+fn a_far_off_modified_at_on_tape_rebuilds_with_no_mtime() {
+    let far = "2300-01-01T00:00:00+00:00";
+    let near = "2026-09-01T12:00:00+00:00";
+    let mut vol = build_sealed_volume_editing_catalog_db(
+        CatalogDb::Old,
+        &format!(
+            "UPDATE files SET modified_at = '{near}';
+             UPDATE files SET modified_at = '{far}' WHERE id = (SELECT MIN(id) FROM files);"
+        ),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("one far-off timestamp must not fail a DR rebuild");
+
+    let mtimes: Vec<(String, Option<i64>)> = conn
+        .prepare(
+            "SELECT p.path, fv.mtime_ns FROM file_versions fv JOIN paths p ON p.id = fv.path_id
+             ORDER BY p.path",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(mtimes.len(), UNITS.len() * 2, "every row came back");
+    let near_ns = db::files::mtime_ns_from_secs(1_788_264_000);
+    let unset = mtimes.iter().filter(|(_, ns)| ns.is_none()).count();
+    assert_eq!(unset, 1, "only the far-off row has no mtime: {mtimes:?}");
+    assert!(
+        mtimes.iter().all(|(_, ns)| ns.is_none() || *ns == near_ns),
+        "every other row keeps its mtime: {mtimes:?}"
+    );
+
+    let mut vol = build_sealed_volume_editing_catalog_db(
+        CatalogDb::Old,
+        "UPDATE files SET modified_at = 'yesterday' WHERE id = (SELECT MIN(id) FROM files);",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let secret = vol.operator_secret.clone();
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("text the walk never writes is refused")
+        .to_string();
+    assert!(
+        err.contains("catalog.db files row") && err.contains("\"yesterday\""),
+        "{err}"
+    );
 }
 
 /// A tape written before #83 carries no `catalog.db`. The restore path must
@@ -1308,7 +1448,8 @@ fn row_counts(conn: &rusqlite::Connection) -> Vec<(String, i64)> {
         "volumes",
         "writes",
         "write_positions",
-        "files",
+        "paths",
+        "file_versions",
         // Issue #165: without these two, the idempotence test below proves
         // nothing about the cartridge writes a rebuild now makes.
         "cartridges",
@@ -2934,5 +3075,136 @@ fn a_slice_row_with_the_same_number_but_other_ciphertext_is_refused() {
         before,
         row_counts(&conn),
         "a refused rebuild changes nothing"
+    );
+}
+
+/// A `MemStore` that, before every read, checks from a SECOND connection
+/// whether the catalog's write lock is free (`BEGIN IMMEDIATE` with no busy
+/// wait). Issue #413: a rebuild must never hold the write lock across tape
+/// I/O, which on a real drive takes seconds per positioning and would stall
+/// every other tapectl command for that long.
+struct LockProbeStore {
+    inner: MemStore,
+    db: std::path::PathBuf,
+    reads: usize,
+    locked_reads: Vec<u32>,
+}
+
+impl LockProbeStore {
+    fn probe(&mut self, position: u32) {
+        self.reads += 1;
+        let other = rusqlite::Connection::open(&self.db).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match other.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => other.execute_batch("ROLLBACK").unwrap(),
+            Err(_) => self.locked_reads.push(position),
+        }
+    }
+}
+
+impl tapectl::store::Store for LockProbeStore {
+    fn capacity(&mut self) -> tapectl::error::Result<tapectl::store::CapacityReport> {
+        self.inner.capacity()
+    }
+    fn execute(
+        &mut self,
+        src: &mut dyn std::io::Read,
+        len: u64,
+        sync: bool,
+    ) -> tapectl::error::Result<u64> {
+        self.inner.execute(src, len, sync)
+    }
+    fn read_file(
+        &mut self,
+        position: u32,
+        sink: &mut dyn std::io::Write,
+    ) -> tapectl::error::Result<u64> {
+        self.probe(position);
+        self.inner.read_file(position, sink)
+    }
+    fn read_file_head(
+        &mut self,
+        position: u32,
+        max_bytes: u64,
+        sink: &mut dyn std::io::Write,
+    ) -> tapectl::error::Result<u64> {
+        self.probe(position);
+        self.inner.read_file_head(position, max_bytes, sink)
+    }
+    fn reposition_for_resume(&mut self, file_index: u32) -> tapectl::error::Result<()> {
+        self.inner.reposition_for_resume(file_index)
+    }
+}
+
+/// Issue #413: no tape read happens while the rebuild holds the catalog's
+/// write lock. Attestation reads one slice header per unit, and it used to
+/// run inside the rebuild's one IMMEDIATE transaction.
+#[test]
+fn a_rebuild_reads_no_tape_while_it_holds_the_write_lock() {
+    let vol = build_sealed_volume_with(CatalogDb::Old);
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rebuilt.db");
+    let conn = fresh_db(dir.path());
+    register_escrow(&conn, &vol.escrow_public);
+    let scratch = tempfile::tempdir().unwrap();
+
+    let key_dir = tempfile::tempdir().unwrap();
+    let key = key_file(key_dir.path(), "k.age.key", &vol.escrow_secret);
+    let identity: age::x25519::Identity = tapectl::crypto::keys::read_secret_key(&key)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut store = LockProbeStore {
+        inner: vol.store,
+        db: db_path,
+        reads: 0,
+        locked_reads: Vec::new(),
+    };
+
+    // Positive control: the probe sees the rebuild connection's write lock.
+    let held = db::busy::immediate_tx(&conn).unwrap();
+    store.probe(u32::MAX);
+    held.rollback().unwrap();
+    assert_eq!(
+        store.locked_reads,
+        vec![u32::MAX],
+        "positive control: the probe must see a held write lock on this catalog"
+    );
+    store.locked_reads.clear();
+    store.reads = 0;
+
+    let site = ContactSite::new(
+        cfg(),
+        Operation::CatalogRebuild,
+        "memstore",
+        Medium::NoBackend,
+    );
+    let report = rebuild::rebuild_from_store(
+        &conn,
+        &mut store,
+        &[identity],
+        Some(LABEL),
+        "recovered",
+        Some("lto0"),
+        scratch.path(),
+        "memstore",
+        site,
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.attested,
+        UNITS.len(),
+        "positive control: attestation read a slice header per unit"
+    );
+    assert!(
+        store.reads > UNITS.len(),
+        "positive control: {} reads",
+        store.reads
+    );
+    assert!(
+        store.locked_reads.is_empty(),
+        "tape positions read while the write lock was held: {:?}",
+        store.locked_reads
     );
 }

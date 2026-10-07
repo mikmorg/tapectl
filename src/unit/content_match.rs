@@ -32,16 +32,18 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::db::files::FileKind;
 use crate::error::Result;
 
-/// One file as recorded / freshly walked — the same shape the `files`
-/// table stores (path, size_bytes, modified_at as RFC3339), so a
-/// snapshot's recorded rows and a fresh walk compare like for like.
+/// One file as recorded / freshly walked — the same shape a version's file
+/// list stores (path, size_bytes, mtime in ns), so a snapshot's recorded
+/// rows and a fresh walk compare like for like.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileStamp {
     pub(crate) path: String,
     pub(crate) size_bytes: i64,
-    pub(crate) modified_at: String,
+    /// Whole seconds, in ns (`db::files::mtime_ns_from_secs`), on both sides.
+    pub(crate) mtime_ns: Option<i64>,
 }
 
 /// Specific added/removed/modified paths behind a content mismatch. Empty
@@ -120,7 +122,7 @@ pub(crate) fn diff_stamps(recorded: &[FileStamp], fresh: &[FileStamp]) -> Finger
         match recorded[i].path.cmp(&fresh[j].path) {
             std::cmp::Ordering::Equal => {
                 if recorded[i].size_bytes != fresh[j].size_bytes
-                    || recorded[i].modified_at != fresh[j].modified_at
+                    || recorded[i].mtime_ns != fresh[j].mtime_ns
                 {
                     modified.push(fresh[j].path.clone());
                 }
@@ -165,20 +167,20 @@ pub(crate) fn latest_snapshot(
         .optional()?)
 }
 
-/// `snapshot_id`'s recorded `(path, size_bytes, modified_at)` for every
+/// `snapshot_id`'s recorded `(path, size_bytes, mtime_ns)` for every
 /// non-directory row, sorted by path.
 fn recorded_stamps(conn: &Connection, snapshot_id: i64) -> Result<Vec<FileStamp>> {
-    let mut stmt = conn.prepare(
-        "SELECT path, size_bytes, modified_at FROM files
-         WHERE snapshot_id = ?1 AND is_directory = 0
-         ORDER BY path",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.path, fv.size_bytes, fv.mtime_ns FROM {}
+         WHERE fv.snapshot_id = ?1 AND fv.kind <> 0",
+        crate::db::files::VERSION_FILES
+    ))?;
     let mut rows: Vec<FileStamp> = stmt
         .query_map(params![snapshot_id], |row| {
             Ok(FileStamp {
                 path: row.get(0)?,
                 size_bytes: row.get(1)?,
-                modified_at: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                mtime_ns: row.get(2)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -186,24 +188,25 @@ fn recorded_stamps(conn: &Connection, snapshot_id: i64) -> Result<Vec<FileStamp>
     Ok(rows)
 }
 
-/// `(file_type, sha256)`, keyed by path.
-type HashBaseline = HashMap<String, (Option<String>, Option<String>)>;
+/// `(kind, sha256 hex)`, keyed by path.
+type HashBaseline = HashMap<String, (FileKind, Option<String>)>;
 
-/// `snapshot_id`'s recorded `(file_type, sha256)` per path — the extra
+/// `snapshot_id`'s recorded `(kind, sha256)` per path — the extra
 /// baseline the `sha256` checksum_mode needs beyond what `FileStamp`
 /// carries.
 fn recorded_hash_baseline(conn: &Connection, snapshot_id: i64) -> Result<HashBaseline> {
-    let mut stmt = conn.prepare(
-        "SELECT path, file_type, sha256 FROM files
-         WHERE snapshot_id = ?1 AND is_directory = 0",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.path, fv.kind, fv.sha256 FROM {}
+         WHERE fv.snapshot_id = ?1 AND fv.kind <> 0",
+        crate::db::files::VERSION_FILES
+    ))?;
     let map = stmt
         .query_map(params![snapshot_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 (
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, FileKind>(1)?,
+                    crate::db::files::sha256_column(row.get(2)?),
                 ),
             ))
         })?
@@ -245,11 +248,11 @@ pub(crate) fn matches_snapshot(
     let baseline = recorded_hash_baseline(conn, snapshot_id)?;
     let mut modified = Vec::new();
     for stamp in fresh {
-        let Some((file_type, sha256)) = baseline.get(&stamp.path) else {
+        let Some((kind, sha256)) = baseline.get(&stamp.path) else {
             continue; // Not reached in practice: mtime_size already agreed
                       // on the path set by the time this loop runs.
         };
-        if file_type.as_deref() != Some("regular") {
+        if *kind != FileKind::Regular {
             continue; // symlink/special/dir — no content to hash.
         }
         let Some(expected) = sha256 else {
@@ -283,25 +286,25 @@ pub(crate) fn matches_snapshot(
 mod tests {
     use super::*;
 
-    fn stamp(path: &str, size: i64, mtime: &str) -> FileStamp {
+    fn stamp(path: &str, size: i64, mtime_s: i64) -> FileStamp {
         FileStamp {
             path: path.to_string(),
             size_bytes: size,
-            modified_at: mtime.to_string(),
+            mtime_ns: crate::db::files::mtime_ns_from_secs(mtime_s),
         }
     }
 
     #[test]
     fn diff_stamps_reports_no_changes_for_identical_sorted_lists() {
-        let recorded = vec![stamp("a.txt", 5, "t1"), stamp("b.txt", 7, "t1")];
+        let recorded = vec![stamp("a.txt", 5, 1), stamp("b.txt", 7, 1)];
         let fresh = recorded.clone();
         assert!(diff_stamps(&recorded, &fresh).is_empty());
     }
 
     #[test]
     fn diff_stamps_reports_a_new_path_as_added() {
-        let recorded = vec![stamp("a.txt", 5, "t1")];
-        let fresh = vec![stamp("a.txt", 5, "t1"), stamp("b.txt", 7, "t1")];
+        let recorded = vec![stamp("a.txt", 5, 1)];
+        let fresh = vec![stamp("a.txt", 5, 1), stamp("b.txt", 7, 1)];
         let diff = diff_stamps(&recorded, &fresh);
         assert_eq!(diff.added, vec!["b.txt".to_string()]);
         assert!(diff.removed.is_empty());
@@ -311,8 +314,8 @@ mod tests {
     #[test]
     fn diff_stamps_reports_a_missing_path_as_removed() {
         // ADR-0012: removal is change, not silently ignored.
-        let recorded = vec![stamp("a.txt", 5, "t1"), stamp("b.txt", 7, "t1")];
-        let fresh = vec![stamp("a.txt", 5, "t1")];
+        let recorded = vec![stamp("a.txt", 5, 1), stamp("b.txt", 7, 1)];
+        let fresh = vec![stamp("a.txt", 5, 1)];
         let diff = diff_stamps(&recorded, &fresh);
         assert!(diff.added.is_empty());
         assert_eq!(diff.removed, vec!["b.txt".to_string()]);
@@ -321,8 +324,8 @@ mod tests {
 
     #[test]
     fn diff_stamps_reports_a_size_or_mtime_change_as_modified() {
-        let recorded = vec![stamp("a.txt", 5, "t1")];
-        let fresh = vec![stamp("a.txt", 6, "t1")];
+        let recorded = vec![stamp("a.txt", 5, 1)];
+        let fresh = vec![stamp("a.txt", 6, 1)];
         let diff = diff_stamps(&recorded, &fresh);
         assert_eq!(diff.modified, vec!["a.txt".to_string()]);
     }

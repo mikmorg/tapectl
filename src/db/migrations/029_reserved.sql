@@ -1,0 +1,14 @@
+-- 029: RESERVED, deliberately empty.
+--
+-- Migration numbers are handed out per batch of work, and 029 belongs to a
+-- batch that had not landed on master when 030 (paths and file_versions,
+-- issue #380) was written. `rusqlite_migration` numbers a migration by its
+-- position in `db::migrations()`, so without this placeholder 030 would apply
+-- as user_version 29 and a later real 029 would never run on a catalog that
+-- had already taken it.
+--
+-- WHOEVER MERGES: if the real 029 is on master, replace this file and its
+-- entry with it. Never ship this placeholder to a production catalog while a
+-- real 029 exists anywhere: a catalog that ran the placeholder is at
+-- user_version >= 29 and would skip the real one.
+SELECT 1;

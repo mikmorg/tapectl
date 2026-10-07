@@ -13,9 +13,9 @@ tapectl catalog [OPTIONS] <COMMAND>
 **Subcommands**
 
 - [`ls`](#tapectl-catalog-ls) — List files in a unit's latest snapshot
-- [`search`](#tapectl-catalog-search) — Search for files by pattern
+- [`search`](#tapectl-catalog-search) — Search for files by pattern, in each unit's newest version
 - [`locate`](#tapectl-catalog-locate) — Show which volume(s) contain a unit
-- [`stats`](#tapectl-catalog-stats) — Show catalog statistics
+- [`stats`](#tapectl-catalog-stats) — Show catalog statistics. Files and Total are summed over every version that still has a file list: Files counts non-directory entries, Total counts regular-file bytes
 - [`rebuild`](#tapectl-catalog-rebuild) — Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
 
 ### tapectl catalog ls
@@ -32,7 +32,7 @@ tapectl catalog ls [OPTIONS] <UNIT>
 
 ### tapectl catalog search
 
-Search for files by pattern
+Search for files by pattern, in each unit's newest version
 
 ```text
 tapectl catalog search [OPTIONS] <PATTERN>
@@ -45,6 +45,7 @@ tapectl catalog search [OPTIONS] <PATTERN>
 **Options**
 
 - `--limit <LIMIT>` *(default: `50`)* — Limit results
+- `--all-versions` — Search every version of each unit, not only its newest: a file is listed once per version that holds it
 
 ### tapectl catalog locate
 
@@ -60,7 +61,7 @@ tapectl catalog locate [OPTIONS] <UNIT>
 
 ### tapectl catalog stats
 
-Show catalog statistics
+Show catalog statistics. Files and Total are summed over every version that still has a file list: Files counts non-directory entries, Total counts regular-file bytes
 
 ```text
 tapectl catalog stats [OPTIONS]
