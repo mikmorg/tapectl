@@ -1,3 +1,4 @@
+pub mod alert_flags;
 pub mod contact;
 pub mod drive_identity;
 #[cfg(test)]

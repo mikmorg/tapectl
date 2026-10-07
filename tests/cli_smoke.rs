@@ -2825,6 +2825,8 @@ fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings(
         "readings": readings,
         "read_error_trends": [],
         "read_error_rise_factor": tapectl::tape::read_errors::DEFAULT_RISE_FACTOR,
+        // Issue #303, additive: no TapeAlert was raised here.
+        "tape_alerts_raised": [],
     });
     assert_eq!(parsed, expected, "the whole --json document");
 }
