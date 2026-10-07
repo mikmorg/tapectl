@@ -4610,7 +4610,10 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         on_disk.sort();
-        assert_eq!(on_disk, included, "every file, and only those, included in order");
+        assert_eq!(
+            on_disk, included,
+            "every file, and only those, included in order"
+        );
         assert_eq!(
             user_version(&open_memory().unwrap()),
             included.len() as i64,

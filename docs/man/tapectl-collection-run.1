@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-collection\-run \- Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit\*(Aqs resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action
 .SH SYNOPSIS
-\fBtapectl collection run\fR <\fB\-\-collection\fR> [\fB\-\-json\fR] [\fB\-\-batch\fR] [\fB\-\-dry\-run\fR] [\fB\-\-label\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl collection run\fR <\fB\-\-collection\fR> [\fB\-\-json\fR] [\fB\-\-batch\fR] [\fB\-\-dry\-run\fR] [\fB\-\-label\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-home\fR] [\fB\-\-jobs\fR] [\fB\-\-full\-confirm\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit\*(Aqs resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action
 .SH OPTIONS
@@ -51,6 +51,12 @@ Fill each tape to at most this fraction of its capacity, for this command only: 
 tapectl home directory: database, keys, catalogs, stage\-reports, logs.
 
 Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-\-jobs\fR \fI<JOBS>\fR
+How many of the batch\*(Aqs units to stage at once (1 to 16), as `stage create \-\-jobs`. Defaults to `[staging] jobs`, itself 1
+.TP
+\fB\-\-full\-confirm\fR
+See `volume write \-\-full\-confirm`: read every copy this run writes back in full after sealing it
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

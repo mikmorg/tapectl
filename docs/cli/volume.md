@@ -74,6 +74,7 @@ tapectl volume write [OPTIONS] <LABEL>
 - `--allow-missing-escrow` — Seal slices that were staged before the escrow recipient existed (ADR-0005). Only reachable for tapes copied forward via `read-slices`/`compact-read`, since `stage create` refuses to stage without escrow; use it to migrate a dying pre-escrow cartridge, knowing the copy stays unrecoverable by the escrow key
 - `--prewrite-hash` — Full-hash every staged slice from disk before the tape moves (tri-layer L1). Off by default (ADR-0012, 2026-09-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch
 - `--fill-ceiling <FILL_CEILING>` — Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012). The pre-write check refuses a layout above the ceiling and names by how much
+- `--full-confirm` — After sealing, read every file back and hash it against the front index (tri-layer L3, hours on a full cartridge). Off by default (ADR-0012, 2026-10-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify-status` name it until `volume verify` runs one
 
 ### tapectl volume resume
 
@@ -99,6 +100,7 @@ tapectl volume resume [OPTIONS] <LABEL>
 
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--prewrite-hash` — See `volume write --prewrite-hash`: the revalidation full-hashes every staged slice instead of size-checking it. The session's frozen generated files are re-hashed either way
+- `--full-confirm` — See `volume write --full-confirm`: the confirm this resume runs (or re-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`
 
 ### tapectl volume abort
 
@@ -117,6 +119,8 @@ tapectl volume abort [OPTIONS] <LABEL>
 ### tapectl volume verify
 
 Verify volume contents via the keyless chain walk (seal -> front index -> content). Default tier is `--full` (integrity: hashes every content file); `--quick` opts down to navigable (seal binding + front index self-consistency only, no per-file content hashing).
+
+A full verify that was stopped part-way CONTINUES when run again: files the volume's latest readback (this command's or a write's `--full-confirm`) already read back clean are not read again, as long as the front index on the tape is the one they were checked against.
 
 Exit status: 0 = every checked file matched. 2 = the verify PROVED THE MEDIUM BAD: the volume is quarantined and no longer counts as a copy — write its content to another cartridge. 3 = inconclusive: a drive or transport failure, or an error before any verdict (no cartridge loaded, the wrong tape, an unknown label, a mistyped command line); the volume is untouched — check the drive and verify again.
 
@@ -218,6 +222,7 @@ tapectl volume compact-write [OPTIONS] --destination <DESTINATION>
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--allow-missing-escrow` — See `volume write --allow-missing-escrow`. A compaction whose source volume predates the escrow recipient needs this to proceed
 - `--prewrite-hash` — See `volume write --prewrite-hash`
+- `--full-confirm` — See `volume write --full-confirm`
 
 ### tapectl volume plan
 
@@ -272,6 +277,7 @@ tapectl volume compact [OPTIONS] <LABEL>
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--allow-missing-escrow` — See `volume write --allow-missing-escrow`
 - `--prewrite-hash` — See `volume write --prewrite-hash` (step 2's write)
+- `--full-confirm` — See `volume write --full-confirm` (step 2's write)
 - `--force` — See `volume compact-finish --force` — step 3's ADR-0008 Tier-2 gate. With this (or the global `--yes`) step 3 asks nothing; the cartridge swap after step 1 still waits for you
 
 ### tapectl volume deposit

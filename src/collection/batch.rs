@@ -973,6 +973,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
+            false,
             true,
         )
         .expect_err("the sealed destination is not a write target");

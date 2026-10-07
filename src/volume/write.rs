@@ -15278,6 +15278,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
