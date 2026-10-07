@@ -12,7 +12,7 @@ One drive (`\-\-device`) serves both the read and the write, so the flow PAUSES 
 .PP
 Step 3 applies `compact\-finish`\*(Aqs ADR\-0008 Tier\-2 gate and may refuse non\-interactively without `\-\-force`. When it does, the destination tape is already written and sealed and nothing is lost: `volume compact\-finish <SOURCE> \-\-force` completes the flow without re\-reading or re\-writing anything.
 .PP
-Exit status: `volume write`\*(Aqs, for step 2\*(Aqs write (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A step 1 failure exits 2: step 1 writes nothing. A step 3 failure exits 0 with a warning naming `volume compact\-finish`: the destination is sealed and confirmed and counts as a copy.
+Exit status: `volume write`\*(Aqs, for step 2\*(Aqs write (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A step 1 failure exits 2: step 1 writes nothing. Step 3 refused for consent (no terminal, no \-\-yes) exits 0 with a warning naming `volume compact\-finish \-\-force`: the destination is sealed, confirmed and a full carry\-forward. Step 3 refused because content was not carried forward exits 2.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR

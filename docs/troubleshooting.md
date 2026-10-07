@@ -137,7 +137,7 @@ that finishes it on its own:
 
 | Step that did not finish | Finish it with |
 |---|---|
-| `volume compact`'s step 3, retiring the source (a consent refusal, or a Tier-3 refusal) | `tapectl volume compact-finish <source>` (`--force` only when the warning names it: the consent refusal) |
+| `volume compact`'s step 3, retiring the source, refused for consent (no terminal and no `--yes`, or a "no" at the prompt) | `tapectl volume compact-finish <source> --force` |
 | releasing `collection run`'s staging (a catalog error) | `tapectl staging clean`, which retains whatever is still below its policy |
 | recording the copy's figures (`bytes_written`, `num_data_files`, `last_write`) and its `write_completed` event (a catalog error) | nothing re-records them; the copy is unaffected, and `volume info` shows the figures as unrecorded |
 
@@ -150,6 +150,12 @@ not finish: database error: disk I/O error. The tape needs nothing. To finish it
 `collection run --json` carries it as `release_warning`.
 
 Older builds exited 2 for every one of these failures.
+
+`volume compact`'s step 3 refused for any other reason still exits 2 with its
+`error:` line. Those are its absolute-floor refusals (a live slice with no
+copy elsewhere, the last eligible copy of a live version): after step 2 they
+mean some content was not carried forward to the destination, so that copy
+does not stand in this sense. Read the error; `--force` does not reach them.
 
 ### `audit`: 0, 1, 2 or 70
 

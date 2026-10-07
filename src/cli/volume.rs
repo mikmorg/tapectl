@@ -365,9 +365,10 @@ pub enum VolumeCommands {
     /// Exit status: `volume write`'s, for step 2's write (0 sealed and
     /// confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted,
     /// 5 aborted, 6 quarantined, 75 catalog busy). A step 1 failure exits 2:
-    /// step 1 writes nothing. A step 3 failure exits 0 with a warning naming
-    /// `volume compact-finish`: the destination is sealed and confirmed and
-    /// counts as a copy.
+    /// step 1 writes nothing. Step 3 refused for consent (no terminal, no
+    /// --yes) exits 0 with a warning naming `volume compact-finish --force`:
+    /// the destination is sealed, confirmed and a full carry-forward. Step 3
+    /// refused because content was not carried forward exits 2.
     Compact {
         /// Source volume label
         label: String,
@@ -1549,10 +1550,14 @@ pub fn run(
             // at-risk set narrow to units whose content was not carried
             // forward — exactly the issue #147 case that should gate.
             //
-            // ADR-0012 2026-10-07 item 33: whatever step 3's failure, the
-            // destination is sealed and confirmed and counts as a copy, so
-            // the command warns, naming `volume compact-finish`, and exits 0
-            // — never 2, which says nothing was written.
+            // ADR-0012 2026-10-07 item 33 (and the CTO's ruling on its
+            // question 2): a consent refusal of step 3 leaves a destination
+            // that is sealed, confirmed and a full carry-forward, so the
+            // command warns, naming `volume compact-finish --force`, and
+            // exits 0. A Tier-3 refusal means content was NOT carried
+            // forward — the copy does not stand in item 33's sense — so it
+            // keeps its error and its non-zero exit
+            // (`compact_step3_outcome`).
             match write::compact_finish(conn, config, label, *force || yes) {
                 Ok(report) => {
                     println!("  Volume \"{label}\" retired");
@@ -1573,7 +1578,7 @@ pub fn run(
                     }
                 }
                 Err(e) => {
-                    let warning = compact_step3_warning(label, dest_label, &e);
+                    let warning = compact_step3_outcome(label, dest_label, e)?;
                     eprintln!("{warning}");
                     if json_output {
                         println!(
@@ -1626,32 +1631,39 @@ pub fn run(
     Ok(exit_code)
 }
 
-/// The warning `volume compact` prints, and exits 0 on, when step 3 —
-/// retiring `source` — fails after step 2 sealed and confirmed `dest`
-/// (ADR-0012 2026-10-07 item 33): the destination counts as a copy, so
-/// nothing is redone. It names `volume compact-finish <source>`, which
-/// finishes step 3 without re-reading or re-writing anything, with `--force`
-/// ONLY for the consent refusal. `compact_finish`'s other failures are its
-/// Tier-3 refusals (an unprotected live slice; the last eligible copy of a
-/// live version): after a successful compact-write either means content was
-/// not carried forward, and naming `--force` for an absolute floor is the
-/// confusion ADR-0008 warns about. Neither refusal's text contains the
-/// consent substrings below.
-fn compact_step3_warning(source: &str, dest: &str, err: &crate::error::TapectlError) -> String {
+/// What `volume compact` does when step 3 — retiring `source` — fails
+/// after step 2 sealed and confirmed `dest` (ADR-0012 2026-10-07 item 33,
+/// and the CTO's ruling on its question 2):
+///
+/// - a **consent refusal** (no terminal and no `--yes`, or a "no" at the
+///   prompt): `dest` is a full carry-forward and counts as a copy, so this
+///   is `Ok(warning)` — printed, and the command exits 0. The warning names
+///   `volume compact-finish <source> --force`, which finishes step 3
+///   without re-reading or re-writing anything.
+/// - anything else, notably `compact_finish`'s **Tier-3 refusals** (an
+///   unprotected live slice; the last eligible copy of a live version):
+///   after a successful compact-write either means content was NOT carried
+///   forward, so the copy does not stand in item 33's sense. `Err(err)`,
+///   unchanged: the same message and non-zero exit as before item 33.
+///   Naming `--force` for an absolute floor is the confusion ADR-0008 warns
+///   about, and neither refusal's text contains the consent substrings.
+fn compact_step3_outcome(
+    source: &str,
+    dest: &str,
+    err: crate::error::TapectlError,
+) -> std::result::Result<String, crate::error::TapectlError> {
     let msg = err.to_string();
     let consent =
         msg.contains("refused: non-interactive session") || msg.contains("aborted, not confirmed");
-    let finish = if consent {
-        format!("tapectl volume compact-finish {source} --force")
-    } else {
-        format!("tapectl volume compact-finish {source}")
-    };
-    crate::error::unfinished_after_seal(
+    if !consent {
+        return Err(err);
+    }
+    Ok(crate::error::unfinished_after_seal(
         dest,
         &format!("step 3, retiring the source \"{source}\","),
         &msg,
-        Some(&finish),
-    )
+        Some(&format!("tapectl volume compact-finish {source} --force")),
+    ))
 }
 
 /// `volume deposit` (ADR-0006, issue #73).
@@ -2859,48 +2871,53 @@ fn print_volume_info(info: &VolumeInfo) {
 mod tests {
     use super::*;
 
-    /// ADR-0012 2026-10-07 item 33: `volume compact`'s step 3 failing after
-    /// step 2 sealed and confirmed the destination is a warning naming
-    /// `volume compact-finish`, with `--force` only for a consent refusal —
-    /// never for a Tier-3 refusal, an absolute floor.
-    mod compact_step3_is_a_warning {
+    /// ADR-0012 2026-10-07 item 33 and the ruling on its question 2:
+    /// `volume compact`'s step 3 refused for CONSENT after step 2 sealed and
+    /// confirmed the destination is a warning naming `volume compact-finish
+    /// --force`, and the command exits 0. A Tier-3 refusal (content not
+    /// carried forward) is not: it stays the error it was, non-zero.
+    mod compact_step3_outcome_by_refusal {
         use super::*;
 
         #[test]
-        fn a_consent_refusal_names_compact_finish_with_force() {
-            let err = TapectlError::Other(
-                "retire volume \"L6-SRC\" refused: non-interactive session".into(),
-            );
-            let w = compact_step3_warning("L6-SRC", "L6-DST", &err);
-            assert!(
-                w.starts_with(
-                    "warning: volume \"L6-DST\" is sealed and confirmed and counts as a copy, \
-                     but step 3, retiring the source \"L6-SRC\", did not finish: retire volume"
-                ),
-                "{w}"
-            );
-            assert!(
-                w.ends_with("To finish it: tapectl volume compact-finish L6-SRC --force"),
-                "{w}"
-            );
+        fn a_consent_refusal_is_a_warning_naming_compact_finish_with_force() {
+            for text in [
+                "retire volume \"L6-SRC\" refused: non-interactive session",
+                "retire volume \"L6-SRC\": aborted, not confirmed",
+            ] {
+                let w = compact_step3_outcome("L6-SRC", "L6-DST", TapectlError::Other(text.into()))
+                    .unwrap_or_else(|e| panic!("{text}: a consent refusal warns, got {e}"));
+                assert!(
+                    w.starts_with(
+                        "warning: volume \"L6-DST\" is sealed and confirmed and counts as a \
+                         copy, but step 3, retiring the source \"L6-SRC\", did not finish: "
+                    ),
+                    "{w}"
+                );
+                assert!(
+                    w.ends_with("To finish it: tapectl volume compact-finish L6-SRC --force"),
+                    "{w}"
+                );
+            }
         }
 
         #[test]
-        fn a_tier3_refusal_names_compact_finish_without_force() {
-            let err = TapectlError::Other(
-                "refusing to retire \"L6-SRC\": it holds the last eligible copy".into(),
-            );
-            let w = compact_step3_warning("L6-SRC", "L6-DST", &err);
-            assert!(
-                w.ends_with("To finish it: tapectl volume compact-finish L6-SRC"),
-                "{w}"
+        fn a_tier3_refusal_keeps_its_error_and_its_non_zero_exit() {
+            let text = "refusing to retire \"L6-SRC\": it holds the last eligible copy";
+            let err = compact_step3_outcome("L6-SRC", "L6-DST", TapectlError::Other(text.into()))
+                .expect_err("content not carried forward does not stand: no exit 0");
+            assert_eq!(err.to_string(), text, "the message is unchanged");
+            assert_eq!(
+                crate::error::ErrorContract::Write.exit_code(&anyhow::Error::from(err)),
+                crate::error::EXIT_ERROR,
+                "the exit it had before item 33"
             );
         }
 
-        /// The Compact arm matches on step 3's result rather than `?`-ing
-        /// it into an exit-2 error.
+        /// The Compact arm routes step 3's failure through
+        /// `compact_step3_outcome`, propagating its `Err` with `?`.
         #[test]
-        fn the_compact_arm_does_not_propagate_step_3() {
+        fn the_compact_arm_routes_step_3_through_the_outcome() {
             const SRC: &str = include_str!("volume.rs");
             let start = SRC.find("VolumeCommands::Compact {\n").unwrap();
             let arm = &SRC[start..start + SRC[start..].find("VolumeCommands::Deposit").unwrap()];
@@ -2908,7 +2925,10 @@ mod tests {
                 arm.contains("match write::compact_finish(conn, config, label, *force || yes) {"),
                 "{arm}"
             );
-            assert!(arm.contains("compact_step3_warning("), "{arm}");
+            assert!(
+                arm.contains("compact_step3_outcome(label, dest_label, e)?"),
+                "{arm}"
+            );
         }
     }
 
