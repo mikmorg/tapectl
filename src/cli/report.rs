@@ -1680,7 +1680,8 @@ fn report_health(
 /// `report health --json`: the readings ([`health_json`], each exactly as
 /// before) under `readings`, and the read-error trends the text output
 /// prints (issue #421) under `read_error_trends`, with the
-/// `read_error_rise_factor` they were judged against. An object since the
+/// `read_error_rise_factor` and `read_error_rise_floor_per_gib` (ADR-0012
+/// 2026-10-07 item 7) they were judged against. An object since the
 /// trends joined it: the readings used to be the whole document, a bare
 /// array, which has no room for a second block. Like the text block, the
 /// trends cover every cartridge whatever `--volume` says.
@@ -1725,6 +1726,7 @@ pub(crate) fn report_health_json(
         "readings": health_json(rows),
         "read_error_trends": trends,
         "read_error_rise_factor": factor,
+        "read_error_rise_floor_per_gib": crate::tape::read_errors::RISE_FLOOR_PER_GIB,
     }))
 }
 
@@ -4823,6 +4825,10 @@ Read error counter page  [0x3]
         let v = report_health_json(&conn, &rows, DEFAULT_RISE_FACTOR).unwrap();
         assert_eq!(v["readings"], health_json(&rows), "readings unchanged");
         assert_eq!(v["read_error_rise_factor"], DEFAULT_RISE_FACTOR);
+        assert_eq!(
+            v["read_error_rise_floor_per_gib"],
+            crate::tape::read_errors::RISE_FLOOR_PER_GIB
+        );
         let trends = v["read_error_trends"].as_array().unwrap();
         let by = |c: &str| {
             trends

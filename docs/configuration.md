@@ -479,7 +479,7 @@ the table, every key takes its default. See
 
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
-| `read_error_rise_factor` | float | `2.0` | at least 1 | A cartridge is flagged (`audit`'s `read_error_trend`, `RISING` in `report health`) when its newest `volume verify` corrected more read errors per GiB than this many times its previous verify's. **Provisional**: the default is a starting point, to be set from the production host's recorded verifies (ADR-0012, 2026-10-06). |
+| `read_error_rise_factor` | float | `2.0` | at least 1 | A cartridge is flagged (`audit`'s `read_error_trend`, `RISING` in `report health`) when its newest `volume verify` corrected more read errors per GiB than this many times its previous verify's, **and** more than 1 corrected error per GiB in all. That floor is fixed, not a key (ADR-0012, 2026-10-07): it keeps a first non-zero reading after a zero one, a rise past any factor, from being an alarm. **Provisional**: the factor's default is a starting point, to be set from the production host's recorded verifies (ADR-0012, 2026-10-06). |
 
 ### `[ops]`
 

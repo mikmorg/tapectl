@@ -1809,16 +1809,20 @@ scrub.
 ```text
 $ tapectl report health
 Corrected read errors per GiB, by cartridge, verify over verify:
-  EW7VWMVKF6: 0.012 -> 0.015 -> 0.044 corrected/GiB over 3 verifies (uncorrected 0, 0, 0)
-    ** RISING — corrected read errors per GiB rose from 0.015 to 0.044 between its last two verifies, ... **
+  EW7VWMVKF6: 0.120 -> 0.450 -> 1.800 corrected/GiB over 3 verifies (uncorrected 0, 0, 0)
+    ** RISING — corrected read errors per GiB rose from 0.450 to 1.800 between its last two verifies, ... **
 ```
 
 A cartridge is flagged when its newest verify corrected more than
-`read_error_rise_factor` times as many errors per GiB as the verify before it,
-and `tapectl audit` warns on it (`read_error_trend`). The factor lives in
-`config.toml` and is **provisional**: 2.0 is a starting point, not a measured
-threshold, to be set once home2's verifies show what a healthy cartridge looks
-like.
+`read_error_rise_factor` times as many errors per GiB as the verify before it
+**and** more than 1 corrected error per GiB, and `tapectl audit` warns on it
+(`read_error_trend`). The factor lives in `config.toml` and is
+**provisional**: 2.0 is a starting point, not a measured threshold, to be set
+once home2's verifies show what a healthy cartridge looks like. The floor of 1
+per GiB is fixed (ADR-0012, 2026-10-07): from a verify that corrected nothing,
+any later figure is a rise past every factor, so without it a cartridge's first
+corrected error would be an alarm. A cartridge going from 0 to 0.5 per GiB is
+not flagged; one going from 0 to 2 per GiB is.
 
 ```toml
 [health]
@@ -1828,8 +1832,9 @@ read_error_rise_factor = 2.0
 `report health --json` carries the same figures: an object whose
 `read_error_trends` holds one entry per cartridge (its verifies, oldest first,
 in `points`, and `rising` set — with the line above as its `message` — when it
-is flagged), beside the `read_error_rise_factor` it was judged against and the
-health readings under `readings`. (Before the trends joined it, the document
+is flagged), beside the `read_error_rise_factor` and
+`read_error_rise_floor_per_gib` it was judged against and the health readings
+under `readings`. (Before the trends joined it, the document
 was the readings array alone.)
 
 How to read it:
