@@ -6451,4 +6451,59 @@ mod tests {
             "a read in the abort's second is not after it"
         );
     }
+
+    /// Issue #397's other order: a resume whose seal is RECORDED but does
+    /// not read back re-enters confirm seal FIRST, so the unreadable seal
+    /// is found at one read rather than after a forward pass over the whole
+    /// tape. (The seal-last pass is only for a seal this session has just
+    /// written or just parsed.)
+    #[test]
+    fn a_resume_whose_recorded_seal_does_not_read_confirms_seal_first() {
+        let f = make_fixture();
+        let volume_id = f.volume_id;
+        let keys = f.keys.clone();
+        let (conn, _pending, _store, fake, seal, _dirs) = sealed_on_a_fake_tape_keeping_dirs(f);
+        conn.execute(
+            "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        // What `write::finish_session` records once `seal()` returns.
+        conn.execute(
+            "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        // The seal marker no longer parses (one block of garbage).
+        {
+            let mut st = fake.state();
+            let block = st.block_size;
+            st.files[seal as usize] = vec![0xA5; block];
+        }
+        let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        let pending = match InterruptedSession::rehydrate(&conn, volume_id)
+            .unwrap()
+            .expect("resumable")
+            .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+            .unwrap()
+        {
+            ResumeOutcome::Confirming(p) => p,
+            _ => panic!("a recorded seal re-enters confirm"),
+        };
+        fake.clear_ops();
+        let outcome = pending.confirm(&conn, &mut store, Tier::Integrity).unwrap();
+        assert!(
+            matches!(outcome, ConfirmOutcome::Inconclusive(_)),
+            "an unreadable seal is inconclusive, not quarantine"
+        );
+        let reads: Vec<u32> = fake
+            .ops()
+            .into_iter()
+            .filter_map(|op| match op {
+                Op::Read(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec![seal], "the seal, and nothing after it");
+    }
 }
