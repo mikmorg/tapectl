@@ -1303,6 +1303,16 @@ landed on master in de732a7 and 21f93a3; the questions are in their issues.
 28. **The append-only journals are never pruned** (#310): `health_logs`, `verification_results`,
     `events` and the forensic journals keep every row, as logs and stage reports do (item 13).
     `db stats` reports the size of each table, so growth can be seen.
+29. **Drive health is read on a schedule** (#309), by its own read-only command and timer, not
+    by the audit: the audit unit keeps `PrivateDevices=true` and never reaches a device. A new
+    `tapectl drive poll` reads the drive's health pages (and the chip, when a cartridge is
+    loaded) through the SCSI generic node only — never a tape node, never a tape motion — and
+    journals what it reads verbatim, as a contact of its own, landing as a drive-only reading
+    when no known cartridge is loaded. It takes the drive lock without waiting and exits 75,
+    reading nothing, when a tapectl command holds the drive. Its `contrib/systemd` service
+    allows `/dev/sg*` and nothing else and runs daily; its wrapper pings the health check as the
+    audit's does, and a raised TapeAlert or a drive-reported unrecovered error is a `/fail`. A
+    read-to-clear page (0x2E) read by a poll is not lost: the journal holds it.
 
 Also ruled: the chip's and the drive's wear figures stay in the journal (ADR-0013) and are not
 copied into columns on `cartridges` (#299). And **a migration file is named for its position**
