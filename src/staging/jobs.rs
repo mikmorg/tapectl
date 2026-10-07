@@ -50,6 +50,9 @@ pub const MEMORY_PER_JOB: u64 = super::validate::READ_AHEAD_BYTES + (64 << 20);
 pub struct StageJob {
     pub unit_name: String,
     pub snapshot_id: i64,
+    /// A first stage of the version, or a `--version` re-stage: what
+    /// admission rechecks (issue #368).
+    pub admission: super::Admission,
 }
 
 /// How one unit's stage ended.
@@ -175,12 +178,13 @@ pub fn stage_many(
         }
         #[cfg(test)]
         let _running = super::lock::db_file_of(c).map(|d| in_flight::Running::enter(&d));
-        let result = super::stage_create_reporting(
+        let result = super::stage_create_admitting(
             c,
             paths,
             cfg,
             job.snapshot_id,
             assume_yes,
+            job.admission,
             &mut std::io::stderr(),
         );
         let ok = result.is_ok();
@@ -435,6 +439,7 @@ mod tests {
             jobs.push(StageJob {
                 unit_name: name.to_string(),
                 snapshot_id,
+                admission: crate::staging::Admission::Unstaged,
             });
         }
         (
@@ -598,6 +603,7 @@ mod tests {
             StageJob {
                 unit_name: "ghost".into(),
                 snapshot_id: 999_999,
+                admission: crate::staging::Admission::Unstaged,
             },
         );
         let out = stage_many(

@@ -341,6 +341,11 @@ pub fn run(
                 to_stage.push(staging::jobs::StageJob {
                     unit_name: n.clone(),
                     snapshot_id: snapshot_to_stage(conn, n, *version)?,
+                    admission: if version.is_some() {
+                        staging::Admission::Restage
+                    } else {
+                        staging::Admission::Unstaged
+                    },
                 });
             }
             let outcomes = staging::jobs::stage_many(
