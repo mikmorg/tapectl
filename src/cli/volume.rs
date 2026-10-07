@@ -313,6 +313,12 @@ pub enum VolumeCommands {
         /// `fill_ceiling` (default 97%): `0.99` or `99%`.
         #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
         fill_ceiling: Option<f64>,
+        /// List first the staged units a write would help: those whose
+        /// audit finds too few copies or a required location with no copy,
+        /// each with what it falls short of. `volume write` writes every
+        /// staged set either way; this orders the listing only.
+        #[arg(long)]
+        policy_aware: bool,
     },
 
     /// Retire source volume after compaction (compaction step 3)
@@ -1228,22 +1234,16 @@ pub fn run(
             generation,
             device,
             fill_ceiling,
+            policy_aware,
         } => {
             let config = &config.with_fill_ceiling(*fill_ceiling);
             // Show what staged data would be written
-            let mut stmt = conn.prepare(
-                "SELECT u.name, s.version, ss.num_slices, ss.total_encrypted_size
-                 FROM stage_sets ss
-                 JOIN snapshots s ON s.id = ss.snapshot_id
-                 JOIN units u ON u.id = s.unit_id
-                 WHERE ss.status = 'staged'
-                 ORDER BY ss.total_encrypted_size DESC",
-            )?;
-            let rows: Vec<(String, i64, Option<i64>, Option<i64>)> = stmt
-                .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let plan_rows = staged_plan_rows(conn, config, *policy_aware)?;
+            let rows: Vec<(String, i64, Option<i64>, Option<i64>)> = plan_rows
+                .iter()
+                .map(|r| (r.unit.clone(), r.version, r.slices, r.size))
+                .collect();
+            let finding = |i: usize| plan_rows[i].finding.as_deref();
 
             let total_bytes: i64 = rows.iter().map(|(_, _, _, s)| s.unwrap_or(0)).sum();
             let total_slices: i64 = rows.iter().map(|(_, _, n, _)| n.unwrap_or(0)).sum();
@@ -1258,8 +1258,10 @@ pub fn run(
             if json_output {
                 let units: Vec<serde_json::Value> = rows
                     .iter()
-                    .map(|(name, ver, slices, size)| {
-                        serde_json::json!({"unit": name, "version": ver, "slices": slices, "size": size})
+                    .enumerate()
+                    .map(|(i, (name, ver, slices, size))| {
+                        serde_json::json!({"unit": name, "version": ver, "slices": slices,
+                                           "size": size, "finding": finding(i)})
                     })
                     .collect();
                 println!(
@@ -1267,17 +1269,19 @@ pub fn run(
                     serde_json::json!({
                         "copies": copies, "total_slices": total_slices,
                         "total_bytes": total_bytes, "units": units,
+                        "policy_aware": policy_aware,
                     })
                 );
             } else if rows.is_empty() {
                 println!("no staged data to plan");
             } else {
                 println!("volume write plan ({copies} copy/copies):");
-                for (name, ver, slices, size) in &rows {
+                for (i, (name, ver, slices, size)) in rows.iter().enumerate() {
                     println!(
-                        "  {name} v{ver}: {} slices, {}",
+                        "  {name} v{ver}: {} slices, {}{}",
                         slices.unwrap_or(0),
                         crate::util::format_bytes_binary(size.unwrap_or(0)),
+                        finding(i).map(|f| format!("  ({f})")).unwrap_or_default(),
                     );
                 }
                 println!(
@@ -2794,9 +2798,103 @@ fn print_volume_info(info: &VolumeInfo) {
     }
 }
 
+/// One `volume plan` row: a staged stage set, and — under `--policy-aware`
+/// — what its unit falls short of, when it does.
+#[derive(Debug)]
+struct PlanRow {
+    unit: String,
+    version: i64,
+    slices: Option<i64>,
+    size: Option<i64>,
+    finding: Option<String>,
+}
+
+/// `volume plan`'s rows: every `'staged'` stage set, largest first. With
+/// `policy_aware` (ADR-0012 2026-10-07 item 26, issue #144), the rows whose
+/// unit falls short of its policy on the audit's own terms
+/// (`coverage::Shortfall`: too few copies, a required location with no
+/// copy) come first, each carrying the shortfall, and the rest after, the
+/// size order kept within each group. It orders a listing: `volume write`
+/// selects every staged set regardless (`find_staged_data`), so here there
+/// is no selection for the flag to change.
+fn staged_plan_rows(
+    conn: &Connection,
+    config: &Config,
+    policy_aware: bool,
+) -> Result<Vec<PlanRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT u.name, s.version, ss.num_slices, ss.total_encrypted_size
+         FROM stage_sets ss
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE ss.status = 'staged'
+         ORDER BY ss.total_encrypted_size DESC",
+    )?;
+    let mut rows: Vec<PlanRow> = stmt
+        .query_map([], |row| {
+            Ok(PlanRow {
+                unit: row.get(0)?,
+                version: row.get(1)?,
+                slices: row.get(2)?,
+                size: row.get(3)?,
+                finding: None,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if policy_aware {
+        for row in &mut rows {
+            if let Some(unit) = crate::db::queries::get_unit_by_name(conn, &row.unit)? {
+                let short = crate::policy::coverage::unit_shortfall(conn, config, &unit)?;
+                if short.any() {
+                    row.finding = Some(short.describe());
+                }
+            }
+        }
+        // Stable: the size order holds within each group.
+        rows.sort_by_key(|r| r.finding.is_none());
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #144 (ADR-0012 2026-10-07 item 26): `volume plan
+    /// --policy-aware` lists first the staged units a write would help.
+    /// `big` v2 is staged and larger, but `big` v1 already has the default
+    /// two copies; `small` v1 is staged with none.
+    #[test]
+    fn plan_rows_put_the_units_with_findings_first_under_policy_aware() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
+             INSERT INTO units (uuid, name, tenant_id, status) VALUES
+                 ('u-big', 'big', 1, 'active'), ('u-small', 'small', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, snapshot_type, status, source_path) VALUES
+                 (1, 1, 1, 'full', 'current', '/b'), (2, 1, 2, 'full', 'staged', '/b'),
+                 (3, 2, 1, 'full', 'staged', '/s');
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size, total_encrypted_size) VALUES
+                 (1, 1, 'cleaned', 524288, 50), (2, 2, 'staged', 524288, 100),
+                 (3, 3, 'staged', 524288, 10);
+             INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status) VALUES
+                 (1, 'S1', 'lto', 'p', 1, 'sealed'), (2, 'S2', 'lto', 'p', 1, 'sealed');
+             INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status) VALUES
+                 (1, 1, 1, 'completed'), (1, 1, 2, 'completed');",
+        )
+        .unwrap();
+        let config = Config::default();
+        let units = |rows: &[PlanRow]| rows.iter().map(|r| r.unit.clone()).collect::<Vec<_>>();
+
+        let plain = staged_plan_rows(&conn, &config, false).unwrap();
+        assert_eq!(units(&plain), ["big", "small"], "largest first");
+        assert!(plain.iter().all(|r| r.finding.is_none()));
+
+        let aware = staged_plan_rows(&conn, &config, true).unwrap();
+        assert_eq!(units(&aware), ["small", "big"]);
+        assert_eq!(aware[0].finding.as_deref(), Some("0 of 2 copies"));
+        assert_eq!(aware[1].finding, None);
+    }
 
     /// Issue #146: `volume compact`'s destination-label prompt had no
     /// terminal check, so a non-interactive run blocked forever on a handle

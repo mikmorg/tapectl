@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-collection\-run \- Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit\*(Aqs resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action
 .SH SYNOPSIS
-\fBtapectl collection run\fR <\fB\-\-collection\fR> [\fB\-\-json\fR] [\fB\-\-batch\fR] [\fB\-\-dry\-run\fR] [\fB\-\-label\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-home\fR] [\fB\-\-jobs\fR] [\fB\-\-full\-confirm\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl collection run\fR <\fB\-\-collection\fR> [\fB\-\-json\fR] [\fB\-\-batch\fR] [\fB\-\-dry\-run\fR] [\fB\-\-label\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-home\fR] [\fB\-\-jobs\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-policy\-aware\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit\*(Aqs resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action
 .SH OPTIONS
@@ -57,6 +57,9 @@ How many of the batch\*(Aqs units to stage at once (1 to 16), as `stage create \
 .TP
 \fB\-\-full\-confirm\fR
 See `volume write \-\-full\-confirm`: read every copy this run writes back in full after sealing it
+.TP
+\fB\-\-policy\-aware\fR
+Number the batches as `collection plan \-\-policy\-aware` does: the units a write would help (too few copies, a required location with no copy) are packed first
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

@@ -51,6 +51,7 @@ tapectl collection plan [OPTIONS]
 - `--generation <GENERATION>` — Plan against this media generation rather than the drive's own (ADR-0010) — e.g. sizing batches for LTO-5 stock that an LTO-6 drive will write. No cartridge need be loaded
 - `--device <DEVICE>` — Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi-drive config rather than asking
 - `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012)
+- `--policy-aware` — Pack first the units a write would help: those whose audit finds too few copies or a required location with no copy (a never-archived unit always does). Each group stays in name order. Batch numbers then follow this order, so give `collection run` the same flag to run the batch reviewed here
 
 ### tapectl collection run
 
@@ -70,4 +71,5 @@ tapectl collection run [OPTIONS] --collection <COLLECTION>
 - `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012)
 - `--jobs <JOBS>` — How many of the batch's units to stage at once (1 to 16), as `stage create --jobs`. Defaults to `[staging] jobs`, itself 1
 - `--full-confirm` — See `volume write --full-confirm`: read every copy this run writes back in full after sealing it
+- `--policy-aware` — Number the batches as `collection plan --policy-aware` does: the units a write would help (too few copies, a required location with no copy) are packed first
 

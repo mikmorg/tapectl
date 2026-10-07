@@ -98,7 +98,7 @@ line, or rename the key as the table shows.
 | `backends.lto[].nominal_capacity` | Renamed. Capacity follows the loaded cartridge's generation. | Delete it. Use `capacity_override` only for a virtual drive. For one unusual cartridge, use `cartridge register --capacity`. |
 | `backends.lto[].block_size` | Removed. The block size (512 KiB) is a constant of the tape format and is written into the recovery text on every tape. | Delete the line. |
 | `backends.lto[].hardware_compression` | Removed. The write path always turns drive compression off. | Delete the line. |
-| `[packing]` (`strategy`, `fill_threshold`, `min_free_for_append`) | Whole table removed. Batches are chosen alphabetically, first-fit, and tapes are never appended to. | Delete the table. |
+| `[packing]` (`strategy`, `fill_threshold`, `min_free_for_append`) | Whole table removed. Batches are chosen alphabetically, first-fit (`collection plan --policy-aware` packs first the units the audit finds short of copies or locations), and tapes are never appended to. | Delete the table. |
 | `[labels]` (`format`) | Whole table removed. Volume labels always come from `--label`. | Delete the table. |
 | `defaults.hash` | Removed. Every checksum tapectl takes is sha256. | Delete the line. `checksum_mode` is the real setting. |
 | `defaults.min_copies_for_tape_only` | Renamed `min_copies`. The meaning and the default (2) are unchanged: it is the copy requirement every unit starts from. | Rename the key and keep the value. |

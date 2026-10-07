@@ -69,6 +69,13 @@ pub enum CollectionCommands {
         /// `fill_ceiling` (default 97%, ADR-0012).
         #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
         fill_ceiling: Option<f64>,
+        /// Pack first the units a write would help: those whose audit
+        /// finds too few copies or a required location with no copy (a
+        /// never-archived unit always does). Each group stays in name order.
+        /// Batch numbers then follow this order, so give `collection run`
+        /// the same flag to run the batch reviewed here.
+        #[arg(long)]
+        policy_aware: bool,
     },
 
     /// Execute one batch: stage every unit in it once, write one session to
@@ -122,6 +129,11 @@ pub enum CollectionCommands {
         /// writes back in full after sealing it.
         #[arg(long)]
         full_confirm: bool,
+        /// Number the batches as `collection plan --policy-aware` does: the
+        /// units a write would help (too few copies, a required location
+        /// with no copy) are packed first.
+        #[arg(long)]
+        policy_aware: bool,
     },
 }
 
@@ -171,12 +183,14 @@ pub fn run(
             generation,
             device,
             fill_ceiling,
+            policy_aware,
         } => cmd_plan(
             conn,
             &config.with_fill_ceiling(*fill_ceiling),
             *copies,
             generation.as_deref(),
             device.as_deref(),
+            *policy_aware,
             json_output,
         ),
         CollectionCommands::Run {
@@ -188,6 +202,7 @@ pub fn run(
             fill_ceiling,
             jobs,
             full_confirm,
+            policy_aware,
         } => cmd_run(
             conn,
             paths,
@@ -199,11 +214,37 @@ pub fn run(
             *prewrite_hash,
             *jobs,
             *full_confirm,
+            *policy_aware,
             json_output,
             global_dry_run,
             assume_yes,
         ),
     }
+}
+
+/// What each unit in `batches` that a write would help falls short of
+/// (`coverage::Shortfall::describe`), keyed by unit name — only the units
+/// that fall short. JSON strings, so `--json` and the plain listing print
+/// the same words.
+fn shortfalls<'a>(
+    conn: &Connection,
+    config: &Config,
+    batches: impl Iterator<Item = &'a collection::selector::Batch>,
+) -> Result<std::collections::HashMap<String, serde_json::Value>> {
+    let mut out = std::collections::HashMap::new();
+    for name in batches.flat_map(|b| b.unit_names()) {
+        let Some(unit) = crate::db::queries::get_unit_by_name(conn, name)? else {
+            continue;
+        };
+        let short = crate::policy::coverage::unit_shortfall(conn, config, &unit)?;
+        if short.any() {
+            out.insert(
+                name.to_string(),
+                serde_json::Value::String(short.describe()),
+            );
+        }
+    }
+    Ok(out)
 }
 
 fn no_libraries_configured(json_output: bool) {
@@ -397,6 +438,7 @@ fn cmd_plan(
     copies: i64,
     generation: Option<&str>,
     device: Option<&str>,
+    policy_aware: bool,
     json_output: bool,
 ) -> Result<i32> {
     if config.collections.is_empty() {
@@ -407,11 +449,24 @@ fn cmd_plan(
     let mut rows = Vec::new();
     let mut any_refused = false;
     for lib in &config.collections {
-        let (batches, refused) =
-            collection::plan::plan_for_collection(conn, config, lib, generation, device)?;
+        let (batches, refused) = collection::plan::plan_for_collection(
+            conn,
+            config,
+            lib,
+            generation,
+            device,
+            policy_aware,
+        )?;
         any_refused |= !refused.is_empty();
         rows.push((lib.name.clone(), batches, refused));
     }
+    // `--policy-aware` (issue #144): what each prioritised unit falls short
+    // of, printed beside it so the order explains itself.
+    let findings = if policy_aware {
+        shortfalls(conn, config, rows.iter().flat_map(|(_, b, _)| b.iter()))?
+    } else {
+        std::collections::HashMap::new()
+    };
 
     if json_output {
         let json: Vec<serde_json::Value> = rows
@@ -426,12 +481,18 @@ fn cmd_plan(
                             "units": b.unit_names(),
                             "total_bytes": b.total_bytes,
                             "padded_bytes": b.padded_bytes,
+                            "findings": b
+                                .unit_names()
+                                .into_iter()
+                                .filter_map(|u| findings.get(u).map(|f| (u.to_string(), f.clone())))
+                                .collect::<serde_json::Map<String, serde_json::Value>>(),
                         })
                     })
                     .collect();
                 serde_json::json!({
                     "collection": name,
                     "copies": copies,
+                    "policy_aware": policy_aware,
                     "batches": batch_json,
                     "cartridges_needed": batches.len() as i64 * copies,
                     "refused": refused_json(refused),
@@ -453,7 +514,10 @@ fn cmd_plan(
                         crate::util::format_bytes_binary(b.padded_bytes as i64),
                     );
                     for u in b.unit_names() {
-                        println!("    {u}");
+                        match findings.get(u) {
+                            Some(serde_json::Value::String(f)) => println!("    {u}  ({f})"),
+                            _ => println!("    {u}"),
+                        }
                     }
                 }
                 println!(
@@ -484,6 +548,7 @@ fn cmd_run(
     prewrite_hash: bool,
     jobs: Option<usize>,
     full_confirm: bool,
+    policy_aware: bool,
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
@@ -521,7 +586,7 @@ fn cmd_run(
     // so nothing below needs to special-case them; they are only reported,
     // and their presence is what makes this command's exit code non-zero.
     let (batches, budget, refused) =
-        collection::plan::plan_for_run(conn, config, lib, device, labels)?;
+        collection::plan::plan_for_run(conn, config, lib, device, labels, policy_aware)?;
     let exit_code = refused_exit_code(!refused.is_empty());
 
     if !json_output {

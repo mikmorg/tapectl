@@ -787,6 +787,81 @@ fn names_holding_every(
     Ok(present.unwrap_or_default())
 }
 
+// ── What a new copy would resolve (ADR-0012 2026-10-07 item 26, #144) ──
+
+/// How far a unit's CURRENT coverage falls short of its resolved policy, on
+/// exactly the two terms `audit`'s `copy_count` and `location_presence`
+/// checks judge it by: [`copy_count_expr`] against `min_copies`, and
+/// [`missing_required_locations`] against `required_locations`. These are
+/// the two findings a write can resolve, which is what `--policy-aware`
+/// (`collection plan`/`run`, `volume plan`) orders by and what `collection
+/// status` counts as under-copied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shortfall {
+    pub copies: i64,
+    pub min_copies: i64,
+    /// Required locations with no copy, in the policy's order.
+    pub missing_locations: Vec<String>,
+}
+
+impl Shortfall {
+    /// `audit`'s `copy_count` finding.
+    pub fn under_copied(&self) -> bool {
+        self.copies < self.min_copies
+    }
+
+    /// Either finding: a write would help this unit.
+    pub fn any(&self) -> bool {
+        self.under_copied() || !self.missing_locations.is_empty()
+    }
+
+    /// The findings in words, for a plan's listing: `"1 of 2 copies; no copy
+    /// at offsite"`. Empty when there is no shortfall.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.under_copied() {
+            parts.push(format!("{} of {} copies", self.copies, self.min_copies));
+        }
+        if !self.missing_locations.is_empty() {
+            parts.push(format!("no copy at {}", self.missing_locations.join(", ")));
+        }
+        parts.join("; ")
+    }
+}
+
+/// [`Shortfall`] for unit `unit_id` under its resolved policy `resolved`.
+/// A unit with no current snapshot has 0 copies and is at no location, so a
+/// never-archived unit always falls short of a non-zero `min_copies`.
+pub fn shortfall(
+    conn: &Connection,
+    unit_id: i64,
+    resolved: &crate::policy::ResolvedPolicy,
+) -> crate::error::Result<Shortfall> {
+    let copies: i64 = conn.query_row(
+        &format!(
+            "SELECT {}",
+            copy_count_expr(&CoverageQuery::current_unit("?1"))
+        ),
+        params![unit_id],
+        |row| row.get(0),
+    )?;
+    Ok(Shortfall {
+        copies,
+        min_copies: resolved.min_copies,
+        missing_locations: missing_required_locations(conn, unit_id, &resolved.required_locations)?,
+    })
+}
+
+/// [`shortfall`] under the unit's own resolved policy (`policy::resolve`,
+/// whose error — a policy layer that cannot be read — is returned as is).
+pub fn unit_shortfall(
+    conn: &Connection,
+    config: &crate::config::Config,
+    unit: &crate::db::models::Unit,
+) -> crate::error::Result<Shortfall> {
+    shortfall(conn, unit.id, &crate::policy::resolve(conn, config, unit)?)
+}
+
 // ── The retire family's floor (ADR-0008 Tier 3 / ADR-0012, issue #147) ──
 
 /// One CURRENT version of a unit whose coverage a retirement is about to
@@ -1019,6 +1094,43 @@ pub(crate) mod tests {
     fn scalar(conn: &Connection, expr: &str, unit_id: i64) -> i64 {
         conn.query_row(&format!("SELECT {expr}"), params![unit_id], |r| r.get(0))
             .unwrap()
+    }
+
+    // ── shortfall (issue #144) ──
+
+    /// A resolved policy with `min_copies` and `required_locations` set.
+    fn policy(
+        conn: &Connection,
+        min_copies: i64,
+        required: &[&str],
+    ) -> crate::policy::ResolvedPolicy {
+        let unit = crate::db::queries::get_unit_by_name(conn, "photos")
+            .unwrap()
+            .unwrap();
+        let mut resolved =
+            crate::policy::resolve(conn, &crate::config::Config::default(), &unit).unwrap();
+        resolved.min_copies = min_copies;
+        resolved.required_locations = names(required);
+        resolved
+    }
+
+    /// The fixture's unit has two copies (a tape at `home`, its deposit at
+    /// `glacier`): judged by the audit's own two predicates it is short of
+    /// three copies and of `offsite`, and short of nothing against two
+    /// copies at `home`.
+    #[test]
+    fn shortfall_is_the_audits_copy_and_location_findings() {
+        let (conn, unit_id, _vol) = setup_unit_with_deposit("active");
+        let short = shortfall(&conn, unit_id, &policy(&conn, 3, &["home", "offsite"])).unwrap();
+        assert_eq!(short.copies, 2);
+        assert!(short.under_copied());
+        assert_eq!(short.missing_locations, names(&["offsite"]));
+        assert!(short.any());
+        assert_eq!(short.describe(), "2 of 3 copies; no copy at offsite");
+
+        let met = shortfall(&conn, unit_id, &policy(&conn, 2, &["home"])).unwrap();
+        assert!(!met.any(), "{met:?}");
+        assert_eq!(met.describe(), "");
     }
 
     // ── missing_required_locations (issue #348) ──

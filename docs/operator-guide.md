@@ -873,6 +873,20 @@ no stage set owes a copy
 `--generation LTO-5` to count cartridges of another generation that drive can
 write.
 
+`--policy-aware` puts first the units a write would help: those `audit` finds
+with too few copies, or with no copy at a required location. Each one is named
+with what it is short of. `volume plan --policy-aware` only orders the list,
+because `volume write` writes every staged set either way. `collection plan
+--policy-aware` changes the batches: those units are packed into the first
+batches, each group in name order. Batch numbers follow that order, so give
+`collection run` the same flag to run the batch you reviewed:
+
+```bash
+tapectl volume plan --copies 2 --policy-aware
+tapectl collection plan --policy-aware
+tapectl collection run --collection movies --batch 0 --label L8-0003 --policy-aware
+```
+
 ### Restore
 
 `restore` takes everything as flags: `--unit`, the volume to read `--from`,

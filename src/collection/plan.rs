@@ -67,12 +67,21 @@ const BLOCK_SIZE: u64 = 512 * 1024;
 /// `limit` says where `budget` came from, for the refusal of a unit too big
 /// for one tape (issues #391, #395: the refusal names the overage and the
 /// per-generation limit, ADR-0012 2026-10-06 items 16 and 17).
+///
+/// `policy_aware` (ADR-0012 2026-10-07 item 26, issue #144): order the
+/// selection so the units whose audit findings a write would resolve —
+/// [`coverage::Shortfall`], the audit's own `copy_count` and
+/// `location_presence` predicates — are packed first
+/// (`selector::plan_batches_prioritised`). A never-archived unit always
+/// falls short; a changed unit whose current version already meets its
+/// policy does not, and waits behind the ones that do.
 fn batches_for_budget(
     conn: &Connection,
     config: &Config,
     lib: &CollectionConfig,
     budget: u64,
     limit: &str,
+    policy_aware: bool,
 ) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
     let scan = super::fingerprint::pending_units_for_collection(
         conn,
@@ -88,7 +97,18 @@ fn batches_for_budget(
         })
         .collect();
 
-    let batches = selector::plan_batches(synthetic, budget, BLOCK_SIZE).map_err(|oversized| {
+    let planned = if policy_aware {
+        let mut prioritised = std::collections::HashSet::new();
+        for p in &scan.pending {
+            if coverage::unit_shortfall(conn, config, &p.unit)?.any() {
+                prioritised.insert(p.unit.name.clone());
+            }
+        }
+        selector::plan_batches_prioritised(synthetic, &prioritised, budget, BLOCK_SIZE)
+    } else {
+        selector::plan_batches(synthetic, budget, BLOCK_SIZE)
+    };
+    let batches = planned.map_err(|oversized| {
         TapectlError::Other(format!(
             "collection \"{}\": {} unit(s) exceed the per-tape budget and can never be \
              batched (a unit is never split across tapes; ADR-0012): {}. The limit: {limit}. \
@@ -124,6 +144,8 @@ pub fn plan_for_collection(
     // errored outright the moment a second drive was configured rather than
     // asking which one was meant.
     device: Option<&str>,
+    // `--policy-aware` (issue #144): see `batches_for_budget`.
+    policy_aware: bool,
 ) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
     let backend = crate::config::resolve_lto_backend(config, device)?;
     // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
@@ -134,7 +156,14 @@ pub fn plan_for_collection(
     // one value, so the refusal names the figures the packing used.
     let tape = backend.planning_tape_budget(media)?;
 
-    batches_for_budget(conn, config, lib, tape.bytes, &tape.describe())
+    batches_for_budget(
+        conn,
+        config,
+        lib,
+        tape.bytes,
+        &tape.describe(),
+        policy_aware,
+    )
 }
 
 /// `collection run`'s per-tape budget (issue #175): resolved from the
@@ -410,6 +439,8 @@ pub fn plan_for_run(
     lib: &CollectionConfig,
     device: &str,
     labels: &[String],
+    // `--policy-aware` (issue #144): see `batches_for_budget`.
+    policy_aware: bool,
 ) -> Result<(Vec<Batch>, DestinationBudget, Vec<RefusedUnit>)> {
     if labels.len() > 1 {
         return Err(TapectlError::Other(format!(
@@ -425,8 +456,14 @@ pub fn plan_for_run(
         )));
     }
     let budget = destination_budget(conn, config, device, labels)?;
-    let (batches, refused) =
-        batches_for_budget(conn, config, lib, budget.bytes, &budget.describe())?;
+    let (batches, refused) = batches_for_budget(
+        conn,
+        config,
+        lib,
+        budget.bytes,
+        &budget.describe(),
+        policy_aware,
+    )?;
     Ok((batches, budget, refused))
 }
 
@@ -480,13 +517,122 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None).unwrap();
+        let (batches, refused) =
+            plan_for_collection(&conn, &config, &lib, None, None, false).unwrap();
         assert!(refused.is_empty());
         assert_eq!(batches.len(), 1, "two 3 MiB units must fit one 10 MiB tape");
         assert_eq!(
             batches[0].unit_names(),
             vec!["testlib/alpha", "testlib/beta"]
         );
+    }
+
+    /// Issue #144 (ADR-0012 2026-10-07 item 26): `--policy-aware` packs the
+    /// units a write would help first. `alpha` changed on disk but its
+    /// current version already has two eligible copies (the default
+    /// `min_copies`); `beta` was never archived. One unit fits a tape, so
+    /// the batch ORDER is the assertion: alphabetical puts `alpha` first,
+    /// policy-aware puts `beta` first — and both `collection plan` and
+    /// `collection run` order the same way.
+    #[test]
+    fn policy_aware_packs_the_units_with_findings_first() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        }
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        // `alpha`: a current version (with no files recorded, so the disk
+        // reads as changed) on two sealed volumes.
+        let alpha: i64 = conn
+            .query_row(
+                "SELECT id FROM units WHERE name = 'testlib/alpha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            params![alpha],
+        )
+        .unwrap();
+        let snap = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'cleaned', 524288)",
+            params![snap],
+        )
+        .unwrap();
+        let ss = conn.last_insert_rowid();
+        for label in ["S1", "S2"] {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+                 VALUES (?1, 'lto', 'p', 1, 'sealed')",
+                params![label],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss, snap, conn.last_insert_rowid()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('L1', 'lto', 'p', 4000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+
+        let mut config = config_with_tiny_backend();
+        config.backends.lto[0].capacity_override = Some("4M".into());
+        let order = |batches: &[Batch]| -> Vec<Vec<String>> {
+            batches
+                .iter()
+                .map(|b| b.unit_names().iter().map(|n| n.to_string()).collect())
+                .collect()
+        };
+        let alphabetical = vec![
+            vec!["testlib/alpha".to_string()],
+            vec!["testlib/beta".into()],
+        ];
+        let policy_first = vec![
+            vec!["testlib/beta".to_string()],
+            vec!["testlib/alpha".into()],
+        ];
+
+        let (plain, _) = plan_for_collection(&conn, &config, &lib, None, None, false).unwrap();
+        assert_eq!(order(&plain), alphabetical);
+        let (aware, _) = plan_for_collection(&conn, &config, &lib, None, None, true).unwrap();
+        assert_eq!(order(&aware), policy_first);
+
+        let label = ["L1".to_string()];
+        let (run_plain, _, _) =
+            plan_for_run(&conn, &config, &lib, "/dev/null", &label, false).unwrap();
+        assert_eq!(order(&run_plain), alphabetical);
+        let (run_aware, _, _) =
+            plan_for_run(&conn, &config, &lib, "/dev/null", &label, true).unwrap();
+        assert_eq!(order(&run_aware), policy_first);
     }
 
     /// Issues #391 and #395 (ADR-0012 2026-10-06 items 16 and 17): a unit
@@ -524,7 +670,7 @@ mod tests {
 
         let mut config = config_with_tiny_backend();
         config.backends.lto[0].fill_ceiling = 0.9;
-        let msg = plan_for_collection(&conn, &config, &lib, None, None)
+        let msg = plan_for_collection(&conn, &config, &lib, None, None, false)
             .unwrap_err()
             .to_string();
         // 10,000,000 x 0.9 = 9,000,000; the unit pads to 9,437,184.
@@ -548,6 +694,7 @@ mod tests {
             &lib,
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(batches.len(), 1);
@@ -600,15 +747,15 @@ mod tests {
 
         // Without a device, two drives is an error asking for one — not a
         // silent pick.
-        let err = plan_for_collection(&conn, &config, &lib, None, None).unwrap_err();
+        let err = plan_for_collection(&conn, &config, &lib, None, None, false).unwrap_err();
         assert!(err.to_string().contains("--device"), "{err}");
 
         let (big, _refused) =
-            plan_for_collection(&conn, &config, &lib, None, Some("/dev/null")).unwrap();
+            plan_for_collection(&conn, &config, &lib, None, Some("/dev/null"), false).unwrap();
         assert_eq!(big.len(), 1, "10 MiB tape holds both 3 MiB units");
 
         let (small, _refused) =
-            plan_for_collection(&conn, &config, &lib, None, Some("/dev/zero")).unwrap();
+            plan_for_collection(&conn, &config, &lib, None, Some("/dev/zero"), false).unwrap();
         assert_eq!(small.len(), 2, "4 MiB tape cannot hold both 3 MiB units");
     }
 
@@ -655,8 +802,15 @@ mod tests {
 
         let config = config_with_tiny_backend();
 
-        let (volume_batches, _budget, _refused) =
-            plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap();
+        let (volume_batches, _budget, _refused) = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1".to_string()],
+            false,
+        )
+        .unwrap();
         assert_eq!(
             volume_batches.len(),
             2,
@@ -664,7 +818,7 @@ mod tests {
         );
 
         let (generation_batches, _refused) =
-            plan_for_collection(&conn, &config, &lib, None, None).unwrap();
+            plan_for_collection(&conn, &config, &lib, None, None, false).unwrap();
         assert_eq!(
             generation_batches.len(),
             1,
@@ -739,7 +893,7 @@ mod tests {
         assert_eq!(budget.num_destinations, 2);
 
         let (batches, refused) =
-            batches_for_budget(&conn, &config, &lib, budget.bytes, "test").unwrap();
+            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", false).unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -800,6 +954,7 @@ mod tests {
             &lib,
             "/dev/null",
             &["nonexistent".to_string()],
+            false,
         )
         .unwrap_err();
         assert!(
@@ -882,8 +1037,15 @@ mod tests {
                 .unwrap();
 
             let config = config_with_tiny_backend();
-            let err =
-                plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap_err();
+            let err = plan_for_run(
+                &conn,
+                &config,
+                &lib,
+                "/dev/null",
+                &["L1".to_string()],
+                false,
+            )
+            .unwrap_err();
 
             match &err {
                 TapectlError::VolumeNotWriteTarget {
@@ -957,7 +1119,15 @@ mod tests {
             .unwrap();
 
         let config = config_with_tiny_backend();
-        let err = plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap_err();
+        let err = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1".to_string()],
+            false,
+        )
+        .unwrap_err();
 
         match &err {
             TapectlError::VolumeQuarantined { label } => {
@@ -1064,6 +1234,7 @@ mod tests {
             &lib,
             "/dev/null",
             &["L1-REBUILT".to_string()],
+            false,
         )
         .unwrap_err();
 
@@ -1120,8 +1291,15 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let (batches, budget, refused) =
-            plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap();
+        let (batches, budget, refused) = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1".to_string()],
+            false,
+        )
+        .unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -1160,7 +1338,7 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let err = plan_for_collection(&conn, &config, &lib, None, None).unwrap_err();
+        let err = plan_for_collection(&conn, &config, &lib, None, None, false).unwrap_err();
         assert!(
             err.to_string().contains("testlib/huge"),
             "error must name the offending unit: {err}"
@@ -1222,6 +1400,7 @@ mod tests {
             &lib,
             "/dev/null",
             &["L1".to_string(), "L2".to_string()],
+            false,
         )
         .unwrap_err();
 
@@ -1342,7 +1521,7 @@ mod tests {
         );
 
         let (batches, refused) =
-            batches_for_budget(&conn, &config, &lib, budget.bytes, "test").unwrap();
+            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", false).unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -1401,6 +1580,7 @@ mod tests {
             &lib,
             "/dev/null",
             &["L1".to_string(), "L1".to_string()],
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("volume write"), "{err}");
@@ -1493,7 +1673,7 @@ pattern = ["*.tmp"]
         };
 
         let config = config_with_tiny_backend();
-        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None)
+        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None, false)
             .expect("a per-unit dotfile fault must not abort `collection plan`'s own scan");
 
         assert_eq!(refused.len(), 1, "exactly one unit must be refused");
