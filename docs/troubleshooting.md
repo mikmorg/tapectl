@@ -691,20 +691,14 @@ version.
 The findings it can name, and what to do about each:
 
 - **A `modified_at` not in the spelling every tapectl release writes**
-  (`2026-09-01T12:00:00+00:00`). One case of this is not a hand edit: earlier
-  releases recorded every file's modified time as text, so a file stamped past
-  year 9999 was recorded with a leading sign (`+10000-01-01T00:00:00+00:00`).
-  The walk now records no modified time for such a file; set the value to NULL
-  (`sqlite3 "$DB" "UPDATE files SET modified_at = NULL WHERE id = 4012"`) and
-  the next `snapshot create` also records none for it, so the unit still reads
-  as unchanged.
+  (`2026-09-01T12:00:00+00:00`).
 - **A sha256 that is not 64 lowercase hex characters.**
 - **An `is_directory` and `file_type` that disagree**, or a `file_type` that
   is not `dir`, `regular`, `symlink` or `special`.
 - **A row whose snapshot no longer exists.** This is the one row to delete:
   it belongs to no version.
 
-Apart from the signed year, every row they name was edited by hand.
+Every row they name was edited by hand.
 A sha256 or a `modified_at` you cannot recover may be set to NULL: a
 version without a sha256 is baselined again by its next stage, and a file
 whose modified time is NULL reads as changed to the next
@@ -713,10 +707,12 @@ all is not refused: it takes the type its `is_directory` gives, as migration
 005 did.
 
 A `modified_at` in that spelling but before 1677-09-21 or after 2262-04-11 --
-1601-01-01, the zero time of an NTFS volume, say -- is not refused: no
-nanosecond count holds it, so 030 records no modified time for that file,
-which is what the walk records for it today, and the unit still reads as
-unchanged. It says so once, on stderr, naming each row:
+1601-01-01, the zero time of an NTFS volume, say -- is not refused, and
+neither is a year past 9999 in the spelling earlier releases gave it, with a
+leading sign (`+10000-01-01T00:00:00+00:00`). No nanosecond count holds
+either, so 030 records no modified time for that file, which is what the walk
+records for it today, and the unit still reads as unchanged. It says so once,
+on stderr, naming up to ten rows and then the count (`, ... (12 rows)`):
 
 ```text
 WARN tapectl::db: migration 030 recorded no modified time for 1 file row(s) whose modified_at is outside

@@ -192,6 +192,7 @@ fn build_sealed_volume_full(
         label: LABEL,
         volume_uuid: VOL_UUID,
         keys: &FixtureKeys::fresh(),
+        slices_per_unit: 2,
     })
 }
 
@@ -231,6 +232,9 @@ struct TapeSpec<'a> {
     label: &'a str,
     volume_uuid: &'a str,
     keys: &'a FixtureKeys,
+    /// Slices per unit: two everywhere but the one test that pins the
+    /// single-slice boundary of `ensure_stage_set`'s step 2.
+    slices_per_unit: i64,
 }
 
 /// Run the production write session for [`UNITS`] at version 7 into a
@@ -245,6 +249,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         label,
         volume_uuid,
         keys,
+        slices_per_unit,
     } = spec;
     let db_dir = tempfile::tempdir().unwrap();
     let conn = db::open(&db_dir.path().join("src.db")).unwrap();
@@ -331,7 +336,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         // Two slices per unit, so "slice number is not tape position" is a
         // claim the fixture can actually falsify.
         let mut slices = Vec::new();
-        for slice_number in 1..=2i64 {
+        for slice_number in 1..=slices_per_unit {
             let mut plaintext = content.to_vec();
             plaintext.extend_from_slice(format!("-slice{slice_number}").as_bytes());
             let recipients = vec![
@@ -2876,6 +2881,7 @@ fn two_tapes_of_one_version() -> (SealedVolume, SealedVolume) {
         label: LABEL,
         volume_uuid: VOL_UUID,
         keys: &keys,
+        slices_per_unit: 2,
     });
     let b = build_tape(TapeSpec {
         catalog_db: CatalogDb::New,
@@ -2884,6 +2890,7 @@ fn two_tapes_of_one_version() -> (SealedVolume, SealedVolume) {
         label: LABEL_B,
         volume_uuid: VOL_UUID_B,
         keys: &keys,
+        slices_per_unit: 2,
     });
     (a, b)
 }
@@ -3171,6 +3178,112 @@ fn a_first_slice_mismatch_in_the_writing_catalog_is_refused() {
         row_counts(&live),
         "a refused rebuild changes nothing"
     );
+}
+
+/// `ensure_stage_set`'s step 2: with no write row on this volume to find
+/// the stage set by (step 1), it is found by ANY of this tape's slices whose
+/// ciphertext the catalog shares -- here slice 2, slice 1 having been
+/// altered -- and then every slice of it is compared with the tape, so the
+/// slice-1 disagreement refuses rather than minting a sibling.
+#[test]
+fn a_first_slice_mismatch_with_no_write_row_is_found_by_a_later_slice_and_refused() {
+    let (mut a, _) = two_tapes_of_one_version();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = a.operator_secret.clone();
+    rebuild(&conn, &mut a, &secret, scratch.path()).expect("first rebuild");
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF; DELETE FROM write_positions; DELETE FROM writes; \
+         PRAGMA foreign_keys = ON; \
+         UPDATE stage_slices SET sha256_encrypted = 'feedface' WHERE slice_number = 1;",
+    )
+    .unwrap();
+    // The precondition: no write row for step 1 to find the stage set by.
+    let writes: i64 = conn
+        .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(writes, 0);
+    let before = row_counts(&conn);
+
+    let err = rebuild(&conn, &mut a, &secret, scratch.path()).expect_err("refused");
+    assert!(err.to_string().contains("slice 1 of stage set"), "{err}");
+    assert!(err.to_string().contains("feedface"), "{err}");
+    assert_eq!(
+        before,
+        row_counts(&conn),
+        "a refused rebuild changes nothing"
+    );
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(
+            stage_sets_of_v7(&conn, unit_name),
+            1,
+            "{unit_name}: no sibling stage set"
+        );
+    }
+}
+
+/// The known boundary of step 2: a stage set is matched by a slice whose
+/// ciphertext it shares with the tape, so a ONE-slice unit whose only slice
+/// disagrees, with no write row on this volume to find it by, shares
+/// nothing -- indistinguishable from a different staging of the same
+/// Version (issue #379). A new stage set is minted beside the altered one
+/// rather than refused. Pinned so a change to that is a decision, not a
+/// surprise.
+#[test]
+fn known_boundary_a_single_slice_mismatch_with_no_write_row_mints_a_new_stage_set() {
+    let keys = FixtureKeys::fresh();
+    let mut vol = build_tape(TapeSpec {
+        catalog_db: CatalogDb::New,
+        mam_serial: "SERIAL-A",
+        cartridge_identity_source: Some("mam"),
+        label: LABEL,
+        volume_uuid: VOL_UUID,
+        keys: &keys,
+        slices_per_unit: 1,
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).expect("first rebuild");
+    let slices: i64 = conn
+        .query_row("SELECT COUNT(*) FROM stage_slices", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(slices, UNITS.len() as i64, "one slice per unit");
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF; DELETE FROM write_positions; DELETE FROM writes; \
+         PRAGMA foreign_keys = ON; \
+         UPDATE stage_slices SET sha256_encrypted = 'feedface' WHERE slice_number = 1;",
+    )
+    .unwrap();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("nothing on this tape names the altered stage set, so nothing refuses");
+    assert_eq!(report.stage_sets, UNITS.len(), "{report:?}");
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(
+            stage_sets_of_v7(&conn, unit_name),
+            2,
+            "{unit_name}: the altered stage set and a new one beside it"
+        );
+    }
+    // The new stage set is the tape's: restore resolves it and its
+    // ciphertext checks out.
+    use tapectl::store::Store;
+    for (unit_name, _, _) in UNITS {
+        let selection =
+            tapectl::volume::restore::select_write_positions(&conn, unit_name, &vol.label, None)
+                .unwrap();
+        assert_eq!(selection.positions.len(), 1, "{unit_name}");
+        let p = &selection.positions[0];
+        let mut bytes = Vec::new();
+        vol.store
+            .read_file(p.position.parse().unwrap(), &mut bytes)
+            .unwrap();
+        bytes.truncate(p.encrypted_bytes as usize);
+        assert_eq!(sha256_hex(&bytes), p.sha256_encrypted, "{unit_name}");
+    }
 }
 
 /// A `MemStore` that, before every read, checks from a SECOND connection

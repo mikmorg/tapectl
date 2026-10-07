@@ -561,10 +561,15 @@ fn warn_030_nulled_mtimes(conn: &Connection) -> Result<()> {
     if !present {
         return Ok(());
     }
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM temp.m030_mtime_nulled", [], |r| {
+        r.get(0)
+    })?;
+    // At most ten rows named, as the refusals name theirs: a catalog with
+    // thousands of such files must not print thousands of lines.
     let rows: Vec<String> = conn
         .prepare(
             "SELECT files_id, snapshot_id, path_id, modified_at
-               FROM temp.m030_mtime_nulled ORDER BY files_id",
+               FROM temp.m030_mtime_nulled ORDER BY files_id LIMIT 10",
         )?
         .query_map([], |r| {
             Ok(format!(
@@ -577,14 +582,20 @@ fn warn_030_nulled_mtimes(conn: &Connection) -> Result<()> {
         })?
         .collect::<rusqlite::Result<_>>()?;
     conn.execute_batch("DROP TABLE temp.m030_mtime_nulled")?;
-    if !rows.is_empty() {
+    if total > 0 {
+        let more = if total > rows.len() as i64 {
+            format!(", ... ({total} rows)")
+        } else {
+            String::new()
+        };
         warn!(
             "migration 030 recorded no modified time for {} file row(s) whose modified_at is \
-             outside 1677-09-21..2262-04-11, the range a nanosecond count holds: {}. A walk \
+             outside 1677-09-21..2262-04-11, the range a nanosecond count holds: {}{}. A walk \
              records none for such a file either, so these units still read as unchanged; \
              nothing else was altered",
-            rows.len(),
-            rows.join("; ")
+            total,
+            rows.join("; "),
+            more
         );
     }
     Ok(())
@@ -4487,12 +4498,12 @@ mod tests {
                 "modified_at = '2026-09-01 12:00:01'",
                 "modified_at is not YYYY-MM-DDTHH:MM:SS+00:00",
             ),
-            // A year past 9999 is spelled with a sign: malformed text, still
-            // refused (ADR-0012 amendment 2026-10-07 item 9). An in-spelling
-            // value outside the nanosecond range is not refused: see
+            // A year past 9999 in chrono's signed spelling is not refused
+            // (ADR-0012 amendment 2026-10-07 item 9): see
             // `test_migration_030_writes_null_for_an_mtime_no_nanosecond_count_holds`.
+            // A signed year in any other spelling still is.
             (
-                "modified_at = '+10000-01-01T00:00:00+00:00'",
+                "modified_at = '+10000-01-01T00:00:00Z'",
                 "modified_at is not YYYY-MM-DDTHH:MM:SS+00:00",
             ),
             ("file_type = 'fifo'", "is_directory/file_type"),
@@ -4579,11 +4590,17 @@ mod tests {
     /// own spelling but outside 1677-09-21..2262-04-11, which no i64 count
     /// of nanoseconds holds, converts to a NULL `mtime_ns` -- what the walk
     /// and the rebuild record for the same file -- and the migration warns,
-    /// naming the row, instead of refusing. Every other value converts as
-    /// before.
+    /// naming the row, instead of refusing. So does a year past 9999 in the
+    /// signed spelling chrono's `to_rfc3339` gave it before 030, which
+    /// SQLite's date functions do not read at all. Every other value
+    /// converts as before.
     #[test]
     fn test_migration_030_writes_null_for_an_mtime_no_nanosecond_count_holds() {
-        for far_off in ["2300-01-01T00:00:00+00:00", "1601-01-01T00:00:00+00:00"] {
+        for far_off in [
+            "2300-01-01T00:00:00+00:00",
+            "1601-01-01T00:00:00+00:00",
+            "+10000-01-01T00:00:00+00:00",
+        ] {
             let mut conn = open_memory_at_version(29);
             seed_schema_29_files(&conn);
             let id: i64 = conn
@@ -4648,6 +4665,45 @@ mod tests {
         let log = CapturedLog::default();
         log.capture(|| migrate(&mut conn)).unwrap();
         assert!(!log.text().contains("migration 030"), "{}", log.text());
+    }
+
+    /// The WARN names at most ten rows, then the count, as the refusals do:
+    /// a catalog with thousands of NTFS-zero-time files prints one line.
+    #[test]
+    fn test_migration_030_warning_names_at_most_ten_rows() {
+        let mut conn = open_memory_at_version(29);
+        seed_schema_29_files(&conn);
+        let mut ids = Vec::new();
+        for i in 0..12 {
+            conn.execute(
+                "INSERT INTO files (snapshot_id, path, is_directory, file_type, size_bytes,
+                                    modified_at)
+                 VALUES (22, ?1, 0, 'regular', 1, '1601-01-01T00:00:00+00:00')",
+                [format!("far/{i}")],
+            )
+            .unwrap();
+            ids.push(conn.last_insert_rowid());
+        }
+
+        let log = CapturedLog::default();
+        log.capture(|| migrate(&mut conn)).unwrap();
+        let text = log.text();
+        assert!(text.contains("for 12 file row(s)"), "{text}");
+        for id in &ids[..10] {
+            assert!(text.contains(&format!("files row {id} ")), "{text}");
+        }
+        for id in &ids[10..] {
+            assert!(!text.contains(&format!("files row {id} ")), "{text}");
+        }
+        assert!(text.contains(", ... (12 rows). A walk"), "{text}");
+        let nulled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_versions WHERE snapshot_id = 22 AND mtime_ns IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulled, 12, "every row is converted, not only the ten named");
     }
 
     /// A `files` row whose snapshot is gone has no unit to intern its path

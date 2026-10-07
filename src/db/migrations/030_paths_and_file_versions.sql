@@ -53,25 +53,28 @@
 --   (d) a `modified_at` that is not the walk's own spelling,
 --       `YYYY-MM-DDTHH:MM:SS+00:00` (chrono's `to_rfc3339` of a whole-second
 --       UTC time), the only spelling that converts to an integer and back
---       unchanged.
--- (b), (c) and the rest of (d) are hand edits. One far-off modified_at is
--- not: every walk before 030 spelled a file's own mtime, so one past year
--- 9999 was spelled `+10000-...` and is refused by (d) as malformed text.
--- Deleting a row is the remedy only for (a): a version one row short of its
--- `file_count` cannot be staged (staging's file-list check).
+--       unchanged -- or the signed spelling of a year past 9999, which is
+--       the exception below, not a refusal.
+-- (b), (c) and (d) are hand edits. Deleting a row is the remedy only for
+-- (a): a version one row short of its `file_count` cannot be staged
+-- (staging's file-list check).
 --
 -- THE EXCEPTION: AN MTIME NO NANOSECOND COUNT HOLDS
 -- -------------------------------------------------
 -- A `modified_at` in the walk's spelling but outside 1677-09-21..2262-04-11
 -- (a file stamped 1601-01-01, the zero time of an NTFS volume, say) is not
--- refused: no nanosecond count in an INTEGER holds it (it would overflow to
--- a REAL), so it converts to a NULL `mtime_ns`, which is what the walk and
--- `catalog rebuild` record for the same file today -- the unit still reads
--- as unchanged. ADR-0012 amendment 2026-10-07 item 9: a refusal here blocked
--- every command on the host for a value nothing is lost by dropping. The
--- rows are kept in the TEMP table `m030_mtime_nulled` (files row id,
--- snapshot, the new path id, the old text); `db::migrate_to` reads it after
--- the migration commits, warns naming every row, and drops it. TEMP, so it
+-- refused, and neither is one past year 9999: every walk before 030 spelled
+-- a file's own mtime with chrono's `to_rfc3339`, which writes such a year
+-- with a sign and five or more digits (`+10000-01-01T00:00:00+00:00`), a
+-- spelling (d) exempts by GLOB. No nanosecond count in an INTEGER holds
+-- either (it would overflow to a REAL), so it converts to a NULL
+-- `mtime_ns`, which is what the walk and `catalog rebuild` record for the
+-- same file today -- the unit still reads as unchanged. ADR-0012
+-- amendment 2026-10-07 item 9: a refusal here blocked every command on the
+-- host for a value nothing is lost by dropping. The rows are kept in the
+-- TEMP table `m030_mtime_nulled` (files row id, snapshot, the new path id,
+-- the old text); `db::migrate_to` reads it after the migration commits,
+-- warns naming the first ten rows and the count, and drops it. TEMP, so it
 -- is never part of the schema, and rolled back with everything else if any
 -- later check refuses.
 --
@@ -158,10 +161,14 @@ FROM (
                          WHERE modified_at IS NOT NULL
                            AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at)
                                IS NOT modified_at
+                           AND modified_at NOT GLOB
+                               '[+-][0-9][0-9][0-9][0-9][0-9]*-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00'
                          ORDER BY id LIMIT 10)) AS ids
               FROM files
              WHERE modified_at IS NOT NULL
-               AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at) IS NOT modified_at)
+               AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at) IS NOT modified_at
+               AND modified_at NOT GLOB
+                   '[+-][0-9][0-9][0-9][0-9][0-9]*-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00')
      WHERE n > 0
 )
 HAVING COUNT(*) > 0;
@@ -197,16 +204,20 @@ SELECT s.unit_id, f.path
  ORDER BY MIN(f.id);
 
 -- The exception above: every remaining modified_at is in the walk's
--- spelling (the guard refused the rest), so this is exactly the set outside
--- the range an i64 of nanoseconds holds.
+-- spelling or the signed spelling of a year past 9999 (the guard refused the
+-- rest), so this is exactly the set outside the range an i64 of nanoseconds
+-- holds. The signed spelling is named outright: SQLite's date functions
+-- read it as NULL, so the range test alone would never select it.
 CREATE TEMP TABLE m030_mtime_nulled AS
 SELECT f.id AS files_id, f.snapshot_id, p.id AS path_id, f.modified_at
   FROM files f
   JOIN snapshots s ON s.id = f.snapshot_id
   JOIN paths p ON p.unit_id = s.unit_id AND p.path = f.path
  WHERE f.modified_at IS NOT NULL
-   AND CAST(strftime('%s', f.modified_at) AS INTEGER)
-       NOT BETWEEN -9223372036 AND 9223372036
+   AND (CAST(strftime('%s', f.modified_at) AS INTEGER)
+            NOT BETWEEN -9223372036 AND 9223372036
+        OR f.modified_at GLOB
+           '[+-][0-9][0-9][0-9][0-9][0-9]*-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00')
  ORDER BY f.id;
 
 INSERT INTO file_versions (snapshot_id, path_id, kind, size_bytes, mtime_ns, sha256,
