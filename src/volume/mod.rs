@@ -1,6 +1,8 @@
 pub mod adopt_lost;
 pub(crate) mod binding;
 pub mod build;
+#[cfg(test)]
+mod cost_budget;
 pub mod envelope;
 pub mod format;
 pub mod layout;
