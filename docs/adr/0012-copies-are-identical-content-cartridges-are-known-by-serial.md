@@ -1276,6 +1276,19 @@ landed on master in de732a7 and 21f93a3; the questions are in their issues.
 22. **The 2026-10-06 batches ship in 1.1.0**, still untagged.
 23. **Resume continues from min(catalog cursor, files on the medium)** (#403), recorded in
     `layout-session.md`.
+24. **The unit's own `.tapectl-unit.toml` is not content** (#378, option A). The unit-root file is
+    left out of every change comparison on both sides (the fingerprint walk, the recorded stamps,
+    staging's size, sha256 and NEW checks, `unit check-integrity`), and is still recorded and
+    still archived. `unit tag`, `unit rename`, a `[policy]` edit, or a changed `compression` or
+    `slice_size` mints no Version; a setting takes effect at the next real content change. The
+    catalog is the authority for a unit's name, tags and policy; the copy on tape is a record of
+    them as of the last archive, kept for self-registering restores (design v4 §2.2), whose key
+    is the uuid. `collection sync` and `unit discover` refuse, per unit, two directories carrying
+    one uuid in a walk, and a known uuid found in a new directory while its recorded one still
+    exists (a copy, not a move). It lands before #383 makes `tenant reassign` rewrite the file.
+25. **A serial bound to a live sealed volume is not refused when the tape proves blank** (#400).
+    The displacement rule (ADR-0010/0012: erase, then `volume init`, no `--force`) stands; what
+    #400 does refuse is a File 0 read error with no blank evidence.
 
 Also ruled: the chip's and the drive's wear figures stay in the journal (ADR-0013) and are not
 copied into columns on `cartridges` (#299). And **a migration file is named for its position**
