@@ -477,14 +477,20 @@ mod tests {
                     .unwrap();
                 // Not the dotfile: it carries each home's own unit uuid.
                 let hashes: Vec<(String, String)> = conn
-                    .prepare(
-                        "SELECT f.path, COALESCE(f.sha256, '') FROM files f
-                         JOIN snapshots s ON s.id = f.snapshot_id
-                         WHERE s.unit_id = ?1 AND f.is_directory = 0
-                           AND f.path <> '.tapectl-unit.toml' ORDER BY f.path",
-                    )
+                    .prepare(&format!(
+                        "SELECT p.path, fv.sha256 FROM {}
+                         JOIN snapshots s ON s.id = fv.snapshot_id
+                         WHERE s.unit_id = ?1 AND fv.kind <> 0
+                           AND p.path <> '.tapectl-unit.toml' ORDER BY p.path",
+                        crate::db::files::VERSION_FILES
+                    ))
                     .unwrap()
-                    .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .query_map([id], |r| {
+                        Ok((
+                            r.get(0)?,
+                            crate::db::files::sha256_column(r.get(1)?).unwrap_or_default(),
+                        ))
+                    })
                     .unwrap()
                     .collect::<std::result::Result<_, _>>()
                     .unwrap();

@@ -1534,10 +1534,15 @@ mod tests {
             .clone();
         let mut bytes: Vec<u8> = (0..24u32 << 20).map(|j| (j % 253) as u8).collect();
         conn.execute(
-            "UPDATE files SET size_bytes = ?1, sha256 = ?2 WHERE path = ?3",
+            "UPDATE file_versions SET size_bytes = ?1, sha256 = ?2
+             WHERE snapshot_id = ?3
+               AND path_id = (SELECT id FROM paths
+                               WHERE unit_id = (SELECT unit_id FROM snapshots WHERE id = ?3)
+                                 AND path = ?4)",
             params![
                 bytes.len() as i64,
-                format!("{:x}", Sha256::digest(&bytes)),
+                Sha256::digest(&bytes).as_slice(),
+                sid,
                 first
             ],
         )

@@ -3741,13 +3741,13 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 8 per-unit checks + 4 archive-wide checks. `policy_unresolvable`
+            // 8 per-unit checks + 5 archive-wide checks. `policy_unresolvable`
             // is not one of them (see below), and `escrow_kit_missing`/
             // `escrow_kit_stale` share one row.
             assert_eq!(
                 names.len(),
-                12,
-                "expected 8 per-unit + 4 archive-wide CHECKS rows, got: {names:?}"
+                13,
+                "expected 8 per-unit + 5 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {

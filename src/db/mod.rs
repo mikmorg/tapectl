@@ -4590,8 +4590,9 @@ mod tests {
         let source = std::fs::read_to_string(dir.join("mod.rs")).unwrap();
         let body = &source[source.find("fn migrations()").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
+        // Some entries wrap `include_str!(` and its path onto two lines.
         let included: Vec<String> = body
-            .match_indices("include_str!(\"migrations/")
+            .match_indices("\"migrations/")
             .map(|(i, m)| {
                 let rest = &body[i + m.len()..];
                 rest[..rest.find('"').unwrap()].to_string()
