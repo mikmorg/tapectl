@@ -16,7 +16,10 @@
 #                      75 = a tapectl command holds the drive (or the
 #                           catalog); nothing was read                    -> no ping, logged
 #             anything else = no reading (the sg node could not be read,
-#                           the config is wrong, tapectl stopped)         -> failure
+#                           the config is wrong, the catalog refuses
+#                           writes, tapectl stopped), or a reading the
+#                           catalog could not record (the output is its
+#                           only copy)                                    -> failure
 #
 # A raised TapeAlert is a hardware fact, not a policy finding, so unlike the
 # audit's warnings it is a failure here: this is the check that exists to go

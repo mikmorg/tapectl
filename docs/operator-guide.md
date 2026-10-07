@@ -1741,7 +1741,12 @@ the volume on it.
 The TapeAlert page (0x2E) may clear as it is read, so the poll runs only when
 no tapectl command has the drive: it takes the drive lock without waiting, and
 when a command holds it, it reads nothing and exits 75. A poll can therefore
-never take the alerts a write's or a verify's own reading is owed. **Reading
+never take the alerts a write's or a verify's own reading is owed. Nor does it
+read a page the catalog cannot record: it takes the catalog's write lock and
+records its contact before the first page, and reads nothing when it cannot (75
+for a catalog another command is writing, 2 for one that refuses writes); a
+page it read but could not record is named, printed in full, and exits 2.
+**Reading
 page 0x2E by hand (`sg_logs --page=0x2e`) can clear it the same way** —
 debugging with `sg_logs` can erase the evidence you are looking for; run
 `tapectl drive poll` instead, which keeps it.
@@ -1750,8 +1755,8 @@ debugging with `sg_logs` can erase the evidence you are looking for; run
 |---|---|---|
 | 0 | recorded; the drive reported nothing | success |
 | 1 | recorded; the drive raised a TapeAlert or reported an unrecovered error (named) | **failure** |
-| 2 | no reading: the sg node could not be read, or no drive is configured | failure |
-| 75 | a tapectl command holds the drive (or the catalog); nothing was read | neither (`SuccessExitStatus=75`, no ping) |
+| 2 | no reading: the sg node could not be read, no drive is configured, or the catalog refuses writes — or a reading the catalog could not record (named; the output is its only copy) | failure |
+| 75 | a tapectl command holds the drive, or another is writing the catalog; nothing was read | neither (`SuccessExitStatus=75`, no ping) |
 
 Unlike the audit's warnings, a raised TapeAlert *is* a failure here: it is a
 hardware fact, not a policy finding, and this is the check that exists to go
@@ -1760,8 +1765,8 @@ audit's: set `TAPECTL_DRIVE_HEALTHCHECK_URL` in `tapectl-drive-poll.service`
 (`/start` before, bare URL on 0, `/fail` on 1, 2 and anything else but 75; the
 poll's output is the ping's body, so the check's log names the flags). The
 audit sees the same alerts from the catalog: `tape_alert` warns (exit 1) for
-each live volume whose cartridge raised one since the volume's last passed
-full verify, and names the flags; the remedy is `tapectl volume verify
+each live volume whose cartridge raised one not before the volume's last
+passed full verify started, and names the flags; the remedy is `tapectl volume verify
 <label>`, which either passes (the warning goes) or quarantines the volume
 (and the copy checks take over).
 

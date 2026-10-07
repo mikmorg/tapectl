@@ -20,7 +20,7 @@ Read the drive's health pages (and the cartridge chip, when one is loaded) and r
 
 Sends LOG SENSE, READ ATTRIBUTE and INQUIRY to the backend's `device_sg`, and nothing else: it never opens the tape node, never moves the tape, never loads or ejects a cartridge. Every log page it reads is journalled verbatim as a contact of its own (`report health` shows the reading), so a TapeAlert page the drive clears on read is never lost. With no known cartridge loaded the reading is the drive's alone.
 
-Takes the drive lock without waiting: while a tapectl command has the drive it reads nothing and exits 75. Exit 0: recorded, the drive reported nothing. Exit 1: recorded, and the drive raised a TapeAlert or reported an unrecovered error (named). Exit 2: no reading — the sg node could not be read, or the drive is not configured. Run daily by `contrib/systemd/tapectl-drive-poll.timer`.
+Takes the drive lock without waiting: while a tapectl command has the drive, or another command is writing the catalog, it reads nothing and exits 75. It reads no page the catalog cannot record. Exit 0: recorded, the drive reported nothing. Exit 1: recorded, and the drive raised a TapeAlert or reported an unrecovered error (named). Exit 2: no reading — the sg node could not be read, the drive is not configured, or the catalog refuses writes — or a reading the catalog could not record (named, and printed in full). Run daily by `contrib/systemd/tapectl-drive-poll.timer`.
 
 ```text
 tapectl drive poll [OPTIONS]

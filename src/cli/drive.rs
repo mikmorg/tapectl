@@ -24,11 +24,14 @@ pub enum DriveCommands {
     /// the drive's alone.
     ///
     /// Takes the drive lock without waiting: while a tapectl command has
-    /// the drive it reads nothing and exits 75. Exit 0: recorded, the drive
-    /// reported nothing. Exit 1: recorded, and the drive raised a TapeAlert
-    /// or reported an unrecovered error (named). Exit 2: no reading — the
-    /// sg node could not be read, or the drive is not configured. Run daily
-    /// by `contrib/systemd/tapectl-drive-poll.timer`.
+    /// the drive, or another command is writing the catalog, it reads
+    /// nothing and exits 75. It reads no page the catalog cannot record.
+    /// Exit 0: recorded, the drive reported nothing. Exit 1: recorded, and
+    /// the drive raised a TapeAlert or reported an unrecovered error
+    /// (named). Exit 2: no reading — the sg node could not be read, the
+    /// drive is not configured, or the catalog refuses writes — or a
+    /// reading the catalog could not record (named, and printed in full).
+    /// Run daily by `contrib/systemd/tapectl-drive-poll.timer`.
     Poll {
         /// The drive to poll, by its tape node path as configured
         /// (`[[backends.lto]].device_tape`; a by-id link). Defaults to the
@@ -83,16 +86,26 @@ pub fn run(
                 return Ok(EXIT_DRIVE_BUSY);
             }
             let conn = crate::db::open(&paths.db_file)?;
-            let report = poll::poll(&conn, config, backend, Probe::default());
+            let report = poll::poll(&conn, config, backend, Probe::default())?;
             render(&report, json_output);
             exit_code(&report)
         }
     }
 }
 
-/// The exit code for a recorded poll: an error when no log page could be
-/// read at all, 1 when the drive reported a problem, 0 otherwise.
+/// The exit code for a poll: an error when something it read could not be
+/// recorded (never "busy": the reading is lost, so the wrapper must
+/// `/fail`), an error when no log page could be read at all, 1 when the
+/// drive reported a problem, 0 otherwise.
 pub fn exit_code(report: &PollReport) -> Result<i32> {
+    if !report.unrecorded.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "drive poll read {} but could not record in the catalog: {}. Page 0x2E (TapeAlert) \
+             may clear when it is read, so what the drive said is in this output only",
+            report.device_sg,
+            report.unrecorded.join("; ")
+        )));
+    }
     if report.pages_read == 0 {
         return Err(TapectlError::Other(format!(
             "drive poll read no log page from {} ({} attempt(s) failed, each journalled in the \
@@ -155,6 +168,9 @@ fn render(report: &PollReport, json_output: bool) {
     for p in &problems {
         println!("  ** {p} **");
     }
+    for u in &report.unrecorded {
+        println!("  !! NOT RECORDED: {u}");
+    }
     if let Some(cid) = report.contact_id {
         println!("  recorded as contact {cid} (tapectl report health)");
     }
@@ -196,6 +212,13 @@ mod tests {
             exit_code(&nothing).is_err(),
             "no reading is never a quiet 0"
         );
+        // A reading that could not be recorded fails even when the drive
+        // reported nothing — and is never "busy" (75 sends no ping).
+        let mut lost = report();
+        lost.unrecorded = vec!["page 0x2e's journal row (disk full)".into()];
+        let err = exit_code(&lost).expect_err("a lost reading is never a quiet 0");
+        assert!(!crate::db::busy::is_busy_error(&err), "{err}");
+        assert!(err.to_string().contains("0x2e"), "{err}");
         assert_eq!(EXIT_DRIVE_BUSY, crate::error::EXIT_CATALOG_BUSY);
     }
 }

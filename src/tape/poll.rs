@@ -27,13 +27,28 @@
 //! the backend's `device_sg` (LOG SENSE, READ ATTRIBUTE, INQUIRY); the
 //! drive's identity and the st statistics come from sysfs.
 //!
-//! **Read-to-clear.** Page 0x2E may clear as it is read. The sweep's journal
-//! rows are written before anything here looks at what they say, so the
-//! poll cannot read the page without persisting it — and it runs only under
-//! the drive lock (`staging::lock::try_hold_drive`, taken by the CLI before
-//! the catalog is even opened), which every tape command holds from its
-//! contact to its exit, so a poll never takes the alerts a command's own
-//! sweep is owed.
+//! **Read-to-clear.** Page 0x2E may clear as it is read, so a page the poll
+//! reads must reach the catalog, and a poll that cannot record what it
+//! reads must not read it:
+//!
+//! - **Before the sweep**, the poll proves the catalog writable (it takes
+//!   the write lock once, then opens its contact). A busy catalog is
+//!   [`TapectlError::CatalogBusy`] — exit 75, "the next poll reads it" — and
+//!   any other refusal (read-only, wrong owner, a full disk), or a contact
+//!   that could not be recorded, is an error (exit 2, `/fail`); either way
+//!   NO page is read.
+//! - **After the sweep**, every journal row and the reading's `health_logs`
+//!   row is written under the busy policy (`db::busy::retry`), and anything
+//!   that still could not be written is named in
+//!   [`PollReport::unrecorded`]: the CLI prints what was read — the alerts
+//!   included, the only copy left — and exits 2 naming it, never 0 and
+//!   never 75 (the wrapper sends `/fail`).
+//!
+//! The journal rows are written before anything here looks at what they
+//! say, and the poll runs only under the drive lock
+//! (`staging::lock::try_hold_drive`, taken by the CLI before the catalog is
+//! even opened), which every tape command holds from its contact to its
+//! exit, so a poll never takes the alerts a command's own sweep is owed.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -41,9 +56,11 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::config::{Config, LtoBackendConfig};
+use crate::db::busy::{self, BusyPolicy};
+use crate::error::{Result, TapectlError};
 use crate::tape::contact::{ContactSite, Medium, Operation, OUTCOME_FAILED, OUTCOME_OK};
 use crate::tape::drive_identity::{self, DriveIdentity};
-use crate::tape::health::Reading;
+use crate::tape::health::{self, Reading};
 use crate::tape::log_pages::{self, LogSource};
 use crate::tape::mam::{self, MamRead};
 use crate::tape::mam_journal::Hook;
@@ -56,6 +73,9 @@ pub struct Probe<'a> {
     pub identity: Option<DriveIdentity>,
     pub mam: Option<MamRead>,
     pub sysfs_root: Option<&'a Path>,
+    /// How long the post-sweep writes wait out a busy catalog. `None`, the
+    /// production value, is [`BusyPolicy::DEFAULT`].
+    pub busy: Option<BusyPolicy>,
 }
 
 /// What one poll recorded, and what the drive reported.
@@ -87,6 +107,11 @@ pub struct PollReport {
     /// "Total uncorrected errors" on pages 0x02 + 0x03 — the drive's own
     /// count of unrecovered errors. `None` when either page was not read.
     pub uncorrected: Option<i64>,
+    /// What this poll read but could not write to the catalog (a log page's
+    /// journal row, the reading's `health_logs` row), one line each, with
+    /// the catalog's error. Not empty: the reading is lost but for this
+    /// report, and the poll fails (`cli::drive::exit_code`).
+    pub unrecorded: Vec<String>,
 }
 
 impl PollReport {
@@ -129,10 +154,14 @@ fn raised_tape_alerts(decoded_0x2e: &str) -> Vec<String> {
 }
 
 /// Poll the drive `backend` names: one MAM read, one contact, one log-page
-/// sweep, every row written before anything is judged. Never fails: every
-/// failure is recorded (a failed page read is a journal row that says so),
-/// and the caller judges the report — a sweep that read nothing is
-/// [`PollReport::pages_read`] `== 0`.
+/// sweep, every row written before anything is judged.
+///
+/// Fails, reading no page, when the catalog cannot record the poll: busy
+/// ([`TapectlError::CatalogBusy`]) or refusing writes (any other error).
+/// Past that point it returns a report: a failed page read is a journal row
+/// that says so, a sweep that read nothing is [`PollReport::pages_read`]
+/// `== 0`, and a row that could not be written is in
+/// [`PollReport::unrecorded`] — the caller judges all three.
 ///
 /// The caller must already hold the drive lock (`staging::lock::
 /// try_hold_drive`).
@@ -141,7 +170,31 @@ pub fn poll(
     config: &Config,
     backend: &LtoBackendConfig,
     probe: Probe<'_>,
-) -> PollReport {
+) -> Result<PollReport> {
+    let policy = probe.busy.unwrap_or(BusyPolicy::DEFAULT);
+    // Writable, before anything is read: one take of the write lock (the
+    // connection's own busy_timeout is the wait), rolled back at once. The
+    // contact's INSERT below is the proof; this is what tells "busy" (75,
+    // the next poll reads it) from "refused" (2), because the contact guard
+    // swallows its own INSERT error by design.
+    match busy::immediate_tx(conn) {
+        Ok(tx) => drop(tx),
+        Err(e) if busy::is_busy_error(&e) => {
+            return Err(TapectlError::CatalogBusy(format!(
+                "drive poll: another tapectl command is writing the catalog ({e}); nothing \
+                 was read from {} — the next poll will read it",
+                backend.device_sg
+            )))
+        }
+        Err(e) => {
+            return Err(TapectlError::Other(format!(
+                "drive poll: the catalog refuses writes ({e}), so nothing read from {} \
+                 could be recorded; nothing was read",
+                backend.device_sg
+            )))
+        }
+    }
+
     let mut mam_read = probe
         .mam
         .unwrap_or_else(|| mam::read_mam(&backend.device_sg));
@@ -163,8 +216,19 @@ pub fn poll(
         site = site.with_sysfs_root(root);
     }
     let guard = site.open(conn, None);
+    let Some(contact_id) = guard.id() else {
+        // The INSERT failed although the write lock was taken above (the
+        // catalog is read-only to this user, or filled in between): a page
+        // read now would have no contact to land on, and 0x2E may not
+        // survive its read.
+        guard.finish(OUTCOME_FAILED, None);
+        return Err(TapectlError::Other(format!(
+            "drive poll: its contact could not be recorded in the catalog (the warning above \
+             says why), so nothing was read from {}",
+            backend.device_sg
+        )));
+    };
     guard.journal_mam(Operation::DrivePoll, Hook::DrivePoll, &mam_read.capture);
-    let contact_id = guard.id();
 
     // The sweep: the ONE log-page reader. An injected source stands in for
     // the drive entirely, INQUIRY included.
@@ -180,16 +244,11 @@ pub fn poll(
         None => drive_identity::read_identity(backend),
     };
     let drive_serial = identity.serial.clone();
-    crate::volume::write::record_sweep_and_health(
+    let unrecorded = record(
         conn,
-        crate::volume::write::HealthSite {
-            volume_id: None,
-            contact_id,
-            session_id: None,
-            reading: Reading::Poll,
-            trigger: Operation::DrivePoll,
-            device_tape: &backend.device_tape,
-        },
+        policy,
+        contact_id,
+        backend,
         &sweep,
         header.as_deref(),
         identity,
@@ -214,7 +273,7 @@ pub fn poll(
     let report = PollReport {
         backend: backend.name.clone(),
         device_sg: backend.device_sg.clone(),
-        contact_id,
+        contact_id: Some(contact_id),
         drive_serial,
         medium_serial,
         cartridge,
@@ -224,21 +283,92 @@ pub fn poll(
         raised_alerts,
         tape_alerts: counters.tape_alerts,
         uncorrected: counters.total_uncorrected,
+        unrecorded,
     };
     let detail = format!(
-        "{pages_read} page(s) read, {pages_failed} failed{}",
+        "{pages_read} page(s) read, {pages_failed} failed{}{}",
         match report.problems() {
             p if p.is_empty() => String::new(),
             p => format!("; {}", p.join("; ")),
+        },
+        match report.unrecorded.len() {
+            0 => String::new(),
+            n => format!("; {n} row(s) not recorded"),
         }
     );
-    let outcome = if pages_read == 0 {
+    let outcome = if pages_read == 0 || !report.unrecorded.is_empty() {
         OUTCOME_FAILED
     } else {
         OUTCOME_OK
     };
     guard.finish(outcome, Some(&detail));
-    report
+    Ok(report)
+}
+
+/// Write the sweep to the catalog: every page's journal row, then the
+/// reading's `health_logs` row (kind `poll`, no volume), then the drive.
+/// The rows `volume::write::record_sweep_and_health` writes for a command's
+/// reading, but each journal and health INSERT waits out a busy catalog
+/// (`policy`), and a failure is RETURNED, one line each, not only warned: a
+/// command's sweep is bookkeeping beside its real work, and the poll's
+/// sweep is all of its work.
+fn record(
+    conn: &Connection,
+    policy: BusyPolicy,
+    contact_id: i64,
+    backend: &LtoBackendConfig,
+    sweep: &log_pages::Sweep,
+    header: Option<&str>,
+    mut identity: DriveIdentity,
+) -> Vec<String> {
+    let mut unrecorded = Vec::new();
+    let trigger = Operation::DrivePoll.as_str();
+    for capture in &sweep.captures {
+        let row = log_pages::JournalRow::from_capture(
+            Some(contact_id),
+            trigger,
+            Some(&backend.device_tape),
+            capture,
+        );
+        if let Err(e) = busy::retry(policy, "a drive poll's log page", || {
+            Ok(log_pages::insert(conn, &row)?)
+        }) {
+            unrecorded.push(format!(
+                "page 0x{:02x}'s journal row ({e})",
+                capture.page_code
+            ));
+        }
+    }
+    let collected = sweep.health(header);
+    if let Some((counters, raw)) = &collected {
+        if let Err(e) = busy::retry(policy, "a drive poll's health reading", || {
+            health::record(
+                conn,
+                None,
+                Some(contact_id),
+                None,
+                Reading::Poll,
+                counters,
+                raw,
+            )
+        }) {
+            unrecorded.push(format!("the reading's health_logs row ({e})"));
+        }
+        identity.backfill_from_sg_logs_header(raw);
+    }
+    // The drive, best-effort as every reading's is: which drive answered is
+    // an addition to the record, and the contact already names it.
+    crate::volume::write::record_health_and_drive(
+        conn,
+        None,
+        Some(contact_id),
+        None,
+        Reading::Poll,
+        None,
+        identity,
+        &backend.device_tape,
+    );
+    unrecorded
 }
 
 /// The registered cartridge `serial` names (its barcode), and the live
@@ -349,8 +479,10 @@ mod tests {
                 identity: Some(drive()),
                 mam: Some(mam_read),
                 sysfs_root: Some(Path::new("/nonexistent/poll-test/sys")),
+                busy: None,
             },
         )
+        .expect("a writable catalog records the poll")
     }
 
     /// The empty drive (the acceptance's tapeless case): a contact with no
@@ -528,6 +660,110 @@ mod tests {
         assert!(report.raised_alerts.is_empty());
         assert!(report.drive_reported_problem());
         assert_eq!(report.problems().len(), 1, "{:?}", report.problems());
+    }
+
+    /// A poll's exit code as the CLI computes it, and the source it read
+    /// through — so a test can ask which pages the "drive" was asked for.
+    fn run_keeping(
+        conn: &Connection,
+        source: FixtureSource,
+    ) -> (crate::error::Result<i32>, FixtureSource) {
+        let cell = RefCell::new(source);
+        let code = poll(
+            conn,
+            &config(),
+            &backend(),
+            Probe {
+                log_source: Some(&cell),
+                identity: Some(drive()),
+                mam: Some(mam(None)),
+                sysfs_root: Some(Path::new("/nonexistent/poll-test/sys")),
+                busy: None,
+            },
+        )
+        .and_then(|report| crate::cli::drive::exit_code(&report));
+        (code, cell.into_inner())
+    }
+
+    /// A catalog the poll cannot write to (read-only, wrong owner, a full
+    /// disk): nothing could record what it reads, and page 0x2E may clear
+    /// on read — so it reads NO page, and does not exit 0.
+    #[test]
+    fn an_unwritable_catalog_reads_no_page() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch("PRAGMA query_only = 1").unwrap();
+        let (code, source) = run_keeping(&conn, FixtureSource::default());
+        assert!(
+            source.reads.is_empty(),
+            "no page may be read that cannot be journalled: {:?}",
+            source.reads
+        );
+        let err = code.expect_err("an unrecorded poll is never a success");
+        assert!(
+            !crate::db::busy::is_busy_error(&err),
+            "a read-only catalog is not 'busy, retry later': {err}"
+        );
+    }
+
+    /// A catalog another writer holds: the poll reads nothing and says
+    /// "busy" — the 75 `main` gives a busy catalog, which the wrapper
+    /// treats as "the next poll will read it".
+    #[test]
+    fn a_busy_catalog_reads_no_page_and_says_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tapectl.db");
+        let conn = crate::db::open(&path).unwrap();
+        let holder = crate::db::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let (code, source) = run_keeping(&conn, FixtureSource::default());
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(source.reads.is_empty(), "{:?}", source.reads);
+        let err = code.expect_err("a busy catalog is never a success");
+        assert!(
+            crate::db::busy::is_busy_error(&err),
+            "busy, so `main` exits 75: {err}"
+        );
+    }
+
+    /// The contact opened, but page 0x2E's journal row was refused: the
+    /// page was read (and may be cleared), so the poll must fail naming it
+    /// — never a quiet 0, and never "busy" (the wrapper does not ping on
+    /// 75, and this reading is lost).
+    #[test]
+    fn a_page_read_but_not_journalled_fails_naming_it() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER refuse_0x2e BEFORE INSERT ON main.log_page_journal
+               WHEN NEW.page_code = 46
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+        let (code, source) = run_keeping(&conn, FixtureSource::default());
+        assert_eq!(
+            source.reads.get(&0x2e),
+            Some(&1),
+            "positive control: the hazard happened, 0x2E was read"
+        );
+        let err = code.expect_err("a lost 0x2E is never a success");
+        assert!(!crate::db::busy::is_busy_error(&err), "{err}");
+        assert!(err.to_string().contains("0x2e"), "names the page: {err}");
+    }
+
+    /// Likewise the reading's `health_logs` row — what `audit` and `report
+    /// health` read: refused, the poll fails saying so.
+    #[test]
+    fn a_reading_whose_health_row_is_refused_fails() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER refuse_health BEFORE INSERT ON main.health_logs
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+        let (code, _) = run_keeping(&conn, FixtureSource::default());
+        let err = code.expect_err("an unrecorded reading is never a success");
+        assert!(!crate::db::busy::is_busy_error(&err), "{err}");
+        assert!(err.to_string().contains("health"), "{err}");
     }
 
     /// A sweep that read nothing (the sg node unreadable) is still a
