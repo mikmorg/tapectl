@@ -3131,6 +3131,55 @@ fn tenant_info_names_the_escrow_key_as_escrow() {
     );
 }
 
+/// Issue #393: `tapectl status` reads the session logs and nothing else, so
+/// it runs against a home whose catalog and config it cannot open — here a
+/// home that has nothing BUT `logs/`, as an `[ops] group` member sees it.
+#[test]
+fn status_reads_the_logs_without_a_catalog_or_config() {
+    let home = TempDir::new().unwrap();
+    let logs = home.path().join("logs");
+    std::fs::create_dir(&logs).unwrap();
+    std::fs::write(
+        logs.join("20261001T031240Z-volume-write-L6-0001-999999999.log"),
+        "2026-10-01T03:12:40.118Z session start: volume write L6-0001 (tapectl 1.1.0, pid 999999999, display Lines)\n\
+         2026-10-01T03:12:40.200Z phase start: write (1.20 TiB)\n\
+         2026-10-01T05:40:00.000Z phase end: write  2h 27m  1.20 TiB  142.9 MiB/s\n\
+         2026-10-01T05:40:01.000Z session result: ok\n\
+         2026-10-01T05:40:01.100Z session end after 2h 27m\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(home.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let s = &v["sessions"][0];
+    assert_eq!(s["command"], "volume write L6-0001");
+    assert_eq!(s["state"], "ended");
+    assert_eq!(s["outcome"], "ok");
+    assert!(
+        !home.path().join("tapectl.db").exists(),
+        "status created no catalog"
+    );
+
+    let human = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("running: nothing"), "{text}");
+    assert!(text.contains("volume write L6-0001  — ok"), "{text}");
+}
+
 /// A pipe whose reading end is already closed: every write to the returned
 /// end fails with EPIPE, as `tapectl … | head` does once `head` has its lines.
 fn closed_pipe() -> std::io::PipeWriter {

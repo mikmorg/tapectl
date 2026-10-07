@@ -68,6 +68,7 @@ SVC_HOME_WANT=""       # step 5: home for a NEW service user (default /var/lib/<
 LOCATIONS=()           # step 10: "name|description" — the first is the shelf step 13 moves tape 1 to
 TENANTS=()             # step 11: "name|description" — non-operator tenants to create
 COLLECTIONS=()         # step 11: "name|root|tenant|unit_depth" — [[collections]] to configure and sync
+OPS_GROUP=""           # step 7: a group that may read the session logs (`tapectl status`), e.g. tapectl-ops (issue #393); empty = none
 # CONTENDER_UNITS is left UNSET here on purpose: unset means "this VM's homorg
 # timers" (the historical default, step 13); a profile that declares it — even
 # as () — replaces that list.
@@ -672,6 +673,34 @@ if [ -n "$DAR_BIN" ]; then
   fi
   run tc config check || true
   ok "dar: $DAR_BIN"
+fi
+# Issue #393: the profile's OPS_GROUP lets the operator's own account (and an
+# agent helping them) watch sessions with `tapectl status` without sudo. The
+# group reads logs/ and nothing else in the home; the service user must be a
+# member too, so tapectl can give the home and logs/ the group itself.
+if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ]; then
+  explain <<EOF
+THE OPS GROUP. Live progress prints only on the terminal that started a command, and the session logs under $EFFECTIVE_HOME/logs/ belong to $SVC_USER (0700), so your own account cannot see whether a write is running, which phase it is in, or how the last one ended without sudo. With [ops] group = "$OPS_GROUP", every tapectl command run as $SVC_USER keeps the home at 0710 and logs/ at 2750 owned by $OPS_GROUP, and writes each session log 0640: members can run \`tapectl --home $EFFECTIVE_HOME status\` and read the logs, and open nothing else — every other entry of the home (the catalog, the keys, config.toml, …) is kept closed to the group. Group membership takes effect at the member's next login.
+EOF
+  if ! getent group "$OPS_GROUP" >/dev/null; then
+    confirm "Create group $OPS_GROUP?" && run sudo groupadd --system "$OPS_GROUP"
+  fi
+  if getent group "$OPS_GROUP" >/dev/null; then
+    for m in "$SVC_USER" "$USER"; do
+      svc_in_group "$m" "$OPS_GROUP" || { confirm "sudo usermod -aG $OPS_GROUP $m ?" && run sudo usermod -aG "$OPS_GROUP" "$m"; }
+    done
+    if as_svc grep -qE '^\[ops\]' "$CFG"; then ok "[ops] is already in config.toml"
+    else
+      printf '\n[ops]\ngroup = "%s"\n' "$OPS_GROUP" | as_svc tee -a "$CFG" >/dev/null
+      tc config show >/dev/null 2>&1 || die "config.toml does not load after adding [ops] — read: tapectl config check"
+    fi
+    # Any tapectl command run as the service user applies the modes; this one
+    # also reports them.
+    run tc config check || true
+    ok "ops group $OPS_GROUP: \`tapectl --home $EFFECTIVE_HOME status\` works for its members"
+  else
+    note "no group $OPS_GROUP — the session logs stay readable by $SVC_USER only"
+  fi
 fi
 ok "home ready at $EFFECTIVE_HOME"
 }

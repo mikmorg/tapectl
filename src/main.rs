@@ -95,7 +95,19 @@ fn main() {
     // verify whose command line did not parse already exited 3 above, in
     // `parse_error_exit_code`.)
     let error_code = error_exit_code(&cli.command);
-    if let Err(err) = run(cli) {
+    // Issue #393: the progress session lives here, not in `run`, so its log
+    // records how the command ended (`session result:`) before its end line.
+    let mut session = None;
+    let result = run(cli, &mut session);
+    if let Some(s) = &session {
+        let text = result.as_ref().err().map(|e| format!("{e:#}"));
+        s.note_result(match &text {
+            None => Ok(()),
+            Some(t) => Err(t.as_str()),
+        });
+    }
+    drop(session);
+    if let Err(err) = result {
         // Issue #377: a busy catalog is "retry later", not a failure of what
         // the command checks, so it exits 75 — except where a command's own
         // contract already has a code for "no verdict, try again" (`volume
@@ -267,7 +279,10 @@ fn exit_if_nonzero(code: i32) {
     }
 }
 
-fn run(cli: Cli) -> anyhow::Result<()> {
+fn run(
+    cli: Cli,
+    progress_slot: &mut Option<tapectl::progress::SessionGuard>,
+) -> anyhow::Result<()> {
     // Completions need neither a database nor a resolved home, so they are
     // dispatched BEFORE the resolution below (issue #228): an unset `HOME`
     // is now a refusal, and `tapectl completions bash` in the very cron,
@@ -330,6 +345,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Issue #393: `status` reads the session logs and nothing else — no
+    // catalog, no config, no chmod — so it runs for an account that can
+    // only read `<home>/logs/` (a member of the `[ops] group`), before the
+    // initialization gate and `ensure_dirs` below, neither of which such an
+    // account could pass.
+    if let Commands::Status { last } = cli.command {
+        cli::status::run(&paths.logs_dir, last, cli.json)?;
+        return Ok(());
+    }
+
     // Everything else requires initialization
     if !paths.is_initialized() {
         bail!("tapectl is not initialized — run `tapectl init` first");
@@ -342,17 +367,25 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     // Calling it here too is what makes the tightening reach an
     // already-initialized `~/.tapectl` on ordinary use, not just a fresh
     // `tapectl init`.
+    //
+    // Issue #393: an `[ops] group` shares the session logs with that group
+    // (the home 0710, `logs/` 2750, each log 0640) and nothing else. Peeked
+    // like `[logging]`, before the strict load below, because the session
+    // log is created before it.
+    let ops_group = startup::peek_ops_group(&paths);
     paths
-        .ensure_dirs()
+        .ensure_dirs_shared(ops_group.as_deref())
         .context("failed to secure tapectl home directories")?;
+    tapectl::progress::share_logs_with_group(ops_group.is_some());
 
     // Issue #386: a long operation — stage create, volume write/resume/
     // verify/read-slices, restore — runs inside a progress session: live
     // progress on stderr (a redrawn line on a terminal, plain periodic lines
     // otherwise, nothing under `--quiet`) and a session log under
     // `<home>/logs/`. Never under `--dry-run`, which moves nothing. Held
-    // until `run` returns, so the log's last line is the session's end.
-    let _progress = match cli::progress_session_name(&cli.command) {
+    // by `main` past `run`'s return (issue #393), so the log's last lines
+    // are the command's result and the session's end.
+    *progress_slot = match cli::progress_session_name(&cli.command) {
         Some(name) if !cli.dry_run => {
             use std::io::IsTerminal;
             // Issue #404: a long run over bare ssh dies with the connection;
@@ -621,7 +654,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let exit_code = cli::config::run(&conn, &paths, command, cli.json)?;
             exit_if_nonzero(exit_code);
         }
-        Commands::Init { .. } | Commands::Completions { .. } | Commands::Host { .. } => {
+        Commands::Init { .. }
+        | Commands::Completions { .. }
+        | Commands::Host { .. }
+        | Commands::Status { .. } => {
             unreachable!()
         }
     }

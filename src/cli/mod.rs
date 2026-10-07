@@ -16,6 +16,7 @@ pub mod restore;
 pub mod snapshot;
 pub mod stage;
 pub mod staging;
+pub mod status;
 pub mod tenant;
 pub mod unit;
 pub mod volume;
@@ -295,6 +296,18 @@ pub enum Commands {
     Host {
         #[command(subcommand)]
         command: host::HostCommands,
+    },
+
+    /// What is running and how the last sessions ended, from the session
+    /// logs alone: the live session's phase, progress, rate and ETA, and
+    /// each recent session's outcome and phase timings. Opens no catalog
+    /// and no config, so an account in the home's `[ops] group` can run it
+    /// (`tapectl --home <service home> status`) without sudo
+    Status {
+        /// How many finished sessions to show, newest first (running ones
+        /// are always shown)
+        #[arg(long, default_value_t = 5)]
+        last: usize,
     },
 
     /// Generate shell completions

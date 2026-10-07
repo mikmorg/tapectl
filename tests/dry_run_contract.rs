@@ -274,6 +274,8 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (&["stage", "list"], Verdict::ReadOnly),
     (&["staging", "clean"], Verdict::Refuses { probe_args: &[] }),
     (&["staging", "status"], Verdict::ReadOnly),
+    // status: reads the session logs, writes nothing anywhere (issue #393).
+    (&["status"], Verdict::ReadOnly),
     (&["tenant", "add"], Verdict::Honours),
     (&["tenant", "delete"], Verdict::Honours),
     (&["tenant", "info"], Verdict::ReadOnly),

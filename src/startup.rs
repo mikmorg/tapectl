@@ -292,6 +292,20 @@ pub fn peek_logging_config(paths: &TapectlPaths) -> LoggingConfig {
         .unwrap_or_default()
 }
 
+/// `[ops] group` from the config file, read leniently like
+/// [`peek_logging_config`] (issue #393): `main` needs it before the strict
+/// load, because the home's modes are set and the session log is created
+/// before that load runs. A file that is unreadable or does not parse, or
+/// an `[ops]` table without a string `group`, is `None` — the private
+/// default; the strict load then refuses a malformed table by name.
+pub fn peek_ops_group(paths: &TapectlPaths) -> Option<String> {
+    std::fs::read_to_string(&paths.config_file)
+        .ok()
+        .and_then(|content| content.parse::<toml::Value>().ok())
+        .and_then(|value| value.get("ops")?.get("group")?.as_str().map(str::to_string))
+        .filter(|g| !g.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     //! Issue #228, finding 3: the input table, as a test.

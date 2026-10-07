@@ -37,6 +37,7 @@ documentation is [docs/README.md](README.md).
 - [Day-to-Day Operations](#day-to-day-operations)
   - [A typical write session](#a-typical-write-session)
   - [Watching a long operation: progress and the session log](#watching-a-long-operation-progress-and-the-session-log)
+  - [Watching from another account](#watching-from-another-account)
   - [Register units](#register-units)
   - [Archive to tape](#archive-to-tape)
   - [A quiet host while the tape runs](#a-quiet-host-while-the-tape-runs)
@@ -440,7 +441,8 @@ pass), `recheck` (every hashed file unchanged since), `catalog` and `finalize`.
 
 Every such command also writes a **session log**, whether or not anything
 was shown: `<home>/logs/<UTC start>-<command>-<label>-<pid>.log` (mode 0600,
-in the same 0700 directory as the catalog). Each line starts with a UTC
+in the same 0700 directory as the catalog — or 0640 in a group-readable
+`logs/` with an [`[ops] group`](#watching-from-another-account)). Each line starts with a UTC
 timestamp. It records each phase's start and end with its duration, bytes and
 rate; a progress line every interval; every tapectl log event at INFO and
 above (DEBUG under `--verbose`), whatever `[logging] level` lets through to
@@ -495,6 +497,59 @@ Phase timings (volume write, session 20260930T120001Z-volume-write-L6-0001-4242)
 and each stage report (`<home>/stage-reports/`) ends with a `Phase timings:`
 section for the stage it describes. `volume info --json` does not carry them;
 they are in the `phase_timings` table (migration 028) for scripts.
+
+Each session log now ends with how the command ended — `session result: ok`,
+or `session result: failed — <the error>` — just before its `session end` line
+(a `volume verify` that exits 2 or 3 logs `session exit with code N` instead).
+
+### Watching from another account
+
+`tapectl status` says what is running and how the last sessions ended, from
+the session logs alone — it opens no catalog and no config:
+
+```bash
+tapectl --home /srv/archive_meta/tapectl status            # what is running, and the last 5
+tapectl --home /srv/archive_meta/tapectl status --last 20 --json
+```
+
+```text
+session logs: /srv/archive_meta/tapectl/logs
+running: volume write L6-0002 (pid 81234), started 2026-10-06T03:12:40.118Z
+  phase:    write
+  progress: write 512.0 GiB of 1.20 TiB (41.7%), 145.2 MiB/s, ETA 1h 21m, elapsed 1h 00m — file 19 of 43 (at 2026-10-06T04:12:41.002Z)
+  last log line at 2026-10-06T04:12:58.310Z
+  log:      /srv/archive_meta/tapectl/logs/20261006T031240Z-volume-write-L6-0002-81234.log
+recent:
+  2026-10-05T19:02:11.904Z  stage create keepsake/1998-wedding  — ok
+      check            2.1 s
+      archive         41m 3s   88.2 GiB  36.6 MiB/s
+      ...
+```
+
+A running session's progress line is at most one interval (30 s) old, whatever
+its display. A session whose log has no end line and whose process is gone is
+shown as ended with no end line — killed, crashed or power lost — and the phase
+it stopped in; the next tapectl command recovers what it was doing.
+
+The logs belong to the user tapectl runs as. To let your own account (or an
+agent helping you) run `status` without sudo, name a group in the home's
+config.toml:
+
+```toml
+[ops]
+group = "tapectl-ops"
+```
+
+Both the service user and your account must be members (`sudo usermod -aG
+tapectl-ops tapectl`, and the same for yourself; it takes effect at the next
+login). From then on every command run as the service user keeps the home
+at 0710 and `logs/` at 2750 owned by the group, and writes each log 0640 — the
+group can read the logs and open nothing else: every other entry of the home
+(the catalog, the keys, config.toml, …) is closed to it on every command. `config check` (as the service user) says whether
+the group, the memberships and the modes are as they should be;
+[configuration.md](configuration.md#ops) has the details. `scripts/first-run.sh`
+does all of it in step 7 when the host profile sets `OPS_GROUP` — on an existing
+install, `scripts/first-run.sh --profile <profile> --from 7 --to 7`.
 
 ### Register units
 

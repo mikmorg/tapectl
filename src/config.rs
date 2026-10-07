@@ -22,6 +22,20 @@ pub fn secure_path(path: &Path, mode: u32) {
     }
 }
 
+/// Best-effort give `path` the group `gid` (issue #393). Like
+/// [`secure_path`], never fails the caller: a process that is not a member
+/// of the group cannot `chgrp` to it, and that is `config check`'s to say.
+pub fn share_with_group(path: &Path, gid: nix::unistd::Gid) {
+    if let Err(e) = nix::unistd::chown(path, None, Some(gid)) {
+        tracing::warn!(
+            path = %path.display(),
+            gid = gid.as_raw(),
+            error = %e,
+            "could not give the [ops] group to this path (is the service user a member?)"
+        );
+    }
+}
+
 /// Write `contents` to `path`, created with `mode` from the very first
 /// `open()` call — no umask-derived default in between. Mirrors
 /// `crypto::keys::save_secret_key`'s pattern. Unlike `secure_path`, a
@@ -126,6 +140,33 @@ pub struct Config {
     /// [`HOST_CHECK_EXAMPLE`], commented out, instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_check: Option<HostCheckConfig>,
+
+    /// `[ops]` — operator visibility without sudo (issue #393). `None` (no
+    /// table) keeps the home private to the user tapectl runs as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops: Option<OpsConfig>,
+}
+
+/// `[ops]`: a group whose members may read the session logs — and nothing
+/// else in the home — so an operator's own account can run `tapectl status`
+/// against the service user's home without sudo (issue #393).
+///
+/// With `group` set, every command run as the service user keeps the home
+/// at 0710 and `logs/` at 2750 (setgid, so each new log takes the group),
+/// owned by that group, and writes session logs 0640; every other entry
+/// of the home (`config.toml`, the catalog, the keys, `locks/`, `tmp/`, …)
+/// loses its group and other bits, because traversing the home would
+/// otherwise reach any of them by name
+/// (`TapectlPaths::ensure_dirs_shared`) — a member can name them and open
+/// none.
+/// The service user must itself be a member, so it can give the
+/// directories the group (`chgrp` is limited to one's own groups);
+/// `config check` says when anything here is not as it should be.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpsConfig {
+    /// The group, by name (e.g. `tapectl-ops`).
+    pub group: String,
 }
 
 /// `[host_check]` — what counts as a noisy host before a tape write
@@ -1747,10 +1788,36 @@ impl TapectlPaths {
     /// does not own (e.g. a shared multi-user box) only logs a warning
     /// rather than aborting an otherwise-fine command.
     pub fn ensure_dirs(&self) -> Result<()> {
+        self.ensure_dirs_shared(None)
+    }
+
+    /// [`Self::ensure_dirs`], with the session logs shared with `ops_group`
+    /// when one is configured (`[ops] group`, issue #393): the home 0710 and
+    /// `logs/` 2750, both given that group, and every other entry of the
+    /// home closed to group and others ([`Self::close_home_to_group`]: the
+    /// home's execute bit would otherwise let a member open any of them by
+    /// name). Every other directory stays 0700. `None` is the private home, and undoes a
+    /// shared one: an `[ops]` table removed from config.toml takes the
+    /// group's access away on the next command.
+    ///
+    /// A group that does not exist, or one the service user is not a member
+    /// of (`chgrp` needs that), is a warning, like every chmod here, never a
+    /// failure: `config check` names it.
+    pub fn ensure_dirs_shared(&self, ops_group: Option<&str>) -> Result<()> {
         // Before the create loop, or it would create an empty
         // stage-reports/ first and the "both exist" rule below would then
         // block the move for good.
         self.move_legacy_stage_reports_dir();
+        let gid = ops_group.and_then(|name| {
+            let found = nix::unistd::Group::from_name(name).ok().flatten();
+            if found.is_none() {
+                tracing::warn!(
+                    group = name,
+                    "[ops] group does not exist; the session logs stay private"
+                );
+            }
+            found.map(|g| g.gid)
+        });
         for dir in [
             &self.home,
             &self.keys_dir,
@@ -1759,9 +1826,56 @@ impl TapectlPaths {
             &self.logs_dir,
         ] {
             std::fs::create_dir_all(dir)?;
-            secure_path(dir, 0o700);
+            let mode = match gid {
+                Some(_) if dir == &self.home => 0o710,
+                Some(_) if dir == &self.logs_dir => 0o2750,
+                _ => 0o700,
+            };
+            if let Some(gid) = gid {
+                if mode != 0o700 {
+                    share_with_group(dir, gid);
+                }
+            }
+            secure_path(dir, mode);
+        }
+        if gid.is_some() {
+            self.close_home_to_group();
         }
         Ok(())
+    }
+
+    /// With the home traversable by the `[ops]` group (0710), any file in it
+    /// whose name a member knows is theirs to open if its own mode lets
+    /// them: `config.toml`, `tapectl.db` and its sidecars, `locks/` and its
+    /// lockfiles (a member could `flock` one and stall a writer), `tmp/`
+    /// (the write's plaintext `catalog.db`), a `staging/` made by hand.
+    /// Under the private 0700 home their modes never mattered, and several
+    /// are created with the umask's. So every direct child of the home but
+    /// `logs/` loses its group and other bits here, whatever made it (issue
+    /// #393: the group reads the logs and nothing else). A symlink is left
+    /// alone: its target's own modes decide, home or no home. Like
+    /// [`secure_path`], a chmod that fails is a warning, never a failure.
+    fn close_home_to_group(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(entries) = std::fs::read_dir(&self.home) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == self.logs_dir {
+                continue;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                secure_path(&path, mode & 0o7700);
+            }
+        }
     }
 
     /// Issue #361: a home created before the rename keeps its stage
@@ -1848,6 +1962,112 @@ mod tests {
                 mode_of(dir)
             );
         }
+    }
+
+    /// Issue #393: with an `[ops] group`, the home is traversable (0710) and
+    /// `logs/` readable (2750) by that group, both owned by it, and nothing
+    /// else opens to it — every other directory stays 0700, and every other
+    /// entry of the home, whatever made it, loses its group and other bits. Without the group (the table removed), the next
+    /// command takes the access back. The group is this process's own
+    /// primary one, the only group a test can be sure it may `chgrp` to.
+    #[test]
+    fn an_ops_group_shares_the_logs_and_nothing_else() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join(".tapectl"));
+        paths.ensure_dirs().unwrap();
+        std::fs::write(&paths.config_file, "").unwrap();
+        std::fs::set_permissions(&paths.config_file, std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let gid = nix::unistd::getegid();
+        let group = nix::unistd::Group::from_gid(gid).unwrap().unwrap().name;
+
+        paths.ensure_dirs_shared(Some(&group)).unwrap();
+        let full_mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(full_mode(&paths.home), 0o710);
+        assert_eq!(
+            full_mode(&paths.logs_dir),
+            0o2750,
+            "setgid: logs take the group"
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.logs_dir).unwrap().gid(),
+            gid.as_raw()
+        );
+        for (name, dir) in all_dirs(&paths) {
+            if dir != paths.home.as_path() && dir != paths.logs_dir.as_path() {
+                assert_eq!(mode_of(dir), 0o700, "{name} stays private");
+            }
+        }
+        assert_eq!(mode_of(&paths.config_file), 0o600);
+
+        // Everything else the home comes to hold, made by the code that
+        // makes it and then given the umask's modes, as a 022 umask would:
+        // the catalog, `locks/` and a lockfile, `tmp/`, and what an
+        // operator leaves there. A member can open none of it by name.
+        let _db = crate::db::open(&paths.db_file).unwrap();
+        let _lock = crate::staging::lock::acquire(&paths.db_file, 1).unwrap();
+        let _work = crate::staging::home_work_dir(&paths, "t").unwrap();
+        let locks = paths.home.join("locks");
+        let stray_dir = paths.home.join("staging");
+        let stray_file = paths.home.join("notes.txt");
+        std::fs::create_dir(&stray_dir).unwrap();
+        std::fs::write(&stray_file, "x").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, "x").unwrap();
+        std::os::unix::fs::symlink(&outside, paths.home.join("link")).unwrap();
+        for (p, m) in [
+            (&paths.db_file, 0o644),
+            (&locks, 0o755),
+            (&paths.home.join("tmp"), 0o755),
+            (&stray_dir, 0o755),
+            (&stray_file, 0o664),
+            (&outside, 0o644),
+        ] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        }
+        paths.ensure_dirs_shared(Some(&group)).unwrap();
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&paths.home).unwrap() {
+            let p = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            if p == paths.logs_dir || meta.file_type().is_symlink() {
+                continue;
+            }
+            seen += 1;
+            assert_eq!(
+                meta.permissions().mode() & 0o077,
+                0,
+                "{} is open to the group or others",
+                p.display()
+            );
+        }
+        assert!(
+            seen >= 8,
+            "positive control: the sweep saw the home's entries ({seen})"
+        );
+        assert_eq!(mode_of(&locks), 0o700, "the owner's bits are kept");
+        assert_eq!(mode_of(&stray_file), 0o600);
+        assert_eq!(
+            mode_of(&outside),
+            0o644,
+            "a symlink's target is not ours to change"
+        );
+
+        // A group that does not exist shares nothing and fails nothing.
+        paths
+            .ensure_dirs_shared(Some("tapectl-no-such-group-393"))
+            .unwrap();
+        assert_eq!(mode_of(&paths.home), 0o700);
+
+        paths.ensure_dirs_shared(Some(&group)).unwrap();
+        paths.ensure_dirs().unwrap();
+        assert_eq!(
+            full_mode(&paths.home),
+            0o700,
+            "the table removed: private again"
+        );
+        assert_eq!(full_mode(&paths.logs_dir), 0o700);
     }
 
     #[test]

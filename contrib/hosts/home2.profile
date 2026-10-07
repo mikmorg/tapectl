@@ -62,3 +62,9 @@ COLLECTIONS=(
 # Nothing on home2 touches acache or the drive (operator, 2026-09-28). The
 # load/memory checks still run; memory and I/O pressure do not exist on 4.19.
 CONTENDER_UNITS=()
+
+# Issue #393: let mikmorg (and an agent helping) watch sessions without sudo —
+# `tapectl --home /srv/archive_meta/tapectl status`. The group reads logs/ and
+# nothing else in the home. Not yet decided for home2: uncomment to have step 7
+# create the group, add tapectl and mikmorg to it, and write [ops] group.
+# OPS_GROUP=tapectl-ops

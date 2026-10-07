@@ -153,4 +153,5 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`config check`](config.md#tapectl-config-check) | Check configuration validity |
 | [`host`](host.md) | This host's fitness to feed a tape drive (the quiet-host check) |
 | &nbsp;&nbsp;[`host check`](host.md#tapectl-host-check) | Is this host quiet enough to write a tape? |
+| [`status`](status.md) | What is running and how the last sessions ended, from the session logs alone: the live session's phase, progress, rate and ETA, and each recent session's outcome and phase timings. Opens no catalog and no config, so an account in the home's `[ops] group` can run it (`tapectl --home <service home> status`) without sudo |
 | [`completions`](completions.md) | Generate shell completions |
