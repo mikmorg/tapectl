@@ -642,14 +642,38 @@ fn seal_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
 
 // ── a full readback continues an interrupted one (#410) ──
 
+/// An interrupted full readback a new one continues (issue #410): which
+/// readback session it was, and what it had read back clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Continuation {
+    /// The `verification_sessions` row being continued.
+    pub session_id: i64,
+    pub checkpoints: Checkpoints,
+}
+
+impl Continuation {
+    /// The checkpoints, for [`ConfirmPlan::resuming`].
+    pub fn checkpoints(this: Option<&Self>) -> Option<&Checkpoints> {
+        this.map(|c| &c.checkpoints)
+    }
+}
+
 /// What the previous readback of this volume read back clean, when it is
-/// one a full confirm may continue (issue #410): the volume's latest
+/// one a full readback may continue (issue #410): the volume's latest
 /// `verification_sessions` row is a FULL one that never finished —
-/// `in_progress` (its process died) or `aborted` (the startup sweep's
-/// word for the same) — with checkpoints all taken against one front
-/// index. A readback that finished, passed or failed, is never continued:
-/// a failed one is re-read whole, so a drive that was cleaned in between
-/// gets to read everything again.
+/// `in_progress` (its process died) or `aborted` (a stopped verify, or the
+/// startup sweep's word for a dead one) — with checkpoints all taken
+/// against one front index. A readback that finished, passed or failed, is
+/// never continued: a failed one is re-read whole, so a drive that was
+/// cleaned in between gets to read everything again.
+///
+/// Nor is one any of whose files was read back at or before the volume's
+/// recorded write abort: ADR-0012's 2026-09-23 adoption rule wants a full
+/// readback wholly after the abort ([`aborted_adoption`], by `started_at`),
+/// and a continuation would otherwise let files read before it stand in a
+/// verify that started after it. A skipped file keeps the time it was
+/// actually read ([`record_checkpoint`]), so this holds down a chain of
+/// interruptions too.
 ///
 /// Shared by the write's confirm and `volume verify` (both record their
 /// readbacks in `verification_sessions`), so either continues the other's
@@ -658,7 +682,7 @@ fn seal_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
 pub(crate) fn interrupted_readback(
     conn: &Connection,
     volume_id: i64,
-) -> Result<Option<Checkpoints>> {
+) -> Result<Option<Continuation>> {
     let latest: Option<(i64, String, String)> = conn
         .query_row(
             "SELECT id, verify_type, outcome FROM verification_sessions
@@ -675,37 +699,62 @@ pub(crate) fn interrupted_readback(
     {
         return Ok(None);
     }
-    let rows: Vec<(u32, String, String)> = conn
+    let rows: Vec<(u32, String, String, String)> = conn
         .prepare(
-            "SELECT position, sha256, front_index_sha256 FROM readback_checkpoints
+            "SELECT position, sha256, front_index_sha256, checked_at FROM readback_checkpoints
              WHERE session_id = ?1",
         )?
         .query_map(params![session_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let Some(front_index_sha256) = rows.first().map(|(_, _, fi)| fi.clone()) else {
+    let Some(front_index_sha256) = rows.first().map(|(_, _, fi, _)| fi.clone()) else {
         return Ok(None);
     };
-    if rows.iter().any(|(_, _, fi)| *fi != front_index_sha256) {
+    if rows.iter().any(|(_, _, fi, _)| *fi != front_index_sha256) {
         return Ok(None);
     }
-    Ok(Some(Checkpoints {
-        front_index_sha256,
-        passed: rows.into_iter().map(|(p, sha, _)| (p, sha)).collect(),
+    if let Some(aborted_at) = recorded_abort_time(conn, volume_id)? {
+        if rows.iter().any(|(_, _, _, at)| *at <= aborted_at) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(Continuation {
+        session_id,
+        checkpoints: Checkpoints {
+            front_index_sha256,
+            passed: rows.into_iter().map(|(p, sha, _, _)| (p, sha)).collect(),
+        },
     }))
 }
 
 /// Record one file a full readback read back clean, under readback session
-/// `session_id` (issue #410), as the walk goes. Best-effort: a row that
-/// cannot be written costs one re-read on a later continuation, never the
-/// readback itself, so a failure is warned about and swallowed.
-pub(crate) fn record_checkpoint(conn: &Connection, session_id: i64, c: Checkpoint<'_>) {
+/// `session_id` (issue #410), as the walk goes. A file the readback skipped
+/// on `continuing`'s word keeps the time it was actually read there, not
+/// now: what a checkpoint dates is the read. Best-effort: a row that cannot
+/// be written costs one re-read on a later continuation, never the readback
+/// itself, so a failure is warned about and swallowed.
+pub(crate) fn record_checkpoint(
+    conn: &Connection,
+    session_id: i64,
+    continuing: Option<&Continuation>,
+    c: Checkpoint<'_>,
+) {
     if let Err(e) = conn.execute(
         "INSERT OR IGNORE INTO readback_checkpoints
-             (session_id, position, sha256, front_index_sha256)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![session_id, c.position, c.sha256, c.front_index_sha256],
+             (session_id, position, sha256, front_index_sha256, checked_at)
+         VALUES (?1, ?2, ?3, ?4, COALESCE(
+             (SELECT checked_at FROM readback_checkpoints
+              WHERE session_id = ?5 AND position = ?2 AND sha256 = ?3
+                AND front_index_sha256 = ?4),
+             datetime('now')))",
+        params![
+            session_id,
+            c.position,
+            c.sha256,
+            c.front_index_sha256,
+            continuing.map(|k| k.session_id),
+        ],
     ) {
         tracing::warn!(
             position = c.position,
@@ -1595,7 +1644,7 @@ impl SealedPending {
         if let Some(r) = &resume {
             tracing::info!(
                 label = %self.built.layout.label,
-                files = r.passed.len(),
+                files = r.checkpoints.passed.len(),
                 "continuing an interrupted full readback: files it read back clean are not \
                  read again if the front index is unchanged"
             );
@@ -1638,10 +1687,10 @@ impl SealedPending {
         // goes, so an interruption (#404) leaves this readback continuable.
         // Best-effort: a row that cannot be written costs one re-read on a
         // later resume, never this readback.
-        let record = |c: Checkpoint<'_>| record_checkpoint(conn, vs_id, c);
+        let record = |c: Checkpoint<'_>| record_checkpoint(conn, vs_id, resume.as_ref(), c);
         let plan = ConfirmPlan::new(tier)
             .with_order(self.seal_order)
-            .resuming(resume.as_ref());
+            .resuming(Continuation::checkpoints(resume.as_ref()));
         let plan = match tier {
             Tier::Integrity => plan.checkpointing(&record),
             Tier::Navigable => plan,
@@ -6347,8 +6396,9 @@ mod tests {
         )
         .unwrap();
         let r = interrupted_readback(conn, f.volume_id).unwrap().unwrap();
-        assert_eq!(r.front_index_sha256, "bb");
-        assert_eq!(r.passed.get(&4).map(String::as_str), Some("aa"));
+        assert_eq!(r.session_id, id);
+        assert_eq!(r.checkpoints.front_index_sha256, "bb");
+        assert_eq!(r.checkpoints.passed.get(&4).map(String::as_str), Some("aa"));
         // A quick one, even interrupted, read no content to continue from.
         conn.execute(
             "UPDATE verification_sessions SET verify_type = 'quick' WHERE id = ?1",
@@ -6356,5 +6406,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(interrupted_readback(conn, f.volume_id).unwrap(), None);
+    }
+
+    /// ADR-0012's 2026-09-23 adoption rule wants a full readback wholly
+    /// after a write abort, so a readback holding a file read back at or
+    /// before the volume's recorded abort is not continued (issue #410) —
+    /// else a verify started after the abort would carry reads from before
+    /// it, and `volume resume` would adopt on them.
+    #[test]
+    fn a_readback_with_a_file_read_before_the_recorded_abort_is_not_continued() {
+        let f = make_fixture();
+        let conn = &f.conn;
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'aborted')",
+            params![f.volume_id],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO readback_checkpoints
+                 (session_id, position, sha256, front_index_sha256, checked_at)
+             VALUES (?1, 4, 'aa', 'bb', '2026-01-02 00:00:00')",
+            params![id],
+        )
+        .unwrap();
+        let abort_at = |at: &str| {
+            conn.execute(
+                "INSERT INTO events (timestamp, entity_type, entity_id, action)
+                 VALUES (?1, 'volume', ?2, 'write_aborted')",
+                params![at, f.volume_id],
+            )
+            .unwrap();
+        };
+        abort_at("2026-01-01 00:00:00");
+        assert!(
+            interrupted_readback(conn, f.volume_id).unwrap().is_some(),
+            "positive control: every read postdates that abort"
+        );
+        abort_at("2026-01-02 00:00:00");
+        assert_eq!(
+            interrupted_readback(conn, f.volume_id).unwrap(),
+            None,
+            "a read in the abort's second is not after it"
+        );
     }
 }

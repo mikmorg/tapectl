@@ -4228,7 +4228,7 @@ fn verify_contacted(
     if let Some(r) = &resume {
         info!(
             label,
-            files = r.passed.len(),
+            files = r.checkpoints.passed.len(),
             "continuing an interrupted full readback: files it read back clean are not read \
              again if the front index is unchanged"
         );
@@ -4239,8 +4239,10 @@ fn verify_contacted(
         params![volume_id, tier.verify_type()],
     )?;
     let session_id = conn.last_insert_rowid();
-    let record = |c: crate::store::Checkpoint<'_>| session::record_checkpoint(conn, session_id, c);
-    let plan = ConfirmPlan::new(tier).resuming(resume.as_ref());
+    let record = |c: crate::store::Checkpoint<'_>| {
+        session::record_checkpoint(conn, session_id, resume.as_ref(), c)
+    };
+    let plan = ConfirmPlan::new(tier).resuming(session::Continuation::checkpoints(resume.as_ref()));
     let plan = match tier {
         Tier::Integrity => plan.checkpointing(&record),
         Tier::Navigable => plan,
@@ -6468,9 +6470,15 @@ mod tests {
         for p in [0u32, 1, 2] {
             let claim = claims.iter().find(|c| c.position == p as i32).unwrap();
             conn.execute(
-                "INSERT INTO readback_checkpoints (session_id, position, sha256, front_index_sha256)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![first, p, claim.sha256_encrypted.as_deref().unwrap(), fi_hash],
+                "INSERT INTO readback_checkpoints
+                     (session_id, position, sha256, front_index_sha256, checked_at)
+                 VALUES (?1, ?2, ?3, ?4, '2026-01-01 00:00:00')",
+                params![
+                    first,
+                    p,
+                    claim.sha256_encrypted.as_deref().unwrap(),
+                    fi_hash
+                ],
             )
             .unwrap();
         }
@@ -6547,6 +6555,28 @@ mod tests {
         assert_eq!(reads, vec![0, 3, 5, 3, 4]);
         let third = report.session_id.unwrap();
         assert_eq!(checkpointed_positions(&conn, third), vec![0, 1, 2, 4]);
+        // A checkpoint dates the READ: what was skipped keeps the time the
+        // first readback read it, down the chain; the slice is read now.
+        let read_at: Vec<(u32, String)> = conn
+            .prepare(
+                "SELECT position, checked_at FROM readback_checkpoints
+                 WHERE session_id = ?1 ORDER BY position",
+            )
+            .unwrap()
+            .query_map(params![third], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for (p, at) in &read_at {
+            if *p == 4 {
+                assert_ne!(
+                    at, "2026-01-01 00:00:00",
+                    "the slice was read by this verify"
+                );
+            } else {
+                assert_eq!(at, "2026-01-01 00:00:00", "file {p} keeps its read time");
+            }
+        }
         let outcome: String = conn
             .query_row(
                 "SELECT outcome FROM verification_sessions WHERE id = ?1",

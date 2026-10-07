@@ -307,9 +307,15 @@ Rules that hold in every path:
   claims the skipped files matched; §2.5's precedence is untouched (the seal
   is still judged first, a refused seal is still the whole verdict). Skipped
   files count toward `files_checked` and are recorded again under the new
-  session, so a chain of interruptions accumulates. A readback that finished,
-  passed or failed, is never continued, and the quick tier neither records
-  nor skips anything.
+  session — keeping the time they were actually read — so a chain of
+  interruptions accumulates. A readback that finished, passed or failed, is
+  never continued, nor one holding a file read at or before the volume's
+  recorded write abort (the 2026-09-23 adoption rule wants a full readback
+  wholly after it), and the quick tier neither records nor skips anything.
+  `volume verify` takes part the same way: it records its session
+  `in_progress` from the start and leaves it `aborted` when stopped, so
+  re-running it continues; each continues the volume's latest readback,
+  whichever command took it.
 - **Snapshot lifecycle transitions happen only at Sealed**, inside the same
   transaction that records evidence, and are event-logged (#58).
 
