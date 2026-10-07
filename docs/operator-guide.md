@@ -405,11 +405,14 @@ precedes the release. The `volume verify` that steps 3–5 above run before
 `staging clean` comes only after the staged slices are gone, and a copy it finds
 bad is rewritten from another copy (`volume read-slices`), not from staging.
 When the data matters, have at least one copy read back in full before the
-release. `collection run --full-confirm` does that for every copy the run
-writes, each taking about as long as its write (~2.3 h on a full LTO-6); this
-path has no per-copy choice. To read back one copy only, stage and write that
-batch by hand (steps 1–5 above) and pass `--full-confirm` to the first
-`volume write` alone.
+release. `collection run --full-confirm-first` reads the run's first copy back
+in full and confirms the others quickly; `--full-confirm` reads every copy back
+in full. Each full readback takes about as long as its write (~2.3 h on a full
+LTO-6). The two flags cannot be given together (ADR-0012, 2026-10-07). A
+`collection run` writes one copy today (it takes one `--label`), so the two
+flags read back the same copy; `--full-confirm-first` says what you mean if
+runs ever write more. A second copy written afterwards with `volume write`
+gets the quick confirm unless you pass it `--full-confirm`.
 
 A collection archives only its units: the real folders at exactly
 `unit_depth` below its root, and everything inside them. Anything else under
@@ -1795,7 +1798,7 @@ volume has had none of its data read back. Give it a full `volume verify`
 soon after the write — best before `staging clean` releases its units, while
 the staged slices can still rewrite a bad copy cheaply. `collection run` gives
 no such window: it releases staging right after its quick confirms, so use its
-`--full-confirm` when the data matters (see
+`--full-confirm-first` (or `--full-confirm`, every copy) when the data matters (see
 [A typical write session](#a-typical-write-session)). `report
 verify-status` ends with the volumes still owed one:
 

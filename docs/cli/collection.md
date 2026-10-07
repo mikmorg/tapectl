@@ -72,4 +72,5 @@ tapectl collection run [OPTIONS] --collection <COLLECTION>
 - `--fill-ceiling <FILL_CEILING>` — Fill each tape to at most this fraction of its capacity, for this command only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012)
 - `--jobs <JOBS>` — How many of the batch's units to stage at once (1 to 16), as `stage create --jobs`. Defaults to `[staging] jobs`, itself 1
 - `--full-confirm` — See `volume write --full-confirm`: read every copy this run writes back in full after sealing it
+- `--full-confirm-first` — Read the run's first copy back in full after sealing it and confirm the others quickly: the one full readback to have before the run releases staging. A run writes one copy today, so this reads back the same copy `--full-confirm` does
 

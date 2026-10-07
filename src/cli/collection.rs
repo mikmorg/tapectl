@@ -124,11 +124,36 @@ pub enum CollectionCommands {
         /// `stage create --jobs`. Defaults to `[staging] jobs`, itself 1.
         #[arg(long)]
         jobs: Option<usize>,
-        /// See `volume write --full-confirm`: read every copy this run
-        /// writes back in full after sealing it.
-        #[arg(long)]
-        full_confirm: bool,
+        #[command(flatten)]
+        confirm: RunConfirmArgs,
     },
+}
+
+/// `collection run`'s readback choice (ADR-0012 2026-10-07 item 31).
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct RunConfirmArgs {
+    /// See `volume write --full-confirm`: read every copy this run writes
+    /// back in full after sealing it.
+    #[arg(long, conflicts_with = "full_confirm_first")]
+    pub full_confirm: bool,
+    /// Read the run's first copy back in full after sealing it and confirm
+    /// the others quickly: the one full readback to have before the run
+    /// releases staging. A run writes one copy today, so this reads back the
+    /// same copy `--full-confirm` does.
+    #[arg(long)]
+    pub full_confirm_first: bool,
+}
+
+impl RunConfirmArgs {
+    /// Which copies get the full readback.
+    pub fn confirm(&self) -> collection::batch::RunConfirm {
+        use collection::batch::RunConfirm;
+        match (self.full_confirm, self.full_confirm_first) {
+            (true, _) => RunConfirm::FullEvery,
+            (false, true) => RunConfirm::FullFirst,
+            (false, false) => RunConfirm::Quick,
+        }
+    }
 }
 
 /// Run a collection subcommand.
@@ -193,7 +218,7 @@ pub fn run(
             prewrite_hash,
             fill_ceiling,
             jobs,
-            full_confirm,
+            confirm,
         } => cmd_run(
             conn,
             paths,
@@ -204,7 +229,7 @@ pub fn run(
             &crate::cli::write_device(config, device.as_deref())?,
             *prewrite_hash,
             *jobs,
-            *full_confirm,
+            confirm.confirm(),
             json_output,
             global_dry_run,
             assume_yes,
@@ -489,7 +514,7 @@ fn cmd_run(
     device: &str,
     prewrite_hash: bool,
     jobs: Option<usize>,
-    full_confirm: bool,
+    confirm: collection::batch::RunConfirm,
     json_output: bool,
     dry_run: bool,
     assume_yes: bool,
@@ -606,7 +631,7 @@ fn cmd_run(
         device,
         DEFAULT_BLOCK_SIZE,
         prewrite_hash,
-        full_confirm,
+        confirm,
         assume_yes,
     )?;
 

@@ -25,6 +25,34 @@ use crate::staging::clean::CleanReport;
 
 use super::selector::Batch;
 
+/// Which copies of a `collection run` its confirm reads back in full
+/// (ADR-0012 2026-10-07 item 31). The default confirm is quick (the front
+/// index and the seal), and a run releases staging right after its confirms
+/// (item 2), so a full readback is the operator's choice here, per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunConfirm {
+    /// No flag: every copy gets the quick confirm.
+    #[default]
+    Quick,
+    /// `--full-confirm`: every copy is read back in full.
+    FullEvery,
+    /// `--full-confirm-first`: the run's first copy is read back in full,
+    /// the others confirmed quickly — the one-copy readback item 2
+    /// recommends when the data matters.
+    FullFirst,
+}
+
+impl RunConfirm {
+    /// Whether copy `index` (0 = the run's first) gets the full readback.
+    pub fn full_for_copy(self, index: usize) -> bool {
+        match self {
+            RunConfirm::Quick => false,
+            RunConfirm::FullEvery => true,
+            RunConfirm::FullFirst => index == 0,
+        }
+    }
+}
+
 /// One batch unit's copy count against its own resolved `min_copies`,
 /// computed AFTER this call's write(s) landed. Only populated when release
 /// did NOT happen (see [`BatchExecutionReport::cleaned`]).
@@ -122,8 +150,9 @@ pub struct BatchExecutionReport {
 ///
 /// `prewrite_hash` is `collection run --prewrite-hash`, handed to every
 /// copy's `volume_write` (ADR-0012, 2026-09-30 later amendment), and
-/// `full_confirm` is `collection run --full-confirm`, likewise (ADR-0012,
-/// 2026-10-06 item 1).
+/// `confirm` is `collection run --full-confirm` / `--full-confirm-first`,
+/// asked per copy ([`RunConfirm::full_for_copy`]; ADR-0012, 2026-10-06 item
+/// 1 and 2026-10-07 item 31).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_batch(
     conn: &Connection,
@@ -134,7 +163,7 @@ pub fn execute_batch(
     device: &str,
     block_size: usize,
     prewrite_hash: bool,
-    full_confirm: bool,
+    confirm: RunConfirm,
     assume_yes: bool,
 ) -> Result<BatchExecutionReport> {
     if batch.units.is_empty() {
@@ -253,7 +282,7 @@ pub fn execute_batch(
     // doc comment) — a contact-check refusal here means the wrong physical
     // cartridge got loaded for this batch, which must hard-refuse, not
     // silently override (issue #27).
-    for label in copy_labels {
+    for (copy, label) in copy_labels.iter().enumerate() {
         crate::volume::write::volume_write(
             conn,
             paths,
@@ -264,7 +293,7 @@ pub fn execute_batch(
             false,
             false,
             prewrite_hash,
-            full_confirm,
+            confirm.full_for_copy(copy),
             assume_yes,
         )?;
     }
@@ -404,6 +433,33 @@ fn batch_unit_ids(conn: &Connection, batch: &Batch) -> Result<Vec<i64>> {
 mod tests {
     use super::*;
     use crate::collection::selector::PendingUnit;
+
+    /// ADR-0012 2026-10-07 item 31: which copies of a run get the full
+    /// readback. `--full-confirm-first` reads the first only, the one-copy
+    /// readback item 2 recommends; `--full-confirm` every one; neither, none.
+    #[test]
+    fn full_confirm_first_reads_back_only_the_first_copy() {
+        let full = |c: RunConfirm| (0..3).map(|i| c.full_for_copy(i)).collect::<Vec<_>>();
+        assert_eq!(full(RunConfirm::Quick), [false, false, false]);
+        assert_eq!(full(RunConfirm::FullEvery), [true, true, true]);
+        assert_eq!(full(RunConfirm::FullFirst), [true, false, false]);
+    }
+
+    /// The write loop asks [`RunConfirm::full_for_copy`] for each copy by
+    /// its index, rather than handing one flag to every copy.
+    #[test]
+    fn execute_batch_asks_the_confirm_choice_per_copy() {
+        const SRC: &str = include_str!("batch.rs");
+        let f = "pub fn execute_batch(";
+        let start = SRC.find(f).unwrap();
+        let end = SRC[start..].find("\n}\n").unwrap() + start;
+        let body = &SRC[start..end];
+        assert!(
+            !body[f.len()..].contains("\nfn ") && !body[f.len()..].contains("\npub fn "),
+            "body extraction overran into another function"
+        );
+        assert!(body.contains("confirm.full_for_copy(copy)"), "{body}");
+    }
     use crate::config::Config;
     use crate::db;
     use rusqlite::params;
@@ -974,7 +1030,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
-            false,
+            RunConfirm::Quick,
             true,
         )
         .expect_err("the sealed destination is not a write target");
@@ -1013,7 +1069,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
-            false, // --full-confirm
+            RunConfirm::Quick,
             true,
         )
         .expect_err("the sealed destination is not a write target");
@@ -1044,7 +1100,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
-            false, // --full-confirm
+            RunConfirm::Quick,
             false,
         )
         .expect_err("no terminal and no --yes: a stage that may not fit is refused");
@@ -1072,7 +1128,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
-            false, // --full-confirm
+            RunConfirm::Quick,
             true,
         )
         .expect_err("the sealed destination is not a write target");

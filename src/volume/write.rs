@@ -13991,8 +13991,8 @@ mod tests {
                 GENCHK_DEVICE,
                 512 * 1024,
                 false, // --prewrite-hash
-                false, // --full-confirm
-                true,  // --yes: the host pre-flight is not under test here
+                crate::collection::batch::RunConfirm::Quick,
+                true, // --yes: the host pre-flight is not under test here
             )
             .unwrap_err()
             .to_string();
