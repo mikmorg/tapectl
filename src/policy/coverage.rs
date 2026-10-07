@@ -862,6 +862,190 @@ pub fn unit_shortfall(
     shortfall(conn, unit.id, &crate::policy::resolve(conn, config, unit)?)
 }
 
+// ── Copy distinctness at plan time (ADR-0012 2026-10-07 item 26, #144) ──
+
+/// A copy that already exists of a version a write is about to put on a
+/// destination volume, and what it shares with that destination.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExistingCopy {
+    pub unit: String,
+    pub version: i64,
+    /// The volume holding the existing copy — for a warehouse deposit, the
+    /// volume it was deposited from.
+    pub volume: String,
+    /// What is shared: the cartridge's barcode for
+    /// [`Distinctness::same_cartridge`], the location's name for
+    /// [`Distinctness::shared_location`].
+    pub shared: String,
+    /// The existing copy is a recorded warehouse deposit (ADR-0006), not the
+    /// tape itself.
+    pub deposit: bool,
+}
+
+impl ExistingCopy {
+    fn describe(&self) -> String {
+        if self.deposit {
+            format!(
+                "{} v{} (a warehouse deposit of volume \"{}\")",
+                self.unit, self.version, self.volume
+            )
+        } else {
+            format!(
+                "{} v{} (volume \"{}\")",
+                self.unit, self.version, self.volume
+            )
+        }
+    }
+}
+
+/// How a write's destination stands against the copies its versions already
+/// have: the two questions design v4 §2.17's "copies don't share volumes"
+/// promise reduces to once a copy is identical content counted per version
+/// (ADR-0012).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Distinctness {
+    /// Existing copies on a volume of the destination's own cartridge. A
+    /// second copy there is the same tape again — one copy, not two — so
+    /// the write is REFUSED ([`Distinctness::refusal`]).
+    pub same_cartridge: Vec<ExistingCopy>,
+    /// Existing copies at the destination's location (a tape shelved there,
+    /// or a warehouse deposit there). Named in a WARNING only
+    /// ([`Distinctness::warning`]): location policy is advisory (ADR-0004)
+    /// and `audit` still reports a required location with no copy.
+    pub shared_location: Vec<ExistingCopy>,
+}
+
+fn list_copies(copies: &[ExistingCopy]) -> String {
+    copies
+        .iter()
+        .map(ExistingCopy::describe)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl Distinctness {
+    /// The refusal for writing to `dest_label`, when one of its versions
+    /// already has a copy on the destination's cartridge.
+    pub fn refusal(&self, dest_label: &str) -> Option<String> {
+        let first = self.same_cartridge.first()?;
+        Some(format!(
+            "volume \"{dest_label}\" is on cartridge \"{}\", which already holds a copy of \
+             what this write would put on it: {}. Two copies on one cartridge are one copy, \
+             not two (ADR-0012), so tapectl will not write it. Write this copy to a volume \
+             initialised on a different cartridge.",
+            first.shared,
+            list_copies(&self.same_cartridge),
+        ))
+    }
+
+    /// The warning for writing to `dest_label`, when its versions already
+    /// have a copy at the destination's location. Never a refusal.
+    pub fn warning(&self, dest_label: &str) -> Option<String> {
+        let first = self.shared_location.first()?;
+        Some(format!(
+            "warning: volume \"{dest_label}\" is at location \"{}\", where these versions \
+             already have a copy: {}. Copies in one place are lost together. Writing anyway: \
+             location policy is advisory (ADR-0004), and `tapectl audit` reports any required \
+             location still without a copy.",
+            first.shared,
+            list_copies(&self.shared_location),
+        ))
+    }
+}
+
+/// [`Distinctness`] for writing the stage sets `stage_set_ids` to the volume
+/// `dest_volume_id`: the existing copies of each one's VERSION (any stage
+/// set of the same snapshot — ADR-0012 counts copies per version) that are
+/// copies right now ([`eligible`], a completed write) and share the
+/// destination's cartridge or location.
+///
+/// **The cartridge** is the destination's open mount in `cartridge_volumes`
+/// and the existing copy's binding row (`UNIQUE(volume_id)`: a volume is
+/// only ever bound to one cartridge). A destination with no open mount — a
+/// legacy volume `volume init` could not bind — has no cartridge the catalog
+/// can compare, and nothing is refused on that half; its first contact binds
+/// it (`bind_late`), and the File 0 check refuses a cartridge that still
+/// carries another volume's identity.
+///
+/// **The location** is the destination's `location_id` against the same
+/// union [`location_count_expr`] counts: an eligible copy's own
+/// `location_id`, and a warehouse deposit of it. A destination with no
+/// location shares none.
+pub fn copy_distinctness(
+    conn: &Connection,
+    dest_volume_id: i64,
+    stage_set_ids: &[i64],
+) -> crate::error::Result<Distinctness> {
+    // The existing copies of stage set ?1's version: completed writes of
+    // any stage set of the same snapshot, on an eligible volume other than
+    // the destination ?2. Aliases as `eligible_writes`'s.
+    let copies_of = |extra_joins: &str, cond: &str, cols: &str| {
+        format!(
+            "SELECT {cols}
+             FROM stage_sets ss
+             JOIN snapshots cs ON cs.id = ss.snapshot_id
+             JOIN units u ON u.id = cs.unit_id
+             JOIN stage_sets css ON css.snapshot_id = cs.id
+             JOIN writes cw ON cw.stage_set_id = css.id AND cw.status = 'completed'
+             JOIN volumes cv ON cv.id = cw.volume_id
+             JOIN volumes d ON d.id = ?2
+             {extra_joins}
+             WHERE ss.id = ?1 AND cv.id != ?2 AND {eligible} AND {cond}",
+            eligible = eligible("cv"),
+        )
+    };
+    let same_cartridge = copies_of(
+        "JOIN cartridge_volumes cm ON cm.volume_id = cv.id
+         JOIN cartridge_volumes dm ON dm.volume_id = d.id AND dm.unmounted_at IS NULL
+         JOIN cartridges c ON c.id = dm.cartridge_id",
+        "cm.cartridge_id = dm.cartridge_id",
+        "u.name, cs.version, cv.label, c.barcode, 0",
+    );
+    // The location union `location_count_expr` counts: the tape's own
+    // shelf, and a warehouse deposit of it.
+    let shared_location = format!(
+        "{} UNION {}",
+        copies_of(
+            "JOIN locations l ON l.id = d.location_id",
+            "cv.location_id = d.location_id",
+            "u.name, cs.version, cv.label, l.name, 0",
+        ),
+        copies_of(
+            "JOIN locations l ON l.id = d.location_id
+             JOIN volume_deposits cd ON cd.volume_id = cv.id",
+            "cd.location_id = d.location_id",
+            "u.name, cs.version, cv.label, l.name, 1",
+        ),
+    );
+
+    let collect = |sql: &str| -> crate::error::Result<Vec<ExistingCopy>> {
+        let mut stmt = conn.prepare(sql)?;
+        let mut out = Vec::new();
+        for &ss in stage_set_ids {
+            let rows = stmt.query_map(params![ss, dest_volume_id], |r| {
+                Ok(ExistingCopy {
+                    unit: r.get(0)?,
+                    version: r.get(1)?,
+                    volume: r.get(2)?,
+                    shared: r.get(3)?,
+                    deposit: r.get(4)?,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        // Two stage sets of one version find the same copies.
+        out.sort();
+        out.dedup();
+        Ok(out)
+    };
+    Ok(Distinctness {
+        same_cartridge: collect(&same_cartridge)?,
+        shared_location: collect(&shared_location)?,
+    })
+}
+
 // ── The retire family's floor (ADR-0008 Tier 3 / ADR-0012, issue #147) ──
 
 /// One CURRENT version of a unit whose coverage a retirement is about to
@@ -1131,6 +1315,140 @@ pub(crate) mod tests {
         let met = shortfall(&conn, unit_id, &policy(&conn, 2, &["home"])).unwrap();
         assert!(!met.any(), "{met:?}");
         assert_eq!(met.describe(), "");
+    }
+
+    // ── copy_distinctness (issue #144) ──
+
+    /// The fixture plus a destination `L6-0009` (initialised, nothing
+    /// written) at `dest_location`, with the existing copy `L6-0003` and the
+    /// destination bound to cartridges `copy_cart` and `dest_cart`. Returns
+    /// the connection, the destination's id and the fixture's stage set.
+    fn distinctness_fixture(
+        dest_location: Option<&str>,
+        copy_cart: &str,
+        dest_cart: &str,
+    ) -> (Connection, i64, i64) {
+        let (conn, _unit, vol) = setup_unit_with_deposit("active");
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, location_id)
+             VALUES ('L6-0009', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized',
+                     (SELECT id FROM locations WHERE name = ?1))",
+            params![dest_location],
+        )
+        .unwrap();
+        let dest = conn.last_insert_rowid();
+        for barcode in [copy_cart, dest_cart] {
+            conn.execute(
+                "INSERT OR IGNORE INTO cartridges (barcode, media_type, nominal_capacity)
+                 VALUES (?1, 'LTO-6', 2500000000000)",
+                params![barcode],
+            )
+            .unwrap();
+        }
+        for (volume, barcode) in [(vol, copy_cart), (dest, dest_cart)] {
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id)
+                 VALUES ((SELECT id FROM cartridges WHERE barcode = ?1), ?2)",
+                params![barcode, volume],
+            )
+            .unwrap();
+        }
+        let ss: i64 = conn
+            .query_row("SELECT id FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        (conn, dest, ss)
+    }
+
+    fn copy(volume: &str, shared: &str, deposit: bool) -> ExistingCopy {
+        ExistingCopy {
+            unit: "photos".into(),
+            version: 1,
+            volume: volume.into(),
+            shared: shared.into(),
+            deposit,
+        }
+    }
+
+    /// ADR-0012 2026-10-07 item 26: a destination on the cartridge that
+    /// already holds the version's copy is named for refusal — that is one
+    /// copy, not two.
+    #[test]
+    fn a_destination_on_the_copys_own_cartridge_is_refused() {
+        let (conn, dest, ss) = distinctness_fixture(None, "BC1", "BC1");
+        let d = copy_distinctness(&conn, dest, &[ss]).unwrap();
+        assert_eq!(d.same_cartridge, vec![copy("L6-0003", "BC1", false)]);
+        let refusal = d.refusal("L6-0009").expect("one cartridge is one copy");
+        assert!(
+            refusal.contains("cartridge \"BC1\"")
+                && refusal.contains("photos v1 (volume \"L6-0003\")")
+                && refusal.contains("one copy"),
+            "{refusal}"
+        );
+    }
+
+    /// A copy that is no longer a copy (its volume erased) is not a clash,
+    /// and two cartridges are two copies.
+    #[test]
+    fn only_a_live_copy_on_the_same_cartridge_is_refused() {
+        let (conn, dest, ss) = distinctness_fixture(None, "BC1", "BC2");
+        let d = copy_distinctness(&conn, dest, &[ss]).unwrap();
+        assert_eq!(d, Distinctness::default());
+        assert_eq!(d.refusal("L6-0009"), None);
+        assert_eq!(d.warning("L6-0009"), None);
+
+        let (conn, dest, ss) = distinctness_fixture(None, "BC1", "BC1");
+        conn.execute(
+            "UPDATE volumes SET status = 'erased' WHERE label = 'L6-0003'",
+            [],
+        )
+        .unwrap();
+        let d = copy_distinctness(&conn, dest, &[ss]).unwrap();
+        assert!(d.same_cartridge.is_empty(), "{d:?}");
+    }
+
+    /// A destination at a location that already holds a copy — the tape at
+    /// `home`, or the warehouse deposit at `glacier` — is named in a warning,
+    /// never a refusal (ADR-0004).
+    #[test]
+    fn a_shared_location_is_a_warning_naming_the_copy_there() {
+        let (conn, dest, ss) = distinctness_fixture(Some("home"), "BC1", "BC2");
+        let d = copy_distinctness(&conn, dest, &[ss]).unwrap();
+        assert!(d.same_cartridge.is_empty());
+        assert_eq!(d.refusal("L6-0009"), None);
+        assert_eq!(d.shared_location, vec![copy("L6-0003", "home", false)]);
+        let warning = d.warning("L6-0009").unwrap();
+        assert!(
+            warning.starts_with("warning:")
+                && warning.contains("location \"home\"")
+                && warning.contains("photos v1 (volume \"L6-0003\")"),
+            "{warning}"
+        );
+
+        let (conn, dest, ss) = distinctness_fixture(Some("glacier"), "BC1", "BC2");
+        let d = copy_distinctness(&conn, dest, &[ss]).unwrap();
+        assert_eq!(d.shared_location, vec![copy("L6-0003", "glacier", true)]);
+        assert!(d
+            .warning("L6-0009")
+            .unwrap()
+            .contains("a warehouse deposit of volume \"L6-0003\""));
+    }
+
+    /// Copies are counted per version (ADR-0012): another stage set of the
+    /// same snapshot is the same content, and a write of it to the copy's
+    /// cartridge is refused just the same.
+    #[test]
+    fn a_second_stage_set_of_the_same_version_is_the_same_content() {
+        let (conn, dest, _ss) = distinctness_fixture(None, "BC1", "BC1");
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+             SELECT snapshot_id, 'staged', 104857600 FROM stage_sets",
+            [],
+        )
+        .unwrap();
+        let second = conn.last_insert_rowid();
+        let d = copy_distinctness(&conn, dest, &[second]).unwrap();
+        assert_eq!(d.same_cartridge, vec![copy("L6-0003", "BC1", false)]);
     }
 
     // ── missing_required_locations (issue #348) ──

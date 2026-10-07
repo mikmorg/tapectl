@@ -1069,7 +1069,19 @@ fire-risk: all units meet their resolved minimum copy requirements
 
 The normal way to make another copy is to write the still-staged data to
 another cartridge (`volume init` + `volume write`, as in
-[A typical write session](#a-typical-write-session)). Once staging has been
+[A typical write session](#a-typical-write-session)).
+
+Before the tape moves, the write checks each version against the copies it
+already has (ADR-0012, 2026-10-07). If a copy is already on the cartridge
+the destination volume is on, the write is refused, because two copies on one
+cartridge are one copy. Initialise the next copy on a different cartridge. If a
+copy is already at the destination volume's location, the write goes ahead
+with a warning naming that copy. Copies kept in one place are lost together,
+and `audit` still reports any required location with no copy. `collection run`
+makes the same check before it stages anything, for the staged sets that will
+ride along, and `--dry-run` prints the warning.
+
+Once staging has been
 cleaned, copy from an existing tape instead: read its encrypted slices back
 into staging, then write them to a new cartridge with the full self-describing
 layout.

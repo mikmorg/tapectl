@@ -638,6 +638,7 @@ fn cmd_run(
                     "labels": labels,
                     "dry_run": true,
                     "refused": refused_json(&refused),
+                    "warnings": budget.warnings,
                 })
             );
         } else {
@@ -652,6 +653,11 @@ fn cmd_run(
                 println!("    {u}");
             }
             println!("  destination(s): {}", labels.join(", "));
+        }
+        // Copy-distinctness warnings (issue #144). Only a dry run prints
+        // them here: a real run's `volume write` names them as it writes.
+        for warning in &budget.warnings {
+            eprintln!("{warning}");
         }
         return Ok(exit_code);
     }

@@ -195,6 +195,11 @@ pub struct DestinationBudget {
     /// What is already staged and will ride along (issue #232 item 1),
     /// subtracted.
     pub already_staged_bytes: u64,
+    /// Copy-distinctness warnings (issue #144): a destination at a location
+    /// where a stage set riding along already has a copy, one rendered
+    /// [`coverage::Distinctness::warning`] per such label. Advisory
+    /// (ADR-0004): `volume write` names them again when it writes.
+    pub warnings: Vec<String>,
 }
 
 impl DestinationBudget {
@@ -256,6 +261,23 @@ fn already_staged_on_tape_bytes(conn: &Connection) -> Result<u64> {
         .map(|bytes| pad_to_blocks(bytes.max(0) as u64, BLOCK_SIZE))
         .sum();
     Ok(total)
+}
+
+/// The stage sets already staged that `volume write` will take along with
+/// this run's batch: the selection [`already_staged_on_tape_bytes`] sizes
+/// (a `'staged'` set with a slice still on disk).
+fn riding_stage_set_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT ss.id
+         FROM stage_sets ss
+         JOIN stage_slices sl ON sl.stage_set_id = ss.id
+         WHERE ss.status = 'staged' AND sl.staging_path IS NOT NULL
+         ORDER BY ss.id",
+    )?;
+    let ids = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    Ok(ids)
 }
 
 /// Resolve `collection run`'s budget from the destination volumes' own
@@ -335,6 +357,8 @@ pub fn destination_budget(
         ));
     }
 
+    let riding = riding_stage_set_ids(conn)?;
+    let mut warnings = Vec::new();
     let mut smallest: Option<(String, i64)> = None;
     for label in labels {
         let (volume_id, status, observed_condition, capacity_bytes): (i64, String, String, i64) =
@@ -370,6 +394,18 @@ pub fn destination_budget(
                 label: label.clone(),
             });
         }
+        // Copy distinctness (ADR-0012 2026-10-07 item 26, issue #144), the
+        // check `volume_write` makes at its plan time, made here against the
+        // stage sets that are already staged and will ride along — the
+        // retained sets of a batch awaiting its next copy — so a destination
+        // on the cartridge holding their copy is refused before this run
+        // stages anything. The batch's own units are not staged yet; their
+        // versions are checked when `volume_write` plans.
+        let distinct = coverage::copy_distinctness(conn, volume_id, &riding)?;
+        if let Some(refusal) = distinct.refusal(label) {
+            return Err(TapectlError::Other(refusal));
+        }
+        warnings.extend(distinct.warning(label));
 
         let replace = match &smallest {
             None => true,
@@ -409,6 +445,7 @@ pub fn destination_budget(
         fill_ceiling: backend.fill_ceiling,
         reserve_bytes: enospc_buffer,
         already_staged_bytes: already_staged,
+        warnings,
     })
 }
 
@@ -1252,6 +1289,131 @@ mod tests {
             before, after,
             "a recorded-write label must fail before staging ever touches snapshots"
         );
+    }
+
+    /// A retained stage set (`unit_id`'s version 1, already written once to
+    /// the sealed `L1-COPY` at `home`, on cartridge `BC1`) and an initialised
+    /// destination `L1-DEST` on cartridge `dest_cart` at `dest_location`:
+    /// the state between a batch's first and second copy.
+    fn retained_copy_fixture(dest_cart: &str, dest_location: &str) -> Connection {
+        let conn = db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 'media', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (1, 'u-old', 'old', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (1, 1, 1, 'current', '/tmp', 1, 10);
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size) VALUES (1, 1, 'staged', 524288);
+             INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path)
+                 VALUES (1, 1, 10, 10, 'a', 'b', '/nonexistent/s1');
+             INSERT INTO locations (id, name, kind) VALUES (1, 'home', 'shelf'), (2, 'offsite', 'shelf');
+             INSERT INTO cartridges (id, barcode, media_type, nominal_capacity)
+                 VALUES (1, 'BC1', 'LTO-8', 10485760), (2, 'BC2', 'LTO-8', 10485760);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status, location_id)
+             VALUES (1, 'L1-COPY', 'lto', 'p', ?1, 'sealed', 1),
+                    (2, 'L1-DEST', 'lto', 'p', ?1, 'initialized',
+                     (SELECT id FROM locations WHERE name = ?2))",
+            params![10 * 1024 * 1024_i64, dest_location],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (1, 1, 1, 'completed');
+             INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (1, 1);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id)
+             VALUES ((SELECT id FROM cartridges WHERE barcode = ?1), 2)",
+            [dest_cart],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// An empty collection to plan against: the retained stage set is what
+    /// rides along.
+    fn empty_collection() -> (CollectionConfig, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        (lib, root)
+    }
+
+    /// Issue #144 (ADR-0012 2026-10-07 item 26): `collection run` refuses,
+    /// before staging anything, a destination on the cartridge that already
+    /// holds a copy of a stage set that would ride along to it — two copies
+    /// on one cartridge are one copy. The same predicate `volume write`
+    /// applies (`coverage::copy_distinctness`), so this is never stricter.
+    #[test]
+    fn run_refuses_a_destination_on_the_cartridge_holding_a_riding_copy() {
+        let conn = retained_copy_fixture("BC1", "offsite");
+        let (lib, _root) = empty_collection();
+        let err = plan_for_run(
+            &conn,
+            &config_with_tiny_backend(),
+            &lib,
+            "/dev/null",
+            &["L1-DEST".to_string()],
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cartridge \"BC1\"")
+                && msg.contains("old v1 (volume \"L1-COPY\")")
+                && msg.contains("one copy, not two"),
+            "{msg}"
+        );
+    }
+
+    /// A destination on its own cartridge at the location the riding copy
+    /// is already at plans normally and carries the warning naming it; one
+    /// at another location carries none.
+    #[test]
+    fn run_warns_of_a_destination_sharing_a_riding_copys_location() {
+        let conn = retained_copy_fixture("BC2", "home");
+        let (lib, _root) = empty_collection();
+        let config = config_with_tiny_backend();
+        let (_, budget, _) = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1-DEST".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(budget.warnings.len(), 1, "{:?}", budget.warnings);
+        assert!(
+            budget.warnings[0].contains("location \"home\"")
+                && budget.warnings[0].contains("old v1 (volume \"L1-COPY\")"),
+            "{:?}",
+            budget.warnings
+        );
+
+        let conn = retained_copy_fixture("BC2", "offsite");
+        let (_, budget, _) = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1-DEST".to_string()],
+            false,
+        )
+        .unwrap();
+        assert!(budget.warnings.is_empty(), "{:?}", budget.warnings);
     }
 
     /// Issue #224: the negative-space check for the fix above -- a label
