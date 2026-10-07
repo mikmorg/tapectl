@@ -13,6 +13,13 @@
 #                  1 = warnings    -> success, logged
 #                  2 = violations  -> failure
 #                 75 = catalog busy -> no verdict, logged, no ping (issue #377)
+#           anything else = no verdict -> failure (issue #408)
+#
+# "Anything else" is a run that never reached a verdict: tapectl stopped on
+# an error, panicked (101), or exited a code this script does not know. It is
+# a failure — a broken audit must not go quiet — but it is NOT reported as
+# violations, which would send the operator to the policy when the problem is
+# the run itself.
 #
 # Warnings are deliberately NOT a failure. `audit` warns for ordinary drift
 # (an overdue verification, a unit one copy short of its target) and paging on
@@ -69,8 +76,13 @@ case "$rc" in
 	# audit simply did not run. The next timer run tries again.
 	echo "audit: catalog busy — another tapectl command holds the catalog; no verdict this run, retry later" >&2
 	;;
-*)
+2)
 	echo "audit: VIOLATIONS (exit $rc)" >&2
+	ping_hc /fail
+	;;
+*)
+	# Issue #408: no verdict. The audit's own output above says why.
+	echo "audit: no verdict (exit $rc) — the audit did not complete; its error is above" >&2
 	ping_hc /fail
 	;;
 esac

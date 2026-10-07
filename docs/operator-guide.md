@@ -1655,6 +1655,8 @@ verify-status`, and its exit status is `audit`'s:
 | 0 | clean | success |
 | 1 | warnings only | **success** (`SuccessExitStatus=1`) |
 | 2 | violations | failure |
+| 75 | catalog busy: no verdict this run | neither (no `/fail` ping) |
+| anything else | no verdict: the audit did not complete (a crash, say) | failure |
 
 Warnings are not a failure on purpose. `audit` warns for ordinary drift — an
 overdue verification (for a unit whose archive set sets an interval; see
@@ -1671,8 +1673,8 @@ it covers only units whose archive set sets `verify_interval_days`. For every
 other unit, the verify-status listing in the journal is the only record.
 
 Set `TAPECTL_HEALTHCHECK_URL` in the service to ping a healthchecks.io-style
-endpoint (`/start` before, bare URL on 0 or 1, `/fail` on 2, no second ping
-on 75, catalog busy). It is off unless set, and a missing `curl` or a failed
+endpoint (`/start` before, bare URL on 0 or 1, `/fail` on 2 and on any code
+but 75, no second ping on 75, catalog busy). It is off unless set, and a missing `curl` or a failed
 ping never changes the run's own result.
 
 Two things the timers do **not** change:
