@@ -7639,6 +7639,12 @@ mod tests {
 
         std::fs::remove_dir(&path).unwrap();
         std::fs::write(&path, &good).unwrap();
+        // What `volume resume` does in a new process: the session comes
+        // back from the catalog and the session directory, not from memory.
+        drop(interrupted);
+        let interrupted = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("the interrupted session is resumable");
         let ready = match interrupted
             .resume_checking(&f.conn, &f.keys, SliceCheck::Size, &mut store, || false)
             .unwrap()
