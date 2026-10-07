@@ -2554,12 +2554,16 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
 
     // Verification history: every session, every outcome (unlike
     // `VolumeRow::verified`, which is the latest PASSED full one only).
+    // Newest recorded first, by id: a continued full readback is dated from
+    // its oldest read (ADR-0012 2026-10-07 item 1), which can be older than
+    // the interrupted sessions it continued, so `started_at` would sort the
+    // one that concluded below them.
     let mut verify_stmt = conn.prepare(
         "SELECT started_at, completed_at, verify_type, outcome,
                 slices_checked, slices_passed, slices_failed
          FROM verification_sessions
          WHERE volume_id = ?1
-         ORDER BY started_at DESC, id DESC",
+         ORDER BY id DESC",
     )?;
     let verifications: Vec<VerificationRow> = verify_stmt
         .query_map(rusqlite::params![vol_id], |row| {

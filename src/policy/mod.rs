@@ -356,6 +356,31 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
     Ok(policy)
 }
 
+/// A volume's resolved `verify_interval_days` (ADR-0012 2026-10-07 item 1):
+/// the tightest interval among the units written to it, or `None` when no
+/// unit on it has one.
+///
+/// The interval is a unit's policy and a volume holds many units, so the
+/// volume answers to the strictest of them. Only an archive set carries the
+/// key — it is not a dotfile key and `[defaults]` has none ([`resolve`]
+/// starts from `None` and only layer 2 sets it) — so this reads
+/// `archive_sets` directly rather than resolving every unit (which would
+/// read every unit's dotfile, and fail a readback on a bad one). Every
+/// `writes` row counts, whatever its status: a write's own confirm runs
+/// while its rows are still `in_progress`.
+pub fn volume_verify_interval_days(conn: &Connection, volume_id: i64) -> Result<Option<i64>> {
+    Ok(conn.query_row(
+        "SELECT MIN(a.verify_interval_days)
+           FROM writes w
+           JOIN snapshots s ON s.id = w.snapshot_id
+           JOIN units u ON u.id = s.unit_id
+           JOIN archive_sets a ON a.id = u.archive_set_id
+          WHERE w.volume_id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
