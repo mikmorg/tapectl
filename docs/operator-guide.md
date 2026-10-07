@@ -499,8 +499,7 @@ hash or the drive. Read them together:
 - `tape waited` high and `queue full` high: the hash set the pace (the
   reader is ahead of it, the drive behind it) — the CPU is the limit.
 - `tape waited` high and `queue full` near zero: reading the staged file set
-  the pace — the staging disk is the limit. Nothing prunes `logs/`; a session log is a few kilobytes plus about one
-line per interval.
+  the pace — the staging disk is the limit.
 
 The durations are kept in the catalog too. `volume info` ends with the phase
 timings of the last session recorded against the volume (write, resume,
@@ -524,6 +523,21 @@ they are in the `phase_timings` table (migration 028) for scripts.
 Each session log now ends with how the command ended — `session result: ok`,
 or `session result: failed — <the error>` — just before its `session end` line
 (a `volume verify` that exits 2 or 3 logs `session exit with code N` instead).
+
+**tapectl never prunes session logs or stage reports** (ADR-0012, 2026-10-07):
+they are evidence — what each long command did and when, and the hash of every
+slice as it was staged — so how long to keep them is your call. They grow
+slowly. A session log starts at about 1.5 KB (a small `stage create` writes
+1.6 KB) and adds about 20 KB per hour the command runs (one `progress:` line
+every 30 seconds), plus about 130 bytes per file a write puts on tape and
+about 100 bytes per slice a stage produces. A stage report is about 600 bytes
+plus about 200 bytes per slice. At the default 1 GiB slice, a full LTO-6's
+worth of data (about 2,300 slices) comes to roughly 0.3 MB of stage logs and
+0.5 MB of stage reports, about 0.5 MB for each copy's write log, and under
+0.1 MB for each full verify: about 2 MB for two copies, and around 100 MB a
+year at a cartridge a week. Pruning `logs/` loses nothing the catalog needs,
+but `tapectl status --last N` reads only the logs that are there; the phase
+timings are kept in the catalog regardless.
 
 ### Watching from another account
 
@@ -690,7 +704,8 @@ went ahead does run out of room, it stops and the partial slices are removed.
 Each stage set also leaves a short stage report (unit, tenant, snapshot, and
 every slice's size and hash) in `<home>/stage-reports/`. A home initialised
 before 2026-09-29 kept these in `receipts/`; the first command run on it moves
-the directory.
+the directory. Nothing prunes them; see
+[how fast they and the session logs grow](#watching-a-long-operation-progress-and-the-session-log).
 
 **`volume write` writes everything still staged, not just what you staged in
 this sitting** — and it says so before it touches the drive:
