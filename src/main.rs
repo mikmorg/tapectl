@@ -501,6 +501,15 @@ fn run(
     // `main()` built from them. See `tests/cli_smoke.rs`'s
     // `logging_level_debug_surfaces_this_line`.
     tracing::debug!(config = %paths.config_file.display(), "loaded config");
+    // Issue #309 (ADR-0012, 2026-10-07 item 29): `drive poll` takes the
+    // drive lock BEFORE the catalog is opened, so a poll that finds a
+    // command holding the drive exits 75 having touched nothing at all; it
+    // opens the catalog itself once it holds the lock.
+    if let Commands::Drive { ref command } = cli.command {
+        let exit_code = cli::drive::run(&paths, &cfg, command, cli.json, cli.dry_run)?;
+        exit_if_nonzero(exit_code);
+        return Ok(());
+    }
     // Issue #233: a pre-existing orphan anywhere in the database makes
     // `.foreign_key_check()`'s whole-database check abort `migrate()` the
     // instant any pending migration carrying it runs (003/012/013/017),
@@ -661,6 +670,7 @@ fn run(
         Commands::Init { .. }
         | Commands::Completions { .. }
         | Commands::Host { .. }
+        | Commands::Drive { .. }
         | Commands::Status { .. } => {
             unreachable!()
         }

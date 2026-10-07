@@ -7,6 +7,7 @@ pub mod collection;
 pub mod config;
 pub mod consent;
 pub mod db;
+pub mod drive;
 pub mod host;
 pub mod key;
 pub mod location;
@@ -284,6 +285,12 @@ pub enum Commands {
     Backend {
         #[command(subcommand)]
         command: BackendCommands,
+    },
+
+    /// The drive itself: read its health on a schedule (`drive poll`)
+    Drive {
+        #[command(subcommand)]
+        command: drive::DriveCommands,
     },
 
     /// Database operations

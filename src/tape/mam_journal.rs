@@ -38,7 +38,7 @@ use crate::tape::mam::{self, MamCapture};
 
 /// Which of the MAM-reading call sites took a reading — `mam_journal.hook`.
 ///
-/// Five sites, and one read-path contact takes two of them, which is exactly
+/// Six sites, and one read-path contact takes two of them, which is exactly
 /// why the journal points at the contact (ADR-0013 §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hook {
@@ -58,6 +58,9 @@ pub enum Hook {
     /// `MamInfo`. The stored string follows the governing record, so a
     /// reader who looks it up there finds it.
     LoadedMediumSerial,
+    /// `tape::poll::poll`'s one read (issue #309): the chip of whatever is
+    /// loaded when `drive poll` runs — a failed read is the empty drive.
+    DrivePoll,
 }
 
 impl Hook {
@@ -68,6 +71,7 @@ impl Hook {
             Hook::VolumeResume => "volume_resume",
             Hook::CheckReadContact => "check_read_contact",
             Hook::LoadedMediumSerial => "loaded_medium_serial",
+            Hook::DrivePoll => "drive_poll",
         }
     }
 
@@ -78,6 +82,7 @@ impl Hook {
         Hook::VolumeResume,
         Hook::CheckReadContact,
         Hook::LoadedMediumSerial,
+        Hook::DrivePoll,
     ];
 }
 
@@ -614,6 +619,7 @@ mod tests {
                 "volume_resume",
                 "check_read_contact",
                 "loaded_medium_serial",
+                "drive_poll",
             ]
         );
     }
