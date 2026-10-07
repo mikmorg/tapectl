@@ -548,9 +548,9 @@ fn migrate_to(conn: &mut Connection, target: Option<usize>) -> Result<()> {
 /// rows it did that to in the TEMP table `m030_mtime_nulled`. Read once the
 /// migration has committed -- a refusal rolls the table back with
 /// everything else, so a warning is never printed for a conversion that did
-/// not land -- named row by row in one WARN, and dropped. A no-op on every
-/// open that did not apply 030 (the table is TEMP: it exists only on the
-/// connection that ran the migration).
+/// not land -- named in one WARN (the first ten rows, then the count), and
+/// dropped. A no-op on every open that did not apply 030 (the table is
+/// TEMP: it exists only on the connection that ran the migration).
 fn warn_030_nulled_mtimes(conn: &Connection) -> Result<()> {
     let present: bool = conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_temp_master
