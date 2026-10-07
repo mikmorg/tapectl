@@ -1743,7 +1743,11 @@ fn volume_write_in_contact<'c>(
     let phase = progress::phase("plan", None);
     let planned = validated.plan(conn, volume_id, &inputs.units)?;
     phase.done();
-    let execute_outcome = planned.execute(conn, store)?;
+    // From here the session's `writes` rows exist (issue #408): an error
+    // no outcome classifies leaves it resumable — exit 4, never 2.
+    let execute_outcome = planned
+        .execute(conn, store)
+        .map_err(|e| e.in_write_session(label))?;
 
     // The Layout comes back with `Ok` so the caller's feed ratio (issue
     // #338) has its denominator; every `Err` returns to the caller's sweep.
@@ -2731,7 +2735,9 @@ fn finish_session(
     match outcome {
         ResumeOutcome::Ready(ready) => {
             let phase = progress::phase("seal", None);
-            let sealed_pending = ready.seal(store)?;
+            // Issue #408: a seal that fails leaves the session `in_progress`
+            // (swept to `interrupted`), so `volume resume` writes it again.
+            let sealed_pending = ready.seal(store).map_err(|e| e.in_write_session(label))?;
             // ADR-0012's 2026-09-21 correction "the seal is RECORDED, not
             // inferred" (issue #277, migration 018): the moment `seal()`
             // returns `Ok`, that fact must become durable state, because
@@ -2756,7 +2762,8 @@ fn finish_session(
                      WHERE id = ?1",
                     params![volume_id],
                 )?)
-            })?;
+            })
+            .map_err(|e| e.in_write_session(label))?;
             phase.done();
 
             // Issue #276: sibling to `session`'s `TAPECTL_TEST_PAUSE_AFTER_PLAN`
@@ -2775,7 +2782,9 @@ fn finish_session(
                 None => crate::signal::is_interrupted(),
             };
             if stop_before_confirm {
-                sealed_pending.mark_interrupted(conn)?;
+                sealed_pending
+                    .mark_interrupted(conn)
+                    .map_err(|e| e.in_write_session(label))?;
                 events::log_event(
                     conn,
                     "volume",
@@ -2787,12 +2796,14 @@ fn finish_session(
                     None,
                     None,
                     None,
-                )?;
-                return Err(TapectlError::Interrupted(format!(
-                    "volume \"{label}\": interrupted after seal, before confirm -- the \
-                         tape IS sealed but its readback never ran, so the catalog cannot \
-                         yet count it as a copy. Reload the same cartridge and run `tapectl \
-                         volume resume {label}` to re-enter confirm."
+                )
+                .map_err(|e| e.in_write_session(label))?;
+                // Exit 4 (issue #408), with the text `Interrupted` printed.
+                return Err(TapectlError::WriteInterrupted(format!(
+                    "stopped by a signal: volume \"{label}\": interrupted after seal, before \
+                     confirm -- the tape IS sealed but its readback never ran, so the catalog \
+                     cannot yet count it as a copy. Reload the same cartridge and run `tapectl \
+                     volume resume {label}` to re-enter confirm."
                 )));
             }
 
@@ -2837,17 +2848,20 @@ fn finish_session(
                 None,
                 i.reason(),
                 None,
-            )?;
+            )
+            .map_err(|e| e.in_write_session(label))?;
             // Issue #408: a staged-file read error or a drive error other
             // than a full medium stops the write resumably, and says which.
+            // Both exit 4, interrupted (ADR-0012, 2026-10-07 item 20).
             Err(match i.reason() {
-                None => TapectlError::Interrupted(format!(
-                    "volume \"{label}\" write interrupted — the tape is left unsealed, and \
+                None => TapectlError::WriteInterrupted(format!(
+                    "stopped by a signal: volume \"{label}\" write interrupted — the tape is \
+                     left unsealed, and \
                      the session's `writes`/`write_positions` rows are in the `interrupted` state. \
                      Reload the same cartridge and run `tapectl volume resume {label}` to continue \
                      from where it stopped."
                 )),
-                Some(reason) => TapectlError::Other(format!(
+                Some(reason) => TapectlError::WriteInterrupted(format!(
                     "volume \"{label}\" write interrupted: {reason}. The tape is left unsealed and \
                      the session is `interrupted`, not aborted: the files before this one are \
                      whole, and resume writes this one again from its start. Fix the cause — a \
@@ -2869,8 +2883,16 @@ fn finish_session(
                 Some(&a.reason),
                 None,
                 None,
-            )?;
-            Err(TapectlError::Other(format!(
+            )
+            .map_err(|e| {
+                TapectlError::WriteAborted(format!(
+                    "volume \"{label}\" write aborted: {} (recording the abort event failed: \
+                     {e})",
+                    a.reason
+                ))
+            })?;
+            // Exit 5 (issue #408): the session cannot resume.
+            Err(TapectlError::WriteAborted(format!(
                 "volume \"{label}\" write aborted: {}",
                 a.reason
             )))
@@ -2978,16 +3000,34 @@ fn finish_confirm(
     let confirmed = sealed_pending
         .confirm(conn, store, confirm_tier)
         .map_err(|e| match e {
-            TapectlError::Interrupted(at) => TapectlError::Interrupted(format!(
-                "volume \"{label}\": confirm {at}. The tape IS sealed; the catalog cannot \
-                 count it as a copy until its readback passes. Reload the same cartridge and \
-                 {resume_hint}."
+            // Exit 4 (issue #408): a signal stopped the readback.
+            TapectlError::Interrupted(at) => TapectlError::WriteInterrupted(format!(
+                "stopped by a signal: volume \"{label}\": confirm {at}. The tape IS sealed; \
+                 the catalog cannot count it as a copy until its readback passes. Reload the \
+                 same cartridge and {resume_hint}."
             )),
-            other => other,
+            classified if classified.write_outcome().is_some() => classified,
+            // Exit 3 (issue #408): any other error stopped the confirm
+            // before its verdict — as every error of `volume verify` is.
+            other => TapectlError::ConfirmInconclusive(format!(
+                "volume \"{label}\": the confirm stopped before its verdict: {other}. The tape \
+                 IS sealed; the catalog cannot count it as a copy until its readback passes. \
+                 Reload the same cartridge and {resume_hint}."
+            )),
         })?;
     match confirmed {
         ConfirmOutcome::Sealed(sealed) => {
-            record_write_bookkeeping(conn, volume_id, layout, block_size)?;
+            // The copy is sealed, confirmed and committed above: a failure
+            // recording its figures after that is not a write outcome, and
+            // `volume resume` has nothing to do (issue #408). It says so,
+            // and exits 2 — the tape needs nothing.
+            let after_sealed = |e: TapectlError| {
+                TapectlError::Other(format!(
+                    "volume \"{label}\" IS sealed and confirmed and counts as a copy, but \
+                     recording its figures failed: {e}"
+                ))
+            };
+            record_write_bookkeeping(conn, volume_id, layout, block_size).map_err(after_sealed)?;
             events::log_event(
                 conn,
                 "volume",
@@ -2999,7 +3039,8 @@ fn finish_confirm(
                 None,
                 None,
                 None,
-            )?;
+            )
+            .map_err(after_sealed)?;
             info!(label = sealed.label, volume_id, "volume write sealed");
             Ok(())
         }
@@ -3027,8 +3068,16 @@ fn finish_confirm(
                 Some(&detail),
                 None,
                 None,
-            )?;
-            Err(TapectlError::Other(format!(
+            )
+            .map_err(|e| {
+                TapectlError::ConfirmInconclusive(format!(
+                    "volume \"{label}\": confirm could not complete — {detail} (recording the \
+                     event failed: {e}); run `tapectl volume resume {label}` to retry the \
+                     confirm readback."
+                ))
+            })?;
+            // Exit 3 (issue #408).
+            Err(TapectlError::ConfirmInconclusive(format!(
                 "volume \"{label}\": confirm could not complete — {detail}. The tape is \
                  physically unharmed and the write is not lost; run `tapectl volume resume \
                  {label}` to retry the confirm readback."
@@ -3093,7 +3142,8 @@ pub(crate) fn log_quarantine(
 /// (condition, `writes` rows, event) were recorded together by
 /// `session::record_quarantine` before the outcome reached the caller.
 pub(crate) fn quarantine_error(label: &str, reason: &QuarantineReason) -> TapectlError {
-    TapectlError::Other(format!(
+    // Exit 6 (ADR-0012, 2026-10-07 item 20; issue #408).
+    TapectlError::WriteQuarantined(format!(
         "volume \"{label}\" quarantined: {}",
         describe_quarantine(reason)
     ))
@@ -15187,7 +15237,7 @@ mod tests {
             crate::signal::interrupt_this_thread(false);
             let err = slot.finish_result(r).expect_err("the confirm stops");
             let msg = err.to_string();
-            assert!(matches!(err, TapectlError::Interrupted(_)), "{msg}");
+            assert!(matches!(err, TapectlError::WriteInterrupted(_)), "{msg}");
             assert!(
                 msg.contains("volume resume SW-STOP --full-confirm"),
                 "names the flag that continues the readback: {msg}"
@@ -15423,6 +15473,247 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(status, "sealed");
+        }
+
+        // ── ADR-0012, 2026-10-07 item 20 (issue #408): the write family's
+        //    exit table, one outcome at a time, through `volume write`
+        //    itself over an injected store ──
+
+        /// A fault one test injects into a [`Faulty`] store.
+        #[derive(Clone, Copy)]
+        enum Fault {
+            /// Every write fails with a drive error (not ENOSPC).
+            WriteIo,
+            /// The seal's write (the one synchronous filemark) fails with a
+            /// drive error; every other write lands.
+            SealIo,
+            /// Reading File 3 back fails with a drive error.
+            ReadFrontIndexIo,
+            /// Reading File 3 back returns different bytes from those
+            /// written.
+            ReadFrontIndexCorrupt,
+        }
+
+        /// A `MemStore` with one [`Fault`].
+        struct Faulty {
+            inner: MemStore,
+            fault: Fault,
+        }
+
+        impl Store for Faulty {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(
+                &mut self,
+                src: &mut dyn std::io::Read,
+                len: u64,
+                sync: bool,
+            ) -> Result<u64> {
+                match self.fault {
+                    Fault::WriteIo => Err(TapectlError::TapeIo("injected write error".into())),
+                    Fault::SealIo if sync => {
+                        Err(TapectlError::TapeIo("injected seal write error".into()))
+                    }
+                    _ => self.inner.execute(src, len, sync),
+                }
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn std::io::Write) -> Result<u64> {
+                let sealed = self.inner.syncs.last() == Some(&true);
+                match self.fault {
+                    Fault::ReadFrontIndexIo if sealed && position == 3 => {
+                        Err(TapectlError::TapeIo("injected read error".into()))
+                    }
+                    Fault::ReadFrontIndexCorrupt if sealed && position == 3 => {
+                        let mut bytes = Vec::new();
+                        let n = self.inner.read_file(position, &mut bytes)?;
+                        bytes[0] ^= 0xff;
+                        sink.write_all(&bytes)?;
+                        Ok(n)
+                    }
+                    _ => self.inner.read_file(position, sink),
+                }
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.inner.blank_at_bot()
+            }
+        }
+
+        /// One `volume write` of a fresh fixture over `store`, returning
+        /// the result and the outcome `main` would exit with.
+        fn write_outcome(
+            label: &str,
+            store: &mut dyn Store,
+            prewrite_hash: bool,
+        ) -> (Result<()>, i32) {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, _volume_id) = swept_write_fixture(label, tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                label,
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                prewrite_hash,
+                false,
+                true,
+                &mut slot,
+                ContactStore::Injected(store),
+            );
+            let r = slot.finish_result(r).map(|_| ());
+            let code = match &r {
+                Ok(()) => crate::error::EXIT_SUCCESS,
+                Err(e) => crate::error::ErrorContract::Write.exit_code(&clone_error(e).into()),
+            };
+            (r, code)
+        }
+
+        /// The library error, rebuilt for an `anyhow::Error` (it is not
+        /// `Clone`): the variant decides the code, the text is kept.
+        fn clone_error(e: &TapectlError) -> TapectlError {
+            let text = e.to_string();
+            match e {
+                TapectlError::WriteInterrupted(_) => TapectlError::WriteInterrupted(text),
+                TapectlError::WriteAborted(_) => TapectlError::WriteAborted(text),
+                TapectlError::WriteQuarantined(_) => TapectlError::WriteQuarantined(text),
+                TapectlError::ConfirmInconclusive(_) => TapectlError::ConfirmInconclusive(text),
+                TapectlError::CatalogBusy(_) => TapectlError::CatalogBusy(text),
+                _ => TapectlError::Other(text),
+            }
+        }
+
+        /// 0: sealed and confirmed.
+        #[test]
+        fn exit_0_a_write_that_seals_and_confirms() {
+            let (r, code) = write_outcome("EX-0", &mut MemStore::new(512 * 1024), false);
+            r.expect("seals");
+            assert_eq!(code, 0);
+        }
+
+        /// 2: refused before anything was written — the loaded tape is
+        /// another volume's (the File 0 check), and a signal during the
+        /// pre-write hash. Neither leaves a session to resume.
+        #[test]
+        fn exit_2_a_write_refused_before_the_tape_moved() {
+            let mut foreign = MemStore::new(512 * 1024);
+            fw_put_file(
+                &mut foreign,
+                0,
+                fw_id_thunk_bytes("OTHER", "00000000-0000-0000-0000-000000000000", 8),
+            );
+            let (r, code) = write_outcome("EX-2A", &mut foreign, false);
+            assert!(r.is_err(), "positive control: refused");
+            assert_eq!(code, 2, "{}", r.unwrap_err());
+
+            crate::signal::interrupt_this_thread(true);
+            let (r, code) = write_outcome("EX-2B", &mut MemStore::new(512 * 1024), true);
+            crate::signal::interrupt_this_thread(false);
+            let err = r.unwrap_err();
+            assert!(err.to_string().contains("nothing was written"), "{err}");
+            assert_eq!(code, 2, "{err}");
+        }
+
+        /// 3: the seal is on the tape and the confirm's readback failed on
+        /// the drive, proving nothing about the medium.
+        #[test]
+        fn exit_3_a_confirm_that_reached_no_verdict() {
+            let mut store = Faulty {
+                inner: MemStore::new(512 * 1024),
+                fault: Fault::ReadFrontIndexIo,
+            };
+            let (r, code) = write_outcome("EX-3", &mut store, false);
+            let err = r.unwrap_err();
+            assert!(
+                matches!(err, TapectlError::ConfirmInconclusive(_)),
+                "{err:?}"
+            );
+            assert_eq!(code, 3, "{err}");
+        }
+
+        /// 4: a drive error mid-write, and the seal's own write failing —
+        /// both leave a session `volume resume` continues.
+        #[test]
+        fn exit_4_a_write_stopped_part_way_is_resumable() {
+            for fault in [Fault::WriteIo, Fault::SealIo] {
+                let mut store = Faulty {
+                    inner: MemStore::new(512 * 1024),
+                    fault,
+                };
+                let (r, code) = write_outcome("EX-4", &mut store, false);
+                let err = r.unwrap_err();
+                assert!(matches!(err, TapectlError::WriteInterrupted(_)), "{err:?}");
+                assert!(err.to_string().contains("volume resume EX-4"), "{err}");
+                assert_eq!(code, 4, "{err}");
+            }
+        }
+
+        /// 4, through a signal: the full confirm stopped between files.
+        #[test]
+        fn exit_4_a_signal_during_the_confirm() {
+            let mut store = StopAfterFour {
+                inner: MemStore::new(512 * 1024),
+            };
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, _) = swept_write_fixture("EX-4S", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "EX-4S",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                true, // --full-confirm
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            crate::signal::interrupt_this_thread(false);
+            let err = slot.finish_result(r).unwrap_err();
+            assert!(matches!(err, TapectlError::WriteInterrupted(_)), "{err:?}");
+            assert_eq!(
+                crate::error::ErrorContract::Write.exit_code(&clone_error(&err).into()),
+                4
+            );
+        }
+
+        /// 5: the medium ran out (ENOSPC), and a staged slice that changed
+        /// under the write (tri-layer L2) — clean aborts, not resumable.
+        #[test]
+        fn exit_5_an_aborted_write() {
+            let mut short = MemStore::new(512 * 1024).with_enospc_after(2 * 512 * 1024);
+            let (r, code) = write_outcome("EX-5", &mut short, false);
+            let err = r.unwrap_err();
+            assert!(matches!(err, TapectlError::WriteAborted(_)), "{err:?}");
+            assert_eq!(code, 5, "{err}");
+        }
+
+        /// 6: the confirm's readback proved the medium bad — the volume is
+        /// quarantined.
+        #[test]
+        fn exit_6_a_confirm_that_proved_the_medium_bad() {
+            let mut store = Faulty {
+                inner: MemStore::new(512 * 1024),
+                fault: Fault::ReadFrontIndexCorrupt,
+            };
+            let (r, code) = write_outcome("EX-6", &mut store, false);
+            let err = r.unwrap_err();
+            assert!(matches!(err, TapectlError::WriteQuarantined(_)), "{err:?}");
+            assert_eq!(code, 6, "{err}");
         }
 
         /// Issue #386: a MemStore write inside a progress session records

@@ -257,6 +257,10 @@ pub enum Commands {
     /// The volume must already exist — run `tapectl volume init LABEL
     /// --device /dev/tape/by-id/<drive>-nst` first. This command creates the unit, snapshot and
     /// stage set, but not the volume.
+    ///
+    /// Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing
+    /// written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6
+    /// quarantined, 75 catalog busy).
     QuickArchive {
         /// Path to directory
         path: String,
@@ -412,6 +416,66 @@ pub enum ConfigCommands {
     Check,
 }
 
+/// How the errors of `command` map to an exit code, decided before it runs
+/// so the errors raised before the command's own module is reached (the
+/// database, the config) map the same way. `main` asks the contract for the
+/// code of whatever error the invocation returned.
+///
+/// - `volume verify`: [`ErrorContract::Verify`] (issue #356).
+/// - `audit`: [`ErrorContract::Audit`] (issue #408).
+/// - The write family — `volume write`, `volume resume`, `volume
+///   compact-write`, `volume compact`, `collection run`, `quick-archive`:
+///   [`ErrorContract::Write`] (ADR-0012, 2026-10-07 item 20).
+/// - Everything else: [`ErrorContract::Ordinary`].
+///
+/// [`ErrorContract::Verify`]: crate::error::ErrorContract::Verify
+/// [`ErrorContract::Audit`]: crate::error::ErrorContract::Audit
+/// [`ErrorContract::Write`]: crate::error::ErrorContract::Write
+/// [`ErrorContract::Ordinary`]: crate::error::ErrorContract::Ordinary
+pub fn error_contract(command: &Commands) -> crate::error::ErrorContract {
+    use crate::error::ErrorContract;
+    match command {
+        Commands::Volume { command } => volume::error_contract(command),
+        Commands::Audit { .. } => ErrorContract::Audit,
+        Commands::Collection {
+            command: collection::CollectionCommands::Run { .. },
+        }
+        | Commands::QuickArchive { .. } => ErrorContract::Write,
+        _ => ErrorContract::Ordinary,
+    }
+}
+
+/// The error contract of the command `args` (argv, program name first)
+/// names, whether or not the rest of it parses — for a command line that
+/// did not parse, which leaves no [`Commands`] to ask. The same arguments
+/// are parsed again leniently (`ignore_errors`), which keeps the subcommand
+/// chain clap had matched before it hit the error. Scanning argv by hand
+/// instead would have to know which global flags take a value (`--home X
+/// volume verify`); the lenient parse knows because it IS the definition.
+/// An invocation it cannot place (`volume verfy`, `audt`) is
+/// [`crate::error::ErrorContract::Ordinary`].
+pub fn invocation_contract(args: &[std::ffi::OsString]) -> crate::error::ErrorContract {
+    use crate::error::ErrorContract;
+    use clap::CommandFactory;
+    let Ok(matches) = Cli::command()
+        .ignore_errors(true)
+        .try_get_matches_from(args)
+    else {
+        return ErrorContract::Ordinary;
+    };
+    match matches.subcommand() {
+        Some(("volume", volume)) => match volume.subcommand_name() {
+            Some("verify") => ErrorContract::Verify,
+            Some("write" | "resume" | "compact-write" | "compact") => ErrorContract::Write,
+            _ => ErrorContract::Ordinary,
+        },
+        Some(("collection", c)) if c.subcommand_name() == Some("run") => ErrorContract::Write,
+        Some(("quick-archive", _)) => ErrorContract::Write,
+        Some(("audit", _)) => ErrorContract::Audit,
+        _ => ErrorContract::Ordinary,
+    }
+}
+
 /// The name of the progress session `command` opens (issue #386), or `None`
 /// for a command short enough to need none. It names the session log
 /// (`<home>/logs/<UTC>-<name>-<pid>.log`) and heads its first line.
@@ -512,6 +576,54 @@ pub(crate) fn refuse_dry_run(command: &str, why: &str) -> crate::error::TapectlE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0012, 2026-10-07 items 19 and 20 (issue #408): which commands'
+    /// errors take which exit contract — from a parsed command line, and
+    /// from one that did not parse (the lenient reparse).
+    #[test]
+    fn each_command_takes_its_error_contract() {
+        use crate::error::ErrorContract::{self, *};
+        let cases: &[(&[&str], ErrorContract)] = &[
+            (&["volume", "write", "L"], Write),
+            (&["volume", "resume", "L"], Write),
+            (&["volume", "compact-write", "--destination", "L"], Write),
+            (&["volume", "compact", "S", "--to", "L"], Write),
+            (
+                &["collection", "run", "--collection", "c", "--label", "L"],
+                Write,
+            ),
+            (
+                &["quick-archive", "/src", "--tenant", "t", "--volume", "L"],
+                Write,
+            ),
+            (&["volume", "verify", "L"], Verify),
+            (&["audit"], Audit),
+            (&["volume", "init", "L"], Ordinary),
+            (&["volume", "compact-read", "L"], Ordinary),
+            (&["volume", "compact-finish", "L"], Ordinary),
+            (&["collection", "plan"], Ordinary),
+            (&["report", "summary"], Ordinary),
+        ];
+        for (args, want) in cases {
+            let argv: Vec<&str> = std::iter::once("tapectl")
+                .chain(args.iter().copied())
+                .collect();
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert_eq!(error_contract(&cli.command), *want, "{argv:?}");
+            let os: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
+            assert_eq!(invocation_contract(&os), *want, "{argv:?} reparsed");
+        }
+        // A line that does not parse past the subcommand still names it.
+        let os = |a: &[&str]| -> Vec<std::ffi::OsString> { a.iter().map(Into::into).collect() };
+        assert_eq!(
+            invocation_contract(&os(&["argv0", "volume", "write", "--bogus"])),
+            Write
+        );
+        assert_eq!(
+            invocation_contract(&os(&["argv0", "volume", "wirte", "L"])),
+            Ordinary
+        );
+    }
 
     /// Issue #169: `import --generation` lost its `"LTO-6"` default and is
     /// now a plain required `clap` field, so omitting it is a usage error

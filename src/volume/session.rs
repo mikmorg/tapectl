@@ -1782,6 +1782,13 @@ impl InterruptedSession {
         let phase = crate::progress::phase("positioning", None);
         let start_index = store.reposition_at_most(cursor as u32)? as usize;
         phase.done();
+        // Issue #408 (ADR-0012, 2026-10-07 item 20): from here the resume
+        // changes the session — positions demoted, rows `in_progress`,
+        // files written — so an error no outcome classifies leaves it
+        // resumable, exit 4, never 2. Everything above wrote nothing and left
+        // the session as it was.
+        let label = self.built.layout.label.clone();
+        let in_session = |e: TapectlError| e.in_write_session(&label);
         if start_index < cursor {
             tracing::warn!(
                 catalog_cursor = cursor,
@@ -1793,14 +1800,15 @@ impl InterruptedSession {
                 "the tape holds {start_index} file(s) where the catalog recorded {cursor} \
                  written; resuming from file {start_index}"
             ));
-            demote_positions_from(conn, &self.write_ids, start_index)?;
+            demote_positions_from(conn, &self.write_ids, start_index).map_err(in_session)?;
         }
 
         for (write_id, _) in &self.write_ids {
             conn.execute(
                 "UPDATE writes SET status = 'in_progress' WHERE id = ?1",
                 params![write_id],
-            )?;
+            )
+            .map_err(|e| in_session(e.into()))?;
         }
 
         let outcome = run_entries(
@@ -1816,7 +1824,8 @@ impl InterruptedSession {
             // execute it exists to make reachable.
             &mut is_interrupted,
             park_marker_from_env(),
-        )?;
+        )
+        .map_err(in_session)?;
         Ok(outcome.into())
     }
 }

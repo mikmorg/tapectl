@@ -59,6 +59,8 @@ Write staged data to volume
 
 Refuses any volume not left `initialized` by `volume init` — a sealed, retired, erased or quarantined volume is not a write target (ADR-0012); no flag overrides it.
 
+Exit status, shared by every command that writes a tape: 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re-enters the confirm. 4 = interrupted part-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
+
 ```text
 tapectl volume write [OPTIONS] <LABEL>
 ```
@@ -87,6 +89,8 @@ Everything else quarantines the volume: a File 0 whose identity does not match, 
 An ABORTED session is adopted and re-confirmed the same way (never written, never re-sealed) only when its seal is recorded, its condition is ok, and a passing FULL verify is recorded after the abort (ADR-0012, 2026-09-23); otherwise resume names the first unmet condition and, where one exists, the command that resolves it.
 
 Refuses any volume whose CATALOG status is not `initialized` — a volume recorded sealed, retired or erased, or whose condition is quarantined, is not a write target (ADR-0012); no flag overrides it. That is a different question from whether the loaded TAPE carries a seal marker, which is what the re-confirm path above is about.
+
+Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A resume refused before it changed the session exits 2 and leaves the session as it was.
 
 ```text
 tapectl volume resume [OPTIONS] <LABEL>
@@ -212,6 +216,8 @@ tapectl volume compact-read [OPTIONS] <LABEL>
 
 Write compaction slices from staging to destination (compaction step 2)
 
+Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy).
+
 ```text
 tapectl volume compact-write [OPTIONS] --destination <DESTINATION>
 ```
@@ -263,6 +269,8 @@ Interactive compaction: read + write + finish in one flow
 One drive (`--device`) serves both the read and the write, so the flow PAUSES after step 1 for you to unload the source and load the destination — always, with or without `--to`. It therefore needs a terminal, and without one it refuses before reading anything. To compact unattended, run the steps separately: `volume compact-read <SOURCE>`, swap cartridges, `volume compact-write --destination <DEST>`, then `volume compact-finish <SOURCE>`.
 
 Step 3 applies `compact-finish`'s ADR-0008 Tier-2 gate and may refuse non-interactively without `--force`. When it does, the destination tape is already written and sealed and nothing is lost: `volume compact-finish <SOURCE> --force` completes the flow without re-reading or re-writing anything.
+
+Exit status: `volume write`'s, for step 2's write (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A step 1 or step 3 failure exits 2: step 1 writes nothing, and a step 3 refusal leaves the destination sealed.
 
 ```text
 tapectl volume compact [OPTIONS] <LABEL>

@@ -1246,7 +1246,7 @@ The full list of reports is in the [command reference](cli/report.md).
 ### Scripting against tapectl
 
 The global `--json` flag makes a command print machine-readable output on
-stdout; log lines always go to stderr. Only the commands in the first six
+stdout; log lines always go to stderr. Only the commands in the first seven
 rows put a finding in their exit status:
 
 | command | 0 | 1 | 2 | 3 |
@@ -1256,8 +1256,27 @@ rows put a finding in their exit status:
 | `db fsck` | clean | findings that are not corruption (orphaned rows, repaired or not) | the integrity check failed, or an error | — |
 | `collection sync`, `status`, `plan`, `run` | every unit ran | a unit was refused (its dotfile), or `sync` could not register a folder (invalid name, missing tenant or archive set), or (`sync`, `status`) something under the root belongs to no unit; the rest ran | an error | — |
 | `host check` | quiet | something tripped | an error | — |
+| the write family: `volume write`, `volume resume`, `collection run`, `quick-archive`, `volume compact-write`, `volume compact` | sealed and confirmed | (`collection run` only) sealed, and a unit was refused | an error with the medium untouched: nothing was written | the confirm was inconclusive; more codes below |
 | `config check` | the config loads | — | it does not, or an error | — |
 | every other command | it ran, whatever it found | — | an error, including a usage error | — |
+
+The write family goes past 3 (ADR-0012, 2026-10-07; the full table is in
+[Troubleshooting](troubleshooting.md#the-write-family-0-2-3-4-5-6-or-75)):
+
+| exit | the tape and the session | next |
+|---|---|---|
+| 0 | sealed and confirmed | nothing |
+| 2 | untouched: refused before anything was written, or a usage error | fix the error, run it again |
+| 3 | sealed; the confirm reached no verdict | `volume resume <label>` |
+| 4 | interrupted part-way (a signal, a drive or disk error) | `volume resume <label>` |
+| 5 | aborted: cannot resume (end of tape, a slice changed) | `volume write <label>` again |
+| 6 | the medium proven bad, quarantined | another cartridge |
+| 75 | the catalog was busy, nothing written | run it again |
+
+`collection run` exits with the worst outcome among its copies, in the order
+6, 5, 4, 3, 2, 0. A wrapper that retries can therefore act on the code alone:
+resume on 3 or 4, write again on 5, page someone on 6. Older builds exited 2
+for all of these.
 
 Every other command reports what it finds in its output only, and exits 0
 whatever that is. `unit check-integrity` exits 0 when files no longer match,

@@ -9,6 +9,8 @@ tapectl\-volume\-write \- Write staged data to volume
 Write staged data to volume
 .PP
 Refuses any volume not left `initialized` by `volume init` — a sealed, retired, erased or quarantined volume is not a write target (ADR\-0012); no flag overrides it.
+.PP
+Exit status, shared by every command that writes a tape: 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re\-enters the confirm. 4 = interrupted part\-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
 .SH OPTIONS
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR

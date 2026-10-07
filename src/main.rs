@@ -29,7 +29,7 @@ use tapectl::{cli, config, db, error, signal, startup, tenant};
 use std::ffi::OsString;
 
 use anyhow::{bail, Context};
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 
 use cli::{Cli, Commands, ConfigCommands};
 use config::{Config, TapectlPaths};
@@ -96,7 +96,7 @@ fn main() {
     // before they ever ran — exits their "no verdict" code instead. (A
     // command line that did not parse was mapped above, in
     // `parse_error_exit_code`.)
-    let contract = error_contract(&cli.command);
+    let contract = cli::error_contract(&cli.command);
     // Issue #393: the progress session lives here, not in `run`, so its log
     // records how the command ended (`session result:`) before its end line.
     let mut session = None;
@@ -118,17 +118,6 @@ fn main() {
     }
 }
 
-/// How the errors of `command` map to an exit code —
-/// [`error::ErrorContract::Ordinary`] for everything except `volume verify`
-/// (see `cli::volume::error_contract`) and `audit` (issue #408).
-fn error_contract(command: &Commands) -> error::ErrorContract {
-    match command {
-        Commands::Volume { command } => cli::volume::error_contract(command),
-        Commands::Audit { .. } => error::ErrorContract::Audit,
-        _ => error::ErrorContract::Ordinary,
-    }
-}
-
 /// The exit code for a command line that did not parse (issues #356, #408).
 ///
 /// clap's own is 0 for `--help`/`--version` and 2 for a usage error, and 2
@@ -137,41 +126,17 @@ fn error_contract(command: &Commands) -> error::ErrorContract {
 /// or an audit whose command line is wrong — a missing label, a mistyped
 /// flag — has read nothing and proved nothing, so it exits that command's
 /// "no verdict" code ([`error::ErrorContract::usage_error_code`]), exactly
-/// as every other error of the invocation does ([`error_contract`]). Every
-/// other command keeps clap's code, and help keeps 0.
-///
-/// A failed parse leaves no [`Cli`] to ask which command it was, so the
-/// same arguments are parsed again leniently (`ignore_errors`), which keeps
-/// the subcommand chain clap had matched before it hit the error. Scanning
-/// argv by hand instead would have to know which global flags take a value
-/// (`--home X volume verify`); the lenient parse knows because it IS the
-/// definition. If even that cannot place the invocation — `volume verfy`,
-/// `audt` — clap's code stands.
+/// as every other error of the invocation does (`cli::error_contract`).
+/// Every other command keeps clap's code — the write family's table gives a
+/// usage error 2 too — and help keeps 0. Which command a line that did not
+/// parse names is `cli::invocation_contract`'s lenient reparse.
 fn parse_error_exit_code(err: &clap::Error, args: &[OsString]) -> i32 {
     if !err.use_stderr() {
         return err.exit_code();
     }
-    invocation_contract(args)
+    cli::invocation_contract(args)
         .usage_error_code()
         .unwrap_or_else(|| err.exit_code())
-}
-
-/// The error contract of the command `args` (argv, program name first)
-/// names, whether or not the rest of it parses.
-fn invocation_contract(args: &[OsString]) -> error::ErrorContract {
-    let Ok(matches) = Cli::command()
-        .ignore_errors(true)
-        .try_get_matches_from(args)
-    else {
-        return error::ErrorContract::Ordinary;
-    };
-    match matches.subcommand() {
-        Some(("volume", volume)) if volume.subcommand_name() == Some("verify") => {
-            error::ErrorContract::Verify
-        }
-        Some(("audit", _)) => error::ErrorContract::Audit,
-        _ => error::ErrorContract::Ordinary,
-    }
 }
 
 /// Install the global tracing subscriber (issue #45/H10 — closes the "no
@@ -563,7 +528,7 @@ fn run(
             // for `Verify` (issue #356: 0 = passed, 2 = the medium proven
             // bad and quarantined, 3 = inconclusive); every other
             // subcommand returns EXIT_SUCCESS. Mirrors the Audit arm below.
-            // A verify's ERRORS exit 3 too — see `error_contract` above.
+            // A verify's ERRORS exit 3 too — see `cli::error_contract`.
             let exit_code =
                 cli::volume::run(&conn, &paths, &cfg, command, cli.json, cli.yes, cli.dry_run)?;
             exit_if_nonzero(exit_code);
@@ -588,7 +553,7 @@ fn run(
             ref unit,
         } => {
             // 0 clean, 1 warnings, 2 violations — its ERRORS exit 70
-            // (`error_contract`, issue #408), so 2 is only ever a verdict.
+            // (`cli::error_contract`, issue #408), so 2 is only ever a verdict.
             let exit_code = cli::audit::run(&conn, &cfg, unit.as_deref(), action_plan, cli.json)?;
             exit_if_nonzero(exit_code);
         }
