@@ -396,6 +396,21 @@ media root — a [Collection](cli/collection.md) (`collection sync`,
 `quick-archive` registers, snapshots, stages and writes a single directory
 onto a volume you have already initialised.
 
+**`collection run` releases staging as soon as its copies are confirmed.**
+Each copy's write ends with the default quick confirm (the front index and the
+seal marker, not the data), and once every unit of the batch has the copies its
+`min_copies` asks for, the run releases those units' staged slices straight
+away (ADR-0012, 2026-10-07). So on this path no full readback of the data
+precedes the release. The `volume verify` that steps 3–5 above run before
+`staging clean` comes only after the staged slices are gone, and a copy it finds
+bad is rewritten from another copy (`volume read-slices`), not from staging.
+When the data matters, have at least one copy read back in full before the
+release. `collection run --full-confirm` does that for every copy the run
+writes, each taking about as long as its write (~2.3 h on a full LTO-6); this
+path has no per-copy choice. To read back one copy only, stage and write that
+batch by hand (steps 1–5 above) and pass `--full-confirm` to the first
+`volume write` alone.
+
 A collection archives only its units: the real folders at exactly
 `unit_depth` below its root, and everything inside them. Anything else under
 the root down to that depth is in no unit and never reaches a tape: a loose
@@ -1733,7 +1748,10 @@ $ tapectl report verify-status
 front index and the seal marker unless you passed `--full-confirm`, so a new
 volume has had none of its data read back. Give it a full `volume verify`
 soon after the write — best before `staging clean` releases its units, while
-the staged slices can still rewrite a bad copy cheaply. `report
+the staged slices can still rewrite a bad copy cheaply. `collection run` gives
+no such window: it releases staging right after its quick confirms, so use its
+`--full-confirm` when the data matters (see
+[A typical write session](#a-typical-write-session)). `report
 verify-status` ends with the volumes still owed one:
 
 ```text
