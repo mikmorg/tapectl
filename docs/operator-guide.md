@@ -564,7 +564,9 @@ than open to whatever group they already have. `config check` (as the service us
 the group, the memberships and the modes are as they should be;
 [configuration.md](configuration.md#ops) has the details. `scripts/first-run.sh`
 does all of it in step 7 when the host profile sets `OPS_GROUP` — on an existing
-install, `scripts/first-run.sh --profile <profile> --from 7 --to 7`.
+install, `scripts/first-run.sh --profile <profile> --from 7 --to 7`, once the
+installed tapectl is 1.1.0 or later (`tapectl --version`): an older one refuses
+`[ops]` as an unknown key, and step 7 would leave it in `config.toml`.
 
 ### Register units
 
