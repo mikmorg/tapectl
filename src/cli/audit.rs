@@ -767,11 +767,29 @@ fn check_location_presence(
         return Ok(f);
     }
 
-    let missing = policy::coverage::missing_required_locations(
+    // ADR-0012 2026-10-07 item 34: a tape-only unit needs the multiplier's
+    // copies at each name, as `snapshot mark-reclaimable` asks.
+    let per_name = policy::coverage::copies_per_named_location(ctx.config, &unit.status);
+    let short = policy::coverage::short_required_locations(
         ctx.conn,
-        unit.id,
+        policy::coverage::NamedScope::Unit(unit.id),
         &resolved.required_locations,
+        per_name,
     )?;
+    let missing = policy::coverage::missing_names(&short);
+    if missing.is_empty() && !short.is_empty() {
+        let extra = format!(" && tapectl volume move <OTHER-LABEL> --to {}", short[0].0);
+        f.violations.push(AuditFinding {
+            unit: unit.name.clone(),
+            check: "location_presence".into(),
+            message: format!(
+                "has {} (tape-only {per_name}x) (policy requires {})",
+                policy::coverage::describe_named_shortfall(&short, per_name),
+                resolved.required_locations.join(", "),
+            ),
+            action: additional_copy_action(ctx.conn, unit, &extra)?,
+        });
+    }
     if !missing.is_empty() {
         let location_count = location_count_for_unit(ctx.conn, unit.id)?;
         // The remedy's last step says where the new copy goes. One copy can
@@ -3648,6 +3666,63 @@ mod tests {
         #[test]
         fn copies_at_every_named_location_satisfy_it() {
             let conn = setup(&["home-rack", "offsite"]);
+            assert!(location_findings(&conn).is_empty());
+        }
+
+        /// One more sealed volume holding the unit's one version, shelved at
+        /// `loc`.
+        fn add_copy_at(conn: &Connection, label: &str, loc: &str) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, location_id)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                         (SELECT id FROM locations WHERE name = ?2))",
+                params![label, loc],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 SELECT ss.id, ss.snapshot_id, ?1, 'completed' FROM stage_sets ss",
+                params![conn.last_insert_rowid()],
+            )
+            .unwrap();
+        }
+
+        /// ADR-0012 2026-10-07 items 15 and 34: for a tape-only unit each
+        /// named location must hold `tape_only_safety_multiplier` copies,
+        /// in `audit` as in `snapshot mark-reclaimable`. One copy at each of
+        /// `home-rack` and `offsite` meets the policy for an active unit,
+        /// not for a tape-only one at 2x.
+        #[test]
+        fn a_tape_only_unit_needs_the_multiplied_copies_at_each_named_location() {
+            let conn = setup(&["home-rack", "offsite"]);
+            conn.execute("UPDATE units SET status = 'tape_only'", [])
+                .unwrap();
+            let findings = location_findings(&conn);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(
+                findings[0].message,
+                "has 1 copy at required location home-rack, 1 copy at required location \
+                 offsite, needs 2 at each (tape-only 2x) (policy requires home-rack, offsite)"
+            );
+            assert!(
+                findings[0]
+                    .action
+                    .ends_with("tapectl volume move <OTHER-LABEL> --to home-rack"),
+                "{}",
+                findings[0].action
+            );
+
+            // One short name is named alone.
+            add_copy_at(&conn, "V-home-rack-2", "home-rack");
+            assert_eq!(
+                location_findings(&conn)[0].message,
+                "has 1 copy at required location offsite, needs 2 (tape-only 2x) \
+                 (policy requires home-rack, offsite)"
+            );
+
+            // Positive control: two at each meets it.
+            add_copy_at(&conn, "V-offsite-2", "offsite");
             assert!(location_findings(&conn).is_empty());
         }
     }

@@ -2454,12 +2454,17 @@ pub fn unit_mark_tape_only(
         conn.query_row(&sql, params![unit.id], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
     // Issue #348: `required_locations` checked BY NAME, through the one
-    // predicate `audit`'s `location_presence` also uses.
-    let missing_locations = crate::policy::coverage::missing_required_locations(
+    // predicate `audit`'s `location_presence` also uses — and, the unit
+    // being about to be tape-only, with the multiplier's copies at each name
+    // (ADR-0012 2026-10-07 item 34).
+    let per_name = crate::policy::coverage::copies_per_named_location(config, "tape_only");
+    let short_locations = crate::policy::coverage::short_required_locations(
         conn,
-        unit.id,
+        crate::policy::coverage::NamedScope::Unit(unit.id),
         &policy.required_locations,
+        per_name,
     )?;
+    let missing_locations = crate::policy::coverage::missing_names(&short_locations);
 
     // Issue #153 / ADR-0012: `copy_count` above is already the MINIMUM
     // across the unit's current versions -- this names WHICH version that
@@ -2557,6 +2562,12 @@ pub fn unit_mark_tape_only(
         facts.push(format!(
             "insufficient locations: no copy at required location(s) {} (policy requires {})",
             missing_locations.join(", "),
+            policy.required_locations.join(", ")
+        ));
+    } else if !short_locations.is_empty() {
+        facts.push(format!(
+            "insufficient locations: has {} (tape-only {per_name}x) (policy requires {})",
+            crate::policy::coverage::describe_named_shortfall(&short_locations, per_name),
             policy.required_locations.join(", ")
         ));
     }
@@ -4922,12 +4933,54 @@ mod tests {
 
         /// Positive control for the one above: the names met, nothing to
         /// confirm, no prompt — a compliant unit must never reach the gate
-        /// (a non-interactive run would otherwise refuse it).
+        /// (a non-interactive run would otherwise refuse it). The multiplier
+        /// is set to 1 so one copy at each name meets the policy;
+        /// `named_locations_take_the_tape_only_multiplier` below is the 2x
+        /// case (ADR-0012 2026-10-07 item 34).
         #[test]
         fn a_unit_meeting_its_named_locations_is_marked_without_a_prompt() {
             let conn = photos_in_archive_set("required_locations", "'[\"home\",\"glacier\"]'");
-            unit_mark_tape_only(&conn, &Config::default(), "photos", false, false)
+            let mut config = Config::default();
+            config.compaction.tape_only_safety_multiplier = 1;
+            unit_mark_tape_only(&conn, &config, "photos", false, false)
                 .expect("every named location holds a copy");
+            assert_eq!(photos_status(&conn), "tape_only");
+        }
+
+        /// ADR-0012 2026-10-07 items 15 and 34: the unit is about to be
+        /// tape-only, so each named location must hold
+        /// `tape_only_safety_multiplier` copies — the predicate `audit` and
+        /// `snapshot mark-reclaimable` use. `home` holds one tape: met for
+        /// an active unit, short at 2x, so it is a Tier-2 fact. A second
+        /// tape at `home` meets it with no prompt.
+        #[test]
+        fn named_locations_take_the_tape_only_multiplier() {
+            let conn = photos_in_archive_set("required_locations", "'[\"home\"]'");
+            let config = Config::default();
+            let err = unit_mark_tape_only(&conn, &config, "photos", false, false)
+                .expect_err("one copy at home does not meet [home] at 2x");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(
+                    "insufficient locations: has 1 copy at required location home, needs 2 \
+                     (tape-only 2x) (policy requires home)"
+                ),
+                "{msg}"
+            );
+            assert_eq!(photos_status(&conn), "active");
+
+            conn.execute_batch(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, location_id)
+                     SELECT 'L6-0004', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', id
+                     FROM locations WHERE name = 'home';
+                 INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT ss.id, ss.snapshot_id, v.id, 'completed'
+                     FROM stage_sets ss, volumes v WHERE v.label = 'L6-0004';",
+            )
+            .unwrap();
+            unit_mark_tape_only(&conn, &config, "photos", false, false)
+                .expect("two copies at home meet [home] at 2x");
             assert_eq!(photos_status(&conn), "tape_only");
         }
     }

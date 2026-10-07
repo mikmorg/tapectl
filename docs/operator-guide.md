@@ -1249,7 +1249,10 @@ audit: 4 violations, 1 warnings (exit 2)
 where its copies actually are: a missing place reads
 `no copy at required location(s) offsite (policy requires home-rack, offsite; copies are in 1 location(s))`,
 and its fix ends in `tapectl volume move <OTHER-LABEL> --to offsite`. A name
-that is not a registered location counts as missing.
+that is not a registered location counts as missing. A tape-only unit needs
+`[compaction] tape_only_safety_multiplier` copies at each named place
+(ADR-0012, 2026-10-07): at the default 2x, one copy at `offsite` reads
+`has 1 copy at required location offsite, needs 2 (tape-only 2x) (policy requires offsite)`.
 
 ### Reports
 
