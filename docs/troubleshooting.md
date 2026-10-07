@@ -818,7 +818,8 @@ stand behind; `volume verify` checks one afterwards.
 Migration 033 removes three cartridge columns no tapectl release has ever
 written or read: `total_bytes_written`, `total_bytes_read` and `error_history`
 (ADR-0012, 2026-10-07). A cartridge with a value in one of them other than its
-default (0, 0, empty) had it set by hand, and 033 will not drop it silently:
+default (0, 0, NULL; NULL counts as unwritten everywhere, and an empty text
+is a value) had it set by hand, and 033 will not drop it silently:
 
 ```text
 error: failed to open database: migration error: migration 033 cannot run: total_bytes_written, total_bytes_read
