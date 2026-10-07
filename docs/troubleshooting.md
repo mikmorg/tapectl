@@ -799,6 +799,29 @@ volume and set it with `sqlite3`, the same way as for migration 026 above
 `sealed` counts as a copy, so choose it only for a volume whose seal you can
 stand behind; `volume verify` checks one afterwards.
 
+### `migration 033 cannot run`
+
+Migration 033 removes three cartridge columns no tapectl release has ever
+written or read: `total_bytes_written`, `total_bytes_read` and `error_history`
+(ADR-0012, 2026-10-07). A cartridge with a value in one of them other than its
+default (0, 0, empty) had it set by hand, and 033 will not drop it silently:
+
+```text
+error: failed to open database: migration error: migration 033 cannot run: total_bytes_written, total_bytes_read
+or error_history is set on 1 cartridge row(s) (id 4). Migration 033 removes these three columns from the schema.
+No tapectl release has ever written them, so these values were set by hand, and 033 will not drop them silently.
+Copy them somewhere if they matter, set each named row back to total_bytes_written = 0, total_bytes_read = 0,
+error_history = NULL, then run the command again. Nothing has been changed.
+```
+
+Nothing has been changed. Read the values first if you want to keep them
+(`sqlite3 "$DB" "SELECT id, barcode, total_bytes_written, total_bytes_read,
+error_history FROM cartridges WHERE id = 4"`), then reset them:
+
+```bash
+sqlite3 "$DB" "UPDATE cartridges SET total_bytes_written = 0, total_bytes_read = 0, error_history = NULL WHERE id = 4"
+```
+
 ---
 
 ## Staging
