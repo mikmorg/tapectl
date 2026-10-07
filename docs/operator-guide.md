@@ -2316,15 +2316,20 @@ Run it on a database you brought in with `db import` before you use it:
 
 ### The journals are never pruned
 
-The catalog keeps every reading it takes of a tape, a drive and a write, and
-never deletes one: `health_logs`, `verification_sessions` and
-`verification_results`, `events`, `cartridge_contacts`, `mam_journal`,
-`log_page_journal`, `st_stats_journal` and `phase_timings` only grow. No
-command, timer or startup step removes their rows, and none is to be added
-(ADR-0012, 2026-10-07, item 28). They are evidence: a journal with rows
-missing looks complete and is not, and the earliest reading of a cartridge is
-the only baseline its later readings have. The session logs and stage reports
-under the home are kept the same way.
+The catalog keeps every reading it takes of a tape, a drive and a write:
+`health_logs`, `verification_sessions` and `verification_results`, `events`,
+`cartridge_contacts`, `mam_journal`, `log_page_journal`, `st_stats_journal` and
+`phase_timings` only grow. Nothing removes their rows by age or size, and nothing
+that does is to be added (ADR-0012, 2026-10-07, item 28). They are evidence: a
+journal with rows missing looks complete and is not, and the earliest reading of
+a cartridge is the only baseline its later readings have. The session logs and
+stage reports under the home are kept the same way.
+
+Two commands do delete journal rows, and only rows the catalog can no longer
+refer to. `snapshot delete`, which deletes only a snapshot never written to tape
+(with `--force` once it is staged), takes that snapshot's own
+`verification_results` rows with the slices they point at. `db fsck --repair`
+deletes any row, in any table, whose foreign-key parent is gone.
 
 The cost is small. The largest journal is `verification_results`, one row of
 about 250 bytes per slice per full verify: a full LTO-6 at the default 1 GiB

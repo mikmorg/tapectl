@@ -102,6 +102,9 @@ pub fn plan(original: &str, path: &Path, edit: &Edit) -> Result<Planned> {
     })?;
     let segs = parse_key(edit.key())?;
     let before = check_text(original, path);
+    if !matches!(edit, Edit::Remove { .. }) {
+        refuse_under_unknown(&before, path, edit, &segs)?;
+    }
     match edit {
         Edit::Set { value, .. } => plan_set(&doc, original, path, &before, edit, &segs, value),
         Edit::Add { values, .. } => plan_add(&doc, original, path, &before, edit, &segs, values),
@@ -375,6 +378,60 @@ fn acceptable(before: &LenientReport, after: &LenientReport) -> bool {
     }
     let old = &before.problems[1..];
     after.problems[1..].iter().all(|p| old.contains(p))
+}
+
+/// Refuse a `set` or `add` at or under a key the file already has and no
+/// reader accepts. [`acceptable`] lets an edit through a broken file when it
+/// adds no problem, but an edit inside an unknown table adds none the
+/// checker can see — it strips the whole table and reports it once — so
+/// `config set nonsense.evil 1` would be written. The allowance is for
+/// repairing a file; `config remove` is how an unknown key leaves it.
+///
+/// Compared without selectors: the checker counts a list's entries by
+/// position, the edit may name them, and an entry's unknown key is unknown
+/// in every entry.
+fn refuse_under_unknown(
+    before: &LenientReport,
+    path: &Path,
+    edit: &Edit,
+    segs: &[Seg],
+) -> Result<()> {
+    fn plain(p: &str) -> String {
+        let mut out = String::new();
+        let mut depth = 0usize;
+        for c in p.chars() {
+            match c {
+                '[' => depth += 1,
+                ']' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+    let edited = segs
+        .iter()
+        .map(|s| s.key.as_str())
+        .collect::<Vec<_>>()
+        .join(".");
+    for p in &before.problems {
+        let Some(unknown) = p.strip_prefix("unknown key: ") else {
+            continue;
+        };
+        let bare = plain(unknown);
+        if edited == bare || edited.starts_with(&format!("{bare}.")) {
+            return Err(TapectlError::Config(format!(
+                "config {} {} refused; {} is unchanged:\n  - unknown key: {unknown} is \
+                 already in the file, and no reader accepts it — remove it with \
+                 `tapectl config remove {unknown}` (or fix its spelling by hand) instead \
+                 of editing under it",
+                edit.verb(),
+                edit.key(),
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Try `apply` with each combination of candidate values until one yields
@@ -778,6 +835,224 @@ fn plan_add_values(
 }
 
 // ------------------------------------------------------------------ remove
+//
+// toml_edit hangs the comment lines above a table header or a key on that
+// item, as its prefix. Removing the item whole would take them with it —
+// and they are often not its own: init's commented `[[backends.lto]]`
+// example sits above `# [host_check]`, so uncommenting that header made the
+// drive example its prefix. Before an item goes, the comments above where
+// it began are handed to whatever the file prints next (the next header or
+// key, or the text after the last table), so the file reads as before less
+// the removed lines. Comments inside the removed table go with it.
+
+/// One step of a path to a table: a key, and the entry it selects when the
+/// key holds a list of tables.
+#[derive(Debug, Clone, PartialEq)]
+struct Step {
+    key: String,
+    index: Option<usize>,
+}
+
+/// Something the file prints with a prefix of its own: a table's header,
+/// or a `key = value` line in a table.
+#[derive(Debug, Clone)]
+enum Slot {
+    Header(Vec<Step>),
+    Key(Vec<Step>, String),
+}
+
+/// What a removal takes out of the file.
+enum Removed {
+    /// A table or one list entry, with everything under it.
+    Subtree(Vec<Step>),
+    /// One `key = value` line.
+    Key(Vec<Step>, String),
+}
+
+impl Removed {
+    fn takes(&self, slot: &Slot) -> bool {
+        match (self, slot) {
+            (Removed::Subtree(p), Slot::Header(t) | Slot::Key(t, _)) => t.starts_with(p),
+            (Removed::Key(p, k), Slot::Key(t, j)) => p == t && k == j,
+            (Removed::Key(..), Slot::Header(_)) => false,
+        }
+    }
+}
+
+/// The steps `segs` take through `root`, with each name selector resolved
+/// to its entry's position. `None` when the path is not there as tables;
+/// [`descend`] names that problem.
+fn steps_of(root: &Table, segs: &[Seg]) -> Option<Vec<Step>> {
+    let mut cur = root;
+    let mut out = Vec::new();
+    for seg in segs {
+        cur = match (&seg.select, cur.get(&seg.key)?) {
+            (None, Item::Table(t)) => {
+                out.push(Step {
+                    key: seg.key.clone(),
+                    index: None,
+                });
+                t
+            }
+            (Some(sel), Item::ArrayOfTables(aot)) => {
+                let idx = select(aot, sel, &seg.key).ok()?;
+                out.push(Step {
+                    key: seg.key.clone(),
+                    index: Some(idx),
+                });
+                aot.get(idx)?
+            }
+            _ => return None,
+        };
+    }
+    Some(out)
+}
+
+/// The table `path` leads to from `root`.
+fn table_at<'a>(root: &'a Table, path: &[Step]) -> Option<&'a Table> {
+    let mut cur = root;
+    for step in path {
+        cur = match (step.index, cur.get(&step.key)?) {
+            (None, Item::Table(t)) => t,
+            (Some(i), Item::ArrayOfTables(aot)) => aot.get(i)?,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+/// The headers and keys of `doc` in the order the file prints them — the
+/// order `toml_edit`'s own `Display` uses: tables by document position (a
+/// table built in memory follows the one before it), each header (unless
+/// an implicit table with no values hides it) followed by its keys.
+fn render_order(doc: &DocumentMut) -> Vec<Slot> {
+    fn walk<'a>(t: &'a Table, path: &mut Vec<Step>, out: &mut Vec<(Vec<Step>, &'a Table)>) {
+        if !t.is_dotted() {
+            out.push((path.clone(), t));
+        }
+        for (k, item) in t.iter() {
+            match item {
+                Item::Table(sub) => {
+                    path.push(Step {
+                        key: k.to_string(),
+                        index: None,
+                    });
+                    walk(sub, path, out);
+                    path.pop();
+                }
+                Item::ArrayOfTables(aot) => {
+                    for (i, sub) in aot.iter().enumerate() {
+                        path.push(Step {
+                            key: k.to_string(),
+                            index: Some(i),
+                        });
+                        walk(sub, path, out);
+                        path.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut tables = Vec::new();
+    walk(doc.as_table(), &mut Vec::new(), &mut tables);
+    let mut last = 0;
+    let mut ordered: Vec<(usize, Vec<Step>, &Table)> = tables
+        .into_iter()
+        .map(|(path, t)| {
+            if let Some(pos) = t.position() {
+                last = pos;
+            }
+            (last, path, t)
+        })
+        .collect();
+    ordered.sort_by_key(|(pos, _, _)| *pos);
+    let mut out = Vec::new();
+    for (_, path, t) in ordered {
+        let entry = path.last().is_some_and(|s| s.index.is_some());
+        if !path.is_empty() && (entry || !(t.is_implicit() && t.get_values().is_empty())) {
+            out.push(Slot::Header(path.clone()));
+        }
+        for (k, item) in t.iter() {
+            if item.is_value() {
+                out.push(Slot::Key(path.clone(), k.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Run `f` on the prefix decor of `slot` in `doc`; `false` when the slot is
+/// not there.
+fn with_prefix(doc: &mut DocumentMut, slot: &Slot, f: impl FnOnce(&mut toml_edit::Decor)) -> bool {
+    let (path, key) = match slot {
+        Slot::Header(p) => (p, None),
+        Slot::Key(p, k) => (p, Some(k)),
+    };
+    let mut cur = doc.as_table_mut();
+    for step in path {
+        let Some(item) = cur.get_mut(&step.key) else {
+            return false;
+        };
+        cur = match (step.index, item) {
+            (None, Item::Table(t)) => t,
+            (Some(i), Item::ArrayOfTables(aot)) => match aot.get_mut(i) {
+                Some(t) => t,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
+    match key {
+        None => f(cur.decor_mut()),
+        Some(k) => match cur.key_mut(k) {
+            Some(mut km) => f(km.leaf_decor_mut()),
+            None => return false,
+        },
+    }
+    true
+}
+
+fn prefix_text(decor: &toml_edit::Decor) -> Option<String> {
+    decor
+        .prefix()
+        .and_then(|raw| raw.as_str())
+        .map(str::to_string)
+}
+
+/// Before `removed` leaves `doc`, hand the comments above where it begins to
+/// whatever the file prints next. A prefix of blank lines alone is not
+/// carried, so removing a table does not leave its spacing behind.
+fn keep_leading_comments(doc: &mut DocumentMut, removed: &Removed) {
+    let order = render_order(doc);
+    let Some(first) = order.iter().position(|s| removed.takes(s)) else {
+        return;
+    };
+    let mut carried = String::new();
+    with_prefix(doc, &order[first], |d| {
+        carried = prefix_text(d).unwrap_or_default();
+    });
+    if !carried.contains('#') {
+        return;
+    }
+    match order[first + 1..].iter().find(|s| !removed.takes(s)) {
+        Some(next) => {
+            // What toml_edit prints for a prefix that was never set.
+            let default = match next {
+                Slot::Header(_) => "\n",
+                Slot::Key(..) => "",
+            };
+            with_prefix(doc, next, |d| {
+                let old = prefix_text(d).unwrap_or_else(|| default.to_string());
+                d.set_prefix(format!("{carried}{old}"));
+            });
+        }
+        None => {
+            let trailing = doc.trailing().as_str().unwrap_or("").to_string();
+            doc.set_trailing(format!("{carried}{trailing}"));
+        }
+    }
+}
 
 fn plan_remove(
     doc: &DocumentMut,
@@ -790,6 +1065,35 @@ fn plan_remove(
 ) -> Result<Planned> {
     let (last, parents) = segs.split_last().expect("parse_key yields at least one");
     let mut d = doc.clone();
+    // What goes, worked out against the file as it is; a path that is not
+    // there is refused below, by name.
+    if raws.is_empty() {
+        let removed = steps_of(doc.as_table(), parents).and_then(|mut path| {
+            let parent = table_at(doc.as_table(), &path)?;
+            match (&last.select, parent.get(&last.key)?) {
+                (Some(sel), Item::ArrayOfTables(aot)) => {
+                    let idx = select(aot, sel, &last.key).ok()?;
+                    path.push(Step {
+                        key: last.key.clone(),
+                        index: Some(idx),
+                    });
+                    Some(Removed::Subtree(path))
+                }
+                (None, Item::Table(_)) => {
+                    path.push(Step {
+                        key: last.key.clone(),
+                        index: None,
+                    });
+                    Some(Removed::Subtree(path))
+                }
+                (None, Item::Value(_)) => Some(Removed::Key(path, last.key.clone())),
+                _ => None,
+            }
+        });
+        if let Some(removed) = removed {
+            keep_leading_comments(&mut d, &removed);
+        }
+    }
     let summary;
     let json;
     {
@@ -1068,6 +1372,119 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "a = 2\n");
         // And no temporary file is left behind.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    fn remove(original: &str, key: &str) -> String {
+        plan(
+            original,
+            &p(),
+            &Edit::Remove {
+                key: key.into(),
+                values: Vec::new(),
+            },
+        )
+        .unwrap()
+        .new_text
+    }
+
+    /// The review's reproduction: init's own template with `[host_check]`
+    /// uncommented. The comments above that header were the table's prefix,
+    /// and removing the table took the drive example with it.
+    #[test]
+    fn removing_a_table_keeps_the_comments_above_its_header() {
+        let original = format!(
+            "[defaults]\nslice_size = \"1G\"\n{}{}",
+            crate::config::LTO_BACKEND_EXAMPLE,
+            crate::config::HOST_CHECK_EXAMPLE.replacen("# [host_check]", "[host_check]", 1)
+        );
+        assert!(original.contains("\n[host_check]\n"), "precondition");
+        let after = remove(&original, "host_check");
+        assert_eq!(after, original.replacen("[host_check]\n", "", 1));
+        assert!(after.contains("Tape drive. Uncomment and edit"), "{after}");
+        assert!(after.contains("# [[backends.lto]]"), "{after}");
+    }
+
+    #[test]
+    fn removing_a_key_hands_its_comment_to_what_follows() {
+        let original = "[defaults]\n# sized for LTO-6\nslice_size = \"1G\"\nglobal_excludes = []\n";
+        assert_eq!(
+            remove(original, "defaults.slice_size"),
+            "[defaults]\n# sized for LTO-6\nglobal_excludes = []\n"
+        );
+        // The last key of a table: the comment goes to the next header.
+        let original =
+            "[defaults]\n# sized for LTO-6\nslice_size = \"1G\"\n\n[staging]\njobs = 2\n";
+        assert_eq!(
+            remove(original, "defaults.slice_size"),
+            "[defaults]\n# sized for LTO-6\n\n[staging]\njobs = 2\n"
+        );
+    }
+
+    #[test]
+    fn removing_the_last_entry_of_a_list_keeps_the_comment_above_it() {
+        let head = "[defaults]\nslice_size = \"1G\"\n\n# drive notes, kept\n";
+        let original =
+            format!("{head}[[collections]]\nname = \"m\"\nroot = \"/x\"\ntenant = \"t\"\n");
+        assert_eq!(remove(&original, "collections[m]"), head);
+    }
+
+    #[test]
+    fn removing_one_entry_hands_its_comment_to_the_next() {
+        let original = "[defaults]\nslice_size = \"1G\"\n\n# first, kept\n\
+                        [[collections]]\nname = \"a\"\nroot = \"/a\"\ntenant = \"t\"\n\n\
+                        [[collections]]\nname = \"b\"\nroot = \"/b\"\ntenant = \"t\"\n";
+        assert_eq!(
+            remove(original, "collections[a]"),
+            "[defaults]\nslice_size = \"1G\"\n\n# first, kept\n\n\
+             [[collections]]\nname = \"b\"\nroot = \"/b\"\ntenant = \"t\"\n"
+        );
+    }
+
+    #[test]
+    fn whitespace_alone_is_not_carried() {
+        let original =
+            "[defaults]\nslice_size = \"1G\"\n\n[staging]\njobs = 2\n\n[dar]\nbinary = \"dar\"\n";
+        assert_eq!(
+            remove(original, "staging"),
+            "[defaults]\nslice_size = \"1G\"\n\n[dar]\nbinary = \"dar\"\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_under_an_unknown_key_is_refused_even_on_a_broken_file() {
+        for (original, key) in [
+            ("[nonsense]\na = 1\n", "nonsense.evil"),
+            ("[defaults]\ntypo = 1\n", "defaults.typo"),
+            ("[[typos]]\nname = \"x\"\n", "typos[x].a"),
+        ] {
+            let err = plan(
+                original,
+                &p(),
+                &Edit::Set {
+                    key: key.into(),
+                    value: "2".into(),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("unknown key"), "{key}: {err}");
+        }
+        let err = plan(
+            "[defaults]\ntypo_list = []\n",
+            &p(),
+            &Edit::Add {
+                key: "defaults.typo_list".into(),
+                values: vec!["a".into()],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("defaults.typo_list"), "{err}");
+        // Removing the unknown key is what the allowance is for.
+        assert_eq!(
+            remove("[defaults]\ntypo = 1\n", "defaults.typo"),
+            "[defaults]\n"
+        );
     }
 
     #[test]

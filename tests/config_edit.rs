@@ -537,3 +537,73 @@ fn json_output_names_the_change() {
     assert_eq!(v["value"], "\"2G\"");
     assert_eq!(v["previous"], "\"1G\"");
 }
+
+/// The review's reproduction (ADR-0012 2026-10-07 item 27: comments and
+/// layout are kept): with init's `[host_check]` uncommented, the comments
+/// above the header — init's commented drive example among them — were the
+/// table's prefix, and removing the table deleted them.
+#[test]
+fn removing_a_table_keeps_init_s_drive_example() {
+    let home = home();
+    let cfg = config_path(home.path());
+    let original = read(home.path());
+    let uncommented = original.replacen("# [host_check]\n", "[host_check]\n", 1);
+    assert_ne!(
+        uncommented, original,
+        "precondition: init writes # [host_check]"
+    );
+    std::fs::write(&cfg, &uncommented).unwrap();
+    config_check_passes(home.path());
+
+    ok(home.path(), &["config", "remove", "host_check"]);
+    let after = read(home.path());
+    assert!(after.contains("Tape drive. Uncomment and edit"), "{after}");
+    assert!(after.contains("# [[backends.lto]]"), "{after}");
+    assert!(after.contains("# operator note"), "{after}");
+    assert_eq!(after, uncommented.replacen("[host_check]\n", "", 1));
+    config_check_passes(home.path());
+}
+
+/// The same for the last entry of a list of tables written at the end of
+/// the file, below init's commented examples.
+#[test]
+fn removing_the_last_collection_keeps_the_comments_above_it() {
+    let home = home();
+    let cfg = config_path(home.path());
+    let original = read(home.path());
+    let entry = "\n# the media shelf\n[[collections]]\nname = \"movies\"\n\
+                 root = \"/srv/media/movies\"\ntenant = \"family\"\n";
+    std::fs::write(&cfg, format!("{original}{entry}")).unwrap();
+    config_check_passes(home.path());
+
+    ok(home.path(), &["config", "remove", "collections[movies]"]);
+    let after = read(home.path());
+    assert!(after.contains("Tape drive. Uncomment and edit"), "{after}");
+    assert!(after.contains("# [host_check]"), "{after}");
+    assert!(after.contains("# the media shelf"), "{after}");
+    assert!(!after.contains("[[collections]]"), "{after}");
+    config_check_passes(home.path());
+}
+
+/// An unknown key is refused by name even on a file that already has it:
+/// the broken-file allowance is for repairing a file, not for writing more
+/// under a key no reader accepts.
+#[test]
+fn an_edit_under_an_unknown_key_already_in_the_file_is_refused() {
+    let home = home();
+    let cfg = config_path(home.path());
+    let original = read(home.path());
+    std::fs::write(&cfg, format!("{original}\n[typo]\na = 1\n")).unwrap();
+    let out = refused(home.path(), &["config", "set", "typo.x", "1"]);
+    assert!(out.contains("typo"), "{out}");
+
+    let broken = original.replacen("[defaults]\n", "[defaults]\ntypo = 1\n", 1);
+    assert_ne!(broken, original, "precondition");
+    std::fs::write(&cfg, format!("{broken}\n[typo]\na = 1\n")).unwrap();
+    let out = refused(home.path(), &["config", "set", "defaults.typo", "2"]);
+    assert!(out.contains("defaults.typo"), "{out}");
+
+    ok(home.path(), &["config", "remove", "typo"]);
+    ok(home.path(), &["config", "remove", "defaults.typo"]);
+    config_check_passes(home.path());
+}

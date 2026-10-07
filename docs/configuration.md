@@ -204,7 +204,9 @@ tapectl config remove defaults.slice_size
   writes through the same editor.
 - **`config remove`** removes a key, so its default applies, or one entry of a list
   of tables, or the values you name from a list. A whole list of tables goes one
-  entry at a time.
+  entry at a time. The comment lines directly above a removed key or table header
+  stay in the file, joined to whatever follows; comments inside a removed table go
+  with it.
 
 Before anything is written, the edited file is loaded the way every other command
 loads it. If it would not load, the edit is refused, every problem is listed, and
@@ -215,7 +217,9 @@ permissions, and a symlinked `config.toml` is written through to its target.
 
 A file that already fails to load can be repaired one key at a time: on such a file
 an edit that adds no new problem goes through and lists the problems that are left.
-An edit that adds a problem is refused there too. Each command accepts `--dry-run`
+An edit that adds a problem is refused there too, and so is a `set` or `add` at or
+under an unknown key the file already has: `config remove` takes that key out, and
+nothing is written under it. Each command accepts `--dry-run`
 (shows the change, refuses what the real run would refuse, writes nothing) and
 `--json`.
 
