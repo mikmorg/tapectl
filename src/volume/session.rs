@@ -1759,10 +1759,13 @@ impl SealedPending {
             let promoted = busy::retry(BusyPolicy::DEFAULT, "the seal", || {
                 let tx = busy::immediate_tx(conn)?;
                 for ((write_id, _), entered) in self.write_ids.iter().zip(&entry_statuses) {
+                    // ADR-0012 2026-10-06 item 24: `write_verified` means
+                    // fully read back — an Integrity confirm, never a quick one.
                     let completed = tx.execute(
-                        "UPDATE writes SET status = 'completed', completed_at = datetime('now')
+                        "UPDATE writes SET status = 'completed', completed_at = datetime('now'),
+                                write_verified = ?3
                          WHERE id = ?1 AND status = ?2",
-                        params![write_id, entered],
+                        params![write_id, entered, tier == Tier::Integrity],
                     )?;
                     if completed == 0 {
                         // Issue #376 (c): the row moved while confirm read the
@@ -6522,6 +6525,16 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, "passed");
         assert_eq!((checked, passed), ((seal + 1) as i64, (seal + 1) as i64));
+        // ADR-0012 2026-10-06 item 24: the continued readback read the
+        // whole tape between its two runs, so the write was read back.
+        let verified: bool = conn
+            .query_row(
+                "SELECT write_verified FROM writes WHERE volume_id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(verified, "a continued full readback that passes is one");
     }
 
     /// Only an INTERRUPTED readback is continued: one that finished — here
@@ -6660,5 +6673,41 @@ mod tests {
             })
             .collect();
         assert_eq!(reads, vec![seal], "the seal, and nothing after it");
+    }
+
+    /// ADR-0012 2026-10-06 item 24 (#392): `writes.write_verified` means
+    /// "this write was fully read back". A passing Integrity confirm sets
+    /// it on the rows it completes; a passing quick (Navigable) confirm,
+    /// which reads File 0, the front index and the seal only, leaves it 0.
+    #[test]
+    fn a_full_confirm_marks_the_write_verified_and_a_quick_one_does_not() {
+        for (tier, want) in [(Tier::Integrity, true), (Tier::Navigable, false)] {
+            let f = make_fixture();
+            let mut store = MemStore::new(BS as usize);
+            let planned = f
+                .built
+                .into_validated(&f.keys, SliceCheck::Size, &mut store)
+                .unwrap()
+                .plan(&f.conn, f.volume_id, &f.units)
+                .unwrap();
+            let ExecuteOutcome::Ready(ready) = planned.execute(&f.conn, &mut store).unwrap() else {
+                panic!("expected Ready");
+            };
+            let outcome = ready
+                .seal(&mut store)
+                .unwrap()
+                .confirm(&f.conn, &mut store, tier)
+                .unwrap();
+            assert!(matches!(outcome, ConfirmOutcome::Sealed(_)), "{tier:?}");
+            let rows: Vec<(String, bool)> = f
+                .conn
+                .prepare("SELECT status, write_verified FROM writes WHERE volume_id = ?1")
+                .unwrap()
+                .query_map(params![f.volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(rows, vec![("completed".to_string(), want)], "{tier:?}");
+        }
     }
 }
