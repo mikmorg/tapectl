@@ -173,6 +173,18 @@ pub fn run(
             // Issue #241: both lookups above already refuse an unknown
             // tenant on either side; a dry run counts what would move
             // instead of running the UPDATE.
+            //
+            // #383: the written copies the destination's own keys cannot
+            // open stay that way (they keep their recipients; the operator
+            // and escrow keys still open them). Shown, before and after.
+            let unreadable =
+                crate::policy::tenancy::copies_unreadable_after_reassign(conn, src.id, dst.id)?;
+            let unreadable_note = format!(
+                "{unreadable} written cop{} of these units cannot be opened by \"{to}\"'s \
+                 keys (the operator and escrow keys still open them); `tapectl audit` names \
+                 each one as `tenancy`",
+                if unreadable == 1 { "y" } else { "ies" }
+            );
             if dry_run {
                 let would_move: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM units WHERE tenant_id = ?1",
@@ -183,16 +195,24 @@ pub fn run(
                     println!(
                         "{}",
                         serde_json::json!({"from": source, "to": to,
-                                           "units_moved": would_move, "dry_run": true})
+                                           "units_moved": would_move, "dry_run": true,
+                                           "copies_unreadable_by_destination": unreadable})
                     );
                 } else {
                     println!(
                         "would reassign {would_move} unit(s) from \"{source}\" to \"{to}\" \
                          (DRY RUN — no changes made)"
                     );
+                    if unreadable > 0 {
+                        println!("  {unreadable_note}");
+                    }
                 }
                 return Ok(());
             }
+            let moved_paths: Vec<Option<String>> = conn
+                .prepare("SELECT current_path FROM units WHERE tenant_id = ?1")?
+                .query_map(rusqlite::params![src.id], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
             let moved: usize = conn.execute(
                 "UPDATE units SET tenant_id = ?1 WHERE tenant_id = ?2",
                 rusqlite::params![dst.id, src.id],
@@ -214,13 +234,23 @@ pub fn run(
                 to,
                 None,
             )?;
+            // #383: each moved unit's dotfile names its new tenant, so the
+            // dotfile and the catalog agree (since #378 the dotfile is not
+            // content: this mints no version). Warned, never fatal.
+            for path in &moved_paths {
+                crate::unit::retenant_dotfile(path.as_deref(), to);
+            }
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"from": source, "to": to, "units_moved": moved})
+                    serde_json::json!({"from": source, "to": to, "units_moved": moved,
+                                       "copies_unreadable_by_destination": unreadable})
                 );
             } else {
                 println!("{moved} unit(s) reassigned from \"{source}\" to \"{to}\"");
+                if unreadable > 0 {
+                    println!("  {unreadable_note}");
+                }
             }
         }
         TenantCommands::Delete { name } => {
@@ -321,5 +351,59 @@ mod tests {
 
         assert_eq!(old_value.as_deref(), Some("acme"));
         assert_eq!(new_value.as_deref(), Some("othertenant"));
+    }
+
+    /// #383: a reassign rewrites each moved unit's dotfile to name its new
+    /// tenant (after #378 the dotfile is not content, so this mints no
+    /// version), so the dotfile and the catalog agree afterwards.
+    #[test]
+    fn reassign_rewrites_the_moved_units_dotfiles() {
+        let conn = crate::db::open_memory().unwrap();
+        queries::insert_tenant(&conn, "acme", None, false).unwrap();
+        queries::insert_tenant(&conn, "othertenant", None, false).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('u-1', 'one', (SELECT id FROM tenants WHERE name = 'acme'), ?1, 'active')",
+            rusqlite::params![dir],
+        )
+        .unwrap();
+        let path = tmp.path().join(crate::unit::dotfile::UNIT_DOTFILE);
+        crate::unit::dotfile::write_dotfile(
+            &path,
+            &crate::unit::dotfile::UnitDotfile {
+                uuid: "u-1".into(),
+                name: "one".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                tags: vec!["keep".into()],
+                tenant: "acme".into(),
+                archive_set: None,
+                checksum_mode: None,
+                compression: Some("gzip".into()),
+                slice_size: None,
+                warehouse_copies: None,
+                exclude_patterns: vec![],
+            },
+        )
+        .unwrap();
+        let paths = TapectlPaths::new(std::path::PathBuf::from("/nonexistent-383-test"));
+
+        run(
+            &conn,
+            &paths,
+            &TenantCommands::Reassign {
+                source: "acme".to_string(),
+                to: "othertenant".to_string(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+
+        let df = crate::unit::dotfile::read_dotfile(&path).unwrap();
+        assert_eq!(df.tenant, "othertenant");
+        assert_eq!(df.tags, vec!["keep".to_string()], "nothing else changes");
+        assert_eq!(df.compression.as_deref(), Some("gzip"));
     }
 }

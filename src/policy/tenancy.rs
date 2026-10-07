@@ -103,6 +103,26 @@ pub fn unreadable_stage_sets(
         .collect())
 }
 
+/// How many written copies of `from_tenant`'s units none of `to_tenant`'s
+/// keys opens: what a `tenant reassign` from one to the other leaves its
+/// destination unable to read (#383).
+pub fn copies_unreadable_after_reassign(
+    conn: &Connection,
+    from_tenant: i64,
+    to_tenant: i64,
+) -> Result<usize> {
+    let keys = tenant_public_keys(conn, to_tenant)?;
+    let mut stmt = conn.prepare("SELECT id FROM units WHERE tenant_id = ?1")?;
+    let units = stmt
+        .query_map(params![from_tenant], |r| r.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut n = 0;
+    for unit_id in units {
+        n += unreadable_stage_sets(conn, unit_id, &keys)?.len();
+    }
+    Ok(n)
+}
+
 /// The tenant the unit's dotfile names, with the dotfile's path, when the
 /// unit has a directory and a dotfile that reads. A unit with no dotfile
 /// (`dotfiles = false` collections) or an unreadable one has nothing to
@@ -168,6 +188,82 @@ mod tests {
         assert_eq!(readable_by(None, &keys), None, "absent: not judged");
         assert_eq!(readable_by(Some("not json"), &keys), None);
         assert_eq!(readable_by(Some(r#"["age1old"]"#), &[]), Some(false));
+    }
+
+    /// What a reassign from `acme` to `other` leaves `other` unable to
+    /// open: the sealed copy encrypted to acme's key only.
+    #[test]
+    fn a_reassign_counts_the_copies_the_destination_cannot_open() {
+        let conn = crate::db::open_memory().unwrap();
+        for (name, key) in [("acme", "age1acme"), ("other", "age1other")] {
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES (?1, 0, 'active')",
+                params![name],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key)
+                 VALUES (last_insert_rowid(), ?1, ?1, ?2)",
+                params![name, key],
+            )
+            .unwrap();
+        }
+        let id = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT id FROM tenants WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, status) VALUES ('u', 'one', ?1, 'active')",
+            params![id("acme")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (last_insert_rowid(), 1, 'full', 'current', '/src')",
+            [],
+        )
+        .unwrap();
+        let snap = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES ('V1', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let vol = conn.last_insert_rowid();
+        let write = |list: &str| {
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, encrypted, key_fingerprints)
+                 VALUES (?1, 'staged', 524288, 1, ?2)",
+                params![snap, list],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (last_insert_rowid(), ?1, ?2, 'completed')",
+                params![snap, vol],
+            )
+            .unwrap();
+        };
+        write(r#"["age1acme","age1op"]"#);
+        assert_eq!(
+            copies_unreadable_after_reassign(&conn, id("acme"), id("other")).unwrap(),
+            1
+        );
+        assert_eq!(
+            copies_unreadable_after_reassign(&conn, id("acme"), id("acme")).unwrap(),
+            0
+        );
+        write(r#"["age1acme","age1other","age1op"]"#);
+        assert_eq!(
+            copies_unreadable_after_reassign(&conn, id("acme"), id("other")).unwrap(),
+            1,
+            "only the copy encrypted without other's key"
+        );
     }
 
     /// An active unit whose dotfile names another tenant than the catalog
