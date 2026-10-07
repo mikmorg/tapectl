@@ -1254,7 +1254,7 @@ rows put a finding in their exit status:
 | `audit` | clean | warnings only | violations, and only violations: an error exits 70 | — |
 | `volume verify` | every checked file matched | — | the medium is proven bad: the volume is quarantined and no longer counts as a copy | inconclusive: a drive or transport failure, or any error, including a command line that does not parse |
 | `db fsck` | clean | findings that are not corruption (orphaned rows, repaired or not) | the integrity check failed, or an error | — |
-| `collection sync`, `status`, `plan`, `run` | every unit ran | a unit was refused (its dotfile), or `sync` could not register a folder (invalid name, missing tenant or archive set), or (`sync`, `status`) something under the root belongs to no unit; the rest ran | an error | — |
+| `collection sync`, `status`, `plan`, `run` | every unit ran | a unit was refused (its dotfile), or `sync` could not register a folder (invalid name, missing tenant or archive set), or (`sync`, `status`) something under the root belongs to no unit; the rest ran | an error (`run`: the write family's codes, below) | — |
 | `host check` | quiet | something tripped | an error | — |
 | the write family: `volume write`, `volume resume`, `collection run`, `quick-archive`, `volume compact-write`, `volume compact` | sealed and confirmed | (`collection run` only) sealed, and a unit was refused | an error with the medium untouched: nothing was written | the confirm was inconclusive; more codes below |
 | `config check` | the config loads | — | it does not, or an error | — |
