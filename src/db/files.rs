@@ -172,21 +172,28 @@ pub fn mtime_ns_to_rfc3339(ns: i64) -> Option<String> {
 }
 
 /// The inverse of [`mtime_ns_to_rfc3339`], for text read off a tape. Refused
-/// unless it converts back to exactly the same text: the on-tape value is
-/// what the walk wrote, and a value that would come back different is not
-/// one tapectl wrote.
-pub fn mtime_ns_from_rfc3339(text: &str) -> Result<i64> {
+/// unless it is exactly what the walk writes for some time: the on-tape
+/// value is what the walk wrote, and a value that would come back different
+/// is not one tapectl wrote.
+///
+/// `Ok(None)` for a time the walk spelled before migration 030 but that no
+/// nanosecond count in an i64 holds (before 1677-09-21 or after 2262-04-11):
+/// the walk records no mtime for such a file now ([`mtime_ns_from_secs`]),
+/// so `None` is what a fresh walk of the same file gives, and a DR rebuild
+/// must not fail over one far-off timestamp.
+pub fn mtime_ns_from_rfc3339(text: &str) -> Result<Option<i64>> {
     let bad = || {
         TapectlError::Other(format!(
             "not a modified_at tapectl writes (YYYY-MM-DDTHH:MM:SS+00:00): {text:?}"
         ))
     };
     let dt = chrono::DateTime::parse_from_rfc3339(text).map_err(|_| bad())?;
-    let ns = dt.timestamp_nanos_opt().ok_or_else(bad)?;
-    if mtime_ns_to_rfc3339(ns).as_deref() != Some(text) {
+    let spelled = chrono::DateTime::from_timestamp(dt.timestamp(), dt.timestamp_subsec_nanos())
+        .map(|utc| utc.to_rfc3339());
+    if spelled.as_deref() != Some(text) {
         return Err(bad());
     }
-    Ok(ns)
+    Ok(dt.timestamp_nanos_opt())
 }
 
 /// The unit a version belongs to.
@@ -476,7 +483,9 @@ mod tests {
 
     #[test]
     fn mtime_text_round_trips_only_in_the_walks_spelling() {
-        let ns = mtime_ns_from_rfc3339("2026-09-01T12:00:00+00:00").unwrap();
+        let ns = mtime_ns_from_rfc3339("2026-09-01T12:00:00+00:00")
+            .unwrap()
+            .unwrap();
         assert_eq!(ns, 1_788_264_000 * 1_000_000_000);
         assert_eq!(
             mtime_ns_to_rfc3339(ns).as_deref(),
@@ -487,7 +496,13 @@ mod tests {
         let walked = chrono::DateTime::from_timestamp(1_788_264_000, 0)
             .unwrap()
             .to_rfc3339();
-        assert_eq!(mtime_ns_from_rfc3339(&walked).unwrap(), ns);
+        assert_eq!(mtime_ns_from_rfc3339(&walked).unwrap(), Some(ns));
+        // The walk's spelling, past what an i64 of nanoseconds holds: no
+        // mtime, as a fresh walk of such a file records.
+        for far in ["2300-01-01T00:00:00+00:00", "1600-01-01T00:00:00+00:00"] {
+            assert_eq!(mtime_ns_from_rfc3339(far).unwrap(), None, "{far}");
+        }
+        assert_eq!(mtime_ns_from_secs(10_000_000_000), None);
         for bad in [
             "2026-09-01T12:00:00Z",
             "2026-09-01T14:00:00+02:00",

@@ -1437,7 +1437,12 @@ fn ensure_files(
     // The on-tape shape (path, hex sha256, RFC 3339 mtime, is_directory) is
     // mapped into the catalog's (migration 030). A value that would not come
     // back as the same text is refused, naming the row: a rebuild does not
-    // guess.
+    // guess. One exception: a `modified_at` in the walk's own spelling but
+    // dated before 1677-09-21 or after 2262-04-11, which no nanosecond count
+    // holds, comes back as no mtime — what today's walk records for that
+    // same file — rather than failing the rebuild of a tape that cannot be
+    // corrected. (Migration 030 refuses the same value in a catalog, which
+    // the operator can correct.)
     //
     // Issue #381: the kind is derived from `is_directory`, as migration 005
     // did, because no generation of the on-tape `catalog.db` carries a file
@@ -1472,7 +1477,8 @@ fn ensure_files(
                 .as_deref()
                 .map(files_db::mtime_ns_from_rfc3339)
                 .transpose()
-                .map_err(|e| bad(&f, e))?,
+                .map_err(|e| bad(&f, e))?
+                .flatten(),
             sha256: f
                 .sha256
                 .as_deref()

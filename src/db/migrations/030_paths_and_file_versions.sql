@@ -53,7 +53,10 @@
 --   (d) a `modified_at` that is not the walk's own spelling,
 --       `YYYY-MM-DDTHH:MM:SS+00:00` (chrono's `to_rfc3339` of a whole-second
 --       UTC time), the only spelling that converts to an integer and back
---       unchanged.
+--       unchanged;
+--   (e) a `modified_at` in that spelling but outside 1677-09-21..2262-04-11,
+--       which no nanosecond count in an INTEGER holds (it would overflow to
+--       a REAL). The walk records no mtime for such a file today (NULL).
 -- The one expected gap is a NULL `file_type`: rows `catalog rebuild` wrote
 -- before #381, and the pre-005 rows 005 backfilled. They take the type
 -- `is_directory` gives, exactly as 005 did (a pre-005 symlink therefore
@@ -139,6 +142,24 @@ FROM (
               FROM files
              WHERE modified_at IS NOT NULL
                AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at) IS NOT modified_at)
+     WHERE n > 0
+    UNION ALL
+    SELECT n || ' files row(s) whose modified_at is outside 1677-09-21..2262-04-11, '
+           || 'the range a nanosecond count holds (id '
+           || ids || CASE WHEN n > 10 THEN ', ...' ELSE '' END || ')'
+      FROM (SELECT COUNT(*) AS n,
+                   (SELECT group_concat(id, ', ') FROM (
+                        SELECT id FROM files
+                         WHERE modified_at IS NOT NULL
+                           AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at) IS modified_at
+                           AND CAST(strftime('%s', modified_at) AS INTEGER)
+                               NOT BETWEEN -9223372036 AND 9223372036
+                         ORDER BY id LIMIT 10)) AS ids
+              FROM files
+             WHERE modified_at IS NOT NULL
+               AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at) IS modified_at
+               AND CAST(strftime('%s', modified_at) AS INTEGER)
+                   NOT BETWEEN -9223372036 AND 9223372036)
      WHERE n > 0
 )
 HAVING COUNT(*) > 0;

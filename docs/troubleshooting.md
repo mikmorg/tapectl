@@ -677,7 +677,9 @@ each named files row, then run the command again. Nothing has been changed.
 ```
 
 The other findings it can name: a `modified_at` not in the spelling every
-tapectl release writes (`2026-09-01T12:00:00+00:00`), an `is_directory` and
+tapectl release writes (`2026-09-01T12:00:00+00:00`), a `modified_at` before
+1677-09-21 or after 2262-04-11 (a nanosecond count cannot hold it; the walk
+records no modified time for such a file now), an `is_directory` and
 `file_type` that disagree or a `file_type` that is not `dir`, `regular`,
 `symlink` or `special`, and a row whose snapshot no longer exists. tapectl never
 writes any of these, so the rows were edited by hand. Nothing has been changed.

@@ -4412,6 +4412,17 @@ mod tests {
                 "modified_at = '2026-09-01 12:00:01'",
                 "modified_at is not YYYY-MM-DDTHH:MM:SS+00:00",
             ),
+            // The walk's own spelling, but past what `mtime_ns` (an i64 of
+            // nanoseconds) can hold: converted, it would overflow to a REAL
+            // that no reader can take back as an integer.
+            (
+                "modified_at = '2300-01-01T00:00:00+00:00'",
+                "modified_at is outside 1677-09-21..2262-04-11",
+            ),
+            (
+                "modified_at = '1600-01-01T00:00:00+00:00'",
+                "modified_at is outside 1677-09-21..2262-04-11",
+            ),
             ("file_type = 'fifo'", "is_directory/file_type"),
             ("file_type = 'dir'", "is_directory/file_type"),
         ] {
