@@ -1842,22 +1842,16 @@ pub fn cartridge_mark_erased(
     Ok(())
 }
 
-/// `volumes.status` values the live CHECK admits -- migration 026's
-/// (`026_drop_unwritten_states.sql`, issue #362), which dropped `'blank'`
-/// and `'missing'` after 017 had dropped `'quarantined'`. A status recovered
+/// `volumes.status` values the live CHECK admits -- migration 032's
+/// (`032_drop_volume_status_full.sql`, ADR-0012 amendment 2026-10-07 item
+/// 16), which dropped `'full'` after 026 had dropped `'blank'` and
+/// `'missing'` (issue #362) and 017 `'quarantined'`. A status recovered
 /// from `events.old_value` is checked against this SAME set before ever
 /// being written back to `status`, for the identical reason 017's own
 /// migrating subquery does (see its header): an unfiltered read of older
 /// history can legally carry a value the CHECK no longer admits, and
 /// writing that straight back trips it (issue #250).
-const LEGAL_VOLUME_STATUSES: [&str; 6] = [
-    "initialized",
-    "active",
-    "full",
-    "retired",
-    "erased",
-    "sealed",
-];
+const LEGAL_VOLUME_STATUSES: [&str; 5] = ["initialized", "active", "retired", "erased", "sealed"];
 
 /// Issue #287: [`LEGAL_VOLUME_STATUSES`] hand-copies the set the `volumes`
 /// table's own CHECK constraint permits, and nothing pinned the two
@@ -7904,7 +7898,7 @@ mod tests {
             let vol_id = if mount_volume {
                 conn.execute(
                     "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-                     VALUES ('L6-MOUNTED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'full')",
+                     VALUES ('L6-MOUNTED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
                     [],
                 )
                 .unwrap();
@@ -7988,7 +7982,7 @@ mod tests {
             );
             assert_eq!(
                 volume_status(&conn, vol_id.unwrap()),
-                "full",
+                "sealed",
                 "dry-run must not change the mounted volume's status"
             );
         }
@@ -8078,7 +8072,7 @@ mod tests {
             );
             assert_eq!(
                 volume_status(&conn, vol_id.unwrap()),
-                "full",
+                "sealed",
                 "a refused mark-erased must not touch the mounted volume either"
             );
             assert!(

@@ -43,7 +43,7 @@
 -- CONVERSION, AND WHAT REFUSES IT
 -- -------------------------------
 -- Every row converts exactly or the migration refuses, naming the rows and
--- changing nothing (026/027's rule). Refused:
+-- changing nothing (026/027's rule), with one exception below. Refused:
 --   (a) a row whose snapshot does not exist (no unit to intern its path
 --       under);
 --   (b) `is_directory` other than 0/1, a `file_type` outside the four names,
@@ -53,25 +53,39 @@
 --   (d) a `modified_at` that is not the walk's own spelling,
 --       `YYYY-MM-DDTHH:MM:SS+00:00` (chrono's `to_rfc3339` of a whole-second
 --       UTC time), the only spelling that converts to an integer and back
---       unchanged;
---   (e) a `modified_at` in that spelling but outside 1677-09-21..2262-04-11,
---       which no nanosecond count in an INTEGER holds (it would overflow to
---       a REAL). The walk records no mtime for such a file today (NULL).
--- (b), (c) and the rest of (d) are hand edits. A far-off modified_at is not:
--- every walk before 030 spelled a file's own mtime, so a file stamped
--- 1601-01-01 (a zero NTFS time) was recorded as such and is refused by (e),
--- and one past year 9999 was spelled `+10000-...` and is refused by (d).
--- Setting it to NULL is the remedy, and loses nothing: a fresh walk records
--- NULL for that file too, so the unit still reads as unchanged. Deleting a
--- row is the remedy only for (a): a version one row short of its
--- `file_count` cannot be staged (staging's file-list check).
+--       unchanged -- or the signed spelling of a year past 9999, which is
+--       the exception below, not a refusal.
+-- (b), (c) and (d) are hand edits. Deleting a row is the remedy only for
+-- (a): a version one row short of its `file_count` cannot be staged
+-- (staging's file-list check).
+--
+-- THE EXCEPTION: AN MTIME NO NANOSECOND COUNT HOLDS
+-- -------------------------------------------------
+-- A `modified_at` in the walk's spelling but outside 1677-09-21..2262-04-11
+-- (a file stamped 1601-01-01, the zero time of an NTFS volume, say) is not
+-- refused, and neither is one past year 9999: every walk before 030 spelled
+-- a file's own mtime with chrono's `to_rfc3339`, which writes such a year
+-- with a sign and five or more digits (`+10000-01-01T00:00:00+00:00`), a
+-- spelling (d) exempts by GLOB. No nanosecond count in an INTEGER holds
+-- either (it would overflow to a REAL), so it converts to a NULL
+-- `mtime_ns`, which is what the walk and `catalog rebuild` record for the
+-- same file today -- the unit still reads as unchanged. ADR-0012
+-- amendment 2026-10-07 item 9: a refusal here blocked every command on the
+-- host for a value nothing is lost by dropping. The rows are kept in the
+-- TEMP table `m030_mtime_nulled` (files row id, snapshot, the new path id,
+-- the old text); `db::migrate_to` reads it after the migration commits,
+-- warns naming the first ten rows and the count, and drops it. TEMP, so it
+-- is never part of the schema, and rolled back with everything else if any
+-- later check refuses.
+--
 -- The one expected gap is a NULL `file_type`: rows `catalog rebuild` wrote
 -- before #381, and the pre-005 rows 005 backfilled. They take the type
 -- `is_directory` gives, exactly as 005 did (a pre-005 symlink therefore
 -- stays 'regular', which 005 already accepted).
 --
--- After the copy, the row counts, the hash count and the mtime count must
--- match the source or the migration refuses.
+-- After the copy, the row counts, the hash count and the mtime count (less
+-- the mtimes written as NULL above) must match the source or the migration
+-- refuses.
 --
 -- The search index is built once, by FTS5's 'rebuild', after `paths` is
 -- full -- not row by row through a trigger (#413). `db::migrate` VACUUMs
@@ -147,28 +161,14 @@ FROM (
                          WHERE modified_at IS NOT NULL
                            AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at)
                                IS NOT modified_at
+                           AND modified_at NOT GLOB
+                               '[+-][0-9][0-9][0-9][0-9][0-9]*-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00'
                          ORDER BY id LIMIT 10)) AS ids
               FROM files
              WHERE modified_at IS NOT NULL
-               AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at) IS NOT modified_at)
-     WHERE n > 0
-    UNION ALL
-    SELECT n || ' files row(s) whose modified_at is outside 1677-09-21..2262-04-11, '
-           || 'the range a nanosecond count holds (id '
-           || ids || CASE WHEN n > 10 THEN ', ...' ELSE '' END || ')'
-      FROM (SELECT COUNT(*) AS n,
-                   (SELECT group_concat(id, ', ') FROM (
-                        SELECT id FROM files
-                         WHERE modified_at IS NOT NULL
-                           AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at) IS modified_at
-                           AND CAST(strftime('%s', modified_at) AS INTEGER)
-                               NOT BETWEEN -9223372036 AND 9223372036
-                         ORDER BY id LIMIT 10)) AS ids
-              FROM files
-             WHERE modified_at IS NOT NULL
-               AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at) IS modified_at
-               AND CAST(strftime('%s', modified_at) AS INTEGER)
-                   NOT BETWEEN -9223372036 AND 9223372036)
+               AND strftime('%Y-%m-%dT%H:%M:%S+00:00', modified_at) IS NOT modified_at
+               AND modified_at NOT GLOB
+                   '[+-][0-9][0-9][0-9][0-9][0-9]*-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00')
      WHERE n > 0
 )
 HAVING COUNT(*) > 0;
@@ -203,6 +203,23 @@ SELECT s.unit_id, f.path
  GROUP BY s.unit_id, f.path
  ORDER BY MIN(f.id);
 
+-- The exception above: every remaining modified_at is in the walk's
+-- spelling or the signed spelling of a year past 9999 (the guard refused the
+-- rest), so this is exactly the set outside the range an i64 of nanoseconds
+-- holds. The signed spelling is named outright: SQLite's date functions
+-- read it as NULL, so the range test alone would never select it.
+CREATE TEMP TABLE m030_mtime_nulled AS
+SELECT f.id AS files_id, f.snapshot_id, p.id AS path_id, f.modified_at
+  FROM files f
+  JOIN snapshots s ON s.id = f.snapshot_id
+  JOIN paths p ON p.unit_id = s.unit_id AND p.path = f.path
+ WHERE f.modified_at IS NOT NULL
+   AND (CAST(strftime('%s', f.modified_at) AS INTEGER)
+            NOT BETWEEN -9223372036 AND 9223372036
+        OR f.modified_at GLOB
+           '[+-][0-9][0-9][0-9][0-9][0-9]*-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00')
+ ORDER BY f.id;
+
 INSERT INTO file_versions (snapshot_id, path_id, kind, size_bytes, mtime_ns, sha256,
                            link_target)
 SELECT f.snapshot_id,
@@ -210,7 +227,8 @@ SELECT f.snapshot_id,
        CASE f.file_type WHEN 'dir' THEN 0 WHEN 'regular' THEN 1
                         WHEN 'symlink' THEN 2 WHEN 'special' THEN 3 END,
        f.size_bytes,
-       CAST(strftime('%s', f.modified_at) AS INTEGER) * 1000000000,
+       CASE WHEN f.id IN (SELECT files_id FROM m030_mtime_nulled) THEN NULL
+            ELSE CAST(strftime('%s', f.modified_at) AS INTEGER) * 1000000000 END,
        unhex(f.sha256),
        f.link_target
   FROM files f
@@ -225,7 +243,8 @@ SELECT 'migration 030 cannot run: the converted rows do not match the source ('
        || (SELECT COUNT(*) FROM file_versions) || ' converted; '
        || (SELECT COUNT(*) FROM files WHERE sha256 IS NOT NULL) || ' hashes, '
        || (SELECT COUNT(*) FROM file_versions WHERE sha256 IS NOT NULL) || ' converted; '
-       || (SELECT COUNT(*) FROM files WHERE modified_at IS NOT NULL) || ' mtimes, '
+       || (SELECT COUNT(*) FROM files WHERE modified_at IS NOT NULL) || ' mtimes ('
+       || (SELECT COUNT(*) FROM m030_mtime_nulled) || ' out of range), '
        || (SELECT COUNT(*) FROM file_versions WHERE mtime_ns IS NOT NULL) || ' converted; '
        || (SELECT COUNT(*) FROM (SELECT DISTINCT s.unit_id, f.path FROM files f
                                    JOIN snapshots s ON s.id = f.snapshot_id))
@@ -235,6 +254,7 @@ SELECT 'migration 030 cannot run: the converted rows do not match the source ('
     OR (SELECT COUNT(*) FROM files WHERE sha256 IS NOT NULL)
        <> (SELECT COUNT(*) FROM file_versions WHERE sha256 IS NOT NULL)
     OR (SELECT COUNT(*) FROM files WHERE modified_at IS NOT NULL)
+       - (SELECT COUNT(*) FROM m030_mtime_nulled)
        <> (SELECT COUNT(*) FROM file_versions WHERE mtime_ns IS NOT NULL)
     OR (SELECT COUNT(*) FROM (SELECT DISTINCT s.unit_id, f.path FROM files f
                                 JOIN snapshots s ON s.id = f.snapshot_id))

@@ -45,7 +45,7 @@
 //! Both alternatives were wrong in different directions:
 //! - `eligible` (`sealed`-only) is the ADR-0004 durability question ("does
 //!   this volume contribute a COPY"). Escrow asks a different one: "does the
-//!   CURRENT escrow key open the bytes this volume holds". An `active`/`full`
+//!   CURRENT escrow key open the bytes this volume holds". An `active`
 //!   volume mid-write already holds sealed slices from earlier stage sets on
 //!   the same tape and has not yet been sealed itself — `eligible` would
 //!   hide those from the escrow check for no reason connected to escrow.

@@ -131,10 +131,10 @@ condition as a second argument — because a write-path quarantine no longer
 moves the status off `initialized`, and without that second argument a
 quarantined volume would silently become a legal write target again.
 
-`active` and `full` are read-only holdovers: `active` is written only by
-`tapectl import`, describing a tape written elsewhere, and `full` is the
-pre-renovation sealed-equivalent for legacy volumes. This write path produces
-neither. `blank` and `missing` are schema-legal with no writer at all.
+`active` is a read-only holdover: it is written only by `tapectl import`,
+describing a tape written elsewhere, and this write path never produces it.
+`blank` and `missing` (migration 026) and `full` (migration 032, ADR-0012
+amendment 2026-10-07 item 16) left the schema: none ever had a writer.
 
 ADR-0012: `initialized` is the only status `volume write` and `volume resume`
 may target. Every other status is refused by status, before either command does

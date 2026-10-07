@@ -438,6 +438,13 @@ fn migrations() -> Migrations<'static> {
         // whole table. Index only, no rows touched, so no
         // `.foreign_key_check()`.
         M::up(include_str!("migrations/031_events_action_index.sql")),
+        // 032 rebuilds `volumes` to drop status 'full' from its CHECK
+        // (ADR-0012 amendment 2026-10-07 item 16): nothing has ever written
+        // it. 026's shape and 026's rule -- a row carrying it was set by hand
+        // and is refused by id, never remapped. `.foreign_key_check()` for
+        // the same reason as 026: every table that names a volume points
+        // into the rebuilt one. See the header.
+        M::up(include_str!("migrations/032_drop_volume_status_full.sql")).foreign_key_check(),
     ])
 }
 
@@ -531,7 +538,67 @@ fn migrate_to(conn: &mut Connection, target: Option<usize>) -> Result<()> {
         }
     });
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    result
+    result?;
+    warn_030_nulled_mtimes(conn)
+}
+
+/// ADR-0012 amendment 2026-10-07, item 9: migration 030 converts a
+/// `modified_at` no i64 count of nanoseconds holds (before 1677-09-21 or
+/// after 2262-04-11) to a NULL `mtime_ns` instead of refusing, and leaves the
+/// rows it did that to in the TEMP table `m030_mtime_nulled`. Read once the
+/// migration has committed -- a refusal rolls the table back with
+/// everything else, so a warning is never printed for a conversion that did
+/// not land -- named in one WARN (the first ten rows, then the count), and
+/// dropped. A no-op on every open that did not apply 030 (the table is
+/// TEMP: it exists only on the connection that ran the migration).
+fn warn_030_nulled_mtimes(conn: &Connection) -> Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_temp_master
+                         WHERE type = 'table' AND name = 'm030_mtime_nulled')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(());
+    }
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM temp.m030_mtime_nulled", [], |r| {
+        r.get(0)
+    })?;
+    // At most ten rows named, as the refusals name theirs: a catalog with
+    // thousands of such files must not print thousands of lines.
+    let rows: Vec<String> = conn
+        .prepare(
+            "SELECT files_id, snapshot_id, path_id, modified_at
+               FROM temp.m030_mtime_nulled ORDER BY files_id LIMIT 10",
+        )?
+        .query_map([], |r| {
+            Ok(format!(
+                "files row {} (snapshot {}, path id {}, was {})",
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    conn.execute_batch("DROP TABLE temp.m030_mtime_nulled")?;
+    if total > 0 {
+        let more = if total > rows.len() as i64 {
+            format!(", ... ({total} rows)")
+        } else {
+            String::new()
+        };
+        warn!(
+            "migration 030 recorded no modified time for {} file row(s) whose modified_at is \
+             outside 1677-09-21..2262-04-11, the range a nanosecond count holds: {}{}. A walk \
+             records none for such a file either, so these units still read as unchanged; \
+             nothing else was altered",
+            total,
+            rows.join("; "),
+            more
+        );
+    }
+    Ok(())
 }
 
 /// Open the database WITHOUT running migrations — for `db fsck --repair`
@@ -1102,19 +1169,21 @@ mod tests {
         );
     }
 
-    /// (b) + (d): a DB populated at 002-level -- with a legacy 'full' volume row and a row in
+    /// (b) + (d): a DB populated at 002-level -- with an 'active' volume row and a row in
     /// every table that FK-references volumes(id) (cartridge_volumes, volume_movements,
     /// writes, verification_sessions, health_logs; five in total per the §3.6 recon) --
     /// migrates cleanly through the real `migrate()` (exercising the actual FK on/off
     /// wrapping), `PRAGMA foreign_key_check` comes back empty, every row is intact, the
-    /// legacy 'full' status is still readable, and `db_fsck` is clean.
+    /// row's status is still readable, and `db_fsck` is clean. ('active', not the 'full'
+    /// this test seeded until migration 032 dropped it: a row in a dropped state stops
+    /// the chain at the migration that drops it, by design.)
     #[test]
     fn test_migrate_002_populated_db_to_003_preserves_data_and_fk() {
         let mut conn = open_memory_at_002();
 
         conn.execute(
             "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-             VALUES ('V-LEGACY', 'lto', 'lto0', 'LTO-6', 2500000000000, 'full')",
+             VALUES ('V-LEGACY', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
             [],
         )
         .unwrap();
@@ -1212,8 +1281,8 @@ mod tests {
             .unwrap();
         assert_eq!(label, "V-LEGACY");
         assert_eq!(
-            status, "full",
-            "(d) legacy 'full' row must still be readable"
+            status, "active",
+            "(d) the pre-003 row's status must still be readable"
         );
 
         let writes_vol: i64 = conn
@@ -3889,6 +3958,10 @@ mod tests {
     fn seed_schema_26_catalog(conn: &Connection, snapshots: i64, per: i64) -> i64 {
         seed_schema_25(conn);
         assert_eq!(user_version(conn), 26, "precondition: at schema 26");
+        // seed_schema_25's 703 is 'full', legal at 26 and refused by 032;
+        // a catalog these tests carry to the head must not hold one.
+        conn.execute("UPDATE volumes SET status = 'sealed' WHERE id = 703", [])
+            .unwrap();
         let tx = conn.unchecked_transaction().unwrap();
         for s in 0..snapshots {
             let sid = 10_000 + s;
@@ -4425,16 +4498,13 @@ mod tests {
                 "modified_at = '2026-09-01 12:00:01'",
                 "modified_at is not YYYY-MM-DDTHH:MM:SS+00:00",
             ),
-            // The walk's own spelling, but past what `mtime_ns` (an i64 of
-            // nanoseconds) can hold: converted, it would overflow to a REAL
-            // that no reader can take back as an integer.
+            // A year past 9999 in chrono's signed spelling is not refused
+            // (ADR-0012 amendment 2026-10-07 item 9): see
+            // `test_migration_030_writes_null_for_an_mtime_no_nanosecond_count_holds`.
+            // A signed year in any other spelling still is.
             (
-                "modified_at = '2300-01-01T00:00:00+00:00'",
-                "modified_at is outside 1677-09-21..2262-04-11",
-            ),
-            (
-                "modified_at = '1600-01-01T00:00:00+00:00'",
-                "modified_at is outside 1677-09-21..2262-04-11",
+                "modified_at = '+10000-01-01T00:00:00Z'",
+                "modified_at is not YYYY-MM-DDTHH:MM:SS+00:00",
             ),
             ("file_type = 'fifo'", "is_directory/file_type"),
             ("file_type = 'dir'", "is_directory/file_type"),
@@ -4484,6 +4554,158 @@ mod tests {
         }
     }
 
+    /// A `MakeWriter` over a shared buffer, so a test can read what a
+    /// `tracing` event printed.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        /// Run `f` with every `tracing` event at WARN and above written here.
+        fn capture<T>(&self, f: impl FnOnce() -> T) -> T {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, f)
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// ADR-0012 amendment 2026-10-07, item 9: a `modified_at` in the walk's
+    /// own spelling but outside 1677-09-21..2262-04-11, which no i64 count
+    /// of nanoseconds holds, converts to a NULL `mtime_ns` -- what the walk
+    /// and the rebuild record for the same file -- and the migration warns,
+    /// naming the row, instead of refusing. So does a year past 9999 in the
+    /// signed spelling chrono's `to_rfc3339` gave it before 030, which
+    /// SQLite's date functions do not read at all. Every other value
+    /// converts as before.
+    #[test]
+    fn test_migration_030_writes_null_for_an_mtime_no_nanosecond_count_holds() {
+        for far_off in [
+            "2300-01-01T00:00:00+00:00",
+            "1601-01-01T00:00:00+00:00",
+            "+10000-01-01T00:00:00+00:00",
+        ] {
+            let mut conn = open_memory_at_version(29);
+            seed_schema_29_files(&conn);
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM files WHERE snapshot_id = 20 AND path = 'docs/a.txt'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE files SET modified_at = ?1 WHERE id = ?2",
+                rusqlite::params![far_off, id],
+            )
+            .unwrap();
+
+            let log = CapturedLog::default();
+            log.capture(|| migrate(&mut conn))
+                .unwrap_or_else(|e| panic!("030 must convert {far_off}, got {e}"));
+            assert!(user_version(&conn) >= 30);
+
+            let mtime = |sid: i64, path: &str| -> Option<i64> {
+                conn.query_row(
+                    "SELECT fv.mtime_ns FROM file_versions fv JOIN paths p ON p.id = fv.path_id
+                     WHERE fv.snapshot_id = ?1 AND p.path = ?2",
+                    rusqlite::params![sid, path],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(mtime(20, "docs/a.txt"), None, "{far_off} becomes NULL");
+            // The positive control: the rows around it keep their mtimes.
+            assert_eq!(
+                mtime(20, "docs").map(files::mtime_ns_to_rfc3339),
+                Some(Some("2026-09-01T12:00:00+00:00".to_string()))
+            );
+            assert_eq!(
+                mtime(21, "docs/a.txt").map(files::mtime_ns_to_rfc3339),
+                Some(Some("2026-09-02T00:00:00+00:00".to_string()))
+            );
+
+            let text = log.text();
+            assert!(text.contains("WARN"), "{text}");
+            assert!(text.contains("migration 030"), "{text}");
+            assert!(text.contains(&format!("files row {id} ")), "{text}");
+            assert!(text.contains(far_off), "{text}");
+            assert!(text.contains("1677-09-21..2262-04-11"), "{text}");
+
+            // The bookkeeping that carried the warning does not outlive it.
+            let leftover: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE 'm030%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(leftover, 0);
+        }
+
+        // And a catalog with nothing to null migrates without a word.
+        let mut conn = open_memory_at_version(29);
+        seed_schema_29_files(&conn);
+        let log = CapturedLog::default();
+        log.capture(|| migrate(&mut conn)).unwrap();
+        assert!(!log.text().contains("migration 030"), "{}", log.text());
+    }
+
+    /// The WARN names at most ten rows, then the count, as the refusals do:
+    /// a catalog with thousands of NTFS-zero-time files prints one line.
+    #[test]
+    fn test_migration_030_warning_names_at_most_ten_rows() {
+        let mut conn = open_memory_at_version(29);
+        seed_schema_29_files(&conn);
+        let mut ids = Vec::new();
+        for i in 0..12 {
+            conn.execute(
+                "INSERT INTO files (snapshot_id, path, is_directory, file_type, size_bytes,
+                                    modified_at)
+                 VALUES (22, ?1, 0, 'regular', 1, '1601-01-01T00:00:00+00:00')",
+                [format!("far/{i}")],
+            )
+            .unwrap();
+            ids.push(conn.last_insert_rowid());
+        }
+
+        let log = CapturedLog::default();
+        log.capture(|| migrate(&mut conn)).unwrap();
+        let text = log.text();
+        assert!(text.contains("for 12 file row(s)"), "{text}");
+        for id in &ids[..10] {
+            assert!(text.contains(&format!("files row {id} ")), "{text}");
+        }
+        for id in &ids[10..] {
+            assert!(!text.contains(&format!("files row {id} ")), "{text}");
+        }
+        assert!(text.contains(", ... (12 rows). A walk"), "{text}");
+        let nulled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_versions WHERE snapshot_id = 22 AND mtime_ns IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulled, 12, "every row is converted, not only the ten named");
+    }
+
     /// A `files` row whose snapshot is gone has no unit to intern its path
     /// under: refused by id.
     #[test]
@@ -4503,6 +4725,152 @@ mod tests {
             "{msg}"
         );
         assert_eq!(user_version(&conn), 29, "rolled back");
+    }
+
+    // --- Migration 032 (ADR-0012 amendment 2026-10-07 item 16) ---
+
+    /// `seed_schema_25`'s catalog -- a volume in every status 026 kept, and a
+    /// row in every table that references `volumes` -- carried through the
+    /// real chain to schema 31, where 032 starts, plus a `phase_timings` row
+    /// (028's reference into `volumes`, which the 25 seed predates).
+    fn open_memory_at_031_seeded() -> Connection {
+        let mut conn = open_memory_at_version(25);
+        seed_schema_25(&conn);
+        migrate_to(&mut conn, Some(31)).expect("seed_schema_25 migrates to 31");
+        assert_eq!(user_version(&conn), 31, "precondition: at schema 31");
+        conn.execute_batch(
+            "INSERT INTO phase_timings (id, session, operation, volume_id, seq, phase,
+                                        started_at, duration_ms, outcome)
+                 VALUES (812, 's', 'volume verify', 700, 1, 'read', '2026-01-07', 1, 'ok');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// THE test for 032: `volumes` is rebuilt without 'full' in its status
+    /// CHECK, and nothing else moves -- every row of every table, every
+    /// schema object outside `volumes`, both of its indexes, every foreign
+    /// key in and out, and every column. Afterwards 'full' is refused and
+    /// every kept status is still accepted.
+    #[test]
+    fn test_migrate_031_populated_db_to_032_preserves_every_row_and_drops_full() {
+        let mut conn = open_memory_at_031_seeded();
+        // 703 is seed_schema_25's 'full' volume, which 032 would refuse.
+        conn.execute("UPDATE volumes SET status = 'sealed' WHERE id = 703", [])
+            .unwrap();
+
+        let rows_before = every_row(&conn);
+        let objects_before = schema_objects(&conn);
+        let tables: Vec<String> = rows_before.keys().cloned().collect();
+        let fks_before: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        let cols_before = table_info(&conn, "volumes");
+        assert_eq!(
+            index_names(&conn, "volumes"),
+            vec![
+                "idx_volumes_location",
+                "idx_volumes_uuid",
+                "sqlite_autoindex_volumes_1"
+            ],
+            "positive control: volumes has its indexes to compare"
+        );
+
+        migrate_to(&mut conn, Some(32)).expect("032 must migrate a catalog with no 'full' row");
+        assert_eq!(user_version(&conn), 32);
+
+        assert_eq!(
+            rows_before,
+            every_row(&conn),
+            "032 must not add, drop, renumber or alter a single row anywhere"
+        );
+        assert_eq!(rows_before["volumes"].len(), 6, "positive control");
+        let objects_after = schema_objects(&conn);
+        let not_volumes = |objs: &[(String, String, String, Option<String>)]| {
+            objs.iter()
+                .filter(|o| !(o.0 == "table" && o.1 == "volumes"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            not_volumes(&objects_before),
+            not_volumes(&objects_after),
+            "032 changed a schema object other than volumes, or did not recreate one of \
+             its indexes exactly"
+        );
+        let fks_after: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        assert_eq!(fks_before, fks_after, "032 must restate every foreign key");
+        assert_eq!(
+            cols_before,
+            table_info(&conn, "volumes"),
+            "no column changes"
+        );
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            conn.execute("DELETE FROM volumes WHERE id = 700", [])
+                .is_err(),
+            "volumes 700 is referenced; FK enforcement must refuse the delete"
+        );
+
+        let set = |status: &str| {
+            conn.execute(
+                "UPDATE volumes SET status = ?1 WHERE id = 701",
+                rusqlite::params![status],
+            )
+        };
+        let err = set("full").expect_err("'full' must be refused after 032");
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+        for status in ["initialized", "active", "retired", "erased", "sealed"] {
+            set(status)
+                .unwrap_or_else(|e| panic!("volumes.status '{status}' must stay legal: {e}"));
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes)
+                 VALUES ('V-NOSTATUS', 'lto', 'lto0', 1000)",
+                [],
+            )
+            .is_err(),
+            "volumes.status still has no DEFAULT"
+        );
+    }
+
+    /// No release has written 'full', so a row carrying it was set by hand,
+    /// and 032 refuses by name and row rather than guess (026's rule). The
+    /// positive control is the test above: the same seed with 703 moved off
+    /// 'full' migrates.
+    #[test]
+    fn test_migration_032_refuses_a_full_volume_by_name() {
+        let mut conn = open_memory_at_031_seeded();
+        conn.execute("UPDATE volumes SET status = 'full' WHERE id = 704", [])
+            .unwrap();
+        let err = migrate(&mut conn).expect_err("032 must refuse a 'full' volume");
+        let msg = match &err {
+            TapectlError::Migration(m) => m.clone(),
+            other => panic!("expected the generic Migration variant, got {other:?}"),
+        };
+        assert!(msg.starts_with("migration 032 cannot run: "), "{msg}");
+        assert!(
+            msg.contains("volumes.status = 'full' on 2 row(s) (id 703, 704)"),
+            "{msg}"
+        );
+        assert!(msg.contains("Nothing has been changed."), "{msg}");
+        assert!(
+            !msg.contains("CREATE TABLE") && !msg.contains("CHECK constraint failed"),
+            "032's own words, not the SQL dump: {msg}"
+        );
+        assert_eq!(user_version(&conn), 31, "a refused 032 rolls back");
+        let full: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM volumes WHERE status = 'full'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(full, 2, "a refused 032 rewrites no row");
     }
 
     /// Migration 029 (issue #410): `readback_checkpoints` exists on a fresh
