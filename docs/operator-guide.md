@@ -537,7 +537,12 @@ recent:
 A running session's progress line is at most one interval (30 s) old, whatever
 its display. A session whose log has no end line and whose process is gone is
 shown as ended with no end line — killed, crashed or power lost — and the phase
-it stopped in; the next tapectl command recovers what it was doing.
+it stopped in; the next tapectl command recovers what it was doing. Another
+account may not see the writer in `/proc` at all (`/proc` mounted with
+`hidepid`, or the service in its own PID namespace), which looks the same as a
+process that is gone: while such a session's log is still being written (its
+last line under two minutes old) it is listed as running, marked "process not
+visible from this account", and only a log quiet for longer reads as ended.
 
 The logs belong to the user tapectl runs as. To let your own account (or an
 agent helping you) run `status` without sudo, name a group in the home's

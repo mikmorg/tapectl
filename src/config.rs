@@ -2091,12 +2091,21 @@ impl TapectlPaths {
             }
             found.map(|g| g.gid)
         });
+        // `locks/` and `tmp/` are made here too, at 0700, not first by the
+        // code that uses them (issue #393): made there, they are born at the
+        // umask's mode, and inside a home the `[ops]` group can traverse a
+        // member could open a lockfile and `flock` it — stalling a writer —
+        // until the next command's sweep closed them.
+        let locks_dir = self.home.join("locks");
+        let tmp_dir = self.home.join("tmp");
         for dir in [
             &self.home,
             &self.keys_dir,
             &self.catalogs_dir,
             &self.stage_reports_dir,
             &self.logs_dir,
+            &locks_dir,
+            &tmp_dir,
         ] {
             std::fs::create_dir_all(dir)?;
             let mut mode = match gid {
@@ -2215,13 +2224,18 @@ mod tests {
             & 0o777
     }
 
-    fn all_dirs(paths: &TapectlPaths) -> Vec<(&'static str, &Path)> {
+    fn all_dirs(paths: &TapectlPaths) -> Vec<(&'static str, PathBuf)> {
         vec![
-            ("home", &paths.home),
-            ("keys_dir", &paths.keys_dir),
-            ("catalogs_dir", &paths.catalogs_dir),
-            ("stage_reports_dir", &paths.stage_reports_dir),
-            ("logs_dir", &paths.logs_dir),
+            ("home", paths.home.clone()),
+            ("keys_dir", paths.keys_dir.clone()),
+            ("catalogs_dir", paths.catalogs_dir.clone()),
+            ("stage_reports_dir", paths.stage_reports_dir.clone()),
+            ("logs_dir", paths.logs_dir.clone()),
+            // Issue #393: made by the home's preparation, not first by the
+            // code that uses them, so they are never born at the umask's
+            // mode inside a group-traversable home.
+            ("locks", paths.home.join("locks")),
+            ("tmp", paths.home.join("tmp")),
         ]
     }
 
@@ -2238,11 +2252,11 @@ mod tests {
         for (name, dir) in all_dirs(&paths) {
             assert!(dir.is_dir(), "{name} should exist");
             assert_eq!(
-                mode_of(dir),
+                mode_of(&dir),
                 0o700,
                 "{name} ({}) should be 0700, was {:o}",
                 dir.display(),
-                mode_of(dir)
+                mode_of(&dir)
             );
         }
     }
@@ -2278,8 +2292,8 @@ mod tests {
             gid.as_raw()
         );
         for (name, dir) in all_dirs(&paths) {
-            if dir != paths.home.as_path() && dir != paths.logs_dir.as_path() {
-                assert_eq!(mode_of(dir), 0o700, "{name} stays private");
+            if dir != paths.home && dir != paths.logs_dir {
+                assert_eq!(mode_of(&dir), 0o700, "{name} stays private");
             }
         }
         assert_eq!(mode_of(&paths.config_file), 0o600);
@@ -2390,7 +2404,7 @@ mod tests {
         paths.ensure_dirs().unwrap();
 
         for (name, dir) in all_dirs(&paths) {
-            assert_eq!(mode_of(dir), 0o700, "{name} should stay 0700 on re-run");
+            assert_eq!(mode_of(&dir), 0o700, "{name} should stay 0700 on re-run");
         }
     }
 

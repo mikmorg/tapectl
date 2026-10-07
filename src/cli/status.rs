@@ -64,15 +64,31 @@ pub enum State {
     /// crashed or lost power. The catalog's startup sweep recovers whatever
     /// it was doing on the next command.
     Vanished,
+    /// No end line, `/proc` shows no such process, and the log was written
+    /// within [`STALE_AFTER`]: the writer is most likely running where this
+    /// account cannot see it — `/proc` mounted `hidepid`, or another PID
+    /// namespace. A session that is really gone is told apart only by time,
+    /// so it reads this way until its log goes quiet past that.
+    ProcessNotVisible,
 }
 
+/// How long a log with no end line may be quiet before a writer this
+/// account cannot see in `/proc` is taken for gone: a few progress
+/// intervals, since every session writes its progress line once per
+/// [`crate::progress::DEFAULT_INTERVAL`] whatever its display.
+pub const STALE_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(4 * crate::progress::DEFAULT_INTERVAL.as_secs());
+
 /// Read one log's text into a [`SessionStatus`]. `alive` says whether a
-/// pid is a running tapectl (injected so the parse is testable).
+/// pid is a running tapectl as `/proc` shows it, and `now` is the time the
+/// log's last line is aged against (both injected so the parse is
+/// testable).
 pub fn parse_log(
     session: &str,
     log: &Path,
     text: &str,
     alive: impl Fn(u32) -> bool,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> SessionStatus {
     let mut s = SessionStatus {
         session: session.to_string(),
@@ -159,10 +175,29 @@ pub fn parse_log(
         }
     } else if s.pid.is_some_and(&alive) {
         State::Running
+    } else if s.pid.is_some() && written_within(s.last_line_at.as_deref(), now, STALE_AFTER) {
+        // Issue #393: `/proc` cannot tell a process hidden from this account
+        // (hidepid, another PID namespace) from one that is gone; a log
+        // still being written can.
+        State::ProcessNotVisible
     } else {
         State::Vanished
     };
     s
+}
+
+/// Whether the RFC 3339 stamp `at` is no older than `within` at `now`. An
+/// unreadable stamp, or none, is not recent.
+fn written_within(
+    at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+    within: std::time::Duration,
+) -> bool {
+    let Some(at) = at.and_then(|a| chrono::DateTime::parse_from_rfc3339(a).ok()) else {
+        return false;
+    };
+    let age = now.signed_duration_since(at.with_timezone(&chrono::Utc));
+    chrono::Duration::from_std(within).is_ok_and(|w| age <= w)
 }
 
 /// Whether `pid` is a running tapectl: `/proc/<pid>` exists and, where its
@@ -207,7 +242,13 @@ pub fn read_sessions(logs_dir: &Path, last: usize) -> Result<Vec<SessionStatus>>
             // A log the reader may not open (created before `[ops] group`
             // was set, so mode 0600) is named, not skipped silently.
             Err(e) => {
-                let mut s = parse_log(name.trim_end_matches(".log"), &path, "", |_| false);
+                let mut s = parse_log(
+                    name.trim_end_matches(".log"),
+                    &path,
+                    "",
+                    |_| false,
+                    chrono::Utc::now(),
+                );
                 s.state = State::Ended {
                     outcome: format!("unreadable: {e}"),
                 };
@@ -223,8 +264,9 @@ pub fn read_sessions(logs_dir: &Path, last: usize) -> Result<Vec<SessionStatus>>
             &path,
             &text,
             tapectl_is_running,
+            chrono::Utc::now(),
         );
-        if s.state == State::Running {
+        if s.is_probably_running() {
             out.push(s);
         } else if finished < last {
             out.push(s);
@@ -232,6 +274,14 @@ pub fn read_sessions(logs_dir: &Path, last: usize) -> Result<Vec<SessionStatus>>
         }
     }
     Ok(out)
+}
+
+impl SessionStatus {
+    /// Running, or a writer this account cannot see whose log is still
+    /// being written: listed under `running:` either way.
+    fn is_probably_running(&self) -> bool {
+        matches!(self.state, State::Running | State::ProcessNotVisible)
+    }
 }
 
 fn unreadable(dir: &Path, e: &std::io::Error) -> TapectlError {
@@ -249,7 +299,7 @@ pub fn render(logs_dir: &Path, sessions: &[SessionStatus]) -> String {
     let mut out = format!("session logs: {}\n", logs_dir.display());
     let running: Vec<&SessionStatus> = sessions
         .iter()
-        .filter(|s| s.state == State::Running)
+        .filter(|s| s.is_probably_running())
         .collect();
     if running.is_empty() {
         out.push_str("running: nothing\n");
@@ -261,6 +311,12 @@ pub fn render(logs_dir: &Path, sessions: &[SessionStatus]) -> String {
             s.pid.map_or("?".to_string(), |p| p.to_string()),
             s.started_at.as_deref().unwrap_or("?"),
         ));
+        if s.state == State::ProcessNotVisible {
+            out.push_str(
+                "  process not visible from this account (/proc hides it: hidepid, or \
+                 another PID namespace); its log is still being written\n",
+            );
+        }
         if let Some(p) = &s.phase {
             out.push_str(&format!("  phase:    {p}\n"));
         }
@@ -278,7 +334,7 @@ pub fn render(logs_dir: &Path, sessions: &[SessionStatus]) -> String {
     }
     let done: Vec<&SessionStatus> = sessions
         .iter()
-        .filter(|s| s.state != State::Running)
+        .filter(|s| !s.is_probably_running())
         .collect();
     if !done.is_empty() {
         out.push_str("recent:\n");
@@ -288,7 +344,7 @@ pub fn render(logs_dir: &Path, sessions: &[SessionStatus]) -> String {
             State::Ended { outcome } => outcome.clone(),
             State::EndedUnrecorded => "ended (outcome not recorded)".to_string(),
             State::Vanished => "ended with no end line: killed, crashed or power lost".to_string(),
-            State::Running => unreachable!(),
+            State::Running | State::ProcessNotVisible => unreachable!(),
         };
         out.push_str(&format!(
             "  {}  {}  — {}\n",
@@ -337,12 +393,22 @@ mod tests {
 2026-10-01T03:13:13.000Z wrote file 5 (data_slice): 1.00 GiB in 7.0 s; tape waited 0.1 s for data, queue full 6.2 s
 ";
 
+    /// Long after every fixture's last line.
+    fn later() -> chrono::DateTime<chrono::Utc> {
+        "2026-10-02T00:00:00Z".parse().unwrap()
+    }
+
     fn parse(text: &str, alive: bool) -> SessionStatus {
+        parse_at(text, alive, later())
+    }
+
+    fn parse_at(text: &str, alive: bool, now: chrono::DateTime<chrono::Utc>) -> SessionStatus {
         parse_log(
             "20261001T031240Z-volume-write-L6-0001-4242",
             Path::new("/x.log"),
             text,
             |_| alive,
+            now,
         )
     }
 
@@ -369,6 +435,31 @@ mod tests {
         assert_eq!(s.state, State::Vanished);
         assert_eq!(s.phase.as_deref(), Some("write"), "where it stopped");
         assert!(render(Path::new("/l"), &[s]).contains("killed, crashed or power lost"));
+    }
+
+    /// Issue #393: `/proc` hides another user's process under `hidepid`
+    /// (and another PID namespace's always), so a pid this account cannot
+    /// see is not proof the writer died. While its log is still being
+    /// written it is "process not visible", listed as running; once the log
+    /// has been quiet for a few progress intervals, it ended with no end
+    /// line.
+    #[test]
+    fn a_writer_hidden_from_proc_is_not_called_killed_while_its_log_is_fresh() {
+        let last_line: chrono::DateTime<chrono::Utc> = "2026-10-01T03:13:13.000Z".parse().unwrap();
+        let fresh = last_line + chrono::Duration::seconds(45);
+        let s = parse_at(RUNNING, false, fresh);
+        assert_eq!(s.state, State::ProcessNotVisible);
+        let text = render(Path::new("/l"), &[s]);
+        assert!(text.contains("running: volume write L6-0001"), "{text}");
+        assert!(text.contains("process not visible"), "{text}");
+        assert!(!text.contains("killed"), "{text}");
+
+        let stale = last_line
+            + chrono::Duration::from_std(STALE_AFTER).unwrap()
+            + chrono::Duration::seconds(1);
+        assert_eq!(parse_at(RUNNING, false, stale).state, State::Vanished);
+        // A visible live process is Running whatever the log's age.
+        assert_eq!(parse_at(RUNNING, true, stale).state, State::Running);
     }
 
     #[test]
