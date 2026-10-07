@@ -2343,6 +2343,13 @@ struct VolumeInfo {
     created_at: String,
     first_write: Option<String>,
     last_write: Option<String>,
+    /// When this volume's own seal was written (`volumes.sealed_at`,
+    /// migration 018): set once by the write session's `seal()` and never
+    /// cleared, so it is set on a volume whose confirm did not finish, or
+    /// whose session was then aborted — the fact `volume resume`'s
+    /// re-confirmation of an aborted session turns on (ADR-0012
+    /// 2026-09-23), and that `scripts/first-run.sh` step 13 reads.
+    sealed_at: Option<String>,
     notes: Option<String>,
     unit_count: i64,
     unit_total_bytes: i64,
@@ -2450,6 +2457,12 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
             },
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    let sealed_at: Option<String> = conn.query_row(
+        "SELECT sealed_at FROM volumes WHERE id = ?1",
+        rusqlite::params![vol_id],
+        |r| r.get(0),
+    )?;
 
     // Units carried: one row per unit, aggregated across every completed
     // write of it that landed on THIS volume. Sorted largest-first so the
@@ -2598,6 +2611,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         created_at,
         first_write,
         last_write,
+        sealed_at,
         notes,
         unit_count,
         unit_total_bytes,

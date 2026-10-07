@@ -3052,6 +3052,7 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
             "location",
             "media_type",
             "notes",
+            "sealed_at",
             "status",
             "tenants",
             "unit_count",
@@ -3062,7 +3063,8 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
             "verifications",
             "writes",
         ],
-        "volume info --json is unchanged by issue #386"
+        "volume info --json is unchanged by issue #386 (sealed_at was added after it, \
+         for first-run.sh step 13)"
     );
 }
 
