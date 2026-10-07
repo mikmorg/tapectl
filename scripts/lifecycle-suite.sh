@@ -917,6 +917,19 @@ rm_step_unit() {
     assert_identical "$RM_SRC" "$to"
 }
 
+# `restore volume` (the disaster-recovery path: one pass over the tape, each
+# unit into DIR/<unit name>), asked for this matrix's one unit by --unit. A
+# whole-volume restore would also try every other unit on the volume, which
+# this matrix has no source to compare against, and which fails outright when
+# another tenant's unit cannot be decrypted (key-rotation, tenant-reassign).
+rm_step_volume() {
+    local to="$RM_WORK/volume"
+    TCTL restore volume "$RM_LABEL" --to "$to" --unit "$RM_UNIT" --device "$TAPE_DEV" || return 1
+    [ "$DRY_RUN" = 1 ] && return 0
+    [ -d "$to/$RM_UNIT" ] || { echo "restore volume left no $to/$RM_UNIT"; return 1; }
+    assert_identical "$RM_SRC" "$to/$RM_UNIT"
+}
+
 rm_step_file() {
     local to="$RM_WORK/file" relpath
     if [ "$DRY_RUN" = 1 ]; then
@@ -1169,7 +1182,7 @@ rm_step_verify() {
 }
 
 # restore_matrix <label> <unit> <tenant> <expected_src_dir> <tag> [other_tenant]
-# Runs all 10 methods as separate `check`s named "<tag>.<method>". Call
+# Runs all 11 methods as separate `check`s named "<tag>.<method>". Call
 # after a volume is sealed and while its cartridge is (or can be) reloaded.
 # restore_matrix <label> <unit> <tenant> <src> <tag> [other-tenant]
 #
@@ -1192,6 +1205,7 @@ restore_matrix() {
     fi
 
     check "$RM_TAG.unit"               rm_step_unit
+    check "$RM_TAG.volume"             rm_step_volume
     check "$RM_TAG.file"               rm_step_file
     check "$RM_TAG.restore_sh_dd"      rm_step_restore_sh_dd
     check "$RM_TAG.restore_sh_primary" rm_step_restore_sh_primary
