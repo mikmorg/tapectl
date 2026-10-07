@@ -3502,6 +3502,20 @@ mod tests {
         );
     }
 
+    /// ADR-0012, 2026-10-07 amendment, item 12: `[staging] hash_threads`
+    /// defaults to 1 (the one-file-at-a-time pass) until home2's
+    /// measurements at 1/2/4/8 are in. A literal, not the constant: a test
+    /// comparing the default to `DEFAULT_HASH_THREADS` passes at any value.
+    #[test]
+    fn hash_threads_defaults_to_one() {
+        assert_eq!(crate::staging::validate::DEFAULT_HASH_THREADS, 1);
+        assert_eq!(StagingConfig::default().hash_threads, 1);
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[staging]\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().staging.hash_threads, 1);
+    }
+
     #[test]
     fn config_load_rejects_a_negative_utilization_threshold() {
         let tmp = TempDir::new().unwrap();

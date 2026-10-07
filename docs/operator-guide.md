@@ -642,9 +642,10 @@ staging, never the plaintext archive: dar writes its archive to standard
 output, and tapectl cuts and encrypts it in memory. At its peak staging holds
 the unit's slices, about the unit's size. The source is read once: each file
 is hashed within 1 GiB of dar reading it, so the second read comes from the
-page cache. `[staging] hash_threads` files are hashed at once (4 by default,
+page cache. `[staging] hash_threads` files are hashed at once (1 by default,
 never more than the cores) when they fit in that 1 GiB, as many small files do;
-on a single spinning disk, fewer may read faster.
+more threads can speed a unit of many small files, and on a single spinning
+disk they may instead read slower.
 
 **Several units at once.** `stage create` takes several unit names, and
 `--jobs N` (or `[staging] jobs` in `config.toml`) stages N of them at a time,

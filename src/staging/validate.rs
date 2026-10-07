@@ -441,8 +441,10 @@ struct Lane<'a> {
 
 /// How many source files the hasher reads at once when nothing says
 /// otherwise (issue #366): `[staging] hash_threads`' default, before the
-/// clamp to the cores the host has ([`hash_threads`]).
-pub const DEFAULT_HASH_THREADS: usize = 4;
+/// clamp to the cores the host has ([`hash_threads`]). 1, the
+/// one-file-at-a-time pass, until home2's measurements at 1/2/4/8 threads
+/// are in (ADR-0012, 2026-10-07 amendment, item 12).
+pub const DEFAULT_HASH_THREADS: usize = 1;
 
 /// The most `[staging] hash_threads` may say (issue #366).
 pub const MAX_HASH_THREADS: usize = 64;
