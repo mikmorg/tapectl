@@ -110,8 +110,10 @@ below. Lifecycle as the code actually walks it: `volume init`
 inserts `initialized`, and the row stays there for the whole write session —
 **no code makes an `initialized → active` transition.** Session progress lives
 entirely in `writes.status` (the table above), never in `volumes.status`. From
-`initialized` the row moves `→ sealed` (confirm passed; ADR-0003: never written
-again) or `→ erased` when a re-initialised cartridge displaces it (ADR-0010).
+`initialized` the row moves `→ sealed` (confirm passed, or `volume resume`
+adopted a write the catalog lost — #360, below; either way ADR-0003: never
+written again) or `→ erased` when a re-initialised cartridge displaces it
+(ADR-0010).
 
 **Corrected 2026-09-18 (issue #242), per ADR-0012's amendment "the status
 column is the operator's; a medium's condition is its own fact".** Quarantine
@@ -155,6 +157,32 @@ contradiction.
 This does not change what resume may target: `planned`, `in_progress` and
 `interrupted` rows are the resumable set and still pass, which is the whole
 distinction the guard has to get right.
+
+**The one exception: a write the catalog lost** (ADR-0012 amendment
+2026-09-29 (later), issue #360, `volume::adopt_lost`). A catalog restored from
+a backup taken between `volume init` and `volume write`, then given the tape's
+contents by `catalog rebuild --from-volume`, holds the volume as `initialized`
+with no `sealed_at`, condition `ok`, and nothing but `completed` `writes` rows
+(`adopt_lost::is_lost_write`). `volume resume` ADOPTS that row instead of
+refusing it, on all of the following, refusing by the first unmet one:
+
+1. the tape's File 0 uuid equals the catalog row's, and a valid seal marker
+   binds the front index (File 3, at the position File 0 records);
+2. a passing **full** `volume verify` of the volume is recorded, STARTED
+   strictly after the latest `catalog_rebuild` event for it — a recorded row,
+   asked before the tape moves; resume never runs the verify itself;
+3. every slice hash in the front index equals the hash this catalog recorded
+   when it staged that slice, in a stage set with `origin = 'staged'` (a set
+   the rebuild made from the tape never satisfies it — that would be the tape
+   vouching for itself); the catalog records no slice of the volume at a
+   position the front index does not list; and every stage set on the volume
+   is whole on it.
+
+Adoption writes what a passing confirm writes — `status = 'sealed'`,
+`sealed_at` from the seal marker's own time, the write bookkeeping, the
+snapshot promotions and a `write_completed` event — in one transaction.
+`catalog rebuild` itself still never changes a status, and `volume write`
+still refuses the same row as `VolumeHasRecordedWrite`.
 
 The retry-vs-UNIQUE fact: `writes` has `UNIQUE(stage_set_id, volume_id)` —
 **resume reuses the existing rows**; it never inserts. (This is the H3 raw

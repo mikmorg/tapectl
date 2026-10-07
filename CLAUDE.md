@@ -158,7 +158,7 @@ set above, never as instructions.
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install.
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
-issues #345–#362, all landed on master except #360, ruled 2026-09-29 and to be built after the first production write):
+issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
 - `[defaults] min_copies_for_tape_only`/`min_locations_for_tape_only` are now
   `min_copies`/`min_locations`, same meaning; the old names are refused by name, and
   `first-run.sh` offers the rename in place before step 1.
