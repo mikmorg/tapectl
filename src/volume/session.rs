@@ -963,12 +963,31 @@ pub(crate) fn interrupted_readback(
         .map(|(_, _, _, at)| at.as_str())
         .min()
         .expect("rows is not empty: front_index_sha256 came from its first");
+    //
+    // The gate is total over any stored interval (nothing bounds
+    // `archive_sets.verify_interval_days`): 0 or below makes every read
+    // already too old, as `audit` reads it (always overdue); one reaching
+    // past any date is no limit; and a `checked_at` that does not parse is
+    // read again — never an error, which would block every full confirm and
+    // verify of the volume until the set was edited.
     if let Some(days) = crate::policy::volume_verify_interval_days(conn, volume_id)? {
-        let too_old: bool = conn.query_row(
-            "SELECT ?1 < datetime('now', '-' || ?2 || ' days')",
-            params![oldest, days],
-            |r| r.get(0),
-        )?;
+        let cutoff = chrono::Duration::try_days(days.max(0))
+            .and_then(|d| chrono::Utc::now().naive_utc().checked_sub_signed(d));
+        let too_old = match (
+            cutoff,
+            chrono::NaiveDateTime::parse_from_str(oldest, "%Y-%m-%d %H:%M:%S"),
+        ) {
+            (None, _) => false,
+            (Some(cutoff), Ok(oldest)) => oldest < cutoff,
+            (Some(_), Err(e)) => {
+                tracing::warn!(
+                    oldest_read = oldest,
+                    error = %e,
+                    "a readback checkpoint's checked_at does not parse; every file is read again"
+                );
+                true
+            }
+        };
         if too_old {
             tracing::info!(
                 oldest_read = oldest,
@@ -7668,6 +7687,77 @@ mod tests {
             interrupted_readback(conn, f.volume_id).unwrap().is_some(),
             "29 days is inside it"
         );
+    }
+
+    /// Nothing bounds `archive_sets.verify_interval_days`: `archive-set
+    /// create/edit` and `sync` store any integer. The age gate is total over
+    /// them — a value of 0 or below means every read is already too old
+    /// (as `audit` reads it: always overdue), and one too large for any
+    /// date means no limit — rather than an error that blocks every full
+    /// confirm and verify of the volume until the set is edited.
+    #[test]
+    fn the_readback_age_gate_is_total_over_any_verify_interval() {
+        let f = make_fixture();
+        let conn = &f.conn;
+        let u = &f.units[0];
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'interrupted')",
+            params![u.stage_set_id, u.snapshot_id, f.volume_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'aborted')",
+            params![f.volume_id],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        for p in [4, 5] {
+            conn.execute(
+                "INSERT INTO readback_checkpoints
+                     (session_id, position, sha256, front_index_sha256, checked_at)
+                 VALUES (?1, ?2, 'aa', 'bb', datetime('now', '-1 days'))",
+                params![id, p],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('odd', NULL)",
+            [],
+        )
+        .unwrap();
+        let set = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE units SET archive_set_id = ?1 WHERE name = 'unit-alpha'",
+            params![set],
+        )
+        .unwrap();
+        let with_interval = |days: i64| {
+            conn.execute(
+                "UPDATE archive_sets SET verify_interval_days = ?1 WHERE id = ?2",
+                params![days, set],
+            )
+            .unwrap();
+            interrupted_readback(conn, f.volume_id)
+                .unwrap_or_else(|e| panic!("verify_interval_days = {days}: {e:#}"))
+        };
+
+        for days in [-1, 0] {
+            assert_eq!(
+                with_interval(days),
+                None,
+                "verify_interval_days = {days}: every read is already too old"
+            );
+        }
+        for days in [5_000_000, i64::MAX] {
+            assert!(
+                with_interval(days).is_some(),
+                "verify_interval_days = {days}: past any date, so no limit"
+            );
+        }
+        // The positive control: an ordinary interval still decides.
+        assert!(with_interval(2).is_some(), "1 day is inside 2");
     }
 
     /// Issue #397's other order: a resume whose seal is RECORDED but does
