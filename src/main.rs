@@ -433,6 +433,21 @@ fn run(
         return Ok(());
     }
 
+    // Issue #143: `config set`/`add`/`remove` are dispatched before the
+    // strict load for `check`'s reason — they are how a config that fails
+    // to load gets repaired, and they validate the edited text themselves
+    // (`config_edit`). They need no catalog.
+    if let Commands::Config {
+        command:
+            ref command @ (ConfigCommands::Set { .. }
+            | ConfigCommands::Add { .. }
+            | ConfigCommands::Remove { .. }),
+    } = cli.command
+    {
+        cli::config::run_edit(&paths, command, cli.json, cli.dry_run)?;
+        return Ok(());
+    }
+
     // Issue #261 (precedent: #233's `db::open_for_repair`): `Config::load`'s
     // backend-collision refusal (`validate_backends`) calls
     // `std::fs::canonicalize` on both sides of every `[[backends.lto]]`
@@ -653,8 +668,8 @@ fn run(
             exit_if_nonzero(exit_code);
         }
         Commands::Config { ref command } => {
-            // `Check` is intercepted above, before the strict `Config::load`
-            // (#173); only `Show` ever reaches here.
+            // `Check`, `Set`, `Add` and `Remove` are intercepted above, before
+            // the strict `Config::load` (#173, #143); only `Show` reaches here.
             let exit_code = cli::config::run(&conn, &paths, command, cli.json)?;
             exit_if_nonzero(exit_code);
         }

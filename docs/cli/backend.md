@@ -18,7 +18,7 @@ tapectl backend [OPTIONS] <COMMAND>
 
 Add an LTO tape drive to the config
 
-Writes a validated `[[backends.lto]]` block, appended so existing comments survive. Find your drive with `ls -l /dev/tape/by-id/`, and `lsscsi -g` for the sg node. Prefer the by-id paths: /dev/nstN numbering is not stable across reboots.
+Writes a validated `[[backends.lto]]` block in place, so existing comments survive, through the editor `config add` uses; the file is checked before it is replaced, and a refusal leaves it untouched. Find your drive with `ls -l /dev/tape/by-id/`, and `lsscsi -g` for the sg node. Prefer the by-id paths: /dev/nstN numbering is not stable across reboots.
 
 ```text
 tapectl backend add [OPTIONS] --name <NAME> --device-tape <DEVICE_TAPE> --device-sg <DEVICE_SG> --generation <GENERATION>

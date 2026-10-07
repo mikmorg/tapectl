@@ -999,6 +999,17 @@ impl Config {
         Ok(config)
     }
 
+    /// [`Config::load`] on text already in hand: every check `load` makes,
+    /// with `path` naming the file in the messages but never read. This is
+    /// how `config set`/`add`/`remove` (issue #143) validate an edited file
+    /// as every reader would, BEFORE it is written — the same definition of
+    /// a valid config, not a second one.
+    pub fn from_text(content: &str, path: &Path) -> Result<Self> {
+        let config = Self::from_text_without_backend_check(content, path)?;
+        config.validate_backends(path)?;
+        Ok(config)
+    }
+
     /// [`Config::load`] minus its backend-collision check
     /// ([`Config::validate_backends`]) — issue #261.
     ///
@@ -1050,20 +1061,28 @@ impl Config {
             return Err(TapectlError::ConfigNotFound(path.display().to_string()));
         }
         let content = std::fs::read_to_string(path)?;
+        Self::from_text_without_backend_check(&content, path)
+    }
+
+    /// Parse and validate `content` as the file at `path`, minus
+    /// [`Config::validate_backends`] — the body [`Config::load`],
+    /// [`Config::load_tolerating_backend_ambiguity`] and
+    /// [`Config::from_text`] share.
+    fn from_text_without_backend_check(content: &str, path: &Path) -> Result<Self> {
         // ADR-0010 renamed `backends.lto[].media_type`/`.nominal_capacity` to
         // `.generation`/`.capacity_override`, and `LtoBackendConfig` now
         // rejects unknown fields — a stale config with either old key would
         // otherwise fail with serde's generic "unknown field" message. Catch
         // it here, before serde ever sees it, so the operator gets the exact
         // remediation instead.
-        if let Some(msg) = stale_lto_fields_message(&content) {
+        if let Some(msg) = stale_lto_fields_message(content) {
             return Err(TapectlError::Config(format!("{}: {msg}", path.display())));
         }
         // Issue #171 / ADR-0012: every section now carries
         // `#[serde(deny_unknown_fields)]`, so a typo anywhere in the file —
         // not just `[[backends.lto]]` — fails here by name, naming the FILE
         // too so `config check` and the operator can find it.
-        let config: Config = toml::from_str(&content)
+        let config: Config = toml::from_str(content)
             .map_err(|e| TapectlError::Config(format!("{}: {e}", path.display())))?;
         config.validate_sizes(path)?;
         config.validate_closed_sets(path)?;

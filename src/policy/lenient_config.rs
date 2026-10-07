@@ -82,7 +82,19 @@ const MAX_STRIP_ITERATIONS: usize = 200;
 /// file changing between the two reads) but not a new risk: `cli::config`'s
 /// other scans already re-read the file independently for the same reason.
 pub fn check(content: &str, path: &Path) -> LenientReport {
-    match Config::load(path) {
+    report(Config::load(path), content, path)
+}
+
+/// [`check`] on text that is not (yet) the file at `path` — the verdict is
+/// [`Config::from_text`]'s instead of [`Config::load`]'s, so nothing is
+/// read from disk. `config set`/`add`/`remove` (issue #143) diagnose an
+/// edit with this before writing it.
+pub fn check_text(content: &str, path: &Path) -> LenientReport {
+    report(Config::from_text(content, path), content, path)
+}
+
+fn report(verdict: crate::error::Result<Config>, content: &str, path: &Path) -> LenientReport {
+    match verdict {
         Ok(cfg) => LenientReport {
             valid: true,
             problems: Vec::new(),

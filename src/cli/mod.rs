@@ -329,8 +329,10 @@ pub enum Commands {
 pub enum BackendCommands {
     /// Add an LTO tape drive to the config
     ///
-    /// Writes a validated `[[backends.lto]]` block, appended so existing
-    /// comments survive. Find your drive with `ls -l /dev/tape/by-id/`, and
+    /// Writes a validated `[[backends.lto]]` block in place, so existing
+    /// comments survive, through the editor `config add` uses; the file is
+    /// checked before it is replaced, and a refusal leaves it untouched.
+    /// Find your drive with `ls -l /dev/tape/by-id/`, and
     /// `lsscsi -g` for the sg node. Prefer the by-id paths: /dev/nstN
     /// numbering is not stable across reboots.
     Add {
@@ -405,6 +407,60 @@ pub enum ConfigCommands {
     Show,
     /// Check configuration validity
     Check,
+    /// Set one key in config.toml, keeping its comments and layout
+    ///
+    /// KEY is a dotted path as `config check` prints it:
+    /// `defaults.slice_size`, `host_check.max_load_per_cpu`. An entry of a
+    /// list of tables is selected by its name or its position from 0:
+    /// `collections[movies].unit_depth`, `backends.lto[0].enospc_buffer`.
+    /// A missing table is created.
+    ///
+    /// VALUE is tried as a TOML number, boolean or array first, and as a
+    /// string when that does not load; quote it as TOML (`'"3"'`) to force a
+    /// string. The edited file is checked as every command loads it before
+    /// it is written: an unknown key or a bad value is refused by name and
+    /// the file is left exactly as it was. The file is replaced atomically.
+    Set {
+        /// The key, e.g. defaults.slice_size
+        key: String,
+        /// The value, e.g. 2G
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Add a table to a list of tables, or values to a list
+    ///
+    /// For a list of tables (`collections`, `archive_sets`, `backends.lto`)
+    /// each VALUE is one `field=value` of the new table:
+    /// `config add collections name=movies root=/srv/media/movies tenant=family`.
+    /// Its name must not already be taken. A drive added as `backends.lto`
+    /// gets the checks `backend add` makes. For a list value
+    /// (`defaults.global_excludes`), each VALUE is appended. Checked and
+    /// written as `config set` is.
+    Add {
+        /// The list, e.g. collections or defaults.global_excludes
+        key: String,
+        /// field=value pairs for a table, or the values to append (after
+        /// `--` when one begins with `-`)
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
+    /// Remove a key, an entry of a list of tables, or values from a list
+    ///
+    /// `config remove defaults.slice_size` removes the key, so its default
+    /// applies; `config remove collections[movies]` removes that table;
+    /// `config remove defaults.global_excludes '*.bak'` removes that value.
+    /// A whole list of tables is removed one entry at a time. Checked and
+    /// written as `config set` is: removing a required key is refused. On a
+    /// file that already fails to load, an edit that adds no problem goes
+    /// through and names the problems left, so a broken file can be repaired
+    /// one key at a time.
+    Remove {
+        /// The key, table or list
+        key: String,
+        /// Values to remove from a list (none: remove KEY itself); after
+        /// `--` when one begins with `-`
+        values: Vec<String>,
+    },
 }
 
 /// The name of the progress session `command` opens (issue #386), or `None`

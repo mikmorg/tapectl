@@ -151,6 +151,9 @@ Accepted by every command, before or after the subcommand.
 | [`config`](config.md) | Configuration management |
 | &nbsp;&nbsp;[`config show`](config.md#tapectl-config-show) | Show current configuration |
 | &nbsp;&nbsp;[`config check`](config.md#tapectl-config-check) | Check configuration validity |
+| &nbsp;&nbsp;[`config set`](config.md#tapectl-config-set) | Set one key in config.toml, keeping its comments and layout |
+| &nbsp;&nbsp;[`config add`](config.md#tapectl-config-add) | Add a table to a list of tables, or values to a list |
+| &nbsp;&nbsp;[`config remove`](config.md#tapectl-config-remove) | Remove a key, an entry of a list of tables, or values from a list |
 | [`host`](host.md) | This host's fitness to feed a tape drive (the quiet-host check) |
 | &nbsp;&nbsp;[`host check`](host.md#tapectl-host-check) | Is this host quiet enough to write a tape? |
 | [`status`](status.md) | What is running and how the last sessions ended, from the session logs alone: the live session's phase, progress, rate and ETA, and each recent session's outcome and phase timings. Opens no catalog and no config, so an account in the home's `[ops] group` can run it (`tapectl --home <service home> status`) without sudo |

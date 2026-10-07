@@ -7,7 +7,6 @@
 use crate::cli::BackendCommands;
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
-use std::io::Write;
 
 pub fn run(
     paths: &TapectlPaths,
@@ -37,61 +36,58 @@ pub fn run(
     }
 }
 
-/// The `[[backends.lto]]` block for these values.
+/// The `[[backends.lto]]` table for these values, as the `field=value`
+/// list `config add backends.lto` takes (issue #143): `backend add` writes
+/// through the same editor, so the two cannot write different tables.
 ///
-/// Pure, so the text is testable and the command cannot drift from what the
-/// tests assert. `block_size` and `hardware_compression` were deliberately
-/// absent here while they still parsed (#118, #121 — offering an operator a
-/// knob that does nothing is a false assurance); spec W4 has since deleted
-/// both from `LtoBackendConfig` entirely, so a block carrying either would
-/// now fail to load. `capacity_override` (ADR-0010) is absent unless
-/// explicitly given — a real drive's capacity follows the loaded cartridge's
-/// detected generation, not this config.
-pub fn backend_block(
+/// Pure, so the fields are testable and the command cannot drift from what
+/// the tests assert. `block_size` and `hardware_compression` were
+/// deliberately absent here while they still parsed (#118, #121 — offering
+/// an operator a knob that does nothing is a false assurance); spec W4 has
+/// since deleted both from `LtoBackendConfig` entirely, so a table carrying
+/// either would now fail to load. `capacity_override` (ADR-0010) is absent
+/// unless explicitly given — a real drive's capacity follows the loaded
+/// cartridge's detected generation, not this config.
+pub fn backend_fields(
     name: &str,
     device_tape: &str,
     device_sg: &str,
     generation: &str,
     capacity_override: Option<&str>,
     enospc_buffer: Option<&str>,
-) -> String {
-    let mut s = format!(
-        "\n[[backends.lto]]\nname = \"{name}\"\ndevice_tape = \"{device_tape}\"\n\
-         device_sg = \"{device_sg}\"\ngeneration = \"{generation}\"\n"
-    );
+) -> Vec<String> {
+    // Each value quoted as a TOML string, so a name such as `2024` stays a
+    // string. `Value::from` escapes what needs escaping.
+    let q = |v: &str| toml_edit::Value::from(v).to_string().trim().to_string();
+    let mut fields = vec![
+        format!("name={}", q(name)),
+        format!("device_tape={}", q(device_tape)),
+        format!("device_sg={}", q(device_sg)),
+        format!("generation={}", q(generation)),
+    ];
     if let Some(cap) = capacity_override {
-        s.push_str(&format!("capacity_override = \"{cap}\"\n"));
+        fields.push(format!("capacity_override={}", q(cap)));
     }
     if let Some(buf) = enospc_buffer {
-        s.push_str(&format!("enospc_buffer = \"{buf}\"\n"));
+        fields.push(format!("enospc_buffer={}", q(buf)));
     }
-    s
+    fields
 }
 
-/// Remove a bare `lto = []` from the `[backends]` table.
-///
-/// Scoped to that table rather than matched anywhere in the file: the key is
-/// only meaningful there, and a blind line match would happily delete an
-/// identical line out of some other table. Commented lines are left alone —
-/// `# lto = []` inside the example block is documentation, not a declaration.
-pub fn drop_empty_lto_stub(text: &str) -> String {
-    let mut out = Vec::new();
-    let mut in_backends = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
-            in_backends = trimmed == "[backends]";
-        }
-        if in_backends && trimmed.replace(' ', "") == "lto=[]" {
-            continue;
-        }
-        out.push(line);
-    }
-    let mut s = out.join("\n");
-    if text.ends_with('\n') {
-        s.push('\n');
-    }
-    s
+/// Plan adding a backend with `fields` to the config text `original`.
+pub fn plan_add(
+    original: &str,
+    config_file: &std::path::Path,
+    fields: Vec<String>,
+) -> Result<crate::config_edit::Planned> {
+    crate::config_edit::plan(
+        original,
+        config_file,
+        &crate::config_edit::Edit::Add {
+            key: "backends.lto".to_string(),
+            values: fields,
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -182,12 +178,34 @@ fn add(
         }
     }
 
+    // Issue #143: the table is written by the same editor `config add
+    // backends.lto` uses — in place, keeping every comment (`Config::save`
+    // would drop them all, the commented example `init` writes included),
+    // checked as every command loads the file before it is written, and
+    // replaced atomically, so a refusal leaves the file as it was. An older
+    // config's `lto = []` under `[backends]` (what `init` serialized before
+    // the skip_serializing_if; TOML refuses it beside a `[[backends.lto]]`
+    // table) becomes the list the table joins.
+    let original = std::fs::read_to_string(&paths.config_file)?;
+    let planned = plan_add(
+        &original,
+        &paths.config_file,
+        backend_fields(
+            name,
+            device_tape,
+            device_sg,
+            generation,
+            capacity_override,
+            enospc_buffer,
+        ),
+    )?;
+
     // Issue #241: every refusal above (bad name/generation/capacity,
-    // duplicate name, duplicate device_tape) is a fact about the request
-    // and stays ahead of this return — a dry run must still refuse what
-    // the real run would refuse. The device-missing warning above is
-    // informational, not a mutation, so it is harmless to have already
-    // printed it.
+    // duplicate name, duplicate device_tape, and the planned edit's own
+    // check) is a fact about the request and stays ahead of this return —
+    // a dry run must still refuse what the real run would refuse. The
+    // device-missing warning above is informational, not a mutation, so it
+    // is harmless to have already printed it.
     if dry_run {
         if json_output {
             println!(
@@ -206,46 +224,7 @@ fn add(
         return Ok(());
     }
 
-    // Appended as text, never re-serialized. `Config::save` round-trips
-    // through serde, which silently drops every comment in the file —
-    // including the commented example `init` writes and anything the
-    // operator added. Adding a backend must not quietly rewrite the rest of
-    // their config.
-    // An older config may carry `lto = []` under `[backends]` — what `init`
-    // serialized before the skip_serializing_if. TOML treats that key and a
-    // later `[[backends.lto]]` table as duplicate definitions of `lto` and
-    // refuses to parse the file at all, so the stub is cleared first.
-    let text = std::fs::read_to_string(&paths.config_file)?;
-    let cleaned = drop_empty_lto_stub(&text);
-    if cleaned != text {
-        std::fs::write(&paths.config_file, &cleaned)?;
-    }
-
-    let block = backend_block(
-        name,
-        device_tape,
-        device_sg,
-        generation,
-        capacity_override,
-        enospc_buffer,
-    );
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&paths.config_file)?;
-    f.write_all(block.as_bytes())?;
-    drop(f);
-
-    // Read it back rather than trusting the write: the whole point of the
-    // command is that the operator does not have to check the TOML by hand.
-    let reloaded = Config::load(&paths.config_file)?;
-    let found = reloaded.backends.lto.iter().any(|b| b.name == name);
-    if !found {
-        return Err(TapectlError::Other(format!(
-            "wrote the backend block to {} but reloading the config did not find \
-             it — the file may have pre-existing syntax errors. Run `tapectl config check`.",
-            paths.config_file.display()
-        )));
-    }
+    crate::config_edit::replace_file(&paths.config_file, &original, &planned.new_text)?;
 
     if json_output {
         println!(
@@ -268,23 +247,34 @@ fn add(
 mod tests {
     use super::*;
 
-    /// The block must parse back as a real backend — the acceptance bar is
-    /// "config check passes against it", and a block that only looks right is
-    /// exactly the hand-edited-TOML failure this command removes.
+    fn p() -> std::path::PathBuf {
+        std::path::PathBuf::from("/nonexistent/tapectl-backend-test/config.toml")
+    }
+
+    /// The text `backend add` would write over `original`.
+    fn added(original: &str, fields: Vec<String>) -> String {
+        plan_add(original, &p(), fields)
+            .expect("the add plans")
+            .new_text
+    }
+
+    /// The table must parse back as a real backend — the acceptance bar is
+    /// "config check passes against it", and a table that only looks right
+    /// is exactly the hand-edited-TOML failure this command removes.
     #[test]
-    fn the_generated_block_parses_as_a_backend() {
-        let toml = format!(
-            "[dar]\nbinary = \"dar\"\n{}",
-            backend_block(
+    fn the_generated_table_parses_as_a_backend() {
+        let text = added(
+            "[dar]\nbinary = \"dar\"\n",
+            backend_fields(
                 "hp-lto6",
                 "/dev/tape/by-id/scsi-ABC-nst",
                 "/dev/sg1",
                 "LTO-6",
                 Some("2.5TB"),
                 Some("50M"),
-            )
+            ),
         );
-        let cfg: Config = toml::from_str(&toml).expect("block must parse");
+        let cfg: Config = toml::from_str(&text).expect("table must parse");
         let b = &cfg.backends.lto[0];
         assert_eq!(b.name, "hp-lto6");
         assert_eq!(b.device_tape, "/dev/tape/by-id/scsi-ABC-nst");
@@ -298,16 +288,19 @@ mod tests {
     /// written out as operator choices. `block_size`/`hardware_compression`
     /// are checked for absence still, and now for a stronger reason than
     /// #118/#121: spec W4 deleted both, so emitting either would produce a
-    /// block that `Config::load` rejects outright.
+    /// table that `Config::load` rejects outright.
     #[test]
     fn inert_knobs_are_absent_and_defaulted() {
-        let block = backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None);
-        assert!(!block.contains("block_size"), "{block}");
-        assert!(!block.contains("hardware_compression"), "{block}");
-        assert!(!block.contains("enospc_buffer"), "{block}");
-        assert!(!block.contains("capacity_override"), "{block}");
+        let text = added(
+            "[dar]\nbinary = \"dar\"\n",
+            backend_fields("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
+        );
+        assert!(!text.contains("block_size"), "{text}");
+        assert!(!text.contains("hardware_compression"), "{text}");
+        assert!(!text.contains("enospc_buffer"), "{text}");
+        assert!(!text.contains("capacity_override"), "{text}");
 
-        let cfg: Config = toml::from_str(&format!("[dar]\nbinary = \"dar\"\n{block}")).unwrap();
+        let cfg: Config = toml::from_str(&text).unwrap();
         let b = &cfg.backends.lto[0];
         assert_eq!(b.enospc_buffer, "50M");
         assert!(b.capacity_override.is_none());
@@ -318,36 +311,38 @@ mod tests {
     /// alongside a later `[[backends.lto]]` table as a duplicate — so the
     /// command could not append to the file `init` had just written. No unit
     /// test saw it, because they all built a config with no `[backends]`
-    /// table at all.
+    /// table at all. Since #143 the editor turns the empty list into the
+    /// list of tables the new one joins.
     #[test]
-    fn an_empty_lto_stub_is_cleared_so_the_appended_table_parses() {
-        // `defaults.hash` was this fixture's "other tables survive" witness
-        // until issue #172 deleted it (nothing ever read it); `checksum_mode`
-        // makes the same point — a real, still-live `[defaults]` field whose
-        // non-default value must still be exactly what comes back out.
+    fn an_empty_lto_stub_becomes_the_list_the_table_joins() {
+        // `checksum_mode` is the "other tables survive" witness — a real,
+        // still-live `[defaults]` field whose non-default value must still be
+        // exactly what comes back out.
         let before =
             "[dar]\nbinary = \"dar\"\n\n[backends]\nlto = []\n\n[defaults]\nchecksum_mode = \"sha256\"\n";
-        let block = backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None);
-        assert!(
-            toml::from_str::<Config>(&format!("{before}{block}")).is_err(),
-            "precondition: the stub and the table really do collide"
+        let text = added(
+            before,
+            backend_fields("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
         );
-
-        let after = drop_empty_lto_stub(before);
-        assert!(!after.contains("lto = []"));
-        let cfg: Config =
-            toml::from_str(&format!("{after}{block}")).expect("cleared stub must let it parse");
+        assert!(!text.contains("lto = []"), "{text}");
+        let cfg: Config = toml::from_str(&text).expect("the edited file must parse");
         assert_eq!(cfg.backends.lto.len(), 1);
         assert_eq!(cfg.defaults.checksum_mode, "sha256", "other tables survive");
     }
 
     /// The commented example `init` writes contains lines that look like
-    /// declarations. Deleting from it would corrupt the operator's guide to
-    /// the very thing this command configures.
+    /// declarations. Changing it would corrupt the operator's guide to the
+    /// very thing this command configures.
     #[test]
-    fn commented_lines_and_other_tables_are_left_alone() {
-        let text = "[backends]\n# lto = []\n\n[other]\nlto = []\n";
-        assert_eq!(drop_empty_lto_stub(text), text);
+    fn commented_lines_are_left_alone() {
+        let text = "[dar]\nbinary = \"dar\"\n\n# [[backends.lto]]\n# lto = []\n# name = \"lto6\"\n";
+        let after = added(
+            text,
+            backend_fields("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
+        );
+        for line in text.lines() {
+            assert!(after.contains(line), "{line:?} lost:\n{after}");
+        }
     }
 
     /// A fresh `init` no longer writes the stub at all.
@@ -357,19 +352,29 @@ mod tests {
         assert!(!text.contains("lto = []"), "{text}");
     }
 
-    /// Appending must leave the rest of the file — comments included —
+    /// Adding must leave the rest of the file — comments included —
     /// untouched. `Config::save` would drop every one of them, taking the
     /// commented example `init` writes with it.
     #[test]
-    fn appending_preserves_comments_already_in_the_file() {
+    fn adding_preserves_comments_already_in_the_file() {
         let original =
             "# operator note: the drive lives in the basement\n[dar]\nbinary = \"dar\"\n";
-        let after = format!(
-            "{original}{}",
-            backend_block("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None)
+        let after = added(
+            original,
+            backend_fields("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
         );
-        assert!(after.contains("# operator note: the drive lives in the basement"));
+        assert!(after.starts_with(original), "{after}");
         assert!(toml::from_str::<Config>(&after).is_ok());
+    }
+
+    /// A name that reads as a TOML number is still written as a string.
+    #[test]
+    fn a_numeric_name_is_written_as_a_string() {
+        let text = added(
+            "",
+            backend_fields("2024", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
+        );
+        assert!(text.contains("name = \"2024\""), "{text}");
     }
 
     // ---- issue #174: `add` must refuse a second backend on the same device ----
