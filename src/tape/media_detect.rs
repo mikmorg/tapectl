@@ -1130,6 +1130,8 @@ mod tests {
             "fn volume_init_contacted<'c>(",
             "fn volume_write_contacted<'c>(",
             "fn volume_resume_contacted<'c>(",
+            // ADR-0012, 2026-09-29 later: resume's lost-write adoption.
+            "fn volume_resume_adopt_lost_contacted<'c>(",
         ] {
             let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
             let end = prod[start..].find("\n}\n").unwrap() + start;

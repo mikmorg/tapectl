@@ -2303,7 +2303,9 @@ backup service by hand at the end of every write session too
 (`sudo systemctl start tapectl-backup.service`). A backup taken mid-session,
 after `volume init` and before `volume write`, restores that volume as
 `initialized`, and rebuilding the catalog from the sealed tape attaches its
-units to the row but does not seal it, so nothing on it counts as a copy.
+units to the row but does not seal it, so nothing on it counts as a copy until
+a full `volume verify` and then `volume resume` adopt it (#360; see
+[keys-and-recovery.md](keys-and-recovery.md), runbook D).
 
 `db fsck` runs SQLite's `integrity_check` and `foreign_key_check` and reports
 every violation it finds. `--repair` deletes rows whose foreign-key parent is

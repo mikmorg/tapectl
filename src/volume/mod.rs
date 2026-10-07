@@ -1,3 +1,4 @@
+pub mod adopt_lost;
 pub(crate) mod binding;
 pub mod build;
 pub mod envelope;

@@ -184,9 +184,12 @@ pub enum TapectlError {
         "volume \"{label}\" already has a completed write recorded and is not a write target \
          (ADR-0012): its catalog row still reads `initialized`, but the `writes` table shows \
          bytes were already written to it — most likely `catalog rebuild --from-volume` \
-         attached a rebuilt tape's contents to this row. `--force` does not apply. To write a \
-         real blank cartridge, run `tapectl volume init <new-label>` on it; the File 0 check is \
-         the consent point (ADR-0010)."
+         attached a rebuilt tape's contents to this row. `--force` does not apply. If that \
+         tape is this volume, sealed by a write this catalog lost (it was restored from a \
+         backup taken before the write), a full `tapectl volume verify {label}` and then \
+         `tapectl volume resume {label}` adopt it as sealed (ADR-0012, 2026-09-29 later). To \
+         write a real blank cartridge, run `tapectl volume init <new-label>` on it; the File 0 \
+         check is the consent point (ADR-0010)."
     )]
     VolumeHasRecordedWrite { label: String },
 

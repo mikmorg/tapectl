@@ -959,11 +959,25 @@ tapectl audit
   The backup carries the key rows, so `restore` knows whose each file is.
 - **A backup is only as new as the last copy taken.** For each volume sealed
   after the backup was taken, run `catalog rebuild --from-volume` as in runbook C,
-  step 7. One gap remains: if the backup was taken while a volume was still
-  `initialized` (after `volume init`, before `volume write`), the rebuild attaches
-  the tape's units to that row but leaves its status alone and says so. Until
-  sealed, nothing on it counts as a copy, and the rebuild's own warning ends
-  "the status itself will not change automatically". To avoid this, take a backup at the end of every write session
+  step 7. If the backup was taken while a volume was still `initialized` (after
+  `volume init`, before `volume write`), the rebuild attaches the tape's units to
+  that row but leaves its status alone and says so: until sealed, nothing on it
+  counts as a copy. `volume resume` seals it, after a full verify (ADR-0012,
+  2026-09-29 later; #360):
+
+  ```bash
+  tapectl catalog rebuild --from-volume --key operator.key --device "$TAPE" --label L6-0007
+  tapectl volume verify L6-0007 --device "$TAPE"   # full by default; after the rebuild
+  tapectl volume resume L6-0007 --device "$TAPE"
+  ```
+
+  Resume adopts the volume only when File 0's uuid is this volume's, a seal
+  marker binds the front index, a passing full verify is recorded after the
+  rebuild, and every slice hash in the front index is the one this catalog
+  recorded when it staged that slice. Otherwise it names the first condition
+  that failed. A slice the backup never staged (the backup predates `stage
+  create`) can never satisfy the last condition, so a backup at the end of every
+  write session is still the better habit
   (`sudo systemctl start tapectl-backup.service` on a timer install).
 
 ### E. Moving to a new host
