@@ -354,13 +354,29 @@ index is at the front):
 4. For every file except File 3 and the seal marker, read and hash it, compare to
    File 3's `sha256_encrypted[i]` ⇒ **integrity** tier.
 
-**The integrity tier is the seal default** (ratified 2026-07-22): at seal time the
-staged slices still exist on disk, so a failed confirm costs a fresh cartridge and
-hours — discovered years later, the source may be gone; and with LBP unreachable
-through `st`, the readback hash is the only control spanning host RAM → HBA → drive
-→ medium. `--quick` opts down to the navigable tier and is recorded honestly. The
-tiers map onto the existing `verification_sessions.verify_type` column: integrity →
-`full`, navigable → `quick` (no schema change).
+**Which tier runs depends on the caller** (ADR-0012, amendment 2026-10-06 item 1,
+#387; v2-open-questions.md §1.2's reversal and §2.4 L3):
+
+- **A write's post-seal confirm is navigable by default** (steps 1–3: File 3 and the
+  seal marker), and a passing one seals. `--full-confirm`, on every command that
+  writes a volume, opts in to the integrity tier. What the default gives up is L3 at
+  write time — the one host → HBA → drive → medium check (with LBP unreachable
+  through `st`, the readback hash is the only control spanning that chain) — so
+  `audit` (`no_full_verify`) and `report verify-status` name every sealed volume with
+  no passed full readback recorded until `volume verify` runs one.
+- **`volume verify` runs the integrity tier by default**; `--quick` opts down to the
+  navigable tier and is recorded honestly. A quick verify does not stand in for a
+  full one.
+
+The integrity tier was the seal default from 2026-07-22 to 2026-10-06, on the
+asymmetry of when a bad copy is found: at seal time the staged slices still exist on
+disk, so a failed readback costs a fresh cartridge and hours — discovered years
+later, the source may be gone. That argument is why `--full-confirm` exists and why
+the operator guide asks for a full `volume verify` soon after each write, before
+`staging clean` releases the staged slices (on home2 a full readback cost ~2.3 h
+per tape). The tiers map onto the existing
+`verification_sessions.verify_type` column: integrity → `full`, navigable → `quick`
+(no schema change).
 
 The `verification_sessions` row records **which tier** was achieved, per ADR-0001
 (recorded strength must match what ran). Drive-level Logical Block Protection is

@@ -326,9 +326,14 @@ volume "L8-0001" write completed
 verify L8-0001 (full tier): 13 checked, 13 passed, 0 failed
 ```
 
-`volume write` plans the whole tape, writes it in one session, **reads every byte
-back** against the plan, and only then seals it. A sealed volume is never appended
-to. `verify --full` is a second, independent read of the whole tape.
+`volume write` plans the whole tape, writes it in one session, then **confirms
+it**: it reads back the front index and the seal marker, checks that the two ends of
+the tape agree with each other and with the plan, and only then seals it. A sealed
+volume is never appended to. That confirm reads none of the data back (`volume write
+--full-confirm` would, at the cost of a second pass over the whole tape), so
+`verify --full` is the volume's **first full read-back**: it hashes every file on the
+tape against the front index. Run it soon after the write, while the staged slices
+are still on disk to rewrite a bad copy from.
 
 > [!NOTE]
 > Before a write, tapectl checks that the host is quiet enough to keep the drive
@@ -370,13 +375,15 @@ Writes:
 
 Verification history:
     [full] passed: started 2026-09-29 08:20:02, completed 2026-09-29 08:20:02 (13/13 slices passed)
-    [full] passed: started 2026-09-29 08:20:01, completed 2026-09-29 08:20:01 (13/13 slices passed)
+    [quick] passed: started 2026-09-29 08:20:01, completed 2026-09-29 08:20:01 (2/2 slices passed)
 
 Warehouse deposits: none
 ```
 
-The older of the two verifications is `volume write`'s own read-back; the newer one
-is `verify --full`.
+The older of the two verifications is `volume write`'s own confirm — `quick`, and its
+2 files are the front index and the seal marker; the newer one is `verify --full`,
+the first full read-back. Until a full one passes, `audit` warns about the volume
+(`no_full_verify`) and `report verify-status` lists it as owed one.
 
 The tape is not placed anywhere yet. Put the cartridge on its shelf and tell the
 catalog:
@@ -425,6 +432,7 @@ that.
 ```bash
 tapectl volume init L8-0002 --device "$TAPE"
 tapectl volume write L8-0002 --device "$TAPE"
+tapectl volume verify L8-0002 --device "$TAPE" --full
 tapectl volume move L8-0002 --to offsite
 tapectl audit
 tapectl report copies
@@ -435,6 +443,7 @@ cartridge E01003L8_1775794348 auto-registered from MAM (barcode = medium serial)
 volume "L8-0002" initialized (id=2)
 ...
 volume "L8-0002" write completed
+verify L8-0002 (full tier): 13 checked, 13 passed, 0 failed
 volume "L8-0002" moved to "offsite"
   cartridge "E01003L8_1775794348" moved with it
 
