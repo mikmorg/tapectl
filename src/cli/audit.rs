@@ -809,6 +809,10 @@ fn check_verify_age(
     let mut f = Findings::default();
     if let Some(verify_days) = resolved.verify_interval_days {
         let copy_count = copy_count_for_unit(ctx.conn, unit.id)?;
+        // A FULL readback only (ADR-0012 2026-10-06 items 1 and 24): a quick
+        // confirm or quick verify reads File 0, the front index and the
+        // seal — none of the unit's bytes — so it is no evidence they still
+        // read, and must not refresh this clock.
         let last_verify: Option<String> = ctx
             .conn
             .query_row(
@@ -817,7 +821,8 @@ fn check_verify_age(
                  JOIN writes w ON w.volume_id = vs.volume_id
                  JOIN stage_sets ss ON ss.id = w.stage_set_id
                  JOIN snapshots s ON s.id = ss.snapshot_id
-                 WHERE s.unit_id = ?1 AND vs.outcome = 'passed'",
+                 WHERE s.unit_id = ?1 AND vs.outcome = 'passed'
+                   AND vs.verify_type = 'full'",
                 params![unit.id],
                 |row| row.get(0),
             )
@@ -3639,6 +3644,118 @@ mod tests {
         fn copies_at_every_named_location_satisfy_it() {
             let conn = setup(&["home-rack", "offsite"]);
             assert!(location_findings(&conn).is_empty());
+        }
+    }
+
+    /// ADR-0012 2026-10-06 items 1 and 24: `verify_age` dates a unit's
+    /// evidence from FULL readbacks only. A quick confirm or quick verify
+    /// reads File 0, the front index and the seal — none of the unit's
+    /// bytes — so a passing one must not refresh the clock.
+    mod verify_age_counts_full_readbacks_only {
+        use super::*;
+
+        /// Unit `aged` in archive set `monthly` (verify every 30 days), one
+        /// current version completed-written to one sealed volume, with the
+        /// given `(verify_type, completed_at)` passed sessions on it.
+        fn setup(sessions: &[(&str, &str)]) -> Connection {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('monthly', 30)",
+                [],
+            )
+            .unwrap();
+            let set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status, archive_set_id)
+                 VALUES ('u-aged', 'aged', ?1, 'mtime_size', 1, 'active', ?2)",
+                params![tid, set_id],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('V-AGED', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss_id, snap_id, vol_id],
+            )
+            .unwrap();
+            for (verify_type, completed_at) in sessions {
+                conn.execute(
+                    "INSERT INTO verification_sessions (volume_id, verify_type, outcome, completed_at)
+                     VALUES (?1, ?2, 'passed', ?3)",
+                    params![vol_id, verify_type, completed_at],
+                )
+                .unwrap();
+            }
+            conn
+        }
+
+        fn verify_age_messages(conn: &Connection) -> Vec<String> {
+            let (_violations, warnings) =
+                collect_findings(conn, &Config::default(), Some("aged")).unwrap();
+            warnings
+                .into_iter()
+                .filter(|f| f.check == "verify_age")
+                .map(|f| f.message)
+                .collect()
+        }
+
+        fn days_ago(days: i64) -> String {
+            (chrono::Utc::now().naive_utc() - chrono::Duration::days(days))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        }
+
+        #[test]
+        fn a_quick_readback_alone_is_never_verified() {
+            let conn = setup(&[("quick", &days_ago(1))]);
+            assert_eq!(
+                verify_age_messages(&conn),
+                ["not verified within 30 days (last: never)"]
+            );
+        }
+
+        #[test]
+        fn a_newer_quick_readback_does_not_refresh_an_old_full_one() {
+            let old_full = days_ago(100);
+            let conn = setup(&[("full", &old_full), ("quick", &days_ago(1))]);
+            assert_eq!(
+                verify_age_messages(&conn),
+                [format!("not verified within 30 days (last: {old_full})")]
+            );
+        }
+
+        /// Positive control: a recent full readback is fresh evidence.
+        #[test]
+        fn a_recent_full_readback_is_fresh() {
+            let conn = setup(&[("full", &days_ago(2)), ("quick", &days_ago(1))]);
+            assert!(verify_age_messages(&conn).is_empty());
         }
     }
 

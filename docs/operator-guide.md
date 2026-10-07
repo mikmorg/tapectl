@@ -1018,7 +1018,7 @@ $ tapectl catalog locate family/letters
 | L8-0002 | sealed | ok        | offsite   | 1        | 1      | 2026-09-29 08:20:05 | yes         | -         | yes    | 0d ago   |
 +---------+--------+-----------+-----------+----------+--------+---------------------+-------------+-----------+--------+----------+
 
-note: "Verified" is this catalog's last-known record of each copy's most recent PASSED `volume verify` — not a check of the tape performed just now. "never" means no passed verification is on record, not that the copy is bad; an aged value does not mean the tape has since failed. Re-run `tapectl volume verify <label>` to refresh it.
+note: "Verified" is this catalog's last-known record of each copy's most recent PASSED full readback (a full `volume verify`, or a write's full confirm; a quick one reads none of the copy's bytes and does not count) — not a check of the tape performed just now. "never" means no passed full readback is on record, not that the copy is bad; an aged value does not mean the tape has since failed. Re-run `tapectl volume verify <label>` to refresh it.
 ```
 
 ## Safety Operations

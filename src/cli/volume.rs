@@ -2127,8 +2127,11 @@ struct VolumeRow {
     /// lose this tape, how thin does anything on it get".
     #[tabled(rename = "MIN COPIES", display_with = "display_copies")]
     copies: Option<i64>,
-    /// This volume's own most recent PASSED `verification_sessions` row
-    /// (raw timestamp; `None` = never verified). Deliberately a fresh
+    /// This volume's own most recent PASSED FULL `verification_sessions`
+    /// row (raw timestamp; `None` = never verified). A quick confirm or
+    /// quick verify reads none of the volume's bytes and never counts
+    /// (ADR-0012 2026-10-06 items 1 and 24); `volume info` lists every
+    /// session with its type. Deliberately a fresh
     /// per-volume query rather than `policy::evidence` (see
     /// `remaining_coverage_evidence`'s doc): that module's queries are
     /// scoped to a UNIT's coverage across many volumes and would require a
@@ -2214,7 +2217,8 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
                     WHERE cw2.volume_id = v.id AND cw2.status = 'completed'
                  ) per) AS copies,
                 (SELECT MAX(vs.completed_at) FROM verification_sessions vs
-                  WHERE vs.volume_id = v.id AND vs.outcome = 'passed') AS last_verified
+                  WHERE vs.volume_id = v.id AND vs.outcome = 'passed'
+                    AND vs.verify_type = 'full') AS last_verified
          FROM volumes v
          LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
          LEFT JOIN cartridges c ON c.id = cv.cartridge_id
@@ -2276,8 +2280,8 @@ struct WriteRow {
 }
 
 /// One `verification_sessions` row. Every outcome is shown here (unlike
-/// `VolumeRow::verified`, which is deliberately the latest PASSED session
-/// only) — a dossier's verification history is exactly the place a failed
+/// `VolumeRow::verified`, which is deliberately the latest PASSED full
+/// session only) — a dossier's verification history is exactly the place a failed
 /// or aborted attempt belongs.
 #[derive(Debug, Clone, Serialize)]
 struct VerificationRow {
@@ -2525,7 +2529,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     // Verification history: every session, every outcome (unlike
-    // `VolumeRow::verified`, which is the latest PASSED one only).
+    // `VolumeRow::verified`, which is the latest PASSED full one only).
     let mut verify_stmt = conn.prepare(
         "SELECT started_at, completed_at, verify_type, outcome,
                 slices_checked, slices_passed, slices_failed
@@ -3626,6 +3630,44 @@ mod tests {
                 Some("E01001L8_17757943"),
                 "a displaced volume must still name the cartridge it lived on"
             );
+        }
+
+        /// ADR-0012 2026-10-06 items 1 and 24: VERIFIED is the newest FULL
+        /// readback. A quick verify or quick confirm newer than it (L6-0001)
+        /// does not move it, and a volume with only quick ones (L6-0002) was
+        /// never verified — none of its bytes were read.
+        #[test]
+        fn a_quick_readback_does_not_count_as_verified() {
+            let conn = seed();
+            let id = |label: &str| -> i64 {
+                conn.query_row("SELECT id FROM volumes WHERE label = ?1", [label], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+            };
+            let before = volume_rows(&conn, None).unwrap();
+            let full_l6_0001 = before
+                .iter()
+                .find(|r| r.label == "L6-0001")
+                .unwrap()
+                .verified
+                .clone();
+            assert!(
+                full_l6_0001.is_some(),
+                "positive control: seeded full verify"
+            );
+            for label in ["L6-0001", "L6-0002"] {
+                conn.execute(
+                    "INSERT INTO verification_sessions (volume_id, verify_type, outcome, completed_at)
+                     VALUES (?1, 'quick', 'passed', datetime('now'))",
+                    [id(label)],
+                )
+                .unwrap();
+            }
+            let rows = volume_rows(&conn, None).unwrap();
+            let row = |label: &str| rows.iter().find(|r| r.label == label).unwrap();
+            assert_eq!(row("L6-0001").verified, full_l6_0001);
+            assert_eq!(row("L6-0002").verified, None);
         }
 
         /// Rule: `--status` narrows but is never the default filter, and it

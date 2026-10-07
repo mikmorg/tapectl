@@ -36,8 +36,10 @@ pub enum EvidenceKind {
 /// retired/consumed is excluded.
 ///
 /// For a `Tape` row, `last_verified` is that volume's most recent PASSED
-/// verification timestamp (`None` = never verified) and `deposited_at` /
-/// `location` are `None`.
+/// FULL readback (`None` = never verified) and `deposited_at` / `location`
+/// are `None`. A quick confirm or quick verify is not one: it reads File 0,
+/// the front index and the seal, none of the volume's data (ADR-0012
+/// 2026-10-06 items 1 and 24).
 ///
 /// For a `WarehouseDeposit` row, `last_verified` is ALWAYS `None` — by
 /// design, not by accident — and `deposited_at` carries the recorded
@@ -55,8 +57,8 @@ pub struct CoverageEvidence {
 
 /// The shared query behind [`remaining_coverage_evidence`] and
 /// [`per_volume_verification`]: one row per volume holding a completed
-/// write for `unit_id`, with that volume's most recent PASSED verification
-/// timestamp (`None` = never verified).
+/// write for `unit_id`, with that volume's most recent PASSED FULL
+/// readback (`None` = never verified; a quick one does not count).
 ///
 /// `only_eligible` selects which of the two callers' questions this
 /// answers:
@@ -73,8 +75,9 @@ pub struct CoverageEvidence {
 /// parameter (`Some` excludes the volume being retired/consumed by
 /// identity; `None` excludes nothing).
 ///
-/// `outcome = 'passed'` lives in the `LEFT JOIN`'s `ON` clause, not a
-/// `WHERE` — a `WHERE` filter on a LEFT-JOINed column would silently turn
+/// `outcome = 'passed'` and `verify_type = 'full'` live in the `LEFT
+/// JOIN`'s `ON` clause, not a `WHERE` — a `WHERE` filter on a LEFT-JOINed
+/// column would silently turn
 /// this back into an inner join and a volume with zero passed sessions
 /// would vanish instead of rendering as "never verified". This is the
 /// exact trap `cli::audit`'s `verify_age` query falls into (issue #91).
@@ -101,6 +104,7 @@ fn tape_rows(
          JOIN volumes v ON v.id = w.volume_id
          LEFT JOIN verification_sessions vs
                 ON vs.volume_id = v.id AND vs.outcome = 'passed'
+               AND vs.verify_type = 'full'
          WHERE s.unit_id = ?1 AND w.status = 'completed'
            {exclude_clause}
            {eligible_clause}
@@ -713,6 +717,38 @@ mod tests {
             vec!["V1", "V2"],
             "None must exclude nothing: {labels:?}"
         );
+    }
+
+    /// ADR-0012 2026-10-06 items 1 and 24: a quick confirm or quick verify
+    /// reads none of a volume's bytes, so it is not a verification for the
+    /// Tier-1 display. V1 has only a quick pass (never verified); V2 has an
+    /// old full pass and a newer quick one (the full one's age stands).
+    #[test]
+    fn a_quick_readback_is_not_a_verification() {
+        let (conn, unit_id, v1_id, v2_id) = setup_two_volume_unit();
+        for vol in [v1_id, v2_id] {
+            conn.execute(
+                "INSERT INTO verification_sessions (volume_id, verify_type, completed_at, outcome)
+                 VALUES (?1, 'quick', '2026-10-01 00:00:00', 'passed')",
+                params![vol],
+            )
+            .unwrap();
+        }
+        for evidence in [
+            remaining_coverage_evidence(&conn, unit_id, None).unwrap(),
+            per_volume_verification(&conn, unit_id).unwrap(),
+        ] {
+            let by_label: std::collections::HashMap<&str, Option<&str>> = evidence
+                .iter()
+                .map(|e| (e.volume_label.as_str(), e.last_verified.as_deref()))
+                .collect();
+            assert_eq!(by_label.get("V1"), Some(&None), "{evidence:?}");
+            assert_eq!(
+                by_label.get("V2"),
+                Some(&Some("2020-01-01 00:00:00")),
+                "{evidence:?}"
+            );
+        }
     }
 
     // --- issue #196: `per_volume_verification` (catalog locate's source) ---
