@@ -677,9 +677,16 @@ fn spawn<'scope, 'env, T: Send + 'scope>(
     name: &str,
     f: impl FnOnce() -> T + Send + 'scope,
 ) -> ScopedJoinHandle<'scope, T> {
+    // Issue #344: a stage works for the caller's contact, so what a tape
+    // device notes on it — a failed read's MTIOCGET status, on the tape-read
+    // thread — is that contact's.
+    let contact = crate::tape::mtget_journal::handle();
     std::thread::Builder::new()
         .name(name.to_string())
-        .spawn_scoped(s, f)
+        .spawn_scoped(s, move || {
+            let _for = contact.enter();
+            f()
+        })
         .unwrap_or_else(|e| panic!("cannot start the {name} thread: {e}"))
 }
 
@@ -1160,6 +1167,37 @@ mod tests {
         );
         assert!(delivered.sink.is_ok());
         assert_eq!(sink, vec![7u8; CHUNK * 2]);
+    }
+
+    /// Issue #344: the tape read runs on the `tapectl-tape-read` worker, and
+    /// the MTIOCGET reading a failed read notes there belongs to the contact
+    /// open on the CALLING thread. The worker carries that contact's buffer,
+    /// so the reading is kept, not noted into a thread with no contact.
+    #[test]
+    fn a_reading_noted_on_the_tape_read_thread_reaches_the_callers_contact() {
+        use crate::tape::mtget_journal;
+        let _ = mtget_journal::take();
+        mtget_journal::begin();
+        let mut pool = BufferPool::new(CHUNK, 2);
+        let mut sink = Vec::new();
+        let delivered: Delivered<()> = read_through(
+            &mut pool,
+            |_pipe| {
+                mtget_journal::note(
+                    mtget_journal::POINT_FAILURE,
+                    "/dev/nst9",
+                    Some("read"),
+                    Some(5),
+                    Ok(mtget_journal::MtStatus::default()),
+                );
+                Err(TapectlError::TapeIo("read: EIO".into()))
+            },
+            &mut sink,
+        );
+        assert!(delivered.produced.is_err());
+        let kept = mtget_journal::take();
+        assert_eq!(kept.len(), 1, "the worker's reading reached the contact");
+        assert_eq!(kept[0].command.as_deref(), Some("read"));
     }
 
     /// A sink that fails stops the producer at its next block — it does not

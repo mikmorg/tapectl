@@ -159,7 +159,7 @@ impl FakeTape {
     /// what the end-of-data case below the call keeps).
     fn refuse_unreadable(s: &State, file: usize) -> Result<()> {
         if s.unreadable.contains(&(file as u32)) || (file == 0 && s.files.is_empty()) {
-            return Err(io_error("read"));
+            return Err(read_failed());
         }
         Ok(())
     }
@@ -198,6 +198,20 @@ impl FakeTape {
 
 fn io_error(what: &str) -> TapectlError {
     TapectlError::TapeIo(format!("{what}: Input/output error (os error 5)"))
+}
+
+/// A read st fails with EIO — noted for the open contact as
+/// `TapeDevice::read_file_streaming`/`read_file_head` note theirs (issue
+/// #344), on whatever thread the read runs.
+fn read_failed() -> TapectlError {
+    crate::tape::mtget_journal::note(
+        crate::tape::mtget_journal::POINT_FAILURE,
+        "fake-tape",
+        Some("read"),
+        Some(5),
+        Ok(crate::tape::mtget_journal::MtStatus::default()),
+    );
+    io_error("read")
 }
 
 impl TapeOps for FakeTape {
@@ -274,7 +288,7 @@ impl TapeOps for FakeTape {
         for (i, block) in blocks.iter().enumerate().skip(start) {
             if fails && i > start {
                 s.head = (file, i);
-                return Err(io_error("read"));
+                return Err(read_failed());
             }
             sink.write_all(block)
                 .map_err(|e| TapectlError::TapeIo(format!("sink write: {e}")))?;
@@ -283,7 +297,7 @@ impl TapeOps for FakeTape {
         }
         if fails {
             s.head = (file, blocks.len());
-            return Err(io_error("read"));
+            return Err(read_failed());
         }
         s.head = (file + 1, 0);
         Ok((total, ReadEnd::Filemark))
