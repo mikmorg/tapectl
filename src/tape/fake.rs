@@ -100,6 +100,12 @@ pub(crate) struct State {
     /// release before 1.0.5 (#389). The positive control for the motion
     /// budgets (issue #416).
     pub position_fails: bool,
+    /// The medium holds this many stored bytes, then a write fails as st
+    /// fails one at the early-warning point: the blocks that fit are on
+    /// the tape, no filemark follows them, and the error is ENOSPC (issue
+    /// #416 item 13 — the end-of-tape path under `write_stream`, which no
+    /// real medium has run).
+    pub capacity: Option<u64>,
 }
 
 impl State {
@@ -354,6 +360,23 @@ impl TapeOps for FakeTape {
             bytes.resize(bytes.len().div_ceil(bs) * bs, 0);
             let padded = bytes.len() as u64;
             s.files.truncate(file);
+            if let Some(capacity) = s.capacity {
+                let used: u64 = s.files.iter().map(|f| f.len() as u64).sum();
+                let room = capacity.saturating_sub(used) / bs as u64 * bs as u64;
+                if padded > room {
+                    // `TapeDevice::write_stream`'s `write_error`: ENOSPC is
+                    // a full medium. The blocks before it are recorded.
+                    bytes.truncate(room as usize);
+                    let blocks = bytes.len() / bs;
+                    if blocks > 0 {
+                        s.files.push(bytes);
+                    }
+                    s.head = (file, blocks);
+                    return Err(TapectlError::MediumFull(
+                        "write: No space left on device (os error 28)".to_string(),
+                    ));
+                }
+            }
             s.files.push(bytes);
             s.head = (file + 1, 0);
             Ok(padded)
@@ -485,6 +508,23 @@ mod tests {
             .unwrap();
         assert_eq!(fake.travel(), BS as u64 + 5_000);
         assert_eq!(fake.tape_length(), BS as u64 + 5_000);
+    }
+
+    /// A medium with `capacity` records the blocks that fit of the write
+    /// that crosses it, writes no filemark, and fails with st's ENOSPC.
+    #[test]
+    fn a_write_past_the_capacity_records_what_fits_and_fails_enospc() {
+        let mut fake = FakeTape::with_files(Vec::new(), BS);
+        fake.state().capacity = Some(3 * BS as u64);
+        fake.write_stream(&mut &[1u8; BS][..], BS as u64, false)
+            .unwrap();
+        let err = fake
+            .write_stream(&mut &[2u8; 4 * BS][..], 4 * BS as u64, false)
+            .unwrap_err();
+        assert!(matches!(err, TapectlError::MediumFull(ref m) if m.contains("os error 28")));
+        let s = fake.state();
+        assert_eq!(s.files, vec![vec![1u8; BS], vec![2u8; 2 * BS]]);
+        assert_eq!(s.head, (1, 2), "inside the file: no filemark was written");
     }
 
     /// `position_fails` fails `MTIOCGET` and nothing else.

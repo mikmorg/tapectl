@@ -3737,6 +3737,72 @@ mod tests {
         assert_ne!(volume_status, "sealed");
     }
 
+    /// Issue #416 item 13: the same clean abort through the real
+    /// `TapeStore` over a tape that runs out the way st reports it — the
+    /// drive's ENOSPC from `write_stream` at the first slice's first block
+    /// — not MemStore's budget check above the device layer. No real
+    /// medium has run this path. (`FakeTape`'s own test covers a medium
+    /// that ends partway into a file.)
+    #[test]
+    fn enospc_from_the_drive_at_a_slice_aborts_unsealed() {
+        use crate::tape::fake::{FakeTape, Op};
+        let f = make_fixture();
+        let entries = &f.built.layout.entries;
+        let first_slice = entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+            .expect("the fixture has a slice");
+        let seal_position = entries.len() - 1;
+        let before: u64 = entries[..first_slice]
+            .iter()
+            .map(|e| e.on_tape_bytes(BS).unwrap())
+            .sum();
+        let fake = FakeTape::with_files(Vec::new(), BS as usize);
+        fake.state().capacity = Some(before);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let outcome = planned
+            .execute(&f.conn, &mut store)
+            .expect("a full medium is a clean abort, not a hard error");
+        assert!(
+            matches!(outcome, ExecuteOutcome::Aborted(_)),
+            "expected Aborted"
+        );
+
+        let s = fake.state();
+        assert_eq!(
+            s.files.len(),
+            first_slice,
+            "everything before the slice, and nothing of it"
+        );
+        assert!(
+            s.ops.contains(&Op::Write(first_slice as u32)),
+            "the slice's write reached the drive: {:?}",
+            s.ops
+        );
+        assert!(
+            !s.ops.contains(&Op::Write(seal_position as u32)),
+            "no seal marker is written: {:?}",
+            s.ops
+        );
+        drop(s);
+        assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["aborted"]);
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(volume_status, "sealed");
+    }
+
     // --- issue #401: an abandoned attempt never blocks the next one ---
 
     fn statuses_on(conn: &Connection, volume_id: i64) -> Vec<String> {
