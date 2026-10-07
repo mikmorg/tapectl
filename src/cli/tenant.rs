@@ -158,7 +158,9 @@ pub fn run(
                     println!(
                         "    {} [{}] {}  active={}",
                         key.alias,
-                        key.key_type,
+                        // Issue #363: `escrow` for the escrow key, as `key
+                        // list` shows it (#350); its stored type is `primary`.
+                        crate::cli::key::displayed_key_type(key),
                         &key.fingerprint[..20],
                         key.is_active,
                     );

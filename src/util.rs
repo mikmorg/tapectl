@@ -270,10 +270,162 @@ pub fn format_capacity_progress(bytes_written: i64, capacity_bytes: i64) -> Stri
     )
 }
 
+/// A file read once, front to back, that should not stay in the page cache
+/// (issue #417). Advises the kernel the access is sequential when opened,
+/// then drops each [`DropBehind::WINDOW`] the cursor has passed
+/// (`POSIX_FADV_DONTNEED`), so a terabyte read through it does not push
+/// everything else on the host — on home2, everything in Dom-0's cache —
+/// out of memory for data that is never read again.
+///
+/// Advice only: an `fadvise` that fails (a filesystem that ignores it, a
+/// non-regular file) changes nothing about what is read, so its errors are
+/// ignored. Use it only where nothing reads the same bytes again soon: the
+/// write path's read of a staged file is one (the next read of a slice is
+/// the next copy's write, hours later); a source file during `stage create`
+/// is not (dar and the hasher share one read of it through the page cache,
+/// issue #364), nor is a file just materialized and about to be written.
+pub struct DropBehind {
+    file: std::fs::File,
+    read: u64,
+    dropped: u64,
+}
+
+/// Test-only: the paths this thread opened through [`DropBehind::open`] or
+/// handed to [`drop_cached`], in order — how a test asserts that a path
+/// reads or writes through them, since the page cache itself is not
+/// portably observable.
+#[cfg(test)]
+pub(crate) mod page_cache_log {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static LOG: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(path: &Path) {
+        LOG.with(|l| l.borrow_mut().push(path.to_path_buf()));
+    }
+
+    pub(crate) fn take() -> Vec<PathBuf> {
+        LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+}
+
+/// Drop a file just written and synced from the page cache (issue #417):
+/// `POSIX_FADV_DONTNEED` over all of it. For a staged slice, whose next
+/// reader is a tape write that may be hours away. Only clean pages go, so
+/// call it after the file's `sync_all`; advice only, so it cannot fail.
+pub fn drop_cached(file: &std::fs::File, path: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    let _ = nix::fcntl::posix_fadvise(
+        file.as_raw_fd(),
+        0,
+        0,
+        nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+    );
+    #[cfg(test)]
+    page_cache_log::note(path);
+    #[cfg(not(test))]
+    let _ = path;
+}
+
+impl DropBehind {
+    /// How much is read between two drops: large enough that the advice
+    /// costs nothing next to the I/O, small enough to keep the footprint low.
+    pub const WINDOW: u64 = 64 * 1024 * 1024;
+
+    /// Open `path` for reading through a [`DropBehind`].
+    pub fn open(path: &std::path::Path) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        #[cfg(test)]
+        page_cache_log::note(path);
+        Ok(Self::new(file))
+    }
+
+    pub fn new(file: std::fs::File) -> Self {
+        use std::os::unix::io::AsRawFd;
+        let _ = nix::fcntl::posix_fadvise(
+            file.as_raw_fd(),
+            0,
+            0,
+            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+        );
+        DropBehind {
+            file,
+            read: 0,
+            dropped: 0,
+        }
+    }
+
+    /// Bytes read so far and bytes advised away so far.
+    pub fn progress(&self) -> (u64, u64) {
+        (self.read, self.dropped)
+    }
+
+    fn drop_to(&mut self, end: u64) {
+        use std::os::unix::io::AsRawFd;
+        if end > self.dropped {
+            let _ = nix::fcntl::posix_fadvise(
+                self.file.as_raw_fd(),
+                self.dropped as nix::libc::off_t,
+                (end - self.dropped) as nix::libc::off_t,
+                nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+            );
+            self.dropped = end;
+        }
+    }
+}
+
+impl Read for DropBehind {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read(buf)?;
+        self.read += n as u64;
+        // A window passed, or the end: everything read so far goes.
+        if n == 0 || self.read - self.dropped >= Self::WINDOW {
+            self.drop_to(self.read);
+        }
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Issue #417: the reader changes no byte, and advises the whole file
+    /// away by the end — in windows, not once per read.
+    #[test]
+    fn drop_behind_reads_every_byte_and_drops_what_it_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        let len = (DropBehind::WINDOW + DropBehind::WINDOW / 2) as usize;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+
+        let mut r = DropBehind::new(std::fs::File::open(&path).unwrap());
+        let mut buf = vec![0u8; 1 << 20];
+        let mut got = Vec::with_capacity(len);
+        let mut mid = None;
+        loop {
+            let n = r.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            if got.len() as u64 == DropBehind::WINDOW + (1 << 20) {
+                mid = Some(r.progress());
+            }
+        }
+        assert!(got == data, "the bytes are the file's");
+        assert_eq!(
+            mid,
+            Some((DropBehind::WINDOW + (1 << 20), DropBehind::WINDOW)),
+            "one window dropped once the cursor passed it, not the bytes since"
+        );
+        assert_eq!(r.progress(), (len as u64, len as u64), "all of it by EOF");
+    }
 
     fn direct_hash(data: &[u8]) -> String {
         let mut h = Sha256::new();

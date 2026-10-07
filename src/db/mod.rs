@@ -433,6 +433,11 @@ fn migrations() -> Migrations<'static> {
         // `.foreign_key_check()`. `migrate()` VACUUMs after it. See the
         // header.
         M::up(include_str!("migrations/030_paths_and_file_versions.sql")).foreign_key_check(),
+        // 031 indexes `events(action, timestamp)` (issue #417): `audit`'s
+        // Heir Kit check (`MAX(timestamp) ... WHERE action = ?`) walked the
+        // whole table. Index only, no rows touched, so no
+        // `.foreign_key_check()`.
+        M::up(include_str!("migrations/031_events_action_index.sql")),
     ])
 }
 
@@ -4158,10 +4163,12 @@ mod tests {
         };
 
         let conn = open(&path).unwrap();
+        let latest = user_version(&open_memory().unwrap());
+        assert!(latest >= 28);
         assert_eq!(
             user_version(&conn),
-            30,
-            "027, 028 (issue #386), 029 (issue #410) and 030 (issue #380)"
+            latest,
+            "027, then 028 (issue #386) and every later migration"
         );
         let freelist: i64 = conn
             .query_row("PRAGMA freelist_count", [], |r| r.get(0))
@@ -4538,5 +4545,76 @@ mod tests {
             })
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    /// Issue #417: `audit`'s Heir Kit check — the newest event of one action
+    /// — walked all of `events`. Migration 031's index on `(action,
+    /// timestamp)` makes it one seek. The plan is read before and after the
+    /// migration, so the "before" half is the old behaviour, seen.
+    #[test]
+    fn the_newest_event_of_an_action_is_an_index_seek() {
+        const Q: &str = "EXPLAIN QUERY PLAN \
+            SELECT MAX(timestamp) FROM events WHERE action = 'escrow_kit_generated'";
+        let plan = |conn: &Connection| -> String {
+            let mut stmt = conn.prepare(Q).unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.join("; ")
+        };
+        let mut conn = open_memory_at_version(28);
+        let before = plan(&conn);
+        assert!(
+            !before.contains("idx_events_action_timestamp"),
+            "positive control, before 031: {before}"
+        );
+        migrate_to(&mut conn, None).unwrap();
+        let after = plan(&conn);
+        assert!(
+            after.contains("USING COVERING INDEX idx_events_action_timestamp"),
+            "after 031: {after}"
+        );
+    }
+
+    /// `rusqlite_migration` numbers a migration by its position in
+    /// [`migrations`], not by its file name, so a file whose prefix is not
+    /// its position applies under another number than the one its header,
+    /// the docs and every later branch use. Two batches that each took "the
+    /// next number" would land that way; this refuses it, and a gap or a
+    /// file nothing includes.
+    #[test]
+    fn every_migration_file_is_named_for_its_position() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db");
+        let source = std::fs::read_to_string(dir.join("mod.rs")).unwrap();
+        let body = &source[source.find("fn migrations()").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let included: Vec<String> = body
+            .match_indices("include_str!(\"migrations/")
+            .map(|(i, m)| {
+                let rest = &body[i + m.len()..];
+                rest[..rest.find('"').unwrap()].to_string()
+            })
+            .collect();
+        for (i, name) in included.iter().enumerate() {
+            assert_eq!(
+                name[..3].parse::<usize>().unwrap(),
+                i + 1,
+                "{name} is migration {} in migrations()",
+                i + 1
+            );
+        }
+        let mut on_disk: Vec<String> = std::fs::read_dir(dir.join("migrations"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        on_disk.sort();
+        assert_eq!(on_disk, included, "every file, and only those, included in order");
+        assert_eq!(
+            user_version(&open_memory().unwrap()),
+            included.len() as i64,
+            "one migration per file"
+        );
     }
 }

@@ -136,7 +136,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`restore unit`](restore.md#tapectl-restore-unit) | Restore a unit from a volume |
 | &nbsp;&nbsp;[`restore volume`](restore.md#tapectl-restore-volume) | Restore several units from one volume in one pass over the tape |
 | &nbsp;&nbsp;[`restore file`](restore.md#tapectl-restore-file) | Restore a single file from a unit |
-| &nbsp;&nbsp;[`restore raw-volume`](restore.md#tapectl-restore-raw-volume) | Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path |
+| &nbsp;&nbsp;[`restore raw-volume`](restore.md#tapectl-restore-raw-volume) | Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`) |
 | [`export`](export.md) | Export encrypted slices to directory |
 | [`import`](import.md) | Import a pre-existing volume into the database |
 | [`quick-archive`](quick-archive.md) | Quick archive: create + stage + write in one flow |
@@ -153,4 +153,5 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`config check`](config.md#tapectl-config-check) | Check configuration validity |
 | [`host`](host.md) | This host's fitness to feed a tape drive (the quiet-host check) |
 | &nbsp;&nbsp;[`host check`](host.md#tapectl-host-check) | Is this host quiet enough to write a tape? |
+| [`status`](status.md) | What is running and how the last sessions ended, from the session logs alone: the live session's phase, progress, rate and ETA, and each recent session's outcome and phase timings. Opens no catalog and no config, so an account in the home's `[ops] group` can run it (`tapectl --home <service home> status`) without sudo |
 | [`completions`](completions.md) | Generate shell completions |

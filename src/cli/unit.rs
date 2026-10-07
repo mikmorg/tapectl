@@ -243,41 +243,24 @@ pub fn run(
             } else {
                 None
             };
-            let units = queries::list_units(conn, tenant_id, status.as_deref())?;
-
-            // If filtering by tag, do it in memory (simpler than a join query for now)
-            let units = if let Some(tag_filter) = tag {
-                units
-                    .into_iter()
-                    .filter(|u| {
-                        queries::get_tags_for_unit(conn, u.id)
-                            .unwrap_or_default()
-                            .contains(tag_filter)
-                    })
-                    .collect()
-            } else {
-                units
-            };
+            let listed = unit_list(conn, tenant_id, status.as_deref(), tag.as_deref())?;
 
             if json_output {
+                let units: Vec<&crate::db::models::Unit> = listed.iter().map(|l| &l.unit).collect();
                 println!("{}", serde_json::to_string_pretty(&units).unwrap());
-            } else if units.is_empty() {
+            } else if listed.is_empty() {
                 println!("no units found");
             } else {
-                let mut rows = Vec::new();
-                for u in &units {
-                    let tenant_name = queries::get_tenant_by_id(conn, u.tenant_id)?
-                        .map(|t| t.name)
-                        .unwrap_or_else(|| "?".to_string());
-                    let tags = queries::get_tags_for_unit(conn, u.id)?.join(", ");
-                    rows.push(UnitRow {
-                        name: u.name.clone(),
-                        status: u.status.clone(),
-                        tenant: tenant_name,
-                        path: u.current_path.clone().unwrap_or_default(),
-                        tags,
-                    });
-                }
+                let rows: Vec<UnitRow> = listed
+                    .into_iter()
+                    .map(|l| UnitRow {
+                        name: l.unit.name.clone(),
+                        status: l.unit.status.clone(),
+                        tenant: l.tenant,
+                        path: l.unit.current_path.clone().unwrap_or_default(),
+                        tags: l.tags.join(", "),
+                    })
+                    .collect();
                 println!("{}", Table::new(rows));
             }
         }
@@ -474,6 +457,61 @@ pub fn run(
     Ok(())
 }
 
+/// One `unit list` row: the unit, its tenant's name and its tags (sorted).
+struct ListedUnit {
+    unit: crate::db::models::Unit,
+    tenant: String,
+    tags: Vec<String>,
+}
+
+/// `unit list`'s rows, filtered by tenant, status and tag. Three queries
+/// whatever the number of units (issue #417: it was two more per unit) —
+/// the units, every tenant's name, every unit's tags — joined in memory.
+fn unit_list(
+    conn: &Connection,
+    tenant_id: Option<i64>,
+    status: Option<&str>,
+    tag: Option<&str>,
+) -> Result<Vec<ListedUnit>> {
+    use std::collections::HashMap;
+
+    let units = queries::list_units(conn, tenant_id, status)?;
+    let tenants: HashMap<i64, String> = conn
+        .prepare("SELECT id, name FROM tenants")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    // `ORDER BY t.name` within each unit, as `queries::get_tags_for_unit`
+    // orders one unit's tags.
+    let mut tags: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT ut.unit_id, t.name FROM unit_tags ut
+         JOIN tags t ON t.id = ut.tag_id
+         ORDER BY ut.unit_id, t.name",
+    )?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+        let (unit_id, name) = row?;
+        tags.entry(unit_id).or_default().push(name);
+    }
+
+    let mut out = Vec::new();
+    for u in units {
+        let unit_tags = tags.remove(&u.id).unwrap_or_default();
+        if tag.is_some_and(|t| !unit_tags.iter().any(|x| x == t)) {
+            continue;
+        }
+        let tenant = tenants
+            .get(&u.tenant_id)
+            .cloned()
+            .unwrap_or_else(|| "?".to_string());
+        out.push(ListedUnit {
+            unit: u,
+            tenant,
+            tags: unit_tags,
+        });
+    }
+    Ok(out)
+}
+
 /// Resolve a unit by name or path.
 fn resolve_unit(conn: &Connection, name_or_path: &str) -> Result<crate::db::models::Unit> {
     // Try by name first
@@ -611,6 +649,94 @@ mod tests {
         let mut ours: Vec<String> = UNIT_STATUSES.iter().map(|s| s.to_string()).collect();
         ours.sort();
         assert_eq!(ours, crate::db::live_status_check("units"));
+    }
+
+    /// Issue #417: `unit list` ran two queries per unit (its tenant, its
+    /// tags). The statements it prepares are counted through SQLite's
+    /// authorizer (one `SELECT` action per prepared SELECT) for 3 units and
+    /// for 30, and must not grow with the units; the rows must be the same.
+    #[test]
+    fn unit_list_does_not_query_per_unit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('fam', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO tags (name) VALUES ('photos'), ('tax')", [])
+            .unwrap();
+        let add = |n: usize| {
+            for i in 0..n {
+                conn.execute(
+                    "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                     VALUES (?1, ?2, 1, ?3, 'active')",
+                    params![
+                        format!("uuid-{i:03}"),
+                        format!("u{i:03}"),
+                        format!("/d/{i}")
+                    ],
+                )
+                .unwrap();
+                let unit_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO unit_tags (unit_id, tag_id) VALUES (?1, ?2)",
+                    params![unit_id, 1 + (i % 2) as i64],
+                )
+                .unwrap();
+            }
+        };
+        let selects = |conn: &Connection| -> (usize, Vec<(String, String, String)>) {
+            let n = Arc::new(AtomicUsize::new(0));
+            let counter = n.clone();
+            conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(ctx.action, rusqlite::hooks::AuthAction::Select) {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                rusqlite::hooks::Authorization::Allow
+            }))
+            .unwrap();
+            let rows = unit_list(conn, None, None, None).unwrap();
+            conn.authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .unwrap();
+            let rows = rows
+                .into_iter()
+                .map(|l| (l.unit.name, l.tenant, l.tags.join(",")))
+                .collect();
+            (n.load(Ordering::SeqCst), rows)
+        };
+
+        add(3);
+        let (few, rows) = selects(&conn);
+        assert_eq!(
+            rows[..2],
+            [
+                ("u000".into(), "fam".into(), "photos".into()),
+                ("u001".into(), "fam".into(), "tax".into())
+            ]
+        );
+        conn.execute("DELETE FROM unit_tags", []).unwrap();
+        conn.execute("DELETE FROM units", []).unwrap();
+        add(30);
+        let (many, rows) = selects(&conn);
+        assert_eq!(rows.len(), 30);
+        assert!(few > 0, "positive control: the authorizer counts SELECTs");
+        assert_eq!(
+            few, many,
+            "unit list must prepare the same statements for 3 units as for 30"
+        );
+
+        // The tag filter keeps the units carrying that tag, in name order.
+        let tax = unit_list(&conn, None, None, Some("tax")).unwrap();
+        assert_eq!(tax.len(), 15);
+        assert!(tax.iter().all(|l| l.tags == ["tax"]));
+        assert!(unit_list(&conn, None, None, Some("none"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -15,7 +15,7 @@ tapectl restore [OPTIONS] <COMMAND>
 - [`unit`](#tapectl-restore-unit) — Restore a unit from a volume
 - [`volume`](#tapectl-restore-volume) — Restore several units from one volume in one pass over the tape
 - [`file`](#tapectl-restore-file) — Restore a single file from a unit
-- [`raw-volume`](#tapectl-restore-raw-volume) — Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path
+- [`raw-volume`](#tapectl-restore-raw-volume) — Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`)
 
 ### tapectl restore unit
 
@@ -84,7 +84,7 @@ tapectl restore file [OPTIONS] --file <FILE> --unit <UNIT> --from <FROM> --to <T
 
 ### tapectl restore raw-volume
 
-Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path
+Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path. --positions and --only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `--only restore_sh`)
 
 ```text
 tapectl restore raw-volume [OPTIONS] --to <TO>
@@ -95,4 +95,6 @@ tapectl restore raw-volume [OPTIONS] --to <TO>
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--to <TO>` *(required)* — Destination directory
 - `--from <FROM>` — Refuse unless the tape's own reported label matches (wrong-tape guard) — not a database lookup
+- `--positions <N>` — Dump only the files at these tape positions (comma-separated or repeated; File 0 is the ID thunk, 2 RESTORE.sh, 3 the front index). With --only, a file either names is dumped
+- `--only <TYPE>` — Dump only the files of these front-index types (comma-separated or repeated): id_thunk, system_guide, restore_sh, front_index, tenant_envelope, operator_envelope, operator_envelope_backup, data_slice, seal_marker
 

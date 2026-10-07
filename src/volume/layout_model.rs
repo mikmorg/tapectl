@@ -395,6 +395,22 @@ pub enum LayoutError {
     GeneratedZoneInconsistent { position: i32, message: String },
     #[error("RESTORE.sh failed `bash -n`: {0}")]
     RestoreScriptSyntaxError(String),
+    /// A signal stopped the full hash of the staged slices (`--prewrite-hash`)
+    /// before it finished (#404's follow-up). Nothing was compared after this
+    /// point, so it is reported once, as where the check stopped, and the
+    /// caller turns it into `TapectlError::Interrupted`: a stop, not a
+    /// failure of the slices.
+    #[error("the full hash of the staged slices stopped at file {position} of {files}")]
+    Interrupted { position: i32, files: usize },
+}
+
+impl LayoutError {
+    /// The [`Self::Interrupted`] among `errs`, if a signal stopped the
+    /// validation — the one error that is not a finding about the Layout.
+    pub fn interruption(errs: &[LayoutError]) -> Option<&LayoutError> {
+        errs.iter()
+            .find(|e| matches!(e, LayoutError::Interrupted { .. }))
+    }
 }
 
 /// The complete file plan for one volume.
@@ -542,8 +558,25 @@ impl Layout {
             if slice_check != SliceCheck::FullHash {
                 continue;
             }
+            // #404's follow-up: the full hash reads every staged byte —
+            // hours on a full cartridge, before the drive is even opened —
+            // so a signal stops it between slices and inside one
+            // (`hash_file`), and nothing after that point is checked. Not
+            // cleared here: the caller reports the stop and the process ends.
+            let interrupted = LayoutError::Interrupted {
+                position: e.position,
+                files,
+            };
+            if crate::signal::is_interrupted() {
+                errs.push(interrupted);
+                return;
+            }
             crate::progress::item(format!("hashing file {} of {files}", e.position));
             match hash_file(path) {
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    errs.push(interrupted);
+                    return;
+                }
                 Ok(actual) if &actual == expected => {}
                 Ok(actual) => errs.push(LayoutError::SliceChecksumMismatch {
                     path: path.clone(),
@@ -608,6 +641,13 @@ impl Layout {
                         expected: expected_hash.clone(),
                         actual,
                     }),
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                        errs.push(LayoutError::Interrupted {
+                            position: e.position,
+                            files: self.entries.len(),
+                        });
+                        return;
+                    }
                     Err(err) => errs.push(LayoutError::Io {
                         path: path.clone(),
                         message: err.to_string(),
@@ -653,12 +693,27 @@ impl Layout {
 /// Streamed sha256 of a file (never buffers the whole file — respects the H9
 /// streaming direction). `pub(crate)` so `build.rs` can reuse it rather than
 /// duplicating a streaming-hash loop (plan T5b).
+/// The sha256 of `path`, read in 128 KiB chunks. A signal (#404) stops it
+/// between chunks with an error of kind [`std::io::ErrorKind::Interrupted`],
+/// so a multi-GiB slice does not hold a Ctrl-C off until it is done.
 pub(crate) fn hash_file(path: &Path) -> std::io::Result<String> {
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 128 * 1024];
     loop {
-        let n = f.read(&mut buf)?;
+        if crate::signal::is_interrupted() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "stopped by a signal",
+            ));
+        }
+        // EINTR from a signal that did not set the flag is retried, as
+        // `read_to_end` would; one that did is answered at the top.
+        let n = match f.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             break;
         }
@@ -828,6 +883,56 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| matches!(e, LayoutError::SliceChecksumMismatch { .. })));
+    }
+
+    /// #404's follow-up: `--prewrite-hash` reads every staged byte before the
+    /// drive opens — hours — and a signal used to wait for all of it. Now it
+    /// stops, and says it stopped rather than passing or failing the slices.
+    /// Before the change this validate returned `Ok` (the slice is good).
+    #[test]
+    fn a_signal_stops_the_full_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s1.age");
+        let bytes = b"encrypted slice bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let entry = LayoutEntry {
+            position: 4,
+            kind: ZoneKind::Slice { stage_slice_id: 1 },
+            size_bytes: Some(bytes.len() as u64),
+            sha256: Some(sha_hex(bytes)),
+            source: ContentSource::Staged(path.clone()),
+        };
+        // Positive control: unsignalled, the good slice passes the full hash.
+        assert!(layout_with(vec![entry.clone()], 10 * BS, 0)
+            .validate(&keys_ok(&[]), SliceCheck::FullHash)
+            .is_ok());
+
+        crate::signal::interrupt_this_thread(true);
+        let errs = layout_with(vec![entry.clone()], 10 * BS, 0)
+            .validate(&keys_ok(&[]), SliceCheck::FullHash)
+            .unwrap_err();
+        // Inside one slice too: `hash_file` itself stops between chunks.
+        let mid = hash_file(&path).unwrap_err();
+        // The size-only default reads no bytes and has nothing to stop.
+        let size_only =
+            layout_with(vec![entry], 10 * BS, 0).validate(&keys_ok(&[]), SliceCheck::Size);
+        crate::signal::interrupt_this_thread(false);
+
+        assert!(
+            matches!(
+                LayoutError::interruption(&errs),
+                Some(LayoutError::Interrupted { position: 4, .. })
+            ),
+            "{errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| matches!(e, LayoutError::SliceChecksumMismatch { .. })),
+            "a stop is not a finding about the slice: {errs:?}"
+        );
+        assert_eq!(mid.kind(), std::io::ErrorKind::Interrupted);
+        assert!(size_only.is_ok());
     }
 
     #[test]

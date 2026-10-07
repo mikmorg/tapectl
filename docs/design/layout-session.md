@@ -298,7 +298,7 @@ Rules that hold in every path:
   Interrupted → resume revalidates and re-confirms (confirm is idempotent; no
   dedicated state needed). A full (integrity-tier) readback keeps a
   **checkpoint** per file as it goes (#410, `readback_checkpoints`, migration
-  032): each file that hashed to its front-index claim is recorded with that
+  029): each file that hashed to its front-index claim is recorded with that
   claim and the hash of File 3's true bytes. A re-entered full confirm whose
   volume's latest `verification_sessions` row is a full one that never
   finished (`in_progress` or `aborted`) re-reads the seal marker and File 3 —

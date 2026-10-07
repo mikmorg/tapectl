@@ -1428,14 +1428,30 @@ tapectl volume resume L6-0003 --device "$TAPE"
 `volume resume` explains itself when there is nothing it can pick up:
 
 - ``has a `planned` write session, not an interrupted one: … nothing was ever
-  written to tape``: clear it with `tapectl volume abort <label>`, then run
-  `volume write` again.
+  written to tape``: clear it with `tapectl volume abort <label>`, then write
+  the batch under a NEW label on the same cartridge (`volume init <new>
+  --force`, then `volume write <new>`). The aborted label cannot be written
+  again: its aborted `writes` rows stay, and `writes` allows one row per stage
+  set and volume. File 0 still names the old label, so init refuses without
+  `--force`; with it, init marks the old volume `erased`.
 - ``has an `in_progress` write session … ANOTHER PROCESS IS WRITING THIS TAPE
   RIGHT NOW``: tapectl turns crashed sessions into `interrupted` whenever it
   opens the database, so a row still `in_progress` means a writer is live.
   Find it and do not start a second one.
 - `has no write sessions at all` / `its write sessions are all resolved`: use
   `volume write`.
+
+Under `scripts/first-run.sh`, re-run step 13 with the same label
+(`--from 13 --label <label>`): it finds the interrupted session, offers the
+resume, and then runs the verify, audit, shelf and Heir Kit steps the first
+run never reached (`docs/install.md`, §5).
+
+After a power cut the same holds: resume first, never re-initialise the
+cartridge. A cut after the seal leaves the seal on the medium (it is written
+with a synchronous filemark, which flushes the drive's buffer before the
+catalog records it), and `volume resume` re-confirms it. What each point of
+failure costs is tabled in
+[design/threat-model.md §3](design/threat-model.md#3-power-the-baseline).
 
 ### The write seems stuck: nothing moves
 
@@ -1497,6 +1513,19 @@ longer hashes to the one those files were checked against, or if anything
 else verified the volume in between (only the volume's latest readback is
 continued). A resume without `--full-confirm` runs the quick confirm and
 leaves the full readback to `volume verify`.
+
+`volume write --prewrite-hash` stops too, inside the full hash of the staged
+slices (`… the full hash of the staged slices stopped at file N of M, before
+the tape was opened`). Nothing was written and no session was recorded, so
+there is nothing to resume: run the same `volume write` again. A `volume
+resume --prewrite-hash` stopped the same way says so (`volume resume: … the full
+hash of the staged slices stopped at file N of M, before anything was
+written`), writes nothing and leaves the session as it was; run the resume
+again.
+
+Output to a pipe whose reader has gone (`tapectl … | head`, or a `| tee`
+killed by the same Ctrl-C) is dropped rather than ending the command: it
+finishes, and exits with its own status.
 
 ### A real end of tape during the write
 
@@ -1843,7 +1872,7 @@ remaining one with `restore unit`.
 
 ```text
 error: unit "<unit>" version <n> has no file "<file>" in the catalog's record of what it archived, so the tape was
-not touched. A path is relative to the unit's root and matched exactly; `tapectl catalog search <words of the name>`
+not touched. A path is relative to the unit's root and matched exactly; `tapectl catalog search "<words of the name>"`
 finds one, and `tapectl catalog ls <unit>` lists the newest version's files.
 ```
 
@@ -1852,7 +1881,7 @@ opened. Give the path relative to the unit's root, with no leading `/` or
 `./`, exactly as `catalog ls` prints it:
 
 ```bash
-tapectl catalog search letter mum
+tapectl catalog search "letter mum"
 tapectl catalog ls family/letters
 ```
 
@@ -2180,7 +2209,7 @@ tapectl summary
   Tenants:    2 (the operator not counted)
   Units:      4 active
   Snapshots:  4
-  Volumes:    2 holding data (retired, erased and quarantined not counted)
+  Volumes:    2 holding data (unwritten, retired, erased and quarantined not counted)
   Writes:     8 completed
   Total data: 7.0 MiB on tape
   Staging:    4 stage set(s) held, none owe a copy of their own version (`tapectl staging clean` decides which can be released)

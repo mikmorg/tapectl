@@ -21,7 +21,6 @@ const MTWEOF: i16 = 5;
 const MTWEOFI: i16 = 35;
 const MTSETBLK: i16 = 20;
 const MTFSF: i16 = 1;
-const MTEOM: i16 = 12;
 const MTCOMP: i16 = 32; // MTCOMPRESSION
 
 #[repr(C)]
@@ -77,7 +76,6 @@ fn mt_op_name(op: i16, count: i32) -> String {
         MTWEOFI => "filemark".to_string(),
         MTSETBLK => format!("set block size {count}"),
         MTFSF => format!("space forward {count} file(s)"),
-        MTEOM => "space to end of data".to_string(),
         MTCOMP => "set compression".to_string(),
         other => format!("ioctl op {other} count {count}"),
     }
@@ -183,11 +181,6 @@ impl TapeDevice {
         self.mt_ioctl(MTFSF, count)
     }
 
-    /// Seek to end of media (after last file mark).
-    pub fn seek_eom(&self) -> Result<()> {
-        self.mt_ioctl(MTEOM, 0)
-    }
-
     /// Get current tape position.
     pub fn get_position(&self) -> Result<TapePosition> {
         let mut mtget = MtGet::default();
@@ -204,74 +197,11 @@ impl TapeDevice {
         })
     }
 
-    /// Write data to tape, padding the last block to block_size if needed.
-    /// Returns the number of bytes written (including padding).
-    pub fn write_data(&mut self, data: &[u8]) -> Result<usize> {
-        if self.block_size == 0 {
-            // Variable block mode — write in 512KB chunks
-            let chunk = 512 * 1024;
-            let mut offset = 0;
-            while offset < data.len() {
-                let end = (offset + chunk).min(data.len());
-                self.file
-                    .write_all(&data[offset..end])
-                    .map_err(|e| TapectlError::TapeIo(format!("write: {e}")))?;
-                offset = end;
-            }
-            Ok(data.len())
-        } else {
-            // Fixed block mode — pad last block
-            let bs = self.block_size;
-            let padded_len = data.len().div_ceil(bs) * bs;
-            let mut buf = data.to_vec();
-            buf.resize(padded_len, 0);
-            self.file
-                .write_all(&buf)
-                .map_err(|e| TapectlError::TapeIo(format!("write: {e}")))?;
-            Ok(padded_len)
-        }
-    }
-
-    /// Read one "file" from tape (all data until the next file mark).
-    /// In fixed block mode, reads blocks until a file mark is hit (read returns 0).
-    pub fn read_file(&mut self) -> Result<Vec<u8>> {
-        let mut data = Vec::new();
-        let read_size = if self.block_size > 0 {
-            self.block_size
-        } else {
-            1024 * 1024
-        };
-        let mut buf = vec![0u8; read_size];
-        loop {
-            match self.file.read(&mut buf) {
-                Ok(0) => break, // file mark
-                Ok(n) => data.extend_from_slice(&buf[..n]),
-                Err(e) if e.raw_os_error() == Some(28) => break, // ENOSPC
-                Err(e) => return Err(TapectlError::TapeIo(format!("read: {e}"))),
-            }
-        }
-        Ok(data)
-    }
-
-    /// Write data + file mark (immediate).
-    pub fn write_file_with_mark(&mut self, data: &[u8]) -> Result<usize> {
-        let written = self.write_data(data)?;
-        self.write_filemark_immediate()?;
-        Ok(written)
-    }
-
-    /// Write data + synchronous file mark (for final files).
-    pub fn write_file_with_sync_mark(&mut self, data: &[u8]) -> Result<usize> {
-        let written = self.write_data(data)?;
-        self.write_filemark_sync()?;
-        Ok(written)
-    }
-
     /// Stream-write `len` bytes from `src` in `block_size` chunks, zero-padding
     /// the final partial block to the block boundary, followed by a file mark
-    /// (synchronous if `sync`). Unlike `write_data`/`write_file_with_mark`
-    /// (whole-buffer, kept intact for the v1 read/write paths), peak memory
-    /// here is one block, never `len` (the H9 streaming requirement,
+    /// (synchronous if `sync`). Peak memory is one block, never `len` (the
+    /// H9 streaming requirement; the whole-buffer v1 writers it replaced are
+    /// gone, issue #417,
     /// `docs/design/volume-format-v2.md` §7 / layout-session.md's Store seam).
     /// Returns the number of bytes committed to the medium including padding
     /// (`layout_model::pad_to_blocks(len, block_size)`).
@@ -320,13 +250,12 @@ impl TapeDevice {
 
     /// Stream-read one "file" from tape (all data until the next file mark),
     /// writing each block straight to `sink` as it arrives instead of
-    /// accumulating in memory (unlike `read_file`, kept intact for the v1
-    /// paths). Returns the total bytes read — the on-tape (padded) length;
-    /// trimming to the true size is the caller's job, since only the front
-    /// index knows it — and how the read ended. Same block-mode /
-    /// ENOSPC-as-filemark reading convention as `read_file`; the [`ReadEnd`]
-    /// says which of the two it was, because they leave the head in
-    /// different places (issue #389).
+    /// accumulating in memory. Returns the total bytes read — the on-tape
+    /// (padded) length; trimming to the true size is the caller's job, since
+    /// only the front index knows it — and how the read ended. A read of 0
+    /// is the filemark, and `ENOSPC` is treated as the end of the file; the
+    /// [`ReadEnd`] says which of the two it was, because they leave the head
+    /// in different places (issue #389).
     pub fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
         let mut total = 0u64;
         let read_size = if self.block_size > 0 {

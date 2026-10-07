@@ -162,6 +162,10 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
     // check will actually use. Display only; validation is `report`'s.
     let host_check = loaded.map(|cfg| (cfg.host_check.is_some(), cfg.host_check()));
 
+    // Issue #393: what an `[ops] group` lets another account see, and what
+    // is not yet set up for it. Advisory, like the scans above.
+    let ops_lines = describe_ops(paths, loaded.and_then(|cfg| cfg.ops.as_ref()));
+
     if json_output {
         print_json(
             &report,
@@ -176,6 +180,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             &unsupported_compression_hits,
             &capacity_override_hits,
             host_check.as_ref(),
+            &ops_lines,
         );
     } else {
         print_human(
@@ -192,6 +197,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             &unsupported_compression_hits,
             &capacity_override_hits,
             host_check.as_ref(),
+            &ops_lines,
         );
     }
 
@@ -216,6 +222,7 @@ fn print_json(
     unsupported_compression_hits: &[crate::policy::compression_capability::UnsupportedCompressionHit],
     capacity_override_hits: &[&str],
     host_check: Option<&(bool, crate::config::HostCheckConfig)>,
+    ops_lines: &[String],
 ) {
     let shadowing_json: Vec<_> = shadowing_hits
         .iter()
@@ -356,6 +363,7 @@ fn print_json(
                 "table_present": present,
                 "effective": hc,
             })),
+            "ops": ops_lines,
         })
     );
 }
@@ -375,6 +383,7 @@ fn print_human(
     unsupported_compression_hits: &[crate::policy::compression_capability::UnsupportedCompressionHit],
     capacity_override_hits: &[&str],
     host_check: Option<&(bool, crate::config::HostCheckConfig)>,
+    ops_lines: &[String],
 ) {
     if report.valid {
         println!("config: valid");
@@ -462,6 +471,80 @@ fn print_human(
     if let Some((present, hc)) = host_check {
         println!("{}", describe_host_check(*present, hc));
     }
+    for line in ops_lines {
+        println!("{line}");
+    }
+}
+
+/// `config check`'s lines on the `[ops] group` (issue #393): what the group
+/// can see, and every way the home is not yet as that needs. Advisory: an
+/// ops group that is not set up only hides the logs from it, so nothing
+/// here changes the exit code. Pure but for reading the filesystem and this
+/// process's groups.
+pub(crate) fn describe_ops(
+    paths: &TapectlPaths,
+    ops: Option<&crate::config::OpsConfig>,
+) -> Vec<String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // No table: the private default, nothing to report.
+    let Some(ops) = ops else {
+        return Vec::new();
+    };
+    let name = ops.group.as_str();
+    let Some(group) = nix::unistd::Group::from_name(name).ok().flatten() else {
+        return vec![format!(
+            "warning: ops: [ops] group \"{name}\" does not exist — create it (groupadd \
+             {name}) and add the service user and the operator's account to it"
+        )];
+    };
+    let mut lines = vec![format!(
+        "ops: group \"{name}\" may read the session logs (`tapectl --home {} status`), \
+         and nothing else in the home",
+        paths.home.display()
+    )];
+    let gid = group.gid;
+    let member = nix::unistd::getegid() == gid
+        || nix::unistd::getgroups()
+            .map(|g| g.contains(&gid))
+            .unwrap_or(false);
+    if !member {
+        lines.push(format!(
+            "warning: ops: this user is not a member of \"{name}\", so it cannot give the home \
+             and logs/ that group — usermod -aG {name} <service user>, then log in again"
+        ));
+    }
+    for (dir, want) in [(&paths.home, 0o710u32), (&paths.logs_dir, 0o2750)] {
+        match std::fs::metadata(dir) {
+            Ok(m) => {
+                let mode = m.permissions().mode() & 0o7777;
+                if m.gid() != gid.as_raw() || mode != want {
+                    lines.push(format!(
+                        "warning: ops: {} is mode {mode:04o}, group {}; wants {want:04o}, group \
+                         \"{name}\" (set on the next tapectl command run as the service user)",
+                        dir.display(),
+                        m.gid()
+                    ));
+                }
+            }
+            Err(e) => lines.push(format!("warning: ops: {}: {e}", dir.display())),
+        }
+    }
+    // Logs written before the group was set stay 0600: name how many.
+    if let Ok(entries) = std::fs::read_dir(&paths.logs_dir) {
+        let private = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".log"))
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.gid() != gid.as_raw() || m.permissions().mode() & 0o040 == 0)
+            .count();
+        if private > 0 {
+            lines.push(format!(
+                "ops: {private} older session log(s) are not readable by \"{name}\" (written \
+                 before the group was set); `tapectl status` names them unreadable"
+            ));
+        }
+    }
+    lines
 }
 
 /// `config check`'s one line on the quiet-host limits in force (ADR-0012,

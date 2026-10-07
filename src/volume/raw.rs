@@ -60,6 +60,62 @@ impl RawRestoreReport {
     }
 }
 
+/// Which files a `restore raw-volume` dumps (issue #417). Empty = every
+/// file, the command's original behaviour; otherwise a file is dumped when
+/// its position is listed OR its front-index type is (a union, so `--only
+/// restore_sh --positions 5` takes both). A full dump of a full cartridge is
+/// a terabyte; the heir who wanted RESTORE.sh needed 50 KB of it.
+#[derive(Debug, Clone, Default)]
+pub struct RawSelection {
+    pub positions: Vec<i32>,
+    pub types: Vec<String>,
+}
+
+/// The type labels a front index uses (`layout_model::ZoneKind::type_label`),
+/// the closed set `--only` accepts.
+pub const RAW_TYPES: &[&str] = &[
+    "id_thunk",
+    "system_guide",
+    "restore_sh",
+    "front_index",
+    "tenant_envelope",
+    "operator_envelope",
+    "operator_envelope_backup",
+    "data_slice",
+    "seal_marker",
+];
+
+impl RawSelection {
+    /// Every file.
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    fn is_all(&self) -> bool {
+        self.positions.is_empty() && self.types.is_empty()
+    }
+
+    fn selects(&self, entry: &format::ParsedIndexEntry) -> bool {
+        self.is_all()
+            || self.positions.contains(&entry.position)
+            || self.types.contains(&entry.type_label)
+    }
+
+    /// Refuse a type outside [`RAW_TYPES`] by name, before the tape is
+    /// touched: a misspelt `--only` would otherwise dump nothing and pass.
+    pub fn check_types(&self) -> Result<()> {
+        for t in &self.types {
+            if crate::volume::layout_model::ZoneKind::from_type_label(t).is_none() {
+                return Err(TapectlError::Other(format!(
+                    "--only {t}: not a file type a front index uses; one of {}",
+                    RAW_TYPES.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Dump every file off a tape verbatim into `dest`, using only what File 0
 /// (the ID thunk) and File 3 (the front index) self-report. No `Connection`,
 /// no DB lookup of any kind.
@@ -83,6 +139,19 @@ pub fn restore_raw(
     dest: &Path,
     expect_label: Option<&str>,
 ) -> Result<RawRestoreReport> {
+    restore_raw_selected(store, dest, expect_label, &RawSelection::all())
+}
+
+/// [`restore_raw`], dumping only the files `selection` names (issue #417).
+/// A listed position the front index does not have is refused after File 3
+/// is read and before anything is written.
+pub fn restore_raw_selected(
+    store: &mut dyn Store,
+    dest: &Path,
+    expect_label: Option<&str>,
+    selection: &RawSelection,
+) -> Result<RawRestoreReport> {
+    selection.check_types()?;
     // File 0: the ID thunk. Small and bounded (plain TOML text), so buffering
     // it into a Vec here (like `volume_identify` does) is fine — only the
     // per-content-file loop below needs to stream.
@@ -108,6 +177,21 @@ pub fn restore_raw(
     store.read_file(pointers.front_index as u32, &mut fi_bytes)?;
     let fi_text = String::from_utf8_lossy(&fi_bytes).to_string();
     let entries = format::parse_front_index(&fi_text)?;
+    for p in &selection.positions {
+        if !entries.iter().any(|e| e.position == *p) {
+            return Err(TapectlError::Other(format!(
+                "--positions {p}: this tape's front index has no file at position {p} \
+                 (it lists {} files, positions {}..={})",
+                entries.len(),
+                entries.first().map_or(0, |e| e.position),
+                entries.last().map_or(0, |e| e.position),
+            )));
+        }
+    }
+    let entries: Vec<_> = entries
+        .into_iter()
+        .filter(|e| selection.selects(e))
+        .collect();
 
     fs::create_dir_all(dest)?;
 
@@ -332,6 +416,87 @@ pub(crate) mod tests {
         assert!(tmp.path().join("0000_id_thunk.bin").exists());
         assert!(tmp.path().join("0003_front_index.bin").exists());
         assert!(tmp.path().join("0005_seal_marker.bin").exists());
+    }
+
+    /// Issue #417: `--only`/`--positions` dump only what they name — an heir
+    /// fetching RESTORE.sh no longer dumps every slice of a full cartridge.
+    #[test]
+    fn a_selection_dumps_only_the_files_it_names() {
+        let data = b"slice bytes".to_vec();
+        let tmp = TempDir::new().unwrap();
+        let mut store = build_synthetic_tape("RAWSEL", &data);
+        let only_script = RawSelection {
+            positions: vec![],
+            types: vec!["restore_sh".into()],
+        };
+        let report = restore_raw_selected(&mut store, tmp.path(), None, &only_script).unwrap();
+        assert_eq!(report.files_dumped, 1);
+        assert_eq!(report.files[0].position, 2);
+        assert!(report.all_verified());
+        let names: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["0002_restore_sh.bin"]);
+
+        // A union: a type and a position.
+        let tmp = TempDir::new().unwrap();
+        let mut store = build_synthetic_tape("RAWSEL", &data);
+        let both = RawSelection {
+            positions: vec![0],
+            types: vec!["data_slice".into()],
+        };
+        let report = restore_raw_selected(&mut store, tmp.path(), None, &both).unwrap();
+        let got: Vec<(i32, &str)> = report
+            .files
+            .iter()
+            .map(|f| (f.position, f.type_label.as_str()))
+            .collect();
+        assert_eq!(got, [(0, "id_thunk"), (4, "data_slice")]);
+        assert_eq!(
+            fs::read(tmp.path().join("0004_data_slice.bin")).unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn a_selection_naming_nothing_on_the_tape_is_refused_before_dumping() {
+        let data = b"slice bytes".to_vec();
+        let tmp = TempDir::new().unwrap();
+        let mut store = build_synthetic_tape("RAWSEL", &data);
+        let err = restore_raw_selected(
+            &mut store,
+            tmp.path(),
+            None,
+            &RawSelection {
+                positions: vec![99],
+                types: vec![],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no file at position 99"), "{err}");
+        assert!(
+            fs::read_dir(tmp.path()).unwrap().next().is_none(),
+            "nothing dumped"
+        );
+
+        let typo = RawSelection {
+            positions: vec![],
+            types: vec!["restore_script".into()],
+        };
+        let err = typo.check_types().unwrap_err().to_string();
+        assert!(
+            err.contains("restore_script") && err.contains("restore_sh"),
+            "{err}"
+        );
+        // The closed set is the front index's own vocabulary.
+        for t in RAW_TYPES {
+            assert!(
+                crate::volume::layout_model::ZoneKind::from_type_label(t).is_some(),
+                "{t}"
+            );
+        }
     }
 
     #[test]

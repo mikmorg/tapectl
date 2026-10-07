@@ -686,7 +686,9 @@ fn read_tape_file_at(device: &str, block_size: usize, pos: i32) -> Vec<u8> {
     if pos > 0 {
         tape.forward_space_file(pos).unwrap();
     }
-    tape.read_file().unwrap()
+    let mut bytes = Vec::new();
+    tape.read_file_streaming(&mut bytes).unwrap();
+    bytes
 }
 
 /// Parse `key = N` or `key = <N>` from an ID thunk TOML region.

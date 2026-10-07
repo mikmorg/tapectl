@@ -144,7 +144,7 @@ binary (`TAPECTL_BIN`), so what it proves is what step 13 uses.
 | 4 tests | nothing on the host (`cargo test`, ~2–3 min, needs only `dar`) | — | the script stops if red |
 | 5 service user | system account **`tapectl`**, home `/var/lib/tapectl`, shell `/usr/sbin/nologin`, comment "tapectl archival service" | — | `id tapectl` |
 | 6 the drive | `tapectl` added to the group owning `/dev/nst*` and `/dev/sg*` (usually `tape`) via `usermod -aG` | — | `sudo -u tapectl -H mt -f <by-id> status` |
-| 7 the home | **`/var/lib/tapectl/.tapectl/`** (§4), the escrow identity (secret printed once), the operator tenant and its keys (`init --operator <name>`: run as a system account such as the service user, `init` refuses to guess the operator name from the account); the staging directory (asked; the proposal is `--staging`/`STAGING_DIR` when set, else the directory `config.toml` names if the service user can write it — `<home>/staging` after a fresh `init` — else `/scratch/tapectl-staging` when `/scratch` exists), written into `[staging] directory`, created with `sudo mkdir -p` when missing and offered a `chown tapectl` when the service user cannot write it | home 0700 `tapectl`; staging `tapectl` | `sudo -u tapectl -H tapectl config check`, `db fsck` |
+| 7 the home | **`/var/lib/tapectl/.tapectl/`** (§4), the escrow identity (secret printed once), the operator tenant and its keys (`init --operator <name>`: run as a system account such as the service user, `init` refuses to guess the operator name from the account); the staging directory (asked; the proposal is `--staging`/`STAGING_DIR` when set, else the directory `config.toml` names if the service user can write it — `<home>/staging` after a fresh `init` — else `/scratch/tapectl-staging` when `/scratch` exists), written into `[staging] directory`, created with `sudo mkdir -p` when missing and offered a `chown tapectl` when the service user cannot write it. With `OPS_GROUP` in the profile: that group (`groupadd --system`), the service user and you added to it, and `[ops] group` in `config.toml` (issue #393: members run `tapectl --home <home> status` without sudo) | home 0700 `tapectl` (0710, group `OPS_GROUP`, with an ops group; `logs/` 2750); staging `tapectl` | `sudo -u tapectl -H tapectl config check`, `db fsck` |
 | 8 backend | a `[[backends.lto]]` table appended to `config.toml`: `device_tape` (by-id), `device_sg`, `generation` (from the drive's INQUIRY product id, never from the loaded cartridge — ADR-0010) | in `config.toml` | `tapectl config show` |
 | 9 heir kit | `~/heir-kit/` (**yours**; `--kit-out` moves it): `COVER.txt`, `escrow-kit.html`, `catalog.db.age` | you, 0700 | print `COVER.txt`, hand-write the secret on it, seal, two failure domains |
 | 10 location | a `locations` row (e.g. `home-rack`) | in the catalog | `tapectl location list` |
@@ -255,9 +255,26 @@ re-entry, and this list gives it for each:
   this is understood` and names no re-entry: `--from 12` once understood.
   Never write real data over a red rehearsal.
 
-Step 13 is re-entrant: a unit that was already staged by hand is skipped, and
-a volume row left `initialized` by an interrupted run goes straight to the
-write; anything else asks for a new label.
+Step 13 is re-entrant (issue #414). A unit that was already staged by hand is
+skipped, and re-running `--from 13 --label <label>` with the label of a volume
+an earlier run left behind picks up where that run stopped, by what the
+catalog says the volume is (`tapectl volume info <label>`):
+
+- **initialised, nothing written** — straight to the write;
+- **an interrupted write** (a Ctrl-C, a dropped session, a crash) — the
+  snapshot and staging phases are skipped and the step offers `volume resume`
+  on the same cartridge, after the quiet-host check. A tape whose seal was
+  written but whose confirm did not finish is re-confirmed, never rewritten;
+- **sealed** — only the post-write block is left: `volume verify --full`,
+  `audit`, the move to the shelf, the Heir Kit;
+- **a write in progress right now**, or **a session planned that never
+  reached the tape** — it stops and names the remedy (let the live writer
+  finish; `tapectl volume abort <label>`, then re-run with a new label,
+  `--from 13 --label <new>`: an aborted label cannot be written again; the
+  new label's `volume init` asks before overwriting the cartridge's File 0,
+  which still names the old one, and marks the old volume `erased`);
+- anything else (quarantined, retired, erased) — it stops and asks for a new
+  label.
 
 ---
 

@@ -3179,3 +3179,150 @@ fn dar_dies_with_a_killed_tapectl() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+/// Issue #363: `tenant info` printed the escrow key's stored `key_type`
+/// (`primary`, the only value migration 001's CHECK leaves it), so the one
+/// key that opens every tape read as an ordinary tenant primary. `key list`
+/// was fixed in #350; `tenant info` now says `escrow` the same way.
+#[test]
+fn tenant_info_names_the_escrow_key_as_escrow() {
+    let home = TempDir::new().unwrap();
+    let init = run_tapectl(home.path(), &["init", "--operator", "op"]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let keys = run_tapectl(home.path(), &["key", "list", "--tenant", "op"]);
+    let keys = String::from_utf8_lossy(&keys.stdout);
+    assert!(
+        keys.contains("escrow"),
+        "positive control: init registered an escrow key: {keys}"
+    );
+    let out = run_tapectl(home.path(), &["tenant", "info", "op"]);
+    assert!(out.status.success());
+    let info = String::from_utf8_lossy(&out.stdout);
+    let key_lines: Vec<&str> = info.lines().filter(|l| l.contains(" [")).collect();
+    assert!(
+        key_lines.iter().any(|l| l.contains("[escrow]")),
+        "the escrow key is shown as escrow: {info}"
+    );
+    assert_eq!(
+        key_lines.iter().filter(|l| l.contains("[primary]")).count(),
+        1,
+        "only the operator's own key reads as primary: {info}"
+    );
+}
+
+/// Issue #393: `tapectl status` reads the session logs and nothing else, so
+/// it runs against a home whose catalog and config it cannot open — here a
+/// home that has nothing BUT `logs/`, as an `[ops] group` member sees it.
+#[test]
+fn status_reads_the_logs_without_a_catalog_or_config() {
+    let home = TempDir::new().unwrap();
+    let logs = home.path().join("logs");
+    std::fs::create_dir(&logs).unwrap();
+    std::fs::write(
+        logs.join("20261001T031240Z-volume-write-L6-0001-999999999.log"),
+        "2026-10-01T03:12:40.118Z session start: volume write L6-0001 (tapectl 1.1.0, pid 999999999, display Lines)\n\
+         2026-10-01T03:12:40.200Z phase start: write (1.20 TiB)\n\
+         2026-10-01T05:40:00.000Z phase end: write  2h 27m  1.20 TiB  142.9 MiB/s\n\
+         2026-10-01T05:40:01.000Z session result: ok\n\
+         2026-10-01T05:40:01.100Z session end after 2h 27m\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(home.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let s = &v["sessions"][0];
+    assert_eq!(s["command"], "volume write L6-0001");
+    assert_eq!(s["state"], "ended");
+    assert_eq!(s["outcome"], "ok");
+    assert!(
+        !home.path().join("tapectl.db").exists(),
+        "status created no catalog"
+    );
+
+    let human = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("status")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("running: nothing"), "{text}");
+    assert!(text.contains("volume write L6-0001  — ok"), "{text}");
+}
+
+/// A pipe whose reading end is already closed: every write to the returned
+/// end fails with EPIPE, as `tapectl … | head` does once `head` has its lines.
+fn closed_pipe() -> std::io::PipeWriter {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    writer
+}
+
+/// Issue #404's follow-up: a closed stdout pipe must not panic. Before, the
+/// first `println!` after the reader went panicked ("failed printing to
+/// stdout: Broken pipe") and the process exited 101 — under `first-run.sh`'s
+/// `run … | tee`, a write whose tee died to Ctrl-C read as "did not seal".
+/// `host check` needs no initialised home and always prints.
+#[test]
+fn a_closed_stdout_pipe_does_not_panic() {
+    let home = TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapectl"))
+        .args(["host", "check"])
+        .env("HOME", home.path())
+        .env_remove("TAPECTL_HOME")
+        .stdout(closed_pipe())
+        .output()
+        .expect("spawn tapectl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed stdout must not panic: {stderr}"
+    );
+    // 0 quiet or 1 findings: `host check`'s own codes, never 101.
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(1)),
+        "exit {:?}, stderr: {stderr}",
+        out.status.code()
+    );
+}
+
+/// The stderr twin: an error reported to a closed stderr still exits with
+/// the error's own code (the one it gives with stderr open), not a panic's
+/// 101.
+#[test]
+fn a_closed_stderr_pipe_does_not_panic() {
+    let home = TempDir::new().unwrap();
+    let run = |closed: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_tapectl"));
+        cmd.args(["unit", "list"])
+            .env("HOME", home.path())
+            .env_remove("TAPECTL_HOME");
+        if closed {
+            cmd.stderr(closed_pipe());
+        }
+        cmd.output().expect("spawn tapectl").status.code()
+    };
+    let open = run(false);
+    assert!(
+        matches!(open, Some(c) if c != 0 && c != 101),
+        "positive control: an uninitialised home is refused with an error code, got {open:?}"
+    );
+    assert_eq!(
+        run(true),
+        open,
+        "the not-initialized refusal must exit with its own code with stderr closed"
+    );
+}

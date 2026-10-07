@@ -1016,8 +1016,9 @@ tapectl, needs to know this:
   ([runbook C](#c-the-catalog-is-gone-and-you-hold-the-operator-or-escrow-key),
   step 3). Then `tapectl volume identify --device <drive>` prints a tape's File 0,
   and `tapectl restore raw-volume --device <drive> --to ./out` dumps every file
-  off a tape the catalog has never seen. The rest of runbook C rebuilds a working
-  catalog.
+  off a tape the catalog has never seen — a terabyte on a full cartridge; add
+  `--only restore_sh` to fetch only RESTORE.sh, or `--positions`/`--only` to
+  name the files wanted. The rest of runbook C rebuilds a working catalog.
 
 ---
 

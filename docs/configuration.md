@@ -24,7 +24,7 @@ code does.
     [`[[backends.lto]]`](#backendslto) · [`[[archive_sets]]`](#archive_sets) ·
     [`[[collections]]`](#collections) · [`[discovery]`](#discovery) ·
     [`[compaction]`](#compaction) · [`[logging]`](#logging) ·
-    [`[host_check]`](#host_check) · [`[health]`](#health)
+    [`[host_check]`](#host_check) · [`[health]`](#health) · [`[ops]`](#ops)
   - [Keys that are accepted but do less than their name says](#keys-that-are-accepted-but-do-less-than-their-name-says)
 - [Example: a single-drive home setup](#example-a-single-drive-home-setup)
 - [Example: collections, archive sets and a host check](#example-collections-archive-sets-and-a-host-check)
@@ -480,6 +480,40 @@ the table, every key takes its default. See
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
 | `read_error_rise_factor` | float | `2.0` | at least 1 | A cartridge is flagged (`audit`'s `read_error_trend`, `RISING` in `report health`) when its newest `volume verify` corrected more read errors per GiB than this many times its previous verify's. **Provisional**: the default is a starting point, to be set from the production host's recorded verifies (ADR-0012, 2026-10-06). |
+
+### `[ops]`
+
+Watching sessions from another account (issue #393). On a production host the
+catalog, the keys and the session logs belong to the service user, in a 0700
+home, so the operator's own account cannot see whether a write is running or
+how the last one ended without sudo. `[ops] group` names a group whose members
+may read the session logs, and nothing else:
+
+```toml
+[ops]
+group = "tapectl-ops"
+```
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `group` | group name | *(no table: the home stays private)* | Every command run as the service user keeps the home at 0710 and `logs/` at 2750 (setgid), both owned by this group, and writes each session log 0640. Every other entry of the home — `config.toml`, the catalog, the keys, `catalogs/`, `stage-reports/`, `locks/`, `tmp/`, a `staging/` inside it, whatever else is there — has its group and other bits removed on every command, so a member can open none of them even by name. |
+
+The service user must be a member of the group itself: giving a directory a
+group (`chgrp`) is limited to one's own groups, and until it can, the home and
+`logs/` stay 0700 rather than open to whatever group they already have. A
+member then runs
+`tapectl --home <service user's home> status` (or sets `TAPECTL_HOME`): see
+[`status`](cli/status.md) and the operator guide's "Watching from another
+account". Logs written before the table was added stay 0600, and `status` names
+them unreadable. Removing the table takes the access back on the next command.
+`scripts/first-run.sh` sets all of this up in step 7 when the host profile sets
+`OPS_GROUP`. `config check` reports the group and anything not yet as it should
+be:
+
+```text
+ops: group "tapectl-ops" may read the session logs (`tapectl --home /srv/archive_meta/tapectl status`), and nothing else in the home
+warning: ops: this user is not a member of "tapectl-ops", so it cannot give the home and logs/ that group — usermod -aG tapectl-ops <service user>, then log in again
+```
 
 ### Keys that are accepted but do less than their name says
 
@@ -945,13 +979,14 @@ How to read it:
 | `[defaults].… was renamed to [defaults].… — the config will not load …` | An old key name. Rename it, as the line says ([refused keys](#rules-for-the-whole-file)). |
 | `[defaults].… is not a recognised setting …` | A misspelled or unknown `[defaults]` key. |
 | `host check (…)` | The quiet-host limits in force, and whether they came from a `[host_check]` table or the defaults. |
+| `ops: …` / `warning: ops: …` | Only with an [`[ops]`](#ops) table: the group that may read the session logs, and anything about the group, its membership or the home's modes that is not yet as it needs to be. |
 
 Everything after the first line is advice. It never changes the exit code, and
 `config check` never edits your files or touches a tape. `--json` gives the same
 report as one object, with fields such as `valid`, `problems`, `dar`, `staging`,
 `staging_space`, `tape_devices`, `shadowing_dotfiles`, `unknown_keys`,
 `decorative_keys` (keys that do nothing, such as `dirty_on_metadata_change = true`),
-`subsumed_policy_fields` (the `preserve_acls` notes), `host_check` and more.
+`subsumed_policy_fields` (the `preserve_acls` notes), `host_check`, `ops` and more.
 
 Other commands fail on an invalid config with the first problem only, and exit 2:
 

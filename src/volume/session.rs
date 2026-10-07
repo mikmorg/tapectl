@@ -66,7 +66,6 @@
 //! identity check's quarantine branch) — see the module's test section.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -1283,6 +1282,19 @@ impl InterruptedSession {
             phase.done();
         }
         if let Err(errs) = revalidated {
+            // #404's follow-up: a signal stopped `--prewrite-hash`'s full
+            // read. That is a stop, not a finding about the slices: nothing
+            // was compared past that point, nothing was written, and the
+            // session keeps the state it had, so the answer is to run the
+            // resume again — not to "fix the cause" or abort.
+            if let Some(stop) = LayoutError::interruption(&errs) {
+                return Err(TapectlError::Interrupted(format!(
+                    "volume resume: {stop}, before anything was written — the session keeps \
+                     its state and the cartridge is untouched. Run `tapectl volume resume {}` \
+                     again",
+                    self.built.layout.label
+                )));
+            }
             let detail = errs
                 .iter()
                 .map(|e| e.to_string())
@@ -2088,7 +2100,10 @@ fn run_entries(
         // after, as every file used to be).
         let entry_started = std::time::Instant::now();
         let expected_hash = entry.sha256.as_deref();
-        let (verdict, waits) = match File::open(path) {
+        // Issue #417: read once and not again soon (the next read of a
+        // staged slice is the next copy's write), so behind the cursor the
+        // pages are dropped instead of filling the host's page cache.
+        let (verdict, waits) = match crate::util::DropBehind::open(path) {
             Err(e) => (
                 Verdict::Failed(TapectlError::Other(format!(
                     "execute: open entry at position {}: {e}",
@@ -2680,6 +2695,92 @@ mod tests {
         assert_eq!(unwritten, 0, "every slice's cursor row must be recorded");
     }
 
+    /// Issue #417: execute reads every staged file through `DropBehind`,
+    /// so a cartridge's worth of slices does not fill the host's page cache
+    /// on the way to the tape. Before, a plain `File::open`.
+    #[test]
+    fn execute_reads_the_staged_files_through_drop_behind() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let slices: Vec<std::path::PathBuf> = f
+            .units
+            .iter()
+            .flat_map(|u| u.slices.iter().map(|s| s.staging_path.clone()))
+            .collect();
+        assert!(
+            !slices.is_empty(),
+            "positive control: the fixture stages slices"
+        );
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        crate::util::page_cache_log::take();
+        match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(_) => {}
+            _ => panic!("expected Ready"),
+        }
+        let read = crate::util::page_cache_log::take();
+        for slice in &slices {
+            assert!(
+                read.contains(slice),
+                "{} was not read through DropBehind: {read:?}",
+                slice.display()
+            );
+        }
+    }
+
+    /// Issue #394 (`docs/design/threat-model.md` §2, ADR-0012 2026-10-06
+    /// item 14): every file of a volume ends with an immediate filemark and
+    /// the seal marker — the last — with a synchronous one, which flushes
+    /// the drive's buffer to the medium before the catalog records the
+    /// seal. The power baseline rests on this, so it is pinned.
+    #[test]
+    fn only_the_seal_marker_is_written_with_a_synchronous_filemark() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let seal_position = f
+            .built
+            .layout
+            .entries
+            .iter()
+            .position(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .unwrap();
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready"),
+        };
+        assert!(
+            store.syncs.iter().all(|s| !s),
+            "every file before the seal ends with an immediate filemark: {:?}",
+            store.syncs
+        );
+        ready.seal(&mut store).unwrap();
+        let synced: Vec<usize> = store
+            .syncs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            synced,
+            [seal_position],
+            "only the seal marker's filemark is synchronous"
+        );
+        assert_eq!(
+            store.syncs.len(),
+            seal_position + 1,
+            "the seal is the last file"
+        );
+    }
+
     // --- behavior 1: happy path over MemStore ends Sealed ----------------
 
     #[test]
@@ -3138,6 +3239,60 @@ mod tests {
             store.files.is_empty(),
             "nothing written: {}",
             store.files.len()
+        );
+    }
+
+    /// #404's follow-up: a signal during resume's `--prewrite-hash` stops
+    /// the revalidation as a stop (`TapectlError::Interrupted`, "run the
+    /// resume again"), not as a revalidation failure telling the operator
+    /// to fix a cause or abort. Before, it was `Other("revalidation
+    /// failed … Causes: …")`.
+    #[test]
+    fn a_signal_during_resume_revalidation_is_a_stop_not_a_failure() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let interrupted = match planned
+            .execute_checking(&f.conn, &mut store, || true)
+            .unwrap()
+        {
+            ExecuteOutcome::Interrupted(i) => i,
+            _ => panic!("expected Interrupted"),
+        };
+        let written = store.files.len();
+
+        crate::signal::interrupt_this_thread(true);
+        let r =
+            interrupted
+                .resume_checking(&f.conn, &f.keys, SliceCheck::FullHash, &mut store, || false);
+        crate::signal::interrupt_this_thread(false);
+        match r {
+            Err(TapectlError::Interrupted(at)) => {
+                assert!(
+                    at.contains("full hash of the staged slices stopped"),
+                    "{at}"
+                );
+                assert!(at.contains("volume resume SESSTEST"), "{at}");
+            }
+            Err(other) => panic!("a stop, not a failure: {other}"),
+            Ok(_) => panic!("the signal must stop the revalidation"),
+        }
+        assert_eq!(store.files.len(), written, "nothing more written");
+        let states: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !states.is_empty() && states.iter().all(|s| s == "interrupted"),
+            "the session keeps its state: {states:?}"
         );
     }
 

@@ -641,6 +641,22 @@ impl SessionGuard {
     pub fn log_path(&self) -> Option<&Path> {
         self.rec.log_path.as_deref()
     }
+
+    /// Record how the command ended — `ok`, or `failed — <error>` — just
+    /// before the session's end line (issue #393), so `tapectl status` can
+    /// tell a finished session's outcome from its log alone. Only the
+    /// error's first line is kept.
+    pub fn note_result(&self, result: std::result::Result<(), &str>) {
+        let line = match result {
+            Ok(()) => "session result: ok".to_string(),
+            Err(e) => format!(
+                "session result: failed — {}",
+                e.lines().next().unwrap_or("").trim()
+            ),
+        };
+        let mut st = self.rec.lock();
+        log_line(&mut st, &line);
+    }
 }
 
 impl Drop for SessionGuard {
@@ -808,13 +824,35 @@ fn start_session_diverted(
     }
 }
 
+// The mode a new session log is created with: 0600, or 0640 once `main`
+// has found an `[ops] group` (issue #393) — the logs directory is then
+// setgid to that group, so the file takes it and its members can read it.
+// Per thread, like the recorder itself: `main` sets it on the thread that
+// then starts the session, and parallel tests cannot see each other's.
+thread_local! {
+    static LOG_MODE: std::cell::Cell<u32> = const { std::cell::Cell::new(0o600) };
+}
+
+/// Share the session logs this thread's sessions write with the logs
+/// directory's group (0640) instead of keeping them to the user (0600).
+/// Call before [`start_session`], on the same thread.
+pub fn share_logs_with_group(share: bool) {
+    LOG_MODE.with(|m| m.set(if share { 0o640 } else { 0o600 }));
+}
+
 fn open_private_log(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mode = LOG_MODE.with(|m| m.get());
+    let f = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .mode(0o600)
-        .open(path)
+        .mode(mode)
+        .open(path)?;
+    // The umask can take the group bit away at create; set it outright.
+    if mode != 0o600 {
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(f)
 }
 
 /// A recorder with no log file, no display and no ticker, installed on this
@@ -1301,6 +1339,50 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// Issue #393: with the logs shared (`[ops] group`) a session log is
+    /// group-readable, it records how the command ended, and `tapectl
+    /// status` reads that log back — the real writer, not a fixture.
+    #[test]
+    fn a_shared_log_is_group_readable_and_status_reads_its_outcome() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        share_logs_with_group(true);
+        let path = {
+            let session =
+                start_session(Some(dir.path()), "stage create photos", Display::Off, false);
+            let p = phase("archive", Some(10));
+            add_bytes(10);
+            p.done();
+            session.note_result(Err("stopped by a signal: at slice 3\nmore"));
+            session.log_path().unwrap().to_path_buf()
+        };
+        share_logs_with_group(false);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+
+        let sessions = crate::cli::status::read_sessions(dir.path(), 5).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let s = &sessions[0];
+        assert_eq!(s.command.as_deref(), Some("stage create photos"));
+        assert_eq!(
+            s.state,
+            crate::cli::status::State::Ended {
+                outcome: "failed — stopped by a signal: at slice 3".into()
+            }
+        );
+        assert_eq!(s.phases.len(), 1);
+        assert!(s.phases[0].starts_with("archive"), "{:?}", s.phases);
+
+        // And the default stays private.
+        let private = start_session(Some(dir.path()), "volume verify L", Display::Off, false);
+        let p = private.log_path().unwrap().to_path_buf();
+        drop(private);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     /// Issue #390: a worker that enters the session's handle logs into it,

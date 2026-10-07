@@ -1,0 +1,22 @@
+-- 031: an index on `events(action, timestamp)` (issue #417).
+--
+-- WHY
+-- ---
+-- `audit`'s Heir Kit check asks for the newest event of one action:
+--
+--     SELECT MAX(timestamp) FROM events WHERE action = 'escrow_kit_generated'
+--
+-- `events` had indexes on (entity_type, entity_id), timestamp and tenant_id,
+-- none of them on `action`, so SQLite walked the whole table for it: 12-17 ms
+-- at 20k events, about 0.7 s at a million, on every `audit` while no kit
+-- exists (the check runs whether or not one does). With `action` leading and
+-- `timestamp` second, the MAX is one seek to the end of that action's range,
+-- and the same index serves every other `WHERE action = ?` lookup.
+--
+-- WHAT IT DOES NOT DO
+-- -------------------
+-- Adds an index and nothing else: no row is read, converted or rejected, so
+-- there is nothing for it to refuse. `IF NOT EXISTS` is not used on purpose:
+-- an index of this name already present means a schema this migration list
+-- did not produce, and that should fail loudly here rather than be skipped.
+CREATE INDEX idx_events_action_timestamp ON events(action, timestamp);

@@ -1,16 +1,19 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-restore 1  "tapectl-restore " 
+.TH tapectl-status 1  "tapectl-status " 
 .SH NAME
-tapectl\-restore \- Restore data from volumes
+tapectl\-status \- What is running and how the last sessions ended, from the session logs alone: the live session\*(Aqs phase, progress, rate and ETA, and each recent session\*(Aqs outcome and phase timings. Opens no catalog and no config, so an account in the home\*(Aqs `[ops] group` can run it (`tapectl \-\-home <service home> status`) without sudo
 .SH SYNOPSIS
-\fBtapectl restore\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+\fBtapectl status\fR [\fB\-\-json\fR] [\fB\-\-last\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Restore data from volumes
+What is running and how the last sessions ended, from the session logs alone: the live session\*(Aqs phase, progress, rate and ETA, and each recent session\*(Aqs outcome and phase timings. Opens no catalog and no config, so an account in the home\*(Aqs `[ops] group` can run it (`tapectl \-\-home <service home> status`) without sudo
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
 Output in JSON format
+.TP
+\fB\-\-last\fR \fI<LAST>\fR [default: 5]
+How many finished sessions to show, newest first (running ones are always shown)
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
@@ -36,19 +39,3 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
-.SH SUBCOMMANDS
-.TP
-tapectl\-restore\-unit(1)
-Restore a unit from a volume
-.TP
-tapectl\-restore\-volume(1)
-Restore several units from one volume in one pass over the tape
-.TP
-tapectl\-restore\-file(1)
-Restore a single file from a unit
-.TP
-tapectl\-restore\-raw\-volume(1)
-Dump every file off a tape verbatim, using only what is on the tape itself (no database needed) — the emergency/heir path. \-\-positions and \-\-only narrow it to the files named (a full cartridge is a terabyte; RESTORE.sh alone is `\-\-only restore_sh`)
-.TP
-tapectl\-restore\-help(1)
-Print this message or the help of the given subcommand(s)

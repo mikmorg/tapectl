@@ -1605,6 +1605,15 @@ fn volume_write_in_contact<'c>(
     let validated_pre = built.validate(&keys, slice_check);
     phase.done();
     if let Err(errs) = validated_pre {
+        // #404's follow-up: a signal stops `--prewrite-hash`'s full read
+        // between chunks. The drive has not been opened and no `writes` row
+        // exists yet, so there is nothing to resume: the write starts over.
+        if let Some(stop) = crate::volume::layout_model::LayoutError::interruption(&errs) {
+            return Err(TapectlError::Interrupted(format!(
+                "{stop}, before the tape was opened — nothing was written and no session \
+                 was recorded. Run `tapectl volume write {label}` again to start over"
+            )));
+        }
         let (blocking, waived) = blocking_validation_errors(errs, allow_missing_escrow);
         for e in &waived {
             tracing::warn!(
@@ -15242,6 +15251,54 @@ mod tests {
                     .unwrap();
                 assert_eq!(status, "initialized", "never sealed ({prewrite_hash})");
             }
+        }
+
+        /// #404's follow-up, through the whole `volume_write` orchestration:
+        /// a signal during `--prewrite-hash`'s full read stops the write as
+        /// a stop (`TapectlError::Interrupted`, saying nothing was written),
+        /// before the store sees a byte and before any session is recorded.
+        /// Before, the hash ran to the end and the write went on to the tape.
+        #[test]
+        fn a_signal_stops_prewrite_hash_before_the_tape() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, volume_id) = swept_write_fixture("SW-SIG", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut slot = ContactSlot::empty();
+            let mut store = MemStore::new(512 * 1024);
+
+            crate::signal::interrupt_this_thread(true);
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "SW-SIG",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                true,
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            crate::signal::interrupt_this_thread(false);
+            let err = slot.finish_result(r).unwrap_err();
+            assert!(
+                matches!(&err, TapectlError::Interrupted(at)
+                    if at.contains("full hash of the staged slices stopped")
+                        && at.contains("nothing was written")),
+                "{err}"
+            );
+            assert!(store.files.is_empty(), "nothing reached the store");
+            let sessions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM writes WHERE volume_id = ?1",
+                    params![volume_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(sessions, 0, "no session to resume: the write starts over");
         }
 
         /// The structural statement of "once per contact" for all three
