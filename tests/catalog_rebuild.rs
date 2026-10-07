@@ -3046,7 +3046,7 @@ fn a_second_stage_set_rebuilds_beside_the_live_one_it_shares_a_version_with() {
 
 /// Issue #379's second criterion: a slice row whose number matches but
 /// whose ciphertext does not is never silently reused. Here the catalog's
-/// stage set is tape A's (found by its first slice), but its second slice
+/// stage set is tape A's (found by its write to this volume), but its second slice
 /// row has been altered — the rebuild refuses and changes nothing.
 #[test]
 fn a_slice_row_with_the_same_number_but_other_ciphertext_is_refused() {
@@ -3074,6 +3074,101 @@ fn a_slice_row_with_the_same_number_but_other_ciphertext_is_refused() {
     assert_eq!(
         before,
         row_counts(&conn),
+        "a refused rebuild changes nothing"
+    );
+}
+
+/// Issue #379's asymmetry, closed: a stage set used to be found only by its
+/// FIRST slice's ciphertext, so a catalog whose slice 1 disagreed with the
+/// tape did not refuse as a slice-2 disagreement does (above) -- it missed
+/// the stage set, minted a sibling of the same Version and wrote the
+/// Version to this volume a second time. Now the stage set already written
+/// to this volume is the one this tape's slices are compared with, every
+/// slice of it, and any mismatch refuses naming the slice.
+#[test]
+fn a_first_slice_row_with_other_ciphertext_is_refused_and_mints_no_sibling() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).expect("first rebuild");
+
+    let original: Vec<(i64, String)> = conn
+        .prepare("SELECT id, sha256_encrypted FROM stage_slices WHERE slice_number = 1")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(original.len(), UNITS.len(), "positive control");
+    conn.execute(
+        "UPDATE stage_slices SET sha256_encrypted = 'feedface' WHERE slice_number = 1",
+        [],
+    )
+    .unwrap();
+    let before = row_counts(&conn);
+
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("a first slice row with other ciphertext must not be bypassed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("slice 1 of stage set") && msg.contains("feedface"),
+        "the refusal names the slice and both hashes: {msg}"
+    );
+    assert!(msg.contains("rolled back"), "{msg}");
+    assert_eq!(
+        before,
+        row_counts(&conn),
+        "a refused rebuild changes nothing"
+    );
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(
+            stage_sets_of_v7(&conn, unit_name),
+            1,
+            "{unit_name}: no sibling stage set"
+        );
+    }
+
+    // The positive control: put the hashes back and the same rebuild is the
+    // no-op it was.
+    for (id, sha) in &original {
+        conn.execute(
+            "UPDATE stage_slices SET sha256_encrypted = ?1 WHERE id = ?2",
+            rusqlite::params![sha, id],
+        )
+        .unwrap();
+    }
+    assert!(rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("restored hashes rebuild")
+        .is_noop());
+}
+
+/// The same refusal into the LIVE catalog that wrote the tape: its stage
+/// set is found by the write that put it on this volume, not by a hash the
+/// catalog no longer agrees with.
+#[test]
+fn a_first_slice_mismatch_in_the_writing_catalog_is_refused() {
+    let mut vol = build_sealed_volume(true);
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let live = std::mem::replace(
+        &mut vol.source_conn,
+        rusqlite::Connection::open_in_memory().unwrap(),
+    );
+    live.execute(
+        "UPDATE stage_slices SET sha256_encrypted = 'feedface' WHERE slice_number = 1",
+        [],
+    )
+    .unwrap();
+    let before = row_counts(&live);
+
+    let err = rebuild(&live, &mut vol, &secret, scratch.path())
+        .expect_err("the writing catalog's own stage set disagrees with the tape");
+    assert!(err.to_string().contains("slice 1 of stage set"), "{err}");
+    assert_eq!(
+        before,
+        row_counts(&live),
         "a refused rebuild changes nothing"
     );
 }

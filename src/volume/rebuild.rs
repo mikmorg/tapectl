@@ -1091,11 +1091,11 @@ fn insert_all(
             }
         };
         let snapshot_id = ensure_snapshot(tx, unit, unit_id, supplement, report)?;
-        let stage_set_id = ensure_stage_set(tx, unit, snapshot_id, supplement, report)?;
+        let stage_set_id = ensure_stage_set(tx, unit, snapshot_id, volume_id, supplement, report)?;
 
         let mut slice_ids = Vec::with_capacity(unit.slices.len());
         for slice in &unit.slices {
-            slice_ids.push((slice, ensure_slice(tx, slice, stage_set_id, report)?));
+            slice_ids.push((slice, ensure_slice(tx, unit, slice, stage_set_id, report)?));
         }
 
         let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, report)?;
@@ -1242,6 +1242,7 @@ fn ensure_stage_set(
     tx: &Connection,
     unit: &envelope::ManifestUnit,
     snapshot_id: i64,
+    volume_id: i64,
     supplement: &Supplement,
     report: &mut RebuildReport,
 ) -> Result<i64> {
@@ -1250,31 +1251,62 @@ fn ensure_stage_set(
     // snapshot (unit uuid + version) narrows it to one Version, but a
     // Version can have several stage sets (issue #379): re-staged for a
     // later copy, each staging encrypts under fresh age file keys, so two
-    // tapes carrying identical content carry different ciphertext. What
-    // tells them apart is the ciphertext itself, so the key is the snapshot
-    // plus the first slice's `sha256_encrypted` — keyed on the snapshot
-    // alone, tape B's positions attached to tape A's slice rows and tape B
-    // then read as corrupt against them.
-    let first = unit.slices.iter().min_by_key(|s| s.number);
-    let existing = match first {
-        Some(first) => existing_id(
+    // tapes carrying identical content carry different ciphertext. Keyed on
+    // the snapshot alone, tape B's positions attached to tape A's slice rows
+    // and tape B then read as corrupt against them.
+    //
+    // So the stage set is matched on evidence, in this order, and then
+    // `ensure_slice` compares EVERY slice of it with the tape, refusing on
+    // any mismatch, whichever slice it is:
+    //
+    // 1. This volume: a stage set of this Version the catalog already
+    //    records as written to THIS volume. A volume is written once
+    //    (ADR-0003), so that is the stage set on this tape -- whatever its
+    //    slice rows now say.
+    // 2. The ciphertext: a stage set of this Version holding ANY of this
+    //    tape's slices (same number, same `sha256_encrypted`). Each staging
+    //    encrypts under fresh file keys, so one shared hash proves the same
+    //    stage set; a different staging shares none and gets its own.
+    //
+    // Matching on the first slice alone (as #379 first did) made a slice-1
+    // disagreement miss the stage set, mint a sibling of the same Version
+    // and record a second write of it to this volume, where a disagreement
+    // on any later slice refused. Now the two refuse alike.
+    let on_this_volume = existing_id(
+        tx,
+        "SELECT ss.id FROM stage_sets ss
+         JOIN writes w ON w.stage_set_id = ss.id
+         WHERE ss.snapshot_id = ?1 AND w.volume_id = ?2
+         ORDER BY ss.id LIMIT 1",
+        params![snapshot_id, volume_id],
+    )?;
+    if let Some(id) = on_this_volume {
+        return Ok(id);
+    }
+    let mut slices: Vec<_> = unit.slices.iter().collect();
+    slices.sort_by_key(|s| s.number);
+    for slice in &slices {
+        if let Some(id) = existing_id(
             tx,
             "SELECT ss.id FROM stage_sets ss
              JOIN stage_slices sl ON sl.stage_set_id = ss.id
              WHERE ss.snapshot_id = ?1 AND sl.slice_number = ?2 AND sl.sha256_encrypted = ?3
              ORDER BY ss.id LIMIT 1",
-            params![snapshot_id, first.number, first.sha256_encrypted],
-        )?,
-        // A unit with no slices carries no ciphertext to tell its stage
-        // sets apart, and no slice row a mismatch could corrupt.
-        None => existing_id(
+            params![snapshot_id, slice.number, slice.sha256_encrypted],
+        )? {
+            return Ok(id);
+        }
+    }
+    // A unit with no slices carries no ciphertext to tell its stage sets
+    // apart, and no slice row a mismatch could corrupt.
+    if slices.is_empty() {
+        if let Some(id) = existing_id(
             tx,
             "SELECT id FROM stage_sets WHERE snapshot_id = ?1 ORDER BY id LIMIT 1",
             params![snapshot_id],
-        )?,
-    };
-    if let Some(id) = existing {
-        return Ok(id);
+        )? {
+            return Ok(id);
+        }
     }
     let slice_size = supplement
         .slice_size
@@ -1313,6 +1345,7 @@ fn ensure_stage_set(
 
 fn ensure_slice(
     tx: &Connection,
+    unit: &envelope::ManifestUnit,
     slice: &envelope::ManifestSlice,
     stage_set_id: i64,
     report: &mut RebuildReport,
@@ -1334,10 +1367,14 @@ fn ensure_slice(
         // leaves the catalog as it was.
         if sha256_encrypted != slice.sha256_encrypted {
             return Err(TapectlError::Other(format!(
-                "slice {} of stage set {stage_set_id}: the catalog records ciphertext \
-                 sha256 {} but this tape carries {} — the catalog's stage set is not the \
-                 one on this tape; the rebuild was rolled back",
-                slice.number, sha256_encrypted, slice.sha256_encrypted
+                "{} version {}, slice {} of stage set {stage_set_id}: the catalog records \
+                 ciphertext sha256 {} but this tape carries {} — the catalog's stage set is \
+                 not the one on this tape; the rebuild was rolled back",
+                unit.name,
+                unit.snapshot_version,
+                slice.number,
+                sha256_encrypted,
+                slice.sha256_encrypted
             )));
         }
         return Ok(id);
