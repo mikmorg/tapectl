@@ -1583,7 +1583,7 @@ tapectl volume resume <label> --device "$TAPE"
 Resume writes position `<n>` again from its start. If the tape turns out to
 hold fewer files than the catalog recorded (a power loss can lose the last
 few), resume continues from what the tape holds and says so in the session
-log. Through 1.0.7 both errors aborted the session for good.
+log. Releases without issue #408's fix aborted the session for good on both.
 
 ### A real end of tape during the write
 
@@ -1641,8 +1641,9 @@ What an abort leaves behind:
 - **The next `volume write` replaces it.** When the new session is planned,
   the aborted session's `writes`/`write_positions` rows and its staging
   session directory are removed, and a `write_session_superseded` event names
-  them; the abort itself stays in the `write_aborted` event. (Through 1.0.7 the
-  old rows made the retry fail with `UNIQUE constraint failed`.)
+  them; the abort itself stays in the `write_aborted` event. (Releases without
+  issue #401's fix kept the old rows, and the retry failed with `UNIQUE
+  constraint failed`.)
 - **`volume abort` is not needed.** The session is already aborted.
   [`volume abort`](cli/volume.md#tapectl-volume-abort) is for a `planned`
   session, or an interrupted one you know cannot be resumed.
