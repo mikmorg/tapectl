@@ -503,6 +503,8 @@ mod tests {
             assert_eq!(mtime_ns_from_rfc3339(far).unwrap(), None, "{far}");
         }
         assert_eq!(mtime_ns_from_secs(10_000_000_000), None);
+        // 1601-01-01, a zero NTFS time: no mtime, as for any far-off file.
+        assert_eq!(mtime_ns_from_secs(-11_644_473_600), None);
         for bad in [
             "2026-09-01T12:00:00Z",
             "2026-09-01T14:00:00+02:00",

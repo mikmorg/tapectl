@@ -57,6 +57,14 @@
 --   (e) a `modified_at` in that spelling but outside 1677-09-21..2262-04-11,
 --       which no nanosecond count in an INTEGER holds (it would overflow to
 --       a REAL). The walk records no mtime for such a file today (NULL).
+-- (b), (c) and the rest of (d) are hand edits. A far-off modified_at is not:
+-- every walk before 030 spelled a file's own mtime, so a file stamped
+-- 1601-01-01 (a zero NTFS time) was recorded as such and is refused by (e),
+-- and one past year 9999 was spelled `+10000-...` and is refused by (d).
+-- Setting it to NULL is the remedy, and loses nothing: a fresh walk records
+-- NULL for that file too, so the unit still reads as unchanged. Deleting a
+-- row is the remedy only for (a): a version one row short of its
+-- `file_count` cannot be staged (staging's file-list check).
 -- The one expected gap is a NULL `file_type`: rows `catalog rebuild` wrote
 -- before #381, and the pre-005 rows 005 backfilled. They take the type
 -- `is_directory` gives, exactly as 005 did (a pre-005 symlink therefore
@@ -81,8 +89,9 @@ SELECT
     'migration 030 cannot run: ' || group_concat(finding, '; ') || '. '
     || 'Migration 030 converts every files row exactly (paths interned per unit, '
     || 'sha256 as 32 bytes, modified_at as an integer) and will not guess a value '
-    || 'it cannot convert. Correct or delete each named files row, then run the '
-    || 'command again. Nothing has been changed.'
+    || 'it cannot convert. Correct each named files row (a sha256 or modified_at '
+    || 'you cannot recover may be set to NULL; delete only a row whose snapshot no '
+    || 'longer exists), then run the command again. Nothing has been changed.'
 FROM (
     SELECT n || ' files row(s) whose snapshot does not exist (id ' || ids
            || CASE WHEN n > 10 THEN ', ...' ELSE '' END || ')' AS finding

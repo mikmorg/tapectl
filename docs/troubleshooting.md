@@ -672,24 +672,47 @@ into the same text:
 ```text
 error: failed to open database: migration error: migration 030 cannot run: 1 files row(s) whose sha256 is not 64
 lowercase hex characters (id 4012). Migration 030 converts every files row exactly (paths interned per unit,
-sha256 as 32 bytes, modified_at as an integer) and will not guess a value it cannot convert. Correct or delete
-each named files row, then run the command again. Nothing has been changed.
+sha256 as 32 bytes, modified_at as an integer) and will not guess a value it cannot convert. Correct each named
+files row (a sha256 or modified_at you cannot recover may be set to NULL; delete only a row whose snapshot no
+longer exists), then run the command again. Nothing has been changed.
 ```
 
-The other findings it can name: a `modified_at` not in the spelling every
-tapectl release writes (`2026-09-01T12:00:00+00:00`), a `modified_at` before
-1677-09-21 or after 2262-04-11 (a nanosecond count cannot hold it; the walk
-records no modified time for such a file now), an `is_directory` and
-`file_type` that disagree or a `file_type` that is not `dir`, `regular`,
-`symlink` or `special`, and a row whose snapshot no longer exists. tapectl never
-writes any of these, so the rows were edited by hand. Nothing has been changed.
-Look at the named rows with `sqlite3`, the same way as for migration 026 above,
-and correct them (`sqlite3 "$DB" "SELECT * FROM files WHERE id = 4012"`). A
-sha256 or `modified_at` you cannot recover may be set to NULL: a version
-without a sha256 is baselined again by its next stage, and one without a
-modified time reads as changed to the next `snapshot create`. A row with no
-`file_type` at all is not refused: it takes the type its `is_directory` gives,
-as migration 005 did.
+Look at the named rows with `sqlite3`, the same way as for migration 026 above
+(`sqlite3 "$DB" "SELECT * FROM files WHERE id = 4012"`), and correct them.
+Do not delete a row whose snapshot still exists: a version records how many
+files it holds, and one short a row cannot be staged (it reads as an
+interrupted `snapshot create`, see [A snapshot is incomplete](#a-snapshot-is-incomplete)),
+while the next `snapshot create` sees the file as added and records a new
+version.
+
+The findings it can name, and what to do about each:
+
+- **A `modified_at` before 1677-09-21 or after 2262-04-11.** This one is not a
+  hand edit. Earlier releases recorded every file's modified time as text, so
+  a file stamped far off -- 1601-01-01, the zero time of an NTFS volume, or a
+  year past 2262 -- was recorded as it was. A year past 9999 was recorded with
+  a leading sign (`+10000-01-01T00:00:00+00:00`) and is named as not being in
+  the spelling below. A nanosecond count cannot hold any of them, and the walk
+  now records no modified time for such a file. Set the value to NULL
+  (`sqlite3 "$DB" "UPDATE files SET modified_at = NULL WHERE id = 4012"`):
+  the next `snapshot create` also records none for that file, so the unit
+  still reads as unchanged.
+- **A `modified_at` not in the spelling every tapectl release writes**
+  (`2026-09-01T12:00:00+00:00`), within that range.
+- **A sha256 that is not 64 lowercase hex characters.**
+- **An `is_directory` and `file_type` that disagree**, or a `file_type` that
+  is not `dir`, `regular`, `symlink` or `special`.
+- **A row whose snapshot no longer exists.** This is the one row to delete:
+  it belongs to no version.
+
+Of the last four, tapectl wrote only one case: the signed year above, named
+under the second. Every other row they name was edited by hand.
+A sha256 or an in-range `modified_at` you cannot recover may be set to NULL: a
+version without a sha256 is baselined again by its next stage, and a file
+whose in-range modified time is NULL reads as changed to the next
+`snapshot create`, which records a new version. A row with no `file_type` at
+all is not refused: it takes the type its `is_directory` gives, as migration
+005 did.
 
 Once 030 applies, the same command compacts the catalog once, as after 027.
 

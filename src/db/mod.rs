@@ -4450,6 +4450,19 @@ mod tests {
             assert!(msg.contains(needle), "{column_sql}: {msg}");
             assert!(msg.contains(&format!("(id {id})")), "{column_sql}: {msg}");
             assert!(msg.contains("Nothing has been changed."), "{msg}");
+            // Deleting a non-directory row of a version with a file_count
+            // makes that version unstageable (staging's file-list check)
+            // and reads the file as added to the next `snapshot create`:
+            // the remedy offered is a correction, never a delete.
+            assert!(!msg.contains("delete each"), "{msg}");
+            assert!(
+                msg.contains(
+                    "Correct each named files row (a sha256 or modified_at you cannot \
+                     recover may be set to NULL; delete only a row whose snapshot no \
+                     longer exists)"
+                ),
+                "{msg}"
+            );
             assert_eq!(user_version(&conn), 29, "rolled back");
             let rows: i64 = conn
                 .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
