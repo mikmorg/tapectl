@@ -72,6 +72,7 @@ A few commands finish their work and then report a verdict through the exit code
 |---|---|---|---|
 | [`audit`](cli/audit.md#tapectl-audit) | clean | warnings only | at least one violation (or an error) |
 | [`host check`](cli/host.md#tapectl-host-check) | host is quiet | something tripped | an error |
+| [`drive poll`](cli/drive.md#tapectl-drive-poll) | recorded; the drive reported nothing | recorded; the drive raised a TapeAlert or reported an unrecovered error (named) | no reading: no log page could be read, or no drive is configured (or an error). **75**: a tapectl command holds the drive, nothing was read |
 | [`config check`](cli/config.md#tapectl-config-check) | config valid | never used | config invalid (or an error) |
 | [`db fsck`](cli/db.md#tapectl-db-fsck) | clean | problems found (repaired or not) | database integrity is broken (or an error) |
 | [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed, or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; or (`sync`, `status`) a file, symlink or symlinked folder under the root belongs to no unit (an `OUTSIDE ANY UNIT` line names each); the rest ran, and each failure is an `error:` line | an error |
@@ -489,15 +490,20 @@ When the path cannot be opened at all, the error follows a logged warning,
 `non-blocking open failed during no-medium probe (continuing)`, from the
 empty-drive check that runs first.
 
-**tapectl takes no lock on the drive.** The kernel's `st` driver allows only
-one open at a time, and that is what produces "busy". The file
-`/tmp/tapectl-tape.lock` belongs to the test harnesses
-(`scripts/mhvtl-verify-gate.sh`, `scripts/lifecycle-suite.sh`,
-`scripts/lto6-measure.sh`, `scripts/lto6-fill.sh`) and to `first-run.sh`
-step 13 (the step-12 rehearsal takes it through `lifecycle-suite.sh`). A plain
-`tapectl` command neither takes nor checks it. The
-only lock tapectl itself takes is a per-stage-set lock under
-`<home>/locks/stage-<id>.lock`, held while `stage create` runs. The
+**The drive lock does not exclude a second command.** The kernel's `st`
+driver allows only one open at a time, and that is what produces "busy".
+tapectl's own drive lock, `<home>/locks/drive-<node>.lock`, is held by every
+command that contacts the drive, from its contact until it exits; it exists so
+that the [daily drive poll](operator-guide.md#the-daily-drive-poll) skips
+(exit 75) instead of reading the drive's log pages under a running command. A
+command that finds it held waits up to a minute (a poll takes seconds), then
+warns `another process has held this drive's lock` and carries on, so a second
+command still meets the kernel's "busy". The file `/tmp/tapectl-tape.lock`
+belongs to the test harnesses (`scripts/mhvtl-verify-gate.sh`,
+`scripts/lifecycle-suite.sh`, `scripts/lto6-measure.sh`,
+`scripts/lto6-fill.sh`) and to `first-run.sh` step 13 (the step-12 rehearsal
+takes it through `lifecycle-suite.sh`); a plain `tapectl` command neither
+takes nor checks it. The
 [operator guide](operator-guide.md#a-quiet-host-while-the-tape-runs) asks you
 to keep everything else off the drive while a tape runs.
 
@@ -2248,7 +2254,7 @@ audit: 0 violations, 1 warnings (exit 1)
 
 The per-unit checks cover every unit, whatever its status (`active`,
 `tape_only` or `missing`), except `dirty`, which looks only at `active` ones.
-The archive-wide checks (the last five rows below) run only for a
+The archive-wide checks (the last six rows below) run only for a
 whole-archive audit, not with `--unit`.
 
 | Check | Severity | Message | Meaning and fix |
@@ -2268,6 +2274,7 @@ whole-archive audit, not with `--unit`.
 | `escrow_kit_stale` | warning | `` <n> volume(s) were sealed after the last heir kit (<date>): the kit's escrow secret still opens them (it is a recipient of every tape), but the kit's encrypted catalog (catalog.db.age) does not list them — regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog rebuild --from-volume` `` | Only the kit's catalog is behind; its secret opens every tape. Fix: `tapectl key escrow-kit --out <dir>` and replace the stored copies. The escrow secret itself does not change. |
 | `escrow_identity_mismatch` | warning | `<n> stage set(s) the current escrow key cannot open all name a recipient this catalog does not recognise: <key> — …` | Typical after a disaster rebuild that created a **new** escrow identity. No command replaces a registered escrow identity. The fix is to re-initialise a fresh home with `tapectl init --escrow-public-key <original>` (from the heir kit) and run `catalog rebuild` again. |
 | `no_full_verify` | warning | `volume "<label>" is sealed with no full readback recorded — its write confirmed the front index and seal only` | A write's confirm reads back only the front index and the seal marker unless `--full-confirm` was given (ADR-0012, 2026-10-06), so this volume counts as a copy with none of its data read back yet. Fix: `tapectl volume verify <label>` (full, the default); a passing one clears it, a `--quick` one does not. |
+| `tape_alert` | warning | `volume "<label>": the drive raised a TapeAlert — <n> <flag>; … — at <time> during "<command>" with cartridge <barcode> loaded on drive <serial>` | A contact with this volume, or with the cartridge it is on (a [`drive poll`](operator-guide.md#the-daily-drive-poll) included), read page 0x2E with a flag raised, after the volume's last passed full verify. Retired, erased and quarantined volumes are not named; an `initialized` one an interrupted write left is. A warning, never a violation: a flag may be the medium ("Media", "Read failure") or only the drive ("Cleaning required"), and the volume still counts as a copy. Fix: `tapectl volume verify <label>` — a pass clears it; a failure quarantines the volume and the copy checks take over. `report health` lists every sighting. |
 
 ---
 

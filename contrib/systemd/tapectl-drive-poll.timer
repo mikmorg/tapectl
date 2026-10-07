@@ -1,0 +1,21 @@
+[Unit]
+Description=Daily tapectl drive health poll
+Documentation=file:/usr/share/doc/tapectl/operator-guide.md
+
+[Timer]
+# Daily (ADR-0012, 2026-10-07 item 29). A poll costs a few seconds of LOG
+# SENSE and no tape motion, and a drive idle for months is exactly the drive
+# whose first sign of trouble should not wait a week to be seen: daily
+# narrows "when did it start" to a day.
+OnCalendar=*-*-* 06:30:00
+
+# A machine that was off at 06:30 still gets its reading on the next boot.
+Persistent=true
+
+# Spread the start; nothing here is time-critical.
+RandomizedDelaySec=30m
+
+Unit=tapectl-drive-poll.service
+
+[Install]
+WantedBy=timers.target

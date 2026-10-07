@@ -10,8 +10,12 @@
 #   /etc/systemd/system/tapectl-audit.timer        (Mon 09:00, read-only)
 #   /etc/systemd/system/tapectl-backup.service   daily catalog backup
 #   /etc/systemd/system/tapectl-backup.timer       (03:00, `db backup`, keep N)
-#   /usr/local/lib/tapectl/tapectl-scheduled-audit.sh    the two wrappers
-#   /usr/local/lib/tapectl/tapectl-scheduled-backup.sh   the units run
+#   /etc/systemd/system/tapectl-drive-poll.service  daily drive health poll
+#   /etc/systemd/system/tapectl-drive-poll.timer      (06:30, /dev/sg* only;
+#                                                     2026-10-07 item 29)
+#   /usr/local/lib/tapectl/tapectl-scheduled-audit.sh       the three wrappers
+#   /usr/local/lib/tapectl/tapectl-scheduled-backup.sh      the units run
+#   /usr/local/lib/tapectl/tapectl-scheduled-drive-poll.sh
 #   <backup dir>                                 created, owned by the service
 #                                                user, mode 0700
 #   /usr/local/bin/tapectl-op                    `exec sudo -u <user> -H <tapectl> "$@"`
@@ -45,12 +49,12 @@ UNINSTALL=0
 UNITDIR=/etc/systemd/system
 LIBDIR=/usr/local/lib/tapectl
 WRAPPER_PATH=/usr/local/bin/tapectl-op
-UNITS=(tapectl-audit.service tapectl-audit.timer tapectl-backup.service tapectl-backup.timer)
-TIMERS=(tapectl-audit.timer tapectl-backup.timer)
-SCRIPTS=(tapectl-scheduled-audit.sh tapectl-scheduled-backup.sh)
+UNITS=(tapectl-audit.service tapectl-audit.timer tapectl-backup.service tapectl-backup.timer tapectl-drive-poll.service tapectl-drive-poll.timer)
+TIMERS=(tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer)
+SCRIPTS=(tapectl-scheduled-audit.sh tapectl-scheduled-backup.sh tapectl-scheduled-drive-poll.sh)
 
 usage() {
-  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
   cat <<EOF
 
 Usage: scripts/install-systemd.sh [options]
@@ -116,7 +120,7 @@ if [ "$UNINSTALL" = 1 ]; then
   for t in "${TIMERS[@]}"; do
     if systemctl list-unit-files "$t" 2>/dev/null | grep -q "^$t"; then as_root systemctl disable --now "$t"; else note "$t is not installed"; fi
   done
-  for u in tapectl-audit.service tapectl-backup.service; do
+  for u in tapectl-audit.service tapectl-backup.service tapectl-drive-poll.service; do
     if systemctl is-active --quiet "$u" 2>/dev/null; then as_root systemctl stop "$u"; fi
   done
   for f in "${UNITS[@]}"; do
@@ -231,6 +235,7 @@ if [ "$DRY" = 1 ]; then
   note "dry run: nothing was changed. The timers would be:"
   printf '     tapectl-audit.timer   %s\n' "$(sed -n 's/^OnCalendar=//p' "$TMP/tapectl-audit.timer")"
   printf '     tapectl-backup.timer  %s\n' "$(sed -n 's/^OnCalendar=//p' "$TMP/tapectl-backup.timer")"
+  printf '     tapectl-drive-poll.timer  %s\n' "$(sed -n 's/^OnCalendar=//p' "$TMP/tapectl-drive-poll.timer")"
 else
   run systemctl list-timers --all 'tapectl-*'
   ok "installed. Run one now to see it work:  sudo systemctl start tapectl-backup.service && journalctl -u tapectl-backup.service -n 30"
