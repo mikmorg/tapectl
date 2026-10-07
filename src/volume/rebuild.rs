@@ -157,6 +157,33 @@ pub struct RebuildReport {
     /// fact, not a mistake, so this surfaces it rather than repairing it.
     pub volume_condition_mismatch: Option<String>,
 
+    // --- the tape's own dates (issue #305) ----------------------------------
+    //
+    // What the medium says about when it was written, in the catalog's
+    // `YYYY-MM-DD HH:MM:SS` form — reported whether or not a row was
+    // inserted, so an operator rebuilding onto a row they already had can
+    // still read them. `None` is "the tape does not say" (a File 0 without
+    // the key, or no readable seal marker), never a stand-in date.
+    /// File 0's `created_at`: when `volume write` planned the write that made
+    /// this tape (before the tape moved; a resumed write keeps the first
+    /// attempt's). Written to an INSERTED row's `created_at` and
+    /// `first_write`.
+    pub written_at: Option<String>,
+    /// The seal marker's `sealed_at`. Written to an INSERTED row's
+    /// `sealed_at` and `last_write`.
+    pub sealed_at: Option<String>,
+    /// File 0's `load_count_at_write`: the chip's load count when the write
+    /// was planned. Reported only — `cartridges.total_load_count` is the
+    /// chip's live figure and a years-old one must not overwrite it.
+    pub load_count_at_write: Option<i64>,
+    /// Set (to the catalog's own value) when this label already had a row
+    /// whose `sealed_at` disagrees with the seal marker's by more than
+    /// [`SEALED_AT_TOLERANCE_SECS`]. Report-only, like
+    /// [`Self::volume_status_mismatch`] (issue #158): the row keeps its own.
+    /// A row with no `sealed_at` (sealed before migration 018) is not a
+    /// disagreement — it recorded nothing to disagree with.
+    pub volume_sealed_at_mismatch: Option<String>,
+
     // --- cartridge identity (issue #165) -----------------------------------
     //
     // Before this, `insert_all` wrote a `volumes` row and its unit chain and
@@ -528,6 +555,9 @@ fn rebuild_contacted(
     let entries = format::parse_front_index(&String::from_utf8_lossy(&fi))?;
 
     let opened = open_all_envelopes(store, &entries, identities, scratch)?;
+    // Issue #305: the tape's own dates, read before the rows are written so
+    // an inserted row carries them.
+    let dates = tape_dates(store, &thunk_text, &pointers, &entries, &ident.label);
     let operator = opened
         .iter()
         .find(|e| e.manifest.is_operator())
@@ -554,6 +584,9 @@ fn rebuild_contacted(
         // rebuild that changed `cartridges.serial_number` before the
         // transaction even opened is not reported as `no_changes: true`.
         serial_learned: serial_learned_at_contact,
+        written_at: dates.written_at.clone(),
+        sealed_at: dates.sealed_at.clone(),
+        load_count_at_write: dates.load_count_at_write,
         ..Default::default()
     };
 
@@ -579,6 +612,7 @@ fn rebuild_contacted(
         &ident.label,
         &ident.uuid,
         &meta,
+        &dates,
         &operator.manifest,
         &tenant_of,
         fallback_tenant,
@@ -1004,6 +1038,75 @@ impl Supplement {
     }
 }
 
+/// How far a found row's `sealed_at` may sit from the seal marker's before
+/// the rebuild reports them as disagreeing (issue #305). They are two clocks
+/// on one host a few seconds apart: the marker's is taken as it is
+/// generated, the row's when `seal()` returns, after the marker and its
+/// synchronous filemark are on tape. Ten minutes is far past that and far
+/// short of any real disagreement (a different write, a different tape).
+pub const SEALED_AT_TOLERANCE_SECS: i64 = 600;
+
+/// The tape's own dates and data-file count (issue #305), in the catalog's
+/// form.
+#[derive(Debug, Clone, Default)]
+struct TapeDates {
+    written_at: Option<String>,
+    sealed_at: Option<String>,
+    load_count_at_write: Option<i64>,
+    data_files: i64,
+}
+
+/// Read what the tape says about when it was written: File 0's provenance
+/// (already in hand) and the seal marker's `sealed_at` — one small read at
+/// the position File 0's `[layout]` names. Every failure is an absence: a
+/// rebuild does not verify the tape (module doc), and a tape with no
+/// readable seal marker, or a File 0 without the keys, rebuilds as it always
+/// did, with those dates unknown. A seal marker naming another volume is
+/// not this tape's and is ignored.
+fn tape_dates(
+    store: &mut dyn Store,
+    thunk_text: &str,
+    pointers: &format::IdThunkLayoutPointers,
+    entries: &[format::ParsedIndexEntry],
+    label: &str,
+) -> TapeDates {
+    let provenance = format::parse_id_thunk_provenance(thunk_text).unwrap_or_default();
+    let sealed_at =
+        crate::store::read_small_bytes(store, pointers.seal_marker as u32, "seal marker")
+            .ok()
+            .and_then(|b| format::parse_seal_marker(&String::from_utf8_lossy(&b)).ok())
+            .filter(|seal| seal.volume == label)
+            .and_then(|seal| format::catalog_timestamp(&seal.sealed_at));
+    TapeDates {
+        written_at: provenance
+            .created_at
+            .as_deref()
+            .and_then(format::catalog_timestamp),
+        sealed_at,
+        load_count_at_write: provenance.load_count_at_write,
+        data_files: entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    crate::volume::layout_model::ZoneKind::from_type_label(&e.type_label),
+                    Some(crate::volume::layout_model::ZoneKind::Slice { .. })
+                )
+            })
+            .count() as i64,
+    }
+}
+
+/// Whether a catalog `sealed_at` and the seal marker's agree to within
+/// [`SEALED_AT_TOLERANCE_SECS`]. A value that does not parse as the
+/// catalog's form disagrees: it is not a seal time this rebuild can vouch for.
+fn sealed_at_agrees(recorded: &str, tape: &str) -> bool {
+    let parse = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok();
+    match (parse(recorded), parse(tape)) {
+        (Some(a), Some(b)) => (a - b).num_seconds().abs() <= SEALED_AT_TOLERANCE_SECS,
+        _ => false,
+    }
+}
+
 /// Insert every missing row for one cartridge. Called inside a transaction:
 /// a rebuild that fails partway leaves the catalog exactly as it found it,
 /// rather than half-knowing a tape.
@@ -1013,6 +1116,7 @@ fn insert_all(
     label: &str,
     uuid: &str,
     meta: &format::IdThunkVolumeMeta,
+    dates: &TapeDates,
     operator: &EnvelopeManifest,
     tenant_of: &HashMap<String, String>,
     fallback_tenant: &str,
@@ -1024,15 +1128,22 @@ fn insert_all(
     // back to the type string — never an invented name like "rebuilt", which
     // would put a backend in the catalog that no config declares.
     let backend_name = backend_name.unwrap_or("lto");
-    let existing: Option<(i64, String, String)> = tx
+    #[allow(clippy::type_complexity)]
+    let existing: Option<(i64, String, String, Option<String>)> = tx
         .query_row(
-            "SELECT id, status, observed_condition FROM volumes WHERE label = ?1",
+            "SELECT id, status, observed_condition, sealed_at FROM volumes WHERE label = ?1",
             params![label],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
     let volume_id = match existing {
-        Some((id, status, condition)) => {
+        Some((id, status, condition, recorded_sealed_at)) => {
+            // Issue #305: the third report-only fact. Never edited (#158).
+            if let (Some(recorded), Some(tape)) = (&recorded_sealed_at, &dates.sealed_at) {
+                if !sealed_at_agrees(recorded, tape) {
+                    report.volume_sealed_at_mismatch = Some(recorded.clone());
+                }
+            }
             // Same tape, same evidence — but a row this rebuild merely
             // FOUND is never edited (issue #158). `sealed`/`ok` is what the
             // `None` arm below would have inserted, so anything else is a
@@ -1053,10 +1164,27 @@ fn insert_all(
             id
         }
         None => {
+            // Issue #305: dated by the tape, not by the rebuild. File 0's
+            // `created_at` is when the write was planned — the closest the
+            // medium comes to when it began, and before it the volume was
+            // never written — so it stands for both `created_at` and
+            // `first_write`. The seal marker's `sealed_at` is the tape's last
+            // timestamp: the confirm that sets a live write's `last_write`
+            // leaves no mark on the tape. With no date on the tape,
+            // `created_at` keeps its default (now) and the rest stay NULL.
+            //
+            // `num_data_files` is exact: the front index lists every slice.
+            // `bytes_written` is NOT reconstructed: the live writer stores
+            // block-padded bytes and the write's block size is not on the
+            // tape, so any figure here would depend on the rebuilding
+            // machine (#305's coordinator note). It stays 0, as before.
             tx.execute(
                 "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
-                                      capacity_bytes, mam_capacity_bytes, has_manifest, status)
-                 VALUES (?1, ?2, 'lto', ?3, ?4, ?5, ?6, 1, 'sealed')",
+                                      capacity_bytes, mam_capacity_bytes, has_manifest, status,
+                                      created_at, first_write, sealed_at, last_write,
+                                      num_data_files)
+                 VALUES (?1, ?2, 'lto', ?3, ?4, ?5, ?6, 1, 'sealed',
+                         COALESCE(?7, datetime('now')), ?7, ?8, ?8, ?9)",
                 params![
                     label,
                     uuid,
@@ -1064,6 +1192,9 @@ fn insert_all(
                     meta.media_type,
                     meta.nominal_capacity_bytes,
                     meta.mam_capacity_bytes,
+                    dates.written_at,
+                    dates.sealed_at,
+                    dates.data_files,
                 ],
             )?;
             report.volume_inserted = true;
@@ -2311,6 +2442,7 @@ mod tests {
             "TEST-VOL",
             "vol-uuid",
             &mam_drill_meta(),
+            &TapeDates::default(),
             &manifest,
             &HashMap::new(),
             "recovered",

@@ -2660,6 +2660,17 @@ fn render_write_span(first_write: Option<&str>, last_write: Option<&str>) -> Str
     format!("  First write: {first}\n  Last write:  {last}\n")
 }
 
+/// `volume info`'s seal line (issue #305): `volumes.sealed_at`, which `--json`
+/// carried and the human output never printed — on a rebuilt volume it is
+/// the seal marker's own date, the one thing the tape says about when its
+/// write finished. A volume that recorded none says so.
+fn render_sealed_line(sealed_at: Option<&str>) -> String {
+    format!(
+        "  Sealed:      {}",
+        sealed_at.unwrap_or("(no seal recorded)")
+    )
+}
+
 /// `volume info`'s verification-history section, one line per session.
 /// Both ends of each verify are printed and named (issue #392): this showed
 /// the start alone while `report verify-status` showed the completion, so
@@ -2726,6 +2737,7 @@ fn print_volume_info(info: &VolumeInfo) {
         "{}",
         render_write_span(info.first_write.as_deref(), info.last_write.as_deref())
     );
+    println!("{}", render_sealed_line(info.sealed_at.as_deref()));
     if let Some(notes) = &info.notes {
         println!("  Notes:       {notes}");
     }
@@ -3904,6 +3916,19 @@ mod tests {
             let info = volume_info(&conn, "L6-0003", false).unwrap();
             assert_eq!(info.deposits.len(), 1);
             assert_eq!(info.deposits[0].location, "glacier");
+        }
+
+        /// Issue #305: the seal time is printed, and its absence named.
+        #[test]
+        fn info_prints_the_seal_time_or_says_none_was_recorded() {
+            assert_eq!(
+                render_sealed_line(Some("2026-09-12 03:04:05")),
+                "  Sealed:      2026-09-12 03:04:05"
+            );
+            assert_eq!(
+                render_sealed_line(None),
+                "  Sealed:      (no seal recorded)"
+            );
         }
 
         /// Issue #392: "First write" and "Last write" both showed when the

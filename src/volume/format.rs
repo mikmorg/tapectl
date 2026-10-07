@@ -500,6 +500,84 @@ pub fn parse_id_thunk_media(raw: &str) -> Result<IdThunkMedia> {
     })
 }
 
+/// File 0's two provenance facts (issue #305): when the write that made this
+/// tape was planned (`[volume] created_at`) and the cartridge's MAM load
+/// count at that moment (`[media] load_count_at_write`).
+///
+/// A fifth parser over File 0, for the same reason the other four are
+/// separate: each carries what its consumer needs. `catalog rebuild` is the
+/// consumer — a tape rebuilt into a new catalog is dated by its own bytes,
+/// not by the day of the rebuild.
+///
+/// Both keys are optional. A thunk written before `[media]` existed (the
+/// 2026-07-28 to 2026-09-13 window) has `created_at` and no load count; a
+/// damaged or hand-made one may have neither. An absent key is `None`,
+/// never a default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdThunkProvenance {
+    /// RFC 3339, verbatim. It is taken when `volume write` PLANS the write,
+    /// before the tape moves, and a resumed write keeps the first attempt's
+    /// (the Layout is rehydrated, never rebuilt). So it is when the write
+    /// began, not when its first byte landed — and `sealed_at - created_at`
+    /// spans any interruption: wall-clock provenance, never a throughput.
+    pub created_at: Option<String>,
+    /// The chip's load count when the write was planned. `0` is the
+    /// writer's "unknown" (`volume-format-v2.md` §1.1) and reads as `None`:
+    /// a tape being written has been loaded at least once, and a stored 0
+    /// would be a confident wrong count (#184, migration 015).
+    pub load_count_at_write: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProvenanceVolumeToml {
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProvenanceMediaToml {
+    #[serde(default)]
+    load_count_at_write: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdThunkProvenanceDoc {
+    volume: ProvenanceVolumeToml,
+    #[serde(default)]
+    media: Option<ProvenanceMediaToml>,
+}
+
+/// Parse File 0's [`IdThunkProvenance`]. Same fail-safe convention as its
+/// siblings: no `[volume]` table, or a body that is not TOML, is a normal
+/// `Err`; a missing key is `None`.
+pub fn parse_id_thunk_provenance(raw: &str) -> Result<IdThunkProvenance> {
+    let body = toml_body(raw, "[volume]", "id thunk provenance")?;
+    let doc: IdThunkProvenanceDoc = toml::from_str(body)
+        .map_err(|e| TapectlError::Other(format!("id thunk provenance: TOML parse failed: {e}")))?;
+    Ok(IdThunkProvenance {
+        created_at: doc.volume.created_at,
+        load_count_at_write: doc
+            .media
+            .and_then(|m| m.load_count_at_write)
+            .filter(|n| *n > 0),
+    })
+}
+
+/// An on-tape RFC 3339 timestamp (File 0's `created_at`, the seal marker's
+/// `sealed_at`) in the catalog's own form, `YYYY-MM-DD HH:MM:SS` UTC — what
+/// `datetime('now')` writes, so a rebuilt row's dates sort and compare with
+/// every row the live write path wrote. `None` for text that is not
+/// RFC 3339: a malformed date is an absence, never a guessed one.
+pub fn catalog_timestamp(rfc3339: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339.trim())
+        .ok()
+        .map(|t| {
+            t.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+}
+
 /// A violation of the §2.5 front-index self-consistency rules. Cheap checks
 /// that turn "subtly wrong map" into a loud, structured report rather than a
 /// silent bad read — every violation present is returned, not just the
@@ -1039,6 +1117,112 @@ load_count_at_write = 5
              to \"mam\" would make every tape written before the field existed falsely \
              attest a chip-verified serial"
         );
+    }
+
+    // --- id thunk provenance (when written, at which load — #305) --------
+
+    /// Issue #305: File 0's `created_at` and `load_count_at_write` come back
+    /// by value through the live generator.
+    #[test]
+    fn id_thunk_provenance_round_trips_created_at_and_the_load_count() {
+        let params = sample_id_thunk_params("RT10", "66666666-7777-8888-9999-000000000000");
+        let parsed = parse_id_thunk_provenance(&generate_id_thunk_v2(&params)).expect("parses");
+        assert_eq!(parsed.created_at.as_deref(), Some("2026-07-22T20:09:00Z"));
+        assert_eq!(parsed.load_count_at_write, Some(5));
+    }
+
+    /// The writer's `0` is "unknown" (`volume-format-v2.md` §1.1) and must
+    /// not come back as a confident zero (#184). The non-zero case in the
+    /// same test proves the parser is not simply `None` for everything.
+    #[test]
+    fn a_zero_load_count_at_write_reads_as_unknown() {
+        let unknown = IdThunkV2Params {
+            mam_loads: 0,
+            ..sample_id_thunk_params("RT11", "77777777-8888-9999-0000-111111111111")
+        };
+        let known = IdThunkV2Params {
+            mam_loads: 17,
+            ..sample_id_thunk_params("RT11", "77777777-8888-9999-0000-111111111111")
+        };
+        let parse = |p: &IdThunkV2Params| {
+            parse_id_thunk_provenance(&generate_id_thunk_v2(p))
+                .unwrap()
+                .load_count_at_write
+        };
+        assert_eq!(parse(&unknown), None, "0 is the writer's unknown");
+        assert_eq!(parse(&known), Some(17));
+    }
+
+    /// The positive control: a File 0 that predates both keys — written as
+    /// a LITERAL, so this cannot silently start testing the generator's new
+    /// shape — still parses, to `None` twice. One with `[volume]` and no
+    /// `[media]` at all (the pre-ADR-0010 window) keeps its `created_at`.
+    #[test]
+    fn a_file_0_without_the_provenance_keys_parses_to_unknown() {
+        let neither = "\
+[volume]
+magic = \"tapectl-volume-v2\"
+label = \"OLD01\"
+uuid = \"88888888-9999-0000-1111-222222222222\"
+layout_version = 2
+
+[layout]
+front_index = 3
+seal_marker = 9
+total_files = 10
+
+[media]
+cartridge_serial = \"SERIAL1\"
+";
+        assert_eq!(
+            parse_id_thunk_provenance(neither).expect("an old File 0 must still parse"),
+            IdThunkProvenance::default()
+        );
+        let no_media = "\
+[volume]
+label = \"OLD02\"
+created_at = \"2026-08-01T10:00:00.123456789+00:00\"
+
+[layout]
+front_index = 3
+seal_marker = 9
+total_files = 10
+";
+        let p = parse_id_thunk_provenance(no_media).unwrap();
+        assert_eq!(
+            p.created_at.as_deref(),
+            Some("2026-08-01T10:00:00.123456789+00:00")
+        );
+        assert_eq!(p.load_count_at_write, None);
+        assert!(parse_id_thunk_provenance("no toml here at all").is_err());
+    }
+
+    /// The catalog stores `datetime('now')`'s shape; an on-tape RFC 3339
+    /// value is converted to it in UTC, and text that is not RFC 3339 is an
+    /// absence.
+    #[test]
+    fn on_tape_timestamps_convert_to_the_catalog_form() {
+        assert_eq!(
+            catalog_timestamp("2026-07-22T20:09:00Z").as_deref(),
+            Some("2026-07-22 20:09:00")
+        );
+        assert_eq!(
+            catalog_timestamp("2026-08-01T12:00:00.987654321+02:00").as_deref(),
+            Some("2026-08-01 10:00:00")
+        );
+        assert_eq!(catalog_timestamp("yesterday"), None);
+        assert_eq!(catalog_timestamp(""), None);
+    }
+
+    /// The seal marker's `sealed_at`, as `generate_seal_marker` writes it,
+    /// reaches a caller in the catalog's form.
+    #[test]
+    fn a_generated_seal_marker_yields_a_catalog_sealed_at() {
+        let seal = generate_seal_marker("RT12", 10, &"ab".repeat(32), &sample_files());
+        let parsed = parse_seal_marker(&seal).unwrap();
+        let catalog = catalog_timestamp(&parsed.sealed_at).expect("RFC 3339");
+        assert_eq!(catalog.len(), "2026-07-22 20:09:00".len());
+        assert_eq!(catalog_timestamp(&parsed.sealed_at), Some(catalog));
     }
 
     /// The same, through the live generator: `None` in, nothing out.

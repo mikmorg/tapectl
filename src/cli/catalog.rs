@@ -656,12 +656,29 @@ pub fn run(
                         // trips `volume_status_mismatch` above -- this is
                         // the sibling that still surfaces it.
                         "volume_condition_mismatch": report.volume_condition_mismatch,
+                        // Issue #305: additive. The tape's own dates, the
+                        // chip's load count at write, and a found row's
+                        // disagreeing seal time.
+                        "written_at": report.written_at,
+                        "sealed_at": report.sealed_at,
+                        "load_count_at_write": report.load_count_at_write,
+                        "volume_sealed_at_mismatch": report.volume_sealed_at_mismatch,
                     })
                 );
             } else {
                 println!(
                     "rebuilt from volume \"{}\" (uuid {}), {} envelope(s) opened",
                     report.label, report.uuid, report.envelopes_opened
+                );
+                // Issue #305: what the tape says about its own write, every
+                // run — the dates a rebuilt row now carries.
+                println!(
+                    "  {}",
+                    tape_dates_line(
+                        report.written_at.as_deref(),
+                        report.sealed_at.as_deref(),
+                        report.load_count_at_write
+                    )
                 );
                 if report.is_noop() {
                     println!("  no changes — the catalog already knew this volume");
@@ -758,6 +775,15 @@ pub fn run(
                          nothing on it counts as a copy. Run `tapectl volume verify {}` to check \
                          the tape; the condition itself will not change automatically",
                         report.label, report.label
+                    );
+                }
+                if let Some(recorded) = &report.volume_sealed_at_mismatch {
+                    println!(
+                        "  warning: volume \"{}\" was already in this catalog sealed at \
+                         {recorded}, but its seal marker says {} — the rebuild left the row's \
+                         seal time alone; one of the two is not this tape's",
+                        report.label,
+                        report.sealed_at.as_deref().unwrap_or("?"),
                     );
                 }
                 if !report.had_catalog_db {
@@ -1048,6 +1074,28 @@ fn cartridge_supersession_note(superseded: &str, winner: &str) -> String {
     )
 }
 
+/// `catalog rebuild`'s line about the tape's own write (issue #305): when
+/// it was written (File 0's `created_at`, the plan time), when it was
+/// sealed, and the chip's load count then. Each absent fact is named as
+/// unknown, never left out, so "the tape does not say" reads differently
+/// from "the rebuild did not look".
+fn tape_dates_line(
+    written_at: Option<&str>,
+    sealed_at: Option<&str>,
+    load_count_at_write: Option<i64>,
+) -> String {
+    format!(
+        "on tape: written {} UTC, sealed {}, chip load count at write {}",
+        written_at.unwrap_or("(unknown — File 0 has no created_at)"),
+        sealed_at
+            .map(|s| format!("{s} UTC"))
+            .unwrap_or_else(|| "(unknown — no readable seal marker)".to_string()),
+        load_count_at_write
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+    )
+}
+
 /// First 12 characters of a hash, elided — or the whole thing when it is
 /// shorter than that.
 ///
@@ -1094,6 +1142,25 @@ fn displacements_json(report: &crate::volume::rebuild::RebuildReport) -> serde_j
 
 #[cfg(test)]
 mod tests {
+    /// Issue #305: the tape's dates are printed, and an absent one is named
+    /// as unknown rather than dropped.
+    #[test]
+    fn the_tape_dates_line_names_each_date_or_says_it_is_unknown() {
+        assert_eq!(
+            super::tape_dates_line(
+                Some("2026-09-11 00:00:00"),
+                Some("2026-09-12 03:04:05"),
+                Some(7)
+            ),
+            "on tape: written 2026-09-11 00:00:00 UTC, sealed 2026-09-12 03:04:05 UTC, \
+             chip load count at write 7"
+        );
+        let none = super::tape_dates_line(None, None, None);
+        assert!(none.contains("File 0 has no created_at"), "{none}");
+        assert!(none.contains("no readable seal marker"), "{none}");
+        assert!(none.ends_with("chip load count at write unknown"), "{none}");
+    }
+
     // --- issue #110 item 1: short-hash elision must not panic ---
 
     #[test]
