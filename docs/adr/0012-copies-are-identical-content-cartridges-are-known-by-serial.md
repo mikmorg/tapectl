@@ -1289,6 +1289,20 @@ landed on master in de732a7 and 21f93a3; the questions are in their issues.
 25. **A serial bound to a live sealed volume is not refused when the tape proves blank** (#400).
     The displacement rule (ADR-0010/0012: erase, then `volume init`, no `--force`) stands; what
     #400 does refuse is a File 0 read error with no blank evidence.
+26. **`--policy-aware` and copy distinctness are built** (#144). `--policy-aware` (collection
+    plan/run, volume plan) orders the selection so units whose audit findings a write would
+    resolve (too few copies, too few locations) go first. Copy distinctness is checked at plan
+    time: two copies of one batch on volumes of the same cartridge is refused (that is one copy,
+    not two); copies that share a location are named in a warning, because location policy stays
+    advisory (ADR-0004) and `audit` still reports it. `docs/design-errata.md`'s "Recast" and
+    "Deferred" entries for §2.17 are closed by this.
+27. **`config set`, `config add` and `config remove` are built** (#143). They edit config.toml in
+    place, keeping its comments and layout, refuse an unknown key by name as every reader does,
+    validate the result as `config check` would before writing it, and replace the file
+    atomically. A refused edit leaves the file untouched.
+28. **The append-only journals are never pruned** (#310): `health_logs`, `verification_results`,
+    `events` and the forensic journals keep every row, as logs and stage reports do (item 13).
+    `db stats` reports the size of each table, so growth can be seen.
 
 Also ruled: the chip's and the drive's wear figures stay in the journal (ADR-0013) and are not
 copied into columns on `cartridges` (#299). And **a migration file is named for its position**
