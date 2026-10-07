@@ -438,6 +438,11 @@ fn migrations() -> Migrations<'static> {
         // whole table. Index only, no rows touched, so no
         // `.foreign_key_check()`.
         M::up(include_str!("migrations/031_events_action_index.sql")),
+        // 032 keeps dar's report for every `dar -c` a stage set ran
+        // (issue #343): one append-only row per run, `stage_set_id` ON
+        // DELETE SET NULL with the names kept beside it. A new table, no
+        // rows touched. See the header.
+        M::up(include_str!("migrations/032_dar_create_reports.sql")),
     ])
 }
 

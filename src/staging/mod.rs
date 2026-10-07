@@ -1,4 +1,5 @@
 pub mod clean;
+pub mod dar_report;
 pub mod exclude;
 mod files;
 pub mod jobs;
@@ -892,7 +893,9 @@ fn stage_create_inner(
             // dar's own failure, if it had one, is the cause to report: a
             // short archive is how it reaches the slicer. A refusal from
             // the source check outranks both.
-            let dar_failed = dar_run.abort();
+            let (dar_failed, report) = dar_run.abort_reported();
+            // Issue #343: what dar said, kept whichever way this ends.
+            record_dar_report(conn, stage_set_id, &unit.name, snapshot.version, &report);
             if crate::signal::is_interrupted() {
                 return Err(TapectlError::Interrupted(stopped_archiving(
                     &snapshot.source_path,
@@ -904,7 +907,9 @@ fn stage_create_inner(
             return Err(dar_failed.unwrap_or(e));
         }
     };
-    if let dar::create::DarFinish::FilesChanged { detail } = dar_run.finish()? {
+    let (finished, report) = dar_run.finish_reported();
+    record_dar_report(conn, stage_set_id, &unit.name, snapshot.version, &report);
+    if let dar::create::DarFinish::FilesChanged { detail } = finished? {
         return Err(TapectlError::Other(format!(
             "DIRTY: a source file of unit \"{}\" changed while dar was reading it \
              (dar exit 11). tapectl runs dar with --retry-on-change 0, so a file \
@@ -1158,6 +1163,17 @@ pub(crate) fn home_work_dir(paths: &TapectlPaths, prefix: &str) -> Result<tempfi
 }
 
 /// What a stop during the archive pass says (issue #404).
+/// Keep dar's report of this stage's `dar -c` (issue #343, migration 032).
+fn record_dar_report(
+    conn: &Connection,
+    stage_set_id: i64,
+    unit_name: &str,
+    version: i64,
+    report: &dar::create::DarCreateReport,
+) {
+    dar_report::record(conn, stage_set_id, unit_name, version, report);
+}
+
 fn stopped_archiving(source: &str) -> String {
     format!("dar was stopped while archiving {source}")
 }
@@ -5116,12 +5132,65 @@ mod tests {
 
         let err = result.expect_err("a file changing under dar refuses the stage");
         assert!(err.to_string().contains("DIRTY"), "{err}");
+        // Issue #343: dar's report of the refused run is kept — the run an
+        // operator most needs to read later. Which of the two checks saw
+        // the change first decides how dar ended: dar's own (exit 11), or
+        // the source check stopping the stage while dar still ran.
+        let (outcome, code, stderr): (String, Option<i64>, Vec<u8>) = conn
+            .query_row(
+                "SELECT outcome, dar_exit_code, dar_stderr FROM dar_create_reports",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("one dar report row");
+        assert!(
+            ["files_changed", "failed", "aborted"].contains(&outcome.as_str()),
+            "{outcome}"
+        );
+        if outcome == "files_changed" {
+            assert_eq!(code, Some(11));
+            assert!(!stderr.is_empty(), "dar said why");
+        }
         let left: Vec<_> = fs::read_dir(&config.staging.directory)
             .unwrap()
             .flatten()
             .map(|e| e.file_name())
             .collect();
         assert!(left.is_empty(), "nothing is left in staging: {left:?}");
+    }
+
+    /// Issue #343: a clean stage keeps dar's report too — exit 0, the
+    /// command, the version — against its stage set.
+    #[test]
+    fn a_clean_stage_keeps_dars_report_against_its_stage_set() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("a.txt"), b"some content").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let stage_set_id = stage_create(&conn, &paths, &config, snap_id, false).unwrap();
+        let row: (Option<i64>, String, String, Option<i64>, String, String) = conn
+            .query_row(
+                "SELECT stage_set_id, unit_name, outcome, dar_exit_code, dar_command,
+                        dar_version
+                   FROM dar_create_reports",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .expect("one dar report row");
+        assert_eq!(row.0, Some(stage_set_id));
+        assert_eq!(row.1, "unit1");
+        assert_eq!((row.2.as_str(), row.3), ("complete", Some(0)));
+        assert!(row.4.contains("\"-c\""), "{}", row.4);
+        assert!(!row.5.is_empty(), "dar's version is kept");
     }
 
     /// Issue #370: slices cut from dar's stream are dar slices. Decrypted

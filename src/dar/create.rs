@@ -266,62 +266,145 @@ impl DarStream {
 
     /// Wait for dar to exit, once its archive has been read to the end. A
     /// signal to tapectl meanwhile stops dar (issue #404).
-    pub fn finish(mut self) -> Result<DarFinish> {
+    pub fn finish(self) -> Result<DarFinish> {
+        self.finish_reported().0
+    }
+
+    /// [`Self::finish`], and dar's report of the run (issue #343): what it
+    /// wrote on standard error, verbatim, and how it exited — on every exit.
+    pub fn finish_reported(mut self) -> (Result<DarFinish>, DarCreateReport) {
         drop(self.stdout.take());
         let mut child = self.child.take().expect("dar is waited on once");
         let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(e) => {
+                    super::terminate(&mut child);
+                    let stderr = self.stderr();
+                    let report = self.report(OUTCOME_FAILED, None, stderr);
+                    return (Err(e.into()), report);
+                }
             }
             if crate::signal::is_interrupted() {
                 super::terminate(&mut child);
-                let _ = self.stderr();
-                return Err(TapectlError::Interrupted(
-                    "dar was stopped while finishing its archive".into(),
-                ));
+                let stderr = self.stderr();
+                let report = self.report(OUTCOME_STOPPED, None, stderr);
+                return (
+                    Err(TapectlError::Interrupted(
+                        "dar was stopped while finishing its archive".into(),
+                    )),
+                    report,
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         };
         let stderr = self.stderr();
-        match status.code() {
-            Some(0) => Ok(DarFinish::Complete),
-            Some(EXIT_FILES_CHANGED) => Ok(DarFinish::FilesChanged {
-                detail: excerpt(&stderr),
-            }),
-            _ if crate::signal::is_interrupted() => Err(TapectlError::Interrupted(
-                "dar was stopped while archiving".into(),
-            )),
-            _ => Err(TapectlError::Dar(format!(
-                "dar -c failed (exit {status}): {}",
-                excerpt(&stderr)
-            ))),
-        }
+        let (outcome, result) = match status.code() {
+            Some(0) => (OUTCOME_COMPLETE, Ok(DarFinish::Complete)),
+            Some(EXIT_FILES_CHANGED) => (
+                OUTCOME_FILES_CHANGED,
+                Ok(DarFinish::FilesChanged {
+                    detail: excerpt(&stderr),
+                }),
+            ),
+            _ if crate::signal::is_interrupted() => (
+                OUTCOME_STOPPED,
+                Err(TapectlError::Interrupted(
+                    "dar was stopped while archiving".into(),
+                )),
+            ),
+            _ => (
+                OUTCOME_FAILED,
+                Err(TapectlError::Dar(format!(
+                    "dar -c failed (exit {status}): {}",
+                    excerpt(&stderr)
+                ))),
+            ),
+        };
+        let report = self.report(outcome, status.code(), stderr);
+        (result, report)
     }
 
     /// Stop dar because the archive's consumer failed. If dar had already
     /// failed on its own — a short archive is how its failure reaches the
     /// consumer — that failure is returned, as the one to report.
-    pub fn abort(mut self) -> Option<TapectlError> {
+    pub fn abort(self) -> Option<TapectlError> {
+        self.abort_reported().0
+    }
+
+    /// [`Self::abort`], and dar's report of the run (issue #343).
+    pub fn abort_reported(mut self) -> (Option<TapectlError>, DarCreateReport) {
         // Closing the pipe first lets a dar blocked on a write fail with
         // EPIPE instead of waiting out the grace period.
         drop(self.stdout.take());
-        let mut child = self.child.take()?;
-        let failed = match child.try_wait() {
-            Ok(Some(status)) if !status.success() => Some(status),
-            Ok(Some(_)) => None,
+        let Some(mut child) = self.child.take() else {
+            let stderr = self.stderr();
+            return (None, self.report(OUTCOME_ABORTED, None, stderr));
+        };
+        let (failed, code) = match child.try_wait() {
+            Ok(Some(status)) if !status.success() => (Some(status), status.code()),
+            Ok(Some(status)) => (None, status.code()),
             _ => {
                 super::terminate(&mut child);
-                None
+                (None, None)
             }
         };
         let stderr = self.stderr();
-        failed.map(|status| {
+        let error = failed.map(|status| {
             TapectlError::Dar(format!(
                 "dar -c failed (exit {status}): {}",
                 excerpt(&stderr)
             ))
-        })
+        });
+        let outcome = if error.is_some() {
+            OUTCOME_FAILED
+        } else {
+            OUTCOME_ABORTED
+        };
+        let report = self.report(outcome, code, stderr);
+        (error, report)
     }
+
+    fn report(
+        &self,
+        outcome: &'static str,
+        exit_code: Option<i32>,
+        stderr: Vec<u8>,
+    ) -> DarCreateReport {
+        DarCreateReport {
+            outcome,
+            command: self.dar_command.clone(),
+            exit_code,
+            stderr,
+            dar_version: self.dar_version.clone(),
+        }
+    }
+}
+
+/// `dar_create_reports.outcome` (migration 032): dar exited 0.
+pub const OUTCOME_COMPLETE: &str = "complete";
+/// dar exited 11: a file changed while it read it (refused as DIRTY).
+pub const OUTCOME_FILES_CHANGED: &str = "files_changed";
+/// dar exited with any other code, or could not be waited on.
+pub const OUTCOME_FAILED: &str = "failed";
+/// The archive's consumer failed and tapectl stopped dar.
+pub const OUTCOME_ABORTED: &str = "aborted";
+/// A signal to tapectl stopped dar.
+pub const OUTCOME_STOPPED: &str = "stopped";
+
+/// What one `dar -c` run reported (issue #343): its standard error verbatim
+/// (standard output is the archive), its exit code (`None` when a signal
+/// ended it), and how the run ended. Recorded by
+/// [`crate::staging::dar_report::record`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DarCreateReport {
+    pub outcome: &'static str,
+    /// The command as `stage_sets.dar_command`'s dar part records it.
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub stderr: Vec<u8>,
+    pub dar_version: String,
 }
 
 impl Drop for DarStream {
