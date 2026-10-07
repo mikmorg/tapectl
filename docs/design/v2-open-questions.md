@@ -340,7 +340,9 @@ Notes that make this safe, and one build-time verify:
   documented behavior is the SQLite-recommended FK-off-during-migrations dance;
   confirm, else wrap 003 manually.
 - Legacy `full` retained in the CHECK, read as sealed-equivalent
-  (`layout-session.md`). New code writes `sealed`.
+  (`layout-session.md`). New code writes `sealed`. (Superseded: nothing ever
+  wrote `full`, and migration 032 dropped it -- ADR-0012 amendment 2026-10-07
+  item 16.)
 - `write_positions.status` keeps its dead `'sacrificed'` value as inert reserve
   (EOT salvage deleted; not worth a second rebuild). Same for
   `writes.eot_recovery`/`sacrificed_slice_id` (already ruled inert).

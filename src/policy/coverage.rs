@@ -96,10 +96,12 @@ fn condition_ok(volume_alias: &str) -> String {
 ///   is a durability claim, so it is `sealed`-only (ADR-0004).
 /// - `in_service` — "does this volume's PHYSICAL MEDIA count toward
 ///   inventory and capacity?" That is an accounting question, and the
-///   answer includes legacy `full`: `docs/design/layout-session.md` reads
-///   `full` as sealed-equivalent for pre-renovation volumes, so the
-///   cartridge exists and holds bytes. Dropping it here would silently
-///   under-report physical media — trading one under-report for another.
+///   answer includes `active` (a tape `volume import` describes, written
+///   elsewhere): the cartridge exists and holds bytes. Dropping it here
+///   would silently under-report physical media — trading one
+///   under-report for another. (`full` was in this list as a
+///   "pre-renovation" sealed-equivalent until migration 032 dropped it:
+///   nothing ever wrote it — ADR-0012 amendment 2026-10-07 item 16.)
 ///
 /// Both exclude `retired`/`erased`/`quarantined`: media that is
 /// gone, wiped, or untrusted is neither a copy nor live inventory. Since
@@ -111,7 +113,7 @@ fn condition_ok(volume_alias: &str) -> String {
 pub fn in_service(volume_alias: &str) -> String {
     format!(
         "({} AND {})",
-        status_in(volume_alias, &["active", "full", "sealed"]),
+        status_in(volume_alias, &["active", "sealed"]),
         condition_ok(volume_alias)
     )
 }
@@ -131,7 +133,7 @@ pub fn in_service(volume_alias: &str) -> String {
 pub fn in_service_or_provisioned(volume_alias: &str) -> String {
     format!(
         "({} AND {})",
-        status_in(volume_alias, &["active", "full", "sealed", "initialized"]),
+        status_in(volume_alias, &["active", "sealed", "initialized"]),
         condition_ok(volume_alias)
     )
 }
@@ -139,11 +141,11 @@ pub fn in_service_or_provisioned(volume_alias: &str) -> String {
 /// ADR-0012: the one status `volume write`/`volume resume` may target.
 ///
 /// Deliberately narrower than [`in_service_or_provisioned`], which folds in
-/// `active`/`full`/`sealed` for inventory/capacity accounting — none of
-/// those are write targets. `active` is written only by `tapectl import`
-/// (a tape written elsewhere, not a v2 write session); `full` is the
-/// pre-renovation sealed-equivalent (`blank`/`missing`, which never had a
-/// writer, left the schema in migration 026). A `sealed` volume is never written again (ADR-0003), and
+/// `active`/`sealed` for inventory/capacity accounting — neither is a
+/// write target. `active` is written only by `tapectl import` (a tape
+/// written elsewhere, not a v2 write session). `blank`/`missing` (migration
+/// 026) and `full` (032), which never had a writer, left the schema. A
+/// `sealed` volume is never written again (ADR-0003), and
 /// `retired`/`erased` are catalog facts that make writing wrong regardless
 /// of what the loaded tape looks like. `quarantined` is NOT a `status`
 /// value (ADR-0012's 2026-09-17 amendment, issue #242) — it is the
@@ -286,9 +288,9 @@ pub fn in_service_copy_of_version(
 /// The "not gone" half is written as an EXCLUSION of
 /// `retired`/`erased` ([`status_not_in`]), not an inclusion list,
 /// so a future `volumes.status` value cannot silently drop out of the
-/// Tier-3 floor by omission — migration 026's full legal set is
-/// `initialized`, `active`, `full`, `retired`, `erased`, `sealed`
-/// (`026_drop_unwritten_states.sql`).
+/// Tier-3 floor by omission — the legal set since migration 032 is
+/// `initialized`, `active`, `retired`, `erased`, `sealed`
+/// (`032_drop_volume_status_full.sql`).
 ///
 /// **Must NOT be used for copy counting.** An unconfirmed volume is not a
 /// Copy (ADR-0004) and must not contribute to `min_copies`,
@@ -309,7 +311,7 @@ pub fn holds_sealed_bytes(volume_alias: &str) -> String {
 /// `report verify-status` asks before it synthesises a "never verified"
 /// line for a volume with no verification session (issue #336).
 ///
-/// Bytes: legacy `active`/`full`, `sealed`, or a recorded seal on a volume
+/// Bytes: `active` (imported), `sealed`, or a recorded seal on a volume
 /// whose confirm never landed (`sealed_at` set while `initialized` -- the
 /// state [`holds_sealed_bytes`] also widens to). Not gone: `retired`
 /// and `erased` media is not verified. Unlike
@@ -320,7 +322,7 @@ pub fn holds_sealed_bytes(volume_alias: &str) -> String {
 pub fn holds_bytes_to_verify(volume_alias: &str) -> String {
     format!(
         "(({in_bytes} OR {alias}.sealed_at IS NOT NULL) AND {not_gone})",
-        in_bytes = status_in(volume_alias, &["active", "full", "sealed"]),
+        in_bytes = status_in(volume_alias, &["active", "sealed"]),
         alias = volume_alias,
         not_gone = status_not_in(volume_alias, &["retired", "erased"]),
     )
@@ -1272,11 +1274,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn in_service_keeps_legacy_full_and_adds_sealed() {
+    fn in_service_keeps_imported_active_and_adds_sealed() {
         assert_eq!(
             in_service("v"),
-            "(v.status IN ('active','full','sealed') AND v.observed_condition = 'ok')",
-            "dropping legacy 'full' would under-report physical media"
+            "(v.status IN ('active','sealed') AND v.observed_condition = 'ok')",
+            "dropping imported 'active' would under-report physical media"
         );
     }
 
@@ -1284,7 +1286,7 @@ pub(crate) mod tests {
     fn in_service_takes_a_bare_table_name_for_unaliased_queries() {
         assert_eq!(
             in_service("volumes"),
-            "(volumes.status IN ('active','full','sealed') AND volumes.observed_condition = 'ok')"
+            "(volumes.status IN ('active','sealed') AND volumes.observed_condition = 'ok')"
         );
     }
 
@@ -1292,7 +1294,7 @@ pub(crate) mod tests {
     fn in_service_or_provisioned_adds_initialized_and_nothing_else() {
         assert_eq!(
             in_service_or_provisioned("volumes"),
-            "(volumes.status IN ('active','full','sealed','initialized') AND \
+            "(volumes.status IN ('active','sealed','initialized') AND \
              volumes.observed_condition = 'ok')"
         );
     }
@@ -1636,17 +1638,11 @@ pub(crate) mod tests {
     /// Repointed again, to the LIVE schema (issue #362): reading 017's
     /// text is the same trap one migration later -- 026 dropped `blank`
     /// and `missing` and this pin kept passing against 017. Reading the
-    /// migrated schema itself means the next migration cannot strand it.
+    /// migrated schema itself means the next migration cannot strand it
+    /// (032 dropped `full`, and this pin named it as the first to notice).
     #[test]
     fn is_write_target_admits_exactly_initialized() {
-        let statuses = [
-            "initialized",
-            "active",
-            "full",
-            "retired",
-            "erased",
-            "sealed",
-        ];
+        let statuses = ["initialized", "active", "retired", "erased", "sealed"];
 
         // The live `CHECK(status IN (...))` set, pinned against `statuses`
         // by SET EQUALITY, not mere containment -- a one-directional "does

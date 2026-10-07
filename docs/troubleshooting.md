@@ -604,7 +604,9 @@ sealed -- then run the command again. Nothing has been changed.
 ```
 
 The statuses it removes are `retired` (units), `superseded` and `failed`
-(snapshots), and `blank` and `missing` (volumes). Nothing has been changed:
+(snapshots), and `blank` and `missing` (volumes). The volume statuses its
+message lists still include `full`, which migration 032 removes in turn (see
+[below](#migration-032-cannot-run)): do not choose it. Nothing has been changed:
 the whole step rolls back. Neither `db fsck --repair` nor `db backup` can
 help, because both have to open the database too. Decide, row by row, which
 allowed status tells the truth about it, then set it by hand while no tapectl
@@ -727,6 +729,25 @@ Nothing needs doing about it. The `files` row is gone once 030 applies; the
 path it named is `sqlite3 "$DB" "SELECT path FROM paths WHERE id = 977"`.
 
 Once 030 applies, the same command compacts the catalog once, as after 027.
+
+### `migration 032 cannot run`
+
+Migration 032 removes the volume status `full`, which no tapectl release has
+ever written. A volume carrying it was set by hand, and 032 will not guess what
+it should say:
+
+```text
+error: failed to open database: migration error: migration 032 cannot run: volumes.status = 'full' on 1 row(s)
+(id 7). Migration 032 removes this status from the schema. No tapectl release has ever written it, so these rows
+were set by hand, and 032 will not guess what they should say. Change each named row to a status the new schema
+allows -- initialized, active, retired, erased, sealed -- then run the command again. Nothing has been changed.
+```
+
+Nothing has been changed. Decide which status tells the truth about each named
+volume and set it with `sqlite3`, the same way as for migration 026 above
+(`sqlite3 "$DB" "UPDATE volumes SET status = 'retired' WHERE id = 7"`). Only
+`sealed` counts as a copy, so choose it only for a volume whose seal you can
+stand behind; `volume verify` checks one afterwards.
 
 ---
 

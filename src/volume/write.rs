@@ -9382,7 +9382,7 @@ mod tests {
     /// for that dimension's own regression test.
     #[test]
     fn volume_write_refuses_every_non_initialized_status_before_touching_the_device() {
-        let statuses = ["sealed", "retired", "erased", "active", "full"];
+        let statuses = ["sealed", "retired", "erased", "active"];
         // "Every non-`initialized` status" is the live schema's, not a copy
         // of it (issue #362: `blank`/`missing` stayed here after 026).
         let mut every_other = crate::db::live_status_check("volumes");

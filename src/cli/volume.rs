@@ -396,7 +396,7 @@ pub enum VolumeCommands {
     /// inventory is a tape you forgot you had. `--status` narrows; nothing is
     /// hidden without it.
     List {
-        /// Only volumes in this status (initialized, active, full, retired,
+        /// Only volumes in this status (initialized, active, retired,
         /// erased, sealed). Every status is shown when
         /// omitted. A medium's CONDITION (e.g. quarantined) is its own fact
         /// now (ADR-0012, the 2026-09-17 amendment) and is shown in its own
@@ -468,22 +468,16 @@ pub enum DepositCommands {
 }
 
 /// `volumes.status`'s CHECK constraint
-/// (`src/db/migrations/026_drop_unwritten_states.sql`, which last rewrote it
-/// and is the schema's current word on it: `blank` and `missing` left there,
-/// nothing ever wrote either, issue #362). `quarantined` is deliberately
+/// (`src/db/migrations/032_drop_volume_status_full.sql`, which last rewrote
+/// it and is the schema's current word on it: `full` left there, as `blank`
+/// and `missing` left in 026 -- nothing ever wrote any of them; issue #362,
+/// ADR-0012 amendment 2026-10-07 item 16). `quarantined` is deliberately
 /// absent: ADR-0012's 2026-09-17 amendment ("the status column is the
 /// operator's; a medium's condition is its own fact", issue #242) moved it to
 /// `volumes.observed_condition` in 017 — it left this CHECK entirely, it was
 /// not merely renamed within it. Pinned to the live schema by
 /// `volume_statuses_equal_the_live_check`.
-const VOLUME_STATUSES: &[&str] = &[
-    "initialized",
-    "active",
-    "full",
-    "retired",
-    "erased",
-    "sealed",
-];
+const VOLUME_STATUSES: &[&str] = &["initialized", "active", "retired", "erased", "sealed"];
 
 /// `volume list --status` is a usage error when it names anything other
 /// than one of `VOLUME_STATUSES` (issue #171, ADR-0012) — `volumes.status`

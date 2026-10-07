@@ -359,7 +359,7 @@ tapectl volume list [OPTIONS]
 
 **Options**
 
-- `--status <STATUS>` — Only volumes in this status (initialized, active, full, retired, erased, sealed). Every status is shown when omitted. A medium's CONDITION (e.g. quarantined) is its own fact now (ADR-0012, the 2026-09-17 amendment) and is shown in its own column/line, not filterable here
+- `--status <STATUS>` — Only volumes in this status (initialized, active, retired, erased, sealed). Every status is shown when omitted. A medium's CONDITION (e.g. quarantined) is its own fact now (ADR-0012, the 2026-09-17 amendment) and is shown in its own column/line, not filterable here
 
 ### tapectl volume info
 

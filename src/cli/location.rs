@@ -609,14 +609,14 @@ fn move_together(
                 // `eligible`, deliberately, not `in_service`: the question
                 // this hint answers is "would `volume deposit add` accept
                 // this volume", which is exactly what `eligible` decides
-                // (sealed-only). `in_service` also admits `active`/`full`,
+                // (sealed-only). `in_service` also admits `active`,
                 // which `run_deposit` does not -- using it here would
                 // widen the "go ahead and deposit" branch to statuses
                 // `run_deposit` still refuses, regressing
                 // `move_refuses_a_warehouse_destination_for_an_active_volume`.
                 // The two predicates share `condition_ok`, so they agree on
                 // the quarantine case this issue is actually about; they
-                // diverge only on `active`/`full`, which is where the
+                // diverge only on `active`, which is where the
                 // wrong choice would have shown up.
                 let eligible_expr = crate::policy::coverage::eligible("v");
                 let (status, condition, eligible): (String, String, bool) = conn.query_row(

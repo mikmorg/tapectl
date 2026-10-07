@@ -714,7 +714,7 @@ fn test_compaction_candidate_query() {
              JOIN stage_sets sts ON sts.id = w.stage_set_id
              JOIN snapshots s ON s.id = sts.snapshot_id
              JOIN stage_slices ss ON ss.stage_set_id = sts.id
-             WHERE v.status IN ('active','full')
+             WHERE v.status = 'active'
              GROUP BY v.id
              HAVING utilization < 0.50",
         ).unwrap();

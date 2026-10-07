@@ -624,7 +624,7 @@ pub(crate) fn copies_rows(conn: &Connection, unit_filter: Option<&str>) -> Resul
     // Issue #236 finding 2: this label is "tapes holding any version", the
     // same physical-inventory question `policy::escrow`'s coverage query
     // asks of the SAME volume (`in_service`, not `eligible`) -- so a volume
-    // that is `active`/`full` but not yet `sealed` still shows up here,
+    // that is `active` but not yet `sealed` still shows up here,
     // exactly where the escrow line three lines below already names it.
     // Using `eligible` (sealed-only) here silently dropped those volumes,
     // producing `[tapes holding any version: -]` directly above an escrow
@@ -2876,8 +2876,8 @@ mod tests {
 
         /// Issue #336: a session-less volume that holds nothing to verify
         /// is not listed as "never verified" -- erased, retired and plain
-        /// initialized. Positive controls: a sealed one, a
-        /// legacy `full` one, a quarantined sealed one (verify is what
+        /// initialized. Positive controls: a sealed one, an
+        /// imported `active` one, a quarantined sealed one (verify is what
         /// clears quarantine) and an `initialized` one whose seal is
         /// recorded all still appear; an erased volume WITH a session keeps
         /// its history row; and `--volume` finds an erased one by name.
@@ -2899,7 +2899,7 @@ mod tests {
             }
             seed("GONE-erased-sealed", "erased", true, "ok");
             seed("KEEP-sealed", "sealed", false, "ok");
-            seed("KEEP-full", "full", false, "ok");
+            seed("KEEP-active", "active", false, "ok");
             seed("KEEP-quarantined", "sealed", false, "quarantined");
             seed("KEEP-init-sealed", "initialized", true, "ok");
             seed_verified(&conn, "KEEP-verified", "2020-01-01T00:00:00Z");
@@ -2915,7 +2915,7 @@ mod tests {
             assert_eq!(
                 labels,
                 vec![
-                    "KEEP-full",
+                    "KEEP-active",
                     "KEEP-init-sealed",
                     "KEEP-quarantined",
                     "KEEP-sealed",
@@ -3434,8 +3434,8 @@ mod tests {
         /// version", but the query used to filter that list through
         /// `eligible` (sealed-only) -- the SAME narrower predicate `copies`
         /// itself already uses, not the wider `in_service` question the
-        /// escrow line three lines below asks of the SAME volume. A `full`
-        /// volume (ADR-0011's legacy sealed-equivalent: `in_service` but not
+        /// escrow line three lines below asks of the SAME volume. An `active`
+        /// volume (a tape `volume import` describes: `in_service` but not
         /// `eligible`) genuinely holds a version and must appear, listed in
         /// the additive `volumes_not_eligible` sibling (6th field) rather
         /// than baked into `volumes` itself as a `*` marker -- a raw fact
@@ -3445,22 +3445,22 @@ mod tests {
         /// (`copies_rows_volume_label_list_excludes_a_non_sealed_volume`
         /// above pins that those stay excluded under `in_service` too).
         #[test]
-        fn copies_rows_volume_label_list_includes_a_full_volume_marked_not_eligible() {
-            let conn = setup_unit_with_two_volumes("rep-full", "full");
-            let rows = copies_rows(&conn, Some("rep-full")).unwrap();
+        fn copies_rows_volume_label_list_includes_an_active_volume_marked_not_eligible() {
+            let conn = setup_unit_with_two_volumes("rep-active", "active");
+            let rows = copies_rows(&conn, Some("rep-active")).unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(
                 rows[0].1, 1,
-                "a `full` second volume must not count as a copy"
+                "an `active` second volume must not count as a copy"
             );
             let volumes = rows[0].3.as_deref().unwrap_or("");
             assert!(
-                volumes.contains("rep-full-SEALED"),
+                volumes.contains("rep-active-SEALED"),
                 "the sealed volume must still be listed: {volumes}"
             );
             assert!(
-                volumes.contains("rep-full-OTHER"),
-                "the `full` volume must be listed too: {volumes}"
+                volumes.contains("rep-active-OTHER"),
+                "the `active` volume must be listed too: {volumes}"
             );
             assert!(
                 !volumes.contains('*'),
@@ -3468,7 +3468,7 @@ mod tests {
             );
             let not_eligible = rows[0].5.as_deref().unwrap_or("");
             assert_eq!(
-                not_eligible, "rep-full-OTHER",
+                not_eligible, "rep-active-OTHER",
                 "the ineligible subset is named separately, not folded into `volumes`"
             );
         }
@@ -3850,8 +3850,9 @@ mod tests {
     /// (`docs/design/layout-session.md`: `blank -> initialized -> active ->
     /// sealed`). Against a v2-only catalog every one of them returned the
     /// empty set. These tests pin BOTH halves of the ruling: the
-    /// inventory/capacity surfaces must count `sealed` AND keep legacy
-    /// `full`, while compaction must be `sealed`-only.
+    /// inventory/capacity surfaces must count `sealed` AND keep imported
+    /// `active`, while compaction must be `sealed`-only. (`full` left the
+    /// schema in migration 032: nothing ever wrote it.)
     mod issue96_volume_status_drift {
         use super::*;
 
@@ -3994,14 +3995,13 @@ mod tests {
             assert_eq!(in_service_volume_count(&conn).unwrap(), 1);
         }
 
-        /// The regression an `eligible`-everywhere fix would introduce:
-        /// legacy `full` is sealed-equivalent for pre-renovation volumes and
-        /// its physical media still exists, so dropping it would silently
-        /// under-report inventory.
+        /// The regression an `eligible`-everywhere fix would introduce: an
+        /// imported `active` volume is not a copy, but its physical media
+        /// exists, so dropping it would silently under-report inventory.
         #[test]
-        fn summary_still_counts_a_legacy_full_volume() {
+        fn summary_still_counts_an_imported_active_volume() {
             let (conn, unit) = setup();
-            seed_written_volume(&conn, unit, "FULL01", "full", 1000, 100, 900);
+            seed_written_volume(&conn, unit, "IMP01", "active", 1000, 100, 900);
 
             assert_eq!(in_service_volume_count(&conn).unwrap(), 1);
         }
@@ -4034,14 +4034,14 @@ mod tests {
         }
 
         #[test]
-        fn capacity_totals_include_sealed_and_legacy_full() {
+        fn capacity_totals_include_sealed_and_imported_active() {
             let (conn, unit) = setup();
             seed_written_volume(&conn, unit, "SEAL03", "sealed", 400, 400, 0);
-            seed_written_volume(&conn, unit, "FULL02", "full", 600, 600, 0);
+            seed_written_volume(&conn, unit, "IMP02", "active", 600, 600, 0);
             seed_written_volume(&conn, unit, "RET03", "retired", 9999, 100, 0);
 
             let (cap, written, count) = capacity_totals(&conn).unwrap();
-            assert_eq!(count, 2, "sealed + full count; retired does not");
+            assert_eq!(count, 2, "sealed + active count; retired does not");
             assert_eq!(cap, 2000);
             assert_eq!(written, 1000);
         }
@@ -4049,10 +4049,10 @@ mod tests {
         /// Site 745 keeps `initialized` — a provisioned-but-unwritten tape is
         /// deliberately visible in the per-volume listing.
         #[test]
-        fn per_volume_rows_list_sealed_full_and_initialized_but_not_retired() {
+        fn per_volume_rows_list_sealed_active_and_initialized_but_not_retired() {
             let (conn, unit) = setup();
             seed_written_volume(&conn, unit, "SEAL04", "sealed", 400, 400, 0);
-            seed_written_volume(&conn, unit, "FULL03", "full", 600, 600, 0);
+            seed_written_volume(&conn, unit, "IMP03", "active", 600, 600, 0);
             seed_written_volume(&conn, unit, "INIT01", "initialized", 0, 0, 0);
             seed_written_volume(&conn, unit, "RET04", "retired", 100, 100, 0);
 
@@ -4061,7 +4061,7 @@ mod tests {
                 .into_iter()
                 .map(|(l, _, _, _)| l)
                 .collect();
-            assert_eq!(labels, vec!["FULL03", "INIT01", "SEAL04"]);
+            assert_eq!(labels, vec!["IMP03", "INIT01", "SEAL04"]);
         }
     }
 

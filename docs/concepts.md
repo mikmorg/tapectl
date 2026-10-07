@@ -674,7 +674,7 @@ stateDiagram-v2
 The retire and erase commands do not look at a volume's status.
 `cartridge retire` retires every volume on the cartridge, and
 `cartridge mark-erased`, or binding the cartridge to a new volume, erases every
-volume on it. So an `active` or `full` volume (below) leaves the same ways a
+volume on it. So an `active` volume (below) leaves the same ways a
 `sealed` one does. `cartridge unretire` restores only the volumes that were
 retired with the cartridge, each to the status it had before.
 
@@ -685,7 +685,6 @@ retired with the cartridge, each to the status it had before.
 | `retired` | You took it out of service (`volume retire` shows the impact first; `compact-finish` and `cartridge retire` also retire volumes). Not a copy. `volume retire` accepts a volume in any status. |
 | `erased` | Its cartridge was erased (`cartridge mark-erased`) or re-initialized with a new volume. The bytes are gone. |
 | `active` | Set only by [`import`](cli/import.md), for a volume written outside this catalog. |
-| `full` | Legacy: a volume sealed before the current tape format. No current command sets it. Treated like `sealed` for inventory. |
 
 When you retire the last live volume on a cartridge, the cartridge moves to
 `pending_erase` (see below).
