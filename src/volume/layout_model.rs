@@ -269,6 +269,13 @@ pub struct KeyAvailability {
 /// and the capacity it is a fraction of, and the two ways forward. `None`
 /// unless `errs` holds a [`LayoutError::CapacityExceeded`], so a caller can
 /// append it to any refusal unconditionally.
+///
+/// It names `--fill-ceiling`, so it belongs only to a write planned afresh:
+/// `volume write` and the commands that end in one (`volume compact-write`,
+/// `volume compact`, `quick-archive`, `collection run`), which all take the
+/// flag. `volume resume` never reaches it — it revalidates the frozen
+/// layout against the budget that layout was planned with, which cannot
+/// newly exceed it.
 pub fn capacity_refusal_note(
     errs: &[LayoutError],
     fill_ceiling: f64,

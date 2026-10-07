@@ -222,6 +222,7 @@ tapectl volume compact-write [OPTIONS] --destination <DESTINATION>
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--allow-missing-escrow` — See `volume write --allow-missing-escrow`. A compaction whose source volume predates the escrow recipient needs this to proceed
 - `--prewrite-hash` — See `volume write --prewrite-hash`
+- `--fill-ceiling <FILL_CEILING>` — See `volume write --fill-ceiling`: this write only
 - `--full-confirm` — See `volume write --full-confirm`
 
 ### tapectl volume plan
@@ -277,6 +278,7 @@ tapectl volume compact [OPTIONS] <LABEL>
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--allow-missing-escrow` — See `volume write --allow-missing-escrow`
 - `--prewrite-hash` — See `volume write --prewrite-hash` (step 2's write)
+- `--fill-ceiling <FILL_CEILING>` — See `volume write --fill-ceiling` (step 2's write)
 - `--full-confirm` — See `volume write --full-confirm` (step 2's write)
 - `--force` — See `volume compact-finish --force` — step 3's ADR-0008 Tier-2 gate. With this (or the global `--yes`) step 3 asks nothing; the cartridge swap after step 1 still waits for you
 

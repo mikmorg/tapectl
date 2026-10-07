@@ -535,7 +535,7 @@ anyway).
 | Quantity | Production | Microcosm | Rule |
 |---|---|---|---|
 | Nominal tape capacity | 2400 G | **2400 M** | ÷1024 |
-| Usable-capacity factor | 0.92 | 0.92 | dimensionless |
+| Fill ceiling (`fill_ceiling`, was the usable-capacity factor 0.92) | 0.97 | 0.97 | dimensionless; default 97% since ADR-0012 2026-10-06 item 16 |
 | Slice size | 10 G | **10 M** | ÷1024 |
 | Unit (folder) sizes | 2–15 G | **2–15 M** | ÷1024 |
 | Units per tape | ~280 | **~280** | counts preserved |

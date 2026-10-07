@@ -26,6 +26,54 @@ fn cli_debug_assert() {
     Cli::command().debug_assert();
 }
 
+/// Issue #391 follow-up: `capacity_refusal_note` tells the operator to
+/// raise the ceiling "for this write with --fill-ceiling", so every write
+/// planned afresh takes that flag, as `volume write` does. `volume resume`
+/// re-uses its frozen plan, whose budget was fixed when it was planned, and
+/// takes no such flag.
+#[test]
+fn every_write_planned_afresh_takes_fill_ceiling() {
+    for args in [
+        vec!["tapectl", "volume", "write", "L", "--fill-ceiling", "99%"],
+        vec![
+            "tapectl",
+            "volume",
+            "compact-write",
+            "--destination",
+            "L",
+            "--fill-ceiling",
+            "99%",
+        ],
+        vec![
+            "tapectl",
+            "volume",
+            "compact",
+            "S",
+            "--to",
+            "L",
+            "--fill-ceiling",
+            "0.99",
+        ],
+        vec![
+            "tapectl",
+            "quick-archive",
+            "/src",
+            "--tenant",
+            "t",
+            "--volume",
+            "L",
+            "--fill-ceiling",
+            "99%",
+        ],
+    ] {
+        Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+    }
+    assert!(
+        Cli::try_parse_from(["tapectl", "volume", "resume", "L", "--fill-ceiling", "99%"]).is_err(),
+        "a resume's plan is frozen"
+    );
+}
+
 #[test]
 fn parses_bare_init() {
     let cli = Cli::try_parse_from(["tapectl", "init"]).expect("init should parse");

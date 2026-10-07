@@ -283,6 +283,9 @@ pub enum VolumeCommands {
         /// See `volume write --prewrite-hash`.
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --fill-ceiling`: this write only.
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
         /// See `volume write --full-confirm`.
         #[arg(long)]
         full_confirm: bool,
@@ -361,6 +364,9 @@ pub enum VolumeCommands {
         /// See `volume write --prewrite-hash` (step 2's write).
         #[arg(long)]
         prewrite_hash: bool,
+        /// See `volume write --fill-ceiling` (step 2's write).
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
         /// See `volume write --full-confirm` (step 2's write).
         #[arg(long)]
         full_confirm: bool,
@@ -1345,6 +1351,7 @@ pub fn run(
             device,
             allow_missing_escrow,
             prewrite_hash,
+            fill_ceiling,
             full_confirm,
         } => {
             // Issue #241: same reasoning as `volume write` — a real
@@ -1358,6 +1365,8 @@ pub fn run(
                 ));
             }
             let device = write_device(config, device.as_deref())?;
+            // Issue #391: `--fill-ceiling` for this write only.
+            let config = &config.with_fill_ceiling(*fill_ceiling);
             write::compact_write(
                 conn,
                 paths,
@@ -1418,6 +1427,7 @@ pub fn run(
             device,
             allow_missing_escrow,
             prewrite_hash,
+            fill_ceiling,
             full_confirm,
             force,
         } => {
@@ -1493,7 +1503,8 @@ pub fn run(
             write::compact_write(
                 conn,
                 paths,
-                config,
+                // Issue #391: `--fill-ceiling` for step 2's write only.
+                &config.with_fill_ceiling(*fill_ceiling),
                 dest_label,
                 &device,
                 DEFAULT_BLOCK_SIZE,
@@ -2921,6 +2932,7 @@ mod tests {
                 device: Some(DEV.into()),
                 allow_missing_escrow: false,
                 prewrite_hash: false,
+                fill_ceiling: None,
                 full_confirm: false,
                 force: true,
             };

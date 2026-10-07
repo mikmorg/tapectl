@@ -23,5 +23,6 @@ tapectl quick-archive [OPTIONS] --tenant <TENANT> --volume <VOLUME> <PATH>
 - `-t, --tag <TAG>` — Tags
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--prewrite-hash` — See `volume write --prewrite-hash`
+- `--fill-ceiling <FILL_CEILING>` — See `volume write --fill-ceiling`: this command's write only
 - `--full-confirm` — See `volume write --full-confirm`
 

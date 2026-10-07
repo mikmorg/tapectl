@@ -1438,7 +1438,8 @@ fn check_unit_fits_one_tape(
         "unit \"{unit_name}\" is {size} bytes ({}), {over} bytes ({}) more than one cartridge \
          can take — {}. A unit is never split across cartridges (ADR-0012), so it cannot be \
          written; nothing was staged. A unit this size waits for planned spanning, which is \
-         not built yet.",
+         not built yet. The fill ceiling is the drive's `fill_ceiling` in its \
+         `[[backends.lto]]` entry of config.toml (default 97%).",
         crate::util::format_bytes_binary(i64::try_from(size).unwrap_or(i64::MAX)),
         crate::util::format_bytes_binary(i64::try_from(over).unwrap_or(i64::MAX)),
         limit.describe(),
@@ -5623,6 +5624,10 @@ mod tests {
             "the limit for the generation, and its figures: {msg}"
         );
         assert!(msg.contains("never split"), "{msg}");
+        assert!(
+            msg.contains("`fill_ceiling`") && msg.contains("[[backends.lto]]"),
+            "names the config key that sets the ceiling (stage create has no flag): {msg}"
+        );
         assert!(!msg.contains("dar-must-never-run"), "{msg}");
         let stage_sets: i64 = conn
             .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))

@@ -622,12 +622,14 @@ fn run(
             ref tag,
             ref device,
             prewrite_hash,
+            fill_ceiling,
             full_confirm,
         } => {
             cli::operations::quick_archive(
                 &conn,
                 &paths,
-                &cfg,
+                // Issue #391: `--fill-ceiling` for this command's write only.
+                &cfg.with_fill_ceiling(fill_ceiling),
                 path,
                 tenant,
                 volume,
