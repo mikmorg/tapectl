@@ -78,6 +78,10 @@ pub struct IntegrityReport {
     /// staged), if there is one — named so the operator knows the baseline
     /// is an older version.
     pub newer_without_checksums: Option<i64>,
+    /// A newer live version that records no files at all, only
+    /// directories (the unit was empty when it was snapshotted): it has no
+    /// checksums because it has nothing to hash, staged or not.
+    pub newer_without_files: Option<i64>,
     pub ok: i64,
     pub bitrot: i64,
     pub missing: i64,
@@ -142,12 +146,24 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
             "no staged files with checksums for \"{unit_name}\" — stage at least once first"
         )));
     };
-    let newer_without_checksums: Option<i64> = conn.query_row(
-        "SELECT MAX(version) FROM snapshots
-         WHERE unit_id = ?1 AND status IN ('current', 'staged', 'created') AND version > ?2",
-        params![unit.id, version],
-        |row| row.get(0),
-    )?;
+    // The newest live version above the baseline, and whether it records
+    // any file: one that does lacks checksums because it is not staged yet;
+    // one that does not has nothing to hash, staged or not.
+    let newer: Option<(i64, bool)> = conn
+        .query_row(
+            "SELECT s.version,
+                    EXISTS (SELECT 1 FROM file_versions fv
+                            WHERE fv.snapshot_id = s.id AND fv.kind <> 0)
+             FROM snapshots s
+             WHERE s.unit_id = ?1 AND s.status IN ('current', 'staged', 'created')
+               AND s.version > ?2
+             ORDER BY s.version DESC LIMIT 1",
+            params![unit.id, version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let newer_without_checksums = newer.filter(|(_, has_files)| *has_files).map(|(v, _)| v);
+    let newer_without_files = newer.filter(|(_, has_files)| !*has_files).map(|(v, _)| v);
 
     let mut stmt = conn.prepare(&format!(
         "SELECT p.path, fv.size_bytes, fv.sha256
@@ -170,6 +186,7 @@ pub fn check_integrity(conn: &Connection, unit_name: &str) -> Result<IntegrityRe
         unit: unit_name.to_string(),
         version,
         newer_without_checksums,
+        newer_without_files,
         ..IntegrityReport::default()
     };
 
@@ -228,6 +245,13 @@ fn render_integrity(r: &IntegrityReport) -> String {
             r.version
         ));
     }
+    if let Some(newer) = r.newer_without_files {
+        out.push_str(&format!(
+            "  v{newer} is newer but records no files (the unit held only directories \
+             when it was snapshotted), so it has no checksums; v{} is the baseline\n",
+            r.version
+        ));
+    }
     out.push_str(&format!("  OK:            {}\n", r.ok));
     if r.bitrot > 0 {
         out.push_str(&format!("  BITROT:        {}\n", r.bitrot));
@@ -245,8 +269,9 @@ fn render_integrity(r: &IntegrityReport) -> String {
 }
 
 /// The `--json` rendering of an [`IntegrityReport`]. `version` and
-/// `newer_version_without_checksums` were added by issue #375; every older
-/// key keeps its shape.
+/// `newer_version_without_checksums` were added by issue #375, and
+/// `newer_version_without_files` after it; every older key keeps its
+/// shape.
 fn integrity_json(r: &IntegrityReport) -> serde_json::Value {
     let details: Vec<serde_json::Value> = r
         .details
@@ -263,6 +288,7 @@ fn integrity_json(r: &IntegrityReport) -> serde_json::Value {
         "unit": r.unit,
         "version": r.version,
         "newer_version_without_checksums": r.newer_without_checksums,
+        "newer_version_without_files": r.newer_without_files,
         "ok": r.ok, "bitrot": r.bitrot,
         "missing": r.missing, "size_mismatch": r.size_mismatch,
         "details": details,
@@ -4602,6 +4628,38 @@ mod tests {
             integrity_json(&report)["newer_version_without_checksums"],
             2
         );
+    }
+
+    /// Issue #375 follow-up: a newer version that records no files at all
+    /// (only directories — the unit was empty when snapshotted) has no
+    /// checksums because it has nothing to hash, not because it was never
+    /// staged. Here it IS staged. The report must not claim "not staged
+    /// yet"; it names the version as recording no files.
+    #[test]
+    fn check_integrity_does_not_call_a_newer_version_with_no_files_unstaged() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let (conn, v1) = setup_conn_with_unit(tmp.path().to_str().unwrap());
+        insert_file(&conn, v1, "f.txt", 5, &direct_old_style_hash(b"hello"));
+        let v2 = insert_version(&conn, 2, "staged");
+        crate::db::files::fixture::insert(&conn, v2, "sub", 0, "dir", None);
+
+        let report = check_integrity(&conn, "unit1").unwrap();
+        assert_eq!(report.version, 1);
+        assert_eq!(report.newer_without_checksums, None);
+        assert_eq!(report.newer_without_files, Some(2));
+        let text = render_integrity(&report);
+        assert!(!text.contains("not staged yet"), "{text}");
+        assert!(
+            text.contains("v2 is newer but records no files"),
+            "says why v2 is not the baseline: {text}"
+        );
+        let json = integrity_json(&report);
+        assert_eq!(
+            json["newer_version_without_checksums"],
+            serde_json::Value::Null
+        );
+        assert_eq!(json["newer_version_without_files"], 2);
     }
 
     /// Issue #36/H10: `unit_mark_tape_only`'s dirty guard. Full migrations

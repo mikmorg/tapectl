@@ -2790,14 +2790,16 @@ fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings(
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("report health --json stdout did not parse as one JSON document: {e}\n{stdout:?}")
     });
-    let rows = parsed.as_array().expect("an array of readings");
+    let rows = parsed["readings"]
+        .as_array()
+        .expect("an array of readings under `readings`");
     assert_eq!(
         rows.len(),
         3,
         "positive control: every seeded reading is present"
     );
 
-    let expected = serde_json::json!([
+    let readings = serde_json::json!([
         {
             "volume": "V-FULL", "operation": "write", "at": "2026-09-22 03:00:00",
             "bytes": 4096, "corrected": 2, "uncorrected": 1, "tape_alerts": 0,
@@ -2817,6 +2819,13 @@ fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings(
             "drive_serial": null, "cartridge_barcode": null
         }
     ]);
+    // No verify recorded read errors here, so no trend; the factor is the
+    // `[health]` default.
+    let expected = serde_json::json!({
+        "readings": readings,
+        "read_error_trends": [],
+        "read_error_rise_factor": tapectl::tape::read_errors::DEFAULT_RISE_FACTOR,
+    });
     assert_eq!(parsed, expected, "the whole --json document");
 }
 

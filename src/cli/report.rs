@@ -1595,7 +1595,7 @@ pub(crate) fn health_rows(
     Ok(rows)
 }
 
-/// `report health --json`: one object per reading. Additive-key rule: every
+/// `report health --json`'s `readings`: one object per reading. Additive-key rule: every
 /// key that existed keeps its name and meaning; `volume` may now be `null`
 /// (a drive-only reading, migration 021), and `drive_serial` /
 /// `cartridge_barcode` are new and `null` whenever not recorded.
@@ -1638,9 +1638,10 @@ fn report_health(
 ) -> Result<()> {
     let rows = health_rows(conn, volume_filter)?;
     if json_output {
+        let factor = config.health().read_error_rise_factor;
         println!(
             "{}",
-            serde_json::to_string_pretty(&health_json(&rows)).unwrap()
+            serde_json::to_string_pretty(&report_health_json(conn, &rows, factor)?).unwrap()
         );
         return Ok(());
     }
@@ -1674,6 +1675,57 @@ fn report_health(
         }
     }
     Ok(())
+}
+
+/// `report health --json`: the readings ([`health_json`], each exactly as
+/// before) under `readings`, and the read-error trends the text output
+/// prints (issue #421) under `read_error_trends`, with the
+/// `read_error_rise_factor` they were judged against. An object since the
+/// trends joined it: the readings used to be the whole document, a bare
+/// array, which has no room for a second block. Like the text block, the
+/// trends cover every cartridge whatever `--volume` says.
+pub(crate) fn report_health_json(
+    conn: &Connection,
+    rows: &[HealthRow],
+    factor: f64,
+) -> Result<serde_json::Value> {
+    let trends: Vec<serde_json::Value> = crate::tape::read_errors::trends(conn)?
+        .iter()
+        .map(|t| {
+            let points: Vec<serde_json::Value> = t
+                .points
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "at": p.at,
+                        "volume": p.volume,
+                        "drive_serial": p.drive_serial,
+                        "gib_read": p.gib_read,
+                        "corrected": p.corrected,
+                        "uncorrected": p.uncorrected,
+                        "corrected_per_gib": p.corrected_per_gib,
+                    })
+                })
+                .collect();
+            let rising = t.rising(factor).map(|rise| {
+                serde_json::json!({
+                    "previous": rise.previous,
+                    "newest": rise.newest,
+                    "message": crate::tape::read_errors::rise_message(t, rise, factor),
+                })
+            });
+            serde_json::json!({
+                "cartridge": t.cartridge,
+                "points": points,
+                "rising": rising,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "readings": health_json(rows),
+        "read_error_trends": trends,
+        "read_error_rise_factor": factor,
+    }))
 }
 
 /// `report health`'s read-error trend block (issue #421, ADR-0012
@@ -4751,5 +4803,48 @@ Read error counter page  [0x3]
             block.contains("RISING — corrected read errors per GiB rose from 2.000 to 5.000"),
             "{block}"
         );
+    }
+
+    /// `report health --json` carries the read-error trend block the text
+    /// output has (issue #421): one entry per cartridge, its verifies oldest
+    /// first, and `rising` set only where the newest rate passed the
+    /// factor. The readings are under `readings`, each exactly as before.
+    #[test]
+    fn report_health_json_carries_the_read_error_trends() {
+        use crate::tape::read_errors::{tests::seed_verifies, DEFAULT_RISE_FACTOR};
+        let conn = crate::db::open_memory().unwrap();
+        let empty = report_health_json(&conn, &[], DEFAULT_RISE_FACTOR).unwrap();
+        assert_eq!(empty["readings"], serde_json::json!([]));
+        assert_eq!(empty["read_error_trends"], serde_json::json!([]));
+
+        seed_verifies(&conn, "C-RISE", &[1, 2, 5]);
+        seed_verifies(&conn, "C-FLAT", &[2, 3]);
+        let rows = health_rows(&conn, None).unwrap();
+        let v = report_health_json(&conn, &rows, DEFAULT_RISE_FACTOR).unwrap();
+        assert_eq!(v["readings"], health_json(&rows), "readings unchanged");
+        assert_eq!(v["read_error_rise_factor"], DEFAULT_RISE_FACTOR);
+        let trends = v["read_error_trends"].as_array().unwrap();
+        let by = |c: &str| {
+            trends
+                .iter()
+                .find(|t| t["cartridge"] == c)
+                .unwrap_or_else(|| panic!("{c} in {trends:?}"))
+        };
+        let rise = by("C-RISE");
+        let rates: Vec<f64> = rise["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["corrected_per_gib"].as_f64().unwrap())
+            .collect();
+        assert_eq!(rates, vec![1.0, 2.0, 5.0]);
+        assert_eq!(rise["rising"]["previous"], 2.0);
+        assert_eq!(rise["rising"]["newest"], 5.0);
+        assert!(rise["rising"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("corrected read errors per GiB rose from 2.000 to 5.000"));
+        assert_eq!(by("C-FLAT")["rising"], serde_json::Value::Null);
+        assert_eq!(by("C-FLAT")["points"][0]["uncorrected"], 0);
     }
 }

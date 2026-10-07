@@ -1816,6 +1816,13 @@ like.
 read_error_rise_factor = 2.0
 ```
 
+`report health --json` carries the same figures: an object whose
+`read_error_trends` holds one entry per cartridge (its verifies, oldest first,
+in `points`, and `rising` set — with the line above as its `message` — when it
+is flagged), beside the `read_error_rise_factor` it was judged against and the
+health readings under `readings`. (Before the trends joined it, the document
+was the readings array alone.)
+
 How to read it:
 
 - Only full verifies are recorded. `volume verify --quick` reads File 0, the

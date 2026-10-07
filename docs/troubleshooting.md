@@ -1872,8 +1872,9 @@ remaining one with `restore unit`.
 
 ```text
 error: unit "<unit>" version <n> has no file "<file>" in the catalog's record of what it archived, so the tape was
-not touched. A path is relative to the unit's root and matched exactly; `tapectl catalog search "<words of the name>"`
-finds one, and `tapectl catalog ls <unit>` lists the newest version's files.
+not touched. A path is relative to the unit's root and matched exactly; `tapectl catalog search "<words of the name>"
+--all-versions` finds one and names the versions that hold it (without `--all-versions` it searches each unit's newest
+version only), and `tapectl catalog ls <unit>` lists the newest version's files.
 ```
 
 `--file` is checked against the version's file list before the drive is
@@ -2128,8 +2129,12 @@ byte even though the content is the same. `catalog rebuild` tells them apart by
 the first slice's ciphertext hash: a tape whose first slice matches no stage
 set of that Version gets a stage set of its own. This refusal means the first
 slice matched but a later one did not, so the catalog's record of that stage set
-contradicts the tape. No catalog row is added or changed; only the drive
-contact is recorded. Verify the tape (`tapectl volume verify <label>`), which
+contradicts the tape. The rebuild's own changes are rolled back: no volume,
+stage set, write or file row is added or changed. Two things stay, both
+recorded before the rebuild began: the drive contact, and — when the volume is
+already in the catalog, bound to a cartridge with no serial recorded — the
+serial the drive reported, learnt onto that cartridge (the `note: cartridge
+... learnt <serial>` line says so). Verify the tape (`tapectl volume verify <label>`), which
 checks the tape against its own front index; if it passes, the catalog's rows
 are the ones in doubt.
 
