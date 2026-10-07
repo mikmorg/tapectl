@@ -102,12 +102,60 @@ fn mt_op_name(op: i16, count: i32) -> String {
 }
 
 /// A wrapper around a tape device file descriptor.
+///
+/// It notes the st driver's whole `MTIOCGET` status when it opens, after a
+/// tape command fails and when it closes (issue #344,
+/// [`crate::tape::mtget_journal`]); the contact open on the same thread
+/// journals those readings when it closes.
 pub struct TapeDevice {
     file: File,
     block_size: usize,
+    /// The path it was opened by, for the journal.
+    path: String,
+}
+
+impl Drop for TapeDevice {
+    fn drop(&mut self) {
+        self.note(crate::tape::mtget_journal::POINT_CLOSE, None, None);
+    }
 }
 
 impl TapeDevice {
+    /// The st driver's whole `MTIOCGET` status (issue #344). An ioctl the
+    /// driver answers from its own state: no SCSI command, no tape motion.
+    pub fn status(&self) -> std::result::Result<crate::tape::mtget_journal::MtStatus, String> {
+        let mut m = MtGet::default();
+        let rc = unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCGET, &mut m as *mut MtGet) };
+        if rc != 0 {
+            return Err(format!("MTIOCGET: {}", io::Error::last_os_error()));
+        }
+        Ok(crate::tape::mtget_journal::MtStatus {
+            mt_type: m.mt_type,
+            mt_resid: m.mt_resid,
+            mt_dsreg: m.mt_dsreg,
+            mt_gstat: m.mt_gstat,
+            mt_erreg: m.mt_erreg,
+            mt_fileno: m.mt_fileno,
+            mt_blkno: m.mt_blkno,
+        })
+    }
+
+    /// Note the status for the open contact (issue #344). `command` and
+    /// `errno` name a failed tape command; the errno is taken by the caller
+    /// before this, since MTIOCGET is itself a syscall.
+    fn note(&self, point: &'static str, command: Option<&str>, errno: Option<i32>) {
+        crate::tape::mtget_journal::note(point, &self.path, command, errno, self.status());
+    }
+
+    /// [`Self::note`] for a failed command, from its error.
+    fn note_failure(&self, command: &str, e: &io::Error) {
+        self.note(
+            crate::tape::mtget_journal::POINT_FAILURE,
+            Some(command),
+            e.raw_os_error(),
+        );
+    }
+
     /// Open a tape device for read+write with the given block size.
     pub fn open(device_path: &str, block_size: usize) -> Result<Self> {
         // Issue #386: an open blocks while the drive loads and settles a
@@ -118,8 +166,13 @@ impl TapeDevice {
         )
         .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
 
-        let mut dev = Self { file, block_size };
+        let mut dev = Self {
+            file,
+            block_size,
+            path: device_path.to_string(),
+        };
         dev.set_block_size(block_size)?;
+        dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
         Ok(dev)
     }
 
@@ -131,8 +184,13 @@ impl TapeDevice {
         )
         .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
 
-        let mut dev = Self { file, block_size };
+        let mut dev = Self {
+            file,
+            block_size,
+            path: device_path.to_string(),
+        };
         dev.set_block_size(block_size)?;
+        dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
         Ok(dev)
     }
 
@@ -159,9 +217,10 @@ impl TapeDevice {
             || unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCTOP, &mtop as *const MtOp) },
         );
         if rc != 0 {
+            let e = io::Error::last_os_error();
+            self.note_failure(&mt_op_name(op, count), &e);
             return Err(TapectlError::TapeIo(format!(
-                "ioctl op={op} count={count}: {}",
-                io::Error::last_os_error()
+                "ioctl op={op} count={count}: {e}"
             )));
         }
         Ok(())
@@ -255,9 +314,10 @@ impl TapeDevice {
                 }
             }
             let started = std::time::Instant::now();
-            self.file
-                .write_all(&buf[..bs])
-                .map_err(|e| write_error("write", &e))?;
+            if let Err(e) = self.file.write_all(&buf[..bs]) {
+                self.note_failure("write", &e);
+                return Err(write_error("write", &e));
+            }
             crate::progress::note_if_slow("one tape block write", started.elapsed());
             committed += bs as u64;
             remaining -= want as u64;
@@ -311,7 +371,10 @@ impl TapeDevice {
                 Err(e) if e.raw_os_error() == Some(28) => {
                     return Ok((total, ReadEnd::EndOfMedium));
                 }
-                Err(e) => return Err(TapectlError::TapeIo(format!("read: {e}"))),
+                Err(e) => {
+                    self.note_failure("read", &e);
+                    return Err(TapectlError::TapeIo(format!("read: {e}")));
+                }
             }
         }
     }
@@ -353,7 +416,10 @@ impl TapeDevice {
                 Err(e) if e.raw_os_error() == Some(28) => {
                     return Ok((total, ReadEnd::EndOfMedium));
                 }
-                Err(e) => return Err(TapectlError::TapeIo(format!("read: {e}"))),
+                Err(e) => {
+                    self.note_failure("read", &e);
+                    return Err(TapectlError::TapeIo(format!("read: {e}")));
+                }
             }
         }
         Ok((total, ReadEnd::Stopped))

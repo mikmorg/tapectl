@@ -11,6 +11,7 @@ pub mod log_pages;
 pub mod mam;
 pub mod mam_journal;
 pub mod media_detect;
+pub mod mtget_journal;
 pub mod read_errors;
 pub mod st_stats;
 pub mod wear;

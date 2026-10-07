@@ -443,6 +443,10 @@ fn migrations() -> Migrations<'static> {
         // DELETE SET NULL with the names kept beside it. A new table, no
         // rows touched. See the header.
         M::up(include_str!("migrations/032_dar_create_reports.sql")),
+        // 033 journals the st driver's whole MTIOCGET status at each tape
+        // device's open, close and failed command (issue #344), against the
+        // contact. A new table, no rows touched. See the header.
+        M::up(include_str!("migrations/033_mtget_journal.sql")),
     ])
 }
 
