@@ -19,6 +19,18 @@
 //! tenancy disagreement: `escrow_coverage` already names it, in words that
 //! say what to do about it, and this check does not report it twice.
 //!
+//! **A tenant the catalog holds no key for is not judged either**, as
+//! `policy::escrow` answers "unknown" rather than "gap" when it could not
+//! have known. `catalog rebuild` files units under tenants it creates with
+//! no `encryption_keys` rows (the tape carries recipients, not whose they
+//! are), while each stage set comes back with its recipient list: "the
+//! catalog lists none of this tenant's keys" is then not "this tenant cannot
+//! open the copy", and naming every copy in the archive as one to re-stage
+//! would be the wrong action, and an expensive one. `key import` of the
+//! tenant's public key is what makes its copies judgeable. A tenant holding
+//! only some of its keys (a partial import) is still judged, and `audit`'s
+//! action names `key import` first.
+//!
 //! The volume filter is [`crate::policy::coverage::in_service`] and
 //! `encrypted = 1`, as for escrow coverage's reporting scopes
 //! (`policy::escrow`): the question is about bytes tapectl still accounts
@@ -51,9 +63,13 @@ pub enum Disagreement {
 
 /// Does the recorded recipient list `fingerprints` (a JSON array of age
 /// recipients, as `stage create` writes it) name any of `tenant_keys`?
-/// `None` when the list is absent or unreadable: not this check's to judge
-/// (see the module header).
+/// `None` when the list is absent or unreadable, or when `tenant_keys` is
+/// empty (the catalog holds no key for the tenant: a rebuilt one before
+/// `key import`): not this check's to judge (see the module header).
 pub fn readable_by(fingerprints: Option<&str>, tenant_keys: &[String]) -> Option<bool> {
+    if tenant_keys.is_empty() {
+        return None;
+    }
     let keys: Vec<String> = serde_json::from_str(fingerprints?).ok()?;
     Some(keys.iter().any(|k| tenant_keys.contains(k)))
 }
@@ -105,13 +121,18 @@ pub fn unreadable_stage_sets(
 
 /// How many written copies of `from_tenant`'s units none of `to_tenant`'s
 /// keys opens: what a `tenant reassign` from one to the other leaves its
-/// destination unable to read (#383).
+/// destination unable to read (#383). `None` when the catalog holds no key
+/// for `to_tenant` (a rebuilt tenant before `key import`): not judged, as
+/// [`readable_by`] says.
 pub fn copies_unreadable_after_reassign(
     conn: &Connection,
     from_tenant: i64,
     to_tenant: i64,
-) -> Result<usize> {
+) -> Result<Option<usize>> {
     let keys = tenant_public_keys(conn, to_tenant)?;
+    if keys.is_empty() {
+        return Ok(None);
+    }
     let mut stmt = conn.prepare("SELECT id FROM units WHERE tenant_id = ?1")?;
     let units = stmt
         .query_map(params![from_tenant], |r| r.get::<_, i64>(0))?
@@ -120,7 +141,7 @@ pub fn copies_unreadable_after_reassign(
     for unit_id in units {
         n += unreadable_stage_sets(conn, unit_id, &keys)?.len();
     }
-    Ok(n)
+    Ok(Some(n))
 }
 
 /// The tenant the unit's dotfile names, with the dotfile's path, when the
@@ -187,7 +208,11 @@ mod tests {
         );
         assert_eq!(readable_by(None, &keys), None, "absent: not judged");
         assert_eq!(readable_by(Some("not json"), &keys), None);
-        assert_eq!(readable_by(Some(r#"["age1old"]"#), &[]), Some(false));
+        assert_eq!(
+            readable_by(Some(r#"["age1old"]"#), &[]),
+            None,
+            "a tenant the catalog holds no key for (a rebuilt catalog): not judged"
+        );
     }
 
     /// What a reassign from `acme` to `other` leaves `other` unable to
@@ -252,17 +277,29 @@ mod tests {
         write(r#"["age1acme","age1op"]"#);
         assert_eq!(
             copies_unreadable_after_reassign(&conn, id("acme"), id("other")).unwrap(),
-            1
+            Some(1)
         );
         assert_eq!(
             copies_unreadable_after_reassign(&conn, id("acme"), id("acme")).unwrap(),
-            0
+            Some(0)
         );
         write(r#"["age1acme","age1other","age1op"]"#);
         assert_eq!(
             copies_unreadable_after_reassign(&conn, id("acme"), id("other")).unwrap(),
-            1,
+            Some(1),
             "only the copy encrypted without other's key"
+        );
+
+        // A destination the catalog holds no key for (a rebuilt tenant
+        // before `key import`) is not judged: not "0", not "every copy".
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('keyless', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            copies_unreadable_after_reassign(&conn, id("acme"), id("keyless")).unwrap(),
+            None
         );
     }
 

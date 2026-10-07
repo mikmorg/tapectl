@@ -990,9 +990,11 @@ fn check_tenancy(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -
                      (with the operator and escrow keys) can open it"
                 ),
                 format!(
-                    "if \"{tenant}\"'s key holders must be able to open it, re-stage v{version} \
-                     and write it to a new volume; otherwise accept that {volume_label} opens \
-                     only for its original recipients"
+                    "if \"{tenant}\" has a key the catalog does not list (a rebuilt catalog), \
+                     `tapectl key import` its public key and audit again; otherwise, if \
+                     \"{tenant}\"'s key holders must be able to open it, re-stage v{version} \
+                     and write it to a new volume, or accept that {volume_label} opens only \
+                     for its original recipients"
                 ),
             ),
         };
@@ -3424,7 +3426,9 @@ mod tests {
 
     /// #383: a written copy none of the owning tenant's keys can open (after
     /// a `tenant reassign`, say) is named, as a warning, beside escrow
-    /// coverage; a copy one of its keys opens, retired or not, is not.
+    /// coverage; a copy one of its keys opens, retired or not, is not. A
+    /// tenant the catalog holds no key for (a rebuilt catalog before `key
+    /// import`) is not judged at all.
     #[test]
     fn tenancy_names_a_copy_the_owning_tenant_cannot_open() {
         let tenancy = |conn: &Connection| -> Vec<AuditFinding> {
@@ -3437,6 +3441,18 @@ mod tests {
                 .collect()
         };
         let conn = setup_escrow_coverage(Some(r#"["age1alice","age1operator"]"#), false);
+        assert!(
+            tenancy(&conn).is_empty(),
+            "tenant t has no key rows: not judged, never 'cannot open'"
+        );
+
+        // The reassign case: t holds a key, and the copy names none of them.
+        conn.execute(
+            "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key)
+             VALUES ((SELECT id FROM tenants WHERE name = 't'), 't-now', 'fp-now', 'age1bob')",
+            [],
+        )
+        .unwrap();
         let found = tenancy(&conn);
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(

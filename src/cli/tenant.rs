@@ -177,14 +177,26 @@ pub fn run(
             // #383: the written copies the destination's own keys cannot
             // open stay that way (they keep their recipients; the operator
             // and escrow keys still open them). Shown, before and after.
+            // A destination the catalog holds no key for is not judged
+            // (`None`, JSON null): saying "0" or "every copy" would both be
+            // a guess.
             let unreadable =
                 crate::policy::tenancy::copies_unreadable_after_reassign(conn, src.id, dst.id)?;
-            let unreadable_note = format!(
-                "{unreadable} written cop{} of these units cannot be opened by \"{to}\"'s \
-                 keys (the operator and escrow keys still open them); `tapectl audit` names \
-                 each one as `tenancy`",
-                if unreadable == 1 { "y" } else { "ies" }
-            );
+            let unreadable_note = match unreadable {
+                Some(0) => None,
+                Some(n) => Some(format!(
+                    "{n} written cop{} of these units cannot be opened by \"{to}\"'s \
+                     keys (the operator and escrow keys still open them); `tapectl audit` \
+                     names each one as `tenancy`",
+                    if n == 1 { "y" } else { "ies" }
+                )),
+                None => Some(format!(
+                    "the catalog holds no key for tenant \"{to}\", so which written copies \
+                     of these units its keys can open is not judged; `tapectl key import \
+                     --tenant {to} --alias <alias> <public-key-file>` its public key, then \
+                     `tapectl audit` judges them"
+                )),
+            };
             if dry_run {
                 let would_move: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM units WHERE tenant_id = ?1",
@@ -203,8 +215,8 @@ pub fn run(
                         "would reassign {would_move} unit(s) from \"{source}\" to \"{to}\" \
                          (DRY RUN — no changes made)"
                     );
-                    if unreadable > 0 {
-                        println!("  {unreadable_note}");
+                    if let Some(note) = &unreadable_note {
+                        println!("  {note}");
                     }
                 }
                 return Ok(());
@@ -248,8 +260,8 @@ pub fn run(
                 );
             } else {
                 println!("{moved} unit(s) reassigned from \"{source}\" to \"{to}\"");
-                if unreadable > 0 {
-                    println!("  {unreadable_note}");
+                if let Some(note) = &unreadable_note {
+                    println!("  {note}");
                 }
             }
         }

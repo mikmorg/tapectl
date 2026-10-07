@@ -1216,6 +1216,86 @@ fn units_are_filed_under_their_real_tenants_not_the_operator_placeholder() {
     );
 }
 
+/// #383 review: a rebuilt catalog files units under tenants it holds no key
+/// rows for (`ensure_tenant`), while each stage set comes back with its
+/// recipient list. "The catalog holds none of the tenant's keys" is not "the
+/// tenant cannot open the copy": `tenancy` must not judge it, or `audit`
+/// tells the operator after a disaster to re-stage every copy in the
+/// archive, when the fix is `key import`. Positive control: a key row that
+/// is NOT in the list is judged (the path is exercised), and importing the
+/// tenant's real public key clears it.
+#[test]
+fn a_rebuilt_catalog_with_no_tenant_keys_reports_no_tenancy_disagreement() {
+    use tapectl::policy::tenancy::{disagreements, Disagreement};
+    let mut vol = build_sealed_volume_with(CatalogDb::New);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    let key_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM encryption_keys k JOIN tenants t ON t.id = k.tenant_id
+             WHERE t.name IN ('alpha', 'bravo')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(key_rows, 0, "the shape this test is about: keyless tenants");
+    let stage_set_disagreements = |conn: &rusqlite::Connection, unit_name: &str| -> usize {
+        let unit = db::queries::get_unit_by_name(conn, unit_name)
+            .unwrap()
+            .unwrap();
+        disagreements(conn, &unit)
+            .unwrap()
+            .into_iter()
+            .filter(|d| matches!(d, Disagreement::StageSet { .. }))
+            .count()
+    };
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(
+            stage_set_disagreements(&conn, unit_name),
+            0,
+            "{unit_name}: a keyless tenant is not judged"
+        );
+    }
+
+    // Positive control: alpha now holds a key, and not the one its copies
+    // were encrypted to.
+    let alpha: i64 = conn
+        .query_row("SELECT id FROM tenants WHERE name = 'alpha'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let stranger = generate_keypair();
+    conn.execute(
+        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key)
+         VALUES (?1, 'alpha-other', ?2, ?3)",
+        rusqlite::params![alpha, stranger.fingerprint, stranger.public_key],
+    )
+    .unwrap();
+    assert_eq!(stage_set_disagreements(&conn, "photos/2019"), 1);
+
+    // `key import` of alpha's real public key: the copy is alpha's again.
+    let alpha_public: String = vol
+        .source_conn
+        .query_row(
+            "SELECT k.public_key FROM encryption_keys k JOIN tenants t ON t.id = k.tenant_id
+             WHERE t.name = 'alpha'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key)
+         VALUES (?1, 'alpha-imported', 'fp-alpha-imported', ?2)",
+        rusqlite::params![alpha, alpha_public],
+    )
+    .unwrap();
+    assert_eq!(stage_set_disagreements(&conn, "photos/2019"), 0);
+}
+
 /// The per-file index exists only in the operator envelope's `catalog.db`.
 #[test]
 fn the_file_index_comes_back_from_the_operator_catalog_db() {
