@@ -1686,23 +1686,26 @@ fn report_health(
 /// answer to "which of my tapes is worst", and a cartridge left off it would
 /// read as fine.
 fn report_cartridge_health(conn: &Connection, config: &Config, json_output: bool) -> Result<()> {
-    let fleet = crate::tape::cartridge_health::fleet(conn, config.health().read_error_rise_factor)?;
+    use crate::tape::cartridge_health;
+    let fleet = cartridge_health::fleet(conn, config.health().read_error_rise_factor)?;
     if json_output {
-        let rows: Vec<serde_json::Value> = fleet
-            .iter()
-            .map(crate::tape::cartridge_health::to_json)
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&rows).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&cartridge_health::fleet_json(&fleet)).unwrap()
+        );
         return Ok(());
     }
-    if fleet.is_empty() {
+    if fleet.cartridges.is_empty() {
         println!("no cartridges registered");
-        return Ok(());
     }
-    for h in &fleet {
-        for line in crate::tape::cartridge_health::render(h) {
+    for h in &fleet.cartridges {
+        for line in cartridge_health::render(h) {
             println!("{line}");
         }
+    }
+    // Issue #307: what resolves to no cartridge is said, never dropped.
+    for line in cartridge_health::render_unattributed(&fleet.unattributed) {
+        println!("{line}");
     }
     Ok(())
 }

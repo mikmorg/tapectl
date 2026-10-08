@@ -747,12 +747,19 @@ has no figure, not that the figure is good.
 `tapectl report cartridge-health` ranks every registered cartridge, worst
 first, and says why: `ATTENTION` names each reason (a medium TapeAlert raised on
 one of its contacts, an uncorrected error counted during one, a volume
-quarantined on medium evidence, a volume whose last verify failed, a rising
-read-error rate); `NO_EVIDENCE` is a cartridge with no health reading and no
-verify — never examined, not healthy; `CLEAN` is examined with nothing adverse.
-A drive or cleaning TapeAlert raised while a cartridge was loaded is noted
-against it but is the drive's, and a quarantine from a write-session finding is
-noted, not counted. `cartridge info` shows the last bind and the last contact of
+quarantined on medium evidence, a rising read-error rate); `NO_EVIDENCE` is a
+cartridge with no health reading and no verify that read it back — never
+examined, not healthy; `CLEAN` is examined with nothing adverse. A drive or
+cleaning TapeAlert raised while a cartridge was loaded is noted against it but
+is the drive's, a quarantine from a write-session finding is noted, not counted,
+and so is a volume whose last verify failed without proving the medium bad (the
+drive could not read it — a verify that did prove it quarantined the volume). A
+verify still running, or aborted, is not counted at all. The report ends with
+what resolves to no registered cartridge — readings, medium TapeAlerts and
+rising read-error trends from a contact that identified none, such as a tape
+bound before 2026-09-13 — by volume and contact, or `unattributed: none`; under
+`--json` the cartridges are under `cartridges` and that block under
+`unattributed`. `cartridge info` shows the last bind and the last contact of
 any kind, and when each volume it carried was mounted and unmounted.
 
 **The confirm after sealing.** By default the write reads back the front index
