@@ -5,7 +5,7 @@ use std::os::unix::io::AsRawFd;
 use crate::error::{Result, TapectlError};
 
 // Linux tape ioctl constants from <linux/mtio.h>
-const MTIOCTOP: u64 = 0x40086d01;
+const MTIOCTOP: nix::libc::Ioctl = 0x40086d01;
 /// `_IOR('m', 2, struct mtget)` from `<linux/mtio.h>`.
 ///
 /// `pub(crate)` so `tape::media_detect`'s no-medium probe (issue #152) reads
@@ -13,7 +13,7 @@ const MTIOCTOP: u64 = 0x40086d01;
 /// declarations of an ioctl number and a `#[repr(C)]` layout that `unsafe`
 /// code casts a raw pointer through is a drift hazard of a nastier kind than
 /// most — a divergence would not fail to compile, it would read garbage.
-pub(crate) const MTIOCGET: u64 = 0x80306d02;
+pub(crate) const MTIOCGET: nix::libc::Ioctl = 0x80306d02u32 as nix::libc::Ioctl;
 
 // mtop operation codes
 const MTREW: i16 = 6;
