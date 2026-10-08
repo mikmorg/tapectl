@@ -186,9 +186,10 @@ third re-pin): RESTORE.sh decrypts a unit into scratch space inside `--to` (or
 moves when generated on-tape bytes change, the patch for any other build installed on a
 production host; each such release is tagged `vX.Y.Z` on the commit it is built from. Units are never split by hand: if a large unit's
 re-archiving ever costs too much, the answer is #12's differential-only shape, underneath
-the unit. Until #376/#377/#378 land: one tapectl writer at a time, nothing destructive
-during a write or confirm, and no `unit tag`/`unit rename`/dotfile edit on an archived unit
-(the dotfile counts as content).
+the unit. The interim rules that waited on #376/#377/#378 are lifted: a write session holds
+a per-volume flock and the catalog has a busy policy (#376, #377), and the unit's own
+`.tapectl-unit.toml` is not content (#378, ADR-0012 2026-10-07 item 24), so `unit tag`,
+`unit rename` or a dotfile edit mints no version.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used

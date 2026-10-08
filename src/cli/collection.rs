@@ -357,6 +357,9 @@ fn cmd_sync(conn: &Connection, config: &Config, dry_run: bool, json_output: bool
                     "errors": errors,
                     "refused": refused_json(&r.refused),
                     "outside": outside_json(&r.outside),
+                    "tenant_differs": r.tenant_differs.iter().map(|(unit, tenant)| {
+                        serde_json::json!({"unit": unit, "tenant": tenant})
+                    }).collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -371,6 +374,15 @@ fn cmd_sync(conn: &Connection, config: &Config, dry_run: bool, json_output: bool
             );
             for e in errors {
                 println!("  error: {e}");
+            }
+            if let Some(lib) = config.collections.iter().find(|l| &l.name == name) {
+                for (unit, tenant) in &r.tenant_differs {
+                    println!(
+                        "  warning: unit \"{unit}\" is owned by tenant \"{tenant}\", not the \
+                         collection's \"{}\"; it keeps its owner (new units go to \"{}\")",
+                        lib.tenant, lib.tenant
+                    );
+                }
             }
             print_refused_plain(&r.refused);
             print_outside_plain(&r.outside);

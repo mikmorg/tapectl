@@ -266,6 +266,16 @@ const CHECKS: &[Check] = &[
         },
     },
     Check {
+        // #383: units.tenant_id against the dotfile and the written copies'
+        // recipient lists (`policy::tenancy`). Advisory: warnings only.
+        name: "tenancy",
+        scope: Scope::PerUnit {
+            statuses: ACTIVE_TAPE_ONLY_MISSING,
+            needs_policy: false,
+            run: check_tenancy,
+        },
+    },
+    Check {
         name: "compaction_candidate",
         scope: Scope::Archive {
             run: check_compaction_candidate,
@@ -960,6 +970,63 @@ fn check_escrow_coverage(
                 });
             }
         }
+    }
+    Ok(f)
+}
+
+/// #383: where the unit's tenancy disagrees with `units.tenant_id` — its
+/// dotfile, or a written copy none of the tenant's keys opens. The verdict
+/// and the query are `policy::tenancy`'s; this only words them.
+fn check_tenancy(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -> Result<Findings> {
+    use crate::policy::tenancy::Disagreement;
+    let mut f = Findings::default();
+    let tenant: String = ctx.conn.query_row(
+        "SELECT name FROM tenants WHERE id = ?1",
+        params![unit.tenant_id],
+        |r| r.get(0),
+    )?;
+    for d in crate::policy::tenancy::disagreements(ctx.conn, unit)? {
+        let (message, action) = match d {
+            Disagreement::Dotfile {
+                path,
+                dotfile_tenant,
+            } => (
+                format!(
+                    "the catalog says tenant \"{tenant}\" owns this unit, but {path} \
+                     names tenant \"{dotfile_tenant}\""
+                ),
+                format!(
+                    "the catalog is the authority: set `tenant = \"{tenant}\"` under [unit] \
+                     in {path} (the dotfile is not content, so this mints no version); a \
+                     catalog rebuilt without this unit's ownership would otherwise adopt it \
+                     for \"{dotfile_tenant}\""
+                ),
+            ),
+            Disagreement::StageSet {
+                stage_set_id,
+                version,
+                volume_label,
+            } => (
+                format!(
+                    "volume {volume_label} (stage set {stage_set_id}, v{version}) is encrypted \
+                     to none of tenant \"{tenant}\"'s keys — only its original recipients \
+                     (with the operator and escrow keys) can open it"
+                ),
+                format!(
+                    "if \"{tenant}\" has a key the catalog does not list (a rebuilt catalog), \
+                     `tapectl key import` its public key and audit again; otherwise, if \
+                     \"{tenant}\"'s key holders must be able to open it, re-stage v{version} \
+                     and write it to a new volume, or accept that {volume_label} opens only \
+                     for its original recipients"
+                ),
+            ),
+        };
+        f.warnings.push(AuditFinding {
+            unit: unit.name.clone(),
+            check: "tenancy".into(),
+            message,
+            action,
+        });
     }
     Ok(f)
 }
@@ -3380,6 +3447,52 @@ mod tests {
         assert!(escrow_findings(&conn).is_empty());
     }
 
+    /// #383: a written copy none of the owning tenant's keys can open (after
+    /// a `tenant reassign`, say) is named, as a warning, beside escrow
+    /// coverage; a copy one of its keys opens, retired or not, is not. A
+    /// tenant the catalog holds no key for (a rebuilt catalog before `key
+    /// import`) is not judged at all.
+    #[test]
+    fn tenancy_names_a_copy_the_owning_tenant_cannot_open() {
+        let tenancy = |conn: &Connection| -> Vec<AuditFinding> {
+            let (violations, warnings) =
+                collect_findings(conn, &crate::config::Config::default(), None).unwrap();
+            assert!(!violations.iter().any(|f| f.check == "tenancy"), "advisory");
+            warnings
+                .into_iter()
+                .filter(|f| f.check == "tenancy")
+                .collect()
+        };
+        let conn = setup_escrow_coverage(Some(r#"["age1alice","age1operator"]"#), false);
+        assert!(
+            tenancy(&conn).is_empty(),
+            "tenant t has no key rows: not judged, never 'cannot open'"
+        );
+
+        // The reassign case: t holds a key, and the copy names none of them.
+        conn.execute(
+            "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key)
+             VALUES ((SELECT id FROM tenants WHERE name = 't'), 't-now', 'fp-now', 'age1bob')",
+            [],
+        )
+        .unwrap();
+        let found = tenancy(&conn);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].message.contains("ESCVOL") && found[0].message.contains("\"t\""),
+            "{}",
+            found[0].message
+        );
+
+        conn.execute(
+            "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, is_active)
+             VALUES ((SELECT id FROM tenants WHERE name = 't'), 't-old', 'fp-old', 'age1alice', 0)",
+            [],
+        )
+        .unwrap();
+        assert!(tenancy(&conn).is_empty(), "a retired key still opens it");
+    }
+
     /// #137 / Q12: after a disaster `init` creates a NEW escrow identity and
     /// every receipt names the OLD one. One finding that names the old key,
     /// not N findings that do not.
@@ -3932,7 +4045,7 @@ mod tests {
     mod checks_table {
         use super::*;
 
-        /// The 14 distinct `check` name literals this file's findings can
+        /// The 16 distinct `check` name literals this file's findings can
         /// carry (grep-verified against every `check: "..."` / `check ==
         /// "..."` in this file, non-test code). Every `CHECKS` row name
         /// must be one of these, and every one of these must be covered by
@@ -3947,6 +4060,7 @@ mod tests {
             "no_archive",
             "dirty",
             "encryption",
+            "tenancy",
             "compaction_candidate",
             "escrow_kit_missing",
             "escrow_kit_stale",
@@ -3968,13 +4082,13 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 8 per-unit checks + 5 archive-wide checks. `policy_unresolvable`
+            // 9 per-unit checks + 5 archive-wide checks. `policy_unresolvable`
             // is not one of them (see below), and `escrow_kit_missing`/
             // `escrow_kit_stale` share one row.
             assert_eq!(
                 names.len(),
-                13,
-                "expected 8 per-unit + 5 archive-wide CHECKS rows, got: {names:?}"
+                14,
+                "expected 9 per-unit + 5 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {
@@ -4030,7 +4144,7 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(saw_per_unit, 8, "expected 8 PerUnit rows in CHECKS");
+            assert_eq!(saw_per_unit, 9, "expected 9 PerUnit rows in CHECKS");
         }
 
         /// Issue #105 / ADR-behaviour: a unit whose policy will not resolve

@@ -212,9 +212,16 @@ component is also dropped:
 `[discovery] watch_roots` you configure) or `collection sync` finds the dotfile
 at its new path and reconnects it to the same unit, so the unit's
 history carries over. The dotfile can also hold per-unit policy overrides (see
-[Policy](#policy-archive-sets-and-audit)). It is an ordinary file inside the
-unit, so it is archived with the rest of the unit (`catalog ls family/letters`
-lists `.tapectl-unit.toml` next to `1998-letter-to-mum.txt`).
+[Policy](#policy-archive-sets-and-audit)). It is archived with the rest of the
+unit (`catalog ls family/letters` lists `.tapectl-unit.toml` next to
+`1998-letter-to-mum.txt`), so a restored unit can register itself again. It is
+not counted as content, though: `unit tag`, `unit rename` and an edit to its
+`[policy]` rewrite it without making the unit dirty, and a policy change takes
+effect at the unit's next real content change. Because the uuid is the
+identity, `unit discover` and `collection sync` refuse a directory whose
+dotfile carries the same uuid as another directory they find, or as a unit
+whose recorded directory still exists. That is a copy (a restored unit, say),
+not a move. Remove the copy, or move it outside the watched roots.
 
 A unit's status is `active` (the normal state), `tape_only` (you have declared
 that its disk copy may be deleted, see [tape-only units](#tape-only-units)), or
@@ -225,7 +232,11 @@ that its disk copy may be deleted, see [tape-only units](#tape-only-units)), or
 **Tags** are free-form labels on a unit (`--tag` on `unit init`, or
 [`unit tag`](cli/unit.md#tapectl-unit-tag) later). They are for your own
 organizing and filtering (`unit list --tag photos`). They do not affect policy
-or what gets written.
+or what gets written. `unit tag` also copies the unit's tags into its
+`.tapectl-unit.toml`, but that file is not counted as content: tagging (or
+renaming) an archived unit does not make it dirty and creates no new version.
+The catalog holds a unit's current name, tags and policy; the dotfile on tape
+records them as they were when the unit was last archived.
 
 ### Collection
 

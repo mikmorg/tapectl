@@ -1,6 +1,7 @@
 pub mod content_match;
 pub mod discovery;
 pub mod dotfile;
+pub mod identity;
 pub mod nesting;
 
 use std::path::Path;
@@ -298,6 +299,22 @@ pub fn tag_unit(
         |df| df.tags = tags.clone(),
     );
     Ok(tags)
+}
+
+/// Mirror a `tenant reassign` into the unit's `.tapectl-unit.toml` (#383),
+/// so the dotfile names the tenant the catalog now says owns the unit.
+/// Since #378 the dotfile is not content, so this mints no version. Follows
+/// `rename_unit`'s rule: warned, never fatal.
+pub fn retenant_dotfile(current_path: Option<&str>, tenant: &str) {
+    rewrite_dotfile(
+        current_path,
+        &DotfileChange {
+            done: "reassigned",
+            stale_when_unwritten: "the old tenant",
+            stale_when_unreadable: "the tenant on disk is now stale",
+        },
+        |df| df.tenant = tenant.to_string(),
+    );
 }
 
 /// How to word the warning when a database change could not be mirrored

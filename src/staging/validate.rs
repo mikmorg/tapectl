@@ -96,6 +96,18 @@ pub(crate) fn plan(
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // ADR-0012, 2026-10-07 item 24 (#378): the unit's own dotfile is not
+    // content. `unit tag`/`unit rename`/a `[policy]` edit rewrite it, and
+    // the same Version must still stage, so it is neither size-checked
+    // against the snapshot, compared with a sha256 baseline, nor reported
+    // NEW, and its absence is not MISSING. dar still archives it, so it is
+    // still hashed (at the size it has now, below), and the first stage of a
+    // Version records that hash as for any file.
+    let is_dotfile = crate::unit::dotfile::is_unit_dotfile;
+    let all_entries: Vec<_> = all_entries
+        .into_iter()
+        .filter(|(p, ..)| !is_dotfile(p))
+        .collect();
 
     // The walk dar's own walk matches (same order, same patterns): the NEW
     // check below, and the hashing order.
@@ -103,7 +115,7 @@ pub(crate) fn plan(
     let manifest_paths: HashSet<&str> = all_entries.iter().map(|(p, ..)| p.as_str()).collect();
     let mut new_files: Vec<&str> = disk_entries
         .iter()
-        .filter(|e| !e.is_dir && !manifest_paths.contains(e.path.as_str()))
+        .filter(|e| !e.is_dir && !is_dotfile(&e.path) && !manifest_paths.contains(e.path.as_str()))
         .map(|e| e.path.as_str())
         .collect();
     new_files.sort_unstable();
@@ -136,6 +148,16 @@ pub(crate) fn plan(
 
     let mut files = Vec::with_capacity(regular.len());
     for entry in disk_entries.iter().filter(|e| !e.is_dir) {
+        if is_dotfile(&entry.path) {
+            if entry.file_type == "regular" {
+                files.push(PlannedFile {
+                    rel_path: entry.path.clone(),
+                    expected_size: entry.size,
+                    baseline: None,
+                });
+            }
+            continue;
+        }
         if let Some((size, baseline)) = regular.remove(entry.path.as_str()) {
             check_source_size(&base.join(&entry.path), &entry.path, size)?;
             files.push(PlannedFile {

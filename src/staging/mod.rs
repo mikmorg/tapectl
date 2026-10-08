@@ -4939,6 +4939,115 @@ mod tests {
         );
     }
 
+    /// ADR-0012, 2026-10-07 item 24 (#378): stage `unit1` once, let
+    /// `change` rewrite its dotfile the way an operator command does, then
+    /// require that the unit is not Dirty, that `snapshot create` mints
+    /// nothing, and that the same Version stages again.
+    fn dotfile_change_is_not_content(
+        checksum_mode: &str,
+        change: impl FnOnce(&Connection, &models::Unit, &Path),
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        conn.execute(
+            "UPDATE units SET checksum_mode = ?1 WHERE name = 'unit1'",
+            params![checksum_mode],
+        )
+        .unwrap();
+        fs::write(src.join("a.txt"), b"the unit's real content").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        stage_create(&conn, &paths, &config, snap_id, false).expect("first stage");
+        assert!(
+            crate::db::files::fixture::sha256(&conn, snap_id, ".tapectl-unit.toml").is_some(),
+            "the dotfile is recorded and hashed like any file at the first stage"
+        );
+
+        let unit = queries::get_unit_by_name(&conn, "unit1").unwrap().unwrap();
+        // Whole-second mtimes: make sure the rewrite lands in a later second.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        change(&conn, &unit, &src);
+
+        let unit: models::Unit = conn
+            .query_row(
+                "SELECT name FROM units WHERE id = ?1",
+                params![unit.id],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|name| queries::get_unit_by_name(&conn, &name).unwrap().unwrap())
+            .unwrap();
+        let dirty = crate::collection::fingerprint::classify(&conn, &unit, &[]).unwrap();
+        assert!(
+            dirty.is_none(),
+            "a dotfile rewrite must not make the unit Dirty: {:?}",
+            dirty.map(|p| p.changes)
+        );
+        let again = snapshot_create_detailed(&conn, &unit.name, &Config::default()).unwrap();
+        assert!(!again.minted, "a dotfile rewrite mints no Version");
+        assert_eq!(again.snapshot_id, snap_id);
+        restage(&conn, &paths, &config, snap_id)
+            .expect("the same Version stages again after a dotfile rewrite");
+    }
+
+    #[test]
+    fn a_unit_tag_mints_no_version_and_the_version_restages() {
+        dotfile_change_is_not_content("mtime_size", |conn, unit, _| {
+            crate::unit::tag_unit(conn, unit, &["keep".to_string()], &[]).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_unit_rename_mints_no_version_and_the_version_restages() {
+        dotfile_change_is_not_content("mtime_size", |conn, unit, _| {
+            crate::unit::rename_unit(conn, &unit.name, "unit1-renamed").unwrap();
+        });
+    }
+
+    #[test]
+    fn a_policy_edit_mints_no_version_and_the_version_restages() {
+        dotfile_change_is_not_content("mtime_size", |_, _, src| {
+            let path = src.join(".tapectl-unit.toml");
+            let mut df = crate::unit::dotfile::read_dotfile(&path).unwrap();
+            df.compression = Some("gzip".to_string());
+            df.slice_size = Some("64M".to_string());
+            crate::unit::dotfile::write_dotfile(&path, &df).unwrap();
+        });
+    }
+
+    /// The sha256 checksum mode hashes every file once mtime and size
+    /// agree, so a same-size dotfile edit with its mtime put back is the
+    /// case only that mode's loop would see.
+    #[test]
+    fn a_same_size_dotfile_edit_is_not_content_in_sha256_mode() {
+        dotfile_change_is_not_content("sha256", |_, _, src| {
+            let path = src.join(".tapectl-unit.toml");
+            let before = fs::metadata(&path).unwrap().modified().unwrap();
+            let text = fs::read_to_string(&path).unwrap();
+            let edited = text.replacen("unit1", "UNIT1", 1);
+            assert_ne!(text, edited);
+            assert_eq!(text.len(), edited.len());
+            fs::write(&path, edited).unwrap();
+            restore_mtime_for_snapshot_test(&path, before);
+        });
+    }
+
+    /// A recorded dotfile hash unlike the file on disk is not BITROT: the
+    /// file is rewritten by tapectl itself, and is not content.
+    #[test]
+    fn a_stale_dotfile_baseline_does_not_refuse_a_restage() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("a.txt"), b"the unit's real content").unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        crate::db::files::fixture::set_sha256(
+            &conn,
+            snap_id,
+            ".tapectl-unit.toml",
+            Some(&"0".repeat(64)),
+        );
+        restage(&conn, &paths, &config, snap_id)
+            .expect("a stale dotfile baseline must not read as BITROT");
+    }
+
     /// Issue #361: what `stage create` leaves in `<home>/stage-reports/` is
     /// a stage report, in its header as well as its directory — "receipt"
     /// now means only the recipient list a stage set was encrypted to

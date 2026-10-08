@@ -45,6 +45,12 @@ pub struct SyncReport {
     /// where a unit folder would be. Never archived;
     /// `cli::collection::cmd_sync` names them and exits non-zero.
     pub outside: Vec<super::outside::OutsideEntry>,
+    /// Known units under the root owned by another tenant than the
+    /// collection's configured `tenant` (#383): `(unit name, its tenant)`.
+    /// A warning, never a refusal and never a change: the catalog keeps
+    /// the owner it has (a collection's `tenant` names who new units go to).
+    /// `cli::collection::cmd_sync` prints them.
+    pub tenant_differs: Vec<(String, String)>,
 }
 
 /// Sync one collection with BUILT-IN defaults (`Config::default()`) plus the
@@ -106,7 +112,33 @@ pub fn sync_collection_with_config(
     // — a moved unit's new location is found and its `current_path` updated
     // here, so step 2 (which re-reads `current_path` fresh from the DB)
     // sees the new, existing path and never flags it as vanished.
-    for dir in candidate_unit_dirs(&root_path, lib) {
+    let dirs = candidate_unit_dirs(&root_path, lib);
+    // ADR-0012, 2026-10-07 item 24 (#378): two directories in this walk
+    // carrying one uuid, neither of them the unit's recorded directory, are
+    // each refused before either is resolved (`identity::refused_groups`). A
+    // dotfile that cannot be read is left to `sync_one_directory`, which
+    // names it.
+    let duplicated = if lib.dotfiles {
+        let found: Vec<(String, PathBuf)> = dirs
+            .iter()
+            .filter_map(|d| {
+                let df = dotfile::read_dotfile(&d.join(dotfile::UNIT_DOTFILE)).ok()?;
+                Some((df.uuid, d.clone()))
+            })
+            .collect();
+        crate::unit::identity::refused_groups(conn, &found)?
+    } else {
+        Default::default()
+    };
+    for dir in dirs {
+        if let Some((uuid, group)) = duplicated.iter().find(|(_, g)| g.contains(&dir)) {
+            errors.push(format!(
+                "{}: {}",
+                dir.display(),
+                crate::unit::identity::duplicate_uuid_refusal(uuid, group)
+            ));
+            continue;
+        }
         if let Err(e) = sync_one_directory(conn, config, lib, &root, &dir, dry_run, &mut report) {
             errors.push(format!("{}: {e}", dir.display()));
         }
@@ -214,7 +246,14 @@ fn sync_one_directory(
         if dotfile_path.exists() {
             let df = dotfile::read_dotfile(&dotfile_path)?;
             match queries::get_unit_by_uuid(conn, &df.uuid)? {
-                Some(existing) => resolve_existing(conn, &existing, &abs_str, dry_run, report),
+                Some(existing) => {
+                    // ADR-0012, 2026-10-07 item 24 (#378): a copy, not a move.
+                    if let Some(refusal) = crate::unit::identity::copy_refusal(&existing, &abs_str)
+                    {
+                        return Err(TapectlError::Other(refusal));
+                    }
+                    resolve_existing(conn, lib, &existing, &abs_str, dry_run, report)
+                }
                 None => {
                     // Dotfile on disk, DB doesn't know it yet — adopt it
                     // verbatim (mirrors `unit::discovery`'s own "not found"
@@ -249,7 +288,7 @@ fn sync_one_directory(
         // Path-keyed identity: no dotfile, ever — read-only sources trade
         // away rename robustness for zero on-disk footprint (§11).
         match queries::get_unit_by_path(conn, &abs_str)? {
-            Some(existing) => resolve_existing(conn, &existing, &abs_str, dry_run, report),
+            Some(existing) => resolve_existing(conn, lib, &existing, &abs_str, dry_run, report),
             None => {
                 if !dry_run {
                     insert_path_keyed_unit(conn, config, lib, root, &abs_str)?;
@@ -263,14 +302,32 @@ fn sync_one_directory(
 
 /// A directory resolved to an already-known unit (by uuid or by path):
 /// update its recorded path if it moved, and reactivate it if it was
-/// previously `missing` and has now reappeared.
+/// previously `missing` and has now reappeared. A unit owned by another
+/// tenant than the collection's is named in `tenant_differs` (#383), and
+/// keeps its owner.
 fn resolve_existing(
     conn: &Connection,
+    lib: &CollectionConfig,
     existing: &crate::db::models::Unit,
     abs_str: &str,
     dry_run: bool,
     report: &mut SyncReport,
 ) -> Result<()> {
+    let owner: String = conn.query_row(
+        "SELECT name FROM tenants WHERE id = ?1",
+        params![existing.tenant_id],
+        |r| r.get(0),
+    )?;
+    if owner != lib.tenant {
+        warn!(
+            unit = %existing.name,
+            tenant = %owner,
+            collection_tenant = %lib.tenant,
+            "collection sync: a known unit is owned by another tenant than the collection's"
+        );
+        report.tenant_differs.push((existing.name.clone(), owner));
+    }
+
     if existing.current_path.as_deref() != Some(abs_str) {
         report.moved += 1;
         if !dry_run {
@@ -546,6 +603,136 @@ mod tests {
             .as_deref()
             .unwrap()
             .ends_with("alpha-renamed"));
+    }
+
+    /// ADR-0012, 2026-10-07 item 24 (#378): a directory carrying a known
+    /// unit's uuid while the unit's recorded directory still exists is a
+    /// copy (a restore into the collection root, say), not a move. Sync
+    /// refuses it, naming both, and leaves the unit where it was.
+    #[test]
+    fn a_copy_of_a_known_unit_is_refused_not_taken_for_a_move() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        let lib = test_lib(root.path(), "media");
+        sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        let before = queries::get_unit_by_name(&conn, "testlib/alpha")
+            .unwrap()
+            .unwrap();
+
+        std::fs::create_dir_all(root.path().join("alpha-restored")).unwrap();
+        std::fs::copy(
+            root.path().join("alpha/.tapectl-unit.toml"),
+            root.path().join("alpha-restored/.tapectl-unit.toml"),
+        )
+        .unwrap();
+
+        for dry_run in [true, false] {
+            let (report, errors) =
+                sync_collection(&conn, &paths_in(home.path()), &lib, dry_run, &[]).unwrap();
+            assert_eq!(errors.len(), 1, "dry_run={dry_run}: {errors:?}");
+            assert!(
+                errors[0].contains("alpha-restored")
+                    && errors[0].contains(before.current_path.as_deref().unwrap())
+                    && errors[0].contains("copy"),
+                "the refusal names both directories: {}",
+                errors[0]
+            );
+            assert_eq!((report.moved, report.created), (0, 0));
+        }
+        let after = queries::get_unit_by_name(&conn, "testlib/alpha")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.current_path, before.current_path, "never repointed");
+    }
+
+    /// #383: a collection whose configured `tenant` changed keeps the old
+    /// owner for the units it already knows; sync names each one, changes
+    /// nothing, and does not fail.
+    #[test]
+    fn a_known_unit_owned_by_another_tenant_is_named_not_changed() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        seed_tenant(&conn, "family");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alpha")).unwrap();
+        sync_collection(
+            &conn,
+            &paths_in(home.path()),
+            &test_lib(root.path(), "media"),
+            false,
+            &[],
+        )
+        .unwrap();
+
+        let lib = test_lib(root.path(), "family");
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            report.tenant_differs,
+            vec![("testlib/alpha".to_string(), "media".to_string())]
+        );
+        let unit = queries::get_unit_by_name(&conn, "testlib/alpha")
+            .unwrap()
+            .unwrap();
+        let owner: String = conn
+            .query_row(
+                "SELECT name FROM tenants WHERE id = ?1",
+                params![unit.tenant_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, "media", "the owner is not changed by sync");
+
+        let (report, _) = sync_collection(
+            &conn,
+            &paths_in(home.path()),
+            &test_lib(root.path(), "media"),
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(report.tenant_differs.is_empty());
+    }
+
+    /// The other half of item 24: two directories in one walk carrying one
+    /// uuid are both refused, and no unit is registered for either.
+    #[test]
+    fn two_directories_carrying_one_uuid_are_both_refused() {
+        let conn = db::open_memory().unwrap();
+        seed_tenant(&conn, "media");
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let df = dotfile::UnitDotfile {
+            uuid: uuid::Uuid::new_v4().to_string(),
+            name: "testlib/one".to_string(),
+            created: "2026-01-01T00:00:00Z".to_string(),
+            tags: vec![],
+            tenant: "media".to_string(),
+            archive_set: None,
+            checksum_mode: None,
+            compression: None,
+            slice_size: None,
+            warehouse_copies: None,
+            exclude_patterns: vec![],
+        };
+        for d in ["one", "two"] {
+            std::fs::create_dir_all(root.path().join(d)).unwrap();
+            dotfile::write_dotfile(&root.path().join(d).join(".tapectl-unit.toml"), &df).unwrap();
+        }
+        let lib = test_lib(root.path(), "media");
+        let (report, errors) =
+            sync_collection(&conn, &paths_in(home.path()), &lib, false, &[]).unwrap();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors.iter().all(|e| e.contains(&df.uuid)), "{errors:?}");
+        assert_eq!(report.created, 0);
+        assert!(queries::get_unit_by_uuid(&conn, &df.uuid)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

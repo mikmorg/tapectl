@@ -431,6 +431,60 @@ mod tests {
         assert!(p.changes.modified.is_empty());
     }
 
+    /// ADR-0012, 2026-10-07 item 24 (#378): a version recorded with the
+    /// unit's dotfile among its files (every production snapshot so far)
+    /// compares clean against a walk that finds the dotfile rewritten, at
+    /// another size and mtime.
+    #[test]
+    fn a_rewritten_unit_dotfile_is_not_content() {
+        let conn = db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"hello").unwrap();
+        let dotfile_text = |name: &str| {
+            format!(
+                "[unit]\nuuid = \"u-1\"\nname = \"{name}\"\n\
+                 created = \"2026-01-01T00:00:00Z\"\ntenant = \"t\"\n"
+            )
+        };
+        std::fs::write(tmp.path().join(".tapectl-unit.toml"), dotfile_text("one")).unwrap();
+        let unit_id = seed_unit(&conn, tmp.path());
+        let unit_uuid: String = conn
+            .query_row(
+                "SELECT uuid FROM units WHERE id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let unit = crate::db::queries::get_unit_by_uuid(&conn, &unit_uuid)
+            .unwrap()
+            .unwrap();
+        let snap = crate::staging::snapshot_create(&conn, &unit.name, &Config::default()).unwrap();
+        assert_eq!(
+            crate::db::files::fixture::count(&conn, snap, Some(".tapectl-unit.toml")),
+            1,
+            "the dotfile is still recorded"
+        );
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let dotfile = tmp.path().join(".tapectl-unit.toml");
+        std::fs::write(&dotfile, dotfile_text("one, renamed")).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dotfile)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(
+            classify(&conn, &unit, &[]).unwrap().is_none(),
+            "the unit-root dotfile is not content"
+        );
+
+        // Positive control: a real content change beside it is still seen,
+        // and the dotfile is not named among the changes.
+        std::fs::write(tmp.path().join("f.txt"), b"hello, world").unwrap();
+        let p = classify(&conn, &unit, &[]).unwrap().expect("must be dirty");
+        assert_eq!(p.changes.modified, vec!["f.txt".to_string()]);
+    }
+
     #[test]
     fn a_removed_file_is_named_in_the_dirty_changes() {
         let conn = db::open_memory().unwrap();

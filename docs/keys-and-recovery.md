@@ -302,9 +302,13 @@ Three rings, from the inside out:
    only by opening the envelope.
 
 To move data between tenants, [`tenant reassign`](cli/tenant.md#tapectl-tenant-reassign)
-changes ownership in the catalog. Tapes already written stay encrypted to the old
-tenant's keys. Only data staged after the reassignment is encrypted to the new
-tenant.
+changes ownership in the catalog and rewrites each moved unit's
+`.tapectl-unit.toml` to name the new tenant (the dotfile is not content, so
+this does not create a new version). Tapes already written stay encrypted to the
+old tenant's keys. Only data staged after the reassignment is encrypted to the
+new tenant. The operator and escrow keys still open everything. `tenant reassign`
+(and its `--dry-run`) says how many written copies the new tenant's keys cannot
+open, and `audit` names each one under the `tenancy` check.
 
 ### Handing a tenant its own keys
 
