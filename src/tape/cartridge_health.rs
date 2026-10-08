@@ -304,7 +304,7 @@ pub fn fleet(conn: &Connection, rise_factor: f64) -> Result<Fleet> {
         let (medium_quarantines, session_quarantines) = quarantines(conn, id)?;
         let mut h = CartridgeHealth {
             last_contact: last_contact(conn, id)?,
-            unproven_failed_verifies: unproven_failed_verifies(conn, id)?,
+            unproven_failed_verifies: unproven_failed_verifies(conn, id, &medium_quarantines)?,
             read_errors_rising: rising.remove(&barcode),
             barcode,
             status,
@@ -433,16 +433,20 @@ pub fn last_contact(conn: &Connection, id: i64) -> Result<Option<LastContact>> {
 }
 
 /// Volumes on cartridge `id` whose most recent completed verify failed and
-/// which are not quarantined. A verify that proved the medium bad
-/// quarantines the volume (ADR-0012, 2026-09-17), so a failed last verify
-/// on a volume that is not quarantined is, by construction, one that did
+/// which are not quarantined on medium evidence (`medium_quarantines`). A
+/// verify that proved the medium bad quarantines the volume (ADR-0012,
+/// 2026-09-17), so a failed last verify on any other volume — including one
+/// a write-session finding quarantined — is, by construction, one that did
 /// not: the drive could not read it.
-fn unproven_failed_verifies(conn: &Connection, id: i64) -> Result<Vec<String>> {
+fn unproven_failed_verifies(
+    conn: &Connection,
+    id: i64,
+    medium_quarantines: &[String],
+) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT v.label FROM cartridge_volumes cv
            JOIN volumes v ON v.id = cv.volume_id
           WHERE cv.cartridge_id = ?1
-            AND v.observed_condition IS NOT 'quarantined'
             AND (SELECT s.outcome FROM verification_sessions s
                   WHERE s.volume_id = v.id AND s.completed_at IS NOT NULL
                     AND s.outcome IN ('passed', 'failed')
@@ -452,7 +456,10 @@ fn unproven_failed_verifies(conn: &Connection, id: i64) -> Result<Vec<String>> {
     let rows = stmt
         .query_map([id], |r| r.get(0))?
         .collect::<std::result::Result<Vec<String>, _>>()?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .filter(|label| !medium_quarantines.contains(label))
+        .collect())
 }
 
 /// Quarantined volumes on cartridge `id`, split into medium evidence and
@@ -571,7 +578,7 @@ pub fn render_unattributed(u: &Unattributed) -> Vec<String> {
     }
     let mut lines = vec![format!(
         "unattributed — evidence whose contact identified no registered cartridge \
-         (a tape bound before 2026-09-13, or never bound): {} reading(s), {} medium \
+         (a tape written before 2026-09-13, or never bound): {} reading(s), {} medium \
          TapeAlert sighting(s), {} rising read-error trend(s)",
         u.readings.len(),
         u.medium_alerts.len(),
@@ -805,7 +812,8 @@ mod tests {
                     (31, 14, '2026-09-07 03:00:00', '2026-09-07 03:30:00', 'full', 'aborted'),
                     (32, 15, '2026-09-08 01:00:00', '2026-09-08 02:00:00', 'full', 'failed'),
                     (33, 16, '2026-09-06 01:00:00', '2026-09-06 02:00:00', 'full', 'passed'),
-                    (34, 16, '2026-09-09 01:00:00', '2026-09-09 02:00:00', 'full', 'passed');
+                    (34, 16, '2026-09-09 01:00:00', '2026-09-09 02:00:00', 'full', 'passed'),
+                    (35, 13, '2026-09-04 01:00:00', '2026-09-04 02:00:00', 'quick', 'failed');
              INSERT INTO events (timestamp, entity_type, entity_id, entity_label, action,
                                  field, new_value, details)
              VALUES ('2026-09-06 02:00:00', 'volume', 16, 'V-LOOSE', 'verify_read_errors',
@@ -933,7 +941,11 @@ mod tests {
         assert!(!text.contains("    - the last verify"), "{text}");
 
         // The positive control: C's passed verify is evidence.
-        assert_eq!(by("C-OK").verdict, Verdict::Clean);
+        let c = by("C-OK");
+        assert_eq!(c.verdict, Verdict::Clean);
+        // V-C2 is quarantined, but by a write-session finding, not the
+        // medium: its failed verify is still the unproven kind, and named.
+        assert_eq!(c.unproven_failed_verifies, vec!["V-C2".to_string()]);
     }
 
     /// #307's third case: a reading on a volume bound to no cartridge, whose

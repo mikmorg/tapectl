@@ -757,7 +757,7 @@ drive could not read it — a verify that did prove it quarantined the volume). 
 verify still running, or aborted, is not counted at all. The report ends with
 what resolves to no registered cartridge — readings, medium TapeAlerts and
 rising read-error trends from a contact that identified none, such as a tape
-bound before 2026-09-13 — by volume and contact, or `unattributed: none`; under
+written before 2026-09-13 — by volume and contact, or `unattributed: none`; under
 `--json` the cartridges are under `cartridges` and that block under
 `unattributed`. `cartridge info` shows the last bind and the last contact of
 any kind, and when each volume it carried was mounted and unmounted.
