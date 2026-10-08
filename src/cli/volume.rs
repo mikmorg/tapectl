@@ -136,6 +136,14 @@ pub enum VolumeCommands {
     /// abort (ADR-0012, 2026-09-23); otherwise resume names the first unmet
     /// condition and, where one exists, the command that resolves it.
     ///
+    /// A write the CATALOG lost (it was restored from a backup taken after
+    /// `volume init` and before the write) is adopted as sealed, reading
+    /// only, once `catalog rebuild --from-volume` has attached it and a
+    /// passing full verify is recorded after that rebuild — and only when
+    /// File 0's uuid is this volume's, a seal marker binds the front index,
+    /// and every slice hash in the front index is the one this catalog
+    /// recorded when it staged that slice (ADR-0012, 2026-09-29 later).
+    ///
     /// Refuses any volume whose CATALOG status is not `initialized` — a
     /// volume recorded sealed, retired or erased, or whose condition is
     /// quarantined, is not a write target (ADR-0012); no flag overrides it.

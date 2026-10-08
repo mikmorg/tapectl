@@ -14,6 +14,8 @@ Everything else quarantines the volume: a File 0 whose identity does not match, 
 .PP
 An ABORTED session is adopted and re\-confirmed the same way (never written, never re\-sealed) only when its seal is recorded, its condition is ok, and a passing FULL verify is recorded after the abort (ADR\-0012, 2026\-09\-23); otherwise resume names the first unmet condition and, where one exists, the command that resolves it.
 .PP
+A write the CATALOG lost (it was restored from a backup taken after `volume init` and before the write) is adopted as sealed, reading only, once `catalog rebuild \-\-from\-volume` has attached it and a passing full verify is recorded after that rebuild — and only when File 0\*(Aqs uuid is this volume\*(Aqs, a seal marker binds the front index, and every slice hash in the front index is the one this catalog recorded when it staged that slice (ADR\-0012, 2026\-09\-29 later).
+.PP
 Refuses any volume whose CATALOG status is not `initialized` — a volume recorded sealed, retired or erased, or whose condition is quarantined, is not a write target (ADR\-0012); no flag overrides it. That is a different question from whether the loaded TAPE carries a seal marker, which is what the re\-confirm path above is about.
 .PP
 Exit status: `volume write`\*(Aqs (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A resume refused before it changed the session exits 2 and leaves the session as it was.

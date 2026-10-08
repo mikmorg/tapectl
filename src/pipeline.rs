@@ -1255,4 +1255,141 @@ mod tests {
         assert!(delivered.produced.is_ok() && delivered.sink.is_ok());
         assert_eq!(pool.allocated(), BUFFERS);
     }
+
+    // ── the overlap budget (issue #416 item 6) ──
+    //
+    // #390's whole point is that the stages run at once: the slowest one
+    // sets the rate, not the sum of all of them. Each test below gives two
+    // stages the same per-block delay and holds the wall time to at most
+    // 0.7 of the time the stages spent busy, summed — overlapped, it is
+    // about half; serial, it is all of it. Busy time is measured around
+    // each sleep, so a loaded host that oversleeps inflates both sides.
+
+    const OVERLAP_BLOCKS: usize = 30;
+    const OVERLAP_DELAY: Duration = Duration::from_millis(8);
+    const OVERLAP_BUDGET: f64 = 0.7;
+
+    /// Sleep one block's delay, adding what it took to `busy`.
+    fn busy_block(busy: &Mutex<Duration>) {
+        let started = Instant::now();
+        std::thread::sleep(OVERLAP_DELAY);
+        *busy.lock().unwrap() += started.elapsed();
+    }
+
+    /// A source that takes [`OVERLAP_DELAY`] to deliver each block.
+    struct SlowSource {
+        left: usize,
+        busy: Arc<Mutex<Duration>>,
+    }
+
+    impl Read for SlowSource {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.left == 0 {
+                return Ok(0);
+            }
+            busy_block(&self.busy);
+            let n = buf.len().min(CHUNK);
+            buf[..n].fill(7);
+            self.left -= 1;
+            Ok(n)
+        }
+    }
+
+    /// A sink that takes [`OVERLAP_DELAY`] to take each block.
+    struct SlowSink(Arc<Mutex<Duration>>);
+
+    impl Write for SlowSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            busy_block(&self.0);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn overlap(wall: Duration, a: &Mutex<Duration>, b: &Mutex<Duration>) -> f64 {
+        wall.as_secs_f64() / (*a.lock().unwrap() + *b.lock().unwrap()).as_secs_f64()
+    }
+
+    /// The write pipeline: a staged file that is slow to read and a store
+    /// that is slow to write overlap.
+    #[test]
+    fn a_slow_source_and_a_slow_store_overlap() {
+        let len = (OVERLAP_BLOCKS * CHUNK) as u64;
+        let source_busy = Arc::new(Mutex::new(Duration::ZERO));
+        let store_busy = Arc::new(Mutex::new(Duration::ZERO));
+        let want = sha(&vec![7u8; len as usize]);
+        let mut pool = BufferPool::new(CHUNK, 4);
+        let started = Instant::now();
+        let streamed = write_verified(
+            &mut pool,
+            SlowSource {
+                left: OVERLAP_BLOCKS,
+                busy: source_busy.clone(),
+            },
+            len,
+            Some(&want),
+            |src| {
+                let mut block = [0u8; CHUNK];
+                for _ in 0..OVERLAP_BLOCKS {
+                    src.read_exact(&mut block).unwrap();
+                    busy_block(&store_busy);
+                }
+                Ok(len)
+            },
+        );
+        let wall = started.elapsed();
+        assert!(streamed.store.is_ok());
+        let ratio = overlap(wall, &source_busy, &store_busy);
+        assert!(
+            ratio <= OVERLAP_BUDGET,
+            "the source and the store took turns: wall {wall:?} is {ratio:.2} of their busy time"
+        );
+    }
+
+    /// The read pipeline: a tape read that is slow to deliver and a sink
+    /// that is slow to take overlap.
+    #[test]
+    fn a_slow_tape_read_and_a_slow_sink_overlap() {
+        let tape_busy = Arc::new(Mutex::new(Duration::ZERO));
+        let sink_busy = Arc::new(Mutex::new(Duration::ZERO));
+        let mut pool = BufferPool::new(CHUNK, 4);
+        let busy = tape_busy.clone();
+        let started = Instant::now();
+        let delivered = read_through(
+            &mut pool,
+            move |pipe| {
+                for _ in 0..OVERLAP_BLOCKS {
+                    busy_block(&busy);
+                    pipe.write_all(&[5u8; CHUNK]).unwrap();
+                }
+                Ok(())
+            },
+            &mut SlowSink(sink_busy.clone()),
+        );
+        let wall = started.elapsed();
+        assert!(delivered.produced.is_ok() && delivered.sink.is_ok());
+        let ratio = overlap(wall, &tape_busy, &sink_busy);
+        assert!(
+            ratio <= OVERLAP_BUDGET,
+            "the tape read and the sink took turns: wall {wall:?} is {ratio:.2} of their busy time"
+        );
+    }
+
+    /// The overlap measure's positive control: the same two stages run in
+    /// turn on one thread, as every release before 1.0.6 ran them, are
+    /// over the budget — the measure sees serial work as serial.
+    #[test]
+    fn the_same_stages_in_turn_are_over_the_overlap_budget() {
+        let a = Mutex::new(Duration::ZERO);
+        let b = Mutex::new(Duration::ZERO);
+        let started = Instant::now();
+        for _ in 0..OVERLAP_BLOCKS {
+            busy_block(&a);
+            busy_block(&b);
+        }
+        let ratio = overlap(started.elapsed(), &a, &b);
+        assert!(ratio > OVERLAP_BUDGET, "serial ratio {ratio:.2}");
+    }
 }

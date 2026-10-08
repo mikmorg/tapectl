@@ -22,6 +22,7 @@ use crate::util::{HashingWriter, TruncatingWriter};
 
 use crate::store::{ConfirmPlan, OpenMode, Store, TapeStore, Tier};
 
+use super::adopt_lost;
 use super::binding;
 use super::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
 use super::format;
@@ -1908,6 +1909,20 @@ fn volume_resume_contacted<'c>(
     // NOT disqualify `planned`/`in_progress`/`interrupted` rows -- see
     // `has_completed_write`'s doc comment; those are exactly what
     // `rehydrate`, called next, exists to continue.
+    //
+    // #360 (ADR-0012, 2026-09-29 later): an `initialized` row with nothing
+    // but completed writes attached and no seal recorded is a write this
+    // catalog lost — resume ADOPTS it. Condition 2 (a passing full verify
+    // after the rebuild) is asked of the rows first, so a resume with no
+    // verify behind it is refused before the tape moves.
+    if adopt_lost::is_lost_write(conn, volume_id)? {
+        if let Some(refused) = adopt_lost::recorded_evidence(conn, volume_id)? {
+            return Err(adopt_lost::refusal(label, &refused));
+        }
+        return volume_resume_adopt_lost_contacted(
+            conn, config, label, device, block_size, volume_id, contact,
+        );
+    }
     if coverage::has_completed_write(conn, volume_id)? {
         return Err(TapectlError::VolumeHasRecordedWrite {
             label: label.to_string(),
@@ -2166,6 +2181,107 @@ fn volume_resume_in_contact(
         outcome,
         confirm_tier,
     )
+}
+
+/// `volume resume` on a write this catalog lost (#360, ADR-0012 2026-09-29
+/// later): the same contact [`volume_resume_contacted`] opens — the MAM read,
+/// the contact and its journal, one post-command sweep, the phase timings —
+/// around [`adopt_lost::adopt`] instead of a session. There is no session to
+/// rehydrate and no key to assemble: adoption reads File 0, the front index
+/// and the seal marker, and writes only catalog rows, so the drive opens
+/// read-only (issue #407) and no drive-generation write check applies.
+fn volume_resume_adopt_lost_contacted<'c>(
+    conn: &'c Connection,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    volume_id: i64,
+    contact: &mut ContactSlot<'c>,
+) -> Result<()> {
+    let backend = crate::config::resolve_lto_backend(config, Some(device))?;
+    // An empty drive first, by name and at once (issue #355).
+    crate::tape::media_detect::ensure_medium_loaded(device)?;
+    let phase = progress::phase("contact-open", None);
+    let det = crate::tape::media_detect::detect(device, &backend.device_sg);
+    let injected_identity = contact.injected_drive_identity();
+    let probe = HealthProbe {
+        log_source: contact.injected_log_source(),
+        identity: injected_identity.as_ref(),
+    };
+    let contact = contact.open(
+        conn,
+        config,
+        Operation::VolumeResume,
+        device,
+        Some(volume_id),
+        Medium::Observed {
+            backend,
+            mam: &det.mam,
+        },
+    );
+    contact.journal_mam(Operation::VolumeResume, Hook::VolumeResume, &det.capture);
+    phase.done();
+
+    let result = adopt_lost_in_contact(conn, label, device, block_size, &det, volume_id);
+
+    // ONE post-command sweep per contact, on every outcome (issue #342).
+    let phase = progress::phase("health-sweep", None);
+    collect_health_best_effort(
+        conn,
+        config,
+        device,
+        Some(volume_id),
+        contact.id(),
+        health::Reading::Resume,
+        Operation::VolumeResume,
+        probe,
+    );
+    phase.done();
+    phase_timings::record_drained(
+        conn,
+        "volume resume",
+        phase_timings::Subject::Volume(volume_id),
+    );
+    result
+}
+
+/// Everything the lost-write adoption does inside its contact: corroborate
+/// the loaded medium, open the drive read-only, and ask
+/// [`adopt_lost::adopt`] — whose refusals name the first unmet condition.
+fn adopt_lost_in_contact(
+    conn: &Connection,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    det: &crate::tape::media_detect::Detected,
+    volume_id: i64,
+) -> Result<()> {
+    binding::corroborate_volume(
+        conn,
+        volume_id,
+        label,
+        &binding::MediumFacts::from_serial(det.mam.serial.clone()),
+    )?;
+    let phase = progress::phase("drive-open", None);
+    // Read-only, as resume opens a session whose seal is recorded (#407);
+    // the write family's empty-drive check ran before the contact opened.
+    let mut store = TapeStore::open_as(device, block_size, OpenMode::ReadOnly, 0)?;
+    phase.done();
+    info!(
+        label,
+        volume_id, "adopting a volume this catalog lost mid-write"
+    );
+    match adopt_lost::adopt(conn, &mut store, volume_id, label, block_size as u64)? {
+        adopt_lost::LostAdoption::Adopted { slices } => {
+            info!(
+                label,
+                volume_id, slices, "lost write adopted: volume sealed"
+            );
+            Ok(())
+        }
+        refused => Err(adopt_lost::refusal(label, &refused)),
+    }
 }
 
 /// Deliberately abandon a volume's unfinished write session (issue #94) —
@@ -2472,7 +2588,11 @@ fn nothing_to_resume(conn: &Connection, volume_id: i64, label: &str) -> TapectlE
     if statuses.is_empty() {
         return TapectlError::Other(format!(
             "volume \"{label}\" has no write sessions at all — there is nothing to resume. Run \
-             `tapectl volume write {label}` to start one."
+             `tapectl volume write {label}` to start one. If its cartridge was in fact written \
+             and sealed by a session this catalog lost (the catalog was restored from a backup \
+             taken before the write), load it and run `tapectl catalog rebuild --from-volume`, \
+             then a full `tapectl volume verify {label}`, then `tapectl volume resume {label}` \
+             (ADR-0012, 2026-09-29 later)."
         ));
     }
     if statuses.iter().any(|s| s == "planned") {
@@ -3710,7 +3830,7 @@ fn record_after_sealed(
 /// it only flips `status`. v1 populated these inline as part of the write
 /// loop; this restores that parity for v2-sealed volumes. Deliberately never
 /// touches `status` (confirm's transaction already set it to `sealed`).
-fn record_write_bookkeeping(
+pub(crate) fn record_write_bookkeeping(
     conn: &Connection,
     volume_id: i64,
     layout: &Layout,
@@ -7829,6 +7949,7 @@ mod tests {
         for (f, needle) in [
             ("fn volume_write_contacted", "contact.id(),"),
             ("fn volume_resume_contacted", "contact.id(),"),
+            ("fn volume_resume_adopt_lost_contacted", "contact.id(),"),
             ("pub(crate) fn volume_verify_with_store(", "contact_id,"),
             // Issue #339: init sweeps too, in the function that holds the
             // guard — not in `volume_init_in_contact`, which the `?`s leave.
@@ -10048,8 +10169,13 @@ mod tests {
     /// `volume resume` -- an `initialized` row with a completed write
     /// attached must be named by that fact, not fall through to
     /// `nothing_to_resume`'s message (which would be confusing here: the
-    /// completed row means there is nothing UNRESOLVED to resume, but the
-    /// volume still is not writable).
+    /// completed row means there is nothing UNRESOLVED to resume).
+    ///
+    /// Since #360 (ADR-0012, 2026-09-29 later) that row is the state resume
+    /// ADOPTS — a write the catalog lost — once a rebuild and a full verify
+    /// after it are recorded. With no rebuild recorded the refusal names the
+    /// rebuild, then the verify, before the tape moves (the device is never
+    /// reached).
     #[test]
     fn volume_resume_refuses_an_initialized_volume_with_a_completed_write() {
         let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
@@ -10095,13 +10221,17 @@ mod tests {
         )
         .unwrap_err();
 
-        match &err {
-            TapectlError::VolumeHasRecordedWrite { label } => {
-                assert_eq!(label, "L6-REBUILT-R");
-            }
-            other => panic!("expected VolumeHasRecordedWrite, got: {other:?}"),
-        }
         let msg = err.to_string();
+        assert!(
+            msg.contains("L6-REBUILT-R")
+                && msg.contains("tapectl catalog rebuild --from-volume")
+                && msg.contains("tapectl volume verify L6-REBUILT-R"),
+            "the #360 refusal names the rebuild, then the verify: {msg}"
+        );
+        assert!(
+            !msg.contains("/nonexistent/tapectl-resume-rebuilt-test-nst"),
+            "refused before the tape moves: {msg}"
+        );
         assert!(
             !msg.contains("nothing to resume"),
             "must be refused by the recorded-write fact, not fall through to \
@@ -10122,6 +10252,103 @@ mod tests {
         assert_eq!(
             write_status, "completed",
             "a refused resume must leave the writes row untouched"
+        );
+    }
+
+    /// #360, condition 2 before the tape moves: a lost write whose rebuild
+    /// IS recorded, but with no passing full verify after it, is refused
+    /// naming `volume verify` — from rows alone, so the device is never
+    /// reached. (The tape-side conditions are driven against a `MemStore`
+    /// in `adopt_lost`'s tests.)
+    #[test]
+    fn volume_resume_of_a_rebuilt_lost_write_without_a_verify_names_volume_verify() {
+        let (conn, _tenant_id, stage_set_id) = escrow_check_fixture();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-LOST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, completed_at)
+             VALUES (?1, ?2, ?3, 'completed', datetime('now'))",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+        events::log_event(
+            &conn,
+            "volume",
+            volume_id,
+            Some("L6-LOST"),
+            "catalog_rebuild",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = volume_resume(
+            &conn,
+            &TapectlPaths::new(tmp.path().join("home")),
+            &Config::default(),
+            "L6-LOST",
+            "/nonexistent/tapectl-resume-lost-test-nst",
+            512 * 1024,
+            false,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no passing full verify") && msg.contains("tapectl volume verify L6-LOST"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("/nonexistent/tapectl-resume-lost-test-nst"),
+            "refused before the tape moves: {msg}"
+        );
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "initialized");
+    }
+
+    /// #360: a volume with no writes rows at all is not resumable — but if
+    /// its tape was sealed by a write this catalog lost, the refusal names
+    /// the way back: rebuild, verify, resume.
+    #[test]
+    fn nothing_to_resume_with_no_sessions_names_the_lost_write_path() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-NONE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let msg = nothing_to_resume(&conn, conn.last_insert_rowid(), "L6-NONE").to_string();
+        assert!(msg.contains("tapectl volume write L6-NONE"), "{msg}");
+        assert!(
+            msg.contains("tapectl catalog rebuild --from-volume")
+                && msg.contains("tapectl volume verify L6-NONE")
+                && msg.contains("tapectl volume resume L6-NONE"),
+            "{msg}"
         );
     }
 
@@ -14426,6 +14653,7 @@ mod tests {
                 ("fn volume_init_contacted", "VolumeInit"),
                 ("fn volume_write_contacted", "VolumeWrite"),
                 ("fn volume_resume_contacted", "VolumeResume"),
+                ("fn volume_resume_adopt_lost_contacted", "VolumeResume"),
             ] {
                 let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
                 let end = SRC[start..].find("\n}\n").unwrap() + start;
@@ -14677,7 +14905,11 @@ mod tests {
                  restore raw-volume, identify, read-slices, compact-read, compact — found in \
                  {files:?}"
             );
-            assert_eq!(writes, 3, "init, write, resume — found in {files:?}");
+            assert_eq!(
+                writes, 4,
+                "init, write, resume, resume's lost-write adoption (read-only, behind the \
+                 write family's empty-drive probe) — found in {files:?}"
+            );
             assert_eq!(
                 files,
                 [
@@ -14719,6 +14951,7 @@ mod tests {
                 "fn volume_init_contacted",
                 "fn volume_write_contacted",
                 "fn volume_resume_contacted",
+                "fn volume_resume_adopt_lost_contacted",
             ] {
                 let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
                 let end = SRC[start..].find("\n}\n").unwrap() + start;
@@ -16288,9 +16521,20 @@ mod tests {
                 prod.len() < SRC.len(),
                 "positive control: production half separated"
             );
-            for path in ["init", "write", "resume"] {
-                let outer = format!("fn volume_{path}_contacted");
-                let inner = format!("fn volume_{path}_in_contact");
+            for (outer, inner) in ["init", "write", "resume"]
+                .map(|path| {
+                    (
+                        format!("fn volume_{path}_contacted"),
+                        format!("fn volume_{path}_in_contact"),
+                    )
+                })
+                .into_iter()
+                // #360: resume's lost-write adoption is its own contact.
+                .chain([(
+                    "fn volume_resume_adopt_lost_contacted".to_string(),
+                    "fn adopt_lost_in_contact".to_string(),
+                )])
+            {
                 let body_of = |f: &str| -> &str {
                     let start = prod.find(f).unwrap_or_else(|| panic!("no {f}"));
                     let end = prod[start..].find("\n}\n").unwrap() + start;
@@ -16338,7 +16582,11 @@ mod tests {
             // included — lives one call down in `_in_contact`. The call
             // moved, so the assertion moved with it, which is what this
             // test's own instruction below says to do.
-            for f in ["fn volume_write_in_contact", "fn volume_resume_in_contact"] {
+            for f in [
+                "fn volume_write_in_contact",
+                "fn volume_resume_in_contact",
+                "fn adopt_lost_in_contact",
+            ] {
                 let start = SRC.find(f).unwrap_or_else(|| panic!("no fn {f}"));
                 // Function bodies end at the first `\n}` in column 0.
                 let end = SRC[start..].find("\n}\n").unwrap() + start;

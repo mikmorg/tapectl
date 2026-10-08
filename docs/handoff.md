@@ -154,6 +154,90 @@ and sense capture).
 #311 (#299, #302–#305, #307, #310); #326; #143 (won't-fix unless you want those commands);
 #144 (until bin-packing matters).
 
+## #416 cost budgets: what landed, and where the rest goes
+
+Branch `recovery`, 2026-10-07. The brief was to build the budget harness and the
+budgets #416 lists for the ungated suites, using the counting fakes that already
+exist, and to name the budgets that need mhvtl. Of the 13 items:
+
+**Landed (ungated, in `cargo test`):**
+- **Item 3, the FakeTape distance model:** `src/volume/cost_budget.rs`. It covers
+  a write and its confirm, verify (full and quick), catalog rebuild, the raw dump,
+  envelope open, read-slices, compact-read, the resumed readback and binding, on a
+  150-slice unit plus a 47-slice unit, with each slice modeled as 10 GiB. The tests
+  are `a_write_and_its_confirm_stay_within_their_budgets`,
+  `every_read_path_stays_within_its_budget`, and two positive controls:
+  `a_seal_first_confirm_after_a_write_breaks_the_confirm_budget` and
+  `the_pre_1_0_5_rewind_per_read_breaks_every_multi_file_budget`. This
+  approximates item 2's shape under FakeTape, but **item 2's gate leg is not
+  built**.
+- **Item 6, the overlap budget:** three tests in `src/pipeline.rs`:
+  `a_slow_source_and_a_slow_store_overlap`, `a_slow_tape_read_and_a_slow_sink_overlap`
+  and `the_same_stages_in_turn_are_over_the_overlap_budget` (the positive control).
+- **Item 10, the catalog budgets:** `tests/catalog_budget.rs`, which pins
+  statement counts and query plans for ls, search, locate, stats, the restore
+  lookup, audit and collection status, with three positive controls. The
+  catalog.db build's commit budget is not repeated there. It stays pinned by
+  #399's `the_build_commits_once_whatever_the_row_count` in `db::ontape_catalog`.
+- **Item 13, ENOSPC under `write_stream`:** `FakeTape`'s `capacity`, and
+  `enospc_from_the_drive_at_a_slice_aborts_unsealed` in `src/volume/session.rs`.
+
+**Already pinned on master before this branch:**
+- **Item 5, the RESTORE.sh motion log:** `tests/heir_restore_sh.rs`, in
+  `a_multi_slice_restore_rewinds_once_and_only_spaces_forward`,
+  `verify_rewinds_once_and_reads_the_seal_marker_last` and
+  `info_and_find_envelope_rewind_once`. This is the after-#396 bound, not the
+  "rewinds = files read" ceiling the issue names as the interim.
+
+**Routed to the coordinator: these need a kernel st driver (mhvtl or the real drive):**
+- Item 1: st counter budgets from `st_stats_journal`, in the gate and in
+  `realdrive-forensics.py`. The counters are the kernel's.
+- Item 2: the wide-tape gate leg (about 150 slices of 1 MiB, plus a 47-slice
+  unit, through every path).
+- Item 7: mhvtl latency (`vtlcmd` delays in the gate preamble) and the
+  phase-duration assertions that depend on it.
+- Item 8: the drive duty cycle in forensics (`write_ns`/`read_ns` against the
+  phase duration). It is meaningful only on the real drive.
+- Item 12, the comparison against the kernel's `other_cnt` delta. The other half
+  of item 12, TapeStore motion counters recorded into `phase_timings`, is
+  production instrumentation like item 4 below, and it is not built. In tests,
+  FakeTape's op log already counts the motions, and item 3 uses it.
+
+**Routed to the gated `TAPECTL_PERF_TESTS` suite:**
+- Item 9: the perf harness through a Store, with ratios to an in-test sha256
+  calibration.
+- Item 11: the 100k-file unit (linear scaling, the statement ceiling, VmHWM).
+
+**Item 4, hash and disk-pass budgets: not built, and outside this brief.** No
+existing fake can count it. The write path does not hash through one type:
+- `pipeline::hash_stage` (execute's inline L2 hash, the main pass) builds its
+  own raw `Sha256`.
+- `layout_model::hash_file` (`--prewrite-hash` and the materialized zones) does
+  the same.
+- `build.rs`'s `sha256_hex` hashes materialized bytes in memory.
+- Only confirm's content-file hash (`store::chain_walk`) goes through
+  `util::HashingWriter`.
+
+A counting wrapper around `util::HashingReader`/`HashingWriter` would therefore
+miss the main pass, which is exactly the missed counter that the 0.95x floor
+exists to catch. Item 4 as written needs two new production-side pieces:
+
+1. One counted hasher type that every hashing site uses, plus a counted
+   staging read (`util::DropBehind`).
+2. A place to persist the counts. "Recorded into `phase_timings`" means either
+   new columns, which is a migration (none was expected here), or a new
+   convention for the existing `bytes` column, which today means progress bytes.
+
+What covers it today is narrower and does not count passes:
+- `execute_reads_the_staged_files_through_drop_behind` (session.rs) checks that
+  every staged slice is opened through `DropBehind`.
+- `SliceCheck::Size`, the default, reads only metadata. Its tests are in
+  `layout_model.rs`.
+
+**Who builds it:** an agent, in a follow-up #416 brief, once the coordinator
+rules on where the counts are stored (new `phase_timings` columns or something
+else).
+
 ## Hazards to keep in mind
 
 - `/dev/nstN` numbering moves across reboots; the real drive is

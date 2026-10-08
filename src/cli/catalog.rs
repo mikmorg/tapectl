@@ -736,7 +736,23 @@ pub fn run(
                 // Outside the is_noop() branch on purpose: a second rebuild
                 // onto a row that is still non-sealed is a no-op for row
                 // counts and must still warn every time (issue #158).
-                if let Some(status) = &report.volume_status_mismatch {
+                if let Some(status) = report
+                    .volume_status_mismatch
+                    .as_ref()
+                    .filter(|s| s.as_str() == "initialized")
+                {
+                    // #360 (ADR-0012, 2026-09-29 later): the lost-write case
+                    // has a way back, and the warning names it.
+                    println!(
+                        "  warning: volume \"{}\" was already in this catalog as \"{status}\", \
+                         not sealed — most likely a backup taken before its write. The rebuild \
+                         attached its units to that row and left the status alone; until it is \
+                         sealed, nothing on it counts as a copy. Run a full `tapectl volume \
+                         verify {}`, then `tapectl volume resume {}`: resume seals it when the \
+                         tape holds the slices this catalog staged",
+                        report.label, report.label, report.label
+                    );
+                } else if let Some(status) = &report.volume_status_mismatch {
                     println!(
                         "  warning: volume \"{}\" was already in this catalog as \"{status}\", \
                          not sealed — the rebuild attached its units to that row and left the \
