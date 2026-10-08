@@ -457,6 +457,15 @@ fn migrations() -> Migrations<'static> {
             "migrations/033_drop_dead_cartridge_columns.sql"
         ))
         .foreign_key_check(),
+        // 034 keeps dar's report for every `dar -c` a stage set ran
+        // (issue #343): one append-only row per run, `stage_set_id` ON
+        // DELETE SET NULL with the names kept beside it. A new table, no
+        // rows touched. See the header.
+        M::up(include_str!("migrations/034_dar_create_reports.sql")),
+        // 035 journals the st driver's whole MTIOCGET status at each tape
+        // device's open, close and failed command (issue #344), against the
+        // contact. A new table, no rows touched. See the header.
+        M::up(include_str!("migrations/035_mtget_journal.sql")),
     ])
 }
 

@@ -715,6 +715,9 @@ impl<'a> ContactGuard<'a> {
         // journal, it is written even from an inert guard (`contact_id`
         // NULL): the reading happened either way. The device's node is
         // resolved here once and kept for the close reading.
+        // Issue #344: from here until the close, the tape device opened on
+        // this thread notes its MTIOCGET status for this contact.
+        crate::tape::mtget_journal::begin();
         let root = sysfs_root.unwrap_or(Path::new(drive_identity::SCSI_TAPE_SYSFS_ROOT));
         let stats_dir = st_stats::stats_dir(root, device);
         st_stats::capture(
@@ -743,6 +746,14 @@ impl<'a> ContactGuard<'a> {
     /// same reason it has no outcome.
     pub fn finish(mut self, outcome: &str, detail: Option<&str>) {
         self.finished = true;
+        // Issue #344: the MTIOCGET readings the device noted under this
+        // contact, journalled verbatim.
+        crate::tape::mtget_journal::record(
+            self.conn,
+            self.id,
+            self.operation.as_str(),
+            &crate::tape::mtget_journal::take(),
+        );
         st_stats::capture(
             self.conn,
             self.id,

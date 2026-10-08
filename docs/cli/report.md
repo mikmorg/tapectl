@@ -20,6 +20,7 @@ tapectl report [OPTIONS] <COMMAND>
 - [`pending`](#tapectl-report-pending) — Staged data pending write
 - [`verify-status`](#tapectl-report-verify-status) — Verification recency
 - [`health`](#tapectl-report-health) — Drive error trends
+- [`cartridge-health`](#tapectl-report-cartridge-health) — Every cartridge's health, worst first, and why
 - [`capacity`](#tapectl-report-capacity) — Volume capacity utilization
 - [`age`](#tapectl-report-age) — Snapshot age distribution
 - [`events`](#tapectl-report-events) — Audit trail browsing
@@ -109,6 +110,14 @@ tapectl report health [OPTIONS]
 **Options**
 
 - `--volume <VOLUME>` — Filter to specific volume
+
+### tapectl report cartridge-health
+
+Every cartridge's health, worst first, and why
+
+```text
+tapectl report cartridge-health [OPTIONS]
+```
 
 ### tapectl report capacity
 

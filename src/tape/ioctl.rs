@@ -102,12 +102,85 @@ fn mt_op_name(op: i16, count: i32) -> String {
 }
 
 /// A wrapper around a tape device file descriptor.
+///
+/// It notes the st driver's whole `MTIOCGET` status when it opens, after a
+/// tape command fails and when it closes (issue #344,
+/// [`crate::tape::mtget_journal`]); the contact it works for journals those
+/// readings when it closes. Every `MTIOCGET` it issues — the position reads
+/// too — goes through [`Self::read_status`], which adds st's read-to-clear
+/// recovered-error count to the device's tally.
 pub struct TapeDevice {
     file: File,
     block_size: usize,
+    /// The path it was opened by, for the journal.
+    path: String,
+    /// st's recovered errors, added up across every `MTIOCGET` since the
+    /// open reading (issue #344).
+    recovered: crate::tape::mtget_journal::RecoveredTally,
+}
+
+impl Drop for TapeDevice {
+    fn drop(&mut self) {
+        self.note(crate::tape::mtget_journal::POINT_CLOSE, None, None);
+    }
 }
 
 impl TapeDevice {
+    /// The st driver's whole `MTIOCGET` status (issue #344): an ioctl
+    /// answered by the st driver, not a log-page read (st flushes pending
+    /// write-behind first). It is NOT free to read: st clears its
+    /// recovered-error register (`mt_erreg`) on every `MTIOCGET`, so this is
+    /// the device's one `MTIOCGET` call site, and it adds each reading's
+    /// count to [`Self::recovered`] before anything else sees it.
+    fn read_status(&self) -> std::result::Result<crate::tape::mtget_journal::MtStatus, String> {
+        let mut m = MtGet::default();
+        let rc = unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCGET, &mut m as *mut MtGet) };
+        let status = if rc != 0 {
+            Err(format!("MTIOCGET: {}", io::Error::last_os_error()))
+        } else {
+            Ok(crate::tape::mtget_journal::MtStatus {
+                mt_type: m.mt_type,
+                mt_resid: m.mt_resid,
+                mt_dsreg: m.mt_dsreg,
+                mt_gstat: m.mt_gstat,
+                mt_erreg: m.mt_erreg,
+                mt_fileno: m.mt_fileno,
+                mt_blkno: m.mt_blkno,
+            })
+        };
+        self.recovered.observe(&status);
+        status
+    }
+
+    /// Note the status for the contact this thread works for (issue #344).
+    /// `command` and `errno` name a failed tape command; the errno is taken
+    /// by the caller before this, since MTIOCGET is itself a syscall. The
+    /// open reading restarts the tally: what it carried in accumulated
+    /// before this device opened.
+    fn note(&self, point: &'static str, command: Option<&str>, errno: Option<i32>) {
+        let status = self.read_status();
+        if point == crate::tape::mtget_journal::POINT_OPEN {
+            self.recovered.restart();
+        }
+        crate::tape::mtget_journal::note_reading(
+            point,
+            &self.path,
+            command,
+            errno,
+            status,
+            Some(self.recovered.total()),
+        );
+    }
+
+    /// [`Self::note`] for a failed command, from its error.
+    fn note_failure(&self, command: &str, e: &io::Error) {
+        self.note(
+            crate::tape::mtget_journal::POINT_FAILURE,
+            Some(command),
+            e.raw_os_error(),
+        );
+    }
+
     /// Open a tape device for read+write with the given block size.
     pub fn open(device_path: &str, block_size: usize) -> Result<Self> {
         // Issue #386: an open blocks while the drive loads and settles a
@@ -118,8 +191,14 @@ impl TapeDevice {
         )
         .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
 
-        let mut dev = Self { file, block_size };
+        let mut dev = Self {
+            file,
+            block_size,
+            path: device_path.to_string(),
+            recovered: Default::default(),
+        };
         dev.set_block_size(block_size)?;
+        dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
         Ok(dev)
     }
 
@@ -131,8 +210,14 @@ impl TapeDevice {
         )
         .map_err(|e| TapectlError::TapeIo(format!("open {device_path}: {e}")))?;
 
-        let mut dev = Self { file, block_size };
+        let mut dev = Self {
+            file,
+            block_size,
+            path: device_path.to_string(),
+            recovered: Default::default(),
+        };
         dev.set_block_size(block_size)?;
+        dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
         Ok(dev)
     }
 
@@ -159,9 +244,10 @@ impl TapeDevice {
             || unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCTOP, &mtop as *const MtOp) },
         );
         if rc != 0 {
+            let e = io::Error::last_os_error();
+            self.note_failure(&mt_op_name(op, count), &e);
             return Err(TapectlError::TapeIo(format!(
-                "ioctl op={op} count={count}: {}",
-                io::Error::last_os_error()
+                "ioctl op={op} count={count}: {e}"
             )));
         }
         Ok(())
@@ -203,14 +289,7 @@ impl TapeDevice {
 
     /// Get current tape position.
     pub fn get_position(&self) -> Result<TapePosition> {
-        let mut mtget = MtGet::default();
-        let rc = unsafe { nix::libc::ioctl(self.raw_fd(), MTIOCGET, &mut mtget as *mut MtGet) };
-        if rc != 0 {
-            return Err(TapectlError::TapeIo(format!(
-                "MTIOCGET: {}",
-                io::Error::last_os_error()
-            )));
-        }
+        let mtget = self.read_status().map_err(TapectlError::TapeIo)?;
         Ok(TapePosition {
             file_number: mtget.mt_fileno,
             block_number: mtget.mt_blkno,
@@ -255,9 +334,10 @@ impl TapeDevice {
                 }
             }
             let started = std::time::Instant::now();
-            self.file
-                .write_all(&buf[..bs])
-                .map_err(|e| write_error("write", &e))?;
+            if let Err(e) = self.file.write_all(&buf[..bs]) {
+                self.note_failure("write", &e);
+                return Err(write_error("write", &e));
+            }
             crate::progress::note_if_slow("one tape block write", started.elapsed());
             committed += bs as u64;
             remaining -= want as u64;
@@ -311,7 +391,10 @@ impl TapeDevice {
                 Err(e) if e.raw_os_error() == Some(28) => {
                     return Ok((total, ReadEnd::EndOfMedium));
                 }
-                Err(e) => return Err(TapectlError::TapeIo(format!("read: {e}"))),
+                Err(e) => {
+                    self.note_failure("read", &e);
+                    return Err(TapectlError::TapeIo(format!("read: {e}")));
+                }
             }
         }
     }
@@ -353,7 +436,10 @@ impl TapeDevice {
                 Err(e) if e.raw_os_error() == Some(28) => {
                     return Ok((total, ReadEnd::EndOfMedium));
                 }
-                Err(e) => return Err(TapectlError::TapeIo(format!("read: {e}"))),
+                Err(e) => {
+                    self.note_failure("read", &e);
+                    return Err(TapectlError::TapeIo(format!("read: {e}")));
+                }
             }
         }
         Ok((total, ReadEnd::Stopped))
@@ -409,6 +495,25 @@ mod density_tests {
         // bits carrying unrelated driver state.
         assert_eq!(density_from_dsreg(0x5a00_1234), Some(0x5a));
         assert_eq!(density_from_dsreg(0x5e00_0000), Some(0x5e));
+    }
+
+    /// Issue #344: st clears its recovered-error register on every
+    /// `MTIOCGET`, so a `TapeDevice` that read it anywhere but through the
+    /// one method that adds each reading to its tally would lose counts. The
+    /// rule is held structurally: the device's descriptor is passed to
+    /// `MTIOCGET` in exactly one place. (`density_code` opens its own
+    /// descriptor before any `TapeDevice` exists — st refuses a second
+    /// opener — and is the one other call, counted here so a third is seen.)
+    #[test]
+    fn the_device_issues_mtiocget_in_one_place() {
+        let src = include_str!("ioctl.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            body.matches("ioctl(self.raw_fd(), MTIOCGET").count(),
+            1,
+            "TapeDevice issues MTIOCGET only through read_status"
+        );
+        assert_eq!(body.matches(", MTIOCGET,").count(), 2, "and density_code");
     }
 
     #[test]

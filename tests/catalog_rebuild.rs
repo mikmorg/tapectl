@@ -1521,6 +1521,137 @@ fn rebuilding_the_same_volume_twice_changes_nothing_the_second_time() {
         "the first rebuild's row is already sealed — a second run must not \
          report a mismatch against itself: {second:?}"
     );
+    assert!(
+        second.volume_sealed_at_mismatch.is_none(),
+        "the first rebuild recorded the tape's own seal time — a second run must \
+         not report it as disagreeing with itself: {second:?}"
+    );
+}
+
+// ---- issue #305: a rebuilt tape is dated by its own bytes -----------------
+
+/// The seal marker's `sealed_at` exactly as the tape carries it, in the
+/// catalog's form — read from the last file the write session left in the
+/// store, not from anything the rebuild computed.
+fn tape_sealed_at(vol: &SealedVolume) -> String {
+    let seal = String::from_utf8_lossy(vol.store.files.last().expect("a sealed tape"));
+    let parsed = tapectl::volume::format::parse_seal_marker(&seal).expect("the seal parses");
+    tapectl::volume::format::catalog_timestamp(&parsed.sealed_at).expect("RFC 3339")
+}
+
+type VolumeDates = (String, Option<String>, Option<String>, Option<String>, i64);
+
+fn volume_dates(conn: &rusqlite::Connection, label: &str) -> VolumeDates {
+    conn.query_row(
+        "SELECT created_at, first_write, last_write, sealed_at, num_data_files
+         FROM volumes WHERE label = ?1",
+        rusqlite::params![label],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )
+    .unwrap()
+}
+
+/// Issue #305: a volume row a rebuild INSERTS takes its dates from the tape —
+/// File 0's `created_at` (when the write was planned) for `created_at` and
+/// `first_write`, the seal marker's `sealed_at` for `sealed_at` and
+/// `last_write` — and its data-file count from the front index. Before, it
+/// read as created on the day of the rebuild, never written, never sealed.
+#[test]
+fn a_rebuilt_volume_is_dated_by_its_own_file_0_and_seal_marker() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let sealed = tape_sealed_at(&vol);
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(report.volume_inserted);
+
+    let (created, first, last, sealed_at, data_files) = volume_dates(&conn, LABEL);
+    // `build_tape` writes File 0 with created_at = "2026-09-11T00:00:00Z".
+    assert_eq!(created, "2026-09-11 00:00:00");
+    assert_eq!(first.as_deref(), Some("2026-09-11 00:00:00"));
+    assert_eq!(sealed_at.as_deref(), Some(sealed.as_str()));
+    assert_eq!(last.as_deref(), Some(sealed.as_str()));
+    let slices: usize = vol.expected_positions.iter().map(|(_, p)| p.len()).sum();
+    assert_eq!(data_files, slices as i64, "one per data slice on the tape");
+
+    // The report carries what the tape said, for the operator to read.
+    assert_eq!(report.written_at.as_deref(), Some("2026-09-11 00:00:00"));
+    assert_eq!(report.sealed_at.as_deref(), Some(sealed.as_str()));
+    // The fixture writes `mam_loads: 0`, the writer's "unknown".
+    assert_eq!(report.load_count_at_write, None);
+}
+
+/// The control: a tape whose File 0 carries no `created_at` and which has
+/// no seal marker still rebuilds — the dates are simply absent (`created_at`
+/// falls back to the row's own default, the rebuild time), never invented.
+/// Without this, the test above could not tell "read the tape" from "wrote
+/// a plausible constant".
+#[test]
+fn a_tape_without_the_dates_rebuilds_with_them_absent() {
+    let mut vol = build_sealed_volume(true);
+    // File 0 without its created_at line (same length, so nothing else in
+    // the file moves), and no seal marker: an unsealed tape.
+    let thunk = String::from_utf8(vol.store.files[0].clone()).unwrap();
+    let line = thunk
+        .lines()
+        .find(|l| l.starts_with("created_at = "))
+        .expect("File 0 carries created_at")
+        .to_string();
+    vol.store.files[0] = thunk
+        .replacen(&line, &" ".repeat(line.len()), 1)
+        .into_bytes();
+    vol.store.files.pop();
+    vol.store.syncs.pop();
+
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("a missing date is an absence, never a reason to refuse");
+
+    let (created, first, last, sealed_at, _) = volume_dates(&conn, LABEL);
+    assert_ne!(created, "2026-09-11 00:00:00");
+    assert_eq!(first, None);
+    assert_eq!(last, None);
+    assert_eq!(sealed_at, None);
+    assert_eq!(report.written_at, None);
+    assert_eq!(report.sealed_at, None);
+}
+
+/// A row the rebuild merely FINDS is never edited (#158): when its recorded
+/// seal time disagrees with the tape's, the report says so and the row
+/// keeps its own.
+#[test]
+fn rebuild_onto_a_row_with_another_seal_time_reports_it_and_leaves_it_alone() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                              status, sealed_at)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'sealed', '2020-01-01 00:00:00')",
+        rusqlite::params![LABEL],
+    )
+    .unwrap();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(!report.volume_inserted);
+    assert_eq!(
+        report.volume_sealed_at_mismatch.as_deref(),
+        Some("2020-01-01 00:00:00")
+    );
+    assert_eq!(
+        report.sealed_at.as_deref(),
+        Some(tape_sealed_at(&vol).as_str())
+    );
+    let (_, _, _, sealed_at, _) = volume_dates(&conn, LABEL);
+    assert_eq!(sealed_at.as_deref(), Some("2020-01-01 00:00:00"));
 }
 
 fn row_counts(conn: &rusqlite::Connection) -> Vec<(String, i64)> {

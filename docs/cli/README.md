@@ -127,6 +127,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`report pending`](report.md#tapectl-report-pending) | Staged data pending write |
 | &nbsp;&nbsp;[`report verify-status`](report.md#tapectl-report-verify-status) | Verification recency |
 | &nbsp;&nbsp;[`report health`](report.md#tapectl-report-health) | Drive error trends |
+| &nbsp;&nbsp;[`report cartridge-health`](report.md#tapectl-report-cartridge-health) | Every cartridge's health, worst first, and why |
 | &nbsp;&nbsp;[`report capacity`](report.md#tapectl-report-capacity) | Volume capacity utilization |
 | &nbsp;&nbsp;[`report age`](report.md#tapectl-report-age) | Snapshot age distribution |
 | &nbsp;&nbsp;[`report events`](report.md#tapectl-report-events) | Audit trail browsing |

@@ -1,12 +1,12 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-report 1  "tapectl-report " 
+.TH tapectl-report-cartridge-health 1  "tapectl-report-cartridge-health " 
 .SH NAME
-tapectl\-report \- Generate reports
+tapectl\-report\-cartridge\-health \- Every cartridge\*(Aqs health, worst first, and why
 .SH SYNOPSIS
-\fBtapectl report\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+\fBtapectl report cartridge\-health\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
-Generate reports
+Every cartridge\*(Aqs health, worst first, and why
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -36,49 +36,3 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
-.SH SUBCOMMANDS
-.TP
-tapectl\-report\-summary(1)
-Overview: units, tapes, tenants, capacity
-.TP
-tapectl\-report\-fire\-risk(1)
-Units at risk: below min copies/locations
-.TP
-tapectl\-report\-copies(1)
-Copy count distribution per unit
-.TP
-tapectl\-report\-tape\-only(1)
-Tape\-only unit status
-.TP
-tapectl\-report\-dirty(1)
-Units with changes since last snapshot
-.TP
-tapectl\-report\-pending(1)
-Staged data pending write
-.TP
-tapectl\-report\-verify\-status(1)
-Verification recency
-.TP
-tapectl\-report\-health(1)
-Drive error trends
-.TP
-tapectl\-report\-cartridge\-health(1)
-Every cartridge\*(Aqs health, worst first, and why
-.TP
-tapectl\-report\-capacity(1)
-Volume capacity utilization
-.TP
-tapectl\-report\-age(1)
-Snapshot age distribution
-.TP
-tapectl\-report\-events(1)
-Audit trail browsing
-.TP
-tapectl\-report\-compaction\-candidates(1)
-Volumes flagged for compaction
-.TP
-tapectl\-report\-supersedable(1)
-Superseded snapshot versions that could be marked reclaimable
-.TP
-tapectl\-report\-help(1)
-Print this message or the help of the given subcommand(s)

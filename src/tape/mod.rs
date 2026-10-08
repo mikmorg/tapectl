@@ -1,3 +1,5 @@
+pub mod alert_flags;
+pub mod cartridge_health;
 pub mod contact;
 pub mod drive_identity;
 #[cfg(test)]
@@ -9,6 +11,7 @@ pub mod log_pages;
 pub mod mam;
 pub mod mam_journal;
 pub mod media_detect;
+pub mod mtget_journal;
 pub mod poll;
 pub mod read_errors;
 pub mod st_stats;
