@@ -4,10 +4,14 @@
 //! integration tests import `tapectl::` and cannot reach the binary, so
 //! anything inlined in `main.rs` is untestable from there.
 //!
-//! Every scan below (shadowing, subsumed, decorative keys, unknown
-//! `[defaults]` keys, unsupported compression, and the dar/staging/tape
-//! depth checks) is ADVISORY — it advises, never rewrites operator-owned
-//! files, and never touches the exit code. That contract is load-bearing
+//! `config set`/`add`/`remove` (issue #143) rewrite config.toml by design,
+//! through [`crate::config_edit`], which checks the edited file before it
+//! is written. Everything else here only reads.
+//!
+//! Every `config check` scan below (shadowing, subsumed, decorative keys,
+//! unknown `[defaults]` keys, unsupported compression, and the
+//! dar/staging/tape depth checks) is ADVISORY — it advises, never rewrites
+//! operator-owned files, and never touches the exit code. That contract is load-bearing
 //! (ADR-0004 and the #50/#92 "surface, do not delete" precedent); preserve
 //! it.
 //!
@@ -31,6 +35,7 @@ pub fn run(
     paths: &TapectlPaths,
     command: &ConfigCommands,
     json_output: bool,
+    dry_run: bool,
 ) -> Result<i32> {
     match command {
         ConfigCommands::Show => {
@@ -46,7 +51,100 @@ pub fn run(
             Ok(EXIT_SUCCESS)
         }
         ConfigCommands::Check => run_check(conn, paths, json_output),
+        ConfigCommands::Set { .. } | ConfigCommands::Add { .. } | ConfigCommands::Remove { .. } => {
+            // `main.rs` dispatches these to `run_edit` before the strict
+            // load (#143); reaching here means a caller skipped that.
+            run_edit(paths, command, json_output, dry_run)?;
+            Ok(EXIT_SUCCESS)
+        }
     }
+}
+
+/// `config set` / `add` / `remove` (issue #143): plan the edit with
+/// [`crate::config_edit::plan`] — which refuses, naming every problem and
+/// writing nothing, an edit whose result would not load — then replace the
+/// file atomically. `--dry-run` plans (and so refuses) exactly as the real
+/// run does, and writes nothing.
+pub fn run_edit(
+    paths: &TapectlPaths,
+    command: &ConfigCommands,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<()> {
+    use crate::config_edit::Edit;
+    let edit = match command {
+        ConfigCommands::Set { key, value } => Edit::Set {
+            key: key.clone(),
+            value: value.clone(),
+        },
+        ConfigCommands::Add { key, values } => Edit::Add {
+            key: key.clone(),
+            values: values.clone(),
+        },
+        ConfigCommands::Remove { key, values } => Edit::Remove {
+            key: key.clone(),
+            values: values.clone(),
+        },
+        ConfigCommands::Show | ConfigCommands::Check => {
+            unreachable!("run_edit is only called for set/add/remove")
+        }
+    };
+    let file = &paths.config_file;
+    let original = std::fs::read_to_string(file)?;
+    let planned = crate::config_edit::plan(&original, file, &edit)?;
+    apply_planned(file, &original, &planned, json_output, dry_run)
+}
+
+/// Write (unless `dry_run`) and report a planned edit.
+fn apply_planned(
+    file: &std::path::Path,
+    original: &str,
+    planned: &crate::config_edit::Planned,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<()> {
+    for w in &planned.warnings {
+        eprintln!("{w}");
+    }
+    if planned.changed && !dry_run {
+        crate::config_edit::replace_file(file, original, &planned.new_text)?;
+    }
+    if json_output {
+        let mut obj = planned.json.clone();
+        obj["file"] = serde_json::json!(file.display().to_string());
+        obj["changed"] = serde_json::json!(planned.changed);
+        if dry_run {
+            obj["dry_run"] = serde_json::json!(true);
+        }
+        if !planned.remaining_problems.is_empty() {
+            obj["remaining_problems"] = serde_json::json!(planned.remaining_problems);
+        }
+        println!("{obj}");
+    } else if !planned.changed {
+        println!(
+            "no change: {} already says so ({})",
+            file.display(),
+            planned.summary
+        );
+    } else if dry_run {
+        println!(
+            "would {} in {} (DRY RUN — no changes made)",
+            planned.summary,
+            file.display()
+        );
+    } else {
+        println!("{} in {}", planned.summary, file.display());
+    }
+    if !planned.remaining_problems.is_empty() {
+        eprintln!(
+            "warning: {} still does not load — `tapectl config check` lists it all:",
+            file.display()
+        );
+        for p in &planned.remaining_problems {
+            eprintln!("  - {p}");
+        }
+    }
+    Ok(())
 }
 
 /// `config check`'s body, split out of [`run`] only for readability —

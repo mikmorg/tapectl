@@ -1,12 +1,14 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-db 1  "tapectl-db " 
+.TH tapectl-config-remove 1  "tapectl-config-remove " 
 .SH NAME
-tapectl\-db \- Database operations
+tapectl\-config\-remove \- Remove a key, an entry of a list of tables, or values from a list
 .SH SYNOPSIS
-\fBtapectl db\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+\fBtapectl config remove\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIKEY\fR> [\fIVALUES\fR] 
 .SH DESCRIPTION
-Database operations
+Remove a key, an entry of a list of tables, or values from a list
+.PP
+`config remove defaults.slice_size` removes the key, so its default applies; `config remove collections[movies]` removes that table; `config remove defaults.global_excludes \*(Aq*.bak\*(Aq` removes that value. A whole list of tables is removed one entry at a time. Checked and written as `config set` is: removing a required key is refused. On a file that already fails to load, an edit that adds no problem goes through and names the problems left, so a broken file can be repaired one key at a time.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -36,22 +38,9 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
-.SH SUBCOMMANDS
 .TP
-tapectl\-db\-backup(1)
-Back up the database, and optionally the private key directory
+<\fIKEY\fR>
+The key, table or list
 .TP
-tapectl\-db\-fsck(1)
-Check database integrity
-.TP
-tapectl\-db\-export(1)
-Export database as JSON
-.TP
-tapectl\-db\-import(1)
-Import database from backup
-.TP
-tapectl\-db\-stats(1)
-Show database statistics, and what each table weighs
-.TP
-tapectl\-db\-help(1)
-Print this message or the help of the given subcommand(s)
+[\fIVALUES\fR]
+Values to remove from a list (none: remove KEY itself); after `\-\-` when one begins with `\-`

@@ -2471,6 +2471,51 @@ repair leaves the database exactly as it was.
 Run it on a database you brought in with `db import` before you use it:
 `db import` is a raw page copy and validates no foreign keys of its own.
 
+### The journals are never pruned
+
+The catalog keeps every reading it takes of a tape, a drive and a write:
+`health_logs`, `verification_sessions` and `verification_results`, `events`,
+`cartridge_contacts`, `mam_journal`, `log_page_journal`, `st_stats_journal` and
+`phase_timings` only grow. Nothing removes their rows by age or size, and nothing
+that does is to be added (ADR-0012, 2026-10-07, item 28). They are evidence: a
+journal with rows missing looks complete and is not, and the earliest reading of
+a cartridge is the only baseline its later readings have. The session logs and
+stage reports under the home are kept the same way.
+
+Two commands do delete journal rows, and only rows the catalog can no longer
+refer to. `snapshot delete`, which deletes only a snapshot never written to tape
+(with `--force` once it is staged), takes that snapshot's own
+`verification_results` rows with the slices they point at. `db fsck --repair`
+deletes any row, in any table, whose foreign-key parent is gone.
+
+The cost is small. The largest journal is `verification_results`, one row of
+about 250 bytes per slice per full verify: a full LTO-6 at the default 1 GiB
+slice is about 2,300 slices, so one full verify of it adds about 0.6 MB, and a
+hundred cartridges verified four times a year add about 230 MB a year. A
+contact's health and chip readings are a few kilobytes. SQLite handles a
+catalog of some gigabytes without trouble; what grows with it is the time
+`db backup` takes, because it copies the whole file.
+
+`db stats` shows what each table weighs, largest first, so the growth can be
+seen rather than guessed. On a fresh home every table is a page or two of
+empty structure:
+
+```text
+$ tapectl db stats
+database: 464.0 KiB, 40 tables, 116 pages
+table sizes (measured by SQLite's dbstat: the pages each table and its indexes occupy):
+  units                           0 rows     24.0 KiB
+  cartridges                      0 rows     20.0 KiB
+  events                          3 rows     20.0 KiB
+  ...
+```
+
+The figures are measured when tapectl's SQLite has the `dbstat` table, which
+the build tapectl ships with does. Otherwise the line says `ESTIMATED` and the
+sizes are the stored values' lengths alone, without page or index overhead, so
+they read low. `--json` carries the same list as `table_sizes`, with
+`size_method` saying which (`dbstat` or `estimate`).
+
 ## Disaster Recovery
 
 Every tape is self-describing, so the database being gone costs you convenience,

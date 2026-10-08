@@ -27,6 +27,7 @@ macro_rules! eprint {
 pub mod build_info;
 pub mod cli;
 pub mod config;
+pub mod config_edit;
 pub mod crypto;
 pub mod db;
 pub mod error;

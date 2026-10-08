@@ -1,12 +1,14 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-db 1  "tapectl-db " 
+.TH tapectl-config-add 1  "tapectl-config-add " 
 .SH NAME
-tapectl\-db \- Database operations
+tapectl\-config\-add \- Add a table to a list of tables, or values to a list
 .SH SYNOPSIS
-\fBtapectl db\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+\fBtapectl config add\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIKEY\fR> <\fIVALUES\fR> 
 .SH DESCRIPTION
-Database operations
+Add a table to a list of tables, or values to a list
+.PP
+For a list of tables (`collections`, `archive_sets`, `backends.lto`) each VALUE is one `field=value` of the new table: `config add collections name=movies root=/srv/media/movies tenant=family`. Its name must not already be taken. A drive added as `backends.lto` gets the checks `backend add` makes. For a list value (`defaults.global_excludes`), each VALUE is appended. Checked and written as `config set` is.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -36,22 +38,9 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
-.SH SUBCOMMANDS
 .TP
-tapectl\-db\-backup(1)
-Back up the database, and optionally the private key directory
+<\fIKEY\fR>
+The list, e.g. collections or defaults.global_excludes
 .TP
-tapectl\-db\-fsck(1)
-Check database integrity
-.TP
-tapectl\-db\-export(1)
-Export database as JSON
-.TP
-tapectl\-db\-import(1)
-Import database from backup
-.TP
-tapectl\-db\-stats(1)
-Show database statistics, and what each table weighs
-.TP
-tapectl\-db\-help(1)
-Print this message or the help of the given subcommand(s)
+<\fIVALUES\fR>
+field=value pairs for a table, or the values to append (after `\-\-` when one begins with `\-`)

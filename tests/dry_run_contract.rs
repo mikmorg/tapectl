@@ -126,7 +126,13 @@ const TABLE: &[(&[&str], Verdict)] = &[
     (&["collection", "status"], Verdict::ReadOnly),
     (&["collection", "sync"], Verdict::Honours),
     (&["completions"], Verdict::ReadOnly),
+    // config add/remove/set (issue #143): plan the edit, refusing what the
+    // real run refuses, and write nothing — proven byte-for-byte in
+    // `tests/config_edit.rs` (`dry_run_writes_nothing`).
+    (&["config", "add"], Verdict::Honours),
     (&["config", "check"], Verdict::ReadOnly),
+    (&["config", "remove"], Verdict::Honours),
+    (&["config", "set"], Verdict::Honours),
     (&["config", "show"], Verdict::ReadOnly),
     // db: fixed by issue #247, which closed the fence issue #241 had to
     // draw around `src/cli/db.rs` while issue #233 (the `db::open` failure

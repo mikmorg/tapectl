@@ -19,6 +19,7 @@ code does.
 
 - [Where the configuration lives](#where-the-configuration-lives)
 - [Rules for the whole file](#rules-for-the-whole-file)
+- [Editing from the command line: `config set`, `add`, `remove`](#editing-from-the-command-line-config-set-add-remove)
 - [`config.toml` reference](#configtoml-reference)
   - [`[dar]`](#dar) · [`[staging]`](#staging) · [`[defaults]`](#defaults) ·
     [`[[backends.lto]]`](#backendslto) · [`[[archive_sets]]`](#archive_sets) ·
@@ -168,6 +169,60 @@ Drives are not affected. `init` writes no `lto = []` stub, and
 [`backend add`](cli/backend.md#tapectl-backend-add) appends a
 `[[backends.lto]]` block for you without disturbing your comments.
 
+## Editing from the command line: `config set`, `add`, `remove`
+
+You can edit `config.toml` by hand and run `config check` afterwards, or let tapectl
+make the edit. [`config set`](cli/config.md#tapectl-config-set),
+[`config add`](cli/config.md#tapectl-config-add) and
+[`config remove`](cli/config.md#tapectl-config-remove) change one thing in place and
+leave the rest of the file as it was, comments and blank lines included:
+
+```bash
+tapectl config set defaults.slice_size 2G
+tapectl config set host_check.max_load_per_cpu 2.5
+tapectl config add defaults.global_excludes '*.bak'
+tapectl config add collections name=movies root=/srv/media/movies tenant=family
+tapectl config set 'collections[movies].unit_depth' 2
+tapectl config remove 'collections[movies]'
+tapectl config remove defaults.slice_size
+```
+
+- **Keys** are dotted paths, spelled as `config check` prints them. A table that is
+  missing is created (`host_check` above). An entry of a list of tables
+  (`[[collections]]`, `[[archive_sets]]`, `[[backends.lto]]`) is picked by its `name`,
+  or by its position counting from 0: `collections[movies]`, `backends.lto[0]`. Quote
+  a key with brackets in it, because the shell treats brackets as a pattern.
+- **Values** are read as a TOML number, boolean or array when they look like one and
+  that is what the key takes, and as a string otherwise: `3` is a number for
+  `staging.jobs` and a string for a collection's `name`. To force a string, quote it
+  as TOML: `'"3"'`.
+- **`config add`** adds a table to a list of tables, as `field=value` pairs, or values
+  to a list such as `global_excludes`. The new table's `name` must not already be
+  taken, because names are how entries are picked. A drive added as
+  `config add backends.lto name=… device_tape=… device_sg=… generation=…` gets the
+  checks [`backend add`](cli/backend.md#tapectl-backend-add) makes, and `backend add`
+  writes through the same editor.
+- **`config remove`** removes a key, so its default applies, or one entry of a list
+  of tables, or the values you name from a list. A whole list of tables goes one
+  entry at a time. The comment lines directly above a removed key or table header
+  stay in the file, joined to whatever follows; comments inside a removed table go
+  with it.
+
+Before anything is written, the edited file is loaded the way every other command
+loads it. If it would not load, the edit is refused, every problem is listed, and
+the file is left exactly as it was. That covers an unknown or renamed key, a bad
+value and a required key removed. The file is replaced in one step, through a
+temporary file next to it, so no command ever reads it half-written. It keeps its
+permissions, and a symlinked `config.toml` is written through to its target.
+
+A file that already fails to load can be repaired one key at a time: on such a file
+an edit that adds no new problem goes through and lists the problems that are left.
+An edit that adds a problem is refused there too, and so is a `set` or `add` at or
+under an unknown key the file already has: `config remove` takes that key out, and
+nothing is written under it. Each command accepts `--dry-run`
+(shows the change, refuses what the real run would refuse, writes nothing) and
+`--json`.
+
 ## `config.toml` reference
 
 Every table is optional. A missing table, or a missing key inside one, takes the
@@ -252,7 +307,8 @@ for the drive exists. Reading a tape needs no block: given `--device`, the read
 commands open that device even when no block is configured (see below). The easy way
 to add one is
 [`backend add`](cli/backend.md#tapectl-backend-add), which validates its input and
-appends the block:
+adds the block in place, keeping the file's comments (`config add backends.lto`
+does the same, see [Editing from the command line](#editing-from-the-command-line-config-set-add-remove)):
 
 ```bash
 TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst

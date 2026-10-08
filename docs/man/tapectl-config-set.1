@@ -1,12 +1,16 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH tapectl-db 1  "tapectl-db " 
+.TH tapectl-config-set 1  "tapectl-config-set " 
 .SH NAME
-tapectl\-db \- Database operations
+tapectl\-config\-set \- Set one key in config.toml, keeping its comments and layout
 .SH SYNOPSIS
-\fBtapectl db\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
+\fBtapectl config set\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIKEY\fR> <\fIVALUE\fR> 
 .SH DESCRIPTION
-Database operations
+Set one key in config.toml, keeping its comments and layout
+.PP
+KEY is a dotted path as `config check` prints it: `defaults.slice_size`, `host_check.max_load_per_cpu`. An entry of a list of tables is selected by its name or its position from 0: `collections[movies].unit_depth`, `backends.lto[0].enospc_buffer`. A missing table is created.
+.PP
+VALUE is tried as a TOML number, boolean or array first, and as a string when that does not load; quote it as TOML (`\*(Aq"3"\*(Aq`) to force a string. The edited file is checked as every command loads it before it is written: an unknown key or a bad value is refused by name and the file is left exactly as it was. The file is replaced atomically.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -36,22 +40,9 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
-.SH SUBCOMMANDS
 .TP
-tapectl\-db\-backup(1)
-Back up the database, and optionally the private key directory
+<\fIKEY\fR>
+The key, e.g. defaults.slice_size
 .TP
-tapectl\-db\-fsck(1)
-Check database integrity
-.TP
-tapectl\-db\-export(1)
-Export database as JSON
-.TP
-tapectl\-db\-import(1)
-Import database from backup
-.TP
-tapectl\-db\-stats(1)
-Show database statistics, and what each table weighs
-.TP
-tapectl\-db\-help(1)
-Print this message or the help of the given subcommand(s)
+<\fIVALUE\fR>
+The value, e.g. 2G

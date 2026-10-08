@@ -161,16 +161,38 @@ pub fn run(
                 [],
                 |r| r.get(0),
             )?;
+            // Issue #310: the journals are never pruned (ADR-0012 2026-10-07
+            // item 28), so say what the file is made of, and whether that was
+            // measured or estimated.
+            let sizes = crate::db::stats::table_sizes(conn)?;
             if json_output {
+                let tables: Vec<_> = sizes
+                    .tables
+                    .iter()
+                    .map(|t| serde_json::json!({"name": t.name, "rows": t.rows, "bytes": t.bytes}))
+                    .collect();
                 println!(
                     "{}",
-                    serde_json::json!({"size_bytes": db_size, "tables": table_count, "pages": page_count})
+                    serde_json::json!({"size_bytes": db_size, "tables": table_count,
+                                       "pages": page_count,
+                                       "size_method": sizes.method.as_str(),
+                                       "table_sizes": tables})
                 );
             } else {
                 println!(
                     "database: {}, {table_count} tables, {page_count} pages",
                     crate::util::format_bytes_binary(db_size)
                 );
+                println!("table sizes ({}):", sizes.method.describe());
+                let width = sizes.tables.iter().map(|t| t.name.len()).max().unwrap_or(0);
+                for t in &sizes.tables {
+                    println!(
+                        "  {:<width$}  {:>10} rows  {:>11}",
+                        t.name,
+                        t.rows,
+                        crate::util::format_bytes_binary(t.bytes)
+                    );
+                }
             }
         }
     }
