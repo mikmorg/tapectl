@@ -34,7 +34,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::{CollectionConfig, Config};
-use crate::error::{Result, TapectlError};
+use crate::error::{PolicyLayer, Result, TapectlError};
 use crate::policy::coverage;
 
 use super::fingerprint::RefusedUnit;
@@ -67,20 +67,69 @@ const BLOCK_SIZE: u64 = 512 * 1024;
 /// `limit` says where `budget` came from, for the refusal of a unit too big
 /// for one tape (issues #391, #395: the refusal names the overage and the
 /// per-generation limit, ADR-0012 2026-10-06 items 16 and 17).
+///
+/// `policy_aware` (ADR-0012 2026-10-07 item 26, issue #144): order the
+/// selection so the units whose audit findings a write would resolve —
+/// [`coverage::Shortfall`], the audit's own `copy_count` and
+/// `location_presence` predicates — are packed first
+/// (`selector::plan_batches_prioritised`). A never-archived unit always
+/// falls short; a changed unit whose current version already meets its
+/// policy does not, and waits behind the ones that do. A unit whose own
+/// dotfile `[policy]` cannot be resolved for that ranking is refused, not
+/// fatal to the plan.
 fn batches_for_budget(
     conn: &Connection,
     config: &Config,
     lib: &CollectionConfig,
     budget: u64,
     limit: &str,
+    policy_aware: bool,
 ) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
-    let scan = super::fingerprint::pending_units_for_collection(
+    let mut scan = super::fingerprint::pending_units_for_collection(
         conn,
         lib,
         &config.defaults.global_excludes,
     )?;
-    let synthetic: Vec<selector::PendingUnit> = scan
-        .pending
+
+    // Ranking resolves each pending unit's policy, which the scan above
+    // never did (it reads only `[excludes]`). A unit whose OWN dotfile
+    // fails to resolve — an invalid `[policy]` value — is refused here like
+    // any other dotfile fault (ADR-0012 2026-09-22: it refuses that unit,
+    // not the collection) and left out of every batch. Only the dotfile
+    // layer: a `[defaults]` or archive-set fault is not one unit's, and
+    // still aborts the plan.
+    let mut prioritised = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(scan.pending.len());
+    for p in std::mem::take(&mut scan.pending) {
+        if policy_aware {
+            match coverage::unit_shortfall(conn, config, &p.unit) {
+                Ok(short) => {
+                    if short.any() {
+                        prioritised.insert(p.unit.name.clone());
+                    }
+                }
+                Err(
+                    e @ TapectlError::PolicyUnresolvable {
+                        layer: PolicyLayer::Dotfile,
+                        ..
+                    },
+                ) => {
+                    scan.refused.push(RefusedUnit {
+                        unit_name: p.unit.name.clone(),
+                        path: std::path::Path::new(p.unit.current_path.as_deref().unwrap_or(""))
+                            .join(".tapectl-unit.toml")
+                            .display()
+                            .to_string(),
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        kept.push(p);
+    }
+    let synthetic: Vec<selector::PendingUnit> = kept
         .iter()
         .map(|p| selector::PendingUnit {
             name: p.unit.name.clone(),
@@ -88,7 +137,12 @@ fn batches_for_budget(
         })
         .collect();
 
-    let batches = selector::plan_batches(synthetic, budget, BLOCK_SIZE).map_err(|oversized| {
+    let planned = if policy_aware {
+        selector::plan_batches_prioritised(synthetic, &prioritised, budget, BLOCK_SIZE)
+    } else {
+        selector::plan_batches(synthetic, budget, BLOCK_SIZE)
+    };
+    let batches = planned.map_err(|oversized| {
         TapectlError::Other(format!(
             "collection \"{}\": {} unit(s) exceed the per-tape budget and can never be \
              batched (a unit is never split across tapes; ADR-0012): {}. The limit: {limit}. \
@@ -124,6 +178,8 @@ pub fn plan_for_collection(
     // errored outright the moment a second drive was configured rather than
     // asking which one was meant.
     device: Option<&str>,
+    // `--policy-aware` (issue #144): see `batches_for_budget`.
+    policy_aware: bool,
 ) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
     let backend = crate::config::resolve_lto_backend(config, device)?;
     // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
@@ -134,7 +190,14 @@ pub fn plan_for_collection(
     // one value, so the refusal names the figures the packing used.
     let tape = backend.planning_tape_budget(media)?;
 
-    batches_for_budget(conn, config, lib, tape.bytes, &tape.describe())
+    batches_for_budget(
+        conn,
+        config,
+        lib,
+        tape.bytes,
+        &tape.describe(),
+        policy_aware,
+    )
 }
 
 /// `collection run`'s per-tape budget (issue #175): resolved from the
@@ -166,6 +229,11 @@ pub struct DestinationBudget {
     /// What is already staged and will ride along (issue #232 item 1),
     /// subtracted.
     pub already_staged_bytes: u64,
+    /// Copy-distinctness warnings (issue #144): a destination at a location
+    /// where a stage set riding along already has a copy, one rendered
+    /// [`coverage::Distinctness::warning`] per such label. Advisory
+    /// (ADR-0004): `volume write` names them again when it writes.
+    pub warnings: Vec<String>,
 }
 
 impl DestinationBudget {
@@ -227,6 +295,23 @@ fn already_staged_on_tape_bytes(conn: &Connection) -> Result<u64> {
         .map(|bytes| pad_to_blocks(bytes.max(0) as u64, BLOCK_SIZE))
         .sum();
     Ok(total)
+}
+
+/// The stage sets already staged that `volume write` will take along with
+/// this run's batch: the selection [`already_staged_on_tape_bytes`] sizes
+/// (a `'staged'` set with a slice still on disk).
+fn riding_stage_set_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT ss.id
+         FROM stage_sets ss
+         JOIN stage_slices sl ON sl.stage_set_id = ss.id
+         WHERE ss.status = 'staged' AND sl.staging_path IS NOT NULL
+         ORDER BY ss.id",
+    )?;
+    let ids = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    Ok(ids)
 }
 
 /// Resolve `collection run`'s budget from the destination volumes' own
@@ -306,6 +391,8 @@ pub fn destination_budget(
         ));
     }
 
+    let riding = riding_stage_set_ids(conn)?;
+    let mut warnings = Vec::new();
     let mut smallest: Option<(String, i64)> = None;
     for label in labels {
         let (volume_id, status, observed_condition, capacity_bytes): (i64, String, String, i64) =
@@ -341,6 +428,20 @@ pub fn destination_budget(
                 label: label.clone(),
             });
         }
+        // Copy distinctness (ADR-0012 2026-10-07 item 26, issue #144), the
+        // check `volume_write` makes at its plan time, made here against the
+        // stage sets that are already staged and will ride along — the
+        // retained sets of a batch awaiting its next copy — so a destination
+        // on the cartridge holding their copy is refused before this run
+        // stages anything. The batch's own units are not staged yet; their
+        // versions are checked when `volume_write` plans. As there, the
+        // cartridge half only fires on an inconsistent catalog: binding the
+        // destination erased any copy on its cartridge at `volume init`.
+        let distinct = coverage::copy_distinctness(conn, volume_id, &riding)?;
+        if let Some(refusal) = distinct.refusal(label) {
+            return Err(TapectlError::Other(refusal));
+        }
+        warnings.extend(distinct.warning(label));
 
         let replace = match &smallest {
             None => true,
@@ -380,6 +481,7 @@ pub fn destination_budget(
         fill_ceiling: backend.fill_ceiling,
         reserve_bytes: enospc_buffer,
         already_staged_bytes: already_staged,
+        warnings,
     })
 }
 
@@ -410,6 +512,8 @@ pub fn plan_for_run(
     lib: &CollectionConfig,
     device: &str,
     labels: &[String],
+    // `--policy-aware` (issue #144): see `batches_for_budget`.
+    policy_aware: bool,
 ) -> Result<(Vec<Batch>, DestinationBudget, Vec<RefusedUnit>)> {
     if labels.len() > 1 {
         return Err(TapectlError::Other(format!(
@@ -425,8 +529,14 @@ pub fn plan_for_run(
         )));
     }
     let budget = destination_budget(conn, config, device, labels)?;
-    let (batches, refused) =
-        batches_for_budget(conn, config, lib, budget.bytes, &budget.describe())?;
+    let (batches, refused) = batches_for_budget(
+        conn,
+        config,
+        lib,
+        budget.bytes,
+        &budget.describe(),
+        policy_aware,
+    )?;
     Ok((batches, budget, refused))
 }
 
@@ -480,13 +590,122 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None).unwrap();
+        let (batches, refused) =
+            plan_for_collection(&conn, &config, &lib, None, None, false).unwrap();
         assert!(refused.is_empty());
         assert_eq!(batches.len(), 1, "two 3 MiB units must fit one 10 MiB tape");
         assert_eq!(
             batches[0].unit_names(),
             vec!["testlib/alpha", "testlib/beta"]
         );
+    }
+
+    /// Issue #144 (ADR-0012 2026-10-07 item 26): `--policy-aware` packs the
+    /// units a write would help first. `alpha` changed on disk but its
+    /// current version already has two eligible copies (the default
+    /// `min_copies`); `beta` was never archived. One unit fits a tape, so
+    /// the batch ORDER is the assertion: alphabetical puts `alpha` first,
+    /// policy-aware puts `beta` first — and both `collection plan` and
+    /// `collection run` order the same way.
+    #[test]
+    fn policy_aware_packs_the_units_with_findings_first() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        }
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
+
+        // `alpha`: a current version (with no files recorded, so the disk
+        // reads as changed) on two sealed volumes.
+        let alpha: i64 = conn
+            .query_row(
+                "SELECT id FROM units WHERE name = 'testlib/alpha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/src')",
+            params![alpha],
+        )
+        .unwrap();
+        let snap = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'cleaned', 524288)",
+            params![snap],
+        )
+        .unwrap();
+        let ss = conn.last_insert_rowid();
+        for label in ["S1", "S2"] {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+                 VALUES (?1, 'lto', 'p', 1, 'sealed')",
+                params![label],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![ss, snap, conn.last_insert_rowid()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('L1', 'lto', 'p', 4000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+
+        let mut config = config_with_tiny_backend();
+        config.backends.lto[0].capacity_override = Some("4M".into());
+        let order = |batches: &[Batch]| -> Vec<Vec<String>> {
+            batches
+                .iter()
+                .map(|b| b.unit_names().iter().map(|n| n.to_string()).collect())
+                .collect()
+        };
+        let alphabetical = vec![
+            vec!["testlib/alpha".to_string()],
+            vec!["testlib/beta".into()],
+        ];
+        let policy_first = vec![
+            vec!["testlib/beta".to_string()],
+            vec!["testlib/alpha".into()],
+        ];
+
+        let (plain, _) = plan_for_collection(&conn, &config, &lib, None, None, false).unwrap();
+        assert_eq!(order(&plain), alphabetical);
+        let (aware, _) = plan_for_collection(&conn, &config, &lib, None, None, true).unwrap();
+        assert_eq!(order(&aware), policy_first);
+
+        let label = ["L1".to_string()];
+        let (run_plain, _, _) =
+            plan_for_run(&conn, &config, &lib, "/dev/null", &label, false).unwrap();
+        assert_eq!(order(&run_plain), alphabetical);
+        let (run_aware, _, _) =
+            plan_for_run(&conn, &config, &lib, "/dev/null", &label, true).unwrap();
+        assert_eq!(order(&run_aware), policy_first);
     }
 
     /// Issues #391 and #395 (ADR-0012 2026-10-06 items 16 and 17): a unit
@@ -524,7 +743,7 @@ mod tests {
 
         let mut config = config_with_tiny_backend();
         config.backends.lto[0].fill_ceiling = 0.9;
-        let msg = plan_for_collection(&conn, &config, &lib, None, None)
+        let msg = plan_for_collection(&conn, &config, &lib, None, None, false)
             .unwrap_err()
             .to_string();
         // 10,000,000 x 0.9 = 9,000,000; the unit pads to 9,437,184.
@@ -548,6 +767,7 @@ mod tests {
             &lib,
             None,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(batches.len(), 1);
@@ -600,15 +820,15 @@ mod tests {
 
         // Without a device, two drives is an error asking for one — not a
         // silent pick.
-        let err = plan_for_collection(&conn, &config, &lib, None, None).unwrap_err();
+        let err = plan_for_collection(&conn, &config, &lib, None, None, false).unwrap_err();
         assert!(err.to_string().contains("--device"), "{err}");
 
         let (big, _refused) =
-            plan_for_collection(&conn, &config, &lib, None, Some("/dev/null")).unwrap();
+            plan_for_collection(&conn, &config, &lib, None, Some("/dev/null"), false).unwrap();
         assert_eq!(big.len(), 1, "10 MiB tape holds both 3 MiB units");
 
         let (small, _refused) =
-            plan_for_collection(&conn, &config, &lib, None, Some("/dev/zero")).unwrap();
+            plan_for_collection(&conn, &config, &lib, None, Some("/dev/zero"), false).unwrap();
         assert_eq!(small.len(), 2, "4 MiB tape cannot hold both 3 MiB units");
     }
 
@@ -655,8 +875,15 @@ mod tests {
 
         let config = config_with_tiny_backend();
 
-        let (volume_batches, _budget, _refused) =
-            plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap();
+        let (volume_batches, _budget, _refused) = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1".to_string()],
+            false,
+        )
+        .unwrap();
         assert_eq!(
             volume_batches.len(),
             2,
@@ -664,7 +891,7 @@ mod tests {
         );
 
         let (generation_batches, _refused) =
-            plan_for_collection(&conn, &config, &lib, None, None).unwrap();
+            plan_for_collection(&conn, &config, &lib, None, None, false).unwrap();
         assert_eq!(
             generation_batches.len(),
             1,
@@ -739,7 +966,7 @@ mod tests {
         assert_eq!(budget.num_destinations, 2);
 
         let (batches, refused) =
-            batches_for_budget(&conn, &config, &lib, budget.bytes, "test").unwrap();
+            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", false).unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -800,6 +1027,7 @@ mod tests {
             &lib,
             "/dev/null",
             &["nonexistent".to_string()],
+            false,
         )
         .unwrap_err();
         assert!(
@@ -882,8 +1110,15 @@ mod tests {
                 .unwrap();
 
             let config = config_with_tiny_backend();
-            let err =
-                plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap_err();
+            let err = plan_for_run(
+                &conn,
+                &config,
+                &lib,
+                "/dev/null",
+                &["L1".to_string()],
+                false,
+            )
+            .unwrap_err();
 
             match &err {
                 TapectlError::VolumeNotWriteTarget {
@@ -957,7 +1192,15 @@ mod tests {
             .unwrap();
 
         let config = config_with_tiny_backend();
-        let err = plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap_err();
+        let err = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1".to_string()],
+            false,
+        )
+        .unwrap_err();
 
         match &err {
             TapectlError::VolumeQuarantined { label } => {
@@ -1064,6 +1307,7 @@ mod tests {
             &lib,
             "/dev/null",
             &["L1-REBUILT".to_string()],
+            false,
         )
         .unwrap_err();
 
@@ -1081,6 +1325,137 @@ mod tests {
             before, after,
             "a recorded-write label must fail before staging ever touches snapshots"
         );
+    }
+
+    /// A retained stage set (`unit_id`'s version 1, already written once to
+    /// the sealed `L1-COPY` at `home`, on cartridge `BC1`) and an initialised
+    /// destination `L1-DEST` on cartridge `dest_cart` at `dest_location`:
+    /// the state between a batch's first and second copy.
+    fn retained_copy_fixture(dest_cart: &str, dest_location: &str) -> Connection {
+        let conn = db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 'media', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (1, 'u-old', 'old', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (1, 1, 1, 'current', '/tmp', 1, 10);
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size) VALUES (1, 1, 'staged', 524288);
+             INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path)
+                 VALUES (1, 1, 10, 10, 'a', 'b', '/nonexistent/s1');
+             INSERT INTO locations (id, name, kind) VALUES (1, 'home', 'shelf'), (2, 'offsite', 'shelf');
+             INSERT INTO cartridges (id, barcode, media_type, nominal_capacity)
+                 VALUES (1, 'BC1', 'LTO-8', 10485760), (2, 'BC2', 'LTO-8', 10485760);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status, location_id)
+             VALUES (1, 'L1-COPY', 'lto', 'p', ?1, 'sealed', 1),
+                    (2, 'L1-DEST', 'lto', 'p', ?1, 'initialized',
+                     (SELECT id FROM locations WHERE name = ?2))",
+            params![10 * 1024 * 1024_i64, dest_location],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (1, 1, 1, 'completed');
+             INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (1, 1);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id)
+             VALUES ((SELECT id FROM cartridges WHERE barcode = ?1), 2)",
+            [dest_cart],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// An empty collection to plan against: the retained stage set is what
+    /// rides along.
+    fn empty_collection() -> (CollectionConfig, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        (lib, root)
+    }
+
+    /// Issue #144 (ADR-0012 2026-10-07 item 26): `collection run` refuses,
+    /// before staging anything, a destination on the cartridge that already
+    /// holds a copy of a stage set that would ride along to it — two copies
+    /// on one cartridge are one copy. The same predicate `volume write`
+    /// applies (`coverage::copy_distinctness`), so this is never stricter.
+    ///
+    /// The fixture's raw INSERTs leave two open mounts on one cartridge with
+    /// the copy still sealed, a state no tapectl path produces (binding
+    /// erases the volumes it displaces, pinned by
+    /// `coverage::tests::binding_a_destination_onto_the_copys_cartridge_erases_the_copy_first`).
+    /// This pins the guard against an inconsistent catalog.
+    #[test]
+    fn run_refuses_a_destination_on_the_cartridge_holding_a_riding_copy() {
+        let conn = retained_copy_fixture("BC1", "offsite");
+        let (lib, _root) = empty_collection();
+        let err = plan_for_run(
+            &conn,
+            &config_with_tiny_backend(),
+            &lib,
+            "/dev/null",
+            &["L1-DEST".to_string()],
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cartridge \"BC1\"")
+                && msg.contains("old v1 (volume \"L1-COPY\")")
+                && msg.contains("one copy, not two"),
+            "{msg}"
+        );
+    }
+
+    /// A destination on its own cartridge at the location the riding copy
+    /// is already at plans normally and carries the warning naming it; one
+    /// at another location carries none.
+    #[test]
+    fn run_warns_of_a_destination_sharing_a_riding_copys_location() {
+        let conn = retained_copy_fixture("BC2", "home");
+        let (lib, _root) = empty_collection();
+        let config = config_with_tiny_backend();
+        let (_, budget, _) = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1-DEST".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(budget.warnings.len(), 1, "{:?}", budget.warnings);
+        assert!(
+            budget.warnings[0].contains("location \"home\"")
+                && budget.warnings[0].contains("old v1 (volume \"L1-COPY\")"),
+            "{:?}",
+            budget.warnings
+        );
+
+        let conn = retained_copy_fixture("BC2", "offsite");
+        let (_, budget, _) = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1-DEST".to_string()],
+            false,
+        )
+        .unwrap();
+        assert!(budget.warnings.is_empty(), "{:?}", budget.warnings);
     }
 
     /// Issue #224: the negative-space check for the fix above -- a label
@@ -1120,8 +1495,15 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let (batches, budget, refused) =
-            plan_for_run(&conn, &config, &lib, "/dev/null", &["L1".to_string()]).unwrap();
+        let (batches, budget, refused) = plan_for_run(
+            &conn,
+            &config,
+            &lib,
+            "/dev/null",
+            &["L1".to_string()],
+            false,
+        )
+        .unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -1160,7 +1542,7 @@ mod tests {
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
 
         let config = config_with_tiny_backend();
-        let err = plan_for_collection(&conn, &config, &lib, None, None).unwrap_err();
+        let err = plan_for_collection(&conn, &config, &lib, None, None, false).unwrap_err();
         assert!(
             err.to_string().contains("testlib/huge"),
             "error must name the offending unit: {err}"
@@ -1222,6 +1604,7 @@ mod tests {
             &lib,
             "/dev/null",
             &["L1".to_string(), "L2".to_string()],
+            false,
         )
         .unwrap_err();
 
@@ -1342,7 +1725,7 @@ mod tests {
         );
 
         let (batches, refused) =
-            batches_for_budget(&conn, &config, &lib, budget.bytes, "test").unwrap();
+            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", false).unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -1401,6 +1784,7 @@ mod tests {
             &lib,
             "/dev/null",
             &["L1".to_string(), "L1".to_string()],
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("volume write"), "{err}");
@@ -1493,7 +1877,7 @@ pattern = ["*.tmp"]
         };
 
         let config = config_with_tiny_backend();
-        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None)
+        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None, false)
             .expect("a per-unit dotfile fault must not abort `collection plan`'s own scan");
 
         assert_eq!(refused.len(), 1, "exactly one unit must be refused");
@@ -1524,5 +1908,103 @@ pattern = ["*.tmp"]
             "alpha and gamma must still be planned, got {planned_names:?}"
         );
         assert!(!planned_names.iter().any(|n| n == "testlib/beta"));
+    }
+
+    /// Issue #144 review: `--policy-aware` resolves every pending unit's
+    /// policy to rank it, and an invalid `[policy]` value in one unit's
+    /// dotfile (here a `compression` outside the closed set — the pending
+    /// scan lets it through, since it reads only `[excludes]`) used to abort
+    /// the whole plan. ADR-0012's 2026-09-22 ruling: a unit dotfile fault
+    /// refuses that unit, not the collection — so it is refused, named with
+    /// its dotfile, left out of every batch, and the other unit is planned,
+    /// on both `collection plan` and `collection run`'s planners.
+    #[test]
+    fn policy_aware_refuses_a_unit_whose_dotfile_policy_is_unresolvable() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id: i64 = conn
+            .query_row("SELECT id FROM tenants WHERE name = 'media'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        for name in ["alpha", "beta"] {
+            let dir = root_path.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; 1024]).unwrap();
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                 VALUES (?1, ?2, ?3, ?4, 'active')",
+                params![
+                    format!("u-{name}"),
+                    format!("testlib/{name}"),
+                    tenant_id,
+                    dir.to_string_lossy().to_string()
+                ],
+            )
+            .unwrap();
+        }
+        let beta_dotfile = root_path.join("beta/.tapectl-unit.toml");
+        std::fs::write(
+            &beta_dotfile,
+            r#"
+[unit]
+uuid = "u-beta"
+name = "testlib/beta"
+created = "2026-01-01T00:00:00Z"
+tenant = "media"
+
+[policy]
+compression = "bogus"
+"#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES ('L1', 'lto', 'p', 4000000, 'initialized')",
+            [],
+        )
+        .unwrap();
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root_path.to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let config = config_with_tiny_backend();
+
+        let check = |batches: &[Batch], refused: &[RefusedUnit]| {
+            assert_eq!(refused.len(), 1, "exactly one unit refused: {refused:?}");
+            assert_eq!(refused[0].unit_name, "testlib/beta");
+            assert_eq!(
+                refused[0].path,
+                beta_dotfile.to_string_lossy().to_string(),
+                "must name the dotfile's own path"
+            );
+            assert!(
+                refused[0].reason.contains("compression"),
+                "the reason must carry the policy error: {}",
+                refused[0].reason
+            );
+            let planned: Vec<&str> = batches.iter().flat_map(|b| b.unit_names()).collect();
+            assert_eq!(planned, ["testlib/alpha"], "alpha batched, beta never");
+        };
+
+        let (batches, refused) = plan_for_collection(&conn, &config, &lib, None, None, true)
+            .expect("one unit's [policy] fault must not abort `collection plan --policy-aware`");
+        check(&batches, &refused);
+
+        let label = ["L1".to_string()];
+        let (batches, _, refused) = plan_for_run(&conn, &config, &lib, "/dev/null", &label, true)
+            .expect("one unit's [policy] fault must not abort `collection run --policy-aware`");
+        check(&batches, &refused);
     }
 }

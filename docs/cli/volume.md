@@ -245,6 +245,7 @@ tapectl volume plan [OPTIONS]
 - `--generation <GENERATION>` — Estimate against this media generation rather than the drive's own (ADR-0010) — e.g. counting LTO-5 cartridges for an LTO-6 drive. No cartridge need be loaded; this is an estimate, and the authoritative figure is each volume's own `capacity_bytes` once `volume init` has detected the medium it is actually on
 - `--device <DEVICE>` — Which configured drive to plan against, by its device path. Only needed when more than one `[[backends.lto]]` is configured — without it, planning errored outright on a multi-drive config rather than asking
 - `--fill-ceiling <FILL_CEILING>` — Estimate at this fill ceiling instead of the drive's `fill_ceiling` (default 97%): `0.99` or `99%`
+- `--policy-aware` — List first the staged units a write would help: those whose audit finds too few copies or a required location with no copy, each with what it falls short of. `volume write` writes every staged set either way; this orders the listing only
 
 ### tapectl volume compact-finish
 

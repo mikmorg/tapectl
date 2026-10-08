@@ -1173,6 +1173,33 @@ fn volume_write_contacted<'c>(
     // comment for why this is stderr and why it changes no selection logic.
     announce_staged_selection(label, &units);
 
+    // Copy distinctness at plan time (ADR-0012 2026-10-07 item 26, issue
+    // #144), from the catalog alone, before a backend, the MAM or the drive
+    // is touched: a version already copied to this volume's cartridge is
+    // refused (one cartridge is one copy, not two); one already at this
+    // volume's location is named in a warning and written (ADR-0004). The
+    // cartridge half only ever fires on an inconsistent catalog: binding
+    // this volume to a cartridge erased any copy on it at `volume init`
+    // (ADR-0010 displacement, `Distinctness::same_cartridge`).
+    // Every write path inherits it — `collection run`, `quick-archive` and
+    // `volume compact-write` reach the tape only through here.
+    //
+    // The stage sets this write will put on tape, taken straight from
+    // `find_staged_data`'s single selection above — the one place the write
+    // path decides what it writes. Used here and twice below (the escrow-
+    // recorded-recipient check inside `assemble_session_keys`, issue #115,
+    // and the filtered catalog snapshot, issue #83); deriving it once is
+    // deliberate, because two selections that can drift is exactly how
+    // issue #96 happened.
+    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+    let distinct = coverage::copy_distinctness(conn, volume_id, &stage_set_ids)?;
+    if let Some(refusal) = distinct.refusal(label) {
+        return Err(TapectlError::Other(refusal));
+    }
+    if let Some(warning) = distinct.warning(label) {
+        eprintln!("{warning}");
+    }
+
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
     // ADR-0010 decision 3: capacity was decided ONCE, at `volume init`, from
     // the generation of the medium actually loaded — config is never
@@ -1191,14 +1218,6 @@ fn volume_write_contacted<'c>(
     let mut distinct_tenant_ids: Vec<i64> = units.iter().map(|u| u.tenant_id).collect();
     distinct_tenant_ids.sort_unstable();
     distinct_tenant_ids.dedup();
-    // The stage sets this write will put on tape, taken straight from
-    // `find_staged_data`'s single selection above — the one place the write
-    // path decides what it writes. Used twice below (the escrow-recorded-
-    // recipient check inside `assemble_session_keys`, issue #115, and the
-    // filtered catalog snapshot, issue #83); deriving it once is deliberate,
-    // because two selections that can drift is exactly how issue #96
-    // happened.
-    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let session = assemble_session_keys(conn, &distinct_tenant_ids, &stage_set_ids)?;
 
     // An empty drive is refused here, at once, by name (issue #355) — after
@@ -10376,6 +10395,78 @@ mod tests {
             writes, 0,
             "a write refused this early must still plan nothing"
         );
+    }
+
+    /// Issue #144 (ADR-0012 2026-10-07 item 26): a write whose destination
+    /// is on the cartridge already holding a copy of a version it would
+    /// write is refused at plan time — one cartridge is one copy, not two —
+    /// from the catalog alone, before a backend, the MAM or the drive is
+    /// touched (no backend is configured here, so getting past the check
+    /// would fail at backend resolution instead).
+    ///
+    /// The fixture's two open mounts on one cartridge, the copy still
+    /// sealed, are a state no tapectl path produces: every binding erases
+    /// the volumes it displaces (`binding::mount_and_record`, pinned by
+    /// `coverage::tests::binding_a_destination_onto_the_copys_cartridge_erases_the_copy_first`).
+    /// This pins the guard against an inconsistent catalog.
+    #[test]
+    fn volume_write_refuses_a_second_copy_on_the_copys_own_cartridge() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 't1', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (1, 'u-photos', 'photos', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (1, 1, 1, 'current', '/tmp', 1, 10);
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size) VALUES (1, 1, 'staged', 524288);
+             INSERT INTO volumes (id, label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES (1, 'L6-COPY1', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed'),
+                        (2, 'L6-COPY2', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized');
+             INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status) VALUES (1, 1, 1, 'completed');
+             INSERT INTO cartridges (id, barcode, media_type, nominal_capacity)
+                 VALUES (1, 'BC1', 'LTO-6', 2500000000000);
+             INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (1, 1), (1, 2);",
+        )
+        .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let slice = tmp.path().join("x.dar.age");
+        std::fs::write(&slice, b"0123456789").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+             VALUES (1, 1, 10, 10, 'a', 'b', ?1)",
+            params![slice.to_string_lossy()],
+        )
+        .unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("home"));
+
+        let err = volume_write(
+            &conn,
+            &paths,
+            &Config::default(),
+            "L6-COPY2",
+            "/nonexistent/tapectl-distinct-test-nst",
+            512 * 1024,
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
+        .expect_err("a second copy on one cartridge must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cartridge \"BC1\"")
+                && msg.contains("photos v1 (volume \"L6-COPY1\")")
+                && msg.contains("one copy, not two"),
+            "expected the distinctness refusal, got: {msg}"
+        );
+        let writes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM writes WHERE volume_id = 2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(writes, 0, "a refused write plans nothing");
     }
 
     /// ADR-0012 (issue #161, amended 2026-09-17 for issue #242): `volume

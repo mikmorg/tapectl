@@ -1,7 +1,7 @@
 //! `collection status` (`docs/design/v2-open-questions.md` §11): pending /
 //! dirty / missing / under-copied counts.
 
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 
 use crate::config::{CollectionConfig, Config};
 use crate::error::Result;
@@ -75,15 +75,11 @@ pub fn status_for_collection(
         // missing volumes as live copies (the #89 defect, missed here),
         // and it could not see warehouse deposits (ADR-0006). Both are
         // compared against the same `resolved.min_copies` the audit
-        // check uses, so the two surfaces have to agree.
-        let sql = format!(
-            "SELECT {}",
-            crate::policy::coverage::copy_count_expr(
-                &crate::policy::coverage::CoverageQuery::current_unit("?1")
-            )
-        );
-        let copy_count: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
-        if copy_count < resolved.min_copies {
+        // check uses, so the two surfaces have to agree. Since issue #144
+        // the comparison itself is `coverage::shortfall`'s, the one
+        // `--policy-aware` orders by.
+        let per_name = crate::policy::coverage::copies_per_named_location(config, &unit.status);
+        if crate::policy::coverage::shortfall(conn, unit.id, &resolved, per_name)?.under_copied() {
             status.under_copied += 1;
         }
     }

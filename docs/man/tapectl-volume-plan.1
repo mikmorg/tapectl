@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-plan \- Show bin\-packing plan for pending staged data
 .SH SYNOPSIS
-\fBtapectl volume plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-generation\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl volume plan\fR [\fB\-\-copies\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-generation\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-policy\-aware\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Show bin\-packing plan for pending staged data
 .SH OPTIONS
@@ -32,6 +32,9 @@ Estimate at this fill ceiling instead of the drive\*(Aqs `fill_ceiling` (default
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-\-policy\-aware\fR
+List first the staged units a write would help: those whose audit finds too few copies or a required location with no copy, each with what it falls short of. `volume write` writes every staged set either way; this orders the listing only
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept

@@ -111,7 +111,40 @@ pub fn plan_batches(
     block_size: u64,
 ) -> Result<Vec<Batch>, Vec<OversizedUnit>> {
     units.sort_by(|a, b| a.name.cmp(&b.name));
+    first_fit(units, budget_bytes, block_size)
+}
 
+/// `--policy-aware` (ADR-0012, 2026-10-07 item 26; issue #144): the same
+/// first-fit as [`plan_batches`], over a different order. The units named
+/// in `prioritised` — the caller's set of units whose audit findings a
+/// write would resolve (too few copies, a required location with no copy:
+/// `policy::coverage::shortfall`) — are placed first, in name order, and
+/// every other unit after them, in name order.
+///
+/// This deliberately gives up the §7 "tape spine" across the two groups
+/// (tape 9 is no longer simply M-P): the operator who asks for it has
+/// said that getting the unprotected units onto tape first matters more
+/// than the alphabetical shelf. Within each group the spine holds. Without
+/// the flag nothing calls this, and [`plan_batches`]' order is unchanged.
+pub fn plan_batches_prioritised(
+    mut units: Vec<PendingUnit>,
+    prioritised: &std::collections::HashSet<String>,
+    budget_bytes: u64,
+    block_size: u64,
+) -> Result<Vec<Batch>, Vec<OversizedUnit>> {
+    units.sort_by(|a, b| {
+        (!prioritised.contains(&a.name), &a.name).cmp(&(!prioritised.contains(&b.name), &b.name))
+    });
+    first_fit(units, budget_bytes, block_size)
+}
+
+/// The oversized refusal and the greedy fill, over `units` in the order
+/// given — the one implementation both orders share.
+fn first_fit(
+    units: Vec<PendingUnit>,
+    budget_bytes: u64,
+    block_size: u64,
+) -> Result<Vec<Batch>, Vec<OversizedUnit>> {
     let oversized: Vec<OversizedUnit> = units
         .iter()
         .filter_map(|u| {
@@ -240,6 +273,32 @@ mod tests {
         let units = vec![unit("only", 999)];
         let result = plan_batches(units, 10, 1);
         assert!(result.is_err());
+    }
+
+    /// Issue #144 (ADR-0012 2026-10-07 item 26): the prioritised units are
+    /// placed first, each group in name order, and first-fit runs over that
+    /// order — so the prioritised units fill the first batch.
+    #[test]
+    fn prioritised_units_go_first_each_group_in_name_order() {
+        let units = vec![
+            unit("a", 4),
+            unit("b", 4),
+            unit("c", 4),
+            unit("d", 4),
+            unit("e", 4),
+        ];
+        let first: std::collections::HashSet<String> =
+            ["d".to_string(), "b".to_string()].into_iter().collect();
+        let batches = plan_batches_prioritised(units.clone(), &first, 10, 1).unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.unit_names()).collect::<Vec<_>>(),
+            vec![vec!["b", "d"], vec!["a", "c"], vec!["e"]],
+        );
+        // Nothing prioritised: exactly the alphabetical plan.
+        assert_eq!(
+            plan_batches_prioritised(units.clone(), &Default::default(), 10, 1).unwrap(),
+            plan_batches(units, 10, 1).unwrap(),
+        );
     }
 
     #[test]
