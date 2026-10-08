@@ -25,6 +25,34 @@ use crate::staging::clean::CleanReport;
 
 use super::selector::Batch;
 
+/// Which copies of a `collection run` its confirm reads back in full
+/// (ADR-0012 2026-10-07 item 31). The default confirm is quick (the front
+/// index and the seal), and a run releases staging right after its confirms
+/// (item 2), so a full readback is the operator's choice here, per run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunConfirm {
+    /// No flag: every copy gets the quick confirm.
+    #[default]
+    Quick,
+    /// `--full-confirm`: every copy is read back in full.
+    FullEvery,
+    /// `--full-confirm-first`: the run's first copy is read back in full,
+    /// the others confirmed quickly — the one-copy readback item 2
+    /// recommends when the data matters.
+    FullFirst,
+}
+
+impl RunConfirm {
+    /// Whether copy `index` (0 = the run's first) gets the full readback.
+    pub fn full_for_copy(self, index: usize) -> bool {
+        match self {
+            RunConfirm::Quick => false,
+            RunConfirm::FullEvery => true,
+            RunConfirm::FullFirst => index == 0,
+        }
+    }
+}
+
 /// One batch unit's copy count against its own resolved `min_copies`,
 /// computed AFTER this call's write(s) landed. Only populated when release
 /// did NOT happen (see [`BatchExecutionReport::cleaned`]).
@@ -53,6 +81,12 @@ pub struct BatchExecutionReport {
     /// Non-empty exactly when `cleaned` is `None`: which units are still
     /// short, and by how much.
     pub under_copied: Vec<CopyProgress>,
+    /// `Some` when releasing staging failed after every copy was sealed and
+    /// confirmed (a catalog error): the warning naming the unfinished step
+    /// and `tapectl staging clean`, which finishes it. The copies stand, so
+    /// the run exits as if the release had been retained (ADR-0012
+    /// 2026-10-07 item 33); `cleaned` is `None` and `under_copied` empty.
+    pub release_warning: Option<String>,
 }
 
 /// Execute one batch: stage every unit once, write one session per
@@ -122,8 +156,9 @@ pub struct BatchExecutionReport {
 ///
 /// `prewrite_hash` is `collection run --prewrite-hash`, handed to every
 /// copy's `volume_write` (ADR-0012, 2026-09-30 later amendment), and
-/// `full_confirm` is `collection run --full-confirm`, likewise (ADR-0012,
-/// 2026-10-06 item 1).
+/// `confirm` is `collection run --full-confirm` / `--full-confirm-first`,
+/// asked per copy ([`RunConfirm::full_for_copy`]; ADR-0012, 2026-10-06 item
+/// 1 and 2026-10-07 item 31).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_batch(
     conn: &Connection,
@@ -134,7 +169,7 @@ pub fn execute_batch(
     device: &str,
     block_size: usize,
     prewrite_hash: bool,
-    full_confirm: bool,
+    confirm: RunConfirm,
     assume_yes: bool,
 ) -> Result<BatchExecutionReport> {
     if batch.units.is_empty() {
@@ -253,7 +288,7 @@ pub fn execute_batch(
     // doc comment) — a contact-check refusal here means the wrong physical
     // cartridge got loaded for this batch, which must hard-refuse, not
     // silently override (issue #27).
-    for label in copy_labels {
+    for (copy, label) in copy_labels.iter().enumerate() {
         crate::volume::write::volume_write(
             conn,
             paths,
@@ -264,7 +299,7 @@ pub fn execute_batch(
             false,
             false,
             prewrite_hash,
-            full_confirm,
+            confirm.full_for_copy(copy),
             assume_yes,
         )?;
     }
@@ -272,14 +307,44 @@ pub fn execute_batch(
     // Release staging only when this batch's copy just sealed is enough —
     // see `release_if_covered`'s own doc comment for the gate and the #248
     // scoping it applies.
-    let (cleaned, under_copied) = release_if_covered(conn, config, batch)?;
+    let (cleaned, under_copied, release_warning) =
+        release_after_copies(conn, config, batch, copy_labels);
 
     Ok(BatchExecutionReport {
         units_staged,
         copies_written: copy_labels.len(),
         cleaned,
         under_copied,
+        release_warning,
     })
+}
+
+/// The release step after every copy of the batch is sealed and confirmed:
+/// [`release_if_covered`], with its failure turned into a warning instead
+/// of an error (ADR-0012 2026-10-07 item 33). The copies stand, so a
+/// catalog error here must not make `collection run` exit 2; the warning
+/// names the step and `tapectl staging clean`, which releases what this
+/// did not (it retains, per unit, whatever is still below its policy, as
+/// this release would have).
+fn release_after_copies(
+    conn: &Connection,
+    config: &Config,
+    batch: &Batch,
+    copy_labels: &[String],
+) -> (Option<CleanReport>, Vec<CopyProgress>, Option<String>) {
+    match release_if_covered(conn, config, batch) {
+        Ok((cleaned, under_copied)) => (cleaned, under_copied, None),
+        Err(e) => {
+            let volume = copy_labels.last().map(String::as_str).unwrap_or("?");
+            let warning = crate::error::unfinished_after_seal(
+                volume,
+                "releasing the batch's staging",
+                &e,
+                Some("tapectl staging clean"),
+            );
+            (None, Vec::new(), Some(warning))
+        }
+    }
 }
 
 /// The release decision for one batch, extracted out of [`execute_batch`]
@@ -404,6 +469,66 @@ fn batch_unit_ids(conn: &Connection, batch: &Batch) -> Result<Vec<i64>> {
 mod tests {
     use super::*;
     use crate::collection::selector::PendingUnit;
+
+    /// ADR-0012 2026-10-07 item 33: a catalog error releasing staging after
+    /// the copies are sealed comes back as a warning naming the step and
+    /// `tapectl staging clean`, not as an error — here the batch names a
+    /// unit the catalog does not have, so the release's first query fails.
+    #[test]
+    fn a_failed_release_after_the_copies_is_a_warning() {
+        let conn = db::open_memory().unwrap();
+        let batch = Batch {
+            units: vec![PendingUnit {
+                name: "gone".into(),
+                size_bytes: 1,
+            }],
+            total_bytes: 1,
+            padded_bytes: 1,
+        };
+        let (cleaned, under, warning) =
+            release_after_copies(&conn, &Config::default(), &batch, &["L6-0007".to_string()]);
+        assert!(cleaned.is_none() && under.is_empty());
+        let warning = warning.expect("the failure is reported as a warning");
+        assert!(
+            warning.starts_with(
+                "warning: volume \"L6-0007\" is sealed and confirmed and counts as a copy, but \
+                 releasing the batch's staging did not finish: "
+            ),
+            "{warning}"
+        );
+        assert!(warning.contains("\"gone\""), "the cause: {warning}");
+        assert!(
+            warning.ends_with("To finish it: tapectl staging clean"),
+            "{warning}"
+        );
+    }
+
+    /// ADR-0012 2026-10-07 item 31: which copies of a run get the full
+    /// readback. `--full-confirm-first` reads the first only, the one-copy
+    /// readback item 2 recommends; `--full-confirm` every one; neither, none.
+    #[test]
+    fn full_confirm_first_reads_back_only_the_first_copy() {
+        let full = |c: RunConfirm| (0..3).map(|i| c.full_for_copy(i)).collect::<Vec<_>>();
+        assert_eq!(full(RunConfirm::Quick), [false, false, false]);
+        assert_eq!(full(RunConfirm::FullEvery), [true, true, true]);
+        assert_eq!(full(RunConfirm::FullFirst), [true, false, false]);
+    }
+
+    /// The write loop asks [`RunConfirm::full_for_copy`] for each copy by
+    /// its index, rather than handing one flag to every copy.
+    #[test]
+    fn execute_batch_asks_the_confirm_choice_per_copy() {
+        const SRC: &str = include_str!("batch.rs");
+        let f = "pub fn execute_batch(";
+        let start = SRC.find(f).unwrap();
+        let end = SRC[start..].find("\n}\n").unwrap() + start;
+        let body = &SRC[start..end];
+        assert!(
+            !body[f.len()..].contains("\nfn ") && !body[f.len()..].contains("\npub fn "),
+            "body extraction overran into another function"
+        );
+        assert!(body.contains("confirm.full_for_copy(copy)"), "{body}");
+    }
     use crate::config::Config;
     use crate::db;
     use rusqlite::params;
@@ -833,10 +958,18 @@ mod tests {
             "body extraction overran into another function; fix this test's scan \
              before trusting its verdict"
         );
+        // ADR-0012 2026-10-07 item 33: the release goes through
+        // `release_after_copies`, which turns a failure into a warning, and
+        // that calls `release_if_covered`.
         assert!(
-            body.contains("release_if_covered("),
+            body.contains("release_after_copies(")
+                && SRC.contains("    match release_if_covered(conn, config, batch) {"),
             "execute_batch no longer delegates its release step to release_if_covered \
              -- the #248 scope decision must live in exactly one place (issue #284)"
+        );
+        assert!(
+            !body.contains("release_if_covered("),
+            "called past the warning path"
         );
         assert!(
             !body.contains("CleanScope::"),
@@ -974,7 +1107,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
-            false,
+            RunConfirm::Quick,
             true,
         )
         .expect_err("the sealed destination is not a write target");
@@ -1013,7 +1146,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
-            false, // --full-confirm
+            RunConfirm::Quick,
             true,
         )
         .expect_err("the sealed destination is not a write target");
@@ -1044,7 +1177,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
-            false, // --full-confirm
+            RunConfirm::Quick,
             false,
         )
         .expect_err("no terminal and no --yes: a stage that may not fit is refused");
@@ -1072,7 +1205,7 @@ mod tests {
             &device,
             512 * 1024,
             false,
-            false, // --full-confirm
+            RunConfirm::Quick,
             true,
         )
         .expect_err("the sealed destination is not a write target");

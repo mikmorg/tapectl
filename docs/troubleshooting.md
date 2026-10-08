@@ -130,12 +130,32 @@ are left as, so a script knows what to do next without parsing the message:
 among its copies, in the order 6, 5, 4, 3, 2, 0: a run with any copy
 quarantined exits 6 whatever the others did.
 
-Two failures after a copy is sealed and confirmed still exit 2, because the
-tape needs nothing: `volume compact`'s step 3 (retiring the source) refusing,
-and a catalog error while recording the copy's figures or releasing
-`collection run`'s staging. Read the `error:` line: the copy itself counts.
+A failure after a copy is sealed and confirmed exits **0**, because the copy
+stands and the tape needs nothing (ADR-0012, 2026-10-07, item 33). The command
+prints a `warning:` line naming the step that did not finish, and the command
+that finishes it on its own:
+
+| Step that did not finish | Finish it with |
+|---|---|
+| `volume compact`'s step 3, retiring the source, refused for consent (no terminal and no `--yes`, or a "no" at the prompt) | `tapectl volume compact-finish <source> --force` |
+| releasing `collection run`'s staging (a catalog error) | `tapectl staging clean`, which retains whatever is still below its policy |
+| recording the copy's figures (`bytes_written`, `num_data_files`, `last_write`) and its `write_completed` event (a catalog error) | nothing re-records them; the copy is unaffected, and `volume info` shows the figures as unrecorded |
+
+```text
+warning: volume "L6-0002" is sealed and confirmed and counts as a copy, but releasing the batch's staging did
+not finish: database error: disk I/O error. The tape needs nothing. To finish it: tapectl staging clean
+```
+
+`volume compact --json` says `"source_retired": false` and carries the warning;
+`collection run --json` carries it as `release_warning`.
 
 Older builds exited 2 for every one of these failures.
+
+`volume compact`'s step 3 refused for any other reason still exits 2 with its
+`error:` line. Those are its absolute-floor refusals (a live slice with no
+copy elsewhere, the last eligible copy of a live version): after step 2 they
+mean some content was not carried forward to the destination, so that copy
+does not stand in this sense. Read the error; `--force` does not reach them.
 
 ### `audit`: 0, 1, 2 or 70
 
@@ -798,6 +818,30 @@ volume and set it with `sqlite3`, the same way as for migration 026 above
 (`sqlite3 "$DB" "UPDATE volumes SET status = 'retired' WHERE id = 7"`). Only
 `sealed` counts as a copy, so choose it only for a volume whose seal you can
 stand behind; `volume verify` checks one afterwards.
+
+### `migration 033 cannot run`
+
+Migration 033 removes three cartridge columns no tapectl release has ever
+written or read: `total_bytes_written`, `total_bytes_read` and `error_history`
+(ADR-0012, 2026-10-07). A cartridge with a value in one of them other than its
+default (0, 0, NULL; NULL counts as unwritten everywhere, and an empty text
+is a value) had it set by hand, and 033 will not drop it silently:
+
+```text
+error: failed to open database: migration error: migration 033 cannot run: total_bytes_written, total_bytes_read
+or error_history is set on 1 cartridge row(s) (id 4). Migration 033 removes these three columns from the schema.
+No tapectl release has ever written them, so these values were set by hand, and 033 will not drop them silently.
+Copy them somewhere if they matter, set each named row back to total_bytes_written = 0, total_bytes_read = 0,
+error_history = NULL, then run the command again. Nothing has been changed.
+```
+
+Nothing has been changed. Read the values first if you want to keep them
+(`sqlite3 "$DB" "SELECT id, barcode, total_bytes_written, total_bytes_read,
+error_history FROM cartridges WHERE id = 4"`), then reset them:
+
+```bash
+sqlite3 "$DB" "UPDATE cartridges SET total_bytes_written = 0, total_bytes_read = 0, error_history = NULL WHERE id = 4"
+```
 
 ---
 
@@ -2336,14 +2380,14 @@ whole-archive audit, not with `--unit`.
 | Check | Severity | Message | Meaning and fix |
 |---|---|---|---|
 | `copy_count` | violation | `has <n> copies, needs <m>` | Fewer sealed, in-service copies of the unit's current Version than its policy's `min_copies`. A unit is as covered as its least-covered live Version. Fix: write another volume. The `fix:` line re-stages or `read-slices` first when the staged data is gone. |
-| `location_presence` | violation | `no copy at required location(s) <names> (policy requires <list>; copies are in <n> location(s))` | A location the policy names in `required_locations` holds no copy of the unit's current Version (checked by name; a name that is not a registered location counts as missing). Fix: write another copy and move it there. The `fix:` line ends `&& tapectl volume move <OTHER-LABEL> --to <location>`, and says to repeat it, one new copy each, when several locations are missing. |
+| `location_presence` | violation | `no copy at required location(s) <names> (policy requires <list>; copies are in <n> location(s))` | A location the policy names in `required_locations` holds no copy of the unit's current Version (checked by name; a name that is not a registered location counts as missing). Fix: write another copy and move it there. The `fix:` line ends `&& tapectl volume move <OTHER-LABEL> --to <location>`, and says to repeat it, one new copy each, when several locations are missing. For a tape-only unit each named location needs `[compaction] tape_only_safety_multiplier` copies; one short of it reads `has <n> copy at required location <name>, needs <m> (tape-only <m>x) (policy requires <list>)`. |
 | `warehouse_copies` | violation | `has <n> warehouse deposit(s), needs <m>` | The policy asks for cold-cloud deposits (`warehouse_copies > 0`). Fix: the deposit procedure in the [operator guide](operator-guide.md#warehouse-copies-cold-cloud), then `volume deposit add`. |
 | `encryption` | violation | `<n> unencrypted stage set(s) on tape, policy requires encryption` | Something on tape was written unencrypted (only possible with data from very old versions). Fix: re-stage and rewrite, as the `fix:` line spells out. |
 | `policy_unresolvable` | violation | `policy could not be resolved (<why>); copy_count/location_presence/verify_age/encryption checks were SKIPPED for this unit` | The unit's policy chain (dotfile > archive set > `[defaults]`) is broken, so **no** check ran for it. The `fix:` line names the layer at fault: the unit's `.tapectl-unit.toml`, its archive set, or `[defaults]`. |
 | `dirty` | warning | `source has drifted since last archive (<a> added, <r> removed, <m> modified)` | The source moved on after its last snapshot. This is routine. Fix: `snapshot create`, `stage create`, `volume init`, then `volume write`, as the `fix:` line spells out. |
 | `dirty` | violation | `dirty scan could not run (<error>)` | tapectl could not even read the source to compare it (permissions, a missing path). Fix the access or the unit's dotfile. |
 | `no_archive` | warning | `no current snapshot or tape copies` | Never archived. Fix: snapshot, stage, init and write. |
-| `verify_age` | warning | `not verified within <d> days (last: <date or never>)` | Only when the policy sets a verify interval. Fix: `volume verify <LABEL>` on a volume holding it. |
+| `verify_age` | warning | `not verified within <d> days (last: <date or never>)` | Only when the policy sets a verify interval. Only a full readback counts, dated by when it started (a continued one by its oldest checkpoint). Fix: `volume verify <LABEL>` on a volume holding it. |
 | `escrow_coverage` | warning | `volume <label> (stage set <id>): <reason> — the current escrow key cannot recover it` | That copy cannot be opened by the escrow key. `coverage unknown …` means a catalog rebuilt from a tape with no recipient list; `catalog rebuild --key <escrow key>` attests it. Otherwise re-stage and rewrite, or accept that only the original recipients can open it. |
 | `compaction_candidate` | warning | `live data is <n>% of the archive data on this volume (<live> live, <r> in reclaimable/purged snapshots), below the <t>% compaction threshold` | Part of the volume's data belongs to snapshots marked reclaimable or purged, and the live share has fallen below `[compaction] utilization_threshold`. Only data slices count, never the fixed per-volume metadata, and a volume with nothing reclaimable is never a candidate. Fix: [compaction](operator-guide.md#compaction), starting with `volume compact-read <label>`. |
 | `escrow_kit_missing` | warning | `<n> sealed volume(s) exist but no heir kit has ever been generated — nothing off-site can decrypt them` | Fix: `tapectl key escrow-kit --out <dir>`, then do the paper steps it lists ([keys-and-recovery.md](keys-and-recovery.md)). |

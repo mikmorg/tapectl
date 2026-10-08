@@ -3018,29 +3018,12 @@ fn finish_confirm(
     match confirmed {
         ConfirmOutcome::Sealed(sealed) => {
             // The copy is sealed, confirmed and committed above: a failure
-            // recording its figures after that is not a write outcome, and
-            // `volume resume` has nothing to do (issue #408). It says so,
-            // and exits 2 — the tape needs nothing.
-            let after_sealed = |e: TapectlError| {
-                TapectlError::Other(format!(
-                    "volume \"{label}\" IS sealed and confirmed and counts as a copy, but \
-                     recording its figures failed: {e}"
-                ))
-            };
-            record_write_bookkeeping(conn, volume_id, layout, block_size).map_err(after_sealed)?;
-            events::log_event(
-                conn,
-                "volume",
-                volume_id,
-                Some(label),
-                "write_completed",
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .map_err(after_sealed)?;
+            // recording what followed is not a write outcome, and `volume
+            // resume` has nothing to do (issue #408). It warns and the write
+            // exits 0 — the copy stands (ADR-0012 2026-10-07 item 33).
+            if let Some(warning) = record_after_sealed(conn, volume_id, label, layout, block_size) {
+                eprintln!("{warning}");
+            }
             info!(label = sealed.label, volume_id, "volume write sealed");
             Ok(())
         }
@@ -3652,6 +3635,52 @@ pub(crate) fn record_health_and_drive(
             None
         }
     }
+}
+
+/// Record what follows a copy that is sealed, confirmed and committed: the
+/// volume's write-summary figures ([`record_write_bookkeeping`]) and its
+/// `write_completed` event. Never fails the write (ADR-0012 2026-10-07 item
+/// 33): each statement is retried on a busy catalog (issue #377's policy),
+/// and a failure that remains is returned as the warning
+/// ([`crate::error::unfinished_after_seal`]) the caller prints before
+/// exiting 0. `None` when everything was recorded.
+fn record_after_sealed(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    layout: &Layout,
+    block_size: u64,
+) -> Option<String> {
+    let policy = crate::db::busy::BusyPolicy::DEFAULT;
+    let recorded = crate::db::busy::retry(policy, "the volume's write figures", || {
+        record_write_bookkeeping(conn, volume_id, layout, block_size)
+    })
+    .and_then(|()| {
+        crate::db::busy::retry(policy, "the write_completed event", || {
+            events::log_event(
+                conn,
+                "volume",
+                volume_id,
+                Some(label),
+                "write_completed",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .map(|_| ())
+        })
+    });
+    recorded.err().map(|e| {
+        crate::error::unfinished_after_seal(
+            label,
+            "recording its write figures (bytes_written, num_data_files, last_write) and its \
+             write_completed event",
+            &e,
+            None,
+        )
+    })
 }
 
 /// Populate `volumes`' write-summary columns (`bytes_written`,
@@ -11346,6 +11375,80 @@ mod tests {
         assert_ne!(last, first, "last_write is the completion, stamped now");
     }
 
+    /// ADR-0012 2026-10-07 item 33: a catalog error recording what followed
+    /// a sealed, confirmed copy does not fail the write. It comes back as
+    /// the warning that names the step, and the write exits 0. With the
+    /// catalog writable the same call records both and warns nothing.
+    #[test]
+    fn a_catalog_error_after_the_seal_is_a_warning_not_an_error() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('BKWARN', 'lto', 'lto0', 1000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        let layout = Layout {
+            label: "BKWARN".to_string(),
+            volume_uuid: "u".to_string(),
+            media_type: "LTO-6".to_string(),
+            block_size: 4096,
+            budget: CapacityBudget {
+                available_bytes: 0,
+                reserve_bytes: 0,
+            },
+            entries: vec![],
+        };
+
+        conn.execute_batch("PRAGMA query_only = ON").unwrap();
+        let warning = record_after_sealed(&conn, volume_id, "BKWARN", &layout, 4096)
+            .expect("a read-only catalog cannot record, and says so");
+        assert!(
+            warning.starts_with(
+                "warning: volume \"BKWARN\" is sealed and confirmed and counts as a copy, but \
+                 recording its write figures"
+            ),
+            "{warning}"
+        );
+        assert!(warning.contains("write_completed event"), "{warning}");
+        assert!(warning.contains("The tape needs nothing."), "{warning}");
+
+        conn.execute_batch("PRAGMA query_only = OFF").unwrap();
+        assert_eq!(
+            record_after_sealed(&conn, volume_id, "BKWARN", &layout, 4096),
+            None
+        );
+        let (has_manifest, events): (i64, i64) = conn
+            .query_row(
+                "SELECT has_manifest,
+                        (SELECT COUNT(*) FROM events WHERE action = 'write_completed')
+                 FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((has_manifest, events), (1, 1));
+    }
+
+    /// The confirm's sealed arm records through [`record_after_sealed`],
+    /// whose failure is a warning — never with a `?` that would turn it
+    /// into an exit-2 error again.
+    #[test]
+    fn finish_confirm_records_through_the_warning_path() {
+        const SRC: &str = include_str!("write.rs");
+        let f = "fn finish_confirm(";
+        let start = SRC.find(f).unwrap();
+        let end = SRC[start..].find("\n}\n").unwrap() + start;
+        let body = &SRC[start..end];
+        assert!(
+            !body[f.len()..].contains("\nfn "),
+            "overran into another fn"
+        );
+        assert!(body.contains("record_after_sealed("), "{body}");
+        assert!(!body.contains("record_write_bookkeeping("), "{body}");
+    }
+
     #[test]
     fn record_write_bookkeeping_never_touches_status() {
         // confirm()'s own transaction already set status = 'sealed' before
@@ -13991,8 +14094,8 @@ mod tests {
                 GENCHK_DEVICE,
                 512 * 1024,
                 false, // --prewrite-hash
-                false, // --full-confirm
-                true,  // --yes: the host pre-flight is not under test here
+                crate::collection::batch::RunConfirm::Quick,
+                true, // --yes: the host pre-flight is not under test here
             )
             .unwrap_err()
             .to_string();

@@ -1637,9 +1637,11 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
+        // A full readback is dated by its start (ADR-0012 2026-10-07 item
+        // 30); this one started and completed in the same second.
         conn.execute(
-            "INSERT INTO verification_sessions (volume_id, completed_at, outcome)
-             VALUES (?1, '2026-08-01 12:00:00', 'passed')",
+            "INSERT INTO verification_sessions (volume_id, started_at, completed_at, outcome)
+             VALUES (?1, '2026-08-01 12:00:00', '2026-08-01 12:00:00', 'passed')",
             params![other_id],
         )
         .unwrap();

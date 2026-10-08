@@ -405,11 +405,14 @@ precedes the release. The `volume verify` that steps 3–5 above run before
 `staging clean` comes only after the staged slices are gone, and a copy it finds
 bad is rewritten from another copy (`volume read-slices`), not from staging.
 When the data matters, have at least one copy read back in full before the
-release. `collection run --full-confirm` does that for every copy the run
-writes, each taking about as long as its write (~2.3 h on a full LTO-6); this
-path has no per-copy choice. To read back one copy only, stage and write that
-batch by hand (steps 1–5 above) and pass `--full-confirm` to the first
-`volume write` alone.
+release. `collection run --full-confirm-first` reads the run's first copy back
+in full and confirms the others quickly; `--full-confirm` reads every copy back
+in full. Each full readback takes about as long as its write (~2.3 h on a full
+LTO-6). The two flags cannot be given together (ADR-0012, 2026-10-07). A
+`collection run` writes one copy today (it takes one `--label`), so the two
+flags read back the same copy; `--full-confirm-first` says what you mean if
+runs ever write more. A second copy written afterwards with `volume write`
+gets the quick confirm unless you pass it `--full-confirm`.
 
 A collection archives only its units: the real folders at exactly
 `unit_depth` below its root, and everything inside them. Anything else under
@@ -1246,7 +1249,10 @@ audit: 4 violations, 1 warnings (exit 2)
 where its copies actually are: a missing place reads
 `no copy at required location(s) offsite (policy requires home-rack, offsite; copies are in 1 location(s))`,
 and its fix ends in `tapectl volume move <OTHER-LABEL> --to offsite`. A name
-that is not a registered location counts as missing.
+that is not a registered location counts as missing. A tape-only unit needs
+`[compaction] tape_only_safety_multiplier` copies at each named place
+(ADR-0012, 2026-10-07): at the default 2x, one copy at `offsite` reads
+`has 1 copy at required location offsite, needs 2 (tape-only 2x) (policy requires offsite)`.
 
 ### Reports
 
@@ -1300,7 +1306,7 @@ The write family goes past 3 (ADR-0012, 2026-10-07; the full table is in
 
 | exit | the tape and the session | next |
 |---|---|---|
-| 0 | sealed and confirmed | nothing |
+| 0 | sealed and confirmed (a step after it that failed is a `warning:` line) | nothing, or the command the warning names |
 | 2 | untouched: refused before anything was written, or a usage error | fix the error, run it again |
 | 3 | sealed; the confirm reached no verdict | `volume resume <label>` |
 | 4 | interrupted part-way (a signal, a drive or disk error) | `volume resume <label>` |
@@ -1775,7 +1781,12 @@ tapectl volume verify L6-0003 --device "$TAPE"   # --full is the default
 
 The report lists every verification session, not one line per volume.
 `never verified` lines come first, then sessions oldest first, so a volume
-verified twice appears twice. Judge each volume by its newest line:
+verified twice appears twice. A full readback is dated by when it *started*:
+one that continued an interrupted readback started, as far as its oldest file
+is concerned, when that file was read, and its `started` time says so. `audit`'s
+`verify_age`, `volume list`'s VERIFIED column and the evidence lines the
+destructive commands print date it the same way (ADR-0012, 2026-10-07). Judge
+each volume by its newest line:
 
 ```text
 $ tapectl report verify-status
@@ -1790,7 +1801,7 @@ volume has had none of its data read back. Give it a full `volume verify`
 soon after the write — best before `staging clean` releases its units, while
 the staged slices can still rewrite a bad copy cheaply. `collection run` gives
 no such window: it releases staging right after its quick confirms, so use its
-`--full-confirm` when the data matters (see
+`--full-confirm-first` (or `--full-confirm`, every copy) when the data matters (see
 [A typical write session](#a-typical-write-session)). `report
 verify-status` ends with the volumes still owed one:
 

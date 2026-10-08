@@ -662,4 +662,48 @@ mod tests {
         ]);
         result.expect("omitting --capacity must still parse");
     }
+
+    /// ADR-0012 2026-10-07 item 31: `collection run --full-confirm-first`
+    /// reads the first copy back in full and the others quickly, and
+    /// `--full-confirm` reads every copy; asking for both is a usage error,
+    /// not a silent pick of one.
+    #[test]
+    fn collection_run_full_confirm_first_parses_and_conflicts_with_full_confirm() {
+        let run = |extra: &[&str]| {
+            let mut argv = vec![
+                "tapectl",
+                "collection",
+                "run",
+                "--collection",
+                "lib",
+                "--label",
+                "L1",
+            ];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        let confirm_of = |cli: Cli| match cli.command {
+            Commands::Collection {
+                command: crate::cli::collection::CollectionCommands::Run { confirm, .. },
+            } => confirm,
+            other => panic!("not collection run: {other:?}"),
+        };
+        use crate::collection::batch::RunConfirm;
+        assert_eq!(confirm_of(run(&[]).unwrap()).confirm(), RunConfirm::Quick);
+        assert_eq!(
+            confirm_of(run(&["--full-confirm"]).unwrap()).confirm(),
+            RunConfirm::FullEvery
+        );
+        assert_eq!(
+            confirm_of(run(&["--full-confirm-first"]).unwrap()).confirm(),
+            RunConfirm::FullFirst
+        );
+        let err =
+            run(&["--full-confirm", "--full-confirm-first"]).expect_err("the two flags conflict");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{err}"
+        );
+    }
 }

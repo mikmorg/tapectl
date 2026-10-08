@@ -445,6 +445,17 @@ fn migrations() -> Migrations<'static> {
         // the same reason as 026: every table that names a volume points
         // into the rebuilt one. See the header.
         M::up(include_str!("migrations/032_drop_volume_status_full.sql")).foreign_key_check(),
+        // 033 rebuilds `cartridges` without `total_bytes_written`,
+        // `total_bytes_read` and `error_history` (ADR-0012 amendment
+        // 2026-10-07 item 35): nothing has ever written or read them. A row
+        // carrying a value other than their default was set by hand and is
+        // refused by id, never dropped silently. `.foreign_key_check()`:
+        // `cartridge_volumes` and `cartridge_contacts` point into the rebuilt
+        // table. See the header.
+        M::up(include_str!(
+            "migrations/033_drop_dead_cartridge_columns.sql"
+        ))
+        .foreign_key_check(),
     ])
 }
 
@@ -4871,6 +4882,216 @@ mod tests {
             )
             .unwrap();
         assert_eq!(full, 2, "a refused 032 rewrites no row");
+    }
+
+    // --- Migration 033 (ADR-0012 amendment 2026-10-07 item 35) ---
+
+    /// The three `cartridges` columns no code ever wrote or read.
+    const M033_DROPPED: [&str; 3] = ["total_bytes_written", "total_bytes_read", "error_history"];
+
+    /// `open_memory_at_031_seeded`'s catalog carried on to schema 32, plus a
+    /// second cartridge with every column 033 keeps set to a non-default
+    /// value and an out-of-sequence id (a copy that dropped `id` would
+    /// renumber it), shelved at a location and mounted on a volume.
+    fn open_memory_at_032_seeded() -> Connection {
+        let mut conn = open_memory_at_031_seeded();
+        // 703 is seed_schema_25's 'full' volume, which 032 would refuse.
+        conn.execute("UPDATE volumes SET status = 'sealed' WHERE id = 703", [])
+            .unwrap();
+        migrate_to(&mut conn, Some(32)).expect("the seed migrates to 32");
+        assert_eq!(user_version(&conn), 32, "precondition: at schema 32");
+        conn.execute_batch(
+            "INSERT INTO cartridges (id, barcode, media_type, manufacturer, serial_number,
+                                     tape_length_meters, nominal_capacity, status,
+                                     total_load_count, first_use, last_use, location_id,
+                                     created_at, notes, operator_serial)
+                 VALUES (870, 'BC0870', 'LTO-6', 'HPE', 'MAM0870', 846, 2500000000000,
+                         'pending_erase', 41, '2026-01-01 00:00:00', '2026-01-02 00:00:00',
+                         5, '2025-12-31 00:00:00', 'note-870', 'OP0870');
+             INSERT INTO cartridge_volumes (id, cartridge_id, volume_id, mounted_at)
+                 VALUES (871, 870, 701, '2026-01-06 00:00:09');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn cartridge_columns_kept(conn: &Connection) -> Vec<String> {
+        table_info(conn, "cartridges")
+            .into_iter()
+            .map(|c| c.0)
+            .filter(|name| !M033_DROPPED.contains(&name.as_str()))
+            .collect()
+    }
+
+    /// THE test for 033: `cartridges` is rebuilt without the three dead
+    /// columns, and nothing else moves -- every row of every other table,
+    /// every kept cartridge cell, every schema object outside the
+    /// `cartridges` table itself (its indexes recreated exactly), every
+    /// foreign key in and out, and every kept column's type, default,
+    /// NOT NULL and key. The status CHECK and the partial unique serial
+    /// index still hold afterwards.
+    #[test]
+    fn test_migrate_032_populated_db_to_033_drops_the_dead_cartridge_columns() {
+        let mut conn = open_memory_at_032_seeded();
+
+        let kept = cartridge_columns_kept(&conn);
+        let select_kept = format!("SELECT {} FROM cartridges ORDER BY id", kept.join(", "));
+        let cartridge_rows = |conn: &Connection| -> Vec<Vec<String>> {
+            let mut stmt = conn.prepare(&select_kept).unwrap();
+            let n = stmt.column_count();
+            stmt.query_map([], |r| {
+                (0..n)
+                    .map(|i| r.get_ref(i).map(render_cell))
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let mut rows_before = every_row(&conn);
+        let cartridges_before = cartridge_rows(&conn);
+        assert_eq!(
+            cartridges_before.len(),
+            2,
+            "positive control: two cartridges"
+        );
+        let objects_before = schema_objects(&conn);
+        let tables: Vec<String> = rows_before.keys().cloned().collect();
+        let fks_before: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        let cols_before = table_info(&conn, "cartridges");
+        for dropped in M033_DROPPED {
+            assert!(
+                cols_before.iter().any(|c| c.0 == dropped),
+                "positive control: {dropped} exists before 033"
+            );
+        }
+        let indexes_before = index_names(&conn, "cartridges");
+        assert_eq!(
+            indexes_before,
+            vec![
+                "idx_cartridges_barcode",
+                "idx_cartridges_location",
+                "idx_cartridges_serial_number",
+                "sqlite_autoindex_cartridges_1"
+            ],
+            "positive control: cartridges has its indexes to compare"
+        );
+
+        migrate_to(&mut conn, Some(33)).expect("033 must migrate a catalog that never set them");
+        assert_eq!(user_version(&conn), 33);
+
+        let mut rows_after = every_row(&conn);
+        rows_before.remove("cartridges");
+        rows_after.remove("cartridges");
+        assert_eq!(
+            rows_before, rows_after,
+            "033 must not add, drop, renumber or alter a row of any other table"
+        );
+        assert_eq!(
+            cartridges_before,
+            cartridge_rows(&conn),
+            "033 must keep every cartridge, its id and every kept cell"
+        );
+        let not_cartridges = |objs: &[(String, String, String, Option<String>)]| {
+            objs.iter()
+                .filter(|o| !(o.0 == "table" && o.1 == "cartridges"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            not_cartridges(&objects_before),
+            not_cartridges(&schema_objects(&conn)),
+            "033 changed a schema object other than the cartridges table, or did not \
+             recreate one of its indexes exactly"
+        );
+        let fks_after: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        assert_eq!(fks_before, fks_after, "033 must restate every foreign key");
+        assert_eq!(
+            cols_before
+                .into_iter()
+                .filter(|c| !M033_DROPPED.contains(&c.0.as_str()))
+                .collect::<Vec<_>>(),
+            table_info(&conn, "cartridges"),
+            "exactly the three columns go; every other keeps its shape and order"
+        );
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "{:?}",
+            report.issues
+        );
+        assert!(
+            conn.execute("DELETE FROM cartridges WHERE id = 870", [])
+                .is_err(),
+            "cartridge 870 is mounted; FK enforcement must refuse the delete"
+        );
+        let err = conn
+            .execute(
+                "UPDATE cartridges SET status = 'offsite' WHERE id = 870",
+                [],
+            )
+            .expect_err("the status CHECK survives the rebuild");
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+        let err = conn
+            .execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number)
+                 VALUES ('BC-DUP', 'LTO-6', 1, 'MAM0870')",
+                [],
+            )
+            .expect_err("the partial unique serial index survives the rebuild");
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+    }
+
+    /// Nothing ever wrote the three columns, so a value other than their
+    /// default (0, 0, NULL) was set by hand, and dropping it would lose it
+    /// silently: 033 refuses by name and row, as 026, 027 and 032 do. The
+    /// positive control is the test above: the same seed at its defaults
+    /// migrates.
+    #[test]
+    fn test_migration_033_refuses_a_hand_set_dead_column_by_row() {
+        let mut conn = open_memory_at_032_seeded();
+        conn.execute_batch(
+            "UPDATE cartridges SET total_bytes_written = 5 WHERE id = 8;
+             UPDATE cartridges SET error_history = 'x' WHERE id = 870;",
+        )
+        .unwrap();
+        let err = migrate(&mut conn).expect_err("033 must refuse a hand-set dead column");
+        let msg = match &err {
+            TapectlError::Migration(m) => m.clone(),
+            other => panic!("expected the generic Migration variant, got {other:?}"),
+        };
+        assert!(msg.starts_with("migration 033 cannot run: "), "{msg}");
+        assert!(msg.contains("2 cartridge row(s) (id 8, 870)"), "{msg}");
+        assert!(msg.contains("Nothing has been changed."), "{msg}");
+        assert_eq!(user_version(&conn), 32, "a refused 033 rolls back");
+        let kept: (i64, String) = conn
+            .query_row(
+                "SELECT (SELECT total_bytes_written FROM cartridges WHERE id = 8),
+                        (SELECT error_history FROM cartridges WHERE id = 870)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, (5, "x".to_string()), "a refused 033 drops nothing");
+
+        // Each column alone refuses too, and NULL is a default.
+        for set in [
+            "total_bytes_written = NULL, total_bytes_read = 7, error_history = NULL",
+            "total_bytes_written = 0, total_bytes_read = 0, error_history = ''",
+        ] {
+            let mut conn = open_memory_at_032_seeded();
+            conn.execute(&format!("UPDATE cartridges SET {set} WHERE id = 8"), [])
+                .unwrap();
+            let err = migrate(&mut conn).expect_err(set);
+            assert!(err.to_string().contains("(id 8)"), "{set}: {err}");
+        }
+        let mut conn = open_memory_at_032_seeded();
+        conn.execute(
+            "UPDATE cartridges SET total_bytes_written = NULL, total_bytes_read = NULL",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn).expect("NULL is as unwritten as the default 0");
     }
 
     /// Migration 029 (issue #410): `readback_checkpoints` exists on a fresh

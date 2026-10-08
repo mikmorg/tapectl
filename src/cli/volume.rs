@@ -364,9 +364,11 @@ pub enum VolumeCommands {
     ///
     /// Exit status: `volume write`'s, for step 2's write (0 sealed and
     /// confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted,
-    /// 5 aborted, 6 quarantined, 75 catalog busy). A step 1 or step 3
-    /// failure exits 2: step 1 writes nothing, and a step 3 refusal leaves
-    /// the destination sealed.
+    /// 5 aborted, 6 quarantined, 75 catalog busy). A step 1 failure exits 2:
+    /// step 1 writes nothing. Step 3 refused for consent (no terminal, no
+    /// --yes) exits 0 with a warning naming `volume compact-finish --force`:
+    /// the destination is sealed, confirmed and a full carry-forward. Step 3
+    /// refused because content was not carried forward exits 2.
     Compact {
         /// Source volume label
         label: String,
@@ -1547,46 +1549,54 @@ pub fn run(
             // and invert the gate's meaning. Only after step 2 does the
             // at-risk set narrow to units whose content was not carried
             // forward — exactly the issue #147 case that should gate.
-            let report =
-                write::compact_finish(conn, config, label, *force || yes).inspect_err(|e| {
-                    // ONLY the consent refusal. `compact_finish`'s other two
-                    // failures are its Tier-3 refusals (an unprotected live
-                    // slice; the last eligible copy of a live version), and
-                    // after a successful compact-write either means content was
-                    // not carried forward — a bug, not a `--force` situation.
-                    // Neither refusal's text contains these substrings, so
-                    // neither can reach this hint; naming `--force` as the
-                    // recovery for an absolute floor is precisely the confusion
-                    // ADR-0008 warns about.
-                    let msg = e.to_string();
-                    if msg.contains("refused: non-interactive session")
-                        || msg.contains("aborted, not confirmed")
-                    {
-                        eprintln!(
-                            "\nNothing was lost: destination \"{dest_label}\" is written and \
-                         sealed, and source \"{label}\" is simply not retired yet.\n\
-                         To complete step 3 without re-reading or re-writing anything:\n    \
-                         tapectl volume compact-finish {label} --force"
+            //
+            // ADR-0012 2026-10-07 item 33 (and the CTO's ruling on its
+            // question 2): a consent refusal of step 3 leaves a destination
+            // that is sealed, confirmed and a full carry-forward, so the
+            // command warns, naming `volume compact-finish --force`, and
+            // exits 0. A Tier-3 refusal means content was NOT carried
+            // forward — the copy does not stand in item 33's sense — so it
+            // keeps its error and its non-zero exit
+            // (`compact_step3_outcome`).
+            match write::compact_finish(conn, config, label, *force || yes) {
+                Ok(report) => {
+                    println!("  Volume \"{label}\" retired");
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "source": label,
+                                "destination": dest_label,
+                                "status": "completed",
+                                "source_retired": true,
+                                "affected_units": compact_finish_evidence_json(&report),
+                            })
+                        );
+                    } else {
+                        print_compact_finish_evidence(&report);
+                        println!("\ncompaction complete: {label} → {dest_label}");
+                    }
+                }
+                Err(e) => {
+                    let warning = compact_step3_outcome(label, dest_label, e)?;
+                    eprintln!("{warning}");
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "source": label,
+                                "destination": dest_label,
+                                "status": "source_not_retired",
+                                "source_retired": false,
+                                "warning": warning,
+                            })
+                        );
+                    } else {
+                        println!(
+                            "\ncompaction written: {label} → {dest_label}; \"{label}\" is not retired"
                         );
                     }
-                })?;
-            println!("  Volume \"{label}\" retired");
-            if !json_output {
-                print_compact_finish_evidence(&report);
-            }
-
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "source": label,
-                        "destination": dest_label,
-                        "status": "completed",
-                        "affected_units": compact_finish_evidence_json(&report),
-                    })
-                );
-            } else {
-                println!("\ncompaction complete: {label} → {dest_label}");
+                }
             }
         }
 
@@ -1619,6 +1629,41 @@ pub fn run(
         }
     }
     Ok(exit_code)
+}
+
+/// What `volume compact` does when step 3 — retiring `source` — fails
+/// after step 2 sealed and confirmed `dest` (ADR-0012 2026-10-07 item 33,
+/// and the CTO's ruling on its question 2):
+///
+/// - a **consent refusal** (no terminal and no `--yes`, or a "no" at the
+///   prompt): `dest` is a full carry-forward and counts as a copy, so this
+///   is `Ok(warning)` — printed, and the command exits 0. The warning names
+///   `volume compact-finish <source> --force`, which finishes step 3
+///   without re-reading or re-writing anything.
+/// - anything else, notably `compact_finish`'s **Tier-3 refusals** (an
+///   unprotected live slice; the last eligible copy of a live version):
+///   after a successful compact-write either means content was NOT carried
+///   forward, so the copy does not stand in item 33's sense. `Err(err)`,
+///   unchanged: the same message and non-zero exit as before item 33.
+///   Naming `--force` for an absolute floor is the confusion ADR-0008 warns
+///   about, and neither refusal's text contains the consent substrings.
+fn compact_step3_outcome(
+    source: &str,
+    dest: &str,
+    err: crate::error::TapectlError,
+) -> std::result::Result<String, crate::error::TapectlError> {
+    let msg = err.to_string();
+    let consent =
+        msg.contains("refused: non-interactive session") || msg.contains("aborted, not confirmed");
+    if !consent {
+        return Err(err);
+    }
+    Ok(crate::error::unfinished_after_seal(
+        dest,
+        &format!("step 3, retiring the source \"{source}\","),
+        &msg,
+        Some(&format!("tapectl volume compact-finish {source} --force")),
+    ))
 }
 
 /// `volume deposit` (ADR-0006, issue #73).
@@ -2250,13 +2295,14 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
                     JOIN units cu ON cu.id = cs2.unit_id
                     WHERE cw2.volume_id = v.id AND cw2.status = 'completed'
                  ) per) AS copies,
-                (SELECT MAX(vs.completed_at) FROM verification_sessions vs
+                (SELECT MAX({dated}) FROM verification_sessions vs
                   WHERE vs.volume_id = v.id AND vs.outcome = 'passed'
                     AND vs.verify_type = 'full') AS last_verified
          FROM volumes v
          LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
          LEFT JOIN cartridges c ON c.id = cv.cartridge_id
-         LEFT JOIN locations l ON l.id = v.location_id"
+         LEFT JOIN locations l ON l.id = v.location_id",
+        dated = crate::policy::evidence::full_readback_date("vs"),
     );
     if status.is_some() {
         sql.push_str(" WHERE v.status = ?1");
@@ -2824,6 +2870,67 @@ fn print_volume_info(info: &VolumeInfo) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0012 2026-10-07 item 33 and the ruling on its question 2:
+    /// `volume compact`'s step 3 refused for CONSENT after step 2 sealed and
+    /// confirmed the destination is a warning naming `volume compact-finish
+    /// --force`, and the command exits 0. A Tier-3 refusal (content not
+    /// carried forward) is not: it stays the error it was, non-zero.
+    mod compact_step3_outcome_by_refusal {
+        use super::*;
+
+        #[test]
+        fn a_consent_refusal_is_a_warning_naming_compact_finish_with_force() {
+            for text in [
+                "retire volume \"L6-SRC\" refused: non-interactive session",
+                "retire volume \"L6-SRC\": aborted, not confirmed",
+            ] {
+                let w = compact_step3_outcome("L6-SRC", "L6-DST", TapectlError::Other(text.into()))
+                    .unwrap_or_else(|e| panic!("{text}: a consent refusal warns, got {e}"));
+                assert!(
+                    w.starts_with(
+                        "warning: volume \"L6-DST\" is sealed and confirmed and counts as a \
+                         copy, but step 3, retiring the source \"L6-SRC\", did not finish: "
+                    ),
+                    "{w}"
+                );
+                assert!(
+                    w.ends_with("To finish it: tapectl volume compact-finish L6-SRC --force"),
+                    "{w}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_tier3_refusal_keeps_its_error_and_its_non_zero_exit() {
+            let text = "refusing to retire \"L6-SRC\": it holds the last eligible copy";
+            let err = compact_step3_outcome("L6-SRC", "L6-DST", TapectlError::Other(text.into()))
+                .expect_err("content not carried forward does not stand: no exit 0");
+            assert_eq!(err.to_string(), text, "the message is unchanged");
+            assert_eq!(
+                crate::error::ErrorContract::Write.exit_code(&anyhow::Error::from(err)),
+                crate::error::EXIT_ERROR,
+                "the exit it had before item 33"
+            );
+        }
+
+        /// The Compact arm routes step 3's failure through
+        /// `compact_step3_outcome`, propagating its `Err` with `?`.
+        #[test]
+        fn the_compact_arm_routes_step_3_through_the_outcome() {
+            const SRC: &str = include_str!("volume.rs");
+            let start = SRC.find("VolumeCommands::Compact {\n").unwrap();
+            let arm = &SRC[start..start + SRC[start..].find("VolumeCommands::Deposit").unwrap()];
+            assert!(
+                arm.contains("match write::compact_finish(conn, config, label, *force || yes) {"),
+                "{arm}"
+            );
+            assert!(
+                arm.contains("compact_step3_outcome(label, dest_label, e)?"),
+                "{arm}"
+            );
+        }
+    }
 
     /// Issue #146: `volume compact`'s destination-label prompt had no
     /// terminal check, so a non-interactive run blocked forever on a handle
@@ -3763,6 +3870,34 @@ mod tests {
             let row = |label: &str| rows.iter().find(|r| r.label == label).unwrap();
             assert_eq!(row("L6-0001").verified, full_l6_0001);
             assert_eq!(row("L6-0002").verified, None);
+        }
+
+        /// ADR-0012 2026-10-07 item 30: VERIFIED dates a full readback by
+        /// its START. A continued full verify of L6-0002 that completed
+        /// today started, by its oldest checkpoint, 100 days ago, and the
+        /// column says so: some of its files were last read then.
+        #[test]
+        fn a_continued_full_readback_shows_its_oldest_checkpoint() {
+            let conn = seed();
+            conn.execute(
+                "INSERT INTO verification_sessions
+                     (volume_id, verify_type, outcome, started_at, completed_at)
+                 SELECT id, 'full', 'passed', datetime('now', '-100 days'), datetime('now')
+                 FROM volumes WHERE label = 'L6-0002'",
+                [],
+            )
+            .unwrap();
+            let rows = volume_rows(&conn, None).unwrap();
+            let row = rows.iter().find(|r| r.label == "L6-0002").unwrap();
+            assert_eq!(
+                crate::policy::evidence::compact_age(
+                    row.verified.as_deref(),
+                    chrono::Utc::now().naive_utc()
+                ),
+                "100d ago",
+                "{:?}",
+                row.verified
+            );
         }
 
         /// Rule: `--status` narrows but is never the default filter, and it

@@ -561,9 +561,56 @@ pub fn exit_with_error_code(err: &anyhow::Error, code: i32) -> ! {
     process::exit(code);
 }
 
+/// The warning a write-family command prints, and then exits 0 on, when a
+/// step AFTER a copy was sealed and confirmed fails (ADR-0012 2026-10-07
+/// item 33): the copy stands, so the failure is not a write outcome and the
+/// command does not exit 2. It names the copy, the `step` that did not
+/// finish and why, and `finish` — the command that finishes that step on
+/// its own — or says that none does. One wording for every such step:
+/// `volume compact`'s retirement of the source, `collection run`'s release
+/// of staging, and recording what followed a sealed copy.
+pub fn unfinished_after_seal(
+    volume: &str,
+    step: &str,
+    err: &dyn std::fmt::Display,
+    finish: Option<&str>,
+) -> String {
+    let finish = match finish {
+        Some(cmd) => format!("To finish it: {cmd}"),
+        None => "No tapectl command finishes it afterwards.".to_string(),
+    };
+    format!(
+        "warning: volume \"{volume}\" is sealed and confirmed and counts as a copy, but {step} \
+         did not finish: {err}. The tape needs nothing. {finish}"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0012 2026-10-07 item 33: the warning names the copy that stands,
+    /// the step and why, and the command that finishes it.
+    #[test]
+    fn the_post_seal_warning_names_the_step_and_the_command_that_finishes_it() {
+        let w = unfinished_after_seal(
+            "L6-0002",
+            "releasing the batch's staging",
+            &"database is locked",
+            Some("tapectl staging clean"),
+        );
+        assert_eq!(
+            w,
+            "warning: volume \"L6-0002\" is sealed and confirmed and counts as a copy, but \
+             releasing the batch's staging did not finish: database is locked. The tape needs \
+             nothing. To finish it: tapectl staging clean"
+        );
+        let w = unfinished_after_seal("L6-0002", "recording", &"x", None);
+        assert!(
+            w.ends_with("No tapectl command finishes it afterwards."),
+            "{w}"
+        );
+    }
 
     /// Render an error exactly as [`exit_with_error`] prints it: `{:#}` on
     /// the anyhow error, which walks the `source()` chain. `to_string()`

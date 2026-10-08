@@ -203,11 +203,19 @@ fn superseding_verdict(
     // Checked by count alone, copies at `home` and `garage` met
     // `["home","offsite"]` and the older version was released with nothing
     // offsite.
-    let missing = super::coverage::missing_required_locations_for_snapshot(
+    // ADR-0012 2026-10-07 items 15 and 34: for a tape-only unit each named
+    // location must hold `multiplier` copies of the superseding version, as
+    // the distinct-location count below is multiplied — the per-name count
+    // of the same one predicate (`copies_per_named_location`). One copy at
+    // `offsite` meets `["offsite"]` for an active unit, not at 2x.
+    let per_name = super::coverage::copies_per_named_location(config, &unit.status);
+    let short = super::coverage::short_required_locations(
         conn,
-        superseding.0,
+        super::coverage::NamedScope::Snapshot(superseding.0),
         &resolved.required_locations,
+        per_name,
     )?;
+    let missing = super::coverage::missing_names(&short);
     if !missing.is_empty() {
         return Ok(ReclaimVerdict::Blocked {
             superseding_version: Some(superseding.1),
@@ -220,37 +228,16 @@ fn superseding_verdict(
             ),
         });
     }
-
-    // ADR-0012, 2026-10-07 amendment, item 15: for a tape-only unit each
-    // named location must hold `multiplier` copies of the superseding
-    // version, as the distinct-location count below is multiplied. One copy
-    // at `offsite` meets `["offsite"]` for an active unit, not at 2x.
-    if let Some(m) = tape_only_multiplier {
-        let short = super::coverage::short_required_locations_for_snapshot(
-            conn,
-            superseding.0,
-            &resolved.required_locations,
-            m,
-        )?;
-        if !short.is_empty() {
-            let held = short
-                .iter()
-                .map(|(name, copies)| {
-                    let noun = if *copies == 1 { "copy" } else { "copies" };
-                    format!("{copies} {noun} at required location {name}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let each = if short.len() == 1 { "" } else { " at each" };
-            return Ok(ReclaimVerdict::Blocked {
-                superseding_version: Some(superseding.1),
-                freeable_bytes: freeable,
-                reason: format!(
-                    "superseding v{} has {held}, needs {m}{each} (tape-only {m}x)",
-                    superseding.1,
-                ),
-            });
-        }
+    if !short.is_empty() {
+        return Ok(ReclaimVerdict::Blocked {
+            superseding_version: Some(superseding.1),
+            freeable_bytes: freeable,
+            reason: format!(
+                "superseding v{} has {} (tape-only {per_name}x)",
+                superseding.1,
+                super::coverage::describe_named_shortfall(&short, per_name),
+            ),
+        });
     }
 
     // With every name met, the distinct-location count is at least the

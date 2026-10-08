@@ -528,6 +528,13 @@ hold are all multiplied by `[compaction] tape_only_safety_multiplier` (default
 2). At 2x, `required_locations = ["offsite"]` asks for two copies of the newer
 version at `offsite`, and copies in two places.
 
+The per-name part of that bar is the same everywhere (ADR-0012, 2026-10-07):
+for a tape-only unit, `audit`'s `location_presence`, `unit mark-tape-only` (the
+unit is about to be tape-only), `snapshot mark-reclaimable` and `report
+supersedable` all ask for `tape_only_safety_multiplier` copies at each named
+required location. `audit` and `unit mark-tape-only` do not multiply the copy
+count or the number of places.
+
 ## Policy: archive sets and audit
 
 ### Archive sets and resolution order

@@ -767,11 +767,29 @@ fn check_location_presence(
         return Ok(f);
     }
 
-    let missing = policy::coverage::missing_required_locations(
+    // ADR-0012 2026-10-07 item 34: a tape-only unit needs the multiplier's
+    // copies at each name, as `snapshot mark-reclaimable` asks.
+    let per_name = policy::coverage::copies_per_named_location(ctx.config, &unit.status);
+    let short = policy::coverage::short_required_locations(
         ctx.conn,
-        unit.id,
+        policy::coverage::NamedScope::Unit(unit.id),
         &resolved.required_locations,
+        per_name,
     )?;
+    let missing = policy::coverage::missing_names(&short);
+    if missing.is_empty() && !short.is_empty() {
+        let extra = format!(" && tapectl volume move <OTHER-LABEL> --to {}", short[0].0);
+        f.violations.push(AuditFinding {
+            unit: unit.name.clone(),
+            check: "location_presence".into(),
+            message: format!(
+                "has {} (tape-only {per_name}x) (policy requires {})",
+                policy::coverage::describe_named_shortfall(&short, per_name),
+                resolved.required_locations.join(", "),
+            ),
+            action: additional_copy_action(ctx.conn, unit, &extra)?,
+        });
+    }
     if !missing.is_empty() {
         let location_count = location_count_for_unit(ctx.conn, unit.id)?;
         // The remedy's last step says where the new copy goes. One copy can
@@ -812,17 +830,22 @@ fn check_verify_age(
         // A FULL readback only (ADR-0012 2026-10-06 items 1 and 24): a quick
         // confirm or quick verify reads File 0, the front index and the
         // seal — none of the unit's bytes — so it is no evidence they still
-        // read, and must not refresh this clock.
+        // read, and must not refresh this clock. Dated by its START
+        // (ADR-0012 2026-10-07 item 30): a continued readback's start is its
+        // oldest checkpoint, when some of its files were last read.
         let last_verify: Option<String> = ctx
             .conn
             .query_row(
-                "SELECT MAX(vs.completed_at)
-                 FROM verification_sessions vs
-                 JOIN writes w ON w.volume_id = vs.volume_id
-                 JOIN stage_sets ss ON ss.id = w.stage_set_id
-                 JOIN snapshots s ON s.id = ss.snapshot_id
-                 WHERE s.unit_id = ?1 AND vs.outcome = 'passed'
-                   AND vs.verify_type = 'full'",
+                &format!(
+                    "SELECT MAX({dated})
+                     FROM verification_sessions vs
+                     JOIN writes w ON w.volume_id = vs.volume_id
+                     JOIN stage_sets ss ON ss.id = w.stage_set_id
+                     JOIN snapshots s ON s.id = ss.snapshot_id
+                     WHERE s.unit_id = ?1 AND vs.outcome = 'passed'
+                       AND vs.verify_type = 'full'",
+                    dated = policy::evidence::full_readback_date("vs"),
+                ),
                 params![unit.id],
                 |row| row.get(0),
             )
@@ -3645,6 +3668,63 @@ mod tests {
             let conn = setup(&["home-rack", "offsite"]);
             assert!(location_findings(&conn).is_empty());
         }
+
+        /// One more sealed volume holding the unit's one version, shelved at
+        /// `loc`.
+        fn add_copy_at(conn: &Connection, label: &str, loc: &str) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, location_id)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                         (SELECT id FROM locations WHERE name = ?2))",
+                params![label, loc],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 SELECT ss.id, ss.snapshot_id, ?1, 'completed' FROM stage_sets ss",
+                params![conn.last_insert_rowid()],
+            )
+            .unwrap();
+        }
+
+        /// ADR-0012 2026-10-07 items 15 and 34: for a tape-only unit each
+        /// named location must hold `tape_only_safety_multiplier` copies,
+        /// in `audit` as in `snapshot mark-reclaimable`. One copy at each of
+        /// `home-rack` and `offsite` meets the policy for an active unit,
+        /// not for a tape-only one at 2x.
+        #[test]
+        fn a_tape_only_unit_needs_the_multiplied_copies_at_each_named_location() {
+            let conn = setup(&["home-rack", "offsite"]);
+            conn.execute("UPDATE units SET status = 'tape_only'", [])
+                .unwrap();
+            let findings = location_findings(&conn);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(
+                findings[0].message,
+                "has 1 copy at required location home-rack, 1 copy at required location \
+                 offsite, needs 2 at each (tape-only 2x) (policy requires home-rack, offsite)"
+            );
+            assert!(
+                findings[0]
+                    .action
+                    .ends_with("tapectl volume move <OTHER-LABEL> --to home-rack"),
+                "{}",
+                findings[0].action
+            );
+
+            // One short name is named alone.
+            add_copy_at(&conn, "V-home-rack-2", "home-rack");
+            assert_eq!(
+                location_findings(&conn)[0].message,
+                "has 1 copy at required location offsite, needs 2 (tape-only 2x) \
+                 (policy requires home-rack, offsite)"
+            );
+
+            // Positive control: two at each meets it.
+            add_copy_at(&conn, "V-offsite-2", "offsite");
+            assert!(location_findings(&conn).is_empty());
+        }
     }
 
     /// ADR-0012 2026-10-06 items 1 and 24: `verify_age` dates a unit's
@@ -3656,8 +3736,17 @@ mod tests {
 
         /// Unit `aged` in archive set `monthly` (verify every 30 days), one
         /// current version completed-written to one sealed volume, with the
-        /// given `(verify_type, completed_at)` passed sessions on it.
+        /// given `(verify_type, completed_at)` passed sessions on it, each
+        /// started when it completed.
         fn setup(sessions: &[(&str, &str)]) -> Connection {
+            let dated: Vec<(&str, &str, &str)> =
+                sessions.iter().map(|(t, c)| (*t, *c, *c)).collect();
+            setup_dated(&dated)
+        }
+
+        /// [`setup`] with each session's `(verify_type, started_at,
+        /// completed_at)` given apart.
+        fn setup_dated(sessions: &[(&str, &str, &str)]) -> Connection {
             let conn = crate::db::open_memory().unwrap();
             conn.execute(
                 "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
@@ -3705,11 +3794,12 @@ mod tests {
                 params![ss_id, snap_id, vol_id],
             )
             .unwrap();
-            for (verify_type, completed_at) in sessions {
+            for (verify_type, started_at, completed_at) in sessions {
                 conn.execute(
-                    "INSERT INTO verification_sessions (volume_id, verify_type, outcome, completed_at)
-                     VALUES (?1, ?2, 'passed', ?3)",
-                    params![vol_id, verify_type, completed_at],
+                    "INSERT INTO verification_sessions
+                         (volume_id, verify_type, outcome, started_at, completed_at)
+                     VALUES (?1, ?2, 'passed', ?3, ?4)",
+                    params![vol_id, verify_type, started_at, completed_at],
                 )
                 .unwrap();
             }
@@ -3756,6 +3846,26 @@ mod tests {
         fn a_recent_full_readback_is_fresh() {
             let conn = setup(&[("full", &days_ago(2)), ("quick", &days_ago(1))]);
             assert!(verify_age_messages(&conn).is_empty());
+        }
+
+        /// ADR-0012 2026-10-07 item 30: a full readback is dated by its
+        /// START. A continued one finished yesterday, but its `started_at`
+        /// is its oldest checkpoint, 100 days ago, so it reads as 100 days
+        /// old: some of its files were last read then. A quick readback
+        /// today still does not count (full-only).
+        #[test]
+        fn a_continued_full_readback_is_as_old_as_its_oldest_checkpoint() {
+            let oldest_checkpoint = days_ago(100);
+            let conn = setup_dated(&[
+                ("full", &oldest_checkpoint, &days_ago(1)),
+                ("quick", &days_ago(0), &days_ago(0)),
+            ]);
+            assert_eq!(
+                verify_age_messages(&conn),
+                [format!(
+                    "not verified within 30 days (last: {oldest_checkpoint})"
+                )]
+            );
         }
     }
 
