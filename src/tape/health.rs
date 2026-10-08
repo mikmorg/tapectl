@@ -329,6 +329,12 @@ pub enum Reading {
     /// Folding it into `write` would hide exactly the row a trend wants to
     /// start from.
     Init,
+    /// A `drive poll` (issue #309; ADR-0012, 2026-10-07 item 29): the drive's
+    /// health read on a timer, with no tape command around it and no tape
+    /// motion — read through the sg node only. Its own kind because it
+    /// drove the tape no way at all: a poll reading beside a write's is what
+    /// tells "the drive between sessions" from "the drive during one".
+    Poll,
 }
 
 impl Reading {
@@ -340,6 +346,7 @@ impl Reading {
         Reading::Verify,
         Reading::Restore,
         Reading::Init,
+        Reading::Poll,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -349,6 +356,7 @@ impl Reading {
             Reading::Verify => "verify",
             Reading::Restore => "restore",
             Reading::Init => "init",
+            Reading::Poll => "poll",
         }
     }
 }
@@ -1225,7 +1233,7 @@ Read error counter page  [0x3]
         let names: Vec<&str> = Reading::ALL.iter().map(|r| r.as_str()).collect();
         assert_eq!(
             names,
-            vec!["write", "resume", "verify", "restore", "init"],
+            vec!["write", "resume", "verify", "restore", "init", "poll"],
             "health_logs.operation is what KIND of reading a row is — a \
              different vocabulary from cartridge_contacts.operation, which is \
              the command verbatim"
@@ -1243,8 +1251,21 @@ Read error counter page  [0x3]
             Some(i) => &full[..i],
             None => &full[..],
         };
+        // The two production writers: write.rs (every tape command's
+        // reading) and tape/poll.rs (`drive poll`'s, issue #309), each cut
+        // the same way.
+        let poll_full = source_of("tape/poll.rs");
+        let poll_prod = match poll_full.find("#[cfg(test)]\nmod tests") {
+            Some(i) => &poll_full[..i],
+            None => &poll_full[..],
+        };
+        assert!(
+            poll_prod.len() < poll_full.len(),
+            "positive control: poll.rs's test module was separated from its production half"
+        );
         let corpus: String = prod
             .lines()
+            .chain(poll_prod.lines())
             .filter(|l| !l.trim_start().starts_with("//"))
             .map(|l| format!("{l}\n"))
             .collect();
@@ -1264,7 +1285,7 @@ Read error counter page  [0x3]
             let variant = format!("Reading::{reading:?}");
             assert!(
                 crate::tape::contact::tests::contains_identifier(&corpus, &variant),
-                "{variant} has no PRODUCTION writer in src/volume/write.rs — a vocabulary \
+                "{variant} has no PRODUCTION writer in src/volume/write.rs or src/tape/poll.rs — a vocabulary \
                  value with no writer is exactly the `read`/`clean` defect \
                  ADR-0013 §4 names, and it is a FINDING, not a row to add"
             );

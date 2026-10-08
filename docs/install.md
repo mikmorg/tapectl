@@ -151,7 +151,7 @@ binary (`TAPECTL_BIN`), so what it proves is what step 13 uses.
 | 11 tenants, units | tenant rows and keys under `keys/`; per unit: a POSIX ACL grant (`setfacl -R -m u:tapectl:rX` on the tree, the same as a default ACL so new files inherit it, `rwX` on the top directory only, `x` on each ancestor) and a **`.tapectl-unit.toml`** dotfile in the unit's top directory | files keep their owner and mode | `getfacl <dir>`, `tapectl unit list` |
 | 12 rehearsal | the lifecycle suite's run directories under `<work dir>/tapectl-lifecycle` (`--work-dir`: `/scratch` when it is writable, else `~/.cache/tapectl`; home2's profile sets the latter); on green, the marker **`~/.local/state/tapectl/rehearsal-ok-<sha256 of the binary, 16 hex>`**, which step 13 requires for that exact binary. May add **you** to the `tape` group (the suite runs as you) | you | the marker exists |
 | 13 first tape | the volume, its cartridge row (auto-registered from the chip serial), the write and verify records, a refreshed heir kit; per-run capture files under `~/.local/state/tapectl/` | — | `tapectl volume list`, `report verify-status` |
-| 14 timers, wrapper | via `scripts/install-systemd.sh` (§7): `/etc/systemd/system/tapectl-audit.{service,timer}`, `/etc/systemd/system/tapectl-backup.{service,timer}`, `/usr/local/lib/tapectl/tapectl-scheduled-{audit,backup}.sh`, the backup dir (**`/var/backups/tapectl`** by default), **`/usr/local/bin/tapectl-op`** | units root 0644, scripts root 0755, backup dir `tapectl` 0700, wrapper root 0755 | `systemctl list-timers 'tapectl-*'` |
+| 14 timers, wrapper | via `scripts/install-systemd.sh` (§7): `/etc/systemd/system/tapectl-audit.{service,timer}`, `/etc/systemd/system/tapectl-backup.{service,timer}`, `/etc/systemd/system/tapectl-drive-poll.{service,timer}`, `/usr/local/lib/tapectl/tapectl-scheduled-{audit,backup,drive-poll}.sh`, the backup dir (**`/var/backups/tapectl`** by default), **`/usr/local/bin/tapectl-op`** | units root 0644, scripts root 0755, backup dir `tapectl` 0700, wrapper root 0755 | `systemctl list-timers 'tapectl-*'` |
 
 Nothing is written to a tape before step 12, and step 12 erases only the
 cartridge whose serial you typed.
@@ -353,7 +353,7 @@ each installed file `unchanged`, or rewrites only what differs.
 ## 7. The timers and the operator wrapper
 
 `scripts/install-systemd.sh` is what step 14 runs; it can be run alone at any
-time, and it never touches a tape or a device node.
+time, and it never touches a tape or a device node itself.
 
 ```bash
 scripts/install-systemd.sh --dry-run                       # print the plan, change nothing
@@ -370,7 +370,7 @@ units), `--backup-dir DIR`, `--keep N`, `--tapectl PATH` (default
 It renders `contrib/systemd/` for the host — `User=`, `HOME=`, `TAPECTL_BIN=`,
 `TAPECTL_BACKUP_DIR=`, `TAPECTL_BACKUP_KEEP=`, `ReadWritePaths=` — installs
 only the files whose bytes differ, creates the backup directory (0700, owned by
-the service user), `daemon-reload`s, enables and starts both timers, restarts a
+the service user), `daemon-reload`s, enables and starts the three timers, restarts a
 timer whose unit changed, and prints `systemctl list-timers --all 'tapectl-*'`.
 **Edit the installed units by re-running the script**, not by hand.
 
@@ -378,11 +378,20 @@ timer whose unit changed, and prints `systemctl list-timers --all 'tapectl-*'`.
 |---|---|---|---|
 | `tapectl-audit.timer` → `tapectl-audit.service` | **weekly**, Monday 09:00, `Persistent=true`, up to 30 min random delay | `tapectl-scheduled-audit.sh`: `tapectl audit`, then `tapectl report verify-status` | 0 clean, 1 warnings (**success** — ADR-0004, advisory), 2 violations (failure), 70 the audit's own error and any other code but 75 no verdict (failure) |
 | `tapectl-backup.timer` → `tapectl-backup.service` | **daily**, 03:00, `Persistent=true`, up to 15 min random delay | `tapectl-scheduled-backup.sh`: `tapectl db backup --to <dir>/tapectl-<UTC stamp>.db`, SQLite-header check on the copy, `tapectl db fsck` on the live catalog, prune to the newest **14** | nonzero if the copy is not a database or fsck found problems |
+| `tapectl-drive-poll.timer` → `tapectl-drive-poll.service` | **daily**, 06:30, `Persistent=true`, up to 30 min random delay | `tapectl-scheduled-drive-poll.sh`: `tapectl drive poll` — the drive's log pages and, when a cartridge is loaded, its chip, through `/dev/sg*` only ([operator guide](operator-guide.md#the-daily-drive-poll)) | 0 nothing reported, 1 a raised TapeAlert or an unrecovered error (failure), 75 a tapectl command holds the drive or is writing the catalog (success, nothing read, no ping), any other code no reading, or a reading the catalog could not record (failure) |
 
-Both services run as the service user with `PrivateDevices=true` (no
-`/dev/nst*`, ever), `ProtectSystem=strict` with only the tapectl home and — for
-the backup — the backup directory writable, and `NoNewPrivileges=true`. The
-home must be writable even for a read: the database is in WAL mode.
+The audit and backup services run as the service user with
+`PrivateDevices=true` (no device node at all), the drive poll's with
+`DevicePolicy=closed` and `DeviceAllow=char-sg rw` (every `/dev/sg*`, whatever
+its number after a reboot, and no `/dev/nst*`, ever); all three with
+`ProtectSystem=strict`, only the tapectl home and — for the backup — the
+backup directory writable, and `NoNewPrivileges=true`. The home must be
+writable even for a read: the database is in WAL mode. The poll needs the
+service user in the group that owns the sg node — step 6 (§3) already put it
+there. Its healthchecks.io-style ping is its own: set
+`TAPECTL_DRIVE_HEALTHCHECK_URL` in `tapectl-drive-poll.service`, a second check
+beside the audit's `TAPECTL_HEALTHCHECK_URL`, so a raised TapeAlert can go red
+on its own.
 
 **The backup directory.** Default `/var/backups/tapectl`; retention
 `TAPECTL_BACKUP_KEEP=14`; private keys **not** included (issue #40 — a key copy
@@ -628,7 +637,7 @@ nothing else; the rest is deliberate, by hand, in this order.
 
 ```bash
 # 1. the timers, their wrappers and tapectl-op (disables and stops the timers,
-#    removes the four units and any drop-ins, /usr/local/lib/tapectl/, the wrapper,
+#    removes the six units and any drop-ins, /usr/local/lib/tapectl/, the wrapper,
 #    daemon-reloads)
 scripts/install-systemd.sh --uninstall
 
@@ -685,7 +694,8 @@ tapectl --version                                   # note it; the rehearsal mar
 sudo -u tapectl -H tapectl config check             # config loads; the two device nodes name one drive
 sudo -u tapectl -H tapectl db fsck
 sudo -u tapectl -H tapectl audit                    # 0 clean, 1 warnings, 2 violations — all fine on day one
-systemctl list-timers --all 'tapectl-*'             # both timers, next elapse shown
+systemctl list-timers --all 'tapectl-*'             # the three timers, next elapse shown
+sudo systemctl start tapectl-drive-poll.service && journalctl -u tapectl-drive-poll.service -n 20
 sudo systemctl start tapectl-backup.service && sudo ls -l /var/backups/tapectl
 ls -l ~/.local/state/tapectl/rehearsal-ok-*         # the step-12 marker for THIS binary
 ```

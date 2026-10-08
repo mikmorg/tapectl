@@ -215,6 +215,10 @@ pub enum Operation {
     RestoreVolume,
     RestoreRawVolume,
     CatalogRebuild,
+    /// `tapectl drive poll` (issue #309): a contact with no tape command
+    /// around it — the drive's health pages and chip, read through the sg
+    /// node only, on a timer.
+    DrivePoll,
 }
 
 impl Operation {
@@ -232,6 +236,7 @@ impl Operation {
             Operation::RestoreVolume => "restore volume",
             Operation::RestoreRawVolume => "restore raw-volume",
             Operation::CatalogRebuild => "catalog rebuild",
+            Operation::DrivePoll => "drive poll",
         }
     }
 
@@ -249,6 +254,7 @@ impl Operation {
         Operation::RestoreVolume,
         Operation::RestoreRawVolume,
         Operation::CatalogRebuild,
+        Operation::DrivePoll,
     ];
 }
 
@@ -640,6 +646,12 @@ impl<'a> ContactGuard<'a> {
         given: Option<&DriveIdentity>,
         sysfs_root: Option<&Path>,
     ) -> ContactGuard<'a> {
+        // The drive lock (issue #309; ADR-0012, 2026-10-07 item 29), held
+        // from here until the process exits — past this contact's close,
+        // through the post-command health sweep a read path takes after it
+        // — so a `drive poll` never reads the log pages this command's own
+        // reading is owed. Waits briefly for a poll; never refuses.
+        crate::staging::lock::hold_drive_for_contact(conn, device);
         // Which drive (ADR-0013 §1, issue #314) — asked of the backend the
         // caller already resolved, never looked up again here. Only an
         // Observed medium carries one: `NoBackend` is the DR machine with
@@ -1038,6 +1050,46 @@ pub(crate) mod tests {
         conn.last_insert_rowid()
     }
 
+    /// Issue #309 (ADR-0012, 2026-10-07 item 29): a contact holds its
+    /// drive's lock from the moment it opens — and after it closes, because
+    /// a read path's health sweep runs after its contact has closed — so a
+    /// `drive poll` cannot read the log pages this command's own sweep is
+    /// owed. Positive control: before the contact, the lock is free.
+    #[test]
+    fn a_contact_holds_the_drive_lock_past_its_close() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_file = tmp.path().join("tapectl.db");
+        let conn = crate::db::open(&db_file).unwrap();
+        let device = "/nonexistent/contact-lock/nst5";
+        assert!(
+            !crate::staging::lock::drive_lock_held(&db_file, device),
+            "positive control: nothing holds the drive before the contact"
+        );
+        let config = config_with_backend();
+        let mam = mam_with_serial(None, None);
+        let guard = ContactGuard::open_with_identity(
+            &conn,
+            &config,
+            Operation::VolumeVerify,
+            device,
+            None,
+            Medium::Observed {
+                backend: &backend(),
+                mam: &mam,
+            },
+            Some(&DriveIdentity::default()),
+        );
+        assert!(
+            crate::staging::lock::drive_lock_held(&db_file, device),
+            "an open contact holds the drive lock"
+        );
+        guard.finish(OUTCOME_OK, None);
+        assert!(
+            crate::staging::lock::drive_lock_held(&db_file, device),
+            "and still holds it after the close, for the post-command sweep"
+        );
+    }
+
     #[test]
     fn migration_020_applies_from_001_forward_and_fsck_passes() {
         // `open_memory` runs the full ordered migration chain.
@@ -1118,6 +1170,7 @@ pub(crate) mod tests {
                 "restore volume",
                 "restore raw-volume",
                 "catalog rebuild",
+                "drive poll",
             ],
             "cartridge_contacts.operation is the command VERBATIM — a different \
              vocabulary from health_logs.operation, which says what kind of reading \

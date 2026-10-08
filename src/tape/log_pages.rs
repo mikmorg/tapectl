@@ -921,6 +921,19 @@ pub(crate) mod tests {
         volume_id: Option<i64>,
         pages: usize,
     ) {
+        assert_one_reading_of_kind(conn, cid, trigger, "restore", volume_id, pages);
+    }
+
+    /// [`assert_one_reading_for`] for a reading of any kind — `drive poll`'s
+    /// is `poll` (issue #309).
+    pub(crate) fn assert_one_reading_of_kind(
+        conn: &Connection,
+        cid: i64,
+        trigger: &str,
+        kind: &str,
+        volume_id: Option<i64>,
+        pages: usize,
+    ) {
         let health: Vec<(Option<i64>, String, Option<i64>)> = conn
             .prepare("SELECT contact_id, operation, volume_id FROM health_logs ORDER BY id")
             .unwrap()
@@ -930,8 +943,8 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             health,
-            vec![(Some(cid), "restore".to_string(), volume_id)],
-            "exactly one health_logs row, of kind 'restore', naming contact {cid}"
+            vec![(Some(cid), kind.to_string(), volume_id)],
+            "exactly one health_logs row, of kind '{kind}', naming contact {cid}"
         );
         let journal: Vec<(Option<i64>, String, i64)> = conn
             .prepare("SELECT contact_id, trigger, page_code FROM log_page_journal ORDER BY id")

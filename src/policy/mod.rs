@@ -14,6 +14,7 @@ pub mod lenient_config;
 pub mod reclaimable;
 pub mod shadowing;
 pub mod subsumed;
+pub mod tape_alerts;
 pub mod tenancy;
 pub mod unknown_keys;
 

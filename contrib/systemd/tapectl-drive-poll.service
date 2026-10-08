@@ -1,0 +1,45 @@
+[Unit]
+Description=tapectl daily drive health poll (read-only, SCSI generic node only)
+Documentation=file:/usr/share/doc/tapectl/operator-guide.md
+# Ordering only — this unit is harmless if the network never comes up.
+After=network-online.target
+
+[Service]
+Type=oneshot
+
+# The same account and home as tapectl-audit.service: tapectl resolves its
+# config root purely from $HOME, so both must name the account whose
+# ~/.tapectl holds the database.
+User=tapectl
+Environment=HOME=/var/lib/tapectl
+
+# Optional healthchecks.io-style endpoint for THIS check — a second check,
+# with its own UUID, separate from the audit's: a raised TapeAlert is a
+# hardware fact, not a policy finding, and must be able to go red on its own.
+#Environment=TAPECTL_DRIVE_HEALTHCHECK_URL=https://hc-ping.com/YOUR-OTHER-UUID
+
+# Absolute path to the wrapper (adjust to wherever you installed it).
+ExecStart=/usr/local/lib/tapectl/tapectl-scheduled-drive-poll.sh
+
+# 75: a tapectl command holds the drive (or the catalog), so the poll read
+# nothing. Not a failure — the next run tries again.
+SuccessExitStatus=75
+
+# ADR-0012, 2026-10-07 item 29: the poll may open the SCSI generic node and
+# NOTHING ELSE. `DevicePolicy=closed` admits only the pseudo-devices
+# (/dev/null, /dev/zero, /dev/urandom, ...); `DeviceAllow=` adds every SCSI
+# generic node — the `sg` group in /proc/devices, i.e. /dev/sg* whatever its
+# number after a reboot — read and write: sg_logs and sg_read_attr open the
+# node read-write to send their commands, which is why `rw` and not `r`. The
+# st driver's nodes (/dev/nst*, /dev/st*) are the `st` group and stay closed,
+# so this unit cannot move a tape even by mistake. Do NOT set
+# PrivateDevices=true here (it hides /dev/sg* too), and never relax
+# tapectl-audit.service's, which reads no device at all.
+DevicePolicy=closed
+DeviceAllow=char-sg rw
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tapectl/.tapectl
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

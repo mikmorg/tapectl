@@ -819,10 +819,16 @@ So, before a write or a verify, make the host quiet:
 - Pause anything that competes for CPU, memory or the staging disk: CI runners
   and their systemd timers, container builds, other backups, test suites.
 - Do not start heavy disk I/O on the filesystem that holds staging.
-- Nothing else touches the drive. tapectl itself takes no lock on the device;
-  the repository's scripts (`first-run.sh` step 13 and the test harnesses) take
+- Nothing else touches the drive. Every tapectl command that contacts the
+  drive holds its drive lock (`<home>/locks/drive-<node>.lock`) from its
+  contact until it exits, so the [daily drive poll](#the-daily-drive-poll)
+  skips rather than read the drive under it. The lock does not stop a second
+  tapectl command: the kernel's `st` driver refuses a second open on its own
+  ("Device or resource busy"), and a command that finds the lock held waits a
+  minute and then proceeds without it. The repository's scripts
+  (`first-run.sh` step 13 and the test harnesses) also take
   `/tmp/tapectl-tape.lock` and refuse a second user, but a command you type by
-  hand does not check it.
+  hand does not check that one.
 - Memory matters too: a process killed for memory pressure mid-write costs the
   cartridge its session (a clean abort to an unsealed tape, but the time is
   gone). Keep a few GB free. tapectl itself holds up to 256 MiB of tape blocks
@@ -1694,9 +1700,9 @@ copy.
 The weekly glance is the one part of the cadence a machine can do for you,
 because it is read-only and needs no tape in the drive. A `first-run.sh`
 install already has it: step 14 runs `scripts/install-systemd.sh`, which
-installs two timers from `contrib/systemd/` — a weekly audit and a daily
-catalog backup — plus the `tapectl-op` wrapper. To install or re-render them on
-their own:
+installs three timers from `contrib/systemd/` — a weekly audit, a daily
+catalog backup and a [daily drive poll](#the-daily-drive-poll) — plus the
+`tapectl-op` wrapper. To install or re-render them on their own:
 
 ```bash
 scripts/install-systemd.sh --dry-run                        # print the plan, change nothing
@@ -1747,8 +1753,11 @@ ping never changes the run's own result.
 
 Two things the timers do **not** change:
 
-- **They never write.** No tape command is scheduled, ever. The services set
-  `PrivateDevices=true` so they cannot reach `/dev/nst*` even by mistake.
+- **They never write.** No tape command is scheduled, ever. The audit and
+  backup services set `PrivateDevices=true`, so they cannot reach any device
+  at all; the drive poll's service may open the SCSI generic node
+  (`/dev/sg*`) and nothing else, so it cannot reach `/dev/nst*` even by
+  mistake.
 - **They are safe to fire during other work.** Opening the database runs
   the startup sweep, which marks a crashed write session `interrupted` and a
   crashed verification `aborted`. It tells a crashed session from a live
@@ -1766,6 +1775,72 @@ The same lock guards the destructive commands. `volume abort`, `volume
 resume` and `staging clean` (with or without `--force`) refuse a volume or
 stage set whose session is live, and `--force` does not override that: the
 running command is a fact, not a risk judgement.
+
+#### The daily drive poll
+
+Between a write and the next verify a drive can go months unwatched, and the
+audit cannot look: it reads no device. `tapectl drive poll` is the one
+scheduled command that touches the drive (ADR-0012, 2026-10-07 item 29), and
+it only *reads*:
+
+```bash
+tapectl drive poll                                     # the only configured drive
+tapectl drive poll --device /dev/tape/by-id/scsi-HUJ808A5L4-nst
+```
+
+It sends three kinds of command to the backend's `device_sg`, and nothing
+else: LOG SENSE (every log page the drive lists, each read once), READ
+ATTRIBUTE (the cartridge chip, which answers only when a cartridge is loaded)
+and INQUIRY. It **never** opens the tape node, moves the tape, loads, ejects
+or rewinds a cartridge, or writes to a medium — and tapectl drives no changer,
+so a scheduled load is not something it could do. Everything it reads is
+recorded verbatim as a contact of its own (`cartridge_contacts.operation =
+'drive poll'`): each log page in the log-page journal, the chip read in the
+MAM journal, and one reading in `report health`. With no cartridge loaded, or
+one the catalog does not know, the reading is the drive's alone; with a known
+cartridge loaded the contact names that cartridge, and `audit` follows it to
+the volume on it.
+
+The TapeAlert page (0x2E) may clear as it is read, so the poll runs only when
+no tapectl command has the drive: it takes the drive lock without waiting, and
+when a command holds it, it reads nothing and exits 75. A poll can therefore
+never take the alerts a write's or a verify's own reading is owed. Nor does it
+read a page the catalog cannot record: it takes the catalog's write lock and
+records its contact before the first page, and reads nothing when it cannot (75
+for a catalog another command is writing, 2 for one that refuses writes); a
+page it read but could not record is named, printed in full, and exits 2.
+**Reading
+page 0x2E by hand (`sg_logs --page=0x2e`) can clear it the same way** —
+debugging with `sg_logs` can erase the evidence you are looking for; run
+`tapectl drive poll` instead, which keeps it.
+
+| exit | meaning | unit result |
+|---|---|---|
+| 0 | recorded; the drive reported nothing | success |
+| 1 | recorded; the drive raised a TapeAlert or reported an unrecovered error (named) | **failure** |
+| 2 | no reading: the sg node could not be read, no drive is configured, or the catalog refuses writes — or a reading the catalog could not record (named; the output is its only copy) | failure |
+| 75 | a tapectl command holds the drive, or another is writing the catalog; nothing was read | neither (`SuccessExitStatus=75`, no ping) |
+
+Unlike the audit's warnings, a raised TapeAlert *is* a failure here: it is a
+hardware fact, not a policy finding, and this is the check that exists to go
+red. Ping it through its own healthchecks.io-style check, separate from the
+audit's: set `TAPECTL_DRIVE_HEALTHCHECK_URL` in `tapectl-drive-poll.service`
+(`/start` before, bare URL on 0, `/fail` on 1, 2 and anything else but 75; the
+poll's output is the ping's body, so the check's log names the flags). The
+audit sees the same alerts from the catalog: `tape_alert` warns (exit 1) for
+each live volume whose cartridge raised one not before the volume's last
+passed full verify started, and names the flags; the remedy is `tapectl volume verify
+<label>`, which either passes (the warning goes) or quarantines the volume
+(and the copy checks take over).
+
+The timer runs daily at 06:30 (30 minutes' jitter, `Persistent=true`): a poll
+costs seconds and no tape motion, and a drive idle for months is the one whose
+first sign of trouble should not wait a week. The service runs as the service
+user with `DevicePolicy=closed` and `DeviceAllow=char-sg rw` — every
+`/dev/sg*`, whatever its number after a reboot, and no `/dev/nst*` — and it
+needs that user in the group that owns the sg node (usually `tape`;
+`first-run.sh` step 6 adds it). The audit's service keeps
+`PrivateDevices=true`.
 
 ### Monthly — verify a rotating slice of the library
 

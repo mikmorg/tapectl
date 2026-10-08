@@ -141,6 +141,10 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // #241's file scope), never fixed here, only moved out of `Excluded`.
     (&["db", "import"], Verdict::Honours),
     (&["db", "stats"], Verdict::ReadOnly),
+    // Issue #309: a poll is one read of the drive and a record of it; a
+    // preview would have to read the drive too. Refused before the backend
+    // is resolved, so the refusal never reaches a device.
+    (&["drive", "poll"], Verdict::Refuses { probe_args: &[] }),
     // export/import/init/quick-archive: top-level `Commands::*` arms in
     // `main.rs` that call `cli::operations::*`/`cmd_init` directly, never a
     // `cli::<mod>::run(...)` dispatch — fixed by issue #247, which extended
