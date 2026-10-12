@@ -492,8 +492,11 @@ fn budget(path: Path) -> (f64, usize) {
         // files from BOT, so nearly free in travel, but counted.
         Path::VerifyQuick => (1.05, 1),
         // File 0, File 3 and the operator envelope, all before the slices
-        // (format §1). Rebuild never reads the seal.
-        Path::Rebuild => (0.01, 0),
+        // (format §1), then one locate out to the seal marker for its
+        // `sealed_at` (#305: without it a sealed tape is dated to the
+        // rebuild). On a real drive that is high-speed positioning, not a
+        // read pass; no rewind follows.
+        Path::Rebuild => (1.05, 0),
         // File 0 and File 3 heads, a rewind a few files from BOT, then one
         // forward pass over every file.
         Path::Raw => (1.05, 1),

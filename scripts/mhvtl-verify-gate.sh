@@ -1535,7 +1535,7 @@ s = sqlite3.connect(src); d = sqlite3.connect(dst)
 s.backup(d)   # WAL-safe: a plain cp can miss <db>-wal and hand back a stale copy
 s.close()
 rows = d.execute(
-    """SELECT j.id, j.contact_id, j.decoded, c.barcode
+    """SELECT j.id, j.contact_id, j.decoded, c.barcode, j.raw
        FROM log_page_journal j
        JOIN cartridge_contacts cc ON cc.id = j.contact_id
        LEFT JOIN cartridges c ON c.id = cc.cartridge_id
@@ -1546,17 +1546,31 @@ rows = d.execute(
 assert rows, "positive control: no closed contact with both a decoded 0x2E row and a health row -- nothing to seed"
 # The premise: every 0x2E ever read is all-zero. If that stopped being true,
 # say so -- it is issue #340's first sighting, not a defect in this step.
-raised = [(jid, cid) for jid, cid, dec, _ in rows
+raised = [(jid, cid) for jid, cid, dec, _, _ in rows
           if any(l.rstrip().endswith(": 1") for l in dec.splitlines())]
 nonzero = d.execute("SELECT id, contact_id, tape_alerts FROM health_logs WHERE tape_alerts > 0").fetchall()
 assert not raised and not nonzero, (
     "the UNMODIFIED gate catalog already carries a non-zero TapeAlert -- issue #340's first "
     f"sighting, on mhvtl: journal rows {raised}, health rows {nonzero}. Read it before touching this step.")
-jid, cid, dec, barcode = rows[0]
+jid, cid, dec, barcode, raw = rows[0]
 flipped = dec.replace("  Cleaning required: 0", "  Cleaning required: 1", 1) \
              .replace("  Drive temperature: 0", "  Drive temperature: 1", 1)
 assert flipped.count(": 1") == 2, "the decode did not carry both flag lines to flip"
-d.execute("UPDATE log_page_journal SET decoded = ? WHERE id = ?", (flipped, jid))
+# #303 reads the flags from the journalled page bytes when they parse, so the
+# bytes must say the same thing: set the value bit of parameters 20 and 36.
+if raw is not None:
+    page = bytearray(raw)
+    assert page[0] & 0x3f == 0x2e, "the journalled raw page is not 0x2E"
+    end, at, hit = 4 + int.from_bytes(page[2:4], "big"), 4, []
+    while at + 4 <= end:
+        code, length = int.from_bytes(page[at:at + 2], "big"), page[at + 3]
+        if code in (20, 36) and length:
+            page[at + 4] |= 0x01
+            hit.append(code)
+        at += 4 + length
+    assert hit == [20, 36], f"the raw page did not carry parameters 20 and 36 to flip: {hit}"
+    raw = bytes(page)
+d.execute("UPDATE log_page_journal SET decoded = ?, raw = ? WHERE id = ?", (flipped, raw, jid))
 d.execute("UPDATE health_logs SET tape_alerts = 2 WHERE contact_id = ?", (cid,))
 d.commit()
 print(cid, barcode if barcode is not None else "-")

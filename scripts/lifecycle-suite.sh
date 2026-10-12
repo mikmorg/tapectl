@@ -1814,7 +1814,16 @@ scenario_key_rotation() {
 # moved, write a new version under bob, and prove alice's OLD volume
 # (VOL-A) is still restorable both ways — reassignment changes DB
 # ownership, not which key a slice was encrypted to.
-tr_reassign() { TCTL tenant reassign --to bob alice; }
+# #383: a reassign also rewrites each moved unit's dotfile to name its new
+# tenant, so the source no longer matches what v1 archived -- the pristine
+# copy is taken before it (tr.save_pristine runs first), and this checks the
+# rewrite happened.
+tr_reassign() {
+    TCTL tenant reassign --to bob alice || return 1
+    [ "$DRY_RUN" = 1 ] && return 0
+    grep -q '^tenant = "bob"$' "$SRC/photos/.tapectl-unit.toml" \
+        || { echo "reassign did not rewrite photos' dotfile to tenant bob (#383):"; cat "$SRC/photos/.tapectl-unit.toml"; return 1; }
+}
 
 # `unit list --json` (src/db/queries.rs list_units) returns `tenant_id`,
 # not a tenant name, so the move is checked via the `--tenant NAME` filter
@@ -1893,9 +1902,9 @@ tr_catalog_locate() {
 
 scenario_tenant_reassign() {
     check tr.setup                    bootstrap_archive_v1
+    check tr.save_pristine            tr_save_pristine
     check tr.reassign                 tr_reassign
     check tr.unit_list_shows_move     tr_unit_list_shows_move
-    check tr.save_pristine            tr_save_pristine
     check tr.write_photos_v2          tr_write_photos_v2
 
     restore_matrix VOL-D photos bob "$SRC/photos" tr-photos-bob alice
