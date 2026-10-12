@@ -1918,8 +1918,11 @@ scenario_tenant_reassign() {
 # Scenario: tape-only-and-reclaim
 # ============================================================
 # After bootstrap_two_volumes (VOL-A/vault v1, VOL-B/offsite v2): every
-# first-year unit has 2 sealed copies in 2 locations, so mark-tape-only
-# must PASS for them; a freshly-written "solo" unit with only 1 copy must
+# first-year unit has 2 sealed copies in 2 locations, which meets the
+# policy and the tape-only place floor (2, never multiplied) but not the
+# tape-only copy floor (2 x 2 = 4, ADR-0012 2026-10-12 items 43 and 46), so
+# mark-tape-only must refuse photos naming the multiplier and pass it with
+# --yes; a freshly-written "solo" unit with only 1 copy must
 # be REFUSED, naming the shortfall. Then reclaim v1 (mark-reclaimable ->
 # purge), staging clean, and prove the LATEST version is still restorable.
 #
@@ -1959,8 +1962,26 @@ tor_mark_tape_only_photos_passes() {
         skip "tor.mark_tape_only_photos_passes" "single-cartridge mode: VOL-A was retired when VOL-B/VOL-SOLO reused its cartridge, so photos genuinely has <2 live copies here"
         return $?
     fi
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl unit mark-tape-only photos (>=2 copies in >=2 locations -> PASS)"; return 0; }
-    TCTL unit mark-tape-only photos
+    # ADR-0012 2026-10-12 items 43, 46 and 47 (#423 part 2): mark-tape-only
+    # holds the unit to the floors of a TAPE-ONLY unit. The multiplier (2 by
+    # default) raises the COPY floor only: min_copies 2 -> 4 copies, while
+    # min_locations stays 2 places. By this point v1 was reclaimed and purged
+    # (tor.purge_v1_photos runs first), so photos' one current version, v2,
+    # sits on VOL-B (offsite) and VOL-SOLO (vault): 2 copies in 2 places. That
+    # is short of 4 copies and NOT short of places. A bare run (stdin is
+    # /dev/null) must refuse with the copy fact naming "(tape-only 2x)" and no
+    # location fact at all; the Tier-2 consent (--yes, item 47) then marks it,
+    # as an operator who accepts the margin would.
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl unit mark-tape-only photos (2 copies in 2 locations: short of the tape-only 4 copies, places met at 2 -> REFUSED naming (tape-only 2x), no location fact), then with --yes -> PASS"; return 0; }
+    local out rc
+    out="$(TCTL unit mark-tape-only photos 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "mark-tape-only photos passed without consent below the tape-only copy floor (2 copies against 2 x 2): $out"; return 1; }
+    echo "$out" | grep "insufficient copies: [0-9]* < 4 required .*(tape-only 2x)" >/dev/null || { echo "refusal did not give the multiplied copy floor (< 4, tape-only 2x): $out"; return 1; }
+    if echo "$out" | grep "insufficient locations" >/dev/null; then
+        echo "refusal named a location shortfall: 2 places meets min_locations 2, which the multiplier must not raise (ADR-0012 2026-10-12 item 46): $out"
+        return 1
+    fi
+    TCTL unit mark-tape-only photos --yes
 }
 
 tor_mark_tape_only_solo_refused() {

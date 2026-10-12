@@ -1043,7 +1043,9 @@ pub(crate) struct StagedSetRow {
     /// snapshot scope — a copy is identical content, counted per version,
     /// ADR-0012).
     pub copies: i64,
-    /// The unit's resolved `min_copies` ([`crate::policy::resolve`]), or
+    /// The unit's copy floor: its resolved `min_copies` ([`crate::policy::resolve`]),
+    /// times the tape-only multiplier for a tape-only unit
+    /// ([`crate::policy::coverage::copy_floor`]), or
     /// `None` when its policy cannot be resolved — `audit` reports that as
     /// `policy_unresolvable`; here it counts as owing, the conservative
     /// reading for a list of outstanding work.
@@ -1101,8 +1103,15 @@ pub(crate) fn staged_set_rows(conn: &Connection, config: &Config) -> Result<Vec<
             Some(m) => *m,
             None => {
                 let m = match queries::get_unit_by_name(conn, &unit)? {
+                    // The copy floor through the one tape-only rule
+                    // (ADR-0012 2026-10-12 item 43), as `staging clean`
+                    // retains by.
                     Some(u) => match crate::policy::resolve(conn, config, &u) {
-                        Ok(p) => Some(p.min_copies),
+                        Ok(p) => Some(crate::policy::coverage::copy_floor(
+                            config,
+                            p.min_copies,
+                            &u.status,
+                        )),
                         Err(crate::error::TapectlError::PolicyUnresolvable { .. }) => None,
                         Err(e) => return Err(e),
                     },
@@ -3918,6 +3927,32 @@ mod tests {
                     ("vault", 2, Some(3)),
                 ],
                 "docs (2 of 2 copies) owes nothing; vault's archive set asks for 3"
+            );
+        }
+
+        /// ADR-0012 2026-10-12 item 43: a tape-only unit's staged set owes
+        /// copies up to the one tape-only rule's floor. `docs` holds 2 of
+        /// its 2 — owing nothing while active (the fixture's test above,
+        /// the positive control) — and owes a copy once tape-only at 3x.
+        #[test]
+        fn a_tape_only_units_stage_set_owes_up_to_the_multiplied_floor() {
+            let conn = fixture();
+            conn.execute(
+                "UPDATE units SET status = 'tape_only' WHERE name = 'docs'",
+                [],
+            )
+            .unwrap();
+            let mut config = Config::default();
+            config.compaction.tape_only_safety_multiplier = 3;
+            let rows = staged_set_rows(&conn, &config).unwrap();
+            let docs = rows.iter().find(|r| r.unit == "docs").unwrap();
+            assert_eq!((docs.copies, docs.min_copies), (2, Some(6)));
+            assert!(docs.owes_a_copy());
+            let photos = rows.iter().find(|r| r.unit == "photos").unwrap();
+            assert_eq!(
+                photos.min_copies,
+                Some(2),
+                "an active unit is not multiplied"
             );
         }
 

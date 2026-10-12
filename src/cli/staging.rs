@@ -151,12 +151,18 @@ fn under_copied_release_candidates(
             )
         );
         let copies: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
-        if copies < resolved.min_copies {
+        // The copy floor through the one tape-only rule (ADR-0012
+        // 2026-10-12 item 43): a tape-only unit's staged bytes (staged
+        // again by `volume read-slices`) are retained until it has
+        // `min_copies` times the multiplier, the floor `audit` judges it by.
+        let min_copies =
+            crate::policy::coverage::copy_floor(config, resolved.min_copies, &unit.status);
+        if copies < min_copies {
             under.push(UnderCopiedUnit {
                 unit_id: unit.id,
                 unit_name: name,
                 copies,
-                min_copies: resolved.min_copies,
+                min_copies,
             });
         }
     }
@@ -693,6 +699,30 @@ mod tests {
             "the under-copied unit's stage_set must NOT be released"
         );
         assert!(staged_file.exists(), "the staged .age file must survive");
+    }
+
+    /// ADR-0012 2026-10-12 item 43: the retention gate's floor is the one
+    /// tape-only rule's. One copy meets `min_copies = 1` for an active unit
+    /// (the positive control: released); the same unit tape-only at 3x
+    /// needs 3, so its staged bytes — the cheap route to those copies — are
+    /// retained.
+    #[test]
+    fn the_retention_floor_takes_the_tape_only_multiplier() {
+        let (conn, _staged_file, dir) = seed_unit_needing_a_second_copy("testlib/alpha");
+        let mut config = config_with_staging_dir_and_min_copies(dir.path(), 1);
+        config.compaction.tape_only_safety_multiplier = 3;
+
+        let under = under_copied_release_candidates(&conn, &config, None).unwrap();
+        assert!(
+            under.is_empty(),
+            "an active unit is held to min_copies alone: {under:?}"
+        );
+
+        conn.execute("UPDATE units SET status = 'tape_only'", [])
+            .unwrap();
+        let under = under_copied_release_candidates(&conn, &config, None).unwrap();
+        assert_eq!(under.len(), 1, "{under:?}");
+        assert_eq!((under[0].copies, under[0].min_copies), (1, 3));
     }
 
     /// [`retention_notice`] is what both the human-readable and (indirectly)

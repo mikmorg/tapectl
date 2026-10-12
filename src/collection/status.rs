@@ -78,8 +78,9 @@ pub fn status_for_collection(
         // check uses, so the two surfaces have to agree. Since issue #144
         // the comparison itself is `coverage::shortfall`'s, the one
         // `--policy-aware` orders by.
-        let per_name = crate::policy::coverage::copies_per_named_location(config, &unit.status);
-        if crate::policy::coverage::shortfall(conn, unit.id, &resolved, per_name)?.under_copied() {
+        if crate::policy::coverage::shortfall(conn, config, unit.id, &unit.status, &resolved)?
+            .under_copied()
+        {
             status.under_copied += 1;
         }
     }

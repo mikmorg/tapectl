@@ -248,14 +248,19 @@ written:
 ```text
 error: mark unit "<unit>" tape-only refused: non-interactive session with no confirmation given — refusing
 rather than assuming consent (re-run with --yes to proceed)
-insufficient copies: 0 < 2 required by unit "<unit>"'s policy
+insufficient copies: 0 < 4 required by unit "<unit>"'s policy (tape-only 2x)
 insufficient locations: 0 < 2 required ([defaults] location floor)
 (`--force` or `--yes` confirms this in advance)
 ```
 
 `unit mark-tape-only` reads `min_copies` from the unit's resolved policy
 (dotfile > archive set > `[defaults]`) and the location floor from
-`[defaults] min_locations`. Other fact lines it can show:
+`[defaults] min_locations`, and holds the unit to them as a tape-only unit: the
+copy floor times `[compaction] tape_only_safety_multiplier`, which the
+`(tape-only 2x)` names, and the location floor as set, never multiplied
+(ADR-0012, 2026-10-12). So at the defaults (2, 2, 2x) it asks for 4 copies in 2
+locations; a `0 < 4` copies is not a typo for 2. Set the multiplier to `1` for
+no extra margin. Other fact lines it can show:
 
 - `insufficient locations: no copy at required location(s) <names> (policy
   requires <list>)`
@@ -2385,7 +2390,7 @@ whole-archive audit, not with `--unit`.
 
 | Check | Severity | Message | Meaning and fix |
 |---|---|---|---|
-| `copy_count` | violation | `has <n> copies, needs <m>` | Fewer sealed, in-service copies of the unit's current Version than its policy's `min_copies`. A unit is as covered as its least-covered live Version. Fix: write another volume. The `fix:` line re-stages or `read-slices` first when the staged data is gone. |
+| `copy_count` | violation | `has <n> copies, needs <m>` | Fewer sealed, in-service copies of the unit's current Version than its policy's `min_copies`. A unit is as covered as its least-covered live Version. For a tape-only unit `<m>` is `min_copies` times `[compaction] tape_only_safety_multiplier`, and the message ends `(tape-only <k>x)` (ADR-0012, 2026-10-12). Fix: write another volume. The `fix:` line re-stages or `read-slices` first when the staged data is gone. |
 | `location_presence` | violation | `no copy at required location(s) <names> (policy requires <list>; copies are in <n> location(s))` | A location the policy names in `required_locations` holds no copy of the unit's current Version (checked by name; a name that is not a registered location counts as missing). Fix: write another copy and move it there. The `fix:` line ends `&& tapectl volume move <OTHER-LABEL> --to <location>`, and says to repeat it, one new copy each, when several locations are missing. For a tape-only unit each named location needs `[compaction] tape_only_safety_multiplier` copies; one short of it reads `has <n> copy at required location <name>, needs <m> (tape-only <m>x) (policy requires <list>)`. |
 | `warehouse_copies` | violation | `has <n> warehouse deposit(s), needs <m>` | The policy asks for cold-cloud deposits (`warehouse_copies > 0`). Fix: the deposit procedure in the [operator guide](operator-guide.md#warehouse-copies-cold-cloud), then `volume deposit add`. |
 | `encryption` | violation | `<n> unencrypted stage set(s) on tape, policy requires encryption` | Something on tape was written unencrypted (only possible with data from very old versions). Fix: re-stage and rewrite, as the `fix:` line spells out. |

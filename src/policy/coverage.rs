@@ -692,18 +692,60 @@ pub enum NamedScope {
     Snapshot(i64),
 }
 
-/// How many copies each NAMED required location must hold for a unit whose
-/// status is (or, for `unit mark-tape-only`, is about to be) `unit_status`:
-/// 1, or `[compaction] tape_only_safety_multiplier` for a `tape_only` unit
-/// (ADR-0012 2026-10-07 items 15 and 34 — named locations take the
-/// multiplier everywhere, as the distinct-location count does in `snapshot
-/// mark-reclaimable`). `Config::load` refuses a multiplier below 1.
-pub fn copies_per_named_location(config: &crate::config::Config, unit_status: &str) -> i64 {
+// ── The tape-only multiplier (ADR-0012 2026-10-07 items 15, 34; 2026-10-12 items 43, 46) ──
+
+/// **The** tape-only rule: the factor every COPY floor is multiplied by for
+/// a unit whose status is (or, for `unit mark-tape-only`, is about to be)
+/// `unit_status` — `[compaction] tape_only_safety_multiplier` for
+/// `tape_only`, 1 for every other status. `Config::load` refuses a
+/// multiplier below 1, so this is always at least 1.
+///
+/// ADR-0012 2026-10-12 item 43 (#423 part 2) extended item 34 from the
+/// per-name count to every copy floor: `audit`'s `copy_count`, `unit
+/// mark-tape-only`, `snapshot mark-reclaimable`, `report supersedable`, the
+/// retire family's Tier-2 facts, the staging retention gate and `report
+/// pending` all judge a tape-only unit's copies against `floor × this`.
+/// Item 46 bounds it: the multiplier raises copy floors only — the resolved
+/// `min_copies` ([`copy_floor`]) and the copies each named required
+/// location must hold ([`copies_per_named_location`]) — and NEVER a count
+/// of distinct places (`[defaults] min_locations`, the number of named
+/// locations), which a tape-only unit meets as set. At the defaults that is
+/// 4 copies in 2 places, not 4 in 4. A copy floor is never multiplied
+/// anywhere but through these two.
+pub fn tape_only_multiplier(config: &crate::config::Config, unit_status: &str) -> i64 {
     if unit_status == "tape_only" {
         i64::from(config.compaction.tape_only_safety_multiplier)
     } else {
         1
     }
+}
+
+/// A copy floor `base` (a resolved `min_copies`) as a unit of status
+/// `unit_status` must meet it: `base ×` [`tape_only_multiplier`]. Never hand
+/// it a count of distinct places: those are not multiplied (ADR-0012
+/// 2026-10-12 item 46).
+pub fn copy_floor(config: &crate::config::Config, base: i64, unit_status: &str) -> i64 {
+    base * tape_only_multiplier(config, unit_status)
+}
+
+/// The suffix a copy floor's message carries when the multiplier raised it:
+/// `" (tape-only 3x)"` for a tape-only unit whose multiplier is above 1,
+/// empty otherwise — so a message never shows a number the policy alone
+/// does not explain. A place-count message never carries it (item 46).
+pub fn tape_only_note(config: &crate::config::Config, unit_status: &str) -> String {
+    match tape_only_multiplier(config, unit_status) {
+        1 => String::new(),
+        m => format!(" (tape-only {m}x)"),
+    }
+}
+
+/// How many copies each NAMED required location must hold for a unit whose
+/// status is (or, for `unit mark-tape-only`, is about to be) `unit_status`:
+/// one copy per name, as a [`copy_floor`] — 1, or `[compaction]
+/// tape_only_safety_multiplier` for a `tape_only` unit (ADR-0012 2026-10-07
+/// items 15 and 34 — named locations take the multiplier everywhere).
+pub fn copies_per_named_location(config: &crate::config::Config, unit_status: &str) -> i64 {
+    copy_floor(config, 1, unit_status)
 }
 
 /// **The** named-location predicate: the names in `required` at which
@@ -836,16 +878,18 @@ fn distinct_names(required: &[String]) -> Vec<&String> {
 
 /// How far a unit's CURRENT coverage falls short of its resolved policy, on
 /// exactly the two terms `audit`'s `copy_count` and `location_presence`
-/// checks judge it by: [`copy_count_expr`] against `min_copies`, and
-/// [`short_required_locations`] against `required_locations` (at
-/// [`copies_per_named_location`] copies per name — ADR-0012 2026-10-07
-/// item 34). These are
+/// checks judge it by: [`copy_count_expr`] against the [`copy_floor`] of
+/// `min_copies`, and [`short_required_locations`] against
+/// `required_locations` (at [`copies_per_named_location`] copies per name —
+/// ADR-0012 2026-10-07 item 34, 2026-10-12 item 43). These are
 /// the two findings a write can resolve, which is what `--policy-aware`
 /// (`collection plan`/`run`, `volume plan`) orders by and what `collection
 /// status` counts as under-copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shortfall {
     pub copies: i64,
+    /// The copy floor: the resolved `min_copies`, times the tape-only
+    /// multiplier for a tape-only unit ([`copy_floor`]).
     pub min_copies: i64,
     /// Required locations with no copy, in the policy's order.
     pub missing_locations: Vec<String>,
@@ -853,7 +897,8 @@ pub struct Shortfall {
     /// `per_name` (a tape-only unit, ADR-0012 2026-10-07 item 34), each with
     /// the copies it holds, in the policy's order.
     pub thin_locations: Vec<(String, i64)>,
-    /// Copies each named location must hold ([`copies_per_named_location`]).
+    /// Copies each named location must hold ([`copies_per_named_location`]),
+    /// which is also the [`tape_only_multiplier`] `min_copies` was raised by.
     pub per_name: i64,
 }
 
@@ -873,7 +918,15 @@ impl Shortfall {
     pub fn describe(&self) -> String {
         let mut parts = Vec::new();
         if self.under_copied() {
-            parts.push(format!("{} of {} copies", self.copies, self.min_copies));
+            let note = if self.per_name > 1 {
+                format!(" (tape-only {}x)", self.per_name)
+            } else {
+                String::new()
+            };
+            parts.push(format!(
+                "{} of {} copies{note}",
+                self.copies, self.min_copies
+            ));
         }
         if !self.missing_locations.is_empty() {
             parts.push(format!("no copy at {}", self.missing_locations.join(", ")));
@@ -889,17 +942,20 @@ impl Shortfall {
     }
 }
 
-/// [`Shortfall`] for unit `unit_id` under its resolved policy `resolved`,
-/// each named location asked for `per_name` copies
-/// ([`copies_per_named_location`] of the unit's status).
+/// [`Shortfall`] for unit `unit_id`, whose status is `unit_status`, under
+/// its resolved policy `resolved`: `min_copies` and the copies each named
+/// location must hold both through the one tape-only rule ([`copy_floor`],
+/// [`copies_per_named_location`]).
 /// A unit with no current snapshot has 0 copies and is at no location, so a
 /// never-archived unit always falls short of a non-zero `min_copies`.
 pub fn shortfall(
     conn: &Connection,
+    config: &crate::config::Config,
     unit_id: i64,
+    unit_status: &str,
     resolved: &crate::policy::ResolvedPolicy,
-    per_name: i64,
 ) -> crate::error::Result<Shortfall> {
+    let per_name = copies_per_named_location(config, unit_status);
     let copies: i64 = conn.query_row(
         &format!(
             "SELECT {}",
@@ -916,7 +972,7 @@ pub fn shortfall(
     )?;
     Ok(Shortfall {
         copies,
-        min_copies: resolved.min_copies,
+        min_copies: copy_floor(config, resolved.min_copies, unit_status),
         missing_locations: missing_names(&short),
         thin_locations: short.into_iter().filter(|(_, n)| *n > 0).collect(),
         per_name,
@@ -932,9 +988,10 @@ pub fn unit_shortfall(
 ) -> crate::error::Result<Shortfall> {
     shortfall(
         conn,
+        config,
         unit.id,
+        &unit.status,
         &crate::policy::resolve(conn, config, unit)?,
-        copies_per_named_location(config, &unit.status),
     )
 }
 
@@ -1367,6 +1424,26 @@ pub(crate) mod tests {
         (conn, unit_id, vol_id)
     }
 
+    /// One more copy for [`setup_unit_with_deposit`]'s unit: a sealed volume
+    /// `label` shelved at the existing location `location`, holding the
+    /// unit's one stage set (a completed write).
+    pub(crate) fn add_tape_copy_at(conn: &Connection, label: &str, location: &str) {
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, location_id)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                     (SELECT id FROM locations WHERE name = ?2))",
+            params![label, location],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT ss.id, ss.snapshot_id, ?1, 'completed' FROM stage_sets ss",
+            params![conn.last_insert_rowid()],
+        )
+        .unwrap();
+    }
+
     fn scalar(conn: &Connection, expr: &str, unit_id: i64) -> i64 {
         conn.query_row(&format!("SELECT {expr}"), params![unit_id], |r| r.get(0))
             .unwrap()
@@ -1397,21 +1474,46 @@ pub(crate) mod tests {
     #[test]
     fn shortfall_is_the_audits_copy_and_location_findings() {
         let (conn, unit_id, _vol) = setup_unit_with_deposit("active");
-        let short = shortfall(&conn, unit_id, &policy(&conn, 3, &["home", "offsite"]), 1).unwrap();
+        let config = crate::config::Config::default();
+        let short = shortfall(
+            &conn,
+            &config,
+            unit_id,
+            "active",
+            &policy(&conn, 3, &["home", "offsite"]),
+        )
+        .unwrap();
         assert_eq!(short.copies, 2);
         assert!(short.under_copied());
         assert_eq!(short.missing_locations, names(&["offsite"]));
         assert!(short.any());
         assert_eq!(short.describe(), "2 of 3 copies; no copy at offsite");
 
-        let met = shortfall(&conn, unit_id, &policy(&conn, 2, &["home"]), 1).unwrap();
+        let met = shortfall(
+            &conn,
+            &config,
+            unit_id,
+            "active",
+            &policy(&conn, 2, &["home"]),
+        )
+        .unwrap();
         assert!(!met.any(), "{met:?}");
         assert_eq!(met.describe(), "");
 
         // ADR-0012 2026-10-07 item 34, as `location_presence` judges it: at
-        // the tape-only multiplier each named location is asked for
-        // `per_name` copies, so one copy at `home` is short of two.
-        let thin = shortfall(&conn, unit_id, &policy(&conn, 2, &["home"]), 2).unwrap();
+        // the tape-only multiplier (2 by default) each named location is
+        // asked for `per_name` copies, so one copy at `home` is short of
+        // two. `min_copies = 1` keeps the copy floor (1 x 2) met, so the
+        // named half is the only finding.
+        let thin = shortfall(
+            &conn,
+            &config,
+            unit_id,
+            "tape_only",
+            &policy(&conn, 1, &["home"]),
+        )
+        .unwrap();
+        assert!(!thin.under_copied(), "{thin:?}");
         assert!(thin.missing_locations.is_empty());
         assert_eq!(thin.thin_locations, vec![("home".to_string(), 1)]);
         assert!(thin.any());
@@ -1419,6 +1521,29 @@ pub(crate) mod tests {
             thin.describe(),
             "1 copy at required location home, needs 2 (tape-only 2x)"
         );
+    }
+
+    /// ADR-0012 2026-10-12 item 43: a tape-only unit's copy floor is
+    /// `min_copies` times the configured multiplier, so the two copies that
+    /// meet `min_copies = 2` for an active unit are short of six at 3x —
+    /// the one derivation `audit`'s `copy_count`, `collection status` and
+    /// `--policy-aware` share. The same unit judged active is the positive
+    /// control: nothing is multiplied.
+    #[test]
+    fn shortfall_multiplies_the_copy_floor_of_a_tape_only_unit_only() {
+        let (conn, unit_id, _vol) = setup_unit_with_deposit("tape_only");
+        let mut config = crate::config::Config::default();
+        config.compaction.tape_only_safety_multiplier = 3;
+        let resolved = policy(&conn, 2, &[]);
+
+        let tape_only = shortfall(&conn, &config, unit_id, "tape_only", &resolved).unwrap();
+        assert_eq!((tape_only.copies, tape_only.min_copies), (2, 6));
+        assert!(tape_only.under_copied());
+        assert_eq!(tape_only.describe(), "2 of 6 copies (tape-only 3x)");
+
+        let active = shortfall(&conn, &config, unit_id, "active", &resolved).unwrap();
+        assert_eq!(active.min_copies, 2);
+        assert!(!active.any(), "{active:?}");
     }
 
     // ── copy_distinctness (issue #144) ──
@@ -1750,6 +1875,34 @@ pub(crate) mod tests {
         for status in ["active", "missing"] {
             assert_eq!(copies_per_named_location(&config, status), 1, "{status}");
         }
+    }
+
+    /// ADR-0012 2026-10-12 items 43 and 46: the one rule every COPY floor asks.
+    /// A tape-only unit's floor is the base times the CONFIGURED multiplier
+    /// (3 here, so it cannot be mistaken for a literal 2), and the note
+    /// names it; every other status is the base itself, with no note — the
+    /// positive control that the rule touches tape-only units only.
+    #[test]
+    fn every_copy_floor_takes_the_tape_only_multiplier_for_a_tape_only_unit_only() {
+        let mut config = crate::config::Config::default();
+        config.compaction.tape_only_safety_multiplier = 3;
+        assert_eq!(tape_only_multiplier(&config, "tape_only"), 3);
+        assert_eq!(copy_floor(&config, 2, "tape_only"), 6);
+        assert_eq!(
+            copy_floor(&config, 0, "tape_only"),
+            0,
+            "no floor stays none"
+        );
+        assert_eq!(tape_only_note(&config, "tape_only"), " (tape-only 3x)");
+        for status in ["active", "missing"] {
+            assert_eq!(tape_only_multiplier(&config, status), 1, "{status}");
+            assert_eq!(copy_floor(&config, 2, status), 2, "{status}");
+            assert_eq!(tape_only_note(&config, status), "", "{status}");
+        }
+        // At 1x the floor is the policy's own number, so nothing to name.
+        config.compaction.tape_only_safety_multiplier = 1;
+        assert_eq!(copy_floor(&config, 2, "tape_only"), 2);
+        assert_eq!(tape_only_note(&config, "tape_only"), "");
     }
 
     fn names(v: &[&str]) -> Vec<String> {
