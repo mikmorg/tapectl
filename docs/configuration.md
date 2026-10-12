@@ -576,7 +576,7 @@ them unreadable. Removing the table takes the access back on the next command.
 be:
 
 ```text
-ops: group "tapectl-ops" may read the session logs (`tapectl --home /srv/archive_meta/tapectl status`), and nothing else in the home
+ops: group "tapectl-ops" may read the session logs (`tapectl --home /srv/archive_meta/tapectl/.tapectl status`), and nothing else in the home
 warning: ops: this user is not a member of "tapectl-ops", so it cannot give the home and logs/ that group — usermod -aG tapectl-ops <service user>, then log in again
 ```
 

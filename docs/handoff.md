@@ -186,11 +186,9 @@ You do this on home2, inside tmux, in this order. Read it through once first.
    takes effect at login. Then run `tapectl --home /srv/archive_meta/tapectl/.tapectl
    status` from your own account, without sudo. It must list the sessions. Record the
    result on #393.
-   - **If it says "permission denied",** look first at the directories above the home: a
-     member must be able to traverse each one. `/srv/archive_meta` is root 0750, and
-     `home2-prep.sh` grants `x` on it by ACL to the `tapectl` user only.
-   - **Which path to use.** Some docs spell this path as `/srv/archive_meta/tapectl`,
-     which is the service user's home. Use the path step 7 prints.
+   - **If it says "permission denied",** a directory above the home still blocks the
+     group. Step 7 grants the group traverse (`x` only) on each one that lacks it and checks
+     `status` as you with the group; read what step 7 printed there.
 
 ### L6-0001 at its volume init
 

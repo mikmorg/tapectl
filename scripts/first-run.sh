@@ -773,7 +773,28 @@ EOF
     # Any tapectl command run as the service user applies the modes; this one
     # also reports them.
     run tc config check || true
-    ok "ops group $OPS_GROUP: \`tapectl --home $EFFECTIVE_HOME status\` works for its members"
+    # The home's 0710 is not enough on its own: every directory above it must
+    # let the group through too. On home2 /srv/archive_meta is root 0750 with
+    # traverse granted to the service user alone, so members got "permission
+    # denied" while this step said it worked. Grant traverse (x only) where the
+    # group lacks it, then check as the operator with the group, not by claim.
+    p="$(dirname "$EFFECTIVE_HOME")"
+    while [ "$p" != / ] && [ -n "$p" ]; do
+      read -r pmode pgroup <<< "$(sudo stat -c '%A %G' "$p")"
+      if [ "${pmode:9:1}" = x ] || [ "${pmode:9:1}" = t ] \
+         || { [ "$pgroup" = "$OPS_GROUP" ] && { [ "${pmode:6:1}" = x ] || [ "${pmode:6:1}" = s ]; }; } \
+         || sudo getfacl -p "$p" 2>/dev/null | grep -E "^group:$OPS_GROUP:..x" >/dev/null; then :
+      else
+        run sudo setfacl -m "g:$OPS_GROUP:x" "$p" || die "could not let $OPS_GROUP traverse $p (setfacl)"
+      fi
+      p="$(dirname "$p")"
+    done
+    if sudo setpriv --reuid="$(id -u "$USER")" --regid="$(getent group "$OPS_GROUP" | cut -d: -f3)" --clear-groups \
+         "$TAPECTL" --home "$EFFECTIVE_HOME" status >/dev/null 2>&1; then
+      ok "ops group $OPS_GROUP: \`tapectl --home $EFFECTIVE_HOME status\` works for its members (checked as $USER with the group)"
+    else
+      note "could not run \`tapectl --home $EFFECTIVE_HOME status\` as $USER with group $OPS_GROUP from here — after your next login, run it once; a \"permission denied\" names the directory that still blocks the group"
+    fi
   else
     note "no group $OPS_GROUP — the session logs stay readable by $SVC_USER only"
   fi

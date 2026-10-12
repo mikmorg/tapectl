@@ -548,17 +548,17 @@ timings are kept in the catalog regardless.
 the session logs alone — it opens no catalog and no config:
 
 ```bash
-tapectl --home /srv/archive_meta/tapectl status            # what is running, and the last 5
-tapectl --home /srv/archive_meta/tapectl status --last 20 --json
+tapectl --home /srv/archive_meta/tapectl/.tapectl status            # what is running, and the last 5
+tapectl --home /srv/archive_meta/tapectl/.tapectl status --last 20 --json
 ```
 
 ```text
-session logs: /srv/archive_meta/tapectl/logs
+session logs: /srv/archive_meta/tapectl/.tapectl/logs
 running: volume write L6-0002 (pid 81234), started 2026-10-06T03:12:40.118Z
   phase:    write
   progress: write 512.0 GiB of 1.20 TiB (41.7%), 145.2 MiB/s, ETA 1h 21m, elapsed 1h 00m — file 19 of 43 (at 2026-10-06T04:12:41.002Z)
   last log line at 2026-10-06T04:12:58.310Z
-  log:      /srv/archive_meta/tapectl/logs/20261006T031240Z-volume-write-L6-0002-81234.log
+  log:      /srv/archive_meta/tapectl/.tapectl/logs/20261006T031240Z-volume-write-L6-0002-81234.log
 recent:
   2026-10-05T19:02:11.904Z  stage create keepsake/1998-wedding  — ok
       check            2.1 s
