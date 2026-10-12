@@ -1341,3 +1341,28 @@ Also ruled: the chip's and the drive's wear figures stay in the journal (ADR-001
 copied into columns on `cartridges` (#299). And **a migration file is named for its position**
 in `db::migrations()` — a test refuses one that is not — so two batches that each take "the next
 number" are caught before either lands.
+
+## Amendment, 2026-10-12: home2 starts fresh on 1.1.0
+
+Ruled by the CTO, 2026-10-12, after the 1.1.0 integration landed (master 47909ef):
+
+36. **Production on home2 starts over on 1.1.0** with a new catalog, created by
+    `scripts/first-run.sh` from step 1, after 1.1.0 is frozen, proven on the real drive with the
+    test cartridge, and tagged `v1.1.0`. Nothing is upgraded from 1.0.0, so migrations 027–035
+    first run on an empty catalog there.
+37. **L6-0001 is erased and reused** as a fresh cartridge. It was the only tape copy of
+    `keepsake` (written by 1.0.0, sealed 2026-10-01). The originals stay on disk, so until the
+    fresh archive seals and verifies two copies, `keepsake` has no copy on tape. That window is
+    accepted.
+38. **The 1.0.0 tapectl home (`/srv/archive_meta/tapectl`) and its staging are deleted**, not
+    archived. Anything to be kept from it, the key material item 39 keeps above all, is copied
+    out first.
+39. **The escrow identity is kept**: the fresh `init` adopts the original escrow public key
+    (`init --escrow-public-key`, the DR recipe of #139), so the Heir Kit's handwritten secret
+    stays valid. The tenants' existing keys are kept as well; how they enter the new catalog is
+    settled before step 1 runs (see the follow-up below).
+40. **The on-tape authorization of 2026-10-07 ends when v1.1.0 is installed**, as ruled then.
+
+Follow-up: `key import` registers public keys only, and `tenant add` always mints a keypair, so
+keeping the tenants' keys needs their secret files copied out of the old home before item 38 runs.
+That copy-out is the first step of the fresh start.
