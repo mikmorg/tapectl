@@ -21,10 +21,14 @@ upgrading** (item 36):
 - L6-0001 erased and reused (item 37).
 
 From the erase until two new copies seal and verify, `keepsake` has no copy on tape. Its
-originals stay on disk, and the CTO accepted that window. On master `4342589` the whole
-chain is green: fmt, clippy (gnu and musl), every ungated test binary, check-docs,
-mhvtl_e2e 12/12, mhvtl_motions, the mhvtl gate against an empty manifest, lifecycle
-`--all`, and the first-run re-entry acceptance. What it has not had is a real drive.
+originals stay on disk, and the CTO accepted that window.
+
+The whole chain is green, per #418's landing comment. It ran on land6 `01c4fb8`: fmt,
+clippy (gnu and musl), every ungated test binary, check-docs, mhvtl_e2e 12/12,
+mhvtl_motions, the mhvtl gate against an empty manifest, lifecycle `--all`, and the
+first-run re-entry acceptance. `4342589` then added only the committed gen-1/gen-2
+`catalog.db` fixtures, and the lib test binary was rerun green on it. What 1.1.0 has not
+had is a real drive.
 
 ## Who does what
 
