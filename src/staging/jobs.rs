@@ -222,7 +222,14 @@ pub fn stage_many(
         if many {
             match &result {
                 Ok(id) => say(&format!("staged {} (stage set {id})", job.unit_name)),
-                Err(e) => say(&format!("failed {}: {e}", job.unit_name)),
+                Err(e) => {
+                    // The whole error on stderr; its first line in the
+                    // command's log, which keeps one stamped line per event
+                    // (the unit's own log has the outcome too).
+                    let line = format!("failed {}: {e}", job.unit_name);
+                    announce(&line);
+                    parent.log(line.lines().next().unwrap_or_default());
+                }
             }
         }
         let _ = results[i].set(result);
