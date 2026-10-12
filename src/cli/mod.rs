@@ -384,6 +384,10 @@ pub enum BackendCommands {
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
     /// Back up the database, and optionally the private key directory
+    ///
+    /// Prints the size of the copy it wrote, and of the key files when it
+    /// copied them (`size_bytes` and `keys_bytes` in `--json`): the catalog
+    /// only grows, and the time a backup takes grows with it.
     Backup {
         /// The backup file to write. Its directory must already exist
         #[arg(long)]
@@ -420,6 +424,13 @@ pub enum DbCommands {
     /// is seen. Sizes are measured with SQLite's dbstat table when the build
     /// has it (the bundled build does) and estimated otherwise; the output
     /// says which (`size_method` in `--json`).
+    ///
+    /// Then each journal's growth over the trailing 90 days, fastest first:
+    /// the rows dated in the window, the bytes they take, and that pace over
+    /// a year (`journal_growth` in `--json`). The row count is exact; the
+    /// bytes are derived, the bytes in use on the table's pages shared among
+    /// its rows by stored length. A catalog younger than 90 days is paced
+    /// over its own age, from its oldest journal row.
     Stats,
 }
 

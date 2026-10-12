@@ -39,30 +39,38 @@ pub fn run(
             // `tapectl.keys/`) — "database and keys backed up to <dest>"
             // left the operator to guess where the secret half of the
             // backup was, and it was not at <dest>.
-            let keys_dir =
+            //
+            // Issue #310: and it says how much it copied — the journals are
+            // never pruned, and what their growth costs is this copy's time.
+            let report =
                 crate::cli::operations::db_backup(paths, to, *include_keys, dry_run, json_output)?;
-            if !dry_run {
+            if let Some(report) = report {
+                let size = crate::util::format_bytes_binary(report.db_bytes as i64);
                 if json_output {
                     println!(
                         "{}",
                         serde_json::json!({"backup": to, "keys_included": include_keys,
-                                           "keys_dir": keys_dir})
+                                           "keys_dir": report.keys_dir,
+                                           "size_bytes": report.db_bytes,
+                                           "keys_bytes": report.keys_bytes})
                     );
-                } else if let Some(keys_dir) = keys_dir {
+                } else if let Some(keys_dir) = &report.keys_dir {
                     println!(
-                        "database backed up to {to}; private keys copied to {}/ — treat that \
-                         directory as secret",
-                        keys_dir.display()
+                        "database backed up to {to} ({size}); private keys copied to {}/ ({}) — \
+                         treat that directory as secret",
+                        keys_dir.display(),
+                        crate::util::format_bytes_binary(report.keys_bytes as i64)
                     );
                 } else if *include_keys {
                     println!(
-                        "database backed up to {to} (--include-keys: there is no key directory \
-                         at {} to copy)",
+                        "database backed up to {to} ({size}); --include-keys: there is no key \
+                         directory at {} to copy",
                         paths.keys_dir.display()
                     );
                 } else {
                     println!(
-                        "database backed up to {to} (private keys not included — pass --include-keys to copy them)"
+                        "database backed up to {to} ({size}); private keys not included — pass \
+                         --include-keys to copy them"
                     );
                 }
             }
@@ -165,18 +173,37 @@ pub fn run(
             // item 28), so say what the file is made of, and whether that was
             // measured or estimated.
             let sizes = crate::db::stats::table_sizes(conn)?;
+            // ...and how fast each journal grew lately (the issue's last
+            // piece): rows dated in the trailing window, exact; their
+            // bytes, derived.
+            let growth = crate::db::stats::journal_growth(conn)?;
             if json_output {
                 let tables: Vec<_> = sizes
                     .tables
                     .iter()
                     .map(|t| serde_json::json!({"name": t.name, "rows": t.rows, "bytes": t.bytes}))
                     .collect();
+                let journals: Vec<_> = growth
+                    .journals
+                    .iter()
+                    .map(|j| {
+                        serde_json::json!({"name": j.name, "date_column": j.date_column,
+                                           "rows_in_window": j.rows_in_window,
+                                           "bytes_in_window": j.bytes_in_window,
+                                           "bytes_per_year": j.bytes_per_year})
+                    })
+                    .collect();
                 println!(
                     "{}",
                     serde_json::json!({"size_bytes": db_size, "tables": table_count,
                                        "pages": page_count,
                                        "size_method": sizes.method.as_str(),
-                                       "table_sizes": tables})
+                                       "table_sizes": tables,
+                                       "journal_growth": {
+                                           "size_method": growth.method.as_str(),
+                                           "trailing_days": crate::db::stats::GROWTH_WINDOW_DAYS,
+                                           "window_days": growth.window_days,
+                                           "journals": journals}})
                 );
             } else {
                 println!(
@@ -191,6 +218,33 @@ pub fn run(
                         t.name,
                         t.rows,
                         crate::util::format_bytes_binary(t.bytes)
+                    );
+                }
+                let trailing = crate::db::stats::GROWTH_WINDOW_DAYS;
+                println!(
+                    "journal growth, trailing {trailing} days ({}):",
+                    growth.describe()
+                );
+                let width = growth
+                    .journals
+                    .iter()
+                    .map(|j| j.name.len())
+                    .max()
+                    .unwrap_or(0);
+                for j in &growth.journals {
+                    println!(
+                        "  {:<width$}  {:>10} rows  {:>11}  ~{:>11}/year",
+                        j.name,
+                        j.rows_in_window,
+                        crate::util::format_bytes_binary(j.bytes_in_window),
+                        crate::util::format_bytes_binary(j.bytes_per_year)
+                    );
+                }
+                if growth.window_days < trailing as f64 {
+                    println!(
+                        "note: the journals go back only {:.1} days (counted as at least one), \
+                         so each /year figure is that span's pace scaled to a year",
+                        growth.window_days
                     );
                 }
             }

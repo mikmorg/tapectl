@@ -253,9 +253,9 @@ So:
 
 ```text
 $ tapectl db backup --to /tmp/tour/backup/tapectl.db
-database backed up to /tmp/tour/backup/tapectl.db (private keys not included — pass --include-keys to copy them)
+database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys not included — pass --include-keys to copy them
 $ tapectl db backup --to /tmp/tour/backup/tapectl.db --include-keys
-database backed up to /tmp/tour/backup/tapectl.db; private keys copied to /tmp/tour/backup/tapectl.keys/ — treat that directory as secret
+database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys copied to /tmp/tour/backup/tapectl.keys/ (276 B) — treat that directory as secret
 ```
 
 With `--include-keys` the key directory is named after the destination with its

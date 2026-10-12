@@ -663,7 +663,7 @@ then the result on stdout:
 
 ```text
 <timestamp>  WARN tapectl::cli::operations: private key material copied to backup destination — treat this location as secret destination=/mnt/usb/tapectl.keys
-database backed up to /mnt/usb/tapectl.db; private keys copied to /mnt/usb/tapectl.keys/ — treat that directory as secret
+database backed up to /mnt/usb/tapectl.db (464.0 KiB); private keys copied to /mnt/usb/tapectl.keys/ (276 B) — treat that directory as secret
 ```
 
 ### `migration 026 cannot run`
