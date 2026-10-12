@@ -1599,6 +1599,168 @@ fn a_tenant_envelope_damaged_in_both_copies_fails_the_rebuild() {
     );
 }
 
+/// Damage every `-> X25519` recipient stanza in tape file `pos`'s age
+/// header: the first base64 character of each stanza body (the wrapped file
+/// key) is swapped for another valid one. The header still parses, but no
+/// key unwraps — and age 0.11 reports a stanza that fails to unwrap exactly
+/// as it reports a stanza for someone else, `NoMatchingKeys`. So the only
+/// thing that tells this damage from "not your envelope" is the front
+/// index's hash of the bytes.
+fn damage_stanzas(vol: &mut SealedVolume, pos: i32) {
+    let file = &mut vol.store.files[pos as usize];
+    let header_end = file
+        .windows(5)
+        .position(|w| w == b"\n--- ")
+        .expect("an age header ends in its MAC line");
+    let mut flipped = 0;
+    let mut at = 0;
+    while let Some(off) = file[at..header_end]
+        .windows(10)
+        .position(|w| w == b"-> X25519 ")
+    {
+        let stanza = at + off;
+        let body = stanza
+            + file[stanza..header_end]
+                .iter()
+                .position(|b| *b == b'\n')
+                .expect("a stanza line ends in a newline")
+            + 1;
+        file[body] = if file[body] == b'A' { b'B' } else { b'A' };
+        flipped += 1;
+        at = body;
+    }
+    assert!(
+        flipped > 0,
+        "tape file {pos} has no X25519 stanza to damage"
+    );
+}
+
+/// The envelope of `kind` and its backup (same front-index hash).
+fn envelope_pair(
+    vol: &SealedVolume,
+    kind: &str,
+) -> (
+    tapectl::volume::format::ParsedIndexEntry,
+    tapectl::volume::format::ParsedIndexEntry,
+) {
+    let fi = front_index_of(vol);
+    let primary = fi
+        .iter()
+        .find(|e| e.type_label == kind)
+        .unwrap_or_else(|| panic!("no {kind} on tape"))
+        .clone();
+    let backup = fi
+        .iter()
+        .find(|e| {
+            e.type_label == format!("{kind}_backup")
+                && e.sha256_encrypted == primary.sha256_encrypted
+        })
+        .unwrap_or_else(|| panic!("no backup of the {kind} on tape"))
+        .clone();
+    (primary, backup)
+}
+
+fn assert_tenant_ownership(conn: &rusqlite::Connection) {
+    for (unit_name, tenant_name, _) in UNITS {
+        let got: String = conn
+            .query_row(
+                "SELECT t.name FROM units u JOIN tenants t ON t.id = u.tenant_id
+                 WHERE u.name = ?1",
+                rusqlite::params![unit_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(&got, tenant_name, "unit {unit_name}");
+    }
+}
+
+/// `volume-format-v2.md` §1.3: a copy that "does not match the front index's
+/// hash" falls back to its backup. Damage to the operator envelope's
+/// recipient stanzas reads, to age, like a key that is not a recipient — and
+/// a rebuild that believed age would refuse the operator key as a tenant key
+/// instead of reading `operator_envelope_backup`.
+#[test]
+fn an_operator_envelope_damaged_in_its_stanzas_is_read_from_its_backup() {
+    let mut vol = build_sealed_volume(true);
+    let (primary, _) = envelope_pair(&vol, "operator_envelope");
+    damage_stanzas(&mut vol, primary.position);
+
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("the primary's stanzas are damaged, and its backup is whole");
+    assert_tenant_ownership(&conn);
+    assert_restorable_from(&conn, &mut vol);
+}
+
+/// The same stanza damage on every tenant envelope's primary, on a tape
+/// without `catalog.db` (so the tenant envelopes are where ownership comes
+/// from): each is read from its backup, not quietly counted as an envelope
+/// the operator key does not open.
+#[test]
+fn a_tenant_envelope_damaged_in_its_stanzas_is_read_from_its_backup() {
+    let mut vol = build_sealed_volume(false);
+    let primaries: Vec<_> = front_index_of(&vol)
+        .into_iter()
+        .filter(|e| e.type_label == "tenant_envelope")
+        .collect();
+    assert_eq!(primaries.len(), 2, "alpha and bravo");
+    for p in &primaries {
+        damage_stanzas(&mut vol, p.position);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("both primaries' stanzas are damaged, and both backups are whole");
+    assert!(
+        report.units_without_tenant_envelope.is_empty(),
+        "{:?}",
+        report.units_without_tenant_envelope
+    );
+    assert_tenant_ownership(&conn);
+}
+
+/// Positive control for the two above: a primary that does not read whole
+/// and a backup whose stanzas are damaged leave no good copy. The backup's
+/// "no matching key" must not clear the primary's failure, nor read as a
+/// tenant key — the rebuild fails, naming both copies.
+#[test]
+fn a_damaged_primary_and_a_backup_damaged_in_its_stanzas_fail_the_rebuild() {
+    let mut vol = build_sealed_volume(true);
+    let (primary, backup) = envelope_pair(&vol, "operator_envelope");
+    damage_file(&mut vol, primary.position, primary.size_bytes.unwrap());
+    damage_stanzas(&mut vol, backup.position);
+
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("no whole copy of the operator envelope is left");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!(
+            "the operator_envelope at position {} could not be opened, \
+             and neither could its backup copy at position {}",
+            primary.position, backup.position
+        )),
+        "the error names both copies: {msg}"
+    );
+    assert!(
+        msg.contains("does not match the front index"),
+        "the backup's damage is named as damage: {msg}"
+    );
+    assert!(
+        !msg.contains("neither an operator key nor the escrow key"),
+        "damage is not a tenant key: {msg}"
+    );
+}
+
 /// Idempotence is the property that makes a rebuild safe to run across a
 /// shelf of cartridges, twice, in any order.
 #[test]

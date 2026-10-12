@@ -792,8 +792,9 @@ fn attest_escrow(
 /// Every envelope has a backup copy (`volume-format-v2.md` §1.3: the
 /// operator's since v2's first write, each tenant's since 1.1.0), the same
 /// bytes under the same front-index hash. A backup is opened only when the
-/// envelope it copies could not be — it did not read, or did not decrypt —
-/// and is skipped once a copy with its hash has opened or proved the key is
+/// envelope it copies could not be — it did not read, did not match the
+/// front index's hash, or did not decrypt — and is skipped once a copy with
+/// its hash has opened or, its bytes matching that hash, proved the key is
 /// not a recipient. A copy that failed is an error only when no copy with
 /// its hash opened by the end of the walk.
 /// The HEIR's recipe, and the reason it is a function rather than an inline
@@ -861,7 +862,11 @@ fn open_all_envelopes(
     let mut operator_refused = false;
     // Front-index hashes of the copies already settled: one opened, or the
     // key proved not a recipient. A later copy with the same hash is the
-    // same bytes and would only duplicate (or repeat) that answer.
+    // same bytes and would only duplicate (or repeat) that answer. Both
+    // outcomes are answers about the KEY only because `open_envelope` checks
+    // the bytes against that hash before age sees them: a copy that does not
+    // match is `Failed`, whatever age would have said, since age reports a
+    // damaged recipient stanza as `NoMatchingKeys`.
     let mut settled: HashSet<String> = HashSet::new();
     // Copies that failed (hash, position, kind, why), in tape order: an
     // error only if no copy with that hash opens by the end of the walk.
@@ -921,15 +926,23 @@ fn open_all_envelopes(
     }
 
     if let Some((key, position, type_label, e)) = failed.first() {
-        let copies = failed.iter().filter(|(k, ..)| k == key).count();
-        let others = if copies > 1 {
-            "and neither could its backup copy"
+        let backups: Vec<_> = failed.iter().filter(|(k, ..)| k == key).skip(1).collect();
+        let msg = if backups.is_empty() {
+            format!(
+                "the {type_label} at position {position} could not be opened, \
+                 and the tape holds no other copy of it: {e}"
+            )
         } else {
-            "and the tape holds no other copy of it"
+            let at: Vec<String> = backups.iter().map(|(_, p, ..)| p.to_string()).collect();
+            let why: Vec<String> = backups.iter().map(|(.., e)| e.to_string()).collect();
+            format!(
+                "the {type_label} at position {position} could not be opened, \
+                 and neither could its backup copy at position {}: {e}; the backup: {}",
+                at.join(", "),
+                why.join("; ")
+            )
         };
-        return Err(TapectlError::Other(format!(
-            "the {type_label} at position {position} could not be opened, {others}: {e}"
-        )));
+        return Err(TapectlError::Other(msg));
     }
 
     if operator_refused && !out.iter().any(|e| e.manifest.is_operator()) {
