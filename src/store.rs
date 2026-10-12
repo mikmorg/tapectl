@@ -16,7 +16,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
-use sha2::{Digest, Sha256};
+use crate::pass_count::Sha256;
+use sha2::Digest;
 
 use crate::error::{Result, TapectlError};
 use crate::pipeline::{self, BufferPool};
@@ -1453,13 +1454,87 @@ impl FileCursor {
 /// known. Before trusting the cursor it checks st's own count (`MTIOCGET`),
 /// and repositions from BOT if the two disagree.
 pub struct TapeStore {
-    dev: Box<dyn TapeOps>,
+    dev: CountedOps,
     usable_bytes: u64,
     cursor: FileCursor,
     /// The read pipeline's buffers (issue #390): [`pipeline::QUEUE_BYTES`]
     /// of tape blocks, allocated as a read first fills the queue and reused
     /// by every read after it.
     pool: BufferPool,
+}
+
+/// The st commands a [`TapeStore`] has issued since it opened, counted by
+/// the store itself (issue #416 item 12), so a test on a real st device can
+/// hold them to the kernel's own count: every command st issues that is not
+/// a READ or a WRITE adds one to `/sys/class/scsi_tape/<node>/stats/other_cnt`
+/// ([`crate::tape::st_stats`]). Never recorded anywhere.
+///
+/// The open's own commands (its rewind, block size and compression) are
+/// before the count starts. A rewind or a space is counted when issued,
+/// whether or not it succeeded, since st counts the command either way; a
+/// write's filemark is counted when the write succeeded, since a write that
+/// failed may have stopped before issuing it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Motions {
+    pub rewinds: u64,
+    /// Forward spaces over filemarks, each one command whatever its count.
+    pub spaces: u64,
+    pub filemarks: u64,
+    /// `MTIOCGET` readings of st's position: answered by the driver, no
+    /// SCSI command, so not in [`Self::commands`].
+    pub status_reads: u64,
+}
+
+impl Motions {
+    /// The SCSI commands these are: what `other_cnt` should have counted.
+    pub fn commands(&self) -> u64 {
+        self.rewinds + self.spaces + self.filemarks
+    }
+}
+
+/// [`TapeOps`] with every command counted into [`Motions`].
+struct CountedOps {
+    inner: Box<dyn TapeOps>,
+    counts: std::cell::Cell<Motions>,
+}
+
+impl CountedOps {
+    fn count(&self, f: impl FnOnce(&mut Motions)) {
+        let mut m = self.counts.get();
+        f(&mut m);
+        self.counts.set(m);
+    }
+}
+
+impl TapeOps for CountedOps {
+    fn block_size(&self) -> usize {
+        self.inner.block_size()
+    }
+    fn rewind(&self) -> Result<()> {
+        self.count(|m| m.rewinds += 1);
+        self.inner.rewind()
+    }
+    fn forward_space_file(&self, count: i32) -> Result<()> {
+        self.count(|m| m.spaces += 1);
+        self.inner.forward_space_file(count)
+    }
+    fn position(&self) -> Result<TapePosition> {
+        self.count(|m| m.status_reads += 1);
+        self.inner.position()
+    }
+    fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        let written = self.inner.write_stream(src, len, sync);
+        if written.is_ok() {
+            self.count(|m| m.filemarks += 1);
+        }
+        written
+    }
+    fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
+        self.inner.read_file_streaming(sink)
+    }
+    fn read_file_head(&mut self, max_bytes: u64, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
+        self.inner.read_file_head(max_bytes, sink)
+    }
 }
 
 /// How much `TapeDevice` reads at a time in variable-block mode — its
@@ -1539,7 +1614,10 @@ impl TapeStore {
             n => n,
         };
         Self {
-            dev,
+            dev: CountedOps {
+                inner: dev,
+                counts: Default::default(),
+            },
             usable_bytes,
             cursor: FileCursor::AtStart(0),
             pool: BufferPool::with_queue_bytes(chunk, pipeline::QUEUE_BYTES),
@@ -1552,6 +1630,12 @@ impl TapeStore {
     pub(crate) fn from_ops(dev: Box<dyn TapeOps>, usable_bytes: u64) -> Result<Self> {
         dev.rewind()?;
         Ok(Self::at_bot(dev, usable_bytes))
+    }
+
+    /// The st commands this store has issued since it opened (issue #416
+    /// item 12).
+    pub fn motions(&self) -> Motions {
+        self.dev.counts.get()
     }
 
     /// The cursor, if st's own count agrees with it; otherwise
@@ -1641,7 +1725,7 @@ impl Store for TapeStore {
     /// next file.
     fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
         self.locate(position)?;
-        let dev = &mut *self.dev;
+        let dev = &mut self.dev;
         let delivered =
             pipeline::read_through(&mut self.pool, |pipe| dev.read_file_streaming(pipe), sink);
         self.cursor = FileCursor::after_read(position, &delivered.produced);
@@ -3077,6 +3161,40 @@ mod tests {
                 Op::Read(5),
             ]
         );
+    }
+
+    /// Issue #416 item 12: the store's own count of its commands is the
+    /// fake's log of them, motion for motion, past every kind of read and
+    /// a failed space (st counts a command that failed); the open's rewind
+    /// is before the count. `tests/mhvtl_motions.rs` holds the same count to
+    /// the kernel's on a real st device.
+    #[test]
+    fn the_store_counts_every_command_it_issues() {
+        let (mut store, fake) = simple_tape(6);
+        for p in 0..6 {
+            read_at(&mut store, p).unwrap();
+        }
+        read_at(&mut store, 2).unwrap();
+        store.read_file_head(4, 16, &mut Vec::new()).unwrap();
+        read_at(&mut store, 5).unwrap();
+        assert!(read_at(&mut store, 9).is_err());
+        read_at(&mut store, 0).unwrap();
+        store.execute(&mut &[7u8; 10][..], 10, false).unwrap();
+        store.execute(&mut &[8u8; 10][..], 10, true).unwrap();
+
+        let m = store.motions();
+        let writes = fake
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::Write(_)))
+            .count();
+        assert_eq!(m.rewinds as usize, fake.rewinds() - 1, "{:?}", fake.ops());
+        assert_eq!(m.spaces as usize, fake.spaces(), "{:?}", fake.ops());
+        assert_eq!(m.filemarks as usize, writes);
+        assert_eq!(writes, 2, "positive control: both writes reached the fake");
+        assert!(m.rewinds >= 2 && m.spaces >= 3, "{m:?}");
+        assert_eq!(m.commands(), m.rewinds + m.spaces + m.filemarks);
+        assert!(m.status_reads > 0, "the cursor was cross-checked: {m:?}");
     }
 
     #[test]

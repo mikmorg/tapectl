@@ -693,3 +693,376 @@ fn perf_rebuild_from_a_tape_carrying_a_184k_file_version() {
          {CEILING_SECS} s ceiling (ADR-0012 amendment 2026-10-07 item 10)"
     );
 }
+
+// ── issue #416 items 9 and 11: costs as ratios, at production's shape ──
+
+/// Statements SQLite ran while tracing was on (`Connection::trace_v2`), as
+/// `tests/catalog_budget.rs` counts them: a trigger's sub-program is part of
+/// the statement that fired it.
+static STATEMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn count_statement(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+        if !sql.trim_start().starts_with("--") {
+            STATEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Run `f` with every statement `conn` runs counted; return its result, the
+/// count and the time it took.
+fn counted<T>(conn: &Connection, f: impl FnOnce() -> T) -> (T, u64, Duration) {
+    use rusqlite::trace::TraceEventCodes;
+    use std::sync::atomic::Ordering;
+    STATEMENTS.store(0, Ordering::Relaxed);
+    conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_statement));
+    let start = Instant::now();
+    let out = f();
+    let elapsed = start.elapsed();
+    conn.trace_v2(TraceEventCodes::empty(), None);
+    (out, STATEMENTS.load(Ordering::Relaxed), elapsed)
+}
+
+/// This process's peak resident set (`VmHWM`), in KiB.
+fn peak_rss_kib() -> u64 {
+    let status = fs::read_to_string("/proc/self/status").unwrap();
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("VmHWM:"))
+        .expect("VmHWM in /proc/self/status");
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// Start `VmHWM` over from the current resident set (writing `5` to
+/// `clear_refs`, Linux 4.0+), so a scenario's peak is its own and not the
+/// one an earlier scenario in this process left.
+fn reset_peak_rss() {
+    fs::write("/proc/self/clear_refs", "5").expect("reset VmHWM through /proc/self/clear_refs");
+}
+
+/// What one `n`-file unit cost to snapshot and stage: statements and time
+/// for each step, and the peak resident set across both.
+struct UnitCost {
+    snapshot: (u64, Duration),
+    stage: (u64, Duration),
+    peak_kib: u64,
+}
+
+fn unit_of_files(n: usize) -> UnitCost {
+    let h = setup(&format!("files-{n}"));
+    tenant::add_tenant(&h.conn, &h.paths, "op", None, true).unwrap();
+    let dir = h.source_root.join("unit");
+    for i in 0..n {
+        let sub = dir.join(format!("d{:03}", i / 1000));
+        if i % 1000 == 0 {
+            fs::create_dir_all(&sub).unwrap();
+        }
+        fs::write(sub.join(format!("f_{i:06}.txt")), format!("file {i}\n")).unwrap();
+    }
+    unit::init_unit_with_config(
+        &h.conn,
+        &h.config,
+        &dir.to_string_lossy(),
+        "op",
+        Some("files-unit"),
+        &[],
+        None,
+    )
+    .unwrap();
+
+    reset_peak_rss();
+    let (sid, snap_stmts, snap_time) = counted(&h.conn, || {
+        staging::snapshot_create(&h.conn, "files-unit", &h.config).unwrap()
+    });
+    let ((), stage_stmts, stage_time) = counted(&h.conn, || {
+        staging::stage_create(&h.conn, &h.paths, &h.config, sid, true).unwrap();
+    });
+    let cost = UnitCost {
+        snapshot: (snap_stmts, snap_time),
+        stage: (stage_stmts, stage_time),
+        peak_kib: peak_rss_kib(),
+    };
+    report(
+        "files_unit",
+        &format!("snapshot_create {n} files, {snap_stmts} stmts"),
+        snap_time,
+    );
+    report(
+        "files_unit",
+        &format!("stage_create {n} files, {stage_stmts} stmts"),
+        stage_time,
+    );
+    eprintln!(
+        "[perf] files_unit {n} files: VmHWM {} MiB",
+        cost.peak_kib / 1024
+    );
+    cost
+}
+
+/// Issue #416 item 11: a 100,000-file unit, snapshotted and staged, against
+/// the same unit at a tenth of the size. Each step runs a bounded number of
+/// statements beyond one per file (an N+1 shows as 2N), scales linearly in
+/// time (a superlinear step, such as #413's, shows as ~100x for 10x the
+/// files), and the process stays under 512 MiB resident: the walk and the
+/// manifest stream, they do not hold the unit in memory. dar runs in its
+/// own process, so its memory is not in the figure.
+#[test]
+#[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
+fn perf_a_100k_file_unit_scales_linearly() {
+    if !perf_enabled() {
+        eprintln!("skip: TAPECTL_PERF_TESTS not set");
+        return;
+    }
+    let n: usize = std::env::var("TAPECTL_PERF_UNIT_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let small = unit_of_files(n / 10);
+    let large = unit_of_files(n);
+
+    for (step, (stmts, _)) in [
+        ("snapshot_create", large.snapshot),
+        ("stage_create", large.stage),
+    ] {
+        assert!(
+            stmts <= n as u64 + 50,
+            "{step} of a {n}-file unit ran {stmts} statements, over N + 50"
+        );
+    }
+    // Ten times the files may cost up to twenty times the time: a linear
+    // step with its fixed costs is under ten; a quadratic one is ~100.
+    for (step, (_, t_small), (_, t_large)) in [
+        ("snapshot_create", small.snapshot, large.snapshot),
+        ("stage_create", small.stage, large.stage),
+    ] {
+        let growth = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-3);
+        eprintln!("[perf] files_unit {step}: {growth:.1}x the time for 10x the files");
+        assert!(
+            growth <= 20.0,
+            "{step}: {n} files took {growth:.1}x the time of {}: not linear",
+            n / 10
+        );
+    }
+    assert!(
+        large.peak_kib <= 512 * 1024,
+        "a {n}-file unit peaked at {} MiB resident, over 512 MiB",
+        large.peak_kib / 1024
+    );
+}
+
+/// Issue #416 item 9: a 2 GiB write and full confirm through the real write
+/// session into a `MemStore`, timed against this machine's own sha256 speed
+/// rather than a wall-clock ceiling. The write hashes every byte once on the
+/// way to the store and the confirm once more on the way back
+/// (`tests/pass_budget.rs` pins those counts), so the floor is two hash
+/// passes; the ceiling allows three times that, for the reads, the copies
+/// and the queues between them. A pipeline that stopped overlapping, or a
+/// pass added, shows as a ratio, on a fast machine or a loaded one.
+#[test]
+#[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
+fn perf_a_2gib_write_and_full_confirm_through_a_store() {
+    use sha2::{Digest, Sha256};
+    use tapectl::crypto::keys::generate_keypair;
+    use tapectl::store::{MemStore, Tier};
+    use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
+    use tapectl::volume::layout_model::{KeyAvailability, SliceCheck};
+    use tapectl::volume::session::{ConfirmOutcome, ExecuteOutcome};
+
+    if !perf_enabled() {
+        eprintln!("skip: TAPECTL_PERF_TESTS not set");
+        return;
+    }
+    let mib: usize = std::env::var("TAPECTL_PERF_WRITE_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
+    const SLICE_MIB: usize = 256;
+    const BS: u64 = 512 * 1024;
+    const CEILING: f64 = 3.0;
+    let slices = mib.div_ceil(SLICE_MIB);
+
+    let h = setup("write-2g");
+    let operator = generate_keypair();
+    let tenant = generate_keypair();
+    let escrow = generate_keypair();
+    h.conn
+        .execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (11, 'w-op', 1, 'active');
+             INSERT INTO tenants (id, name, is_operator, status)
+                  VALUES (12, 'w-alpha', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, current_path, status)
+                  VALUES (11, 'write-2g', 'write-2g', 12, '/src/w', 'active');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path)
+                  VALUES (11, 11, 1, 'staged', '/src/w');",
+        )
+        .unwrap();
+    for (tenant_id, kp) in [(11, &operator), (12, &tenant)] {
+        h.conn
+            .execute(
+                "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key,
+                                              key_type, is_active)
+                 VALUES (?1, ?2, ?3, ?4, 'primary', 1)",
+                params![
+                    tenant_id,
+                    format!("w{tenant_id}"),
+                    kp.fingerprint,
+                    kp.public_key
+                ],
+            )
+            .unwrap();
+    }
+    h.conn
+        .execute(
+            "INSERT INTO stage_sets (id, snapshot_id, status, slice_size)
+             VALUES (11, 11, 'staged', ?1)",
+            params![(SLICE_MIB << 20) as i64],
+        )
+        .unwrap();
+    h.conn
+        .execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('PERF-2G', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+            [],
+        )
+        .unwrap();
+    let volume_id = h.conn.last_insert_rowid();
+
+    // The slices, each its own pseudo-random bytes. The first is hashed in
+    // memory as it is made: the calibration, sha256 on this machine now.
+    let slice_dir = Path::new(&h.config.staging.directory).join("write-2g");
+    fs::create_dir_all(&slice_dir).unwrap();
+    let mut built_slices = Vec::new();
+    let mut rate = 0.0f64; // bytes per second
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut buf = vec![0u8; SLICE_MIB << 20];
+    for n in 1..=slices {
+        for word in buf.chunks_exact_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            word.copy_from_slice(&x.to_le_bytes());
+        }
+        let started = Instant::now();
+        let sha = format!("{:x}", Sha256::digest(&buf));
+        if n == 1 {
+            rate = buf.len() as f64 / started.elapsed().as_secs_f64();
+        }
+        let path = slice_dir.join(format!("slice_{n}.age"));
+        fs::write(&path, &buf).unwrap();
+        h.conn
+            .execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                           encrypted_bytes, sha256_plain, sha256_encrypted,
+                                           staging_path)
+                 VALUES (11, ?1, ?2, ?2, ?3, ?3, ?4)",
+                params![n as i64, buf.len() as i64, sha, path.to_string_lossy()],
+            )
+            .unwrap();
+        built_slices.push(BuildSlice {
+            slice_id: h.conn.last_insert_rowid(),
+            slice_number: n as i64,
+            size_bytes: buf.len() as i64,
+            encrypted_bytes: buf.len() as i64,
+            sha256_plain: sha.clone(),
+            sha256_encrypted: sha,
+            staging_path: path,
+        });
+    }
+    drop(buf);
+    let bytes = (slices * (SLICE_MIB << 20)) as f64;
+    eprintln!(
+        "[perf] write_2g calibration: sha256 at {:.0} MiB/s",
+        rate / (1u64 << 20) as f64
+    );
+
+    let units = vec![BuildUnit {
+        stage_set_id: 11,
+        snapshot_id: 11,
+        unit_name: "write-2g".to_string(),
+        unit_uuid: "write-2g".to_string(),
+        tenant_id: 12,
+        dar_version: Some("2.7.20".to_string()),
+        dar_command: None,
+        catalog_path: None,
+        snapshot_version: 1,
+        slices: built_slices,
+    }];
+    let inputs = BuildInputs {
+        label: "PERF-2G".to_string(),
+        volume_uuid: "41641600-0000-4000-8000-000000000009".to_string(),
+        media_type: "LTO-6".to_string(),
+        tapectl_version: "perf".to_string(),
+        created_at: "2026-10-12T00:00:00Z".to_string(),
+        block_size: BS,
+        usable_bytes: 64 * 1024 * 1024 * 1024,
+        enospc_buffer: 1024 * 1024,
+        nominal_capacity: 2_500_000_000_000,
+        mam_capacity: 2_500_000_000_000,
+        mam_manufacturer: "TAPECTL-PERF".to_string(),
+        mam_serial: "PERF2GSERIAL".to_string(),
+        cartridge_identity_source: Some("mam".to_string()),
+        mam_length: 0,
+        mam_loads: 0,
+        units: units.clone(),
+        tenants: vec![TenantInfo {
+            tenant_id: 12,
+            tenant_name: "w-alpha".to_string(),
+            public_keys: vec![tenant.public_key.clone()],
+        }],
+        operator_public_keys: vec![operator.public_key.clone()],
+        escrow_public_key: Some(escrow.public_key.clone()),
+        catalog_db_path: None,
+    };
+    let session_dir = slice_dir.join("session");
+    fs::create_dir_all(&session_dir).unwrap();
+    let built = build::build(&inputs, &session_dir).expect("build");
+    let keys = KeyAvailability {
+        tenant_ids: vec![12],
+        tenants_with_active_key: [12].into_iter().collect(),
+        operator_key_present: true,
+        escrow_recipient_present: None,
+        stage_sets_lacking_escrow: None,
+    };
+    let mut store = MemStore::new(BS as usize);
+
+    let start = Instant::now();
+    let validated = built
+        .into_validated(&keys, SliceCheck::Size, &mut store)
+        .expect("validate");
+    let planned = validated.plan(&h.conn, volume_id, &units).expect("plan");
+    let ready = match planned.execute(&h.conn, &mut store).expect("execute") {
+        ExecuteOutcome::Ready(r) => r,
+        _ => panic!("the write must reach Ready"),
+    };
+    let sealed = ready.seal(&mut store).expect("seal");
+    let written = start.elapsed();
+    assert!(matches!(
+        sealed
+            .confirm(&h.conn, &mut store, Tier::Integrity)
+            .expect("confirm"),
+        ConfirmOutcome::Sealed(_)
+    ));
+    let elapsed = start.elapsed();
+
+    let one_pass = bytes / rate;
+    let ratio = elapsed.as_secs_f64() / (2.0 * one_pass);
+    report(
+        "write_2g",
+        &format!(
+            "write {:.2}x one hash pass",
+            written.as_secs_f64() / one_pass
+        ),
+        written,
+    );
+    report(
+        "write_2g",
+        &format!("write + full confirm {ratio:.2}x two passes"),
+        elapsed,
+    );
+    assert!(
+        ratio <= CEILING,
+        "a {mib} MiB write and full confirm took {elapsed:?}, {ratio:.2}x the two sha256 \
+         passes it needs ({one_pass:.1} s each at this machine's rate), over {CEILING}x"
+    );
+}

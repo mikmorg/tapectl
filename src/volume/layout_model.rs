@@ -14,7 +14,8 @@ use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
+use crate::pass_count::Sha256;
+use sha2::Digest;
 use thiserror::Error;
 
 /// Which zone of the volume layout (v2, ADR-0007) an entry is. Slice and
@@ -704,7 +705,7 @@ impl Layout {
 /// between chunks with an error of kind [`std::io::ErrorKind::Interrupted`],
 /// so a multi-GiB slice does not hold a Ctrl-C off until it is done.
 pub(crate) fn hash_file(path: &Path) -> std::io::Result<String> {
-    let mut f = std::fs::File::open(path)?;
+    let mut f = crate::pass_count::StagedRead::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 128 * 1024];
     loop {
