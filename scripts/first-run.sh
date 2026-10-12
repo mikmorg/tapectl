@@ -71,6 +71,9 @@ LOCATIONS=()           # step 10: "name|description" — the first is the shelf 
 TENANTS=()             # step 11: "name|description" — non-operator tenants to create
 COLLECTIONS=()         # step 11: "name|root|tenant|unit_depth" — [[collections]] to configure and sync
 OPS_GROUP=""           # step 7: a group that may read the session logs (`tapectl status`), e.g. tapectl-ops (issue #393); empty = none
+ESCROW_PUBLIC_KEY=""   # step 7: the ORIGINAL escrow public key (age1…, or a .pub path) for init to adopt instead of
+                       # minting one — a rebuilt or fresh home that keeps the Heir Kit (ADR-0005, #139). Empty = ask
+                       # (or, under --auto, mint).
 ADOPT_KEYS_FROM=""     # steps 7 and 11: a directory of <tenant>.key age identity files (the SECRETS, copied out of an
                        # old home: docs/keys-and-recovery.md) that the operator and the profile's tenants ADOPT instead
                        # of minting new keys (issue #424). Every one of them must have its file. Empty = mint, as usual.
@@ -121,6 +124,9 @@ Options:
   --adopt-keys-from DIR
                     steps 7 and 11 adopt DIR/<name>.key (an age identity file) as the operator's and
                     each profile tenant's key instead of minting one (docs/keys-and-recovery.md)
+  --escrow-public-key KEY
+                    step 7 adopts KEY (age1… or a .pub path) as the escrow identity instead of
+                    minting one, so an existing Heir Kit stays valid (ESCROW_PUBLIC_KEY in a profile)
   --dar PATH        the dar binary: checked in step 2, first on PATH for the step-4 suite,
                     written to [dar] binary in step 7 (default: dar on PATH)
   --skip-build      do not build/install (use the resolved binary as-is)
@@ -155,6 +161,7 @@ while [ $# -gt 0 ]; do
     --staging) STAGING_DIR="$2"; shift 2 ;;
     --dar) DAR_BIN="$2"; shift 2 ;;
     --adopt-keys-from) ADOPT_KEYS_FROM="$2"; shift 2 ;;
+    --escrow-public-key) ESCROW_PUBLIC_KEY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -676,8 +683,9 @@ If you are REBUILDING a machine and already hold the original escrow key, do NOT
 This step's output is deliberately NOT written to the log.
 EOF
   ask OPERATOR "operator name" "${OPERATOR:-$USER}"
-  ADOPT=""
-  if [ "$AUTO" != 1 ]; then ask ADOPT "existing escrow PUBLIC key to adopt (age1…, or a .pub path) — leave empty to mint a new one" ""; fi
+  ADOPT="$ESCROW_PUBLIC_KEY"
+  if [ -n "$ADOPT" ]; then note "adopting the escrow public key from ESCROW_PUBLIC_KEY: $ADOPT (no new escrow identity is minted)"
+  elif [ "$AUTO" != 1 ]; then ask ADOPT "existing escrow PUBLIC key to adopt (age1…, or a .pub path) — leave empty to mint a new one" ""; fi
   INIT_ARGS=(init --operator "$OPERATOR")
   [ -n "$ADOPT" ] && INIT_ARGS+=(--escrow-public-key "$ADOPT")
   if [ -n "$ADOPT_KEYS_FROM" ]; then

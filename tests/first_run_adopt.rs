@@ -256,3 +256,33 @@ fn without_adopt_keys_from_first_run_mints_as_before() {
     .collect();
     assert_eq!(aliases, want);
 }
+
+/// `ESCROW_PUBLIC_KEY` in a profile: step 7 under `--auto` adopts that
+/// escrow identity instead of minting one (ADR-0012 2026-10-12 item 39, the
+/// fresh start that keeps the Heir Kit), and says so. The positive control
+/// is the mint test above, whose step 7 mints a fresh escrow identity.
+#[test]
+fn escrow_public_key_in_a_profile_is_adopted_at_init() {
+    let rig = Rig::new();
+    let profile = rig.profile(false);
+    let escrow = age::x25519::Identity::generate().to_public().to_string();
+    let mut text = std::fs::read_to_string(&profile).unwrap();
+    text.push_str(&format!("ESCROW_PUBLIC_KEY={escrow}\n"));
+    std::fs::write(&profile, text).unwrap();
+
+    let out7 = rig.step_ok(&profile, 7);
+    assert!(
+        out7.contains("adopting the escrow public key from ESCROW_PUBLIC_KEY"),
+        "{}",
+        redacted(out7.as_bytes())
+    );
+    let conn = rusqlite::Connection::open(rig.home().join("tapectl.db")).unwrap();
+    let registered: Vec<String> = conn
+        .prepare("SELECT public_key FROM encryption_keys WHERE is_escrow = 1")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(registered, vec![escrow]);
+}

@@ -13,6 +13,11 @@ DEVICE=/dev/tape/by-id/scsi-HUJ808A5L4-nst
 
 OPERATOR=mikmorg
 
+# The 1.1.0 fresh start keeps the escrow identity (ADR-0012, 2026-10-12, item 39):
+# set this to the ORIGINAL escrow public key, the age1… line on the Heir Kit's
+# cover sheet, before step 7, so init adopts it instead of minting a new one.
+ESCROW_PUBLIC_KEY=""
+
 # ADOPT_KEYS_FROM is deliberately unset: the 1.1.0 fresh start mints new keys
 # for the operator and every tenant (ADR-0012, 2026-10-12, item 41). Set it
 # only to keep keys people already hold (docs/keys-and-recovery.md, runbook F).
