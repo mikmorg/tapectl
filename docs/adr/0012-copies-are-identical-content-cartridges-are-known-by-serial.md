@@ -1363,6 +1363,16 @@ Ruled by the CTO, 2026-10-12, after the 1.1.0 integration landed (master 47909ef
     settled before step 1 runs (see the follow-up below).
 40. **The on-tape authorization of 2026-10-07 ends when v1.1.0 is installed**, as ruled then.
 
-Follow-up: `key import` registers public keys only, and `tenant add` always mints a keypair, so
-keeping the tenants' keys needs their secret files copied out of the old home before item 38 runs.
-That copy-out is the first step of the fresh start.
+Follow-up, ruled the same day:
+
+41. **The fresh start mints new tenant keys**, the operator's included; only the escrow identity
+    (item 39) carries over. Item 39's "the tenants' existing keys are kept" is withdrawn.
+42. **An adopt path is built anyway**, for a rebuilt machine whose key holders already hold
+    their secrets: an existing age keypair can be registered for a tenant (and for the operator
+    at `init`) instead of a minted one, with a documented copy-out from an old home and a
+    `first-run.sh` profile setting that uses it. `key import` stays public-keys-only.
+43. **The tape-only multiplier applies to every copy and place-count floor** (#423 part 2,
+    item 34 extended): `audit`'s copy count and `unit mark-tape-only`'s copy and location floors
+    take it, as `snapshot mark-reclaimable` already does, through one rule in `policy::coverage`.
+    A unit cannot be marked tape-only, freeing its source, with fewer copies than tape-only
+    policy demands.
