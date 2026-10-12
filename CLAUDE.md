@@ -113,10 +113,15 @@ govern the result:
 - The audit that came with it is recorded in `docs/design-errata.md` (four design
   promises no code keeps) and issues #142-#152.
 
-**Handoff:** `docs/handoff.md` is the current division of remaining work into
-what an agent finishes and what needs the operator's hands (the go-ahead for the
-first production write, on hold by the CTO's word; the Heir Kit ceremony; cartridges
-and locations). The real-drive rehearsal is done (2026-09-23,
+**Handoff:** `docs/handoff.md` divides the remaining work between what an agent
+finishes and what needs the operator's hands. It covers the 1.1.0 fresh start in order:
+- the real-drive proof on home2, on the CTO's go-ahead;
+- the `v1.1.0` tag;
+- the operator's fresh start;
+- `keepsake` on two cartridges, then the Heir Kit;
+- the backlog.
+
+The 1.0.0 real-drive rehearsal is done (2026-09-23,
 `docs/runs/2026-09-23-real-drive-rehearsal.md`).
 
 **Post-M7 hardening (complete):** Design gap audit identified 3 active bugs + 6 unacknowledged gaps. All 8 items fixed: clone-slices restructured to staging-only read-slices (self-describing invariant preserved), restore trial-decrypts with all tenant+operator keys (key rotation no longer breaks restore), compact-finish refuses retirement if live slices lack copies elsewhere, volume_verify records verification_sessions (audit feedback loop closed), staging cleanup reports actual bytes freed, compact-read errors on checksum mismatch, critical DB operations wrapped in transactions, export writes MANIFEST.toml + RECOVERY.md. RESTORE.sh fleshed out from stub to full emergency recovery script (--info, --find-envelope, --restore modes with sha256 verification and block-padding trimming). 106 tests (60 unit + 46 integration/lib/isolation/failure-mode), zero clippy warnings.
@@ -155,7 +160,9 @@ Issues #22–#28 (closed) describe the *pre-v2* design; read them against the no
 set above, never as instructions.
 
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
-this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install.
+this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
+runs 1.0.0, which wrote one tape (L6-0001, 2026-10-01). It does not upgrade: it starts
+fresh on 1.1.0 (see 2026-10-12 below).
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -191,6 +198,38 @@ the unit. The interim rules that waited on #376/#377/#378 are lifted: a write se
 a per-volume flock and the catalog has a busy policy (#376, #377), and the unit's own
 `.tapectl-unit.toml` is not content (#378, ADR-0012 2026-10-07 item 24), so `unit tag`,
 `unit rename` or a dotfile edit mints no version.
+
+**2026-10-06 and 2026-10-07: what 1.1.0 is.** ADR-0012's amendments of those dates
+(items 1–24 and 1–35) are the rulings behind 1.1.0. `docs/releases/1.1.0.md` is the
+operator's account of them: on-tape changes, migrations 027–035, exit codes and config
+keys.
+
+**2026-10-12: home2 starts fresh on 1.1.0** (ADR-0012, amendment "2026-10-12", items
+36–48).
+- **The fresh start.** There is no upgrade from 1.0.0. A new catalog comes from
+  `first-run.sh` step 1, and the escrow identity is adopted, not minted (item 39). Every
+  tenant key is new (item 41). The 1.0.0 home and staging are deleted (item 38).
+  L6-0001, `keepsake`'s only tape copy, is erased and reused (item 37). `keepsake` has no
+  tape copy until two new ones seal, and that window is accepted.
+- **Pulled into 1.1.0 for it:**
+  - a backup copy of every tenant envelope on tape (item 44; `volume-format-v2.md` §1.3;
+    re-pin `57f061f`);
+  - the on-tape `catalog.db` generation 3 (item 48; §1.4);
+  - an adopt-keypair path (`init --operator-key`, `tenant add --adopt-key`, `ADOPT_KEYS_FROM`;
+    item 42).
+- **Policy rulings:**
+  - the tape-only multiplier raises copy floors only, never the distinct-place count
+    (item 46);
+  - a tape-only shortfall stays an ADR-0008 Tier-2 consent gate (item 47);
+  - #416's pass counters are test-only (item 45).
+- **Status.** 1.1.0 is frozen on master `4342589`, untagged. Next:
+  - the real-drive proof on home2 with a static musl debug build, on the test cartridge;
+  - the `v1.1.0` tag on the proven commit;
+  - the operator's fresh start.
+
+  `docs/handoff.md` has the sequence. The 2026-10-07 on-tape authorization ends when
+  v1.1.0 is installed (item 40). Open after it: #420, #418 R4, #425, #388, #326 and the
+  #364 staging epic.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
@@ -312,7 +351,7 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
 - **Database** (`src/db/`): SQLite with WAL mode, forward-only numbered migrations, full audit trail; `ontape_catalog.rs` is the operator envelope's `catalog.db` — schema, generation probe, read and write in one place
 - **Unit management** (`src/unit/`): archival entities tracked via `.tapectl-unit.toml` dotfiles in each directory
 - **dar integration** (`src/dar/`): subprocess wrapper for create, restore and the version check; minimum dar 2.6.x
-- **Staging** (`src/staging/`): sha256 validation before archiving, age multi-recipient encryption, ephemeral slices
+- **Staging** (`src/staging/`): sha256 validation beside dar's single read of the source, `dar -c -` cut into dar slices and age-encrypted in memory (no plaintext on the staging device, #370), ephemeral slices
 - **Volume management** (`src/volume/`): Layout-v2 self-describing layout (`volume-format-v2.md`), the typestate write session (`session.rs`), Layout build/materialize (`build.rs`), front-index/seal/ID-thunk parsers (`format.rs`), `MANIFEST.toml` in both directions (`manifest.rs`), envelope read-back (`envelope.rs`), RESTORE.sh from named awk fragments (`restore_script.rs`), catalog rebuild (`rebuild.rs`), raw dump (`raw.rs`), verify, read-slices
 - **Tape I/O** (`src/tape/`): kernel st driver via ioctl, fixed 512KB block mode
 - **Crypto** (`src/crypto/`): age multi-recipient encryption, per-tenant key isolation
@@ -325,7 +364,7 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
 - Strict tenant isolation — zero content metadata in plaintext on tape; tenant envelopes use age trial-decryption
 - Multi-tenant bin-packing on shared volumes
 - Physical cartridges tracked separately from logical volumes (cartridges can be erased/reused)
-- Policy audit is advisory, never blocking (exit codes: 0=clean, 1=warn, 2=violation)
+- Policy audit is advisory, never blocking (exit codes: 0=clean, 1=warn, 2=violation, 70=error)
 
 ## External Dependencies
 
@@ -335,7 +374,8 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
 - `lsscsi`, `mt-st` — the binary never calls them (device discovery and debugging), but
   `scripts/first-run.sh` step 2 requires both, along with `acl` (`setfacl`) and `python3`
 - the `age` and `tar` CLIs — not used by the binary (it uses the `age` and `tar`
-  crates), but the on-tape RESTORE.sh (the heir path) refuses to run without them or `mt`
+  crates), but the on-tape RESTORE.sh (the heir path) refuses to run without them or `mt`,
+  and names `gpg` up front when the dar it finds needs it (ADR-0012 2026-10-06 item 21)
 
 ## Key Rust Dependencies
 

@@ -17,6 +17,7 @@ the repository, grouped by what you are trying to do.
 | [Troubleshooting](troubleshooting.md) | Exit codes, how confirmation works, and every refusal you are likely to meet — what it means and what to do. |
 | [Command reference](cli/README.md) | Every command, subcommand and flag, generated from the binary's own definitions. |
 | [Man pages](man/README.md) | The same reference as `man` pages (`man -l docs/man/tapectl.1`). |
+| [Release notes](releases/) | What each release changes for an operator: on-tape format, catalog migrations, exit codes, config keys, known open items ([1.1.0](releases/1.1.0.md)). |
 
 ## The tape format and the design
 
