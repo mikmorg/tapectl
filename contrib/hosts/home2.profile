@@ -13,6 +13,10 @@ DEVICE=/dev/tape/by-id/scsi-HUJ808A5L4-nst
 
 OPERATOR=mikmorg
 
+# ADOPT_KEYS_FROM is deliberately unset: the 1.1.0 fresh start mints new keys
+# for the operator and every tenant (ADR-0012, 2026-10-12, item 41). Set it
+# only to keep keys people already hold (docs/keys-and-recovery.md, runbook F).
+
 # The service user's home — and so the tapectl home, catalog and keys — lives on
 # /srv/archive_meta (sda, LUKS), not /var (95% full). home2-prep.sh moves it.
 SVC_HOME_WANT=/srv/archive_meta/tapectl

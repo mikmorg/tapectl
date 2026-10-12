@@ -87,15 +87,188 @@ pub fn read_public_key(path: &Path) -> Result<String> {
 /// Read a secret key from a file.
 pub fn read_secret_key(path: &Path) -> Result<String> {
     let content = fs::read_to_string(path)?;
-    let key = content
+    secret_key_line(&content).ok_or_else(|| {
+        TapectlError::Encryption(format!("no secret key found in {}", path.display()))
+    })
+}
+
+/// The secret key line [`read_secret_key`] takes from a key file's text:
+/// the first line starting with `AGE-SECRET-KEY-`, trimmed. The one rule
+/// every reader of `keys/` uses, so adoption (#424) can check that the file
+/// it stores is read back as the identity it validated.
+fn secret_key_line(content: &str) -> Option<String> {
+    content
         .lines()
         .find(|l| l.starts_with("AGE-SECRET-KEY-"))
-        .ok_or_else(|| {
-            TapectlError::Encryption(format!("no secret key found in {}", path.display()))
-        })?
-        .trim()
-        .to_string();
-    Ok(key)
+        .map(|l| l.trim().to_string())
+}
+
+/// The most an identity file offered for adoption may hold. One age
+/// identity with age-keygen's comment lines is about 200 bytes; anything
+/// near this is not an identity file.
+const ADOPT_MAX_BYTES: usize = 64 * 1024;
+
+/// An existing age X25519 identity file, validated for adoption as a
+/// tenant's key (issue #424, ADR-0012 2026-10-12 item 42).
+///
+/// Holds the file's bytes exactly as read, so the copy stored under `keys/`
+/// is byte-identical to what the key holder kept, and the public key derived
+/// from its one identity. `Debug` never shows the bytes.
+pub struct AdoptableIdentity {
+    bytes: Vec<u8>,
+    /// The `age1…` public key of the file's one identity.
+    pub public_key: String,
+}
+
+impl std::fmt::Debug for AdoptableIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdoptableIdentity")
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdoptableIdentity {
+    /// The identity file's bytes, exactly as read.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Read and validate an identity file offered for adoption (#424).
+///
+/// Refuses, naming the reason, anything but a single native age X25519
+/// identity: no identity, more than one, a malformed `AGE-SECRET-KEY-1…`
+/// line, a plugin identity, a public key, an age-encrypted (passphrase
+/// protected) file, or any other non-comment line. Blank lines and `#`
+/// comments (what `age-keygen -o` writes around the key) are allowed and
+/// kept.
+pub fn read_adoptable_identity(path: &Path) -> Result<AdoptableIdentity> {
+    let refuse = |why: String| {
+        TapectlError::Encryption(format!(
+            "{} is not a single age X25519 identity: {why}",
+            path.display()
+        ))
+    };
+    let meta = fs::metadata(path)
+        .map_err(|e| TapectlError::Encryption(format!("cannot read {}: {e}", path.display())))?;
+    if !meta.is_file() {
+        return Err(refuse("it is not a regular file".into()));
+    }
+    if meta.len() > ADOPT_MAX_BYTES as u64 {
+        return Err(refuse(format!(
+            "it is {} bytes, far more than an identity file holds",
+            meta.len()
+        )));
+    }
+    let bytes = fs::read(path)
+        .map_err(|e| TapectlError::Encryption(format!("cannot read {}: {e}", path.display())))?;
+    parse_adoptable_identity(bytes).map_err(refuse)
+}
+
+/// The pure half of [`read_adoptable_identity`]: `Err` is the reason.
+fn parse_adoptable_identity(bytes: Vec<u8>) -> std::result::Result<AdoptableIdentity, String> {
+    const ENCRYPTED: &str = "it is an age-encrypted file (a passphrase-protected identity?) — \
+                             decrypt it with `age -d` first and adopt the plain identity file";
+    if bytes.starts_with(b"age-encryption.org/") {
+        return Err(ENCRYPTED.into());
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Err("it is not a text file".into());
+    };
+    let mut identities: Vec<x25519::Identity> = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let n = i + 1;
+        let line = raw.trim_end();
+        let lead = line.trim_start();
+        if lead.is_empty() || lead.starts_with('#') {
+            continue;
+        }
+        if lead.starts_with("-----BEGIN AGE ENCRYPTED FILE-----") {
+            return Err(ENCRYPTED.into());
+        }
+        if lead.starts_with("AGE-PLUGIN-") {
+            return Err(format!(
+                "line {n} is a plugin identity — tapectl adopts only native X25519 identities \
+                 (AGE-SECRET-KEY-1…)"
+            ));
+        }
+        if lead.starts_with("age1") {
+            return Err(format!(
+                "line {n} is a public key — adoption needs the SECRET identity file \
+                 (AGE-SECRET-KEY-1…); `tapectl key import` registers a public key"
+            ));
+        }
+        if !line.starts_with("AGE-SECRET-KEY-") {
+            return Err(format!(
+                "line {n} is neither a comment nor an age identity at the start of its line"
+            ));
+        }
+        match line.parse::<x25519::Identity>() {
+            Ok(id) => identities.push(id),
+            Err(_) => {
+                return Err(format!("line {n} is not a valid age X25519 identity"));
+            }
+        }
+    }
+    let identity = match identities.len() {
+        0 => return Err("it holds no age identity".into()),
+        1 => identities.pop().expect("one"),
+        k => {
+            return Err(format!(
+                "it holds {k} identities — adopt exactly one, from a file of its own"
+            ))
+        }
+    };
+    // What every reader of `keys/` will take from the stored copy must be
+    // this very identity, or the adopted file would load as something else.
+    let read_back = secret_key_line(text)
+        .and_then(|s| s.parse::<x25519::Identity>().ok())
+        .map(|id| id.to_public().to_string());
+    let public_key = identity.to_public().to_string();
+    if read_back.as_deref() != Some(public_key.as_str()) {
+        return Err("its identity line would not be read back as written".into());
+    }
+    Ok(AdoptableIdentity { bytes, public_key })
+}
+
+/// Store an adopted identity (#424) where a minted one lives: the secret at
+/// `keys/<tenant>-<alias>.age.key`, its bytes exactly as given, created mode
+/// 0600 by this process as [`save_secret_key`] does; the public half beside
+/// it as `.age.pub`. Refuses to replace either file. On a failure part-way,
+/// removes what it wrote.
+pub fn save_adopted_keypair(
+    keys_dir: &Path,
+    tenant_name: &str,
+    alias: &str,
+    identity: &AdoptableIdentity,
+) -> Result<()> {
+    let (pub_path, key_path) = key_paths(keys_dir, tenant_name, alias);
+    if pub_path.exists() || key_path.exists() {
+        return Err(TapectlError::KeyAlreadyExists(format!(
+            "{tenant_name}-{alias}"
+        )));
+    }
+    fs::create_dir_all(keys_dir)?;
+    let write_secret = || -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_path)?;
+        file.write_all(identity.bytes())?;
+        file.sync_all()
+    };
+    if let Err(e) = write_secret() {
+        let _ = fs::remove_file(&key_path);
+        return Err(e.into());
+    }
+    if let Err(e) = save_public_key(&pub_path, &identity.public_key) {
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&pub_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Derive the key file paths for a given tenant + alias.
@@ -350,6 +523,149 @@ mod tests {
         fs::write(&path, content).unwrap();
         let read = read_secret_key(&path).unwrap();
         assert_eq!(read, kp.secret_key);
+    }
+
+    // --- adoption (#424) ----------------------------------------------------
+
+    /// An identity file shaped as `age-keygen -o` writes one: two comment
+    /// lines, then the key.
+    fn keygen_file(dir: &Path, name: &str) -> (std::path::PathBuf, String) {
+        let kp = generate_keypair();
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            format!(
+                "# created: 2026-10-12T00:00:00Z\n# public key: {}\n{}\n",
+                kp.public_key, kp.secret_key
+            ),
+        )
+        .unwrap();
+        (path, kp.public_key)
+    }
+
+    fn refusal(dir: &Path, content: &[u8]) -> String {
+        let path = dir.join("offered.key");
+        fs::write(&path, content).unwrap();
+        read_adoptable_identity(&path).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn an_age_keygen_file_is_adoptable_and_kept_byte_for_byte() {
+        let tmp = TempDir::new().unwrap();
+        let (path, public) = keygen_file(tmp.path(), "fam.key");
+        let id = read_adoptable_identity(&path).unwrap();
+        assert_eq!(id.public_key, public);
+        assert_eq!(id.bytes(), fs::read(&path).unwrap().as_slice());
+        assert!(
+            !format!("{id:?}").contains("AGE-SECRET-KEY"),
+            "Debug must not show the secret"
+        );
+    }
+
+    #[test]
+    fn a_bare_key_line_without_newline_or_comments_is_adoptable() {
+        let tmp = TempDir::new().unwrap();
+        let kp = generate_keypair();
+        let path = tmp.path().join("bare.key");
+        fs::write(&path, &kp.secret_key).unwrap();
+        assert_eq!(
+            read_adoptable_identity(&path).unwrap().public_key,
+            kp.public_key
+        );
+    }
+
+    #[test]
+    fn adoption_refuses_anything_but_one_x25519_identity_naming_why() {
+        let tmp = TempDir::new().unwrap();
+        let a = generate_keypair();
+        let b = generate_keypair();
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (b"# only a comment\n\n".to_vec(), "holds no age identity"),
+            (b"".to_vec(), "holds no age identity"),
+            (
+                format!("{}\n{}\n", a.secret_key, b.secret_key).into_bytes(),
+                "holds 2 identities",
+            ),
+            (
+                format!("{}\n", a.public_key).into_bytes(),
+                "is a public key",
+            ),
+            (b"AGE-PLUGIN-YUBIKEY-1QQQQQQ\n".to_vec(), "plugin identity"),
+            (
+                b"AGE-SECRET-KEY-1NOTREALLYAKEY\n".to_vec(),
+                "line 1 is not a valid age X25519 identity",
+            ),
+            (
+                format!("# ok\nhello\n{}\n", a.secret_key).into_bytes(),
+                "line 2 is neither a comment nor an age identity",
+            ),
+            (
+                format!("  {}\n", a.secret_key).into_bytes(),
+                "line 1 is neither a comment nor an age identity",
+            ),
+            (
+                b"age-encryption.org/v1\n-> scrypt xyz 18\n".to_vec(),
+                "age-encrypted file",
+            ),
+            (
+                b"-----BEGIN AGE ENCRYPTED FILE-----\nYWdl\n".to_vec(),
+                "age-encrypted file",
+            ),
+            (vec![0xff, 0xfe, 0x00, 0x41], "not a text file"),
+        ];
+        for (content, want) in cases {
+            let msg = refusal(tmp.path(), &content);
+            assert!(msg.contains("is not a single age X25519 identity"), "{msg}");
+            assert!(msg.contains(want), "want {want:?} in: {msg}");
+            assert!(
+                !msg.contains(&a.secret_key) && !msg.contains(&b.secret_key),
+                "a refusal never echoes a secret"
+            );
+        }
+    }
+
+    #[test]
+    fn adoption_refuses_a_missing_file_a_directory_and_an_oversized_file() {
+        let tmp = TempDir::new().unwrap();
+        assert!(read_adoptable_identity(&tmp.path().join("ghost.key"))
+            .unwrap_err()
+            .to_string()
+            .contains("cannot read"));
+        assert!(read_adoptable_identity(tmp.path())
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+        let big = tmp.path().join("big.key");
+        fs::write(&big, vec![b'#'; ADOPT_MAX_BYTES + 1]).unwrap();
+        assert!(read_adoptable_identity(&big)
+            .unwrap_err()
+            .to_string()
+            .contains("far more than an identity file holds"));
+    }
+
+    #[test]
+    fn an_adopted_keypair_is_stored_as_a_minted_one_and_loads_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let (path, public) = keygen_file(tmp.path(), "in.key");
+        let id = read_adoptable_identity(&path).unwrap();
+        let keys_dir = tmp.path().join("keys");
+        save_adopted_keypair(&keys_dir, "fam", "primary", &id).unwrap();
+
+        let (pub_path, key_path) = key_paths(&keys_dir, "fam", "primary");
+        assert_eq!(fs::read(&key_path).unwrap(), fs::read(&path).unwrap());
+        let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(read_public_key(&pub_path).unwrap(), public);
+        // Read back by the same rule every restore uses.
+        let owners = KeyOwners {
+            by_alias: HashMap::new(),
+        };
+        let loaded = load_identities_owned_by(&keys_dir, "fam", &owners).unwrap();
+        assert_eq!(publics(&loaded), vec![public]);
+
+        let err = save_adopted_keypair(&keys_dir, "fam", "primary", &id).unwrap_err();
+        assert!(matches!(err, TapectlError::KeyAlreadyExists(_)));
     }
 
     #[test]

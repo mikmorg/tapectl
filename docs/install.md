@@ -102,6 +102,7 @@ any flag still wins. Beyond the flags' own values (`DEVICE`, `OPERATOR`,
 | `SVC_HOME_WANT` | 5 | the service user's home; step 5 refuses if an existing account's home differs |
 | `LOCATIONS=("name\|description" …)` | 10 | every shelf; tape 1 is recorded at the first |
 | `TENANTS=("name\|description" …)` | 11 | non-operator tenants, created if missing |
+| `ADOPT_KEYS_FROM` (`--adopt-keys-from`) | 7, 11 | a directory of `<name>.key` age identity files: `init` adopts `<operator>.key` (`--operator-key`) and each `TENANTS` entry still to be created adopts `<tenant>.key` (`tenant add --adopt-key`) instead of minting keys, each previewed with `--dry-run` first. A missing or unreadable file stops the step before anything is created. The copy-out is in [keys-and-recovery.md](keys-and-recovery.md#f-keeping-existing-keys-on-a-fresh-home) |
 | `COLLECTIONS=("name\|root\|tenant\|depth" …)` | 11 | granted by ACL, written as `[[collections]]`, then `collection sync` |
 | `CONTENDER_UNITS=(…)` | 13 | the systemd units `host check` treats as contenders; unset means the dev VM's homorg timers |
 

@@ -12,7 +12,7 @@ tapectl tenant [OPTIONS] <COMMAND>
 
 **Subcommands**
 
-- [`add`](#tapectl-tenant-add) — Add a new tenant (generates keypair automatically)
+- [`add`](#tapectl-tenant-add) — Add a new tenant (mints a primary and a backup key pair, or adopts an existing identity with --adopt-key)
 - [`list`](#tapectl-tenant-list) — List all tenants
 - [`info`](#tapectl-tenant-info) — Show tenant details
 - [`reassign`](#tapectl-tenant-reassign) — Reassign all units from one tenant to another
@@ -20,7 +20,7 @@ tapectl tenant [OPTIONS] <COMMAND>
 
 ### tapectl tenant add
 
-Add a new tenant (generates keypair automatically)
+Add a new tenant (mints a primary and a backup key pair, or adopts an existing identity with --adopt-key)
 
 ```text
 tapectl tenant add [OPTIONS] <NAME>
@@ -33,6 +33,7 @@ tapectl tenant add [OPTIONS] <NAME>
 **Options**
 
 - `-d, --description <DESCRIPTION>` — Description
+- `--adopt-key <PATH>` — Adopt this existing age identity file (the SECRET: one AGE-SECRET-KEY-1… line; age-keygen's comment lines are kept) as the tenant's primary key instead of minting a pair. It is stored byte for byte as keys/<name>-primary.age.key, mode 0600, and is the tenant's only key: nothing is minted. Refused: anything but one X25519 identity, a public key already registered, and the escrow identity's secret
 
 ### tapectl tenant list
 
