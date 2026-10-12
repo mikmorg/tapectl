@@ -203,6 +203,81 @@ written by tapectl 1.1.0 or later is on it twice.
   ignores those entries and reads the primaries exactly as it always did, so
   this needs no `requires` entry (§1.2 rule 3).
 
+### 1.4 The operator envelope's `catalog.db` (normative)
+
+The operator envelope and its backup carry, beside `MANIFEST.toml`,
+`RECOVERY.md`, `PLAN.toml` and the dar catalogues, a tar member `catalog.db`
+(#83): a standalone SQLite database holding what the catalog knew, at staging
+time, about **this write's stage sets only** — every tenant's, so it is never
+in a tenant envelope. `catalog rebuild --from-volume` reads it
+(`db::ontape_catalog`), and `RECOVERY.md` shows an operator with only
+`sqlite3` how to query it. Tape positions are not in it: `MANIFEST.toml` has
+them. `PRAGMA user_version` is the schema level of the `tapectl.db` it was
+built from, not this file's own shape.
+
+**Generations, told apart by shape.** No stamp says which shape a file has
+(declined 2026-09-11: the probe is the reader, and a stamp would be a second
+source of truth). A reader probes, and refuses a file whose markers disagree,
+naming what it found:
+
+| Generation | Written by | Per-file tables | Also carries |
+|---|---|---|---|
+| 1 | #83's landing (2026-07) to 2026-09-11 | `files` | — |
+| 2 | 2026-09-11 to 1.1.0 | `files` | `tenants`, `stage_sets.key_fingerprints`, `stage_slices.sha256_plain` |
+| 3 | 1.1.0 and later (ADR-0012 2026-10-12 item 48, #418 R3) | `paths`, `file_versions` | as generation 2 |
+
+Generation 3 is recognised by `file_versions` and `paths` with no `files`;
+generations 1 and 2 by `files` with no `file_versions`, and between them by
+`tenants` together with `key_fingerprints` (both present: 2; both absent: 1).
+
+**Generation 1 and 2 `files`**: one row per walked entry: `id`,
+`snapshot_id`, `path`, `size_bytes`, `sha256` (64 lowercase hex characters),
+`modified_at` (RFC 3339 text, `YYYY-MM-DDTHH:MM:SS+00:00`), `is_directory`
+(0/1). Nothing else of a file's type: a rebuild from these tapes records a
+symlink or a special file as a regular file, because the tape cannot say
+otherwise (#381).
+
+**Generation 3** takes the main catalog's narrow shape (migration 030) and
+records each entry's kind and link target, so a rebuilt catalog keeps them:
+
+```sql
+CREATE TABLE paths (
+    id      INTEGER PRIMARY KEY,   -- the writing catalog's own path id
+    unit_id INTEGER NOT NULL,      -- units.id in this file
+    path    TEXT NOT NULL          -- relative to the snapshot's source_path
+);
+CREATE TABLE file_versions (
+    snapshot_id INTEGER NOT NULL,  -- snapshots.id in this file
+    path_id     INTEGER NOT NULL,  -- paths.id
+    kind        INTEGER NOT NULL CHECK(kind IN (0, 1, 2, 3)),
+                                   -- 0 dir, 1 regular, 2 symlink,
+                                   -- 3 special (FIFO, socket, device)
+    size_bytes  INTEGER NOT NULL,  -- lstat's size; 0 for a directory
+    mtime_ns    INTEGER,           -- Unix time in nanoseconds, UTC
+    sha256      BLOB CHECK(sha256 IS NULL
+                           OR (typeof(sha256) = 'blob' AND length(sha256) = 32)),
+    link_target TEXT,              -- a symlink's target; NULL otherwise
+    PRIMARY KEY (snapshot_id, path_id)
+) WITHOUT ROWID;
+```
+
+- `paths` holds only the paths this write's versions use, under the writing
+  catalog's ids; a version's rows in `path_id` order are its walk order.
+- `paths` has **no `UNIQUE(unit_id, path)` index**, unlike the main catalog:
+  nothing on the tape looks a file up by name, a rebuild interns paths into
+  its own catalog's index, and the index would store every path twice. The
+  file is read whole or one version at a time, along the primary key.
+- No full-text index and no triggers. Permissions, owners, xattrs, ACLs,
+  device numbers and hard links stay out, as in the main catalog: the dar
+  catalogue beside it in the envelope is their authority.
+- A reader of generation 3 refuses, naming the row, a `kind` outside 0–3 or a
+  `sha256` that is not 32 bytes; it does not guess.
+
+A tapectl from before 1.1.0 refuses a generation-3 file (it finds no
+`files` table) rather than misreading it, and nothing but tapectl reads the
+file, so the change needs no `requires` entry (§1.2 rule 3). Rebuild keeps
+reading generations 1 and 2 for as long as any such tape exists.
+
 ## 2. Plaintext vs encrypted, and the isolation invariant
 
 | Zone | On tape | Why |
@@ -250,9 +325,11 @@ a third:
    time*: volume identity, units, snapshots, the slice map and plaintext
    hashes (the envelope `MANIFEST.toml`), tenant ownership, each stage set's
    recorded recipient list and the per-file index (the operator envelope's
-   `catalog.db`). Tapes written before 2026-09-11 carry an older `catalog.db`
-   without ownership or receipts; the rebuild takes ownership from the
-   tenant envelopes and reports the receipt as unknown.
+   `catalog.db`, §1.4). Tapes written before 2026-09-11 carry an older
+   `catalog.db` without ownership or receipts; the rebuild takes ownership
+   from the tenant envelopes and reports the receipt as unknown. Tapes
+   written before 1.1.0 record no file kinds or link targets; the rebuild
+   records their non-directories as regular files.
 3. **Never on the tape:** where the cartridge is, whether it has been
    verified and when, what policy applies to a unit, warehouse deposits, and
    any fact the catalog knows only because the operator did something after
