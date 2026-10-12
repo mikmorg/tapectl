@@ -1402,3 +1402,14 @@ Follow-up, ruled the same day:
 50. **The escrow public key stays out of git**: `home2.profile` reads it from a local file outside
     the repository (`~/.config/tapectl/home2.local.profile`) or the `--escrow-public-key` flag, so
     the tagged tree and the binary's version stay clean.
+51. **`tapectl cartridge erase` overwrites a tape with careful verification** (built in 1.1.0):
+    it identifies the medium read-only (chip serial; File 0's label, uuid, layout version and
+    dates; seal; front-index totals; or "not written by tapectl"), cross-checks the catalog by
+    uuid and serial and refuses a volume the catalog counts as a live copy (`volume retire` stays
+    the only way to give one up), asks for the label just read from the tape to be typed
+    (unattended: `--confirm-label` must match it; `--yes` alone never suffices), erases, then
+    re-reads to prove File 0 blank and the chip serial unchanged, and records the event, a
+    contact, and the cartridge (registered by serial, or its retired volume marked erased).
+    `first-run.sh` step 13 offers it when `volume init` refuses a sealed tape.
+52. **Its default erase is short**; `--long` erases the whole medium, for a cartridge that leaves
+    the operator's hands.
