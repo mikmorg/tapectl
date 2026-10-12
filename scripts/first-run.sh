@@ -1093,7 +1093,13 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
     svc_in_group "$USER" "$DEVGRP" || die "$USER is not in group $DEVGRP — cannot run the rehearsal"
     WRAP=(sg "$DEVGRP" -c)   # this login predates the membership; sg opens a shell with it now
   fi
-  if [ -n "$SG" ]; then run sudo sg_read_attr "$SG" | grep -iE "Medium serial|manufacturer" || true; fi
+  # Step 12 runs as you: read the chip directly when your login can open the
+  # SG node (the tape group can on home2), sudo only when it cannot. On a host
+  # whose sudo asks for a password, an unattended run used to hang here.
+  if [ -n "$SG" ]; then
+    if [ -r "$SG" ] && [ -w "$SG" ]; then run sg_read_attr "$SG" | grep -iE "Medium serial|manufacturer" || true
+    else run sudo sg_read_attr "$SG" | grep -iE "Medium serial|manufacturer" || true; fi
+  fi
   ask TEST_BARCODE "medium serial of the TEST cartridge in the drive, as printed above (it will be erased)" "$TEST_BARCODE"
   [ -n "$TEST_BARCODE" ] || die "no barcode given"
   if confirm_destructive "ERASE $TEST_BARCODE and run the rehearsal" "$TEST_BARCODE" "$BARCODE_FROM_FLAG"; then
