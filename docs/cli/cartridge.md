@@ -17,6 +17,7 @@ tapectl cartridge [OPTIONS] <COMMAND>
 - [`info`](#tapectl-cartridge-info) — Show cartridge details
 - [`move`](#tapectl-cartridge-move) — Move a cartridge to a location, taking its volumes with it
 - [`retire`](#tapectl-cartridge-retire) — Retire a cartridge permanently — it must never be written again
+- [`erase`](#tapectl-cartridge-erase) — Erase the tape in the drive, after identifying it, checking it against the catalog and asking for its label; then read it back to prove it
 - [`mark-erased`](#tapectl-cartridge-mark-erased) — Mark a cartridge as erased (available for reuse)
 - [`edit`](#tapectl-cartridge-edit) — Correct a registered cartridge's generation and/or its claimed serial
 - [`relabel`](#tapectl-cartridge-relabel) — Correct a cartridge's barcode label
@@ -107,11 +108,33 @@ tapectl cartridge retire [OPTIONS] <BARCODE>
 - `--reason <REASON>` — Why (appended to the cartridge's notes, never overwriting them)
 - `--force` — Supply the ADR-0008 Tier-2 consent this command asks on every run, including when no unit is left below its policy. It does NOT defeat the Tier-3 refusal — a cartridge holding the last eligible copy of a live version is refused outright and no flag reaches it. See cli::consent
 
+### tapectl cartridge erase
+
+Erase the tape in the drive, after identifying it, checking it against the catalog and asking for its label; then read it back to prove it
+
+ADR-0012 (2026-10-12, items 51 and 52), in order:
+
+1. Identifies the tape READ-ONLY and prints what it is: the chip serial; File 0's label, uuid, layout version, writer and dates; the seal and its front-index totals — or that the tape is blank, that File 0 is EMPTY, unreadable, or not written by tapectl. A blank tape (and an EMPTY File 0, under the short erase) is left alone: there is nothing to erase, and the command succeeds. 2. Cross-checks the catalog by File 0's uuid and by the chip serial. A volume the catalog still holds — anything not `retired` or `erased`, a live copy above all — is refused, naming `volume retire`, the only way to give one up. `--dry-run` stops here. 3. Asks for the label just read from File 0 to be typed (for a tape tapectl did not write: its chip serial). Unattended, `--confirm-label` must equal it. `--yes` never gives this consent. 4. Erases: by default SHORT — one filemark at the beginning of the tape, seconds; File 0 then reads EMPTY and nothing past it can be read. `--long` erases the whole medium (hours on LTO). Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks. 5. Reads the tape back: File 0 must be EMPTY (short) or blank (long), and the chip serial unchanged. 6. Records it: an event, the contact, and the cartridge — registered by its chip serial (status available) if the catalog did not know it, or its retired volumes marked erased and the cartridge made available, as `cartridge mark-erased` does (a `retired_permanent` cartridge stays retired).
+
+After a short erase, `volume init` still refuses the EMPTY File 0 without `--force` (ADR-0003 fails closed); after a long erase the tape is blank and init needs nothing.
+
+Exit status: 0 = erased and verified (also: nothing to erase, and `--dry-run`). 2 = refused, the tape untouched (or a usage error). 3 = erased, but the read-back reached no verdict; nothing recorded — run it again. 4 = the erase failed part-way; nothing recorded — run it again. 6 = the read-back contradicts the erase (File 0 still holds data, or the chip serial changed); nothing recorded. 75 = the catalog was busy.
+
+```text
+tapectl cartridge erase [OPTIONS]
+```
+
+**Options**
+
+- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--long` — Erase the whole medium instead of writing a filemark at its start: hours on real LTO. For a cartridge that leaves your hands
+- `--confirm-label <LABEL>` — The label read from the tape's File 0 (for a tape tapectl did not write, its chip serial), for an unattended erase. It must equal what the tape says; `--dry-run` prints it
+
 ### tapectl cartridge mark-erased
 
 Mark a cartridge as erased (available for reuse)
 
-Run it after erasing the tape in the drive: a long erase (`mt -f <device> erase`, hours on real LTO) or a filemark at its start (`mt -f <device> rewind; mt -f <device> weof 1`). Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks.
+`tapectl cartridge erase` erases the tape in the drive, verifies it and records it in one command; this is the statement alone, for a tape erased some other way. Run it after erasing the tape in the drive: a long erase (`mt -f <device> erase`, hours on real LTO) or a filemark at its start (`mt -f <device> rewind; mt -f <device> weof 1`). Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks.
 
 Refused outright on a `retired_permanent` cartridge — no `--force`, no `--yes`, no exception (ADR-0011, corrected 2026-09-14): this command's own mutation is the cartridge returning to `available`, and no amount of consent makes a medium declared permanently unfit fit again. `cartridge unretire` is the way back.
 

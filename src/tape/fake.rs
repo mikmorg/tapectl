@@ -48,6 +48,8 @@ pub(crate) enum Op {
     ReadHead(u32),
     /// A file written at this position.
     Write(u32),
+    /// A long erase (`MTERASE`) from this position.
+    Erase(u32),
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +108,14 @@ pub(crate) struct State {
     /// #416 item 13 — the end-of-tape path under `write_stream`, which no
     /// real medium has run).
     pub capacity: Option<u64>,
+    /// A drive that reports every write and erase done and changes nothing
+    /// on the medium — how a test proves `cartridge erase` checks its own
+    /// work by reading it back, never by trusting the drive's word (ADR-0012
+    /// 2026-10-12 item 51).
+    pub writes_vanish: bool,
+    /// A long erase that fails part-way, as st fails one on a medium error:
+    /// the command returns EIO with the medium partly erased.
+    pub erase_fails: bool,
 }
 
 impl State {
@@ -366,6 +376,9 @@ impl TapeOps for FakeTape {
             let (file, block) = s.head;
             assert_eq!(block, 0, "the fake only writes at a file boundary");
             s.ops.push(Op::Write(file as u32));
+            if s.writes_vanish {
+                return Ok(len.div_ceil(s.block_size.max(1) as u64) * s.block_size.max(1) as u64);
+            }
             let mut bytes = Vec::with_capacity(len as usize);
             src.take(len)
                 .read_to_end(&mut bytes)
@@ -426,6 +439,30 @@ impl TapeOps for FakeTape {
             }
             s.head = (file + 1, 0);
             Ok((total, ReadEnd::Filemark))
+        })
+    }
+
+    /// st's long erase: everything from the head onward is gone, and the
+    /// head is where it was (the caller rewinds). Refused through a
+    /// read-only open, as a write is.
+    fn erase_long(&mut self) -> Result<()> {
+        self.travelled(|s| {
+            if s.opens.last() == Some(&OpenMode::ReadOnly) {
+                return Err(TapectlError::TapeIo(
+                    "ioctl op=13 count=1: Bad file descriptor (os error 9)".to_string(),
+                ));
+            }
+            let (file, _) = s.head;
+            s.ops.push(Op::Erase(file as u32));
+            if s.erase_fails {
+                s.files.truncate(file + 1);
+                return Err(io_error("ioctl op=13 count=1"));
+            }
+            if !s.writes_vanish {
+                s.files.truncate(file);
+                s.head = (file.min(s.files.len()), 0);
+            }
+            Ok(())
         })
     }
 

@@ -1,0 +1,55 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-cartridge-erase 1  "tapectl-cartridge-erase " 
+.SH NAME
+tapectl\-cartridge\-erase \- Erase the tape in the drive, after identifying it, checking it against the catalog and asking for its label; then read it back to prove it
+.SH SYNOPSIS
+\fBtapectl cartridge erase\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-long\fR] [\fB\-\-confirm\-label\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Erase the tape in the drive, after identifying it, checking it against the catalog and asking for its label; then read it back to prove it
+.PP
+ADR\-0012 (2026\-10\-12, items 51 and 52), in order:
+.PP
+1. Identifies the tape READ\-ONLY and prints what it is: the chip serial; File 0\*(Aqs label, uuid, layout version, writer and dates; the seal and its front\-index totals — or that the tape is blank, that File 0 is EMPTY, unreadable, or not written by tapectl. A blank tape (and an EMPTY File 0, under the short erase) is left alone: there is nothing to erase, and the command succeeds. 2. Cross\-checks the catalog by File 0\*(Aqs uuid and by the chip serial. A volume the catalog still holds — anything not `retired` or `erased`, a live copy above all — is refused, naming `volume retire`, the only way to give one up. `\-\-dry\-run` stops here. 3. Asks for the label just read from File 0 to be typed (for a tape tapectl did not write: its chip serial). Unattended, `\-\-confirm\-label` must equal it. `\-\-yes` never gives this consent. 4. Erases: by default SHORT — one filemark at the beginning of the tape, seconds; File 0 then reads EMPTY and nothing past it can be read. `\-\-long` erases the whole medium (hours on LTO). Never degauss or bulk\-erase an LTO cartridge: that destroys its factory servo tracks. 5. Reads the tape back: File 0 must be EMPTY (short) or blank (long), and the chip serial unchanged. 6. Records it: an event, the contact, and the cartridge — registered by its chip serial (status available) if the catalog did not know it, or its retired volumes marked erased and the cartridge made available, as `cartridge mark\-erased` does (a `retired_permanent` cartridge stays retired).
+.PP
+After a short erase, `volume init` still refuses the EMPTY File 0 without `\-\-force` (ADR\-0003 fails closed); after a long erase the tape is blank and init needs nothing.
+.PP
+Exit status: 0 = erased and verified (also: nothing to erase, and `\-\-dry\-run`). 2 = refused, the tape untouched (or a usage error). 3 = erased, but the read\-back reached no verdict; nothing recorded — run it again. 4 = the erase failed part\-way; nothing recorded — run it again. 6 = the read\-back contradicts the erase (File 0 still holds data, or the chip serial changed); nothing recorded. 75 = the catalog was busy.
+.SH OPTIONS
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+.TP
+\fB\-\-long\fR
+Erase the whole medium instead of writing a filemark at its start: hours on real LTO. For a cartridge that leaves your hands
+.TP
+\fB\-\-confirm\-label\fR \fI<LABEL>\fR
+The label read from the tape\*(Aqs File 0 (for a tape tapectl did not write, its chip serial), for an unattended erase. It must equal what the tape says; `\-\-dry\-run` prints it
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

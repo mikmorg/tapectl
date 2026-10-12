@@ -4,6 +4,7 @@ pub mod build;
 #[cfg(test)]
 mod cost_budget;
 pub mod envelope;
+pub mod erase;
 pub mod figures;
 pub mod format;
 pub mod layout;

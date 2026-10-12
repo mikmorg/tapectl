@@ -335,6 +335,11 @@ pub enum Reading {
     /// drove the tape no way at all: a poll reading beside a write's is what
     /// tells "the drive between sessions" from "the drive during one".
     Poll,
+    /// A `cartridge erase` (ADR-0012 2026-10-12 item 51): its own kind,
+    /// because it drove the tape a way nothing else does — a filemark at
+    /// BOT, or the whole medium erased — and a reading taken after a long
+    /// erase is the cartridge's one full pass end to end.
+    Erase,
 }
 
 impl Reading {
@@ -347,6 +352,7 @@ impl Reading {
         Reading::Restore,
         Reading::Init,
         Reading::Poll,
+        Reading::Erase,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -357,6 +363,7 @@ impl Reading {
             Reading::Restore => "restore",
             Reading::Init => "init",
             Reading::Poll => "poll",
+            Reading::Erase => "erase",
         }
     }
 }
@@ -1233,7 +1240,7 @@ Read error counter page  [0x3]
         let names: Vec<&str> = Reading::ALL.iter().map(|r| r.as_str()).collect();
         assert_eq!(
             names,
-            vec!["write", "resume", "verify", "restore", "init", "poll"],
+            vec!["write", "resume", "verify", "restore", "init", "poll", "erase"],
             "health_logs.operation is what KIND of reading a row is — a \
              different vocabulary from cartridge_contacts.operation, which is \
              the command verbatim"
@@ -1263,9 +1270,21 @@ Read error counter page  [0x3]
             poll_prod.len() < poll_full.len(),
             "positive control: poll.rs's test module was separated from its production half"
         );
+        // The third: volume/erase.rs, `cartridge erase`'s one sweep
+        // (ADR-0012 2026-10-12 item 51), cut the same way.
+        let erase_full = source_of("volume/erase.rs");
+        let erase_prod = match erase_full.find("#[cfg(test)]\nmod tests") {
+            Some(i) => &erase_full[..i],
+            None => &erase_full[..],
+        };
+        assert!(
+            erase_prod.len() < erase_full.len(),
+            "positive control: erase.rs's test module was separated from its production half"
+        );
         let corpus: String = prod
             .lines()
             .chain(poll_prod.lines())
+            .chain(erase_prod.lines())
             .filter(|l| !l.trim_start().starts_with("//"))
             .map(|l| format!("{l}\n"))
             .collect();
@@ -1285,7 +1304,7 @@ Read error counter page  [0x3]
             let variant = format!("Reading::{reading:?}");
             assert!(
                 crate::tape::contact::tests::contains_identifier(&corpus, &variant),
-                "{variant} has no PRODUCTION writer in src/volume/write.rs or src/tape/poll.rs — a vocabulary \
+                "{variant} has no PRODUCTION writer in src/volume/write.rs, src/tape/poll.rs or src/volume/erase.rs — a vocabulary \
                  value with no writer is exactly the `read`/`clean` defect \
                  ADR-0013 §4 names, and it is a FINDING, not a row to add"
             );

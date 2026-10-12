@@ -1815,32 +1815,8 @@ pub fn cartridge_mark_erased(
     }
 
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "UPDATE cartridges SET status = 'available' WHERE id = ?1",
-        params![id],
-    )?;
-    tx.execute(
-        "UPDATE cartridge_volumes SET unmounted_at = datetime('now')
-         WHERE cartridge_id = ?1 AND unmounted_at IS NULL",
-        params![id],
-    )?;
-    for (vol_id, _) in &mounted_volumes {
-        tx.execute(
-            "UPDATE volumes SET status = 'erased' WHERE id = ?1",
-            params![vol_id],
-        )?;
-    }
-    events::log_field_change(
-        &tx,
-        "cartridge",
-        id,
-        barcode,
-        "erased",
-        "status",
-        Some(&status),
-        "available",
-        None,
-    )?;
+    let volume_ids: Vec<i64> = mounted_volumes.iter().map(|(v, _)| *v).collect();
+    record_cartridge_erased(&tx, id, barcode, &status, &volume_ids, "available", None)?;
     tx.commit()?;
 
     if json_output {
@@ -1856,6 +1832,60 @@ pub fn cartridge_mark_erased(
             println!("  volume \"{label}\" marked erased");
         }
     }
+    Ok(())
+}
+
+/// The catalog half of "the bytes on this cartridge are gone", shared by
+/// `cartridge mark-erased` (the operator's statement) and `cartridge erase`
+/// (tapectl's own, after it erased the tape and read it back blank; ADR-0012
+/// 2026-10-12 item 51). The caller holds the transaction and has already
+/// passed every refusal; this only writes:
+///
+/// - the cartridge to `new_status` — `available`, or, for `cartridge erase`
+///   on a `retired_permanent` cartridge (erased before it leaves the
+///   operator's hands), its own status unchanged: erasing a medium declared
+///   unfit does not make it fit (ADR-0011);
+/// - every open mount on it closed;
+/// - each of `erased_volume_ids` to `erased`;
+/// - one `erased` event on the cartridge, `details` carrying what the
+///   caller knows about the act (`cartridge erase`: the mode, the contact,
+///   what File 0 said).
+pub(crate) fn record_cartridge_erased(
+    tx: &Connection,
+    cartridge_id: i64,
+    barcode: &str,
+    prior_status: &str,
+    erased_volume_ids: &[i64],
+    new_status: &str,
+    details: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE cartridges SET status = ?2 WHERE id = ?1",
+        params![cartridge_id, new_status],
+    )?;
+    tx.execute(
+        "UPDATE cartridge_volumes SET unmounted_at = datetime('now')
+         WHERE cartridge_id = ?1 AND unmounted_at IS NULL",
+        params![cartridge_id],
+    )?;
+    for vol_id in erased_volume_ids {
+        tx.execute(
+            "UPDATE volumes SET status = 'erased' WHERE id = ?1",
+            params![vol_id],
+        )?;
+    }
+    events::log_event(
+        tx,
+        "cartridge",
+        cartridge_id,
+        Some(barcode),
+        "erased",
+        Some("status"),
+        Some(prior_status),
+        Some(new_status),
+        details,
+        None,
+    )?;
     Ok(())
 }
 

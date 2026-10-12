@@ -95,6 +95,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`cartridge info`](cartridge.md#tapectl-cartridge-info) | Show cartridge details |
 | &nbsp;&nbsp;[`cartridge move`](cartridge.md#tapectl-cartridge-move) | Move a cartridge to a location, taking its volumes with it |
 | &nbsp;&nbsp;[`cartridge retire`](cartridge.md#tapectl-cartridge-retire) | Retire a cartridge permanently — it must never be written again |
+| &nbsp;&nbsp;[`cartridge erase`](cartridge.md#tapectl-cartridge-erase) | Erase the tape in the drive, after identifying it, checking it against the catalog and asking for its label; then read it back to prove it |
 | &nbsp;&nbsp;[`cartridge mark-erased`](cartridge.md#tapectl-cartridge-mark-erased) | Mark a cartridge as erased (available for reuse) |
 | &nbsp;&nbsp;[`cartridge edit`](cartridge.md#tapectl-cartridge-edit) | Correct a registered cartridge's generation and/or its claimed serial |
 | &nbsp;&nbsp;[`cartridge relabel`](cartridge.md#tapectl-cartridge-relabel) | Correct a cartridge's barcode label |

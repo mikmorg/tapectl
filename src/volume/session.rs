@@ -643,6 +643,10 @@ pub fn check_tape_contact(
 /// `confirm` can start from the seal bytes already in hand.
 #[derive(Debug, Default)]
 pub(crate) struct ContactFacts {
+    /// File 0's bytes as read (block-padded), when File 0 was read and was
+    /// not oversized — kept so `cartridge erase` can report the rest of what
+    /// File 0 says without reading it a second time.
+    file0: Option<Vec<u8>>,
     /// File 0's identity, when File 0 was read and parsed.
     identity: Option<format::IdThunkIdentity>,
     /// File 0's own `[layout] seal_marker` pointer, when it parsed.
@@ -669,8 +673,13 @@ impl ContactFacts {
     }
 
     /// The bytes this contact read at `position`, if it read them.
-    fn seal_bytes(&self, position: u32) -> Option<Vec<u8>> {
+    pub(crate) fn seal_bytes(&self, position: u32) -> Option<Vec<u8>> {
         self.seal_reads.get(&position).cloned().flatten()
+    }
+
+    /// File 0's bytes, when this contact read them (not oversized).
+    pub(crate) fn file0(&self) -> Option<&[u8]> {
+        self.file0.as_deref()
     }
 }
 
@@ -691,6 +700,7 @@ pub(crate) fn contact_report(
             return (ContactOutcome::IdentityMismatch { found: None }, facts)
         }
         Ok(crate::store::SmallRead::Bytes(id_thunk_bytes)) => {
+            facts.file0 = Some(id_thunk_bytes.clone());
             let text = String::from_utf8_lossy(&id_thunk_bytes);
             let identity = format::parse_id_thunk_identity(&text);
             facts.identity = identity.as_ref().ok().cloned();

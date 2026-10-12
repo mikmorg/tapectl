@@ -22,6 +22,10 @@ const MTWEOFI: i16 = 35;
 const MTSETBLK: i16 = 20;
 const MTFSF: i16 = 1;
 const MTCOMP: i16 = 32; // MTCOMPRESSION
+/// `MTERASE` from <linux/mtio.h>. st sends ERASE with the LONG bit set when
+/// the count is non-zero (`st.c`: `cmd[1] = (arg ? 1 : 0)`), which is what
+/// `mt erase` does: the whole medium, hours on real LTO.
+const MTERASE: i16 = 13;
 
 #[repr(C)]
 struct MtOp {
@@ -97,6 +101,7 @@ fn mt_op_name(op: i16, count: i32) -> String {
         MTSETBLK => format!("set block size {count}"),
         MTFSF => format!("space forward {count} file(s)"),
         MTCOMP => "set compression".to_string(),
+        MTERASE => "erase (long)".to_string(),
         other => format!("ioctl op {other} count {count}"),
     }
 }
@@ -280,6 +285,13 @@ impl TapeDevice {
     /// Write a file mark (synchronous flush).
     pub fn write_filemark_sync(&self) -> Result<()> {
         self.mt_ioctl(MTWEOF, 1)
+    }
+
+    /// Erase the whole medium from the head onward — `mt erase`, the LONG
+    /// erase (ADR-0012 2026-10-12 item 52: `cartridge erase --long`). Hours
+    /// on real LTO; instant on mhvtl. A named wait, as every `mt_ioctl` is.
+    pub fn erase_long(&self) -> Result<()> {
+        self.mt_ioctl(MTERASE, 1)
     }
 
     /// Forward space N file marks.

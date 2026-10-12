@@ -103,9 +103,69 @@ pub enum CartridgeCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Erase the tape in the drive, after identifying it, checking it against
+    /// the catalog and asking for its label; then read it back to prove it
+    ///
+    /// ADR-0012 (2026-10-12, items 51 and 52), in order:
+    ///
+    /// 1. Identifies the tape READ-ONLY and prints what it is: the chip
+    ///    serial; File 0's label, uuid, layout version, writer and dates;
+    ///    the seal and its front-index totals — or that the tape is blank,
+    ///    that File 0 is EMPTY, unreadable, or not written by tapectl. A
+    ///    blank tape (and an EMPTY File 0, under the short erase) is left
+    ///    alone: there is nothing to erase, and the command succeeds.
+    /// 2. Cross-checks the catalog by File 0's uuid and by the chip serial.
+    ///    A volume the catalog still holds — anything not `retired` or
+    ///    `erased`, a live copy above all — is refused, naming `volume
+    ///    retire`, the only way to give one up. `--dry-run` stops here.
+    /// 3. Asks for the label just read from File 0 to be typed (for a tape
+    ///    tapectl did not write: its chip serial). Unattended,
+    ///    `--confirm-label` must equal it. `--yes` never gives this consent.
+    /// 4. Erases: by default SHORT — one filemark at the beginning of the
+    ///    tape, seconds; File 0 then reads EMPTY and nothing past it can be
+    ///    read. `--long` erases the whole medium (hours on LTO). Never
+    ///    degauss or bulk-erase an LTO cartridge: that destroys its factory
+    ///    servo tracks.
+    /// 5. Reads the tape back: File 0 must be EMPTY (short) or blank (long),
+    ///    and the chip serial unchanged.
+    /// 6. Records it: an event, the contact, and the cartridge — registered
+    ///    by its chip serial (status available) if the catalog did not know
+    ///    it, or its retired volumes marked erased and the cartridge made
+    ///    available, as `cartridge mark-erased` does (a `retired_permanent`
+    ///    cartridge stays retired).
+    ///
+    /// After a short erase, `volume init` still refuses the EMPTY File 0
+    /// without `--force` (ADR-0003 fails closed); after a long erase the
+    /// tape is blank and init needs nothing.
+    ///
+    /// Exit status: 0 = erased and verified (also: nothing to erase, and
+    /// `--dry-run`). 2 = refused, the tape untouched (or a usage error).
+    /// 3 = erased, but the read-back reached no verdict; nothing recorded —
+    /// run it again. 4 = the erase failed part-way; nothing recorded — run it
+    /// again. 6 = the read-back contradicts the erase (File 0 still holds
+    /// data, or the chip serial changed); nothing recorded. 75 = the catalog
+    /// was busy.
+    Erase {
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
+        /// Erase the whole medium instead of writing a filemark at its
+        /// start: hours on real LTO. For a cartridge that leaves your hands.
+        #[arg(long)]
+        long: bool,
+        /// The label read from the tape's File 0 (for a tape tapectl did not
+        /// write, its chip serial), for an unattended erase. It must equal
+        /// what the tape says; `--dry-run` prints it.
+        #[arg(long, value_name = "LABEL")]
+        confirm_label: Option<String>,
+    },
     /// Mark a cartridge as erased (available for reuse)
     ///
-    /// Run it after erasing the tape in the drive: a long erase (`mt -f
+    /// `tapectl cartridge erase` erases the tape in the drive, verifies it
+    /// and records it in one command; this is the statement alone, for a
+    /// tape erased some other way. Run it after erasing the tape in the
+    /// drive: a long erase (`mt -f
     /// <device> erase`, hours on real LTO) or a filemark at its start (`mt
     /// -f <device> rewind; mt -f <device> weof 1`). Never degauss or
     /// bulk-erase an LTO cartridge: that destroys its factory servo tracks.
@@ -709,6 +769,21 @@ pub fn run(
                 json_output,
             )?;
         }
+        CartridgeCommands::Erase {
+            device,
+            long,
+            confirm_label,
+        } => {
+            cartridge_erase_command(
+                conn,
+                config,
+                device.as_deref(),
+                *long,
+                confirm_label.as_deref(),
+                json_output,
+                dry_run,
+            )?;
+        }
         CartridgeCommands::MarkErased { barcode, force } => {
             crate::cli::operations::cartridge_mark_erased(
                 conn,
@@ -961,6 +1036,97 @@ pub fn run(
 }
 
 /// Resolve `cartridge journal`'s arguments to the rows they name.
+/// `cartridge erase` (ADR-0012 2026-10-12): resolve the drive STRICTLY, as
+/// every write path does (never a default device), run the erase, print the
+/// report. Errors return to `main`, whose `ErrorContract::Erase` gives each
+/// its exit code.
+fn cartridge_erase_command(
+    conn: &Connection,
+    config: &crate::config::Config,
+    device: Option<&str>,
+    long: bool,
+    confirm_label: Option<&str>,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<()> {
+    use crate::volume::erase::{self, EraseOptions, EraseOutcome};
+    let device = crate::cli::write_device(config, device)?;
+    let report = erase::cartridge_erase(
+        conn,
+        config,
+        &device,
+        EraseOptions {
+            mode: if long {
+                crate::store::EraseMode::Long
+            } else {
+                crate::store::EraseMode::Short
+            },
+            confirm_label,
+            dry_run,
+            block_size: crate::cli::volume::DEFAULT_BLOCK_SIZE,
+        },
+    )?;
+    for w in &report.warnings {
+        eprintln!("{w}");
+    }
+    if json_output {
+        let mut v = serde_json::to_value(&report)
+            .map_err(|e| TapectlError::Other(format!("report JSON: {e}")))?;
+        if dry_run {
+            v["dry_run"] = serde_json::json!(true);
+        }
+        println!("{v}");
+        return Ok(());
+    }
+    for line in report.lines() {
+        println!("{line}");
+    }
+    match report.outcome {
+        EraseOutcome::NothingToErase => println!("nothing erased."),
+        EraseOutcome::WouldErase => {
+            println!(
+                "would {} erase this tape; confirm with: --confirm-label {}",
+                report.mode,
+                report.confirm_label.as_deref().unwrap_or("(none: refused)")
+            );
+            println!("DRY RUN — nothing written.");
+        }
+        EraseOutcome::Erased => {
+            println!(
+                "{} erase done; read back: {}; chip serial {}",
+                report.mode,
+                match report.medium_after {
+                    Some(erase::MediumKind::Blank) => "blank",
+                    Some(erase::MediumKind::Empty) => "File 0 EMPTY",
+                    _ => "?",
+                },
+                report
+                    .chip_serial_after
+                    .as_deref()
+                    .map(|s| format!("{s} (unchanged)"))
+                    .unwrap_or_else(|| "none reported, before or after".to_string())
+            );
+            if let Some(r) = &report.recorded {
+                if let Some(c) = &r.cartridge {
+                    println!(
+                        "cartridge {c}{}: {}",
+                        if r.registered {
+                            " registered from its chip"
+                        } else {
+                            ""
+                        },
+                        r.cartridge_status.as_deref().unwrap_or("")
+                    );
+                }
+                for v in &r.volumes_erased {
+                    println!("volume \"{v}\" marked erased");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn journal_selector(
     conn: &Connection,
     barcode: Option<&str>,

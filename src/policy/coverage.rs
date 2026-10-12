@@ -389,6 +389,36 @@ pub fn is_sealed_but_unconfirmed(
     )?)
 }
 
+/// "Has the catalog given this volume up?" — the one test `cartridge erase`
+/// asks of a volume it finds on the tape in the drive, by File 0's uuid or by
+/// the chip serial's open mount (ADR-0012 2026-10-12 item 51: a volume the
+/// catalog counts as a live copy is refused, and `volume retire` stays the
+/// only way to give one up).
+///
+/// `retired` or `erased`, and nothing else. Deliberately NOT the negation of
+/// [`eligible`]: a quarantined sealed volume, an `active` import, an
+/// `initialized` volume mid-write and a sealed-but-unconfirmed one are none
+/// of them copies, and every one of them is still a volume the catalog has
+/// not let go of — its bytes are the evidence a verify, a resume or a
+/// salvage would read. Erasing one would make the catalog describe a tape
+/// that no longer exists without anyone having said so; `volume retire` is
+/// where that is said, with its own Tier-3 floor.
+pub fn given_up(volume_alias: &str) -> String {
+    status_in(volume_alias, &["retired", "erased"])
+}
+
+/// [`given_up`] for one volume by id.
+pub fn is_given_up(conn: &Connection, volume_id: i64) -> crate::error::Result<bool> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM volumes WHERE id = ?1 AND {})",
+            given_up("volumes")
+        ),
+        params![volume_id],
+        |row| row.get(0),
+    )?)
+}
+
 /// True when `volume_label` counts as a Copy RIGHT NOW (issue #280) —
 /// exactly [`eligible`], evaluated for one volume by label rather than
 /// embedded in a larger `JOIN`/aggregate. Built directly from `eligible`'s

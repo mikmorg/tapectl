@@ -516,8 +516,10 @@ pub enum ConfigCommands {
 /// - The write family — `volume write`, `volume resume`, `volume
 ///   compact-write`, `volume compact`, `collection run`, `quick-archive`:
 ///   [`ErrorContract::Write`] (ADR-0012, 2026-10-07 item 20).
+/// - `cartridge erase`: [`ErrorContract::Erase`] (ADR-0012 2026-10-12).
 /// - Everything else: [`ErrorContract::Ordinary`].
 ///
+/// [`ErrorContract::Erase`]: crate::error::ErrorContract::Erase
 /// [`ErrorContract::Verify`]: crate::error::ErrorContract::Verify
 /// [`ErrorContract::Audit`]: crate::error::ErrorContract::Audit
 /// [`ErrorContract::Write`]: crate::error::ErrorContract::Write
@@ -531,6 +533,9 @@ pub fn error_contract(command: &Commands) -> crate::error::ErrorContract {
             command: collection::CollectionCommands::Run { .. },
         }
         | Commands::QuickArchive { .. } => ErrorContract::Write,
+        Commands::Cartridge {
+            command: cartridge::CartridgeCommands::Erase { .. },
+        } => ErrorContract::Erase,
         _ => ErrorContract::Ordinary,
     }
 }
@@ -561,6 +566,7 @@ pub fn invocation_contract(args: &[std::ffi::OsString]) -> crate::error::ErrorCo
         },
         Some(("collection", c)) if c.subcommand_name() == Some("run") => ErrorContract::Write,
         Some(("quick-archive", _)) => ErrorContract::Write,
+        Some(("cartridge", c)) if c.subcommand_name() == Some("erase") => ErrorContract::Erase,
         Some(("audit", _)) => ErrorContract::Audit,
         _ => ErrorContract::Ordinary,
     }
@@ -604,6 +610,10 @@ pub fn progress_session_name(command: &Commands) -> Option<String> {
             R::File { unit, .. } => format!("restore file {unit}"),
             R::RawVolume { .. } => "restore raw-volume".to_string(),
         },
+        // A long erase runs for hours on LTO (ADR-0012 2026-10-12 item 52).
+        Commands::Cartridge {
+            command: cartridge::CartridgeCommands::Erase { .. },
+        } => "cartridge erase".to_string(),
         _ => return None,
     })
 }
@@ -688,6 +698,12 @@ mod tests {
             ),
             (&["volume", "verify", "L"], Verify),
             (&["audit"], Audit),
+            (&["cartridge", "erase"], Erase),
+            (
+                &["cartridge", "erase", "--long", "--confirm-label", "L"],
+                Erase,
+            ),
+            (&["cartridge", "mark-erased", "B"], Ordinary),
             (&["volume", "init", "L"], Ordinary),
             (&["volume", "compact-read", "L"], Ordinary),
             (&["volume", "compact-finish", "L"], Ordinary),

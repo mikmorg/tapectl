@@ -82,6 +82,30 @@ pub const EXIT_WRITE_ABORTED: i32 = 5;
 /// See [`EXIT_WRITE_CONFIRM_INCONCLUSIVE`]: the medium proven bad.
 pub const EXIT_WRITE_MEDIUM_BAD: i32 = 6;
 
+/// `cartridge erase`'s exit table (ADR-0012 2026-10-12 items 51-52), in the
+/// write family's style and with its numbers where the meaning is the same:
+///
+/// - 0 erased and verified — File 0 reads back blank and the chip serial is
+///   unchanged; also a blank tape (nothing to erase) and `--dry-run`;
+/// - 2 refused, the medium untouched ([`EXIT_ERROR`]): no cartridge, a
+///   write-protected one, a live copy the catalog still counts, a label that
+///   was not confirmed, a contradiction between the tape and the catalog,
+///   or a usage error;
+/// - 3 the erase ran and its read-back reached no verdict
+///   ([`EXIT_ERASE_INCONCLUSIVE`]) — File 0 unreadable and not provably
+///   blank, or the chip unreadable after it; nothing was recorded;
+/// - 4 the erase itself failed part-way ([`EXIT_ERASE_INCOMPLETE`]): the
+///   tape may be partly erased — run the command again;
+/// - 6 the read-back contradicts the erase ([`EXIT_ERASE_VERIFY_FAILED`]):
+///   File 0 still holds what was there, or the chip reports a different
+///   serial — the drive said done and the medium says otherwise;
+/// - 75 the catalog busy ([`EXIT_CATALOG_BUSY`]).
+pub const EXIT_ERASE_INCONCLUSIVE: i32 = 3;
+/// See [`EXIT_ERASE_INCONCLUSIVE`]: the erase failed part-way.
+pub const EXIT_ERASE_INCOMPLETE: i32 = 4;
+/// See [`EXIT_ERASE_INCONCLUSIVE`]: the read-back contradicts the erase.
+pub const EXIT_ERASE_VERIFY_FAILED: i32 = 6;
+
 /// How a write-family command ended, ordered from best to worst — the
 /// order `collection run` reports "the worst outcome among its copies" by
 /// (6 > 5 > 4 > 3 > 2 > 0, ADR-0012 2026-10-07 item 20). A busy catalog
@@ -155,6 +179,11 @@ pub enum ErrorContract {
     /// [`EXIT_CATALOG_BUSY`] when the catalog was busy. A usage error keeps
     /// clap's 2, which the table gives it.
     Write,
+    /// `cartridge erase` (ADR-0012 2026-10-12): a classified erase error
+    /// exits its code ([`EXIT_ERASE_INCONCLUSIVE`] and its siblings); an
+    /// unclassified one was raised before the tape was written, so it exits
+    /// [`EXIT_ERROR`], or [`EXIT_CATALOG_BUSY`] when the catalog was busy.
+    Erase,
 }
 
 impl ErrorContract {
@@ -167,6 +196,11 @@ impl ErrorContract {
             ErrorContract::Audit => EXIT_AUDIT_ERROR,
             ErrorContract::Write => match WriteOutcome::of(err) {
                 Some(outcome) => outcome.exit_code(),
+                None if busy() => EXIT_CATALOG_BUSY,
+                None => EXIT_ERROR,
+            },
+            ErrorContract::Erase => match TapectlError::erase_exit_code_of(err) {
+                Some(code) => code,
                 None if busy() => EXIT_CATALOG_BUSY,
                 None => EXIT_ERROR,
             },
@@ -184,7 +218,7 @@ impl ErrorContract {
         match self {
             ErrorContract::Verify => Some(EXIT_VERIFY_INCONCLUSIVE),
             ErrorContract::Audit => Some(EXIT_AUDIT_ERROR),
-            ErrorContract::Ordinary | ErrorContract::Write => None,
+            ErrorContract::Ordinary | ErrorContract::Write | ErrorContract::Erase => None,
         }
     }
 }
@@ -431,6 +465,21 @@ pub enum TapectlError {
     #[error("{0}")]
     ConfirmInconclusive(String),
 
+    // `cartridge erase`'s classified failures (ADR-0012 2026-10-12), read by
+    // [`ErrorContract::Erase`]. Raised only once the tape has been written;
+    // every refusal before that is unclassified and exits 2.
+    /// Exit 3: the erase ran and the read-back reached no verdict.
+    #[error("{0}")]
+    EraseInconclusive(String),
+
+    /// Exit 4: the erase itself failed part-way.
+    #[error("{0}")]
+    EraseIncomplete(String),
+
+    /// Exit 6: the read-back contradicts the erase.
+    #[error("{0}")]
+    EraseVerifyFailed(String),
+
     // General
     #[error("not initialized — run `tapectl init` first")]
     NotInitialized,
@@ -476,6 +525,25 @@ impl TapectlError {
             TapectlError::ConfirmInconclusive(_) => Some(WriteOutcome::ConfirmInconclusive),
             _ => None,
         }
+    }
+
+    /// `cartridge erase`'s exit code for this error, if it is one of the
+    /// erase's classified failures.
+    pub fn erase_exit_code(&self) -> Option<i32> {
+        match self {
+            TapectlError::EraseInconclusive(_) => Some(EXIT_ERASE_INCONCLUSIVE),
+            TapectlError::EraseIncomplete(_) => Some(EXIT_ERASE_INCOMPLETE),
+            TapectlError::EraseVerifyFailed(_) => Some(EXIT_ERASE_VERIFY_FAILED),
+            _ => None,
+        }
+    }
+
+    /// [`Self::erase_exit_code`] of the first classified erase error in
+    /// `err`'s chain.
+    pub fn erase_exit_code_of(err: &anyhow::Error) -> Option<i32> {
+        err.chain()
+            .filter_map(|cause| cause.downcast_ref::<TapectlError>())
+            .find_map(TapectlError::erase_exit_code)
     }
 
     /// An error raised once volume `label`'s write session holds state the
@@ -663,6 +731,30 @@ mod tests {
             assert_eq!(contract.exit_code(&busy), on_busy, "{contract:?} busy");
         }
         assert_eq!(EXIT_AUDIT_ERROR, 70, "sysexits' EX_SOFTWARE");
+    }
+
+    /// ADR-0012 2026-10-12 (`cartridge erase`): its table, code by code,
+    /// through the contract `main` asks; a write-family outcome means
+    /// nothing to it, and its own outcomes mean nothing to the others.
+    #[test]
+    fn the_erase_contract_maps_each_classified_outcome_to_its_code() {
+        let code = |e: TapectlError| ErrorContract::Erase.exit_code(&anyhow::Error::from(e));
+        assert_eq!(code(TapectlError::Other("refused".into())), 2);
+        assert_eq!(code(TapectlError::EraseInconclusive("i".into())), 3);
+        assert_eq!(code(TapectlError::EraseIncomplete("p".into())), 4);
+        assert_eq!(code(TapectlError::EraseVerifyFailed("v".into())), 6);
+        assert_eq!(code(TapectlError::CatalogBusy("record".into())), 75);
+        assert_eq!(code(TapectlError::WriteQuarantined("q".into())), 2);
+        let wrapped = anyhow::Error::from(TapectlError::EraseVerifyFailed("v".into()))
+            .context("cartridge erase");
+        assert_eq!(ErrorContract::Erase.exit_code(&wrapped), 6);
+        assert_eq!(ErrorContract::Erase.usage_error_code(), None, "clap's 2");
+        assert_eq!(
+            ErrorContract::Write.exit_code(&anyhow::Error::from(TapectlError::EraseVerifyFailed(
+                "v".into()
+            ))),
+            EXIT_ERROR
+        );
     }
 
     /// ADR-0012, 2026-10-07 item 20 (issue #408): the write family's table,
