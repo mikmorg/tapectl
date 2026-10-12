@@ -226,3 +226,33 @@ fn a_missing_adopt_file_stops_the_step_before_anything_is_created() {
     assert!(redacted(&o.stderr).contains("opr.key"));
     assert!(!rig.home().join("tapectl.db").exists());
 }
+
+/// Without `ADOPT_KEYS_FROM` the steps mint, as before (ADR-0012 item 41:
+/// the fresh start mints new keys): a primary and a backup for the
+/// operator and for each profile tenant, and no dry run of an adoption.
+#[test]
+fn without_adopt_keys_from_first_run_mints_as_before() {
+    let rig = Rig::new();
+    let profile = rig.profile(false);
+    let out7 = rig.step_ok(&profile, 7);
+    assert!(
+        !out7.contains("--operator-key"),
+        "{}",
+        redacted(out7.as_bytes())
+    );
+    let out11 = rig.step_ok(&profile, 11);
+    assert!(!out11.contains("--adopt-key"), "{out11}");
+    let aliases: Vec<(String, String)> = rig.keys().into_iter().map(|k| (k.0, k.1)).collect();
+    let want: Vec<(String, String)> = [
+        ("family", "family-backup"),
+        ("family", "family-primary"),
+        ("opr", "opr-backup"),
+        ("opr", "opr-primary"),
+        ("parents", "parents-backup"),
+        ("parents", "parents-primary"),
+    ]
+    .iter()
+    .map(|(t, a)| (t.to_string(), a.to_string()))
+    .collect();
+    assert_eq!(aliases, want);
+}
