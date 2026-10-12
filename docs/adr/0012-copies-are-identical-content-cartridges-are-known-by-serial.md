@@ -1376,3 +1376,10 @@ Follow-up, ruled the same day:
     take it, as `snapshot mark-reclaimable` already does, through one rule in `policy::coverage`.
     A unit cannot be marked tape-only, freeing its source, with fewer copies than tape-only
     policy demands.
+44. **A backup copy of each tenant envelope goes on tape in 1.1.0** (#418 item 2, brought forward
+    from 1.2.0, item 22): the fresh start means every production tape carries it from the first,
+    with no mixed fleet. The operator envelope already has two copies. The catalog.db shape change
+    and the cross-volume index stay in 1.2.0. The golden re-pin this needs falls inside the
+    2026-10-07 on-tape authorization and is recorded with its commit.
+45. **#416's hash-pass and staging-read counts are test-only counters**: counted in the budget
+    tests and never recorded in the catalog, so no migration.
