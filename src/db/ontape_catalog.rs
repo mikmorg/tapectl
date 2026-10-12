@@ -60,7 +60,8 @@ use crate::error::{Result, TapectlError};
 /// `tapectl.db` — see `RECOVERY.md`'s "Querying `catalog.db`" section for
 /// the schema as documented to the operator, and `volume-format-v2.md` §1.4
 /// for the normative one. This is generation 3; generations 1 and 2 are only
-/// ever read (and made, for tests, by [`fixture::downgrade`]).
+/// ever read (`tests/fixtures/ontape_catalog/` holds files their own writers
+/// made; [`fixture::downgrade`] approximates them from this writer's output).
 ///
 /// `paths` carries no `UNIQUE(unit_id, path)` index, unlike the main
 /// catalog's: nothing reads this file by name, a rebuild interns paths into
@@ -346,9 +347,10 @@ const LEGACY_FILES_OF_SNAPSHOT: &str =
 const LEGACY_SPANS: &str = "SELECT snapshot_id, MIN(id), MAX(id) FROM files GROUP BY snapshot_id";
 
 /// Generation 3: one version's rows (`?1`) with their paths, in `path_id`
-/// order, which is the walk order the writing catalog interned them in. A
-/// range of `file_versions`' primary key; the bounds keep it one even if a
-/// planner chose otherwise.
+/// order: the order the writing catalog first interned each path — walk
+/// order for a unit's first version; in a later version, paths new to the
+/// unit follow all earlier ones. A range of `file_versions`' primary key;
+/// the bounds keep it one even if a planner chose otherwise.
 const FILE_VERSIONS_OF_SNAPSHOT: &str =
     "SELECT fv.path_id, p.path, fv.kind, fv.size_bytes, fv.mtime_ns, fv.sha256, fv.link_target
      FROM file_versions fv JOIN paths p ON p.id = fv.path_id
@@ -398,9 +400,15 @@ impl FileSpans {
         ids
     }
 
-    /// Hand `f` one version's entries, in walk order, as the catalog's own
-    /// [`FileEntry`] — converted here, so no reader knows which generation
-    /// it read. A version with no rows is an empty iterator.
+    /// Hand `f` one version's entries as the catalog's own [`FileEntry`] —
+    /// converted here, so no reader knows which generation it read — in the
+    /// order the file keeps them: `files.id` order in generations 1 and 2
+    /// (walk order: the shipped writers copied the catalog's own ids, which
+    /// the walk's inserts numbered); `path_id` order in generation 3, the
+    /// order the writing catalog first interned each path (walk order for a
+    /// unit's first version; in a later version, paths new to the unit
+    /// follow all earlier ones). A version with no rows is an empty
+    /// iterator.
     ///
     /// A value that would not come back as what the writer recorded is
     /// refused, naming the row: a reader does not guess.
@@ -566,7 +574,7 @@ impl FileVersionRow {
 /// (generation 1 has no `tenants`, and its `key_fingerprints`/`sha256_plain`
 /// come back as `None`). Rows are returned in `id` order, which is also
 /// insertion order for every table this module writes, and files version by
-/// version in walk order.
+/// version in the order [`FileSpans::stream`] gives them.
 pub fn read(path: &Path) -> Result<OnTapeCatalog> {
     let (conn, mut cat) = read_all_but_files(path)?;
     let spans = FileSpans::read(&conn, cat.generation)?;
@@ -996,7 +1004,9 @@ fn copy_rows(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Resu
     // under the catalog's own ids, for the versions those stage sets hold.
     // `paths` gets only the paths those versions use — a unit's other
     // versions are not on this tape — and a version's rows go in `path_id`
-    // order, which is its walk order.
+    // order: the order the catalog first interned each path, which is walk
+    // order for a unit's first version; in a later version, paths new to the
+    // unit follow all earlier ones.
     let versions = format!("SELECT snapshot_id FROM stage_sets WHERE id IN ({})", ph());
     {
         let sql = format!(
@@ -1061,20 +1071,29 @@ fn copy_rows(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Resu
     Ok(())
 }
 
-/// The older generations, for tests: [`downgrade`](fixture::downgrade)
-/// rewrites a file [`write`] made into the shape generation 1 or 2 had,
-/// with exactly the values that generation's writer put there, so the
-/// readers of tapes already shipped stay tested from the REAL generator's
-/// output rather than a hand-rolled schema that could drift from it.
-/// Panics on a database error: for tests only.
+/// The older generations' SHAPE, for tests that need one built around rows
+/// of their own (a sealed `MemStore` tape whose `catalog.db` must name its
+/// slices): [`downgrade`](fixture::downgrade) rewrites a file [`write`]
+/// made into the shape generation 1 or 2 had.
+///
+/// It is not what the shipped writers wrote. It mirrors the post-030
+/// generation-2 writer on master (0b1e790 until generation 3, in no release
+/// tag, so it never wrote a production tape), which numbered `files.id` from
+/// 1 in (version, `path_id`) order. Every writer before it — b3fe31e's
+/// `catalog_snapshot` (generation 1), then 4292cf9's through v1.0.x's
+/// `ontape_catalog::write` (generation 2) — copied the catalog's own
+/// `files.id` verbatim: not necessarily from 1, and gapped between versions.
+/// Files those writers really made are committed under
+/// `tests/fixtures/ontape_catalog/`; the readers of shipped tapes are pinned
+/// against them. Panics on a database error: for tests only.
 #[doc(hidden)]
 pub mod fixture {
     use super::*;
 
     /// Rewrite the generation-3 `catalog.db` at `path` into `to`'s shape.
     ///
-    /// Generation 2's `files` (the writer from 2026-09-11 until 1.1.0): one
-    /// row per entry, numbered from 1 in (version, walk) order; the sha256 as
+    /// `files` as the never-shipped post-030 writer made it: one row per
+    /// entry, numbered from 1 in (version, `path_id`) order; the sha256 as
     /// lowercase hex; the mtime as the walk's RFC 3339 text; the kind as
     /// `is_directory` alone. Generation 1 additionally lacks `tenants`,
     /// `stage_sets.key_fingerprints` and `stage_slices.sha256_plain`.
@@ -1499,9 +1518,9 @@ mod tests {
         }
     }
 
-    /// The generations already on shipped tape are made from the REAL
-    /// generator's output by `fixture::downgrade` — the derivation
-    /// `tests/catalog_rebuild.rs` uses too — and `read` reads each.
+    /// `fixture::downgrade`'s shapes — the derivation `tests/catalog_rebuild.rs`
+    /// uses — are detected and read. What the shipped writers really wrote is
+    /// pinned by `files_written_by_the_shipped_writers_read_back_exactly`.
     #[test]
     fn each_older_generation_is_detected_and_read() {
         let conn = crate::db::open_memory().unwrap();
@@ -1538,6 +1557,167 @@ mod tests {
                     },
                 }]
             );
+        }
+    }
+
+    /// A committed `catalog.db` fixture, copied out so nothing can touch the
+    /// committed bytes.
+    fn committed_fixture(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ontape_catalog")
+            .join(name);
+        let to = dir.path().join(name);
+        std::fs::copy(&from, &to).unwrap();
+        to
+    }
+
+    /// The files of `tests/fixtures/ontape_catalog/gen{1,2}.db`, as the
+    /// catalog's own [`FileEntry`]: both were written from the same source
+    /// rows (that directory's README and `make_fixture.rs`).
+    fn committed_fixture_files() -> Vec<FileRow> {
+        const RECENT: i64 = 1_788_264_000_000_000_000; // 2026-09-01T12:00:00Z
+        const PRE_1970: i64 = -315_619_200_000_000_000; // 1960-01-01T00:00:00Z
+        let row = |snapshot_id, path: &str, kind, size_bytes, mtime_ns, sha256| FileRow {
+            snapshot_id,
+            entry: FileEntry {
+                path: path.into(),
+                kind,
+                size_bytes,
+                mtime_ns: Some(mtime_ns),
+                sha256,
+                link_target: None,
+            },
+        };
+        use FileKind::{Dir, Regular};
+        vec![
+            row(40, "docs", Dir, 0, RECENT, None),
+            row(40, "docs/a.txt", Regular, 11, PRE_1970, Some([0xa1; 32])),
+            // A symlink and a FIFO: these generations record only
+            // `is_directory`, so both come back regular, with no target.
+            row(40, "docs/latest", Regular, 5, RECENT, None),
+            row(40, "docs/pipe", Regular, 0, RECENT, None),
+            row(47, "fy24.csv", Regular, 20, RECENT, Some([0xf2; 32])),
+            row(47, "notes", Dir, 0, RECENT, None),
+            row(47, "notes/q1.txt", Regular, 9, RECENT, Some([0x9e; 32])),
+        ]
+    }
+
+    /// The generations on shipped tape, read from files their own writers
+    /// made (`tests/fixtures/ontape_catalog/`, README there): generation 1
+    /// by b3fe31e's `catalog_snapshot`, generation 2 by v1.0.6's
+    /// `ontape_catalog::write`. Those writers copied the catalog's own
+    /// `files.id` verbatim — here 77001-77004 and 77010-77012, with 77005-
+    /// 77009 belonging to a version not on the tape — so a reader that
+    /// assumed ids from 1, or no gaps, would fail here and not on
+    /// `fixture::downgrade`'s output. A pre-1970 mtime, a directory with no
+    /// sha256, a symlink and a FIFO are among the rows.
+    #[test]
+    fn files_written_by_the_shipped_writers_read_back_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, generation) in [
+            ("gen1.db", Generation::Original),
+            ("gen2.db", Generation::WithOwnershipAndReceipts),
+        ] {
+            let path = committed_fixture(&dir, name);
+            let cat = read(&path).unwrap();
+            assert_eq!(cat.generation, generation, "{name}");
+            assert_eq!(cat.files, committed_fixture_files(), "{name}");
+
+            let gen2 = generation == Generation::WithOwnershipAndReceipts;
+            assert_eq!(
+                cat.tenants,
+                if gen2 {
+                    vec![
+                        TenantRow {
+                            id: 3,
+                            name: "alice".into(),
+                        },
+                        TenantRow {
+                            id: 5,
+                            name: "bob".into(),
+                        },
+                    ]
+                } else {
+                    vec![]
+                },
+                "{name}"
+            );
+            let units: Vec<(i64, &str, i64)> = cat
+                .units
+                .iter()
+                .map(|u| (u.id, u.name.as_str(), u.tenant_id))
+                .collect();
+            assert_eq!(units, vec![(12, "photos", 3), (14, "ledgers", 5)], "{name}");
+            let snapshots: Vec<(i64, i64, i64)> = cat
+                .snapshots
+                .iter()
+                .map(|s| (s.id, s.unit_id, s.version))
+                .collect();
+            assert_eq!(snapshots, vec![(40, 12, 3), (47, 14, 1)], "{name}");
+            let receipts: Vec<(i64, Option<&str>)> = cat
+                .stage_sets
+                .iter()
+                .map(|s| (s.id, s.key_fingerprints.as_deref()))
+                .collect();
+            assert_eq!(
+                receipts,
+                if gen2 {
+                    vec![
+                        (90, Some(r#"["age1alice","age1operator","age1escrow"]"#)),
+                        (93, Some(r#"["age1bob","age1operator","age1escrow"]"#)),
+                    ]
+                } else {
+                    vec![(90, None), (93, None)]
+                },
+                "{name}"
+            );
+            let slices: Vec<(i64, i64, Option<String>, String)> = cat
+                .slices
+                .iter()
+                .map(|s| {
+                    (
+                        s.id,
+                        s.stage_set_id,
+                        s.sha256_plain.clone(),
+                        s.sha256_encrypted.clone(),
+                    )
+                })
+                .collect();
+            let plain = |b: &str| gen2.then(|| b.repeat(32));
+            assert_eq!(
+                slices,
+                vec![
+                    (300, 90, plain("11"), "c1".repeat(32)),
+                    (301, 90, plain("22"), "c2".repeat(32)),
+                    (305, 93, plain("33"), "c3".repeat(32)),
+                ],
+                "{name}"
+            );
+
+            // The streaming reader finds each version's run of verbatim ids
+            // and gives back exactly what `read` does.
+            let (conn, _) = read_all_but_files(&path).unwrap();
+            let spans = FileSpans::read(&conn, generation).unwrap();
+            assert_eq!(
+                spans.spans,
+                HashMap::from([(40, (77001, 77004)), (47, (77010, 77012))]),
+                "{name}"
+            );
+            let mut streamed = Vec::new();
+            for snapshot_id in spans.snapshot_ids() {
+                spans
+                    .stream(&conn, snapshot_id, |entries| {
+                        for entry in entries {
+                            streamed.push(FileRow {
+                                snapshot_id,
+                                entry: entry?,
+                            });
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert_eq!(streamed, cat.files, "{name}");
         }
     }
 
@@ -1648,13 +1828,15 @@ mod tests {
         );
     }
 
-    /// Generation 2's `files`, as `fixture::downgrade` makes it, holds what
-    /// that generation's writer wrote: the sha256 as lowercase hex, the mtime
-    /// as the walk's RFC 3339 text, the kind as `is_directory`, ids from 1 in
-    /// (version, walk) order. The readers of shipped tapes are tested against
-    /// this, so it must not drift.
+    /// `fixture::downgrade`'s generation-2 `files` is what master's post-030
+    /// generation-2 writer (never in a release) wrote: the sha256 as
+    /// lowercase hex, the mtime as the walk's RFC 3339 text, the kind as
+    /// `is_directory`, ids from 1 in (version, `path_id`) order. Shipped
+    /// generation-2 tapes differ in the ids — v1.0.x copied the catalog's own
+    /// `files.id` verbatim — and are pinned by
+    /// `files_written_by_the_shipped_writers_read_back_exactly`.
     #[test]
-    fn generation_2_files_hold_what_its_writer_wrote() {
+    fn downgrade_mirrors_the_unshipped_post_030_generation_2_writer() {
         let conn = crate::db::open_memory().unwrap();
         let (_unit, ss_id) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
         let snap_id = snapshot_of(&conn, ss_id);

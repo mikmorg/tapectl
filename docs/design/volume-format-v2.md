@@ -230,7 +230,9 @@ Generation 3 is recognised by `file_versions` and `paths` with no `files`;
 generations 1 and 2 by `files` with no `file_versions`, and between them by
 `tenants` together with `key_fingerprints` (both present: 2; both absent: 1).
 
-**Generation 1 and 2 `files`**: one row per walked entry: `id`,
+**Generation 1 and 2 `files`**: one row per walked entry: `id` (the writing
+catalog's own `files.id`, copied verbatim and never renumbered: one run per
+version in walk order, not necessarily from 1, with gaps between versions),
 `snapshot_id`, `path`, `size_bytes`, `sha256` (64 lowercase hex characters),
 `modified_at` (RFC 3339 text, `YYYY-MM-DDTHH:MM:SS+00:00`), `is_directory`
 (0/1). Nothing else of a file's type: a rebuild from these tapes records a
@@ -262,7 +264,10 @@ CREATE TABLE file_versions (
 ```
 
 - `paths` holds only the paths this write's versions use, under the writing
-  catalog's ids; a version's rows in `path_id` order are its walk order.
+  catalog's ids. `path_id` order is the order the writing catalog first
+  interned each path: walk order for a unit's first version; in a later
+  version, paths new to the unit follow all earlier ones (nothing renumbers
+  them). Nothing depends on a version's walk order.
 - `paths` has **no `UNIQUE(unit_id, path)` index**, unlike the main catalog:
   nothing on the tape looks a file up by name, a rebuild interns paths into
   its own catalog's index, and the index would store every path twice. The

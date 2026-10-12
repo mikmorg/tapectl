@@ -78,13 +78,18 @@ const UNITS: &[(&str, &str, &[u8])] = &[
 enum CatalogDb {
     /// None at all — a tape written before #83.
     None,
-    /// Generation 1, the pre-2026-09-11 shape: `files` with no file kinds,
-    /// and no `tenants`, no `key_fingerprints`, no `sha256_plain`. Derived
-    /// from the REAL generator's output (`ontape_catalog::fixture::downgrade`),
-    /// not hand-rolled, so it cannot drift from what old tapes hold.
+    /// Generation 1's shape, the pre-2026-09-11 one: `files` with no file
+    /// kinds, and no `tenants`, no `key_fingerprints`, no `sha256_plain`.
+    /// Made by `ontape_catalog::fixture::downgrade` from this tape's own
+    /// generation-3 file, so it names this tape's slices; its `files.id`
+    /// numbering is that of master's never-shipped post-030 writer (from 1),
+    /// not the shipped writers' (the catalog's own ids, verbatim). Files the
+    /// shipped writers made are pinned in `db::ontape_catalog`'s tests
+    /// (`tests/fixtures/ontape_catalog/`).
     Old,
-    /// Generation 2, 2026-09-11 until 1.1.0: generation 1 plus ownership and
-    /// receipts, still `files` with no file kinds. Derived the same way.
+    /// Generation 2's shape, 2026-09-11 until 1.1.0: generation 1 plus
+    /// ownership and receipts, still `files` with no file kinds. Made the
+    /// same way, with the same caveat.
     Gen2,
     /// Generation 3, what `build_catalog_snapshot` writes today (1.1.0 on).
     New,
