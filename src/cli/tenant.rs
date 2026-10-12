@@ -101,10 +101,11 @@ pub fn run(
                     dry_run,
                 );
             }
-            // Issue #241: the same two facts `add_tenant` itself checks
-            // first, reproduced here rather than inside it, so a dry run
-            // never generates key material or touches disk. Refuses ahead
-            // of the preview, exactly as the real add does.
+            // Issue #241: the same facts `add_tenant` itself checks first
+            // (with #424's stray key file), reproduced here rather than
+            // inside it, so a dry run never generates key material or
+            // touches disk. Refuses ahead of the preview, exactly as the
+            // real add does.
             if dry_run {
                 crate::naming::validate_tenant_name(name)?;
                 if queries::get_tenant_by_name(conn, name)?.is_some() {
@@ -112,6 +113,7 @@ pub fn run(
                         name.clone(),
                     ));
                 }
+                crate::tenant::refuse_stray_key_files(paths, name, crate::tenant::MINTED_ALIASES)?;
                 if json_output {
                     println!("{}", serde_json::json!({"name": name, "dry_run": true}));
                 } else {

@@ -22,6 +22,9 @@ pub fn add_tenant(
     if queries::get_tenant_by_name(conn, name)?.is_some() {
         return Err(TapectlError::TenantAlreadyExists(name.to_string()));
     }
+    // Before the row: a stray key file would otherwise fail
+    // `generate_and_save` only after the tenant row is written.
+    refuse_stray_key_files(paths, name, MINTED_ALIASES)?;
 
     let tenant_id = queries::insert_tenant(conn, name, description, is_operator)?;
     events::log_created(conn, "tenant", tenant_id, name, None)?;
@@ -115,14 +118,33 @@ pub fn plan_adoption(
             existing.alias
         )));
     }
-    let (pub_path, key_path) = keys::key_paths(&paths.keys_dir, name, ADOPTED_ALIAS);
-    for p in [&key_path, &pub_path] {
-        if p.exists() {
-            return Err(TapectlError::Other(format!(
-                "adoption refuses: {} already exists — tenant \"{name}\" has no row, so that \
-                 file is left over from an earlier home; move it out of keys/ first",
-                p.display()
-            )));
+    refuse_stray_key_files(paths, name, ADOPTED_ALIASES)
+}
+
+/// The aliases a minted tenant's key files are written under.
+pub const MINTED_ALIASES: &[&str] = &["primary", "backup"];
+
+/// The aliases an adopted tenant's key files are written under.
+pub const ADOPTED_ALIASES: &[&str] = &[ADOPTED_ALIAS];
+
+/// Refuse when a key file is already where tenant `name`'s `aliases` would
+/// be written: a file left over from an earlier home. Callers have already
+/// established that `name` has no tenant row (or, at `init`, that there is
+/// no catalog yet). It reads only the filesystem, so `init` calls it before
+/// it creates anything and before its dry-run branch: the dry run refuses
+/// what the real run refuses, and a refused `init` leaves no catalog or
+/// config behind.
+pub fn refuse_stray_key_files(paths: &TapectlPaths, name: &str, aliases: &[&str]) -> Result<()> {
+    for alias in aliases {
+        let (pub_path, key_path) = keys::key_paths(&paths.keys_dir, name, alias);
+        for p in [&key_path, &pub_path] {
+            if p.exists() {
+                return Err(TapectlError::Other(format!(
+                    "refused: {} already exists — tenant \"{name}\" has no row, so that file \
+                     is left over from an earlier home; move it out of keys/ first",
+                    p.display()
+                )));
+            }
         }
     }
     Ok(())
@@ -350,6 +372,31 @@ mod tests {
         let (pub_path, key_path) =
             crate::crypto::keys::key_paths(&paths.keys_dir, "alice", "primary");
         assert!(pub_path.exists() && key_path.exists());
+    }
+
+    /// A key file left in keys/ at a path the minted pair would take is
+    /// refused before the tenant row is written: a refused add leaves no
+    /// row, writes no key, and leaves the stray file as it was.
+    #[test]
+    fn a_stray_key_file_refuses_a_minted_tenant_before_any_row() {
+        let (conn, _tmp, paths) = fixture();
+        let stray = paths.keys_dir.join("alice-backup.age.pub");
+        std::fs::write(&stray, "left over\n").unwrap();
+        let msg = add_tenant(&conn, &paths, "alice", None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("alice-backup.age.pub already exists"), "{msg}");
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tenants", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "a refused add leaves no tenant row");
+        let files: Vec<_> = std::fs::read_dir(&paths.keys_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, vec!["alice-backup.age.pub".to_string()]);
+        assert_eq!(std::fs::read_to_string(&stray).unwrap(), "left over\n");
     }
 
     // --- adoption (issue #424) ---------------------------------------------

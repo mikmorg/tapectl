@@ -310,6 +310,21 @@ fn every_tenant_add_adopt_key_refusal_leaves_no_row_or_file() {
     assert!(out.contains(&fresh_pub), "{out}");
     assert_eq!((tenants(), keys(), key_files(&home)), before);
 
+    // A minted add is refused by a stray key file too, its dry run
+    // included, before any row is written.
+    let stray = home.join("keys/dave-backup.age.key");
+    std::fs::write(&stray, "left over\n").unwrap();
+    let with_stray = (tenants(), keys(), key_files(&home));
+    let real = refused(&home, &["tenant", "add", "dave"]);
+    let dry = refused(&home, &["--dry-run", "tenant", "add", "dave"]);
+    assert!(
+        real.contains("dave-backup.age.key already exists"),
+        "{real}"
+    );
+    assert_eq!(real, dry, "the dry run refuses what the add refuses");
+    assert_eq!((tenants(), keys(), key_files(&home)), with_stray);
+    std::fs::remove_file(&stray).unwrap();
+
     // The reverse order: an adopted tenant key offered as the escrow
     // identity is refused by name too (a second escrow is refused first
     // here, so this runs in a home without one).
@@ -385,6 +400,41 @@ fn init_adopts_the_operator_key_and_a_refused_init_creates_no_home() {
     );
     assert!(msg.contains("not a single age X25519 identity"), "{msg}");
     assert!(!home.exists());
+
+    // Refused: a key file left in keys/ at a path init would write — the
+    // adopted primary, or (minting) the primary or the backup. The home
+    // directory exists (it holds the stray file), so what must not appear
+    // is everything else: no catalog, no config. The dry run refuses
+    // exactly what the real init refuses, and neither touches the file.
+    let adopt = ["--operator-key", s(&key)];
+    for (case, stray, extra) in [
+        ("adopt", "op-primary.age.key", &adopt[..]),
+        ("mint-primary", "op-primary.age.pub", &[][..]),
+        ("mint-backup", "op-backup.age.key", &[][..]),
+    ] {
+        for dry in [true, false] {
+            let home = tmp.path().join(format!("stray-{case}-{dry}"));
+            std::fs::create_dir_all(home.join("keys")).unwrap();
+            let stray_path = home.join("keys").join(stray);
+            std::fs::write(&stray_path, "left over\n").unwrap();
+            let mut args = vec!["init", "--operator", "op", "--no-escrow"];
+            args.extend_from_slice(extra);
+            if dry {
+                args.insert(0, "--dry-run");
+            }
+            let msg = refused(&home, &args);
+            assert!(msg.contains(&format!("{stray} already exists")), "{msg}");
+            assert!(!home.join("tapectl.db").exists(), "{case} dry={dry}");
+            assert!(!home.join("config.toml").exists(), "{case} dry={dry}");
+            assert_eq!(key_files(&home), vec![stray.to_string()]);
+            assert_eq!(std::fs::read_to_string(&stray_path).unwrap(), "left over\n");
+            // Moved out of keys/, the same init goes through.
+            if !dry {
+                std::fs::remove_file(&stray_path).unwrap();
+                ok(&home, &args);
+            }
+        }
+    }
 
     // The real one.
     let home = tmp.path().join("h");

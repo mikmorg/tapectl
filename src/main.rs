@@ -716,6 +716,20 @@ fn cmd_init(
         tenant::system_uid_min(),
     )?;
 
+    // #424 review: a key file left in keys/ where the operator's key would be
+    // written is refused here, ahead of the dry-run branch and of every side
+    // effect, so the dry run refuses it too and a refused init leaves no
+    // catalog or config behind (the tenant code repeats the check later).
+    tenant::refuse_stray_key_files(
+        paths,
+        &op_name,
+        if adopted_operator_key.is_some() {
+            tenant::ADOPTED_ALIASES
+        } else {
+            tenant::MINTED_ALIASES
+        },
+    )?;
+
     // Issue #247: `init` writes config, keys and the database — a dry run
     // must report all three and create NONE of them (never a half-created
     // home), so this sits above `paths.ensure_dirs()`, the first side
