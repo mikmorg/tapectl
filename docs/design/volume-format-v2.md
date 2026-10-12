@@ -41,9 +41,11 @@ filemark), in this fixed order:
 │ File 4  Tenant envelope enc(t+op+esc) ┐ MANIFEST.toml (filenames,             │
 │  ...    Tenant envelope enc(t+op+esc) │ sha256_plain, dar command, slice      │
 │ File j   Operator env    enc(op+esc)  │ positions), RECOVERY.md, catalogs/,   │
-│ File j+1 Operator backup enc(op+esc)  ┘ PLAN.toml (op only). Order per §2.    │
+│ File j+1 Operator backup enc(op+esc)  │ PLAN.toml (op only). Order per §2.    │
+│ File j+2 Tenant backup  enc(t+op+esc) │ Each backup is its primary's bytes,   │
+│  ...    Tenant backup   enc(t+op+esc) ┘ copied (§1.3).                        │
 ├──── BULK: encrypted data (the mass of the tape) ──────────────────────────────┤
-│ File j+2 Data slice     enc(t+op+esc) ┐ age(dar base.N.dar). One unit's       │
+│ File k  Data slice      enc(t+op+esc) ┐ age(dar base.N.dar). One unit's       │
 │  ...     Data slice     enc(t+op+esc) │ slices contiguous. The ONLY zone a    │
 │ File M-1 Data slice     enc(t+op+esc) ┘ short/damaged tape can truncate.      │
 ├──── TAIL: the completeness assertion ─────────────────────────────────────────┤
@@ -65,6 +67,10 @@ filemark), in this fixed order:
 - **Envelopes before slices** (decision D2) means a truncated or tail-damaged tape
   loses only trailing *slices*; every envelope needed to navigate and decrypt what
   did land survives.
+- **Every envelope has a backup copy** (§1.3): the operator envelope since v2's
+  first write, each tenant envelope since 1.1.0 (#418 item 2, ADR-0012
+  2026-10-12 item 44), so one unreadable or damaged envelope never strands the
+  slices it describes.
 - **Seal marker last** is the only honest place for "complete" — completeness can
   be asserted only after the last content file exists. It is not optional: it is the
   price of front-loading the index (a front index alone would make a truncated tape
@@ -163,6 +169,40 @@ correctly. 1.1.0 knows none, and requires none. The rules every reader keeps
 Unknown front-index `type`s are not refused by the 1.1.0 readers: a future
 file type arrives with a `requires`, which is refused first.
 
+### 1.3 Envelope backup copies (normative)
+
+Ruled 2026-10-12 (ADR-0012 item 44, bringing #418 item 2 forward from 1.2.0;
+the 2026-10-06 ruling of item 22 had deferred it). Every envelope on a tape
+written by tapectl 1.1.0 or later is on it twice.
+
+- **What a backup is.** The primary's exact bytes, copied: the same
+  ciphertext, so the same `size_bytes` and the same `sha256_encrypted` in the
+  front index. It is not a second encryption (age is randomized per call, and
+  a second ciphertext of the same plaintext would be an unrelated file, not a
+  copy that can be checked against the first).
+- **Where it sits.** The middle zone holds, in order: the tenant envelopes
+  (permuted, §2), the operator envelope, the operator envelope's backup, and
+  then one `tenant_envelope_backup` per tenant **in the same order as the
+  primaries**. So the operator pair keeps the place it has had since v2's
+  first write, every primary comes before every backup, and each tenant's
+  backup is separated from its primary by the operator pair (the largest
+  envelopes on the tape), not written straight after it. The first data slice
+  follows the last tenant backup.
+- **How it is indexed.** Its own front-index `type`, `tenant_envelope_backup`
+  (as the operator's is `operator_envelope_backup`), labelled only by kind
+  like every envelope (§2). A reader pairs a backup with its primary by the
+  equal `sha256_encrypted`, never by position arithmetic.
+- **How readers use it.** A reader opens the primary first, and turns to the
+  backup only when the primary does not read, does not match the front
+  index's hash, or is damaged under a key that matched it. A backup whose
+  primary opened is skipped, not opened again. Confirm and verify treat a
+  backup like any other file: the integrity tier hashes both copies (§5).
+- **Older tapes.** A tape without tenant backups (anything written before
+  1.1.0) is read as before; there is simply no second copy to turn to. A
+  reader that does not know `tenant_envelope_backup` (a 1.0.x RESTORE.sh)
+  ignores those entries and reads the primaries exactly as it always did, so
+  this needs no `requires` entry (§1.2 rule 3).
+
 ## 2. Plaintext vs encrypted, and the isolation invariant
 
 | Zone | On tape | Why |
@@ -242,6 +282,9 @@ reproducible (layout-session.md), UUID-seeded so the order is not the raw
 `tenant_id` sequence. *Status:* the shipped v1 write path orders by `tenant_id`; the
 permutation lands with the v2 write flip (#22/#24). Until then the invariant above
 still holds — the drift is positional-correlation hardening, not a plaintext leak.
+The tenant backups (§1.3) repeat the primaries' permuted order, and each carries
+its primary's hash, so a backup is linkable to its primary and to nothing else:
+the pairing says which two files are one envelope, never whose.
 
 This tightens — and deliberately relaxes one clause of — the v1 rule ("no
 sizes/hashes in plaintext"), which the v1 format already violated by shipping
@@ -269,8 +312,10 @@ Plaintext TOML. One entry per tape file, in position order:
   total: the heir can jump straight to any file, including the seal marker).
 - `type` — on-tape zone kind: `id_thunk`, `system_guide`, `restore_sh`,
   `front_index`, `tenant_envelope`, `operator_envelope`,
-  `operator_envelope_backup`, `data_slice`, `seal_marker`. **No** tenant/unit
-  identity — a `data_slice` and a `tenant_envelope` entry are unlabeled beyond kind.
+  `operator_envelope_backup`, `tenant_envelope_backup` (1.1.0, §1.3),
+  `data_slice`, `seal_marker`. **No** tenant/unit identity — a `data_slice`, a
+  `tenant_envelope` and a `tenant_envelope_backup` entry are unlabeled beyond
+  kind.
 - `size_bytes` — the true (pre-block-padding) byte length, so the heir can
   `head -c $size_bytes` to trim the 512 KB block padding before decrypting. Present
   for every file **except File 3 itself and the seal marker** (corrected
@@ -411,7 +456,10 @@ any doubt is a rewind). The manual steps below read in that order.
    `<uuid8>_v<version>.1.dar`: `dar -l` lists the unit's files and `-T slice`
    which slice holds each, with no slice read; #418). age's "no identity
    matched" means the key is not a recipient; any other failure after a key
-   matched means the envelope is damaged.
+   matched means the envelope is damaged. A damaged or unreadable envelope
+   has a backup copy further on (§1.3: the `*_backup` entry with the same
+   `sha256_encrypted`): read that one instead. RESTORE.sh does this by
+   itself, and skips a backup whose primary already opened.
 5. For each slice position in your manifest, in order: `dd bs=512k` it out;
    `head -c size_bytes` to trim padding; `sha256sum` vs the front index's
    `sha256_encrypted` (**keyless** integrity) and/or the envelope's value;

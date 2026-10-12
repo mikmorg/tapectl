@@ -663,6 +663,8 @@ fn hash_one(
     }
     let file = std::fs::File::open(full_path)
         .map_err(|e| TapectlError::Other(format!("cannot open source file: {rel_path} ({e})")))?;
+    #[cfg(test)]
+    hash_hook::opened(full_path);
     let before = file.metadata()?;
     if before.ino() != path_meta.ino() || before.dev() != path_meta.dev() {
         return Err(changed_while_staging(
@@ -707,6 +709,8 @@ fn hash_one(
             lane.start.saturating_add(streamed as u64),
         );
     }
+    #[cfg(test)]
+    hash_hook::read(full_path, streamed as u64);
     let hex = reader.finalize_hex();
     let after = reader.into_inner().into_inner().metadata()?;
     let seen = Seen::of(&after);
@@ -1036,6 +1040,56 @@ pub(crate) mod hash_hook {
             .as_mut()
             .and_then(|m| m.remove(root))
             .map_or(0, |(_, most)| most)
+    }
+
+    /// What the hasher read under a counted source root (issue #366's
+    /// budget; counted in tests only, ADR-0012 2026-10-12 item 45): each
+    /// file's opens and the bytes read.
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct Reads {
+        pub(crate) opens: HashMap<PathBuf, usize>,
+        pub(crate) bytes: u64,
+    }
+
+    static READS: Mutex<Option<HashMap<PathBuf, Reads>>> = Mutex::new(None);
+
+    /// Count what the hasher reads under `root`, until [`reads`].
+    pub(crate) fn count_reads(root: &Path) {
+        READS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(root.to_path_buf(), Reads::default());
+    }
+
+    /// What the hasher read under `root` since [`count_reads`]; stops counting.
+    pub(crate) fn reads(root: &Path) -> Reads {
+        READS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|m| m.remove(root))
+            .unwrap_or_default()
+    }
+
+    fn counted(path: &Path, f: impl FnOnce(&mut Reads)) {
+        if let Some(map) = READS.lock().unwrap().as_mut() {
+            if let Some((_, r)) = map.iter_mut().find(|(root, _)| path.starts_with(root)) {
+                f(r);
+            }
+        }
+    }
+
+    /// The hasher opened `path`.
+    pub(crate) fn opened(path: &Path) {
+        counted(path, |r| {
+            *r.opens.entry(path.to_path_buf()).or_insert(0) += 1
+        });
+    }
+
+    /// The hasher read `bytes` of `path`.
+    pub(crate) fn read(path: &Path, bytes: u64) {
+        counted(path, |r| r.bytes += bytes);
     }
 
     /// One file being hashed, for the length of the guard.

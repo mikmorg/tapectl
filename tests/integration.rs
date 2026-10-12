@@ -2132,10 +2132,11 @@ fn test_volume_write_refuses_over_capacity() {
         msg.contains(&expected_available),
         "expected the refusal to name the volume row's capacity ({expected_available}), got: {msg}"
     );
-    // Issue #391: the refusal names the overage (9,437,184 on tape + 0
-    // reserve - 4,194,304) and the fill ceiling it was judged against.
+    // Issue #391: the refusal names the overage (9,961,472 on tape — the
+    // tenant envelope's backup is one block of it, volume-format-v2.md §1.3
+    // — + 0 reserve - 4,194,304) and the fill ceiling it was judged against.
     assert!(
-        msg.contains("5242880 bytes (5.0 MiB) over"),
+        msg.contains("5767168 bytes (5.5 MiB) over"),
         "the refusal must name by how much the layout is over, got: {msg}"
     );
     assert!(
@@ -2156,9 +2157,9 @@ fn test_volume_write_refuses_over_capacity() {
 }
 
 /// Issue #391: the fill ceiling binds. The same fixture as
-/// `test_volume_write_refuses_over_capacity` (a layout of 9,437,184 bytes on
-/// tape), on a volume of 9,500,000 bytes: it fits at a 100% ceiling and not
-/// at the default 97% (9,215,000). The default refuses, naming the
+/// `test_volume_write_refuses_over_capacity` (a layout of 9,961,472 bytes on
+/// tape), on a volume of 10,200,000 bytes: it fits at a 100% ceiling and not
+/// at the default 97% (9,894,000). The default refuses, naming the
 /// ceiling; `--fill-ceiling` (`Config::with_fill_ceiling`, what the flag
 /// applies) clears the capacity check for the same write — which is then
 /// refused for other reasons this fixture leaves (no escrow), never capacity.
@@ -2213,7 +2214,7 @@ fn test_volume_write_refuses_above_the_fill_ceiling_and_the_override_lifts_it() 
     .unwrap();
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES ('L6-CEIL', 'lto', 'p', 'LTO-6', 9500000, 'initialized')",
+         VALUES ('L6-CEIL', 'lto', 'p', 'LTO-6', 10200000, 'initialized')",
         [],
     )
     .unwrap();
@@ -2250,11 +2251,11 @@ fn test_volume_write_refuses_above_the_fill_ceiling_and_the_override_lifts_it() 
 
     let refused = write(&config);
     assert!(
-        refused.contains("capacity exceeded") && refused.contains("over the 9215000 bytes"),
+        refused.contains("capacity exceeded") && refused.contains("over the 9894000 bytes"),
         "the default 97% ceiling must refuse a layout that fits only at 100%: {refused}"
     );
     assert!(
-        refused.contains("the fill ceiling is 97% of this volume's 9.5 MB capacity"),
+        refused.contains("the fill ceiling is 97% of this volume's 10.2 MB capacity"),
         "{refused}"
     );
 

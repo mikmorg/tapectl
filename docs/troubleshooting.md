@@ -140,7 +140,7 @@ that finishes it on its own:
 |---|---|
 | `volume compact`'s step 3, retiring the source, refused for consent (no terminal and no `--yes`, or a "no" at the prompt) | `tapectl volume compact-finish <source> --force` |
 | releasing `collection run`'s staging (a catalog error) | `tapectl staging clean`, which retains whatever is still below its policy |
-| recording the copy's figures (`bytes_written`, `num_data_files`, `last_write`) and its `write_completed` event (a catalog error) | nothing re-records them; the copy is unaffected, and `volume info` shows the figures as unrecorded |
+| recording the copy's figures (`bytes_written`, `num_data_files`, `last_write`) and its `write_completed` event (a catalog error) | `tapectl volume verify <label> --full`: once it passes, it records the figures that are missing or wrong, from the front index it read and the catalog's own rows, and logs a `write_figures_recorded` event naming each one. It records nothing when the tape's slices are not the ones the catalog staged for that volume, and says why |
 
 ```text
 warning: volume "L6-0002" is sealed and confirmed and counts as a copy, but releasing the batch's staging did
@@ -667,7 +667,7 @@ then the result on stdout:
 
 ```text
 <timestamp>  WARN tapectl::cli::operations: private key material copied to backup destination — treat this location as secret destination=/mnt/usb/tapectl.keys
-database backed up to /mnt/usb/tapectl.db; private keys copied to /mnt/usb/tapectl.keys/ — treat that directory as secret
+database backed up to /mnt/usb/tapectl.db (464.0 KiB); private keys copied to /mnt/usb/tapectl.keys/ (276 B) — treat that directory as secret
 ```
 
 ### `migration 026 cannot run`

@@ -170,11 +170,35 @@ pub fn stage_many(
     let many = total > 1;
     let results: Vec<OnceLock<Result<i64>>> = jobs.iter().map(|_| OnceLock::new()).collect();
     let started = AtomicUsize::new(0);
-    let run_one = |c: &Connection, cfg: &Config, i: usize| -> bool {
+    // The command's session (issue #386): one at a time, every stage runs
+    // in it. Several at a time, each unit runs in a session of its own
+    // beside it (`progress::Handle::start_child`), so the units' phases,
+    // waits and stalls never interleave in one log and each stage set's
+    // phase timings name a log that exists; the command's log says which
+    // unit started and ended when, and where its own log is.
+    let parent = crate::progress::handle();
+    let say = |line: &str| {
+        announce(line);
+        parent.log(line);
+    };
+    let run_one = |c: &Connection, cfg: &Config, i: usize, own_session: bool| -> bool {
         let job = &jobs[i];
         let n = started.fetch_add(1, Ordering::AcqRel) + 1;
+        let session =
+            own_session.then(|| parent.start_child(&format!("stage create {}", job.unit_name)));
+        // Several at once, the tracing lines the command's log tees in from
+        // every worker say whose they are.
+        let _span =
+            own_session.then(|| tracing::info_span!("stage", unit = %job.unit_name).entered());
         if many {
-            announce(&format!("staging {} ({n} of {total})", job.unit_name));
+            say(&format!("staging {} ({n} of {total})", job.unit_name));
+            if let Some(log) = session.as_ref().and_then(|s| s.log_path()) {
+                parent.log(&format!(
+                    "{}: its own log is {}",
+                    job.unit_name,
+                    log.display()
+                ));
+            }
         }
         #[cfg(test)]
         let _running = super::lock::db_file_of(c).map(|d| in_flight::Running::enter(&d));
@@ -188,10 +212,24 @@ pub fn stage_many(
             &mut std::io::stderr(),
         );
         let ok = result.is_ok();
+        if let Some(session) = &session {
+            match &result {
+                Ok(_) => session.note_result(Ok(())),
+                Err(e) => session.note_result(Err(&e.to_string())),
+            }
+        }
+        drop(session);
         if many {
             match &result {
-                Ok(id) => announce(&format!("staged {} (stage set {id})", job.unit_name)),
-                Err(e) => announce(&format!("failed {}: {e}", job.unit_name)),
+                Ok(id) => say(&format!("staged {} (stage set {id})", job.unit_name)),
+                Err(e) => {
+                    // The whole error on stderr; its first line in the
+                    // command's log, which keeps one stamped line per event
+                    // (the unit's own log has the outcome too).
+                    let line = format!("failed {}: {e}", job.unit_name);
+                    announce(&line);
+                    parent.log(line.lines().next().unwrap_or_default());
+                }
             }
         }
         let _ = results[i].set(result);
@@ -217,7 +255,6 @@ pub fn stage_many(
                     let spawned = std::thread::Builder::new()
                         .name(format!("tapectl-stage-{w}"))
                         .spawn_scoped(s, move || {
-                            let _capture = crate::progress::start_capture();
                             let mut wconn: Option<Connection> = None;
                             loop {
                                 if failed.load(Ordering::Acquire) || crate::signal::is_interrupted()
@@ -237,7 +274,7 @@ pub fn stage_many(
                                     }
                                 }
                                 let c = wconn.as_ref().expect("opened above");
-                                if !run_one(c, cfg, i) {
+                                if !run_one(c, cfg, i, true) {
                                     failed.store(true, Ordering::Release);
                                 }
                             }
@@ -250,7 +287,7 @@ pub fn stage_many(
         }
         _ => {
             for i in 0..total {
-                if !run_one(conn, config, i) {
+                if !run_one(conn, config, i, false) {
                     break;
                 }
             }
@@ -645,5 +682,281 @@ mod tests {
             1,
             "never fewer than one"
         );
+    }
+
+    /// Every file under `root` and its size: what the hasher reads, each
+    /// unit's dotfile included (recorded and archived, though no change
+    /// comparison counts it, ADR-0012 2026-10-07 item 24).
+    fn source_files(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
+        let mut files: Vec<_> = walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| (e.path().to_path_buf(), e.metadata().unwrap().len()))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Issue #366, end to end: `stage create` hashing several files at once
+    /// records the manifest the one-file-at-a-time pass records — every
+    /// file's sha256, byte for byte, and each the sha256 of the file on disk
+    /// — and stays inside the single-read budget at every thread count:
+    /// each source file opened by the hasher once and its bytes read once
+    /// (issue #364), never a second pass. Files really were hashed at once
+    /// where the host has the cores for it.
+    #[test]
+    fn hashing_files_at_once_stages_the_serial_manifest_and_reads_each_byte_once() {
+        use super::super::validate::hash_hook;
+        use sha2::{Digest, Sha256};
+        const TREE: [(&str, usize, usize); 3] = [
+            ("u-tree", 48, 40_000),
+            ("u-wide", 5, 700_000),
+            ("u-tiny", 2, 10),
+        ];
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut want: Option<Vec<Recorded>> = None;
+        for threads in [1, 4, 8] {
+            let (mut h, jobs) = home(&TREE);
+            h.config.staging.hash_threads = threads;
+            // As the unit's source path is recorded: resolved (a temp
+            // directory may sit behind a symlink).
+            let root = fs::canonicalize(h._tmp.path().join("src")).unwrap();
+            hash_hook::count_reads(&root);
+            hash_hook::track(&root);
+            // Each file stays in flight a moment after its hash, so threads
+            // that run at all are seen to overlap.
+            hash_hook::set(&root, |_| {
+                std::thread::sleep(std::time::Duration::from_millis(3))
+            });
+            let out = stage_many(
+                &h.conn,
+                &h.paths,
+                &h.config,
+                &jobs,
+                1,
+                false,
+                &mut Vec::new(),
+                &|_| {},
+            );
+            hash_hook::clear(&root);
+            let most = hash_hook::untrack(&root);
+            let reads = hash_hook::reads(&root);
+            assert_eq!(first_failure(out.unwrap()).unwrap().len(), TREE.len());
+
+            let files = source_files(&root);
+            assert_eq!(files.len(), 48 + 5 + 2 + TREE.len(), "with the dotfiles");
+            let opened: Vec<(std::path::PathBuf, usize)> = {
+                let mut v: Vec<_> = reads.opens.into_iter().collect();
+                v.sort();
+                v
+            };
+            assert_eq!(
+                opened,
+                files
+                    .iter()
+                    .map(|(p, _)| (p.clone(), 1))
+                    .collect::<Vec<_>>(),
+                "{threads} thread(s): every source file opened by the hasher exactly once"
+            );
+            let bytes: u64 = files.iter().map(|(_, n)| n).sum();
+            assert!(bytes > 0);
+            assert_eq!(
+                reads.bytes, bytes,
+                "{threads} thread(s): every source byte hashed exactly once"
+            );
+            let threads_run = threads.min(cores);
+            if threads_run > 1 {
+                assert!(
+                    (2..=threads_run).contains(&most),
+                    "{threads} thread(s): {most} file(s) hashed at once"
+                );
+            } else {
+                assert_eq!(most, 1, "one thread hashes one file at a time");
+            }
+
+            let got = recorded(&h.conn);
+            for (unit, _, _, hashes) in &got {
+                for (path, sha) in hashes {
+                    let on_disk = fs::read(root.join(unit).join(path)).unwrap();
+                    assert_eq!(sha, &format!("{:x}", Sha256::digest(&on_disk)), "{path}");
+                }
+            }
+            match &want {
+                None => want = Some(got),
+                Some(serial) => assert_eq!(&got, serial, "{threads} thread(s) vs one"),
+            }
+        }
+    }
+
+    /// Issue #368 with issue #386: several units staged at once each log to
+    /// a session of their own beside the command's, so no two units' phases
+    /// interleave in one log; the command's log says when each unit started
+    /// and ended and where its log is; each stage set's phase timings are
+    /// recorded under the session id of the log that holds them; and
+    /// `tapectl status` reads every unit's session and how it ended.
+    #[test]
+    fn units_staged_at_once_each_log_to_a_session_of_their_own() {
+        let (h, jobs) = home(&[("u-a", 4, 300_000), ("u-b", 4, 200_000), ("u-c", 3, 1000)]);
+        let logs = h._tmp.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        MEMORY_OVERRIDE.with(|m| m.set(Some(64 * MEMORY_PER_JOB)));
+        let (command_log, staged) = {
+            let session = crate::progress::start_session(
+                Some(&logs),
+                "stage create u-a u-b u-c",
+                crate::progress::Display::Off,
+                false,
+            );
+            let out = stage_many(
+                &h.conn,
+                &h.paths,
+                &h.config,
+                &jobs,
+                3,
+                false,
+                &mut Vec::new(),
+                &|_| {},
+            )
+            .unwrap();
+            session.note_result(Ok(()));
+            (
+                session.log_path().unwrap().to_path_buf(),
+                first_failure(out).unwrap(),
+            )
+        };
+        assert!(
+            in_flight::most(&super::super::lock::db_file_of(&h.conn).unwrap()) >= 2,
+            "several stages ran at once"
+        );
+
+        let text = fs::read_to_string(&command_log).unwrap();
+        assert!(
+            !text.contains("phase start: archive"),
+            "no unit's phases in the command's own log:\n{text}"
+        );
+        let sessions = crate::cli::status::read_sessions(&logs, 10).unwrap();
+        for (unit, stage_set_id) in &staged {
+            assert!(text.contains(&format!("staging {unit} (")), "{text}");
+            assert!(
+                text.contains(&format!("staged {unit} (stage set {stage_set_id})")),
+                "{text}"
+            );
+            let recorded_under: Vec<String> = h
+                .conn
+                .prepare("SELECT DISTINCT session FROM phase_timings WHERE stage_set_id = ?1")
+                .unwrap()
+                .query_map([stage_set_id], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(recorded_under.len(), 1, "{unit}: {recorded_under:?}");
+            let log = logs.join(format!("{}.log", recorded_under[0]));
+            assert!(
+                text.contains(&format!("{unit}: its own log is {}", log.display())),
+                "{text}"
+            );
+            let own = fs::read_to_string(&log).unwrap();
+            assert!(own.contains("phase start: archive"), "{unit}:\n{own}");
+            for other in staged.iter().map(|(n, _)| n).filter(|n| *n != unit) {
+                assert!(
+                    !own.contains(other.as_str()),
+                    "{unit}'s log names {other}:\n{own}"
+                );
+            }
+            for line in own.lines() {
+                let ts = line.split(' ').next().unwrap();
+                assert!(
+                    chrono::DateTime::parse_from_rfc3339(ts).is_ok(),
+                    "every line leads with its timestamp: {line}"
+                );
+            }
+            let s = sessions
+                .iter()
+                .find(|s| s.session == recorded_under[0])
+                .unwrap_or_else(|| panic!("{unit}: no session in {sessions:?}"));
+            assert_eq!(s.command.as_deref(), Some(&*format!("stage create {unit}")));
+            assert_eq!(
+                s.state,
+                crate::cli::status::State::Ended {
+                    outcome: "ok".into()
+                }
+            );
+            assert!(
+                s.phases.iter().any(|p| p.starts_with("archive")),
+                "{:?}",
+                s.phases
+            );
+        }
+    }
+
+    /// Issue #368: a unit that fails while others are staged beside it
+    /// takes nothing from them. The stage running beside it finishes and
+    /// stays staged, its slices on disk; no unit starts after the failure;
+    /// and the error names the failed unit and the ones that were staged.
+    #[test]
+    fn a_unit_failing_beside_others_leaves_their_stages_staged() {
+        let (h, jobs) = home(&[
+            ("u-big", 6, 900_000),
+            ("u-bad", 5, 400_000),
+            ("u-small", 2, 1000),
+        ]);
+        // Gone since its snapshot: the stage of u-bad refuses.
+        fs::remove_file(h._tmp.path().join("src/u-bad/f3.bin")).unwrap();
+        MEMORY_OVERRIDE.with(|m| m.set(Some(64 * MEMORY_PER_JOB)));
+        let out = stage_many(
+            &h.conn,
+            &h.paths,
+            &h.config,
+            &jobs,
+            2,
+            false,
+            &mut Vec::new(),
+            &|_| {},
+        )
+        .unwrap();
+        let big = match &out[0].result {
+            Some(Ok(id)) => *id,
+            other => panic!("u-big: {other:?}"),
+        };
+        assert!(matches!(out[1].result, Some(Err(_))), "{:?}", out[1]);
+        assert!(
+            !matches!(out[2].result, Some(Err(_))),
+            "u-small is staged or never started, never failed: {:?}",
+            out[2]
+        );
+        let status: String = h
+            .conn
+            .query_row("SELECT status FROM stage_sets WHERE id = ?1", [big], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "staged");
+        let slices: Vec<String> = h
+            .conn
+            .prepare("SELECT staging_path FROM stage_slices WHERE stage_set_id = ?1")
+            .unwrap()
+            .query_map([big], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(!slices.is_empty());
+        for s in &slices {
+            assert!(std::path::Path::new(s).is_file(), "{s} is on disk");
+        }
+        let bad_staged: i64 = h
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN units u ON u.id = s.unit_id
+                 WHERE u.name = 'u-bad' AND ss.status = 'staged'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_staged, 0);
+        let err = first_failure(out).unwrap_err().to_string();
+        assert!(err.starts_with("u-bad: "), "{err}");
+        assert!(err.contains("staged: u-big"), "{err}");
     }
 }

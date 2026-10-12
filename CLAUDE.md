@@ -259,6 +259,22 @@ cargo test --test integration           # one integration file
 cargo test test_volume_write_positions  # a single test by name (substring match)
 ```
 
+**Budget suites (issue #416)** pin what a path COSTS, not what it returns — every
+production slowdown passed a correctness suite. All ungated:
+
+```bash
+cargo test --lib cost_budget        # tape motions per read path, FakeTape at 150-slice scale
+cargo test --test catalog_budget    # statements and full-table scans per catalog command
+cargo test --test pass_budget       # sha256 bytes and staging reads per write / stage create
+```
+
+A budget pin moves only on purpose, with the reason in the commit message; a pin that
+fails is a cost change to explain, never a number to refresh. `pass_budget` reads
+process-wide counters (`src/pass_count.rs`, test-only by ADR-0012 2026-10-12 item 45),
+so it stays its own test binary; production hashing goes through
+`pass_count::Sha256`, never `sha2::Sha256` directly, or its passes drop out of the count
+(the budgets' 0.95 floor catches that).
+
 Two suites are gated (they skip at runtime unless the env var is set):
 
 ```bash
@@ -276,7 +292,12 @@ Two suites are gated (they skip at runtime unless the env var is set):
 TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
     cargo test --test mhvtl_e2e -- --ignored --nocapture
 
-# Performance scenarios (thousands of files, large archives); ~2 min. This is the one
+# TapeStore's own command count held to the kernel's other_cnt (#416 item 12). Same
+# gating; it writes the loaded cartridge. Not run by the gate.
+TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
+    cargo test --test mhvtl_motions -- --ignored --nocapture
+
+# Performance scenarios (100k-file unit, 2 GiB write, 184k-file rebuild); ~3 min. The one
 # case a release build is expected.
 TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
     --ignored --nocapture --test-threads=1

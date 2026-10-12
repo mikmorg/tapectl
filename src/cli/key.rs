@@ -611,6 +611,21 @@ pub fn adopt_escrow_recipient(
         TapectlError::Other("no operator tenant — run `tapectl init` first".into())
     })?;
     let pub_key = keys::read_or_parse_public_key(value)?;
+    // #424: the reverse of adoption's escrow refusal. A public key already
+    // in the catalog is a tenant's key; if its secret was adopted, that
+    // secret sits in keys/ on this machine, where ADR-0005 says the escrow
+    // secret never is. Named here rather than left to the UNIQUE constraint.
+    if let Some(existing) = queries::get_key_by_fingerprint(conn, &pub_key)? {
+        let owner = queries::get_tenant_by_id(conn, existing.tenant_id)?
+            .map(|t| t.name)
+            .unwrap_or_else(|| format!("#{}", existing.tenant_id));
+        return Err(TapectlError::Other(format!(
+            "escrow refuses: public key {pub_key} is already registered as \"{}\", a key of \
+             tenant \"{owner}\" — a tenant key cannot also be the escrow identity, whose \
+             secret is never kept on this machine (ADR-0005)",
+            existing.alias
+        )));
+    }
 
     let full_alias = format!("{}-escrow", operator.name);
     let key_id = queries::insert_escrow_key(
@@ -978,5 +993,31 @@ mod tests {
             serde_json::to_string(&value).unwrap(),
             r#"[{"alias":"tenantA-primary","created_at":"2026-01-01T00:00:00Z","escrow":"","fingerprint":"AB12...","is_active":"yes","key_type":"primary"},{"alias":"operator-escrow","created_at":"2026-02-01T00:00:00Z","escrow":"ESCROW (ADR-0005)","fingerprint":"CD34...","is_active":"no","key_type":"escrow"}]"#
         );
+    }
+
+    /// #424, the reverse order of adoption's escrow refusal: a public key
+    /// that is already a tenant's (adopted, so its secret is in keys/) is
+    /// refused as the escrow identity by name, and nothing is registered.
+    #[test]
+    fn a_tenant_key_is_refused_as_the_escrow_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(tmp.path().join("h"));
+        paths.ensure_dirs().unwrap();
+        let conn = crate::db::open_memory().unwrap();
+        crate::tenant::add_tenant(&conn, &paths, "op", None, true).unwrap();
+        let alice_pub: String = {
+            crate::tenant::add_tenant(&conn, &paths, "alice", None, false).unwrap();
+            queries::get_key_by_alias(&conn, "alice-primary")
+                .unwrap()
+                .unwrap()
+                .public_key
+        };
+        let msg = adopt_escrow_recipient(&conn, &paths, &alice_pub)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("\"alice-primary\""), "{msg}");
+        assert!(msg.contains("ADR-0005"), "{msg}");
+        assert!(!queries::escrow_key_exists(&conn).unwrap());
+        assert!(!paths.keys_dir.join("op-escrow.age.pub").exists());
     }
 }

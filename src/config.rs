@@ -1344,6 +1344,18 @@ impl Config {
                 ));
             }
         }
+        // Issue #422: an archive set's verify interval below one day.
+        for (i, as_cfg) in self.archive_sets.iter().enumerate() {
+            if let Some(days) = as_cfg.verify_interval_days {
+                if let Err(e) = validate_verify_interval_days(i64::from(days)) {
+                    problems.push(format!(
+                        "{}: archive_sets[{i}] (\"{}\").verify_interval_days = {days} {e}",
+                        path.display(),
+                        as_cfg.name
+                    ));
+                }
+            }
+        }
         // Issue #421: a rise factor below 1 flags a falling rate, and NaN
         // flags nothing; both are switches, not thresholds.
         let factor = self.health().read_error_rise_factor;
@@ -1823,6 +1835,31 @@ pub const VALID_CHECKSUM_MODES: &[&str] = &["mtime_size", "sha256", "sha256_on_a
 
 pub fn validate_checksum_mode(value: &str) -> std::result::Result<(), String> {
     validate_closed_set("checksum_mode", value, VALID_CHECKSUM_MODES)
+}
+
+/// An archive set's `verify_interval_days` (issue #422): at least one day.
+/// `audit`'s `verify_age` reads 0 or below as "always overdue", and the
+/// readback age gate (ADR-0012 2026-10-07 item 1) never continues an
+/// interrupted readback under it, so such a value is an off switch wearing
+/// an interval's clothes. The error is the reason only; each caller names
+/// the key the way its input spells it (`[[archive_sets]]`'s
+/// `verify_interval_days`, or `--verify-interval-days`) and the value.
+///
+/// Only new values are refused — `archive-set create`/`edit`/`sync` and
+/// config load. A catalog row already holding one keeps working: nothing
+/// re-validates a stored row, and the gate reads every value totally.
+pub fn validate_verify_interval_days(days: i64) -> std::result::Result<(), String> {
+    if days >= 1 {
+        Ok(())
+    } else {
+        Err(
+            "must be >= 1 (how many days a copy may go without a passing full \
+             `volume verify` before `audit` calls it overdue, and the oldest an \
+             interrupted full readback may be and still be continued; at 0 or below \
+             every copy is always overdue and no readback is ever continued)"
+                .to_string(),
+        )
+    }
 }
 
 /// Match a configured `device_tape` against a requested device path.
@@ -3626,6 +3663,50 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&path).expect("valid closed-set values must still load");
         assert_eq!(cfg.archive_sets.len(), 1);
+    }
+
+    /// Issue #422: an `[[archive_sets]]` table's `verify_interval_days`
+    /// below 1 makes `audit`'s `verify_age` always overdue and the readback
+    /// age gate never continue a readback. `Config::load` refuses it naming
+    /// the entry and the key, and `config check`'s lenient path names it
+    /// too. One day is the smallest interval, and loads.
+    #[test]
+    fn config_load_refuses_an_archive_set_verify_interval_below_one_day() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        for days in [0, -7] {
+            let body = format!(
+                "[[archive_sets]]\nname = \"warm\"\nverify_interval_days = 30\n\n\
+                 [[archive_sets]]\nname = \"cold\"\nverify_interval_days = {days}\n"
+            );
+            std::fs::write(&path, &body).unwrap();
+            let msg = Config::load(&path).unwrap_err().to_string();
+            assert!(
+                msg.contains("archive_sets[1] (\"cold\").verify_interval_days"),
+                "{msg}"
+            );
+            assert!(msg.contains(&format!("= {days}")), "{msg}");
+            assert!(msg.contains(">= 1"), "{msg}");
+
+            let report = crate::policy::lenient_config::check(&body, &path);
+            assert!(!report.valid);
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("verify_interval_days")),
+                "{:?}",
+                report.problems
+            );
+        }
+
+        std::fs::write(
+            &path,
+            "[[archive_sets]]\nname = \"cold\"\nverify_interval_days = 1\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("one day is a legitimate interval");
+        assert_eq!(cfg.archive_sets[0].verify_interval_days, Some(1));
     }
 
     // ---- issue #222: two [[backends.lto]] entries on one drive ----

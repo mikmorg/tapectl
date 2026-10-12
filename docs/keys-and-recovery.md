@@ -38,8 +38,8 @@ own.
 
 | Key | How many | Where the private half lives | Rotated? |
 |---|---|---|---|
-| Tenant key pair `<tenant>-primary` / `<tenant>-backup` | two per tenant, both active | `<home>/keys/<tenant>-primary.age.key`, `-backup.age.key` (mode 0600) | yes, `key rotate` |
-| Operator key pair `<operator>-primary` / `-backup` | two, for the operator tenant `init` creates | `<home>/keys/<operator>-*.age.key` | yes, `key rotate` |
+| Tenant key pair `<tenant>-primary` / `<tenant>-backup` | two per tenant, both active (one, `<tenant>-primary`, for a tenant that [adopted](#f-keeping-existing-keys-on-a-fresh-home) an existing key) | `<home>/keys/<tenant>-primary.age.key`, `-backup.age.key` (mode 0600) | yes, `key rotate` |
+| Operator key pair `<operator>-primary` / `-backup` | two, for the operator tenant `init` creates (one with `init --operator-key`) | `<home>/keys/<operator>-*.age.key` | yes, `key rotate` |
 | Escrow recipient `<operator>-escrow` | exactly one for the life of the archive | **nowhere on any machine.** It is on paper, in the Heir Kit | **never** |
 
 The database (`tapectl.db`) holds public keys and fingerprints only. Every private
@@ -74,6 +74,13 @@ active, both are recipients of everything the tenant owns, and either one decryp
 it alone. The second pair exists so that losing one file costs nothing.
 `init` does the same for the operator tenant, so the operator also has
 `<operator>-primary` and `<operator>-backup`.
+
+**Adopting instead of minting.** On a rebuilt machine whose key holders already
+hold their secrets, a tenant can keep its existing key:
+`tenant add <name> --adopt-key <file>` (and `init --operator-key <file>` for the
+operator) registers an existing age identity file as `<name>-primary` and mints
+nothing. [Runbook F](#f-keeping-existing-keys-on-a-fresh-home) is the whole
+procedure, including the copy-out from the old home.
 
 On disk, the private half of the alias shown in `key list` is
 `<home>/keys/<alias>.age.key`, and the public half is `<alias>.age.pub`:
@@ -224,6 +231,7 @@ file:
 | File 0 ID thunk, File 1 guide, File 2 `RESTORE.sh`, File 3 front index, last-file seal marker | nobody (plaintext) | label, layout, sizes and ciphertext hashes. No names, no content |
 | Tenant envelope, one per tenant on the tape | that tenant's active keys **+** operator's active keys **+** escrow (keys active when the volume was written) | `MANIFEST.toml` (units, file list, slice positions, plaintext hashes), `RECOVERY.md`, dar catalogs |
 | Operator envelope and its backup | operator's active keys **+** escrow | the same for *every* tenant on the tape, plus `PLAN.toml` and `catalog.db` (ownership and escrow receipts, used by `catalog rebuild`) |
+| Tenant envelope backup, one per tenant envelope (tapes from 1.1.0) | as the tenant envelope | the same bytes as the tenant envelope it copies; `RESTORE.sh` and `catalog rebuild` read it only when that envelope is damaged or will not read |
 | Data slice | owning tenant's active keys **+** operator's active keys **+** escrow (keys active when the unit was staged) | one dar archive slice |
 
 So:
@@ -253,9 +261,9 @@ So:
 
 ```text
 $ tapectl db backup --to /tmp/tour/backup/tapectl.db
-database backed up to /tmp/tour/backup/tapectl.db (private keys not included — pass --include-keys to copy them)
+database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys not included — pass --include-keys to copy them
 $ tapectl db backup --to /tmp/tour/backup/tapectl.db --include-keys
-database backed up to /tmp/tour/backup/tapectl.db; private keys copied to /tmp/tour/backup/tapectl.keys/ — treat that directory as secret
+database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys copied to /tmp/tour/backup/tapectl.keys/ (276 B) — treat that directory as secret
 ```
 
 With `--include-keys` the key directory is named after the destination with its
@@ -541,6 +549,9 @@ flowchart TD
     RD -->|tapes written after the backup| RC
 ```
 
+Starting a **fresh** catalog on a rebuilt machine, but keeping the keys people
+already hold, is [runbook F](#f-keeping-existing-keys-on-a-fresh-home).
+
 ### A. Restore a unit or a file normally
 
 The catalog knows which volume holds what. Find a copy, then restore from it:
@@ -715,6 +726,11 @@ is the same procedure for a service-user host.
      escrow:   adopted age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7 (imported — its secret lives on the heir kit, not here)
      dar:      dar (found at /usr/bin/dar)
    ```
+   `init --operator-key` is not for this runbook when step 6 imports the kit's
+   catalog: the import replaces every tenant and key row, so the surviving key
+   files go back in step 5 instead. Adopting is for a fresh catalog
+   ([runbook F](#f-keeping-existing-keys-on-a-fresh-home)).
+
    If you hold only the operator key and cannot find the escrow public key, run
    `tapectl init --operator mike --no-escrow` now and
    `tapectl key import --escrow age1…` once you find it. Until then escrow
@@ -990,6 +1006,101 @@ Nothing is lost. The home (catalog, keys, config) moves as one tarball, and the
 escrow identity moves inside the catalog. Follow
 [install.md §9](install.md#9-moving-to-a-new-host), and treat the tarball as
 every private key in the archive.
+
+### F. Keeping existing keys on a fresh home
+
+A rebuilt machine starts a **fresh** catalog (`init`, then `tenant add`), but
+the people who hold a tenant's key, or the operator's, already have it and
+should not need a new one. Each tenant, and the operator at `init`, can
+**adopt** its existing age key pair instead of minting one (ADR-0012,
+2026-10-12, item 42). This is not for a catalog that comes back from a backup
+or the kit: those carry their own tenant and key rows, and the key files just
+go back into `keys/` (runbooks C and D).
+
+> [!WARNING]
+> **Copy the keys out before you delete the old home.** A private key exists
+> only as a file in `<home>/keys/` (and in key-bearing backups). The catalog
+> holds public halves only, and no tapectl command exports a private key.
+> Deleting the old home first destroys every key no one copied, and a tenant
+> whose key is gone gets a new one: their old copies of it no longer open
+> anything written from then on.
+
+1. **Copy the secrets out of the old home**, one file per tenant, named
+   `<tenant>.key`. Take the key the holder keeps using, normally
+   `<tenant>-primary.age.key`. Which aliases a tenant has is
+   `tapectl key list --tenant <tenant>` on the old home. Copy by exact alias,
+   not with a `family-*` glob, which would also pick up a tenant named
+   `family-old`. The operator's file is named after the operator. On a
+   service-user install the old home is the service user's and mode 0700, so
+   copy with `sudo`, into a directory the service user owns:
+
+   ```bash
+   OLD=/var/lib/tapectl/.tapectl              # the old home
+   sudo install -d -m 0700 -o tapectl /srv/adopt-keys
+   sudo install -m 0600 -o tapectl "$OLD/keys/mike-primary.age.key"   /srv/adopt-keys/mike.key
+   sudo install -m 0600 -o tapectl "$OLD/keys/family-primary.age.key" /srv/adopt-keys/family.key
+   sudo install -m 0600 -o tapectl "$OLD/keys/work-primary.age.key"   /srv/adopt-keys/work.key
+   ```
+
+   The directory must be readable by the user tapectl runs as (`tapectl`
+   here), and so must each of its parents be traversable. Keep the rest of the
+   old `keys/` (backup and rotated keys) with your key-bearing backup: older
+   tapes may need them.
+
+2. **Check each file.** `age-keygen -y` prints the public key of an identity
+   file; it must be the one the old home registered (`tapectl key list` there,
+   or the `.age.pub` beside each `.age.key`):
+
+   ```bash
+   sudo age-keygen -y /srv/adopt-keys/family.key
+   sudo cat "$OLD/keys/family-primary.age.pub"
+   ```
+
+3. **Adopt.** `init` adopts the operator's key, and `tenant add` each tenant's.
+   `--dry-run` first shows the public key each will register and creates
+   nothing:
+
+   ```bash
+   tapectl --dry-run init --operator mike --operator-key /srv/adopt-keys/mike.key --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
+   tapectl init --operator mike --operator-key /srv/adopt-keys/mike.key --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
+   tapectl --dry-run tenant add family -d "family photos and letters" --adopt-key /srv/adopt-keys/family.key
+   tapectl tenant add family -d "family photos and letters" --adopt-key /srv/adopt-keys/family.key
+   ```
+
+   ```text
+   tenant "family" created (id=2) with the adopted key "family-primary" (age17f6l4ke42azcze5m9mc6m0p02cwtpdrfat3y5ml6yhe3vrwmvfzsfsa5fe); no key was minted
+   ```
+
+   With `scripts/first-run.sh`, set `ADOPT_KEYS_FROM=/srv/adopt-keys` in the
+   host profile (or pass `--adopt-keys-from`): step 7 adopts `<operator>.key`
+   and step 11 adopts `<tenant>.key` for each profile tenant, each after a
+   `--dry-run` of the same command. A missing file stops the step before it
+   creates anything, so a typo never quietly becomes a new key.
+
+4. **What you get.** The file is stored byte for byte as
+   `<home>/keys/<tenant>-primary.age.key`, mode 0600, with its public half
+   beside it, and registered as the tenant's one key, `<tenant>-primary`.
+   Nothing is minted, so the tenant has no `-backup` pair. To have the usual
+   two, add one:
+
+   ```bash
+   tapectl key generate --tenant family --alias backup --key-type backup
+   ```
+
+   Adoption refuses, and creates nothing, when the file is not exactly one
+   native age X25519 identity (a public key, a plugin identity, a
+   passphrase-protected file, two keys in one file), when its public key is
+   already registered (to any tenant, active or deactivated), and when it is
+   the escrow identity's secret: that secret lives on paper, never on a
+   machine (ADR-0005). `key import` still takes public keys only.
+
+5. **Remove the copies** once a key-bearing backup of the new home exists
+   (`tapectl db backup --to /media/usb/tapectl.db --include-keys`, see
+   [What your backups contain](#what-your-backups-contain)):
+
+   ```bash
+   sudo rm -r /srv/adopt-keys
+   ```
 
 ---
 

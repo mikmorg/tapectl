@@ -690,7 +690,12 @@ tapectl stage create family/letters family/photos family/video --jobs 2
 ```
 
 Each unit prints a line as it starts and ends, and the `staged:` lines follow;
-while several run there is no live progress line.
+while several run there is no live progress line. With more than one at a time,
+each unit also gets a session log of its own beside the command's
+(`<UTC>-stage-create-<unit>-<pid>.log`, a `/` in the name written as `-`), holding that unit's phases, waits and
+progress lines and how it ended, so no two units interleave in one file; the
+command's log records each unit's start and end and names its log, and
+`tapectl status` lists each unit as its own session.
 Every name is checked before anything is staged. If one unit fails, no further
 unit is started; the ones already running finish and stay staged, and the error
 names what was staged, what failed and what was not started. `collection run
@@ -1422,7 +1427,10 @@ These `--json` fields changed incompatibly from older builds:
 | `config show` | `defaults.min_copies_for_tape_only`, `defaults.min_locations_for_tape_only` | `defaults.min_copies`, `defaults.min_locations`; it mirrors config.toml, and a fresh one no longer has empty `collections` and `archive_sets` |
 
 Additions a parser can ignore: `db backup` gains `keys_dir` (`null` when no
-keys were copied), `archive-set sync` gains `unchanged`, `archive-set info`
+keys were copied), `size_bytes` (the copy it wrote) and `keys_bytes` (the key
+files it copied, 0 when none), `db stats` gains `journal_growth` (see
+[The journals are never pruned](#the-journals-are-never-pruned)),
+`archive-set sync` gains `unchanged`, `archive-set info`
 gains `warehouse_copies`, `preserve_xattrs`, `preserve_acls`, `preserve_fsa`
 and `dirty_on_metadata_change`, `key import --reactivate` prints
 `alias`, `fingerprint` and `reactivated`, and `unit check-integrity` gains
@@ -1489,7 +1497,7 @@ tapectl restore raw-volume --device "$TAPE" --to /staging/MHVTLR3 \
 ```
 
 `--from` is a wrong-tape guard against the tape's own reported label, not a
-catalog lookup. Expect output like `dumped 23 files … verified: 21
+catalog lookup. Expect output like `dumped 25 files … verified: 23
 mismatched: 0 unverifiable: 2`. **`mismatched` must be 0.** The two
 unverifiable files are always the front index and the seal marker — neither
 can carry its own hash — so `2` is the correct number, not a warning.
@@ -1499,10 +1507,10 @@ Files land named `{position:04}_{type}.bin`, e.g.:
 ```text
 0000_id_thunk.bin           0006_operator_envelope.bin
 0001_system_guide.bin       0007_operator_envelope_backup.bin
-0002_restore_sh.bin         0008_data_slice.bin  …  0021_data_slice.bin
-0003_front_index.bin        0022_seal_marker.bin
-0004_tenant_envelope.bin
-0005_tenant_envelope.bin
+0002_restore_sh.bin         0008_tenant_envelope_backup.bin
+0003_front_index.bin        0009_tenant_envelope_backup.bin
+0004_tenant_envelope.bin    0010_data_slice.bin  …  0023_data_slice.bin
+0005_tenant_envelope.bin    0024_seal_marker.bin
 ```
 
 **2. Upload, splitting hot from cold.** ADR-0006's zone split is the whole
@@ -2508,7 +2516,7 @@ tapectl db export > tapectl-catalog.json   # every table, as JSON
 
 ```text
 $ tapectl db backup --to /tmp/tour/backup/tapectl.db
-database backed up to /tmp/tour/backup/tapectl.db (private keys not included — pass --include-keys to copy them)
+database backed up to /tmp/tour/backup/tapectl.db (464.0 KiB); private keys not included — pass --include-keys to copy them
 ```
 
 `--to` names the backup *file*, and its directory must already exist:
@@ -2541,8 +2549,8 @@ Run it on a database you brought in with `db import` before you use it:
 
 The catalog keeps every reading it takes of a tape, a drive and a write:
 `health_logs`, `verification_sessions` and `verification_results`, `events`,
-`cartridge_contacts`, `mam_journal`, `log_page_journal`, `st_stats_journal` and
-`phase_timings` only grow. Nothing removes their rows by age or size, and nothing
+`cartridge_contacts`, `mam_journal`, `log_page_journal`, `st_stats_journal`,
+`mtget_journal`, `phase_timings`, `restores` and `dar_create_reports` only grow. Nothing removes their rows by age or size, and nothing
 that does is to be added (ADR-0012, 2026-10-07, item 28). They are evidence: a
 journal with rows missing looks complete and is not, and the earliest reading of
 a cartridge is the only baseline its later readings have. The session logs and
@@ -2560,27 +2568,53 @@ slice is about 2,300 slices, so one full verify of it adds about 0.6 MB, and a
 hundred cartridges verified four times a year add about 230 MB a year. A
 contact's health and chip readings are a few kilobytes. SQLite handles a
 catalog of some gigabytes without trouble; what grows with it is the time
-`db backup` takes, because it copies the whole file.
+`db backup` takes, because it copies the whole file. `db backup` prints the
+size of the copy it wrote (`size_bytes` in `--json`), so a backup log shows the
+catalog growing.
 
-`db stats` shows what each table weighs, largest first, so the growth can be
-seen rather than guessed. On a fresh home every table is a page or two of
-empty structure:
+`db stats` shows what each table weighs, largest first, then how fast each
+journal grew over the trailing 90 days, so the growth can be seen rather than
+guessed. On a fresh home every table is a page or two of empty structure, and
+the only journal rows are the few events `init` wrote (three here, from
+`init --no-escrow`):
 
 ```text
 $ tapectl db stats
-database: 464.0 KiB, 40 tables, 116 pages
+database: 464.0 KiB, 42 tables, 116 pages
 table sizes (measured by SQLite's dbstat: the pages each table and its indexes occupy):
   units                           0 rows     24.0 KiB
   cartridges                      0 rows     20.0 KiB
   events                          3 rows     20.0 KiB
   ...
+journal growth, trailing 90 days (rows exact; bytes derived: the bytes in use on each table's and its indexes' pages, shared among its rows by stored length):
+  events                          3 rows        493 B  ~  175.7 KiB/year
+  cartridge_contacts              0 rows          0 B  ~        0 B/year
+  ...
+note: the journals go back only 1.0 days (counted as at least one), so each /year figure is that span's pace scaled to a year
 ```
 
-The figures are measured when tapectl's SQLite has the `dbstat` table, which
-the build tapectl ships with does. Otherwise the line says `ESTIMATED` and the
-sizes are the stored values' lengths alone, without page or index overhead, so
-they read low. `--json` carries the same list as `table_sizes`, with
-`size_method` saying which (`dbstat` or `estimate`).
+The table sizes are measured when tapectl's SQLite has the `dbstat` table,
+which the build tapectl ships with does. Otherwise the line says `ESTIMATED`
+and the sizes are the stored values' lengths alone, without page or index
+overhead, so they read low. `--json` carries the same list as `table_sizes`,
+with `size_method` saying which (`dbstat` or `estimate`).
+
+The growth lines list every journal, fastest first. The row count is exact:
+the rows whose date (`logged_at`, `captured_at`, `verified_at` and so on, one
+column per journal) falls in the last 90 days. No SQLite figure sizes a row, so
+the bytes are derived: the bytes in use on the table's and its indexes' pages
+(page size less free space, so a near-empty table's empty pages are not charged
+to its few rows), shared among its rows by their stored length; without
+`dbstat` they are the rows' stored lengths alone, and the line says
+`ESTIMATED`. The `/year` figure is that pace over 365 days. A catalog younger
+than 90 days is paced over its own age, from its oldest journal row and never
+under a day, and the `note:` line says so; a few days' pace scaled to a year is
+a rough figure, steadier as the catalog ages. A `verification_sessions` row for
+a readback continued from an interrupted one is dated from its oldest
+checkpoint, so it can fall before the window although it was written today.
+`--json` carries it as `journal_growth`: `size_method`, `trailing_days` (90),
+`window_days` (the days actually covered) and `journals`, each with `name`,
+`date_column`, `rows_in_window`, `bytes_in_window` and `bytes_per_year`.
 
 ## Disaster Recovery
 

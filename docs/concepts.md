@@ -860,6 +860,7 @@ and four slices.
 | 3 | Front index | plaintext | The map: for every file, its position, type, byte size, and sha256 of its on-tape bytes. No names. |
 | 4 … | Tenant envelopes | encrypted to tenant + operator + escrow | One per tenant on the tape: `MANIFEST.toml` (each unit's name, uuid and version, the `dar` version and command, and each slice's position, sizes and plaintext and encrypted sha256), `RECOVERY.md`, and the `dar` catalogs, which are where the archived file names are. |
 | next 2 | Operator envelope + backup | encrypted to operator + escrow | One `MANIFEST.toml` covering every tenant's units, `RECOVERY.md`, every unit's `dar` catalog, the write plan (`PLAN.toml`), and a `catalog.db` covering this write (used by `catalog rebuild`). The backup is a second copy. |
+| next, one per tenant | Tenant envelope backups | as the tenant envelope | A second copy of each tenant envelope, the same bytes, in the same order (since 1.1.0). Read only when the first copy is damaged or will not read. |
 | … M−1 | Data slices | encrypted to tenant + operator + escrow | The archived data itself, one `dar` slice per file, each unit's slices together. |
 | M | Seal marker | plaintext | "Everything before me is here": file count, seal time, the front index's hash, and a full copy of the front index. |
 

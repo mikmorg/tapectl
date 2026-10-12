@@ -358,15 +358,15 @@ fn resume_after_restart_seals_rather_than_quarantines() {
 
     // The fixture's content entries (seal excluded) are, in order: id_thunk,
     // system_guide, restore_sh, front_index, tenant_envelope,
-    // operator_envelope, operator_envelope_backup, slice_1, slice_2. Firing
-    // on check #9 (0-indexed >= 8) stops AFTER slice_1 landed and BEFORE
-    // slice_2 is opened — one slice written, which is the two-case cursor
-    // rule's "reposition and continue" branch.
-    let mut store = interrupt_after(&f, 8);
+    // operator_envelope, operator_envelope_backup, tenant_envelope_backup,
+    // slice_1, slice_2. Firing on check #10 (0-indexed >= 9) stops AFTER
+    // slice_1 landed and BEFORE slice_2 is opened — one slice written, which
+    // is the two-case cursor rule's "reposition and continue" branch.
+    let mut store = interrupt_after(&f, 9);
     assert_eq!(
         store.files.len(),
-        8,
-        "8 entries landed before the interrupt"
+        9,
+        "9 entries landed before the interrupt"
     );
 
     // --- the process restarts: a fresh Connection is all we carry forward ---
@@ -466,8 +466,8 @@ fn resume_after_restart_seals_rather_than_quarantines() {
 fn resume_with_zero_slices_written_restarts_from_bot() {
     let f = make_fixture();
 
-    // Stop after 5 entries (id_thunk .. operator_envelope): plenty written,
-    // but the first slice is at index 7, so no slice has a 'written' cursor
+    // Stop after 5 entries (id_thunk .. tenant_envelope): plenty written,
+    // but the first slice is at index 8, so no slice has a 'written' cursor
     // row. Per the cursor rule that means restart from BOT, not "continue at
     // 5".
     let mut store = interrupt_after(&f, 5);

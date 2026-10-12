@@ -37,8 +37,9 @@
 //! asks it before the tape moves, so a resume with no verify behind it is
 //! refused without a contact. [`adopt`] asks all three in the ruling's order.
 
+use crate::pass_count::Sha256;
 use rusqlite::{params, Connection};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 
 use crate::db::events;
 use crate::error::{Result, TapectlError};

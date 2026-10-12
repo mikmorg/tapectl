@@ -2,7 +2,8 @@
 
 use std::io::{self, Read, Write};
 
-use sha2::{Digest, Sha256};
+use crate::pass_count::Sha256;
+use sha2::Digest;
 
 /// A `Read` adapter that computes the sha256 of every byte read through it.
 ///
@@ -284,6 +285,8 @@ pub fn format_capacity_progress(bytes_written: i64, capacity_bytes: i64) -> Stri
 /// the next copy's write, hours later); a source file during `stage create`
 /// is not (dar and the hasher share one read of it through the page cache,
 /// issue #364), nor is a file just materialized and about to be written.
+/// What it reads is counted as a staging read for the budget tests
+/// ([`crate::pass_count`], issue #416).
 pub struct DropBehind {
     file: std::fs::File,
     read: u64,
@@ -381,6 +384,7 @@ impl Read for DropBehind {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.file.read(buf)?;
         self.read += n as u64;
+        crate::pass_count::note_staging_read(n);
         // A window passed, or the end: everything read so far goes.
         if n == 0 || self.read - self.dropped >= Self::WINDOW {
             self.drop_to(self.read);

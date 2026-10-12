@@ -312,6 +312,12 @@ impl PolicyWrite {
             // at unit-write time with a raw SQLite error.
             crate::config::validate_checksum_mode(m).map_err(TapectlError::Other)?;
         }
+        // Issue #422: a stored row below one day keeps working; only a new
+        // value is refused.
+        if let Some(days) = args.verify_interval_days {
+            crate::config::validate_verify_interval_days(days)
+                .map_err(|e| TapectlError::Other(format!("--verify-interval-days {days} {e}")))?;
+        }
         let required_locations = args
             .required_locations
             .as_ref()
@@ -343,8 +349,13 @@ impl PolicyWrite {
     /// names (CTO ruling 2026-09-28 on issue #346 — config.toml wins, but
     /// only for the keys present; a value set by `edit` for a key the table
     /// omits is left alone). `sync` validates compression and checksum mode
-    /// for every table before calling this; `slice_size` is parsed here.
+    /// for every table before calling this; `slice_size` is parsed and
+    /// `verify_interval_days` bounded (issue #422) here.
     fn from_config(as_cfg: &crate::config::ArchiveSetConfig) -> Result<Self> {
+        if let Some(days) = as_cfg.verify_interval_days {
+            crate::config::validate_verify_interval_days(i64::from(days))
+                .map_err(|e| TapectlError::Other(format!("verify_interval_days = {days} {e}")))?;
+        }
         Ok(Self {
             min_copies: as_cfg.min_copies.map(i64::from),
             required_locations: as_cfg.required_locations.clone(),
@@ -1978,5 +1989,206 @@ fi
             event_count, 0,
             "no per-field event should survive a rolled-back edit"
         );
+    }
+
+    // ---- issue #422: verify_interval_days below 1 is refused ----
+
+    fn with_verify_days(days: i64) -> PolicyArgs {
+        PolicyArgs {
+            verify_interval_days: Some(days),
+            ..PolicyArgs::default()
+        }
+    }
+
+    fn set_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM archive_sets", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn all_events(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// Issue #422: `audit`'s `verify_age` reads 0 or below as "always
+    /// overdue", and the readback age gate (ADR-0012 2026-10-07 item 1)
+    /// never continues an interrupted readback under it. `create` refuses
+    /// it by the flag's name, in a dry run as in a real one (#241), and
+    /// writes nothing.
+    #[test]
+    fn create_refuses_a_verify_interval_below_one_day() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        for days in [0, -1, i64::MIN] {
+            for dry_run in [true, false] {
+                let cmd = ArchiveSetCommands::Create {
+                    name: "cold".to_string(),
+                    policy: with_verify_days(days),
+                };
+                let err = run(&conn, &config, &cmd, false, dry_run)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains("--verify-interval-days"),
+                    "must name the flag ({days}, dry run {dry_run}): {err}"
+                );
+                assert!(
+                    err.contains(&days.to_string()),
+                    "must name the value: {err}"
+                );
+                assert!(err.contains(">= 1"), "must name the bound: {err}");
+            }
+        }
+        assert_eq!(set_count(&conn), 0, "a refused create must write nothing");
+        assert_eq!(all_events(&conn), 0);
+
+        // Positive control: one day is the smallest interval, and is stored.
+        let cmd = ArchiveSetCommands::Create {
+            name: "cold".to_string(),
+            policy: with_verify_days(1),
+        };
+        run(&conn, &config, &cmd, false, false).unwrap();
+        assert_eq!(column_i64(&conn, "cold", "verify_interval_days"), Some(1));
+    }
+
+    /// Issue #422, the `edit` half: refused by the flag's name before any
+    /// column is written or logged, the stored interval left as it was.
+    #[test]
+    fn edit_refuses_a_verify_interval_below_one_day() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        let create = ArchiveSetCommands::Create {
+            name: "cold".to_string(),
+            policy: with_verify_days(90),
+        };
+        run(&conn, &config, &create, false, false).unwrap();
+        let events_before = all_events(&conn);
+
+        for days in [0, -30] {
+            for dry_run in [true, false] {
+                let edit = ArchiveSetCommands::Edit {
+                    name: "cold".to_string(),
+                    policy: PolicyArgs {
+                        min_copies: Some(3),
+                        verify_interval_days: Some(days),
+                        ..PolicyArgs::default()
+                    },
+                };
+                let err = run(&conn, &config, &edit, false, dry_run)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("--verify-interval-days"), "{err}");
+                assert!(err.contains(&days.to_string()), "{err}");
+            }
+        }
+        assert_eq!(column_i64(&conn, "cold", "verify_interval_days"), Some(90));
+        assert_eq!(
+            column_i64(&conn, "cold", "min_copies"),
+            None,
+            "a refused edit writes none of its columns"
+        );
+        assert_eq!(all_events(&conn), events_before);
+
+        // Positive control.
+        let edit = ArchiveSetCommands::Edit {
+            name: "cold".to_string(),
+            policy: with_verify_days(1),
+        };
+        run(&conn, &config, &edit, false, false).unwrap();
+        assert_eq!(column_i64(&conn, "cold", "verify_interval_days"), Some(1));
+    }
+
+    /// Issue #422, the config-driven path: an `[[archive_sets]]` table's
+    /// `verify_interval_days` below 1 is refused by `sync`, naming the set
+    /// and the TOML key (not the CLI flag), before any row is written —
+    /// the valid set listed first included. `Config::load` refuses such a
+    /// file already; `sync` checks again because it can be handed a
+    /// `Config` that was never loaded from a file, as compression and
+    /// required_locations are checked again (#171, #348).
+    #[test]
+    fn sync_refuses_a_verify_interval_below_one_day() {
+        let conn = fresh_conn();
+        let mut config = Config::default();
+        let mut first = set_config("aaa");
+        first.verify_interval_days = Some(30);
+        config.archive_sets.push(first);
+        config.archive_sets.push(set_config("cold"));
+
+        for days in [0, -1] {
+            config.archive_sets[1].verify_interval_days = Some(days);
+            let err = run(&conn, &config, &ArchiveSetCommands::Sync, false, false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("archive set \"cold\""),
+                "must name the set: {err}"
+            );
+            assert!(
+                err.contains("verify_interval_days") && !err.contains("--verify-interval-days"),
+                "must name the TOML key, not the CLI flag: {err}"
+            );
+            assert!(err.contains(&days.to_string()), "{err}");
+            assert_eq!(set_count(&conn), 0, "a refused sync must write nothing");
+        }
+
+        // Positive control.
+        config.archive_sets[1].verify_interval_days = Some(1);
+        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
+        assert_eq!(column_i64(&conn, "cold", "verify_interval_days"), Some(1));
+        assert_eq!(column_i64(&conn, "aaa", "verify_interval_days"), Some(30));
+    }
+
+    /// Issue #422: the refusal only stops new values. A row already
+    /// holding one (written before the check existed) keeps working: an
+    /// `edit` of another column succeeds, `list` and `info` read it, and a
+    /// `sync` whose table omits the key leaves it alone. The readback age
+    /// gate reads such a row totally (`volume::session`'s
+    /// `the_readback_age_gate_is_total_over_any_verify_interval`).
+    #[test]
+    fn an_existing_row_below_one_day_keeps_working() {
+        let conn = fresh_conn();
+        conn.execute(
+            "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('cold', 0)",
+            [],
+        )
+        .unwrap();
+
+        let config = Config::default();
+        run(
+            &conn,
+            &config,
+            &ArchiveSetCommands::Edit {
+                name: "cold".to_string(),
+                policy: PolicyArgs {
+                    min_copies: Some(3),
+                    ..PolicyArgs::default()
+                },
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(column_i64(&conn, "cold", "min_copies"), Some(3));
+        assert_eq!(column_i64(&conn, "cold", "verify_interval_days"), Some(0));
+
+        run(&conn, &config, &ArchiveSetCommands::List, false, false).unwrap();
+        run(
+            &conn,
+            &config,
+            &ArchiveSetCommands::Info {
+                name: "cold".to_string(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        let mut cold = set_config("cold");
+        cold.min_copies = Some(4);
+        config.archive_sets.push(cold);
+        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
+        assert_eq!(column_i64(&conn, "cold", "min_copies"), Some(4));
+        assert_eq!(column_i64(&conn, "cold", "verify_interval_days"), Some(0));
     }
 }

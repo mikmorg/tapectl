@@ -193,6 +193,8 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
   ciphertext hash. Read this first for a full map of the tape.
 - File 4 onward: Tenant envelope(s) — one per tenant sharing this tape
 - Then: Operator envelope, then Operator envelope backup
+- Then: a backup copy of each tenant envelope, in the same order (the
+  same bytes: if your envelope will not read, read its backup)
 - Then: Data slices (age-encrypted dar archives) — one unit's slices
   are stored contiguously
 - LAST file: SEAL MARKER — asserts the tape is complete, and carries a
@@ -285,7 +287,9 @@ If RESTORE.sh is not available, follow these steps:
    slices may be incomplete, but everything the front index describes
    is still readable and independently checkable
 5. Read and trial-decrypt tenant envelopes (File 3 lists their
-   positions as type `tenant_envelope`) with your key
+   positions as type `tenant_envelope`) with your key. If yours is
+   damaged or will not read, use its backup: the
+   `tenant_envelope_backup` entry with the same `sha256_encrypted`
 6. Parse the MANIFEST.toml in your envelope for slice positions
 7. For each slice, in order (rewind once, space to the first slice;
    each read leaves the tape at the next file): read from tape, trim
@@ -319,7 +323,8 @@ physical tape can therefore learn a limited set of *structural* facts
 — but no content:
 
 - the volume label, creation date, and tapectl version;
-- how many tenants share this tape (the number of tenant envelopes);
+- how many tenants share this tape (the number of tenant envelopes,
+  each written twice);
 - how many data slices there are, and the exact on-tape byte size and
   ciphertext hash of every file (needed so an heir can navigate and
   trim block padding without a key).
@@ -1057,10 +1062,12 @@ check_file_list_consistency() {
 # Look up size_bytes / sha256_encrypted for a given tape file position.
 file_size_at() { awk -F'|' -v p="$1" '$1 == p { print $3; exit }' "$2"; }
 file_hash_at() { awk -F'|' -v p="$1" '$1 == p { print $4; exit }' "$2"; }
+file_type_at() { awk -F'|' -v p="$1" '$1 == p { print $2; exit }' "$2"; }
 
-# List tenant/operator envelope positions in on-tape order (the file list is
-# already position-sorted, and the format's fixed zone order already puts
-# tenant envelope(s) before the operator envelope before its backup).
+# List envelope positions in on-tape order (the file list is already
+# position-sorted, and the format's fixed zone order puts the tenant
+# envelope(s), then the operator envelope and its backup, then each tenant
+# envelope's backup: every primary before every backup).
 envelope_positions() {
   awk -F'|' '__AWK_FIND_ENVELOPE__' "$1"
 }
@@ -1550,7 +1557,18 @@ DAMAGED_ENVELOPES=0
 try_envelope() { # <position>
   local pos=$1 esize ehash actual keyfile mismatch=0
   ENV_KEY=""
-  read_tape_raw "$pos" "$WORK/envelope.enc"
+  # A file that will not read is damaged too, not the end of the run: its
+  # backup further on holds the same bytes. A full disk here is not the
+  # tape's fault, and no backup would fare better, so that still stops.
+  : >"$WORK/dd.err"
+  if ! try_read_tape_raw "$pos" "$WORK/envelope.enc"; then
+    if grep -i 'no space left' "$WORK/dd.err" >/dev/null 2>&1; then
+      die_io "reading tape file $pos failed" "$WORK/dd.err" "$WORK"
+    fi
+    DAMAGED_ENVELOPES=$((DAMAGED_ENVELOPES + 1))
+    echo "WARNING: the envelope at file $pos could not be read from the tape: it is DAMAGED" >&2
+    return 2
+  fi
   esize=$(file_size_at "$pos" "$FILES_TXT")
   ehash=$(file_hash_at "$pos" "$FILES_TXT")
   if [ -n "$esize" ]; then
@@ -1593,9 +1611,10 @@ try_envelope() { # <position>
 # Walk the envelopes in tape order — forward only — trying the keys on each,
 # and call "$1 <position>" for each that opens; it returns 1 to stop the
 # walk. A file whose bytes equal one already tried (an envelope's backup, by
-# its front-index hash) is skipped unless that one was damaged.
+# its front-index hash) is skipped unless that one was damaged or would not
+# read: then the backup is what is read instead.
 walk_envelopes() { # <on-open callback>
-  local cb=$1 pos h rc seen=" "
+  local cb=$1 pos h rc ty seen=" "
   while IFS= read -r pos; do
     require_uint envelope_position "$pos"
     h=$(file_hash_at "$pos" "$FILES_TXT")
@@ -1612,6 +1631,10 @@ walk_envelopes() { # <on-open callback>
     try_envelope "$pos" || rc=$?
     [ "$rc" = 2 ] || [ -z "$h" ] || seen="$seen$h "
     if [ "$rc" = 0 ]; then
+      ty=$(file_type_at "$pos" "$FILES_TXT")
+      case "$ty" in
+      *_backup) info "File $pos is a backup copy, read because the envelope it copies could not be used" ;;
+      esac
       rm -rf "$WORK/opened.$pos"
       mv "$WORK/env" "$WORK/opened.$pos"
       "$cb" "$pos" || break

@@ -10,6 +10,9 @@
 #
 # Clean up: rm -rf /scratch/fr-{home,work,kit,backups,staging,src}; sudo rm -rf those
 # owned by tapectl.
+#
+# scripts/first-run-reentry-mhvtl.sh sources this profile with every path moved into
+# its own workspace, and adds issue #414's interrupted-write re-entry on top.
 
 HOME_DIR=/scratch/fr-home
 TAPECTL=/scratch/fr-bin/tapectl

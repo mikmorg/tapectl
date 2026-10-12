@@ -1071,8 +1071,9 @@ rm_step_restore_sh_backup() {
 }
 
 # Decided from src/volume/layout.rs:516 (envelope_positions lists
-# tenant_envelope, operator_envelope AND operator_envelope_backup as equal
-# trial-decrypt candidates) and :883 ("multiple units found" only fires when
+# tenant_envelope, operator_envelope, operator_envelope_backup AND
+# tenant_envelope_backup as trial-decrypt candidates, a backup read only when
+# the envelope it copies could not be used) and :883 ("multiple units found" only fires when
 # a single envelope covers >1 unit) — the operator envelope IS a normal
 # restore path, requiring --unit exactly like a tenant envelope covering
 # more than one unit. Not a refusal-by-design case.

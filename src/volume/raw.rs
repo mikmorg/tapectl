@@ -81,6 +81,7 @@ pub const RAW_TYPES: &[&str] = &[
     "tenant_envelope",
     "operator_envelope",
     "operator_envelope_backup",
+    "tenant_envelope_backup",
     "data_slice",
     "seal_marker",
 ];

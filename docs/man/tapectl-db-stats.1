@@ -9,6 +9,8 @@ tapectl\-db\-stats \- Show database statistics, and what each table weighs
 Show database statistics, and what each table weighs
 .PP
 The database\*(Aqs size, then every table\*(Aqs row count and size, largest first. The journals (`health_logs`, `verification_results`, `events`, the forensic journals) are never pruned, so this is how their growth is seen. Sizes are measured with SQLite\*(Aqs dbstat table when the build has it (the bundled build does) and estimated otherwise; the output says which (`size_method` in `\-\-json`).
+.PP
+Then each journal\*(Aqs growth over the trailing 90 days, fastest first: the rows dated in the window, the bytes they take, and that pace over a year (`journal_growth` in `\-\-json`). The row count is exact; the bytes are derived, the bytes in use on the table\*(Aqs pages shared among its rows by stored length. A catalog younger than 90 days is paced over its own age, from its oldest journal row.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR

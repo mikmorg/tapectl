@@ -30,7 +30,7 @@ Accepted by every command, before or after the subcommand.
 |---|---|
 | [`init`](init.md) | Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR-0005; use --no-escrow to skip it, or --escrow-public-key to adopt an existing one instead of minting a new identity) |
 | [`tenant`](tenant.md) | Manage tenants |
-| &nbsp;&nbsp;[`tenant add`](tenant.md#tapectl-tenant-add) | Add a new tenant (generates keypair automatically) |
+| &nbsp;&nbsp;[`tenant add`](tenant.md#tapectl-tenant-add) | Add a new tenant (mints a primary and a backup key pair, or adopts an existing identity with --adopt-key) |
 | &nbsp;&nbsp;[`tenant list`](tenant.md#tapectl-tenant-list) | List all tenants |
 | &nbsp;&nbsp;[`tenant info`](tenant.md#tapectl-tenant-info) | Show tenant details |
 | &nbsp;&nbsp;[`tenant reassign`](tenant.md#tapectl-tenant-reassign) | Reassign all units from one tenant to another |

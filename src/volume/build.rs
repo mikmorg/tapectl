@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
+use crate::pass_count::Sha256;
+use sha2::Digest;
 use uuid::Uuid;
 
 use crate::error::{Result, TapectlError};
@@ -196,7 +197,8 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
 
     // Positions are pure arithmetic over counts, fixed before any byte is
     // generated (format §1: 4 front files, permuted tenant envelopes,
-    // operator + backup, unit-contiguous slices, seal marker last).
+    // operator + backup, the tenant envelopes' backups in the primaries'
+    // order (§1.3), unit-contiguous slices, seal marker last).
     let mut distinct_tenant_ids: Vec<i64> = inputs.units.iter().map(|u| u.tenant_id).collect();
     distinct_tenant_ids.sort_unstable();
     distinct_tenant_ids.dedup();
@@ -211,7 +213,8 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
     let num_tenants = permuted_tenants.len() as i32;
     let op_pos = first_envelope_pos + num_tenants;
     let op_backup_pos = op_pos + 1;
-    let data_start = op_backup_pos + 1;
+    let first_tenant_backup_pos = op_backup_pos + 1;
+    let data_start = first_tenant_backup_pos + num_tenants;
 
     let all_slices: Vec<&BuildSlice> = inputs.units.iter().flat_map(|u| u.slices.iter()).collect();
     let num_slices = all_slices.len() as i32;
@@ -314,8 +317,25 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
             position: pos,
             kind: ZoneKind::TenantEnvelope { tenant_id },
             size_bytes: Some(size),
+            sha256: Some(hash.clone()),
+            source: ContentSource::Materialized(path.clone()),
+        });
+
+        // Its backup (`volume-format-v2.md` §1.3, #418 item 2): the same
+        // bytes, copied, after the operator pair and in the primaries'
+        // order — a byte-for-byte copy for the reason the operator backup
+        // below is one (a second encryption would be an unrelated file).
+        let backup_pos = first_tenant_backup_pos + i as i32;
+        let backup_path = session_dir.join(format!(
+            "{backup_pos:04}_tenant_envelope_backup_{tenant_id}"
+        ));
+        fs::copy(&path, &backup_path)?;
+        entries.push(LayoutEntry {
+            position: backup_pos,
+            kind: ZoneKind::TenantEnvelopeBackup { tenant_id },
+            size_bytes: Some(size),
             sha256: Some(hash),
-            source: ContentSource::Materialized(path),
+            source: ContentSource::Materialized(backup_path),
         });
     }
 
@@ -1186,8 +1206,9 @@ mod tests {
         let entries = &built.layout.entries;
 
         // 0 id_thunk, 1 guide, 2 restore_sh, 3 front_index, 4-5 tenant
-        // envelopes, 6 operator, 7 operator backup, 8-9 slices, 10 seal.
-        assert_eq!(entries.len(), 11);
+        // envelopes, 6 operator, 7 operator backup, 8-9 the tenant
+        // envelopes' backups (§1.3), 10-11 slices, 12 seal.
+        assert_eq!(entries.len(), 13);
         for (i, e) in entries.iter().enumerate() {
             assert_eq!(
                 e.position, i as i32,
@@ -1203,9 +1224,37 @@ mod tests {
         assert!(matches!(entries[5].kind, ZoneKind::TenantEnvelope { .. }));
         assert_eq!(entries[6].kind, ZoneKind::OperatorEnvelope);
         assert_eq!(entries[7].kind, ZoneKind::OperatorEnvelopeBackup);
-        assert_eq!(entries[8].kind, ZoneKind::Slice { stage_slice_id: 1 });
-        assert_eq!(entries[9].kind, ZoneKind::Slice { stage_slice_id: 2 });
-        assert_eq!(entries[10].kind, ZoneKind::SealMarker);
+        assert!(matches!(
+            entries[8].kind,
+            ZoneKind::TenantEnvelopeBackup { .. }
+        ));
+        assert!(matches!(
+            entries[9].kind,
+            ZoneKind::TenantEnvelopeBackup { .. }
+        ));
+        assert_eq!(entries[10].kind, ZoneKind::Slice { stage_slice_id: 1 });
+        assert_eq!(entries[11].kind, ZoneKind::Slice { stage_slice_id: 2 });
+        assert_eq!(entries[12].kind, ZoneKind::SealMarker);
+
+        // Each backup is its primary's bytes, in the primaries' order.
+        for i in 0..2 {
+            let (primary, backup) = (&entries[4 + i], &entries[8 + i]);
+            let (
+                ZoneKind::TenantEnvelope { tenant_id: p },
+                ZoneKind::TenantEnvelopeBackup { tenant_id: b },
+            ) = (&primary.kind, &backup.kind)
+            else {
+                panic!("expected a tenant envelope and its backup");
+            };
+            assert_eq!(p, b, "backup {i} is not in the primaries' order");
+            assert_eq!(primary.size_bytes, backup.size_bytes);
+            assert_eq!(primary.sha256, backup.sha256);
+            let read = |e: &LayoutEntry| match &e.source {
+                ContentSource::Materialized(path) => fs::read(path).unwrap(),
+                other => panic!("an envelope is materialized, not {other:?}"),
+            };
+            assert_eq!(read(primary), read(backup), "a backup is a byte copy");
+        }
 
         // Envelopes strictly precede slices; seal marker is strictly last.
         let first_slice_idx = entries
@@ -1220,6 +1269,7 @@ mod tests {
                     ZoneKind::TenantEnvelope { .. }
                         | ZoneKind::OperatorEnvelope
                         | ZoneKind::OperatorEnvelopeBackup
+                        | ZoneKind::TenantEnvelopeBackup { .. }
                 )
             })
             .unwrap();
@@ -1489,6 +1539,45 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| matches!(e, LayoutError::CapacityExceeded { .. })));
+    }
+
+    /// The capacity gate counts the tenant envelopes' backups
+    /// (`volume-format-v2.md` §1.3): a budget that fits every file but them
+    /// is refused, and one that fits them too is not. The gate is the
+    /// Layout's own sum over its entries, so the backups count because
+    /// they are entries; this pins that they are.
+    #[test]
+    fn the_capacity_gate_counts_the_tenant_envelope_backups() {
+        let (mut inputs, _src) = two_tenant_inputs("550e8400-e29b-41d4-a716-446655440000");
+        let probe = tempfile::tempdir().unwrap();
+        let layout = build(&inputs, probe.path()).unwrap().layout;
+        let bs = layout.block_size;
+        let total = layout.on_tape_bytes().unwrap();
+        let backups: u64 = layout
+            .entries
+            .iter()
+            .filter(|e| matches!(e.kind, ZoneKind::TenantEnvelopeBackup { .. }))
+            .map(|e| e.on_tape_bytes(bs).unwrap())
+            .sum();
+        assert!(backups > 0, "the fixture has tenant envelope backups");
+        let reserve = layout.budget.reserve_bytes;
+
+        inputs.usable_bytes = total - backups + reserve;
+        let session = tempfile::tempdir().unwrap();
+        let errs = build(&inputs, session.path())
+            .unwrap()
+            .validate(&ok_keys(&inputs), SliceCheck::Size)
+            .unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, LayoutError::CapacityExceeded { .. })));
+
+        inputs.usable_bytes = total + reserve;
+        let session = tempfile::tempdir().unwrap();
+        build(&inputs, session.path())
+            .unwrap()
+            .validate(&ok_keys(&inputs), SliceCheck::Size)
+            .expect("a budget that fits the backups too is enough");
     }
 
     #[test]

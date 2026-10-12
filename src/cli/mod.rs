@@ -110,6 +110,15 @@ pub enum Commands {
         /// receipts keep matching.
         #[arg(long, value_name = "KEY_OR_FILE", conflicts_with = "no_escrow")]
         escrow_public_key: Option<String>,
+        /// Adopt this existing age identity file (the SECRET) as the
+        /// operator's primary key instead of minting a pair, as `tenant add
+        /// --adopt-key` does for a tenant: stored byte for byte as
+        /// keys/<operator>-primary.age.key, mode 0600, and nothing is
+        /// minted. A path only, never a key on the command line. Refused
+        /// before anything is created when it is not one X25519 identity,
+        /// or when it is the secret of --escrow-public-key.
+        #[arg(long, value_name = "PATH")]
+        operator_key: Option<std::path::PathBuf>,
     },
 
     /// Manage tenants
@@ -384,6 +393,10 @@ pub enum BackendCommands {
 #[derive(Subcommand, Debug)]
 pub enum DbCommands {
     /// Back up the database, and optionally the private key directory
+    ///
+    /// Prints the size of the copy it wrote, and of the key files when it
+    /// copied them (`size_bytes` and `keys_bytes` in `--json`): the catalog
+    /// only grows, and the time a backup takes grows with it.
     Backup {
         /// The backup file to write. Its directory must already exist
         #[arg(long)]
@@ -420,6 +433,13 @@ pub enum DbCommands {
     /// is seen. Sizes are measured with SQLite's dbstat table when the build
     /// has it (the bundled build does) and estimated otherwise; the output
     /// says which (`size_method` in `--json`).
+    ///
+    /// Then each journal's growth over the trailing 90 days, fastest first:
+    /// the rows dated in the window, the bytes they take, and that pace over
+    /// a year (`journal_growth` in `--json`). The row count is exact; the
+    /// bytes are derived, the bytes in use on the table's pages shared among
+    /// its rows by stored length. A catalog younger than 90 days is paced
+    /// over its own age, from its oldest journal row.
     Stats,
 }
 

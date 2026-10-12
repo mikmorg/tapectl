@@ -3419,6 +3419,20 @@ fn check_backup_destination(dest: &Path, include_keys: bool) -> Result<()> {
     Ok(())
 }
 
+/// What a real `db backup` copied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupReport {
+    /// Where the private keys went — `None` without `--include-keys`, or
+    /// when there was no key directory to copy — so the caller can name it
+    /// (issue #350).
+    pub keys_dir: Option<std::path::PathBuf>,
+    /// The size of the database file written at `--to` (issue #310): what
+    /// grows with the never-pruned journals is the time this copy takes.
+    pub db_bytes: u64,
+    /// The summed size of the key files copied; 0 when none were.
+    pub keys_bytes: u64,
+}
+
 /// DB backup using SQLite backup API.
 ///
 /// `dry_run` (issue #247) is checked before EITHER `Connection::open` call
@@ -3429,16 +3443,15 @@ fn check_backup_destination(dest: &Path, include_keys: bool) -> Result<()> {
 /// first, dry run included, so a preview refuses exactly what a real run
 /// would.
 ///
-/// Returns the directory the private keys were copied to — `None` without
-/// `--include-keys`, or when there was no key directory to copy — so the
-/// caller can name it (issue #350). A dry run returns `None`.
+/// Returns what was copied ([`BackupReport`]); a dry run copies nothing
+/// and returns `None`.
 pub fn db_backup(
     paths: &TapectlPaths,
     dest: &str,
     include_keys: bool,
     dry_run: bool,
     json_output: bool,
-) -> Result<Option<std::path::PathBuf>> {
+) -> Result<Option<BackupReport>> {
     check_backup_destination(Path::new(dest), include_keys)?;
     let keys_backup = keys_backup_path(Path::new(dest));
 
@@ -3477,6 +3490,9 @@ pub fn db_backup(
     let mut dst_conn = rusqlite::Connection::open(dest)?;
 
     copy_database_in_one_step(&src_conn, &mut dst_conn)?;
+    // Closed before it is measured, so the size is the finished file's.
+    drop(dst_conn);
+    let db_bytes = fs::metadata(dest)?.len();
 
     // Issue #40: unconditionally copying every private key to an arbitrary
     // operator-chosen destination (USB stick, network share, cloud-synced
@@ -3487,9 +3503,10 @@ pub fn db_backup(
     // warning is the right call today, not deprecating the only key-export
     // path there is.
     let mut keys_copied_to = None;
+    let mut keys_bytes = 0;
     if include_keys {
         if paths.keys_dir.exists() {
-            copy_dir_all(&paths.keys_dir, &keys_backup)?;
+            keys_bytes = copy_dir_all(&paths.keys_dir, &keys_backup)?;
             warn!(
                 destination = %keys_backup.display(),
                 "private key material copied to backup destination — treat this location as secret"
@@ -3500,8 +3517,12 @@ pub fn db_backup(
         info!("--include-keys not set; private keys were not copied to this backup");
     }
 
-    info!(dest = dest, "database backup complete");
-    Ok(keys_copied_to)
+    info!(dest = dest, bytes = db_bytes, "database backup complete");
+    Ok(Some(BackupReport {
+        keys_dir: keys_copied_to,
+        db_bytes,
+        keys_bytes,
+    }))
 }
 
 /// DB import: restore a backup file over the live database.
@@ -3910,19 +3931,22 @@ pub struct FsckReport {
 /// source permissions). `secure_path` is best-effort — an operator-chosen
 /// backup destination can be a non-Unix filesystem (FAT/exFAT USB stick),
 /// and a chmod failing there must not sink an otherwise-good backup.
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+///
+/// Returns the summed size of the files copied (issue #310).
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<u64> {
     fs::create_dir_all(dst)?;
     crate::config::secure_path(dst, 0o700);
+    let mut bytes = 0;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let dest = dst.join(entry.file_name());
         if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &dest)?;
+            bytes += copy_dir_all(&entry.path(), &dest)?;
         } else {
-            fs::copy(entry.path(), &dest)?;
+            bytes += fs::copy(entry.path(), &dest)?;
         }
     }
-    Ok(())
+    Ok(bytes)
 }
 
 // ── Commands moved out of `main.rs` (issue #112) ──
@@ -8597,13 +8621,19 @@ mod tests {
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
 
-            let keys = db_backup(&paths, dest.to_str().unwrap(), false, false, false).unwrap();
+            let report = db_backup(&paths, dest.to_str().unwrap(), false, false, false)
+                .unwrap()
+                .expect("a real backup reports what it copied");
 
             assert!(dest.exists(), "the database copy itself must still happen");
             assert_eq!(
-                keys, None,
+                report.keys_dir, None,
                 "no keys directory to report without --include-keys"
             );
+            // #310: the size of what was copied is the file it wrote.
+            assert_eq!(report.db_bytes, fs::metadata(&dest).unwrap().len());
+            assert!(report.db_bytes > 0);
+            assert_eq!(report.keys_bytes, 0);
             let keys_backup = dest.with_extension("keys");
             assert!(
                 !keys_backup.exists(),
@@ -8617,15 +8647,25 @@ mod tests {
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
 
-            let reported = db_backup(&paths, dest.to_str().unwrap(), true, false, false).unwrap();
+            let report = db_backup(&paths, dest.to_str().unwrap(), true, false, false)
+                .unwrap()
+                .expect("a real backup reports what it copied");
 
             let keys_backup = dest.with_extension("keys");
             assert!(keys_backup.is_dir(), ".keys directory should be created");
             assert_eq!(
-                reported.as_deref(),
+                report.keys_dir.as_deref(),
                 Some(keys_backup.as_path()),
                 "db_backup must report the directory it copied the keys to (issue #350)"
             );
+            // #310: the keys' size is the sum of the files copied.
+            let on_disk: u64 = fs::read_dir(&keys_backup)
+                .unwrap()
+                .map(|e| e.unwrap().metadata().unwrap().len())
+                .sum();
+            assert!(on_disk > 0);
+            assert_eq!(report.keys_bytes, on_disk);
+            assert_eq!(report.db_bytes, fs::metadata(&dest).unwrap().len());
             assert_eq!(
                 mode_of(&keys_backup),
                 0o700,
@@ -8651,6 +8691,17 @@ mod tests {
             );
         }
 
+        /// A dry run copies nothing, so it has no size to report.
+        #[test]
+        fn a_dry_run_reports_no_copy() {
+            let (_tmp, paths) = temp_home_with_a_key();
+            let dest_tmp = TempDir::new().unwrap();
+            let dest = dest_tmp.path().join("backup.db");
+            let report = db_backup(&paths, dest.to_str().unwrap(), true, true, false).unwrap();
+            assert!(report.is_none());
+            assert!(!dest.exists());
+        }
+
         #[test]
         fn with_include_keys_but_no_keys_dir_present_does_not_error() {
             let tmp = TempDir::new().unwrap();
@@ -8664,14 +8715,16 @@ mod tests {
             let dest_tmp = TempDir::new().unwrap();
             let dest = dest_tmp.path().join("backup.db");
 
-            let reported = db_backup(&paths, dest.to_str().unwrap(), true, false, false)
-                .expect("a missing keys_dir must not turn --include-keys into an error");
+            let report = db_backup(&paths, dest.to_str().unwrap(), true, false, false)
+                .expect("a missing keys_dir must not turn --include-keys into an error")
+                .expect("a real backup reports what it copied");
 
             assert!(dest.exists());
             assert_eq!(
-                reported, None,
+                report.keys_dir, None,
                 "nothing was copied, so no directory to name"
             );
+            assert_eq!(report.keys_bytes, 0);
             assert!(!dest.with_extension("keys").exists());
         }
     }

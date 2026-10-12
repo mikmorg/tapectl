@@ -22,6 +22,8 @@ tapectl db [OPTIONS] <COMMAND>
 
 Back up the database, and optionally the private key directory
 
+Prints the size of the copy it wrote, and of the key files when it copied them (`size_bytes` and `keys_bytes` in `--json`): the catalog only grows, and the time a backup takes grows with it.
+
 ```text
 tapectl db backup [OPTIONS] --to <TO>
 ```
@@ -68,6 +70,8 @@ tapectl db import [OPTIONS] <PATH>
 Show database statistics, and what each table weighs
 
 The database's size, then every table's row count and size, largest first. The journals (`health_logs`, `verification_results`, `events`, the forensic journals) are never pruned, so this is how their growth is seen. Sizes are measured with SQLite's dbstat table when the build has it (the bundled build does) and estimated otherwise; the output says which (`size_method` in `--json`).
+
+Then each journal's growth over the trailing 90 days, fastest first: the rows dated in the window, the bytes they take, and that pace over a year (`journal_growth` in `--json`). The row count is exact; the bytes are derived, the bytes in use on the table's pages shared among its rows by stored length. A catalog younger than 90 days is paced over its own age, from its oldest journal row.
 
 ```text
 tapectl db stats [OPTIONS]

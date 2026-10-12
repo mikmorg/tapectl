@@ -279,6 +279,7 @@ fn run(
         ref operator,
         no_escrow,
         ref escrow_public_key,
+        ref operator_key,
     } = cli.command
     {
         return cmd_init(
@@ -286,6 +287,7 @@ fn run(
             operator.as_deref(),
             no_escrow,
             escrow_public_key.as_deref(),
+            operator_key.as_deref(),
             cli.json,
             cli.dry_run,
         );
@@ -670,6 +672,7 @@ fn cmd_init(
     operator_name: Option<&str>,
     no_escrow: bool,
     escrow_public_key_arg: Option<&str>,
+    operator_key: Option<&std::path::Path>,
     json_output: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
@@ -687,6 +690,19 @@ fn cmd_init(
         .transpose()
         .context("invalid --escrow-public-key")?;
 
+    // #424: the same for --operator-key, and its one cross-check, against the
+    // escrow key above — the escrow row does not exist yet when the operator
+    // tenant is created, so the catalog cannot catch it. A refused `init`
+    // leaves no home behind.
+    let adopted_operator_key = operator_key
+        .map(tapectl::crypto::keys::read_adoptable_identity)
+        .transpose()
+        .context("invalid --operator-key")?;
+    if let Some(ref identity) = adopted_operator_key {
+        tenant::refuse_escrow_secret(identity, adopted_escrow_public_key.as_deref())
+            .context("invalid --operator-key")?;
+    }
+
     // No side effect — reads only the CLI arg, $USER, the effective uid and
     // /etc/login.defs — so it is safe to compute ahead of the dry-run branch
     // below even though the real path does not need it until the tenant is
@@ -698,6 +714,20 @@ fn cmd_init(
         std::env::var("USER").ok().as_deref(),
         nix::unistd::geteuid().as_raw(),
         tenant::system_uid_min(),
+    )?;
+
+    // #424 review: a key file left in keys/ where the operator's key would be
+    // written is refused here, ahead of the dry-run branch and of every side
+    // effect, so the dry run refuses it too and a refused init leaves no
+    // catalog or config behind (the tenant code repeats the check later).
+    tenant::refuse_stray_key_files(
+        paths,
+        &op_name,
+        if adopted_operator_key.is_some() {
+            tenant::ADOPTED_ALIASES
+        } else {
+            tenant::MINTED_ALIASES
+        },
     )?;
 
     // Issue #247: `init` writes config, keys and the database — a dry run
@@ -714,12 +744,21 @@ fn cmd_init(
             "would mint a new escrow identity (its secret is shown once, at real init time)"
                 .to_string()
         };
+        let operator_key_desc = match (&adopted_operator_key, operator_key) {
+            (Some(identity), Some(path)) => format!(
+                "would adopt {} as \"{op_name}-primary\" ({}); nothing minted",
+                path.display(),
+                identity.public_key
+            ),
+            _ => "would mint a primary and a backup key pair".to_string(),
+        };
         if json_output {
             println!(
                 "{}",
                 serde_json::json!({
                     "home": paths.home.display().to_string(),
                     "operator": op_name,
+                    "operator_keys": operator_key_desc,
                     "config": paths.config_file.display().to_string(),
                     "database": paths.db_file.display().to_string(),
                     "staging": staging_dir.display().to_string(),
@@ -733,6 +772,7 @@ fn cmd_init(
                 paths.home.display()
             );
             println!("  operator: {op_name}");
+            println!("  keys:     {operator_key_desc}");
             println!("  database: {} (would be created)", paths.db_file.display());
             println!(
                 "  config:   {} (would be created)",
@@ -782,8 +822,21 @@ fn cmd_init(
     // Create database with schema
     let conn = db::open(&paths.db_file).context("failed to create database")?;
 
-    // Create operator tenant with keypairs
-    let tenant_id = tenant::add_tenant(&conn, paths, &op_name, Some("System operator"), true)?;
+    // Create operator tenant with keypairs: minted, or the one adopted
+    // (#424), checked again against the catalog (empty here) and against the
+    // escrow key about to be adopted.
+    let tenant_id = match adopted_operator_key {
+        Some(ref identity) => tenant::add_tenant_adopting(
+            &conn,
+            paths,
+            &op_name,
+            Some("System operator"),
+            true,
+            identity,
+            adopted_escrow_public_key.as_deref(),
+        )?,
+        None => tenant::add_tenant(&conn, paths, &op_name, Some("System operator"), true)?,
+    };
 
     // Create the permanent escrow recipient (ADR-0005) as part of first-run
     // setup (CTO decision 2026-09-10): `stage create` and `volume write` refuse
@@ -825,6 +878,7 @@ fn cmd_init(
                 "home": paths.home.display().to_string(),
                 "operator": op_name,
                 "operator_id": tenant_id,
+                "operator_key_adopted": adopted_operator_key.as_ref().map(|i| &i.public_key),
                 "dar_available": dar_ok,
                 "escrow_public_key": escrow_public_key,
             })
@@ -832,6 +886,12 @@ fn cmd_init(
     } else {
         println!("tapectl initialized at {}", paths.home.display());
         println!("  operator: {op_name}");
+        if let Some(identity) = &adopted_operator_key {
+            println!(
+                "  keys:     adopted \"{op_name}-primary\" ({}); no operator key was minted",
+                identity.public_key
+            );
+        }
         println!("  database: {}", paths.db_file.display());
         println!("  config:   {}", paths.config_file.display());
         match &escrow_public_key {
