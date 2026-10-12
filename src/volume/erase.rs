@@ -23,19 +23,24 @@
 //!    tapectl did not write, the chip serial): at a terminal, or as
 //!    `--confirm-label`, which must equal it. `--yes` never gives it
 //!    ([`crate::cli::consent::confirm_typed`]).
+//!    No erase runs without a chip serial read in step 1: nothing else
+//!    proves afterwards which cartridge was erased, or records it.
 //! 4. **Erase.** The drive is reopened read-write; File 0 is read again and
-//!    must be what step 1 read (the same tape is still loaded); then the
-//!    default short erase writes one filemark at the beginning of the tape,
-//!    or `--long` runs the st driver's long erase of the whole medium.
+//!    must be what step 1 read, and the chip read again must report step 1's
+//!    serial (the same tape is still loaded — File 0 alone cannot tell two
+//!    unreadable tapes apart); then the default short erase writes one
+//!    filemark at the beginning of the tape, or `--long` runs the st
+//!    driver's long erase of the whole medium.
 //! 5. **Verify.** Reopened read-only: File 0 must read back EMPTY (short) or
-//!    BLANK (long), and the chip serial, read again, must be unchanged.
+//!    BLANK (long), and the chip serial, read again, must be unchanged. Any
+//!    failure from here on is never exit 2: the tape has been written.
 //! 6. **Record**, only after a passing verify: the cartridge — registered by
 //!    its chip serial as `available` if the catalog did not know it, or, if
 //!    it did, its retired volumes marked `erased` and the cartridge returned
 //!    to `available` the way `cartridge mark-erased` does (a
 //!    `retired_permanent` cartridge keeps that status) — and one `erased`
 //!    event. The whole command is one `cartridge_contacts` row (`cartridge
-//!    erase`), with both chip reads journalled against it and one
+//!    erase`), with all three chip reads journalled against it and one
 //!    post-command health sweep.
 //!
 //! The exit table is [`crate::error::EXIT_ERASE_INCONCLUSIVE`]'s.
@@ -673,20 +678,40 @@ fn erase_in_contact(
 
     // ── 2. cross-check the catalog ──
     let checked = cross_check(conn, device, &mut report, serial)?;
+    // Without the chip serial nothing proves afterwards that the cartridge
+    // erased is the one identified, and nothing records it by serial (item
+    // 51), so no erase runs. A dry run still reports what the tape is, with
+    // no word to confirm it by.
+    let sg = &before.capture.device_sg;
+    if serial.is_none() {
+        report.confirm_label = None;
+        report.notes.push(format!(
+            "the chip serial could not be read (the MAM read on {sg} failed): \
+             `cartridge erase` refuses without it"
+        ));
+    }
     if opts.dry_run {
         report.outcome = EraseOutcome::WouldErase;
         return Ok(report);
     }
-
-    // ── 3. consent: the word read from the tape, typed ──
-    let Some(word) = report.confirm_label.clone() else {
+    let Some(serial) = serial else {
         return Err(TapectlError::Other(format!(
-            "cartridge erase refused: the tape in {device} carries no File 0 label and the \
-             drive reports no chip serial, so there is nothing to confirm this erase with, \
-             and nothing to prove afterwards that the cartridge erased is the one loaded. \
-             Nothing was written."
+            "cartridge erase refused: the chip serial of the cartridge in {device} could not \
+             be read (the MAM read on device_sg {sg} failed: sg permissions, sg3-utils not \
+             installed, or a device_sg that is not this drive's). Without it nothing proves \
+             after the erase that the cartridge erased is the one identified, and nothing \
+             records it by serial. `tapectl volume identify --device {device}` shows what \
+             the chip reports; `tapectl config check` checks the drive's device_sg. Nothing \
+             was written."
         )));
     };
+
+    // ── 3. consent: the word read from the tape, typed ──
+    // File 0's label, else the chip serial — always one, the serial now read.
+    let word = report
+        .confirm_label
+        .clone()
+        .unwrap_or_else(|| serial.to_string());
     let action = format!(
         "{} ERASE the tape in {device} ({})",
         opts.mode.as_str(),
@@ -705,6 +730,27 @@ fn erase_in_contact(
              written. Run the command again to identify what is loaded now."
         )));
     }
+    // ... and so is its chip. File 0 alone cannot show a swap between two
+    // tapes it cannot read (or two too large to read whole): both compare
+    // equal. The drive is held open read-write from here to the erase.
+    let at_erase = chip();
+    guard.journal_mam(
+        Operation::CartridgeErase,
+        Hook::CartridgeEraseRecheck,
+        &at_erase.capture,
+    );
+    if at_erase.mam.serial.as_deref() != Some(serial) {
+        return Err(TapectlError::Other(format!(
+            "cartridge erase refused: the chip in {device} reported serial {serial} when the \
+             tape was identified, and {} now, just before the erase — the cartridge loaded \
+             may not be the one identified and consented to. Nothing was written. Run the \
+             command again to identify what is loaded now.",
+            match at_erase.mam.serial.as_deref() {
+                Some(s) => format!("serial {s}"),
+                None => "no serial (the chip could not be read)".to_string(),
+            }
+        )));
+    }
     let erased = crate::progress::waited(
         || format!("{} erase of the tape in {device}", opts.mode.as_str()),
         || store.erase(opts.mode),
@@ -719,7 +765,16 @@ fn erase_in_contact(
     drop(store);
 
     // ── 5. verify: File 0 blank, the chip unchanged ──
-    let mut store = TapeStore::open_read(device, opts.block_size)?;
+    // The tape has been written from here on: no failure may be read as
+    // exit 2's "the tape untouched".
+    let mut store = TapeStore::open_read(device, opts.block_size).map_err(|e| {
+        TapectlError::EraseInconclusive(format!(
+            "cartridge erase: the tape in {device} was erased ({}), but reopening it to read \
+             it back failed: {e}. The erase is unverified and nothing was recorded. Check the \
+             drive, then run `tapectl cartridge erase` again.",
+            opts.mode.as_str()
+        ))
+    })?;
     let (after, _) =
         session::contact_report(&mut store, NO_EXPECTED_IDENTITY, NO_EXPECTED_IDENTITY, None);
     drop(store);
@@ -742,7 +797,7 @@ fn erase_in_contact(
         device,
         opts.mode,
         &after,
-        serial,
+        Some(serial),
         after_det.mam.serial.as_deref(),
     )?;
 
@@ -760,7 +815,7 @@ fn erase_in_contact(
     let r = record(
         conn,
         &checked,
-        serial,
+        Some(serial),
         before,
         drive_gen,
         &details,
@@ -1163,7 +1218,7 @@ mod tests {
     /// confirmed by the label File 0 carries, short-erased, read back EMPTY
     /// with the chip unchanged, and recorded: the cartridge registered by
     /// its serial as available, one `erased` event, one `cartridge erase`
-    /// contact naming it, both chip reads journalled against it.
+    /// contact naming it, all three chip reads journalled against it.
     #[test]
     fn an_unknown_sealed_tape_is_identified_erased_verified_and_recorded() {
         let conn = crate::db::open_memory().unwrap();
@@ -1239,14 +1294,21 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<_, _>>()
             .unwrap();
-        assert_eq!(hooks, vec!["cartridge_erase", "cartridge_erase_verify"]);
+        assert_eq!(
+            hooks,
+            vec![
+                "cartridge_erase",
+                "cartridge_erase_recheck",
+                "cartridge_erase_verify"
+            ]
+        );
         assert_eq!(
             count(
                 &conn,
                 "SELECT COUNT(*) FROM mam_journal WHERE contact_id IS NULL"
             ),
             0,
-            "both reads name the contact"
+            "every read names the contact"
         );
     }
 
@@ -1585,11 +1647,13 @@ mod tests {
             &conn,
             &fake,
             opts(EraseMode::Short, Some("L6-0001"), false),
-            &[Some(SERIAL), Some("SOMEONEELSE")],
+            // Before, at the erase, and after it: the third read differs.
+            &[Some(SERIAL), Some(SERIAL), Some("SOMEONEELSE")],
         )
         .unwrap_err();
         assert!(err.to_string().contains("SOMEONEELSE"), "{err}");
         assert_eq!(exit_code(err), 6);
+        assert_eq!(writes(&fake), vec![Op::Write(0)], "the erase did run");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM cartridges"), 0);
     }
 
@@ -1603,10 +1667,11 @@ mod tests {
             &conn,
             &fake,
             opts(EraseMode::Short, Some("L6-0001"), false),
-            &[Some(SERIAL), None],
+            &[Some(SERIAL), Some(SERIAL), None],
         )
         .unwrap_err();
         assert_eq!(exit_code(err), 3);
+        assert_eq!(writes(&fake), vec![Op::Write(0)], "the erase did run");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM cartridges"), 0);
     }
 
@@ -1650,15 +1715,128 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM cartridges"), 0);
     }
 
-    /// No File 0 label and no chip serial: nothing to confirm with, refused.
+    /// No File 0 label and no chip serial: refused, untouched.
     #[test]
     fn no_label_and_no_serial_refuses() {
         let conn = crate::db::open_memory().unwrap();
         let fake = FakeTape::with_files(vec![pad(b"foreign".to_vec())], BS);
         let err = run(&conn, &fake, opts(EraseMode::Short, None, false), &[None]).unwrap_err();
-        assert!(err.to_string().contains("nothing to confirm"), "{err}");
+        assert!(err.to_string().contains("chip serial"), "{err}");
         assert_eq!(exit_code(err), 2);
         assert!(writes(&fake).is_empty());
+    }
+
+    /// The chip unreadable BEFORE the erase (sg permissions, no sg3-utils, a
+    /// wrong device_sg), on a tape whose File 0 label would otherwise give
+    /// consent: nothing could prove afterwards that the cartridge erased is
+    /// the one identified, nor record it by serial (item 51). Refused before
+    /// consent, exit 2, the drive never opened read-write. A dry run still
+    /// identifies the tape, but offers no word to confirm with and says why.
+    #[test]
+    fn a_chip_unreadable_before_the_erase_refuses_untouched() {
+        let conn = crate::db::open_memory().unwrap();
+        let fake = sealed_tape("L6-0001");
+        let before = fake.state().files.clone();
+        let err = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, Some("L6-0001"), false),
+            &[None],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("chip serial"), "{msg}");
+        assert!(msg.contains("tapectl volume identify"), "{msg}");
+        assert!(msg.contains("Nothing was written"), "{msg}");
+        assert_eq!(exit_code(err), 2);
+        assert!(writes(&fake).is_empty());
+        assert_eq!(fake.state().files, before);
+        assert_eq!(fake.opens(), vec![OpenMode::ReadOnly]);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM cartridges"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM events"), 0);
+
+        let report = run(&conn, &fake, opts(EraseMode::Short, None, true), &[None])
+            .expect("a dry run still identifies");
+        assert_eq!(report.outcome, EraseOutcome::WouldErase);
+        assert_eq!(report.confirm_label, None, "no word will be accepted");
+        assert!(
+            report.notes.iter().any(|n| n.contains("chip serial")),
+            "{:?}",
+            report.notes
+        );
+        assert!(writes(&fake).is_empty());
+    }
+
+    /// A cartridge swapped while consent was being asked, from one tape
+    /// whose File 0 cannot be read to another (any two of those read the
+    /// same, so the File 0 recheck cannot tell them apart): the chip, read
+    /// again with the drive open read-write, names another cartridge.
+    /// Refused before the erase — exit 2, nothing written — and the read is
+    /// journalled against the contact.
+    #[test]
+    fn a_cartridge_swapped_before_the_erase_is_refused_untouched() {
+        let conn = crate::db::open_memory().unwrap();
+        let fake = FakeTape::with_files(vec![pad(vec![1u8; 10]), pad(vec![2u8; 10])], BS);
+        fake.state().unreadable = vec![0];
+        let before = fake.state().files.clone();
+        let err = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, Some(SERIAL), false),
+            &[Some(SERIAL), Some("OTHERTAPE")],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("OTHERTAPE"), "{msg}");
+        assert!(msg.contains("Nothing was written"), "{msg}");
+        assert_eq!(exit_code(err), 2);
+        assert!(writes(&fake).is_empty(), "{:?}", fake.ops());
+        assert_eq!(fake.state().files, before);
+        assert_eq!(fake.opens(), vec![OpenMode::ReadOnly, OpenMode::ReadWrite]);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM cartridges"), 0);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM mam_journal
+                 WHERE hook = 'cartridge_erase_recheck' AND contact_id IS NOT NULL"
+            ),
+            1
+        );
+
+        // ... and a chip that cannot be read at that point refuses too.
+        let err = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, Some(SERIAL), false),
+            &[Some(SERIAL), None],
+        )
+        .unwrap_err();
+        assert_eq!(exit_code(err), 2);
+        assert!(writes(&fake).is_empty());
+    }
+
+    /// The tape is written, then the read-only reopen for the read-back
+    /// fails (a drive or transport error): exit 3, saying the tape WAS
+    /// erased — never 2, whose meaning is "the tape untouched".
+    #[test]
+    fn a_verify_reopen_that_fails_after_the_erase_is_inconclusive() {
+        let conn = crate::db::open_memory().unwrap();
+        let fake = sealed_tape("L6-0001");
+        fake.state().fail_opens = vec![3];
+        let err = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, Some("L6-0001"), false),
+            &[Some(SERIAL)],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("was erased"), "{msg}");
+        assert!(msg.contains("nothing was recorded"), "{msg}");
+        assert_eq!(exit_code(err), 3);
+        assert_eq!(writes(&fake), vec![Op::Write(0)], "the erase did run");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM cartridges"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM events"), 0);
     }
 
     /// The registration step's collision is found BEFORE the erase: a row

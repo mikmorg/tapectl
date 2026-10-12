@@ -90,10 +90,12 @@ pub const EXIT_WRITE_MEDIUM_BAD: i32 = 6;
 /// - 2 refused, the medium untouched ([`EXIT_ERROR`]): no cartridge, a
 ///   write-protected one, a live copy the catalog still counts, a label that
 ///   was not confirmed, a contradiction between the tape and the catalog,
-///   or a usage error;
+///   the chip serial unreadable before the erase, a chip naming another
+///   cartridge just before it, or a usage error;
 /// - 3 the erase ran and its read-back reached no verdict
-///   ([`EXIT_ERASE_INCONCLUSIVE`]) — File 0 unreadable and not provably
-///   blank, or the chip unreadable after it; nothing was recorded;
+///   ([`EXIT_ERASE_INCONCLUSIVE`]) — the tape could not be reopened for it,
+///   File 0 unreadable and not provably blank, or the chip unreadable after
+///   it; nothing was recorded;
 /// - 4 the erase itself failed part-way ([`EXIT_ERASE_INCOMPLETE`]): the
 ///   tape may be partly erased — run the command again;
 /// - 6 the read-back contradicts the erase ([`EXIT_ERASE_VERIFY_FAILED`]):

@@ -116,6 +116,10 @@ pub(crate) struct State {
     /// A long erase that fails part-way, as st fails one on a medium error:
     /// the command returns EIO with the medium partly erased.
     pub erase_fails: bool,
+    /// The opens, counted from 1 in the order they are asked for, that fail
+    /// as a drive or transport error fails one (EIO) — how a test reaches
+    /// the reopen after a write has already happened.
+    pub fail_opens: Vec<usize>,
 }
 
 impl State {
@@ -296,6 +300,9 @@ impl FakeTape {
     pub(crate) fn open_as(&self, mode: OpenMode) -> Result<()> {
         let mut s = self.state();
         s.opens.push(mode);
+        if s.fail_opens.contains(&s.opens.len()) {
+            return Err(io_error("open fake tape"));
+        }
         if mode == OpenMode::ReadWrite && s.write_protected {
             return Err(TapectlError::TapeIo(
                 "open fake tape: Read-only file system (os error 30)".to_string(),

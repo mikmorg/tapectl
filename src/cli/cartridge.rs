@@ -118,10 +118,15 @@ pub enum CartridgeCommands {
     ///    A volume the catalog still holds — anything not `retired` or
     ///    `erased`, a live copy above all — is refused, naming `volume
     ///    retire`, the only way to give one up. `--dry-run` stops here.
-    /// 3. Asks for the label just read from File 0 to be typed (for a tape
-    ///    tapectl did not write: its chip serial). Unattended,
-    ///    `--confirm-label` must equal it. `--yes` never gives this consent.
-    /// 4. Erases: by default SHORT — one filemark at the beginning of the
+    /// 3. Refuses if the chip serial could not be read (the MAM read on the
+    ///    drive's `device_sg` failed): nothing else proves afterwards which
+    ///    cartridge was erased. Otherwise asks for the label just read from
+    ///    File 0 to be typed (for a tape tapectl did not write: its chip
+    ///    serial). Unattended, `--confirm-label` must equal it. `--yes`
+    ///    never gives this consent.
+    /// 4. Reads the chip again, the drive open read-write: a different
+    ///    serial (a cartridge swapped while consent was asked) is refused.
+    ///    Then erases: by default SHORT — one filemark at the beginning of the
     ///    tape, seconds; File 0 then reads EMPTY and nothing past it can be
     ///    read. `--long` erases the whole medium (hours on LTO). Never
     ///    degauss or bulk-erase an LTO cartridge: that destroys its factory
@@ -139,8 +144,10 @@ pub enum CartridgeCommands {
     /// tape is blank and init needs nothing.
     ///
     /// Exit status: 0 = erased and verified (also: nothing to erase, and
-    /// `--dry-run`). 2 = refused, the tape untouched (or a usage error).
-    /// 3 = erased, but the read-back reached no verdict; nothing recorded —
+    /// `--dry-run`). 2 = refused, the tape untouched (among others: the chip
+    /// serial unreadable; or a usage error). 3 = erased, but the read-back
+    /// reached no verdict (or the tape could not be reopened for it);
+    /// nothing recorded —
     /// run it again. 4 = the erase failed part-way; nothing recorded — run it
     /// again. 6 = the read-back contradicts the erase (File 0 still holds
     /// data, or the chip serial changed); nothing recorded. 75 = the catalog
@@ -1104,7 +1111,7 @@ fn cartridge_erase_command(
                     .chip_serial_after
                     .as_deref()
                     .map(|s| format!("{s} (unchanged)"))
-                    .unwrap_or_else(|| "none reported, before or after".to_string())
+                    .unwrap_or_else(|| "(none reported)".to_string())
             );
             if let Some(r) = &report.recorded {
                 if let Some(c) = &r.cartridge {

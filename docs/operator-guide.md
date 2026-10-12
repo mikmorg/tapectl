@@ -2389,8 +2389,12 @@ hands. In order, it:
    is enforced. `--dry-run` stops here and prints the label to confirm with.
 3. **asks for the label** it just read from File 0 to be typed (for a tape
    tapectl did not write, its chip serial). Unattended, `--confirm-label`
-   gives it and must match. `--yes` never does.
-4. **erases**: by default a filemark at the start of the tape, in seconds;
+   gives it and must match. `--yes` never does. If the chip serial could not
+   be read (the MAM read on the drive's `device_sg` failed), it refuses here
+   instead: nothing else proves afterwards which cartridge was erased.
+4. **erases**, once the chip, read again with the drive held open, still
+   reports the same serial (a cartridge swapped while you were asked is
+   refused, untouched): by default a filemark at the start of the tape, in seconds;
    File 0 then reads EMPTY and nothing past it can be read. `--long` erases
    the whole medium, which takes hours on LTO.
 5. **reads it back**: File 0 must be EMPTY (or blank, after `--long`) and the

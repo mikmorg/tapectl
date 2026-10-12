@@ -1424,7 +1424,7 @@ EOF
       fi
       ERASE_WORD="$(sed -n 's/.*confirm with: --confirm-label \([^ ]*\)$/\1/p' "$EOUT" | head -1)"
       if [ -z "$ERASE_WORD" ] || [ "$ERASE_WORD" = "(none:" ]; then
-        die "cartridge erase found no label and no chip serial to confirm with (above); nothing was erased. Load a different cartridge, then re-run scripts/first-run.sh --from 13"
+        die "cartridge erase cannot erase this tape: the chip serial could not be read (its note above), and without it nothing proves which cartridge was erased; nothing was erased. Check the drive's device_sg with \`tapectl config check\` and what the chip reports with \`tapectl volume identify --device $DEVICE\`, then re-run scripts/first-run.sh --from 13"
       fi
       if [ "$AUTO" = 1 ]; then
         # A default is never consent to erase: under --auto the label must be
