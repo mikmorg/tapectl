@@ -4,10 +4,10 @@
 //! files, hundreds of DB rows, dar + age encryption) and are too slow to
 //! run on every `cargo test` invocation. No tape hardware is required.
 //!
-//! Scenarios are intentionally scaled to a dev VM (≈100 GiB /scratch, no
-//! real drive). Production-scale numbers (2+ TB units, 100K+ files) need
-//! real LTO hardware and are covered by `docs/lto6-validation-checklist.md`
-//! when that lands.
+//! Scenarios are scaled to a dev VM (≈100 GiB /scratch, no real drive): a
+//! 100k-file unit and a 2 GiB write through a `MemStore` (issue #416) are as
+//! large as they go; terabyte units need real LTO hardware
+//! (`docs/lto6-validation-checklist.md`).
 //!
 //! Run locally with:
 //!   TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- --nocapture
@@ -743,9 +743,27 @@ fn reset_peak_rss() {
 /// What one `n`-file unit cost to snapshot and stage: statements and time
 /// for each step, and the peak resident set across both.
 struct UnitCost {
+    /// Everything the walk records: the files, the directories they sit
+    /// in, and the unit's own dotfile.
+    entries: u64,
     snapshot: (u64, Duration),
     stage: (u64, Duration),
     peak_kib: u64,
+}
+
+/// Files and directories under `dir`, not counting `dir`.
+fn entries_under(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            1 + if e.file_type().unwrap().is_dir() {
+                entries_under(&e.path())
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 fn unit_of_files(n: usize) -> UnitCost {
@@ -778,6 +796,7 @@ fn unit_of_files(n: usize) -> UnitCost {
         staging::stage_create(&h.conn, &h.paths, &h.config, sid, true).unwrap();
     });
     let cost = UnitCost {
+        entries: entries_under(&dir),
         snapshot: (snap_stmts, snap_time),
         stage: (stage_stmts, stage_time),
         peak_kib: peak_rss_kib(),
@@ -801,7 +820,8 @@ fn unit_of_files(n: usize) -> UnitCost {
 
 /// Issue #416 item 11: a 100,000-file unit, snapshotted and staged, against
 /// the same unit at a tenth of the size. Each step runs a bounded number of
-/// statements beyond one per file (an N+1 shows as 2N), scales linearly in
+/// statements beyond one per entry the walk records, files and directories
+/// alike (an N+1 shows as 2N), scales linearly in
 /// time (a superlinear step, such as #413's, shows as ~100x for 10x the
 /// files), and the process stays under 512 MiB resident: the walk and the
 /// manifest stream, they do not hold the unit in memory. dar runs in its
@@ -825,8 +845,10 @@ fn perf_a_100k_file_unit_scales_linearly() {
         ("stage_create", large.stage),
     ] {
         assert!(
-            stmts <= n as u64 + 50,
-            "{step} of a {n}-file unit ran {stmts} statements, over N + 50"
+            stmts <= large.entries + 50,
+            "{step} of a {n}-file unit ran {stmts} statements, over N + 50 \
+             (N = {} entries)",
+            large.entries
         );
     }
     // Ten times the files may cost up to twenty times the time: a linear
@@ -854,10 +876,13 @@ fn perf_a_100k_file_unit_scales_linearly() {
 /// session into a `MemStore`, timed against this machine's own sha256 speed
 /// rather than a wall-clock ceiling. The write hashes every byte once on the
 /// way to the store and the confirm once more on the way back
-/// (`tests/pass_budget.rs` pins those counts), so the floor is two hash
-/// passes; the ceiling allows three times that, for the reads, the copies
-/// and the queues between them. A pipeline that stopped overlapping, or a
-/// pass added, shows as a ratio, on a fast machine or a loaded one.
+/// (`tests/pass_budget.rs` pins those counts): two hash passes, which the
+/// calibration times on one 256 MiB buffer. The ceiling allows three times
+/// that, for the reads, the copies and the queues between them. A pipeline
+/// that stopped overlapping, or a pass added, shows as a ratio, on a fast
+/// machine or a loaded one. Measured 2026-10-12 on vm-desk1, release:
+/// 0.82x (the write's hash overlaps its reads, and one calibration run on a
+/// shared VM is noisy, so under 1.0 is normal).
 #[test]
 #[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
 fn perf_a_2gib_write_and_full_confirm_through_a_store() {

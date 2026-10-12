@@ -297,7 +297,7 @@ TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
 TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
     cargo test --test mhvtl_motions -- --ignored --nocapture
 
-# Performance scenarios (thousands of files, large archives); ~2 min. This is the one
+# Performance scenarios (100k-file unit, 2 GiB write, 184k-file rebuild); ~3 min. The one
 # case a release build is expected.
 TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
     --ignored --nocapture --test-threads=1
