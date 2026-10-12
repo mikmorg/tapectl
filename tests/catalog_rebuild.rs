@@ -78,11 +78,15 @@ const UNITS: &[(&str, &str, &[u8])] = &[
 enum CatalogDb {
     /// None at all — a tape written before #83.
     None,
-    /// The pre-2026-09-11 shape: no `tenants`, no `key_fingerprints`, no
-    /// `sha256_plain`. Derived from the REAL generator's output by dropping
-    /// those, not hand-rolled, so it cannot drift from what old tapes hold.
+    /// Generation 1, the pre-2026-09-11 shape: `files` with no file kinds,
+    /// and no `tenants`, no `key_fingerprints`, no `sha256_plain`. Derived
+    /// from the REAL generator's output (`ontape_catalog::fixture::downgrade`),
+    /// not hand-rolled, so it cannot drift from what old tapes hold.
     Old,
-    /// What `build_catalog_snapshot` writes today.
+    /// Generation 2, 2026-09-11 until 1.1.0: generation 1 plus ownership and
+    /// receipts, still `files` with no file kinds. Derived the same way.
+    Gen2,
+    /// Generation 3, what `build_catalog_snapshot` writes today (1.1.0 on).
     New,
 }
 
@@ -140,6 +144,36 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
     } else {
         CatalogDb::None
     })
+}
+
+thread_local! {
+    /// When set, the first unit's version also holds a symlink and a special
+    /// file ([`link_and_special`]), as the walk records them.
+    static WITH_LINK_AND_SPECIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A symlink and a FIFO in `unit_name`, as the walk records them: the kind,
+/// lstat's size, no hash, and the symlink's target.
+fn link_and_special(unit_name: &str) -> Vec<db::files::FileEntry> {
+    use db::files::{FileEntry, FileKind};
+    vec![
+        FileEntry {
+            path: format!("{unit_name}/latest"),
+            kind: FileKind::Symlink,
+            size_bytes: 9,
+            mtime_ns: Some(1_788_264_000_000_000_000),
+            sha256: None,
+            link_target: Some("file0.bin".into()),
+        },
+        FileEntry {
+            path: format!("{unit_name}/pipe"),
+            kind: FileKind::Special,
+            size_bytes: 0,
+            mtime_ns: Some(1_788_264_000_000_000_000),
+            sha256: None,
+            link_target: None,
+        },
+    ]
 }
 
 thread_local! {
@@ -311,6 +345,11 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
                 Some(&sha256_hex(format!("{unit_name}-{n}").as_bytes())),
             );
         }
+        if i == 0 && WITH_LINK_AND_SPECIAL.with(|w| w.get()) {
+            for entry in link_and_special(unit_name) {
+                db::files::fixture::insert_entry(&conn, snapshot_id, entry);
+            }
+        }
 
         conn.execute(
             "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 10485760)",
@@ -402,17 +441,19 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
     let catalog_dir = tempfile::tempdir().unwrap();
     let catalog_db_path = match catalog_db {
         CatalogDb::None => None,
-        CatalogDb::New | CatalogDb::Old => {
+        CatalogDb::New | CatalogDb::Gen2 | CatalogDb::Old => {
             let p = catalog_dir.path().join("catalog.db");
             db::catalog_snapshot::build_catalog_snapshot(&conn, &stage_set_ids, &p).unwrap();
-            if catalog_db == CatalogDb::Old {
-                let c = rusqlite::Connection::open(&p).unwrap();
-                c.execute_batch(
-                    "DROP TABLE tenants;
-                     ALTER TABLE stage_sets DROP COLUMN key_fingerprints;
-                     ALTER TABLE stage_slices DROP COLUMN sha256_plain;",
-                )
-                .unwrap();
+            match catalog_db {
+                CatalogDb::Old => db::ontape_catalog::fixture::downgrade(
+                    &p,
+                    db::ontape_catalog::Generation::Original,
+                ),
+                CatalogDb::Gen2 => db::ontape_catalog::fixture::downgrade(
+                    &p,
+                    db::ontape_catalog::Generation::WithOwnershipAndReceipts,
+                ),
+                CatalogDb::New | CatalogDb::None => {}
             }
             if let Some(sql) = CATALOG_DB_EDIT.with(|e| e.borrow_mut().take()) {
                 rusqlite::Connection::open(&p)
@@ -1340,15 +1381,73 @@ fn the_file_index_comes_back_from_the_operator_catalog_db() {
     assert_eq!(source, format!("/src/{}", UNITS[0].0));
 }
 
+/// ADR-0012 2026-10-12 item 48 (#381's on-tape half): a catalog rebuilt
+/// from a 1.1.0 tape (generation 3 `catalog.db`) keeps each entry's kind
+/// and link target, so a symlink and a FIFO come back as what the walk
+/// recorded, not as regular files with data. The same version on a
+/// generation-2 tape comes back as regular files: that shape records only
+/// `is_directory`, the documented limit for tapes written before 1.1.0.
+#[test]
+fn a_rebuilt_catalog_keeps_each_kind_and_link_target() {
+    use db::files::FileKind;
+    let unit = UNITS[0].0;
+    for generation in [CatalogDb::New, CatalogDb::Gen2] {
+        WITH_LINK_AND_SPECIAL.with(|w| w.set(true));
+        let mut vol = build_sealed_volume_with(generation);
+        WITH_LINK_AND_SPECIAL.with(|w| w.set(false));
+        let dir = tempfile::tempdir().unwrap();
+        let conn = fresh_db(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let secret = vol.operator_secret.clone();
+        let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+        assert_eq!(report.files, UNITS.len() * 2 + 2, "every row came back");
+
+        let rows: Vec<(String, FileKind, Option<String>, bool)> = conn
+            .prepare(
+                "SELECT p.path, fv.kind, fv.link_target, fv.sha256 IS NOT NULL
+                 FROM file_versions fv JOIN paths p ON p.id = fv.path_id
+                 WHERE p.path LIKE ?1 || '/%' ORDER BY p.path",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![unit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let (link_kind, link_target, pipe_kind) = if generation == CatalogDb::New {
+            (
+                FileKind::Symlink,
+                Some("file0.bin".to_string()),
+                FileKind::Special,
+            )
+        } else {
+            (FileKind::Regular, None, FileKind::Regular)
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (format!("{unit}/file0.bin"), FileKind::Regular, None, true),
+                (format!("{unit}/file1.bin"), FileKind::Regular, None, true),
+                (format!("{unit}/latest"), link_kind, link_target, false),
+                (format!("{unit}/pipe"), pipe_kind, None, false),
+            ],
+            "catalog.db generation {}",
+            generation as u8
+        );
+    }
+}
+
 /// Issue #381: a rebuilt version re-staged from source content-validates its
 /// regular files. Rebuild used to leave `files.file_type` NULL, and staging
 /// validates only `file_type = 'regular'`, so it planned zero files: the
 /// size check and the sha256 baseline from the tape were both skipped and
-/// the stage went ahead on whatever the source held. Both `catalog.db`
-/// generations carry `is_directory` only, so both are covered.
+/// the stage went ahead on whatever the source held. Generations 1 and 2 of
+/// `catalog.db` carry `is_directory` only and generation 3 the kind itself,
+/// so all three are covered.
 #[test]
 fn a_rebuilt_version_restaged_from_source_validates_its_regular_files() {
-    for generation in [CatalogDb::Old, CatalogDb::New] {
+    for generation in [CatalogDb::Old, CatalogDb::Gen2, CatalogDb::New] {
         let mut vol = build_sealed_volume_with(generation);
         let dir = tempfile::tempdir().unwrap();
         let conn = fresh_db(dir.path());

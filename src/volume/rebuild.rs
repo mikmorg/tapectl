@@ -18,9 +18,10 @@
 //! | per-file index, `source_path`, sizes | operator envelope's `catalog.db` (#83), via `db::ontape_catalog` | no manifest carries files |
 //!
 //! `db::ontape_catalog::Generation` is how an old tape's `catalog.db` (no
-//! `tenants`, no `key_fingerprints`, no `sha256_plain`) is told apart from a
-//! current one — probed from the file's actual shape, never from a version
-//! number (see that module's doc for why).
+//! `tenants`, no `key_fingerprints`, no `sha256_plain`; or, before 1.1.0, no
+//! file kinds or link targets) is told apart from a current one — probed
+//! from the file's actual shape, never from a version number (see that
+//! module's doc for why, and `volume-format-v2.md` §1.4).
 //!
 //! # What it deliberately does not do
 //!
@@ -56,7 +57,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::files as files_db;
-use crate::db::ontape_catalog::{self, Generation};
+use crate::db::ontape_catalog;
 use crate::error::{Result, TapectlError};
 use crate::store::{Store, TapeStore};
 use crate::volume::envelope::{self, EnvelopeManifest, OpenError, OpenedEnvelope};
@@ -982,13 +983,13 @@ struct Supplement {
     snapshots: HashMap<(String, i64), SnapshotFacts>,
     /// unit name -> slice_size for the stage set.
     slice_size: HashMap<String, i64>,
-    /// (unit name, version) -> that snapshot's id in `db` and the span of
-    /// `files.id` its rows occupy (`ontape_catalog::file_id_spans`), which
-    /// `ensure_files` streams one version at a time (issue #413). A version
-    /// with no rows on tape has no entry.
-    file_snapshot: HashMap<(String, i64), (i64, (i64, i64))>,
-    /// The open `catalog.db`, when the tape carries one.
-    db: Option<Connection>,
+    /// (unit name, version) -> that snapshot's id in `db`, whose file rows
+    /// `ensure_files` streams one version at a time through `file_spans`
+    /// (issue #413). A version with no rows on tape has no entry.
+    file_snapshot: HashMap<(String, i64), i64>,
+    /// The open `catalog.db`, when the tape carries one, and where each
+    /// version's file rows lie in it, whatever its generation.
+    db: Option<(Connection, ontape_catalog::FileSpans)>,
     /// unit name -> owning tenant name, when `catalog.db` carries `tenants`.
     tenant_of: HashMap<String, String>,
     /// unit name -> recorded recipient list JSON, when `catalog.db` carries
@@ -1073,14 +1074,15 @@ impl Supplement {
         }
 
         // Only where each version's rows lie: `ensure_files` streams them.
-        let spans = ontape_catalog::file_id_spans(&db)?;
+        let spans = ontape_catalog::FileSpans::read(&db, cat.generation)?;
         out.file_snapshot = snapshot_key
             .into_iter()
-            .filter_map(|(id, key)| spans.get(&id).map(|span| (key, (id, *span))))
+            .filter(|(id, _)| spans.contains(*id))
+            .map(|(id, key)| (key, id))
             .collect();
-        out.db = Some(db);
+        out.db = Some((db, spans));
 
-        out.has_tenants = cat.generation == Generation::WithOwnershipAndReceipts;
+        out.has_tenants = cat.generation.carries_ownership_and_receipts();
         if out.has_tenants {
             for u in &cat.units {
                 if let (Some(uname), Some(tname)) =
@@ -1656,7 +1658,7 @@ fn ensure_files(
     supplement: &Supplement,
     report: &mut RebuildReport,
 ) -> Result<()> {
-    let (Some(db), Some(&(ontape_snapshot, (first_id, last_id)))) = (
+    let (Some((db, spans)), Some(&ontape_snapshot)) = (
         supplement.db.as_ref(),
         supplement
             .file_snapshot
@@ -1664,70 +1666,33 @@ fn ensure_files(
     ) else {
         return Ok(());
     };
-    // The on-tape shape (path, hex sha256, RFC 3339 mtime, is_directory) is
-    // mapped into the catalog's (migration 030). A value that would not come
-    // back as the same text is refused, naming the row: a rebuild does not
-    // guess. One exception: a `modified_at` in the walk's own spelling but
-    // dated before 1677-09-21 or after 2262-04-11, which no nanosecond count
-    // holds, comes back as no mtime — what today's walk records for that
-    // same file — rather than failing the rebuild of a tape that cannot be
-    // corrected. (Migration 030 does the same to that value in a catalog,
-    // with a warning naming the row: ADR-0012 amendment 2026-10-07 item 9.)
+    // `db::ontape_catalog` maps every generation's rows into the catalog's
+    // own shape (migration 030), refusing, by row, a value it would have to
+    // guess at; its `FileSpans::stream` doc lists what it refuses and the
+    // one far-off-mtime exception.
     //
-    // Issue #381: the kind is derived from `is_directory`, as migration 005
-    // did, because no generation of the on-tape `catalog.db` carries a file
-    // type. A symlink or special file on such a tape is therefore rebuilt as
-    // regular — dar's catalogue still holds its real type, and the on-tape
-    // half is ADR-0012 item 7's 1.2.0 change.
+    // Generation 3 (tapectl 1.1.0 on) records each entry's kind and link
+    // target, so the rebuilt rows keep them. Generations 1 and 2 record
+    // only `is_directory` (#381): a symlink or special file on those tapes
+    // is rebuilt as regular — dar's catalogue still holds its real type.
     //
-    // HAZARD until then: a rebuilt row says `Regular` for what may be a FIFO,
-    // a device or a symlink, so whatever trusts the kind treats it as a file
-    // with data. A reader that opens the source path of every non-directory
-    // row (`kind <> 0`) to hash it or read it blocks forever on a FIFO with
-    // no writer, and fails on a dangling symlink or follows a live one out
-    // of the unit — where the walk's own `Special`/`Symlink` kind would have
-    // told it to skip the row. Remove this caveat when the 1.2.0 on-tape
-    // `catalog.db` carries the kind and this maps it.
+    // HAZARD for rows rebuilt from such a tape: a rebuilt row says `Regular`
+    // for what may be a FIFO, a device or a symlink, so whatever trusts the
+    // kind treats it as a file with data. A reader that opens the source
+    // path of every non-directory row (`kind <> 0`) to hash it or read it
+    // blocks forever on a FIFO with no writer, and fails on a dangling
+    // symlink or follows a live one out of the unit — where the walk's own
+    // `Special`/`Symlink` kind would have told it to skip the row.
     //
     // Streamed (issue #413): one on-tape row at a time, straight into the
     // bulk insert, never the whole tape's rows in memory.
-    let bad = |f: &ontape_catalog::FileRow, e: TapectlError| {
-        TapectlError::Other(format!(
-            "catalog.db files row {} ({:?}) of {} v{}: {e}",
-            f.id, f.path, unit.name, unit.snapshot_version
-        ))
+    let in_version = |e: TapectlError| {
+        TapectlError::Other(format!("{} v{}: {e}", unit.name, unit.snapshot_version))
     };
-    let mut stmt = db.prepare(ontape_catalog::FILES_OF_SNAPSHOT)?;
-    let rows = stmt.query_map(
-        params![ontape_snapshot, first_id, last_id],
-        ontape_catalog::file_row,
-    )?;
-    let entries = rows.map(|row| {
-        let f = row?;
-        let size_bytes = f
-            .size_bytes
-            .ok_or_else(|| bad(&f, TapectlError::Other("NULL size_bytes".to_string())))?;
-        Ok(files_db::FileEntry {
-            path: f.path.clone(),
-            kind: files_db::FileKind::from_is_directory(f.is_directory != 0),
-            size_bytes,
-            mtime_ns: f
-                .modified_at
-                .as_deref()
-                .map(files_db::mtime_ns_from_rfc3339)
-                .transpose()
-                .map_err(|e| bad(&f, e))?
-                .flatten(),
-            sha256: f
-                .sha256
-                .as_deref()
-                .map(files_db::sha256_from_hex)
-                .transpose()
-                .map_err(|e| bad(&f, e))?,
-            link_target: None,
-        })
-    });
-    report.files += files_db::insert_version(tx, snapshot_id, entries)?;
+    let written = spans.stream(db, ontape_snapshot, |entries| {
+        files_db::insert_version(tx, snapshot_id, entries.map(|e| e.map_err(in_version)))
+    })?;
+    report.files += written;
     Ok(())
 }
 

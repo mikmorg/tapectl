@@ -78,10 +78,11 @@ impl FileKind {
         self == FileKind::Dir
     }
 
-    /// What the on-tape `catalog.db` records (`is_directory` only, in both of
-    /// its generations) can say: a directory or not. Not-a-directory is read
-    /// as `Regular` (#381): the on-tape shape carries no other type until its
-    /// 1.2.0 change (ADR-0012 item 7).
+    /// What an on-tape `catalog.db` of generation 1 or 2 records
+    /// (`is_directory` only) can say: a directory or not. Not-a-directory is
+    /// read as `Regular` (#381): those generations carry no other type.
+    /// Generation 3 (1.1.0, ADR-0012 2026-10-12 item 48) records the kind
+    /// itself (`volume-format-v2.md` §1.4).
     pub fn from_is_directory(is_directory: bool) -> Self {
         if is_directory {
             FileKind::Dir
