@@ -109,14 +109,9 @@ pub fn parse_log(
     let mut result: Option<String> = None;
     let mut exit_code: Option<i32> = None;
     for line in text.lines() {
-        // `<RFC 3339 UTC> <message>`; anything else (a tracing line wrapped
-        // across lines) is not one of ours.
-        let Some((ts, msg)) = line.split_once(' ') else {
+        let Some((ts, msg)) = split_line(line) else {
             continue;
         };
-        if !(ts.len() >= 20 && ts.ends_with('Z') && ts.as_bytes()[4] == b'-') {
-            continue;
-        }
         s.last_line_at = Some(ts.to_string());
         if let Some(rest) = msg.strip_prefix("session start: ") {
             s.started_at = Some(ts.to_string());
@@ -152,7 +147,7 @@ pub fn parse_log(
         } else if let Some(rest) = msg.strip_prefix("session exit with code ") {
             exit_code = rest.split_whitespace().next().and_then(|c| c.parse().ok());
             ended = true;
-        } else if msg.starts_with("session end after ") {
+        } else if is_end_line(msg) {
             ended = true;
         }
     }
@@ -186,6 +181,28 @@ pub fn parse_log(
     s
 }
 
+/// One of ours: `<RFC 3339 UTC> <message>`, split into its stamp and
+/// message. Anything else (a tracing line wrapped across lines) is not.
+fn split_line(line: &str) -> Option<(&str, &str)> {
+    let (ts, msg) = line.split_once(' ')?;
+    (ts.len() >= 20 && ts.ends_with('Z') && ts.as_bytes()[4] == b'-').then_some((ts, msg))
+}
+
+/// Whether `msg` is a session's end line: the session's own, or the one
+/// written before a `process::exit`.
+fn is_end_line(msg: &str) -> bool {
+    msg.starts_with("session end after ") || msg.starts_with("session exit with code ")
+}
+
+/// Whether any line of `text` is an end line. `text` may be a log's tail
+/// with a partial first line, which matches only if it is a whole line of
+/// ours anyway.
+fn has_end_line(text: &str) -> bool {
+    text.lines()
+        .filter_map(split_line)
+        .any(|(_, msg)| is_end_line(msg))
+}
+
 /// Whether the RFC 3339 stamp `at` is no older than `within` at `now`. An
 /// unreadable stamp, or none, is not recent.
 fn written_within(
@@ -214,8 +231,20 @@ pub fn tapectl_is_running(pid: u32) -> bool {
     }
 }
 
-/// The sessions to show: every running one among the newest logs, and the
+/// How much of a log's end [`read_sessions`] reads to tell a finished
+/// session from one that may be running. The end line is written last, or
+/// nearly (a tracing line can land after it); a log with more than this
+/// past its end line is read in full, never misjudged.
+const TAIL_BYTES: u64 = 16 * 1024;
+
+/// The sessions to show: every running one, whatever its age, and the
 /// `last` newest that are not running, newest first.
+///
+/// Every log is looked at, not only the newest few: a running command can
+/// have any number of newer logs after it (its own child sessions, one per
+/// unit of a `--jobs` stage; timers; other commands), and the logs are
+/// never pruned (ADR-0012 2026-10-07 item 13). So once the finished list is
+/// full, a log is read in full only when its tail has no end line.
 pub fn read_sessions(logs_dir: &Path, last: usize) -> Result<Vec<SessionStatus>> {
     let entries = std::fs::read_dir(logs_dir).map_err(|e| unreadable(logs_dir, &e))?;
     let mut names: Vec<String> = Vec::new();
@@ -230,13 +259,17 @@ pub fn read_sessions(logs_dir: &Path, last: usize) -> Result<Vec<SessionStatus>>
     // start order.
     names.sort();
     names.reverse();
-    // A running session is among the newest; look a little past `last` so
-    // a few finished ones after it cannot hide it.
-    let window = last.saturating_add(20);
     let mut out = Vec::new();
     let mut finished = 0;
-    for name in names.into_iter().take(window) {
+    for name in names {
         let path = logs_dir.join(&name);
+        // Once the finished list is full, only a log that may be running
+        // is worth reading: one whose tail has no end line. A log that
+        // cannot be read is not one (it is named, below, only while the
+        // finished list has room).
+        if finished >= last && !matches!(read_tail(&path), Ok(tail) if !has_end_line(&tail)) {
+            continue;
+        }
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             // A log the reader may not open (created before `[ops] group`
@@ -274,6 +307,18 @@ pub fn read_sessions(logs_dir: &Path, last: usize) -> Result<Vec<SessionStatus>>
         }
     }
     Ok(out)
+}
+
+/// The last [`TAIL_BYTES`] of `path`, lossily decoded: the cut can fall
+/// inside a character or a line, and [`has_end_line`] allows for both.
+fn read_tail(path: &Path) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
+    let mut buf = Vec::new();
+    f.take(TAIL_BYTES).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 impl SessionStatus {
@@ -552,6 +597,104 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    /// A `collection run --jobs N` logs each unit to a child session whose
+    /// name sorts after the command's own; the command, still running (it
+    /// writes the tape after the staging), must not be pushed out of the
+    /// listing by however many of its children finished after it started.
+    #[test]
+    fn a_running_session_is_listed_however_many_finished_logs_are_newer() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        // Stamped now: read as Running where /proc names this binary a
+        // tapectl, and as ProcessNotVisible (a fresh log) where it does not.
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+        std::fs::write(
+            dir.path()
+                .join(format!("20261012T000000Z-collection-run-k-{me}.log")),
+            format!(
+                "{now} session start: collection run k (tapectl 1.1.0, pid {me}, display Off)\n\
+                 {now} phase start: write (1 GiB)\n"
+            ),
+        )
+        .unwrap();
+        let last = 5;
+        for i in 0..last + 21 {
+            std::fs::write(
+                dir.path()
+                    .join(format!("20261012T0001{i:02}Z-stage-create-u{i}-{me}.log")),
+                format!(
+                    "2026-10-12T00:01:{i:02}.000Z session start: stage create u{i} (tapectl 1.1.0, pid {me}, display Off)\n\
+                     2026-10-12T00:01:{i:02}.500Z session result: ok\n\
+                     2026-10-12T00:01:{i:02}.500Z session end after 0.5 s\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let got = read_sessions(dir.path(), last).unwrap();
+        let running: Vec<_> = got.iter().filter(|s| s.is_probably_running()).collect();
+        assert_eq!(running.len(), 1, "{got:#?}");
+        assert_eq!(running[0].command.as_deref(), Some("collection run k"));
+        assert_eq!(
+            got.iter().filter(|s| !s.is_probably_running()).count(),
+            last,
+            "the newest {last} finished: {got:#?}"
+        );
+    }
+
+    /// Past the finished list, a log whose end line sits further back than
+    /// the tail that is read is read in full and still counts as finished.
+    #[test]
+    fn a_finished_log_with_a_long_tail_past_its_end_line_is_not_called_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text = String::from(
+            "2026-10-01T00:00:00.000Z session start: volume verify L (tapectl 1.1.0, pid 1, display Off)\n\
+             2026-10-01T00:00:01.000Z session result: ok\n\
+             2026-10-01T00:00:01.000Z session end after 1.0 s\n",
+        );
+        while text.len() as u64 <= 2 * TAIL_BYTES {
+            text.push_str("2026-10-01T00:00:01.001Z  INFO tapectl: a late tee line\n");
+        }
+        std::fs::write(
+            dir.path().join("20261001T000000Z-volume-verify-L-1.log"),
+            text,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("20261002T000000Z-audit-1.log"),
+            "2026-10-02T00:00:00.000Z session start: audit (tapectl 1.1.0, pid 1, display Off)\n\
+             2026-10-02T00:00:01.000Z session result: ok\n\
+             2026-10-02T00:00:01.000Z session end after 1.0 s\n",
+        )
+        .unwrap();
+        let got = read_sessions(dir.path(), 1).unwrap();
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert_eq!(got[0].command.as_deref(), Some("audit"));
+    }
+
+    /// The tail check that keeps `status` from reading every finished log in
+    /// full finds an end line wherever it sits in the tail, and only one
+    /// that is a timestamped line of its own.
+    #[test]
+    fn the_tail_check_finds_an_end_line_and_only_a_real_one() {
+        assert!(has_end_line(&format!(
+            "{RUNNING}2026-10-01T05:40:01.000Z session result: ok\n\
+             2026-10-01T05:40:01.100Z session end after 2h 27m\n"
+        )));
+        // A tee line can land after the end line.
+        assert!(has_end_line(
+            "2026-10-01T05:40:01.100Z session end after 2h 27m\n\
+             2026-10-01T05:40:01.101Z  INFO tapectl: late\n"
+        ));
+        assert!(has_end_line(
+            "2026-10-01T05:40:01.100Z session exit with code 4 after 1 s\n"
+        ));
+        assert!(!has_end_line(RUNNING));
+        assert!(!has_end_line(
+            "2026-10-01T05:40:01.101Z  INFO x: session end after 3 s\nsession end after 3 s\n"
+        ));
     }
 
     #[test]
