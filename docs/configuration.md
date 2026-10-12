@@ -286,7 +286,7 @@ and the copies at each place its `required_locations` names, each times
 `[compaction] tape_only_safety_multiplier` (ADR-0012, 2026-10-12). So at 2x an
 archive set asking for three copies needs six, the default location floor of 2 needs
 4 places, and each named place needs two copies. Each fact whose floor the
-multiplier raised ends `(tape-only 2x)`. A unit that falls short of any of them, or is
+multiplier raised names it: `(tape-only 2x)`. A unit that falls short of any of them, or is
 dirty, is a Tier-2 shortfall ([ADR-0008](adr/0008-destructive-consent-tiers.md)): a
 terminal is asked to confirm, `--force` or the global `--yes` confirms in advance, and
 a non-interactive run without either refuses and lists the shortfalls. A unit whose
