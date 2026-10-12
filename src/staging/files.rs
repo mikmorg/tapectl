@@ -40,7 +40,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
 
-use sha2::{Digest, Sha256};
+use crate::pass_count::Sha256;
+use sha2::Digest;
 
 use super::{build_encryptor, make_durable, staging_io_error, EncryptedSliceInfo};
 use crate::error::{Result, TapectlError};

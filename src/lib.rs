@@ -46,6 +46,7 @@ pub mod volume;
 pub mod media;
 pub mod naming;
 pub mod output;
+pub mod pass_count;
 pub mod pipeline;
 pub mod policy;
 pub mod progress;

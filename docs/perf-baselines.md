@@ -125,5 +125,27 @@ size, in the release build the suite runs in.
 | rebuild (184,552)        | fixture: insert + `catalog.db` + write | 23.37 s | 10.98 s | reported, not bounded |
 | rebuild (184,552)        | `rebuild_from_store`, whole            | 17.40 s | 5.26 s  | ceiling 20 s; VM shared with other builds |
 
+### 2026-10-12 — branch `budgets-416` (issue #416 items 9 and 11), vm-desk1, release
+
+Two scenarios that bound ratios rather than wall clock.
+`perf_a_2gib_write_and_full_confirm_through_a_store` (knob
+`TAPECTL_PERF_WRITE_MIB`, default 2048) runs the real write session and a full
+confirm into a `MemStore`, against an in-test sha256 calibration; ceiling 3.0x
+two hash passes. `perf_a_100k_file_unit_scales_linearly` (knob
+`TAPECTL_PERF_UNIT_FILES`, default 100,000) snapshots and stages the unit and
+a tenth of it; per step, statements ≤ entries + 50 (entries: files, their
+directories and the dotfile), at most 20x the time for 10x the files, and
+VmHWM ≤ 512 MiB.
+
+| scenario            | step                         | time    | notes |
+|---------------------|------------------------------|---------|-------|
+| write 2 GiB         | sha256 calibration           | —       | 101 MiB/s (no SHA extensions on this VM) |
+| write 2 GiB         | validate → seal              | 18.81 s | 0.93x one hash pass |
+| write 2 GiB         | + full confirm               | 33.27 s | 0.82x two passes |
+| 10,000-file unit    | `snapshot_create`            | 0.30 s  | 10,025 statements |
+| 10,000-file unit    | `stage_create`               | 4.68 s  | 10,030 statements |
+| 100,000-file unit   | `snapshot_create`            | 3.63 s  | 100,115 statements (100,101 entries); 12.1x for 10x |
+| 100,000-file unit   | `stage_create`               | 44.81 s | 100,030 statements; 9.6x for 10x; VmHWM 87 MiB |
+
 When you add a new baseline row, keep the date and the short commit
 context so future regressions have something to diff against.

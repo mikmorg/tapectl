@@ -46,7 +46,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{Scope, ScopedJoinHandle};
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
+use crate::pass_count::Sha256;
+use sha2::Digest;
 
 use crate::error::{Result, TapectlError};
 use crate::progress;

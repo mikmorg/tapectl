@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
+use crate::pass_count::Sha256;
+use sha2::Digest;
 use uuid::Uuid;
 
 use crate::error::{Result, TapectlError};
