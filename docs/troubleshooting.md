@@ -249,17 +249,18 @@ written:
 error: mark unit "<unit>" tape-only refused: non-interactive session with no confirmation given — refusing
 rather than assuming consent (re-run with --yes to proceed)
 insufficient copies: 0 < 4 required by unit "<unit>"'s policy (tape-only 2x)
-insufficient locations: 0 < 4 required ([defaults] location floor) (tape-only 2x)
+insufficient locations: 0 < 2 required ([defaults] location floor)
 (`--force` or `--yes` confirms this in advance)
 ```
 
 `unit mark-tape-only` reads `min_copies` from the unit's resolved policy
 (dotfile > archive set > `[defaults]`) and the location floor from
-`[defaults] min_locations`, and holds the unit to them as a tape-only unit:
-each times `[compaction] tape_only_safety_multiplier`, which the
-`(tape-only 2x)` names (ADR-0012, 2026-10-12). So at the defaults (2, 2, 2x) it
-asks for 4 copies in 4 locations; a `0 < 4` is not a typo for 2. Set the
-multiplier to `1` for no extra margin. Other fact lines it can show:
+`[defaults] min_locations`, and holds the unit to them as a tape-only unit: the
+copy floor times `[compaction] tape_only_safety_multiplier`, which the
+`(tape-only 2x)` names, and the location floor as set, never multiplied
+(ADR-0012, 2026-10-12). So at the defaults (2, 2, 2x) it asks for 4 copies in 2
+locations; a `0 < 4` copies is not a typo for 2. Set the multiplier to `1` for
+no extra margin. Other fact lines it can show:
 
 - `insufficient locations: no copy at required location(s) <names> (policy
   requires <list>)`

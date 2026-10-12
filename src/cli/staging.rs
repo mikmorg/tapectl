@@ -155,7 +155,8 @@ fn under_copied_release_candidates(
         // 2026-10-12 item 43): a tape-only unit's staged bytes (staged
         // again by `volume read-slices`) are retained until it has
         // `min_copies` times the multiplier, the floor `audit` judges it by.
-        let min_copies = crate::policy::coverage::floor(config, resolved.min_copies, &unit.status);
+        let min_copies =
+            crate::policy::coverage::copy_floor(config, resolved.min_copies, &unit.status);
         if copies < min_copies {
             under.push(UnderCopiedUnit {
                 unit_id: unit.id,

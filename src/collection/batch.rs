@@ -429,7 +429,8 @@ fn under_copied_units(
         let copies: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
         // The floor `staging clean`'s retention gate also asks: the one
         // tape-only rule (ADR-0012 2026-10-12 item 43).
-        let min_copies = crate::policy::coverage::floor(config, resolved.min_copies, &unit.status);
+        let min_copies =
+            crate::policy::coverage::copy_floor(config, resolved.min_copies, &unit.status);
         if copies < min_copies {
             under.push(CopyProgress {
                 unit_name: u.name.clone(),

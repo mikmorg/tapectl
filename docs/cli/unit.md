@@ -152,5 +152,5 @@ tapectl unit mark-tape-only [OPTIONS] <NAME>
 
 **Options**
 
-- `--force` — Confirm in advance, as the global --yes does: mark the unit even though it is short of its policy's min_copies, the [defaults] min_locations floor or its required_locations (each at the tape-only floor: times [compaction] tape_only_safety_multiplier), or is dirty (changed since its last snapshot). Without either flag a terminal asks, and a non-interactive run refuses, naming each shortfall. A unit that was never archived is refused whatever the flags (ADR-0008 Tier 3)
+- `--force` — Confirm in advance, as the global --yes does: mark the unit even though it is short of its policy's min_copies, the copies at each of its required_locations (both times [compaction] tape_only_safety_multiplier, the tape-only floor) or the [defaults] min_locations count of places (never multiplied), or is dirty (changed since its last snapshot). Without either flag a terminal asks, and a non-interactive run refuses, naming each shortfall. A unit that was never archived is refused whatever the flags (ADR-0008 Tier 3)
 

@@ -3235,7 +3235,7 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
     let config_path = home.join("config.toml");
     // Multiplier 1: this test is about the evidence shown, so the unit must
     // meet its floors. At the default 2x, mark-tape-only asks a tape-only
-    // unit for 4 copies in 4 locations (ADR-0012 2026-10-12 item 43).
+    // unit for 4 copies in 2 locations (ADR-0012 2026-10-12 items 43, 46).
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     config.push_str("\n[compaction]\ntape_only_safety_multiplier = 1\n");
     std::fs::write(&config_path, config).unwrap();
@@ -3364,11 +3364,12 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
     );
 }
 
-/// ADR-0012 2026-10-12 item 43, through the binary at the DEFAULT
+/// ADR-0012 2026-10-12 items 43 and 46, through the binary at the DEFAULT
 /// multiplier (2x) — the contract `scripts/lifecycle-suite.sh`'s
 /// `tor.mark_tape_only_photos_passes` relies on, proven without a tape: a
 /// unit with 2 copies in 2 places meets `min_copies`/`min_locations` (2, 2)
-/// but not a tape-only unit's floors (4, 4). Run as the suite runs it
+/// but not a tape-only unit's 4 copies; its 2 places meet the place floor,
+/// which the multiplier does not raise. Run as the suite runs it
 /// (stdin not a terminal, no `--yes`), the command refuses, leaves the unit
 /// active and names the multiplier; the global `--yes` written AFTER the
 /// subcommand, as the suite writes it, is the Tier-2 consent that marks it.
@@ -3463,8 +3464,7 @@ fn test_unit_mark_tape_only_at_default_multiplier_refuses_then_yes_marks() {
     );
     assert!(
         !bare.status.success(),
-        "2 copies in 2 places is short of tape-only's 4 and 4; a run without consent must \
-         refuse: {bare_out}"
+        "2 copies is short of tape-only's 4; a run without consent must refuse: {bare_out}"
     );
     assert!(
         bare_out.contains(
@@ -3474,11 +3474,9 @@ fn test_unit_mark_tape_only_at_default_multiplier_refuses_then_yes_marks() {
         "the copy fact must give the multiplied floor and name the multiplier: {bare_out}"
     );
     assert!(
-        bare_out.contains(
-            "insufficient locations: 2 < 4 required ([defaults] location floor) \
-             (tape-only 2x)"
-        ),
-        "the location fact must give the multiplied floor and name the multiplier: {bare_out}"
+        !bare_out.contains("insufficient locations"),
+        "2 places meets min_locations 2, which the multiplier does not raise (item 46): \
+         {bare_out}"
     );
     assert_eq!(status_of_photos(), "active", "a refusal changes nothing");
 

@@ -526,21 +526,22 @@ that is irreversible in practice, the command is gated:
 - Otherwise the command checks the unit against four facts: its copies against
   its resolved `min_copies`, its number of locations against the
   `[defaults] min_locations` floor (default 2), a copy at each of its named
-  required locations, and whether it is **dirty**. The first three are the
-  floors of a tape-only unit, so each is multiplied by `[compaction]
-  tape_only_safety_multiplier` (below). A unit that meets all four
+  required locations, and whether it is **dirty**. These are the floors of a
+  tape-only unit, so the copy floors, `min_copies` and the copies at each named
+  location, are multiplied by `[compaction] tape_only_safety_multiplier`
+  (below). The number of locations is not. A unit that meets all four
   is marked at once. Any shortfall is listed, and on a terminal the command
   asks before marking. `--force` or the global `--yes` confirms in advance; a
   run with no terminal and neither flag refuses, naming each shortfall.
 
 Tape-only units stay in every audit check except `dirty`, since their disk copy
 may be gone. A tape-only unit is held to a stricter bar everywhere it is judged
-(ADR-0012, 2026-10-07 and 2026-10-12): every copy and place-count floor is
-multiplied by `[compaction] tape_only_safety_multiplier` (default 2) — the copy
-requirement, the number of locations, and the copies each named required
-location must hold. At 2x and the defaults, a tape-only unit needs 4 copies in
-4 locations; `required_locations = ["offsite"]` asks for two copies at
-`offsite`.
+(ADR-0012, 2026-10-07 and 2026-10-12): every copy floor is multiplied by
+`[compaction] tape_only_safety_multiplier` (default 2). That is the copy
+requirement and the copies each named required location must hold. The number
+of distinct locations a unit must span is never multiplied. At 2x and the
+defaults, a tape-only unit needs 4 copies in 2 locations, not 4 in 4;
+`required_locations = ["offsite"]` asks for two copies at `offsite`.
 
 One rule applies it, so the commands cannot disagree: `audit`'s `copy_count`
 and `location_presence`, `unit mark-tape-only` (the unit is about to be
@@ -548,7 +549,8 @@ tape-only), `snapshot mark-reclaimable` and `report supersedable` (for the newer
 version), the retire family's below-policy question, `staging clean`'s
 retention and `report pending`. A message whose floor the multiplier raised
 says so: `has 2 copies, needs 4 (tape-only 2x)`. A unit that is not tape-only is
-never multiplied.
+never multiplied. A shortfall stays a question to confirm, not an absolute
+refusal (ADR-0008 Tier 2).
 
 ## Policy: archive sets and audit
 

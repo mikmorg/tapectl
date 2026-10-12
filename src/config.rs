@@ -1276,13 +1276,13 @@ impl Config {
     /// ADR-0012 reason: a value accepted here that misbehaves later is
     /// exactly the residue ADR-0012 exists to close.
     ///
-    /// `tape_only_safety_multiplier` MULTIPLIES every copy and place-count
-    /// floor of a `tape_only` unit, through the one rule
-    /// `policy::coverage::floor` (the copies, the number of places, and the
-    /// copies each named required location must hold — ADR-0012,
-    /// 2026-10-07, items 15 and 34; 2026-10-12, item 43) — it never
-    /// replaces them. `0`
-    /// zeroes every floor outright (each `copies < floor` guard goes
+    /// `tape_only_safety_multiplier` MULTIPLIES every copy floor of a
+    /// `tape_only` unit, through the one rule `policy::coverage::copy_floor`
+    /// (the copies, and the copies each named required location must hold —
+    /// ADR-0012, 2026-10-07, items 15 and 34; 2026-10-12, items 43 and 46;
+    /// never `min_locations`' count of distinct places) — it never replaces
+    /// them. `0`
+    /// zeroes every copy floor outright (each `copies < floor` guard goes
     /// vacuous), and a negative value is worse: the floor goes negative, so
     /// `copies < floor` is false for any non-negative count.
     /// The only value that preserves "multiply, never replace, never

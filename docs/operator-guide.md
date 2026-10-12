@@ -1203,10 +1203,11 @@ integrity check for "family/letters" against v1's checksums:
 is tape-only. They come from its own resolved policy (dotfile > archive set >
 `[defaults]`): `min_copies` copies (2 by default), copies in `[defaults]
 min_locations` distinct locations (2 by default), and a copy at every one of
-its `required_locations`, by name. A tape-only unit's floors are each
-multiplied by `[compaction] tape_only_safety_multiplier` (2 by default;
-ADR-0012, 2026-10-12), so at the defaults it needs 4 copies in 4 locations,
-and 2 copies at each named location. It also checks that nothing changed on
+its `required_locations`, by name. A tape-only unit's copy floors, the copies
+and the copies at each named location, are multiplied by `[compaction]
+tape_only_safety_multiplier` (2 by default; ADR-0012, 2026-10-12). The number
+of distinct locations is not. So at the defaults it needs 4 copies in 2
+locations, and 2 copies at each named location. It also checks that nothing changed on
 disk since its last snapshot. A unit that meets all of it is marked with no
 question asked.
 
@@ -1220,7 +1221,7 @@ naming each one:
 $ tapectl unit mark-tape-only tv/show/s01 < /dev/null
 error: mark unit "tv/show/s01" tape-only refused: non-interactive session with no confirmation given — refusing rather than assuming consent (re-run with --yes to proceed)
 insufficient copies: 0 < 4 required by unit "tv/show/s01"'s policy (tape-only 2x)
-insufficient locations: 0 < 4 required ([defaults] location floor) (tape-only 2x)
+insufficient locations: 0 < 2 required ([defaults] location floor)
 (`--force` or `--yes` confirms this in advance)
 ```
 
@@ -2230,10 +2231,10 @@ no compaction candidates (threshold: live data below 50% of the archive data on 
 `snapshot mark-reclaimable` releases an older version once a newer current
 version supersedes it, and first checks that the superseding version is
 covered on its own: `min_copies` copies, and a copy at each of its
-`required_locations` by name (for a tape-only unit, every floor multiplied by
-`[compaction] tape_only_safety_multiplier`, as everywhere a tape-only unit is
-judged: the copies, the number of places, and the copies at each named
-location — two at `offsite` at 2x). A shortfall goes through the same
+`required_locations` by name (for a tape-only unit, every copy floor multiplied
+by `[compaction] tape_only_safety_multiplier`, as everywhere a tape-only unit is
+judged: the copies, and the copies at each named location — two at `offsite` at
+2x; never the number of places, ADR-0012 2026-10-12). A shortfall goes through the same
 Tier-2 consent as `mark-tape-only`: a terminal asks, `--force` or `--yes`
 confirms in advance, and a session with no terminal and neither flag refuses,
 naming it (for example

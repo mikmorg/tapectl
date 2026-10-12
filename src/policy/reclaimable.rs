@@ -135,23 +135,20 @@ fn superseding_verdict(
 ) -> Result<ReclaimVerdict> {
     // Precondition 2: Superseding snapshot meets policy
     let resolved = super::resolve(conn, config, unit)?;
-    // Precondition 3: tape-only units get multiplied requirements — every
-    // floor here through the one rule in `policy::coverage` (ADR-0012
-    // 2026-10-07 items 15 and 34, 2026-10-12 item 43), which `audit` and
-    // `unit mark-tape-only` ask too. `tape_only_note` names the CONFIGURED
-    // multiplier in the refusal text (issue #215 finding 1: it once
-    // hardcoded "2x").
-    let required_copies = super::coverage::floor(config, resolved.min_copies, &unit.status);
-    // The count floor the named locations imply: one distinct place per
-    // distinct name (a name listed twice is one place), multiplied for a
-    // tape-only unit. The names themselves are checked below, each for
-    // `copies_per_named_location` copies.
-    let required_locations = {
-        let mut distinct: Vec<&String> = resolved.required_locations.iter().collect();
-        distinct.sort();
-        distinct.dedup();
-        super::coverage::floor(config, distinct.len() as i64, &unit.status)
-    };
+    // Precondition 3: tape-only units get multiplied COPY requirements —
+    // the copy count and the copies at each named location, through the one
+    // rule in `policy::coverage` (ADR-0012 2026-10-07 items 15 and 34,
+    // 2026-10-12 items 43 and 46), which `audit` and `unit mark-tape-only`
+    // ask too. `tape_only_note` names the CONFIGURED multiplier in the
+    // refusal text (issue #215 finding 1: it once hardcoded "2x").
+    //
+    // Item 46: the multiplier never raises a count of distinct places. Until
+    // it, this gate also asked a tape-only unit's superseding version for
+    // (distinct named locations x multiplier) distinct places; that check is
+    // gone, not merely unmultiplied — once every name holds its copies (the
+    // check below), the distinct-place count is at least the number of
+    // names, so an unmultiplied place count could never bind.
+    let required_copies = super::coverage::copy_floor(config, resolved.min_copies, &unit.status);
     let tape_only_note = super::coverage::tape_only_note(config, &unit.status);
 
     // ADR-0004 (issue #89): this query previously had no JOIN to
@@ -186,10 +183,10 @@ fn superseding_verdict(
     // `["home","offsite"]` and the older version was released with nothing
     // offsite.
     // ADR-0012 2026-10-07 items 15 and 34: for a tape-only unit each named
-    // location must hold `multiplier` copies of the superseding version, as
-    // the distinct-location count below is multiplied — the per-name count
-    // of the same one predicate (`copies_per_named_location`). One copy at
-    // `offsite` meets `["offsite"]` for an active unit, not at 2x.
+    // location must hold `multiplier` copies of the superseding version —
+    // the per-name count of the same one predicate
+    // (`copies_per_named_location`). One copy at `offsite` meets
+    // `["offsite"]` for an active unit, not at 2x.
     let per_name = super::coverage::copies_per_named_location(config, &unit.status);
     let short = super::coverage::short_required_locations(
         conn,
@@ -218,24 +215,6 @@ fn superseding_verdict(
                 "superseding v{} has {} (tape-only {per_name}x)",
                 superseding.1,
                 super::coverage::describe_named_shortfall(&short, per_name),
-            ),
-        });
-    }
-
-    // With every name met, the distinct-location count is at least the
-    // number of names, so this binds only for a tape-only unit, whose
-    // floor the multiplier raises above it.
-    let sql = format!("SELECT {}", super::coverage::location_count_expr(&scoped));
-    let location_count: i64 = conn.query_row(&sql, params![superseding.0], |row| row.get(0))?;
-
-    if required_locations > 0 && location_count < required_locations {
-        return Ok(ReclaimVerdict::Blocked {
-            superseding_version: Some(superseding.1),
-            freeable_bytes: freeable,
-            reason: format!(
-                "superseding v{} in {location_count} locations, needs \
-                 {required_locations}{tape_only_note}",
-                superseding.1,
             ),
         });
     }
@@ -874,10 +853,11 @@ pub(crate) mod tests {
 
     /// ADR-0012, 2026-10-07 amendment, item 15: for a tape-only unit the
     /// multiplier applies to each NAMED required location too, as it does to
-    /// the distinct-location count. `["offsite"]` at 2x asks for two copies of
-    /// the superseding version at `offsite`. Here it has one there and one at
-    /// `home`: two copies (min_copies 1, x2), two places (one name, x2), and
-    /// `offsite` present — every check but this one is met.
+    /// the copy count (never to the distinct-place count, 2026-10-12 item
+    /// 46). `["offsite"]` at 2x asks for two copies of the superseding
+    /// version at `offsite`. Here it has one there and one at `home`: two
+    /// copies (min_copies 1, x2) and `offsite` present — every check but
+    /// this one is met.
     #[test]
     fn tape_only_multiplies_the_copies_each_named_location_must_hold() {
         let (conn, _unit) = setup("sup-named-tape", 2, "sealed", "tape_only");
@@ -927,9 +907,8 @@ pub(crate) mod tests {
             "offsite",
             r#"["offsite"]"#,
         );
-        // A warehouse deposit of one of the offsite tapes, at `home`: the
-        // second distinct place the 2x count needs, and not a copy at
-        // `offsite`.
+        // A warehouse deposit of one of the offsite tapes, at `home`: a third
+        // copy, and not one at `offsite`.
         conn.execute(
             "INSERT INTO locations (name, kind) VALUES ('home', 'shelf')",
             [],
@@ -952,21 +931,85 @@ pub(crate) mod tests {
             }
         );
 
-        // The same shape with the deposit AT offsite instead of home is two
-        // tapes and a deposit there: three copies at offsite, but one place.
-        // The distinct-location count still binds (needs 2).
+        // ADR-0012 2026-10-12 item 46: the same shape with the deposit AT
+        // offsite instead of home is two tapes and a deposit there — three
+        // copies at offsite, in one place. The multiplier raises copy floors
+        // only (1 x 2 copies, 2 at `offsite`), never the count of distinct
+        // places, so one place meets the one name and the release stands.
+        // (Until item 46 the place count was multiplied to 2 and blocked.)
         conn.execute(
             "UPDATE volume_deposits SET location_id = (SELECT id FROM locations WHERE name = 'offsite')",
             [],
         )
         .unwrap();
+        assert_eq!(
+            assess(&conn, &config, &unit, 1).unwrap(),
+            ReclaimVerdict::Releasable {
+                superseding_version: 2,
+                freeable_bytes: 1000,
+            },
+            "the distinct-place count is not multiplied"
+        );
+    }
+
+    /// One more sealed volume `label` at location `loc` (created if new),
+    /// holding the HIGHEST version of [`setup`]'s unit `name`.
+    fn add_copy_of_top(conn: &Connection, name: &str, label: &str, loc: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO locations (name, kind) VALUES (?1, 'shelf')",
+            params![loc],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, location_id)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                     (SELECT id FROM locations WHERE name = ?2))",
+            params![label, loc],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT ss.id, s.id, ?1, 'completed'
+             FROM snapshots s JOIN stage_sets ss ON ss.snapshot_id = s.id
+             JOIN units u ON u.id = s.unit_id
+             WHERE u.name = ?2
+               AND s.version = (SELECT MAX(version) FROM snapshots WHERE unit_id = u.id)",
+            params![conn.last_insert_rowid(), name],
+        )
+        .unwrap();
+    }
+
+    /// ADR-0012 2026-10-12 item 46 at the DEFAULTS (min_copies 2, 2x), with
+    /// `required_locations = ["home","offsite"]`: a tape-only unit's
+    /// superseding version needs 4 copies and 2 at each name, in the two
+    /// named places — not 4 places. Three copies (2 at home, 1 at offsite)
+    /// is short of copies; a fourth at offsite releases it.
+    #[test]
+    fn tape_only_four_copies_in_two_places_is_releasable_at_the_defaults() {
+        let name = "sup-four-in-two";
+        let (conn, _unit) = setup(name, 2, "sealed", "tape_only");
+        let unit = place_and_require(&conn, name, "home", "offsite", r#"["home","offsite"]"#);
+        add_copy_of_top(&conn, name, "sup-four-in-two-HOME2", "home");
+        let config = Config::default();
+
         match assess(&conn, &config, &unit, 1).unwrap() {
             ReclaimVerdict::Blocked { reason, .. } => assert!(
-                reason.contains("in 1 locations, needs 2 (tape-only 2x)"),
+                reason.contains("superseding v2 has 3 copies, needs 4 (tape-only 2x)"),
                 "{reason}"
             ),
-            other => panic!("one place must not meet the 2x location count: {other:?}"),
+            other => panic!("3 copies is short of 2 x 2: {other:?}"),
         }
+
+        add_copy_of_top(&conn, name, "sup-four-in-two-OFFSITE2", "offsite");
+        assert_eq!(
+            assess(&conn, &config, &unit, 1).unwrap(),
+            ReclaimVerdict::Releasable {
+                superseding_version: 2,
+                freeable_bytes: 1000,
+            },
+            "4 copies in 2 places, 2 at each name, meets a tape-only unit's floors"
+        );
     }
 
     /// The question is asked of the SUPERSEDING version alone: v1 (the one

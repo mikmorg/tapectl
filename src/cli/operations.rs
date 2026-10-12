@@ -953,9 +953,11 @@ pub(crate) fn refuse_last_eligible_copy(
 /// means no location requirement was configured, and silence is then
 /// correct rather than a gate on a number nobody set.
 ///
-/// For a tape-only unit both floors are multiplied by the one tape-only
-/// rule (`policy::coverage::floor`, ADR-0012 2026-10-12 item 43), as every
-/// other copy and place-count floor is, and each fact names the multiplier.
+/// For a tape-only unit the copy floor is multiplied by the one tape-only
+/// rule (`policy::coverage::copy_floor`, ADR-0012 2026-10-12 item 43), as
+/// every other copy floor is, and its fact names the multiplier. The
+/// location floor is a count of distinct places, which the multiplier never
+/// raises (item 46), so it stays the number of named locations.
 ///
 /// An unresolvable policy PROPAGATES (issue #105's rule, applied at a
 /// destructive moment): tapectl cannot say whether the retirement is within
@@ -976,12 +978,9 @@ pub(crate) fn below_policy_facts(
         let unit = queries::get_unit_by_name(conn, &impact.unit_name)?
             .ok_or_else(|| TapectlError::UnitNotFound(impact.unit_name.clone()))?;
         let policy = crate::policy::resolve(conn, config, &unit)?;
-        let needed_copies = crate::policy::coverage::floor(config, policy.min_copies, &unit.status);
-        let needed_locations = crate::policy::coverage::floor(
-            config,
-            policy.required_locations.len() as i64,
-            &unit.status,
-        );
+        let needed_copies =
+            crate::policy::coverage::copy_floor(config, policy.min_copies, &unit.status);
+        let needed_locations = policy.required_locations.len() as i64;
         let note = crate::policy::coverage::tape_only_note(config, &unit.status);
         for version in &impact.at_stake {
             if version.copies_after == 0 {
@@ -997,7 +996,7 @@ pub(crate) fn below_policy_facts(
             if needed_locations > 0 && version.locations_after < needed_locations {
                 facts.push(format!(
                     "unit \"{}\" v{} would be left in {} location(s), below its policy of \
-                     {needed_locations} ({}){note}",
+                     {needed_locations} ({})",
                     impact.unit_name,
                     version.version,
                     version.locations_after,
@@ -2443,23 +2442,23 @@ pub fn unit_mark_tape_only(
     // resolved refuses here (the error names the layer that broke): a
     // delete-greenlighting gate must not guess at a policy.
     let policy = crate::policy::resolve(conn, config, &unit)?;
-    // ADR-0012 2026-10-12 item 43: every floor below is the one the unit
-    // will be held to once it IS tape-only, so each goes through the one
-    // tape-only rule (`policy::coverage::floor`) asked for status
-    // `tape_only` — not `unit.status`, which is still what it was. A unit
-    // cannot be marked tape-only, freeing its source, with fewer copies or
-    // places than tape-only policy demands without the consent below
-    // naming the shortfall. `tape_only_note` names the multiplier in it.
+    // ADR-0012 2026-10-12 items 43 and 46: every COPY floor below is the one
+    // the unit will be held to once it IS tape-only, so each goes through
+    // the one tape-only rule (`policy::coverage::copy_floor`,
+    // `copies_per_named_location`) asked for status `tape_only` — not
+    // `unit.status`, which is still what it was. A unit is not marked
+    // tape-only, freeing its source, with fewer copies than tape-only policy
+    // demands without the consent below naming the shortfall (item 47: a
+    // Tier-2 gate, not an absolute one). `tape_only_note` names the
+    // multiplier in the copy fact.
     let tape_only_note = crate::policy::coverage::tape_only_note(config, "tape_only");
-    let min_copies = crate::policy::coverage::floor(config, policy.min_copies, "tape_only");
+    let min_copies = crate::policy::coverage::copy_floor(config, policy.min_copies, "tape_only");
     // The location-count floor has no per-unit or per-archive-set layer:
     // it exists only in `[defaults]`, so it is read from there. The named
-    // `required_locations` below is the per-set location policy.
-    let min_locations = crate::policy::coverage::floor(
-        config,
-        i64::from(config.defaults.min_locations),
-        "tape_only",
-    );
+    // `required_locations` below is the per-set location policy. It counts
+    // distinct places, which the multiplier never raises (item 46): at the
+    // defaults a tape-only unit needs 4 copies in 2 places, not 4 in 4.
+    let min_locations = i64::from(config.defaults.min_locations);
 
     // Count copies and locations. ADR-0004: a write's own `status =
     // 'completed'` only proves the volume was sealed AT WRITE TIME —
@@ -2585,7 +2584,7 @@ pub fn unit_mark_tape_only(
     if location_count < min_locations {
         facts.push(format!(
             "insufficient locations: {location_count} < {min_locations} required \
-             ([defaults] location floor){tape_only_note}"
+             ([defaults] location floor)"
         ));
     }
     if !missing_locations.is_empty() {
@@ -5086,14 +5085,17 @@ mod tests {
         }
     }
 
-    /// ADR-0012 2026-10-12 item 43 (#423 part 2): `unit mark-tape-only`'s
-    /// copy and location-count floors are the ones the unit will be held to
-    /// once it IS tape-only — `[defaults]`/archive-set floors times
-    /// `tape_only_safety_multiplier`, through `policy::coverage::floor`. A
-    /// unit cannot be marked tape-only, freeing its source, with fewer
-    /// copies or places than tape-only policy demands without consent.
+    /// ADR-0012 2026-10-12 items 43 and 46 (#423 part 2): `unit
+    /// mark-tape-only`'s floors are the ones the unit will be held to once it
+    /// IS tape-only — the resolved `min_copies` times
+    /// `tape_only_safety_multiplier` (through `policy::coverage::copy_floor`)
+    /// and the multiplier's copies at each named required location — but the
+    /// `[defaults] min_locations` count of distinct places AS SET, never
+    /// multiplied. A shortfall is a Tier-2 fact (item 47): nothing changes
+    /// without consent, and `--force`/`--yes` gives it.
     mod tape_only_floors {
         use super::*;
+        use crate::policy::coverage::tests::{add_tape_copy_at, setup_unit_with_deposit};
 
         fn photos_status(conn: &Connection) -> String {
             conn.query_row("SELECT status FROM units WHERE name = 'photos'", [], |r| {
@@ -5104,20 +5106,20 @@ mod tests {
 
         /// `photos` holds 2 copies in 2 places (a tape at `home`, its
         /// deposit at `glacier`): it meets the default floors of 2 and 2,
-        /// and at 3x (not 2, so a literal cannot pass) is short of 6 and 6.
-        /// Both facts name the multiplier; nothing changes without consent,
-        /// and `--force` confirms it.
+        /// and at 3x (not 2, so a literal cannot pass) is short of 6 copies
+        /// — but not of places, which stay at 2 (item 46). The copy fact
+        /// names the multiplier; nothing changes without consent, and
+        /// `--force` confirms it.
         #[test]
-        fn copy_and_location_floors_take_the_tape_only_multiplier() {
-            let (conn, _unit_id, _vol) =
-                crate::policy::coverage::tests::setup_unit_with_deposit("active");
+        fn the_copy_floor_takes_the_multiplier_and_the_place_floor_does_not() {
+            let (conn, _unit_id, _vol) = setup_unit_with_deposit("active");
             let mut config = Config::default();
             config.compaction.tape_only_safety_multiplier = 3;
             assert_eq!(config.defaults.min_copies, 2);
             assert_eq!(config.defaults.min_locations, 2);
 
             let msg = unit_mark_tape_only(&conn, &config, "photos", false, false)
-                .expect_err("2 copies in 2 places is short of tape-only's 6 and 6")
+                .expect_err("2 copies is short of tape-only's 6")
                 .to_string();
             assert!(
                 msg.contains(
@@ -5127,11 +5129,8 @@ mod tests {
                 "{msg}"
             );
             assert!(
-                msg.contains(
-                    "insufficient locations: 2 < 6 required ([defaults] location floor) \
-                     (tape-only 3x)"
-                ),
-                "{msg}"
+                !msg.contains("insufficient locations"),
+                "2 places meets min_locations 2, which the multiplier does not raise: {msg}"
             );
             assert_eq!(photos_status(&conn), "active");
 
@@ -5165,6 +5164,108 @@ mod tests {
                 .to_string();
             assert!(msg.contains("insufficient copies: 2 < 3 required"), "{msg}");
             assert!(!msg.contains("insufficient locations"), "{msg}");
+            assert_eq!(photos_status(&conn), "active");
+        }
+
+        /// Item 46 at the DEFAULTS (2, 2, 2x): 4 copies in 2 places — the
+        /// fixture's 2 plus two more tapes at `home` — meets a tape-only
+        /// unit's floors, so it is marked with no consent asked (`force`
+        /// false: a compliant unit never reaches the gate).
+        #[test]
+        fn four_copies_in_two_places_is_marked_without_consent_at_the_defaults() {
+            let (conn, _unit_id, _vol) = setup_unit_with_deposit("active");
+            add_tape_copy_at(&conn, "L6-0004", "home");
+            add_tape_copy_at(&conn, "L6-0005", "home");
+            unit_mark_tape_only(&conn, &Config::default(), "photos", false, false)
+                .expect("4 copies in 2 places meets 2 x 2 copies and 2 places");
+            assert_eq!(photos_status(&conn), "tape_only");
+        }
+
+        /// 3 copies in 2 places is short of the 4 copies, and of nothing
+        /// else.
+        #[test]
+        fn three_copies_in_two_places_is_short_of_copies_only() {
+            let (conn, _unit_id, _vol) = setup_unit_with_deposit("active");
+            add_tape_copy_at(&conn, "L6-0004", "home");
+            let msg = unit_mark_tape_only(&conn, &Config::default(), "photos", false, false)
+                .expect_err("3 copies is short of 2 x 2")
+                .to_string();
+            assert!(
+                msg.contains(
+                    "insufficient copies: 3 < 4 required by unit \"photos\"'s policy \
+                     (tape-only 2x)"
+                ),
+                "{msg}"
+            );
+            assert!(!msg.contains("insufficient locations"), "{msg}");
+            assert_eq!(photos_status(&conn), "active");
+        }
+
+        /// 4 copies in ONE place meets the copy floor but is short of
+        /// `min_locations` 2 — unmultiplied, so the fact says 2, not 4, and
+        /// carries no tape-only note.
+        #[test]
+        fn four_copies_in_one_place_is_short_of_the_unmultiplied_place_floor() {
+            let (conn, _unit_id, _vol) = setup_unit_with_deposit("active");
+            conn.execute(
+                "UPDATE volume_deposits
+                 SET location_id = (SELECT id FROM locations WHERE name = 'home')",
+                [],
+            )
+            .unwrap();
+            add_tape_copy_at(&conn, "L6-0004", "home");
+            add_tape_copy_at(&conn, "L6-0005", "home");
+            let msg = unit_mark_tape_only(&conn, &Config::default(), "photos", false, false)
+                .expect_err("one place is short of min_locations 2")
+                .to_string();
+            let line = msg
+                .lines()
+                .find(|l| l.contains("insufficient locations"))
+                .unwrap_or_else(|| panic!("no location fact: {msg}"));
+            assert!(
+                line.contains("insufficient locations: 1 < 2 required ([defaults] location floor)"),
+                "{line}"
+            );
+            assert!(
+                !line.contains("tape-only"),
+                "the place floor is not multiplied: {line}"
+            );
+            assert!(!msg.contains("insufficient copies"), "{msg}");
+            assert_eq!(photos_status(&conn), "active");
+        }
+
+        /// A named required location still needs the multiplier's copies,
+        /// at the defaults: `required_locations = ["glacier"]` with 4 copies
+        /// in 2 places, only the deposit at `glacier`. One copy there is
+        /// short of 2, though the copy and place floors are met.
+        #[test]
+        fn a_named_location_still_needs_the_multipliers_copies_at_the_defaults() {
+            let (conn, unit_id, _vol) = setup_unit_with_deposit("active");
+            add_tape_copy_at(&conn, "L6-0004", "home");
+            add_tape_copy_at(&conn, "L6-0005", "home");
+            conn.execute(
+                "INSERT INTO archive_sets (name, required_locations)
+                 VALUES ('cold', '[\"glacier\"]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE units SET archive_set_id = ?1 WHERE id = ?2",
+                params![conn.last_insert_rowid(), unit_id],
+            )
+            .unwrap();
+            let msg = unit_mark_tape_only(&conn, &Config::default(), "photos", false, false)
+                .expect_err("one copy at glacier is short of 2")
+                .to_string();
+            assert!(
+                msg.contains(
+                    "insufficient locations: has 1 copy at required location glacier, needs 2 \
+                     (tape-only 2x) (policy requires glacier)"
+                ),
+                "{msg}"
+            );
+            assert!(!msg.contains("insufficient copies"), "{msg}");
+            assert!(!msg.contains("location floor"), "{msg}");
             assert_eq!(photos_status(&conn), "active");
         }
     }
@@ -6276,6 +6377,46 @@ mod tests {
                 "no Debug rendering of the location list: {msg}"
             );
         }
+
+        /// ADR-0012 2026-10-12 item 46: the same unit tape-only at 3x. The
+        /// copy fact takes the multiplier (2 left, below 2 x 3 = 6), but the
+        /// distinct-place count does not: it stays the two names, and its
+        /// fact carries no tape-only note.
+        #[test]
+        fn tier2_location_fact_is_not_multiplied_for_a_tape_only_unit() {
+            let (conn, _) = setup_sealed("L6-WHERE-TO", 2);
+            conn.execute(
+                "INSERT INTO archive_sets (name, required_locations)
+                 VALUES ('placed', '[\"home\",\"offsite\"]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE units SET archive_set_id = ?1, status = 'tape_only'
+                 WHERE name = 'unitA'",
+                params![conn.last_insert_rowid()],
+            )
+            .unwrap();
+            let mut config = Config::default();
+            config.compaction.tape_only_safety_multiplier = 3;
+
+            let msg = volume_retire(&conn, &config, "L6-WHERE-TO", false, false, false)
+                .expect_err("below both floors must gate")
+                .to_string();
+            assert!(
+                msg.contains("copy/copies, below its policy of 6 (tape-only 3x)"),
+                "{msg}"
+            );
+            let line = msg
+                .lines()
+                .find(|l| l.contains("location(s), below its policy of"))
+                .unwrap_or_else(|| panic!("no location fact: {msg}"));
+            assert!(
+                line.contains("location(s), below its policy of 2 (home, offsite)"),
+                "{line}"
+            );
+            assert!(!line.contains("tape-only"), "{line}");
+        }
     }
 
     /// Issue #89 / ADR-0004: copy-count derivations must re-qualify
@@ -6391,7 +6532,7 @@ mod tests {
         /// zeroes both because it is isolating a THIRD guard, the dirty
         /// check). The tape-only multiplier is set to 1 for the same
         /// reason: these tests are about which volumes COUNT, and at the
-        /// default 2x every floor would double (ADR-0012 2026-10-12 item
+        /// default 2x every copy floor would double (ADR-0012 2026-10-12 item
         /// 43, which `tape_only_floors` below tests on its own).
         fn config_isolating_copy_count() -> Config {
             let mut config = Config::default();

@@ -1045,7 +1045,7 @@ pub(crate) struct StagedSetRow {
     pub copies: i64,
     /// The unit's copy floor: its resolved `min_copies` ([`crate::policy::resolve`]),
     /// times the tape-only multiplier for a tape-only unit
-    /// ([`crate::policy::coverage::floor`]), or
+    /// ([`crate::policy::coverage::copy_floor`]), or
     /// `None` when its policy cannot be resolved — `audit` reports that as
     /// `policy_unresolvable`; here it counts as owing, the conservative
     /// reading for a list of outstanding work.
@@ -1107,7 +1107,7 @@ pub(crate) fn staged_set_rows(conn: &Connection, config: &Config) -> Result<Vec<
                     // (ADR-0012 2026-10-12 item 43), as `staging clean`
                     // retains by.
                     Some(u) => match crate::policy::resolve(conn, config, &u) {
-                        Ok(p) => Some(crate::policy::coverage::floor(
+                        Ok(p) => Some(crate::policy::coverage::copy_floor(
                             config,
                             p.min_copies,
                             &u.status,
