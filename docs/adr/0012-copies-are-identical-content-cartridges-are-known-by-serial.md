@@ -1391,3 +1391,9 @@ Follow-up, ruled the same day:
     2026-10-07 on-tape authorization and is recorded with its commit.
 45. **#416's hash-pass and staging-read counts are test-only counters**: counted in the budget
     tests and never recorded in the catalog, so no migration.
+48. **The on-tape `catalog.db` takes its third generation in 1.1.0** (#418 R3, brought forward
+    from 1.2.0; docs/research/2026-10-06-plaintext-free-staging.md §6.4 and §7): the operator
+    envelope's catalog follows the main catalog's narrow `paths`/`file_versions` shape
+    (migration 030) and records each file's kind and link target (#381's on-tape half), so a
+    catalog rebuilt from tape keeps them. Rebuild still reads generations 1 and 2 by shape. The
+    cross-volume per-tenant index (R4), #420 and #388 stay after the first production write.
