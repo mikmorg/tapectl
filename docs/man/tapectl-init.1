@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-init \- Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR\-0005; use \-\-no\-escrow to skip it, or \-\-escrow\-public\-key to adopt an existing one instead of minting a new identity)
 .SH SYNOPSIS
-\fBtapectl init\fR [\fB\-\-json\fR] [\fB\-\-operator\fR] [\fB\-\-dry\-run\fR] [\fB\-\-no\-escrow\fR] [\fB\-\-escrow\-public\-key\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl init\fR [\fB\-\-json\fR] [\fB\-\-operator\fR] [\fB\-\-dry\-run\fR] [\fB\-\-no\-escrow\fR] [\fB\-\-escrow\-public\-key\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-operator\-key\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Initialize tapectl (DB, config, operator tenant, keys, and the permanent escrow recipient — ADR\-0005; use \-\-no\-escrow to skip it, or \-\-escrow\-public\-key to adopt an existing one instead of minting a new identity)
 .SH OPTIONS
@@ -26,6 +26,9 @@ Register THIS existing escrow public key (an age1… literal, or a path to a .pu
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
+.TP
+\fB\-\-operator\-key\fR \fI<PATH>\fR
+Adopt this existing age identity file (the SECRET) as the operator\*(Aqs primary key instead of minting a pair, as `tenant add \-\-adopt\-key` does for a tenant: stored byte for byte as keys/<operator>\-primary.age.key, mode 0600, and nothing is minted. A path only, never a key on the command line. Refused before anything is created when it is not one X25519 identity, or when it is the secret of \-\-escrow\-public\-key
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/

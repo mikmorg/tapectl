@@ -13,12 +13,14 @@
 #    5  the SERVICE USER: a nologin `tapectl` account owns the keys, catalog and staging;
 #       every tapectl command from here on runs as it (sudo -u tapectl -H)
 #    6  find the tape drive BY SERIAL and confirm the service user can open it
-#    7  initialise the tapectl home — mints the escrow identity (paper ready)
+#    7  initialise the tapectl home — mints the escrow identity (paper ready);
+#       with ADOPT_KEYS_FROM, the operator adopts its existing key instead of minting
 #    8  register the drive as a backend, by-id path, generation from the
 #       drive's INQUIRY product id (never from the loaded cartridge)
 #    9  the Heir Kit — generate, print, seal, two failure domains
 #   10  a shelf location for cartridges
-#   11  tenants and units: who owns which paths; the service user is granted read by ACL
+#   11  tenants and units: who owns which paths; the service user is granted read by ACL;
+#       with ADOPT_KEYS_FROM, each profile tenant adopts its existing key
 #   12  rehearsal on a TEST cartridge with the INSTALLED binary (erases it —
 #       serial required; runs as YOU). Ruled required before the first write
 #       (ADR-0012, 2026-09-23): a different binary is a different artifact.
@@ -69,6 +71,9 @@ LOCATIONS=()           # step 10: "name|description" — the first is the shelf 
 TENANTS=()             # step 11: "name|description" — non-operator tenants to create
 COLLECTIONS=()         # step 11: "name|root|tenant|unit_depth" — [[collections]] to configure and sync
 OPS_GROUP=""           # step 7: a group that may read the session logs (`tapectl status`), e.g. tapectl-ops (issue #393); empty = none
+ADOPT_KEYS_FROM=""     # steps 7 and 11: a directory of <tenant>.key age identity files (the SECRETS, copied out of an
+                       # old home: docs/keys-and-recovery.md) that the operator and the profile's tenants ADOPT instead
+                       # of minting new keys (issue #424). Every one of them must have its file. Empty = mint, as usual.
 # CONTENDER_UNITS is left UNSET here on purpose: unset means "this VM's homorg
 # timers" (the historical default, step 13); a profile that declares it — even
 # as () — replaces that list.
@@ -113,6 +118,9 @@ Options:
   --work-dir DIR    build lock and step-12 rehearsal workspace (default /scratch if it exists,
                     else ~/.cache/tapectl)
   --staging DIR     default for staging.directory in step 7
+  --adopt-keys-from DIR
+                    steps 7 and 11 adopt DIR/<name>.key (an age identity file) as the operator's and
+                    each profile tenant's key instead of minting one (docs/keys-and-recovery.md)
   --dar PATH        the dar binary: checked in step 2, first on PATH for the step-4 suite,
                     written to [dar] binary in step 7 (default: dar on PATH)
   --skip-build      do not build/install (use the resolved binary as-is)
@@ -146,6 +154,7 @@ while [ $# -gt 0 ]; do
     --work-dir) WORK_DIR="$2"; shift 2 ;;
     --staging) STAGING_DIR="$2"; shift 2 ;;
     --dar) DAR_BIN="$2"; shift 2 ;;
+    --adopt-keys-from) ADOPT_KEYS_FROM="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -302,6 +311,20 @@ kit_prepare() {
   sudo chown -R "$SVC_USER" "$1"
 }
 kit_finish()  { [ "$SVC_MODE" = 1 ] && sudo chown -R "$USER" "$1"; return 0; }
+# adopt_key_for NAME: with ADOPT_KEYS_FROM set, the identity file NAME adopts
+# ($ADOPT_KEYS_FROM/NAME.key) in ADOPT_FILE, after checking that the user
+# tapectl runs as can read it; dies naming the file otherwise — a missing
+# file must never quietly become a freshly minted key (issue #424). Only the
+# PATH is ever passed on or logged; tapectl reads the secret itself.
+adopt_key_for() {
+  ADOPT_FILE="$ADOPT_KEYS_FROM/$1.key"
+  if ! as_svc test -r "$ADOPT_FILE"; then
+    if [ -e "$ADOPT_FILE" ] || sudo -n test -e "$ADOPT_FILE" 2>/dev/null; then
+      die "$( [ "$SVC_MODE" = 1 ] && echo "$SVC_USER" || echo "$USER" ) cannot read $ADOPT_FILE — hand the directory over first: sudo chown -R $( [ "$SVC_MODE" = 1 ] && echo "$SVC_USER" || echo "$USER" ) $ADOPT_KEYS_FROM && sudo chmod 0700 $ADOPT_KEYS_FROM && sudo chmod 0600 $ADOPT_KEYS_FROM/*.key (its parent directories must let that user through)"
+    fi
+    die "ADOPT_KEYS_FROM is set, but there is no $ADOPT_FILE to adopt for \"$1\" — copy it out of the old home (docs/keys-and-recovery.md), or unset ADOPT_KEYS_FROM to mint new keys"
+  fi
+}
 # grant_read PATH: make PATH readable (tree) and its top dir writable (the
 # .tapectl-unit.toml dotfile) by the service user, via ACLs; ancestors get x.
 grant_read() {
@@ -598,6 +621,7 @@ hdr 7 "Initialise the tapectl home"
 skip_if || {
 if as_svc test -e "$EFFECTIVE_HOME/tapectl.db"; then
   ok "$EFFECTIVE_HOME is already initialised — not re-running init"
+  [ -n "$ADOPT_KEYS_FROM" ] && note "the operator's keys are left as they are (ADOPT_KEYS_FROM applies to a fresh init only)"
   # An initialised home can still carry a config this version refuses to
   # load: #171 made unknown keys a hard error and #172 deleted four keys
   # that older `init` runs wrote. The db check above says nothing about
@@ -654,10 +678,22 @@ EOF
   ask OPERATOR "operator name" "${OPERATOR:-$USER}"
   ADOPT=""
   if [ "$AUTO" != 1 ]; then ask ADOPT "existing escrow PUBLIC key to adopt (age1…, or a .pub path) — leave empty to mint a new one" ""; fi
+  INIT_ARGS=(init --operator "$OPERATOR")
+  [ -n "$ADOPT" ] && INIT_ARGS+=(--escrow-public-key "$ADOPT")
+  if [ -n "$ADOPT_KEYS_FROM" ]; then
+    # Issue #424: the operator keeps a key its holder already has. The dry
+    # run validates the file and names the public key it will register,
+    # creating nothing; the real init below repeats every check.
+    explain <<EOF
+ADOPTING THE OPERATOR KEY. ADOPT_KEYS_FROM is $ADOPT_KEYS_FROM, so init registers $OPERATOR.key from it as the operator's key ("$OPERATOR-primary") instead of minting a pair. It is copied byte for byte into the home's keys/, mode 0600. Check that the public key printed next is the one you expect (age-keygen -y on the original prints it).
+EOF
+    adopt_key_for "$OPERATOR"
+    INIT_ARGS+=(--operator-key "$ADOPT_FILE")
+    run tc --dry-run "${INIT_ARGS[@]}" || die "init refuses $ADOPT_FILE (read the reason above) — nothing was created"
+  fi
   note "PAPER READY? The escrow secret appears exactly once, next."
   confirm "Run init now? (type y — Enter means no, nothing has been created)" || die "stopped before init: nothing was minted or written. Re-run with --from $STEP and answer y when the paper is ready"
-  if [ -n "$ADOPT" ]; then run_nolog tc init --operator "$OPERATOR" --escrow-public-key "$ADOPT"
-  else run_nolog tc init --operator "$OPERATOR"; fi
+  run_nolog tc "${INIT_ARGS[@]}"
   note "Written down? It will not be shown again."
 fi
 explain <<'EOF'
@@ -892,11 +928,26 @@ if [ "${#TENANTS[@]}" -gt 0 ] || [ "${#COLLECTIONS[@]}" -gt 0 ]; then
 try:
   d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("tenants",[]); print(" ".join(r.get("name","") for r in rows))
 except Exception: pass' 2>/dev/null || true) "
+  # Issue #424: with ADOPT_KEYS_FROM, every tenant still to be created needs
+  # its file, checked for all of them before the first is added.
+  if [ -n "$ADOPT_KEYS_FROM" ]; then
+    for spec in "${TENANTS[@]}"; do
+      TNAME="${spec%%|*}"
+      case "$EXIST_T" in *" $TNAME "*) ;; *) adopt_key_for "$TNAME" ;; esac
+    done
+  fi
   for spec in "${TENANTS[@]}"; do
     TNAME="${spec%%|*}"; TDESC="${spec#*|}"; [ "$TDESC" = "$spec" ] && TDESC="$TNAME's data"
     case "$EXIST_T" in
-      *" $TNAME "*) ok "tenant $TNAME already exists" ;;
-      *) run tc tenant add "$TNAME" -d "$TDESC" || die "tenant add $TNAME failed" ;;
+      *" $TNAME "*) ok "tenant $TNAME already exists$( [ -n "$ADOPT_KEYS_FROM" ] && echo " — its keys are left as they are" )" ;;
+      *)
+        if [ -n "$ADOPT_KEYS_FROM" ]; then
+          adopt_key_for "$TNAME"
+          run tc --dry-run tenant add "$TNAME" -d "$TDESC" --adopt-key "$ADOPT_FILE" || die "tenant add $TNAME refuses $ADOPT_FILE (read the reason above) — nothing was created for it"
+          run tc tenant add "$TNAME" -d "$TDESC" --adopt-key "$ADOPT_FILE" || die "tenant add $TNAME --adopt-key failed"
+        else
+          run tc tenant add "$TNAME" -d "$TDESC" || die "tenant add $TNAME failed"
+        fi ;;
     esac
   done
   CFG="$EFFECTIVE_HOME/config.toml"
@@ -933,7 +984,12 @@ while [ "$ADD_MORE" = 1 ]; do
   if [ "$NT" != 0 ] && ! confirm "Add a tenant?"; then break; fi
   ask TENANT "tenant name (letters, digits, dot, underscore, dash)" "${TENANT:-alice}"
   ask TDESC "description" "$TENANT's data"
-  run tc tenant add "$TENANT" -d "$TDESC" || note "(already exists?)"
+  if [ -n "$ADOPT_KEYS_FROM" ] && as_svc test -r "$ADOPT_KEYS_FROM/$TENANT.key"; then
+    run tc tenant add "$TENANT" -d "$TDESC" --adopt-key "$ADOPT_KEYS_FROM/$TENANT.key" || note "(already exists, or the key was refused — read above)"
+  else
+    [ -n "$ADOPT_KEYS_FROM" ] && note "no $ADOPT_KEYS_FROM/$TENANT.key — minting new keys for $TENANT"
+    run tc tenant add "$TENANT" -d "$TDESC" || note "(already exists?)"
+  fi
   explain <<'EOF'
 Register this tenant's data as units. Give a directory and it becomes one unit; repeat for each. (For a folder-per-unit tree, add a [[collections]] stanza instead — shown at the end of this step.)
 EOF

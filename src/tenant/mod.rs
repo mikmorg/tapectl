@@ -69,6 +69,129 @@ pub fn add_tenant(
     Ok(tenant_id)
 }
 
+/// The alias an adopted identity is registered under: the tenant's primary.
+const ADOPTED_ALIAS: &str = "primary";
+
+/// Every refusal `tenant add --adopt-key` (and `init --operator-key`) makes,
+/// decided before anything is written (issue #424): the dry run calls this
+/// and stops, the real add calls it and then writes. `pending_escrow` is an
+/// escrow public key about to be registered but not yet in the catalog —
+/// `init --escrow-public-key`'s, since `init` creates the operator tenant
+/// first.
+///
+/// Refuses: an invalid or taken tenant name; a public key the catalog
+/// already has, for any tenant, active or not; the escrow identity's secret
+/// (registered or pending) — ADR-0005 keeps that secret off every machine;
+/// and a key file already at the path the adopted key would take.
+pub fn plan_adoption(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    name: &str,
+    identity: &keys::AdoptableIdentity,
+    pending_escrow: Option<&str>,
+) -> Result<()> {
+    crate::naming::validate_tenant_name(name)?;
+    if queries::get_tenant_by_name(conn, name)?.is_some() {
+        return Err(TapectlError::TenantAlreadyExists(name.to_string()));
+    }
+    refuse_escrow_secret(identity, pending_escrow)?;
+    let pk = &identity.public_key;
+    if let Some(existing) = queries::get_key_by_fingerprint(conn, pk)? {
+        if existing.is_escrow {
+            return Err(escrow_secret_refusal(pk));
+        }
+        let owner = queries::get_tenant_by_id(conn, existing.tenant_id)?
+            .map(|t| t.name)
+            .unwrap_or_else(|| format!("#{}", existing.tenant_id));
+        let state = if existing.is_active {
+            "active"
+        } else {
+            "deactivated"
+        };
+        return Err(TapectlError::Other(format!(
+            "adoption refuses: public key {pk} is already registered as \"{}\", a key of \
+             tenant \"{owner}\" ({state}) — a key belongs to one tenant, so it cannot also be \
+             tenant \"{name}\"'s",
+            existing.alias
+        )));
+    }
+    let (pub_path, key_path) = keys::key_paths(&paths.keys_dir, name, ADOPTED_ALIAS);
+    for p in [&key_path, &pub_path] {
+        if p.exists() {
+            return Err(TapectlError::Other(format!(
+                "adoption refuses: {} already exists — tenant \"{name}\" has no row, so that \
+                 file is left over from an earlier home; move it out of keys/ first",
+                p.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `identity` when it is the secret of `escrow_public_key` — the
+/// escrow identity not yet in the catalog (`init --escrow-public-key`, which
+/// registers it only after the operator tenant). Pure: no catalog.
+pub fn refuse_escrow_secret(
+    identity: &keys::AdoptableIdentity,
+    escrow_public_key: Option<&str>,
+) -> Result<()> {
+    match escrow_public_key {
+        Some(escrow) if escrow == identity.public_key => {
+            Err(escrow_secret_refusal(&identity.public_key))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn escrow_secret_refusal(public_key: &str) -> TapectlError {
+    TapectlError::Other(format!(
+        "adoption refuses: this is the escrow identity's secret (its public key {public_key} \
+         is the escrow recipient) — ADR-0005 keeps the escrow secret on paper, in the Heir \
+         Kit, and never on this machine, so it cannot be a tenant key"
+    ))
+}
+
+/// Add a tenant whose primary key is an existing age identity instead of a
+/// minted pair (issue #424, ADR-0012 2026-10-12 item 42). Mints nothing: the
+/// tenant has the one key it adopted, registered as `<name>-primary`, stored
+/// as [`keys::save_adopted_keypair`] stores it. Every refusal is
+/// [`plan_adoption`]'s and comes before any write; the rows and the files go
+/// in together or not at all.
+pub fn add_tenant_adopting(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    name: &str,
+    description: Option<&str>,
+    is_operator: bool,
+    identity: &keys::AdoptableIdentity,
+    pending_escrow: Option<&str>,
+) -> Result<i64> {
+    plan_adoption(conn, paths, name, identity, pending_escrow)?;
+
+    let tx = conn.unchecked_transaction()?;
+    let tenant_id = queries::insert_tenant(&tx, name, description, is_operator)?;
+    events::log_created(&tx, "tenant", tenant_id, name, None)?;
+    let full_alias = format!("{name}-{ADOPTED_ALIAS}");
+    let key_id = queries::insert_key(
+        &tx,
+        tenant_id,
+        &full_alias,
+        &identity.public_key,
+        &identity.public_key,
+        "primary",
+        Some("Adopted from an existing identity file"),
+    )?;
+    events::log_created(&tx, "encryption_key", key_id, &full_alias, Some(tenant_id))?;
+    keys::save_adopted_keypair(&paths.keys_dir, name, ADOPTED_ALIAS, identity)?;
+    if let Err(e) = tx.commit() {
+        let (pub_path, key_path) = keys::key_paths(&paths.keys_dir, name, ADOPTED_ALIAS);
+        let _ = std::fs::remove_file(key_path);
+        let _ = std::fs::remove_file(pub_path);
+        return Err(e.into());
+    }
+    Ok(tenant_id)
+}
+
 /// Get tenant info by name, returning an error if not found.
 pub fn require_tenant(conn: &Connection, name: &str) -> Result<crate::db::models::Tenant> {
     queries::get_tenant_by_name(conn, name)?
@@ -227,6 +350,146 @@ mod tests {
         let (pub_path, key_path) =
             crate::crypto::keys::key_paths(&paths.keys_dir, "alice", "primary");
         assert!(pub_path.exists() && key_path.exists());
+    }
+
+    // --- adoption (issue #424) ---------------------------------------------
+
+    /// An identity file as `age-keygen -o` writes it, outside the home.
+    fn identity_file(tmp: &TempDir, name: &str) -> (std::path::PathBuf, String) {
+        let kp = keys::generate_keypair();
+        let path = tmp.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "# created: 2026-10-12T00:00:00Z\n# public key: {}\n{}\n",
+                kp.public_key, kp.secret_key
+            ),
+        )
+        .unwrap();
+        (path, kp.public_key)
+    }
+
+    fn counts(conn: &Connection) -> (i64, i64) {
+        let t = conn
+            .query_row("SELECT COUNT(*) FROM tenants", [], |r| r.get(0))
+            .unwrap();
+        let k = conn
+            .query_row("SELECT COUNT(*) FROM encryption_keys", [], |r| r.get(0))
+            .unwrap();
+        (t, k)
+    }
+
+    fn key_files(paths: &TapectlPaths) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&paths.keys_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn an_adopted_tenant_has_exactly_the_one_key_it_was_given() {
+        let (conn, tmp, paths) = fixture();
+        let (path, public) = identity_file(&tmp, "fam.key");
+        let id = keys::read_adoptable_identity(&path).unwrap();
+        let tid = add_tenant_adopting(&conn, &paths, "fam", None, false, &id, None).unwrap();
+
+        let rows = queries::list_keys_for_tenant(&conn, tid).unwrap();
+        assert_eq!(rows.len(), 1, "adoption mints nothing");
+        assert_eq!(rows[0].alias, "fam-primary");
+        assert_eq!(rows[0].key_type, "primary");
+        assert_eq!(rows[0].fingerprint, public);
+        assert_eq!(rows[0].public_key, public);
+        assert!(rows[0].is_active && !rows[0].is_escrow);
+        assert_eq!(
+            key_files(&paths),
+            vec!["fam-primary.age.key", "fam-primary.age.pub"]
+        );
+        let (_, key_path) = keys::key_paths(&paths.keys_dir, "fam", "primary");
+        assert_eq!(
+            std::fs::read(key_path).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        let loaded = keys::load_tenant_identities(&conn, &paths.keys_dir, "fam").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].to_public().to_string(), public);
+    }
+
+    #[test]
+    fn every_adoption_refusal_leaves_no_tenant_key_row_or_file_behind() {
+        let (conn, tmp, paths) = fixture();
+        add_tenant(&conn, &paths, "op", None, true).unwrap();
+        let (taken, _) = identity_file(&tmp, "taken.key");
+        let taken_id = keys::read_adoptable_identity(&taken).unwrap();
+        add_tenant_adopting(&conn, &paths, "alice", None, false, &taken_id, None).unwrap();
+        let (escrow, escrow_pub) = identity_file(&tmp, "escrow.key");
+        let op = queries::get_operator_tenant(&conn).unwrap().unwrap();
+        queries::insert_escrow_key(&conn, op.id, "op-escrow", &escrow_pub, &escrow_pub, None)
+            .unwrap();
+        let escrow_id = keys::read_adoptable_identity(&escrow).unwrap();
+        let (fresh, fresh_pub) = identity_file(&tmp, "fresh.key");
+        let fresh_id = keys::read_adoptable_identity(&fresh).unwrap();
+
+        let before = counts(&conn);
+        let files_before = key_files(&paths);
+
+        let refuse = |name: &str, id: &keys::AdoptableIdentity, pending: Option<&str>| {
+            let planned = plan_adoption(&conn, &paths, name, id, pending)
+                .expect_err("the plan refuses")
+                .to_string();
+            let added = add_tenant_adopting(&conn, &paths, name, None, false, id, pending)
+                .expect_err("the add refuses")
+                .to_string();
+            assert_eq!(planned, added, "the dry run refuses what the add refuses");
+            assert_eq!(counts(&conn), before, "{added}");
+            assert_eq!(key_files(&paths), files_before, "{added}");
+            added
+        };
+
+        // Registered to another tenant (and to the same name it is taken).
+        let msg = refuse("bob", &taken_id, None);
+        assert!(
+            msg.contains("already registered as \"alice-primary\""),
+            "{msg}"
+        );
+        assert!(msg.contains("tenant \"alice\""), "{msg}");
+        // A deactivated key is still registered.
+        conn.execute(
+            "UPDATE encryption_keys SET is_active = 0 WHERE alias = 'alice-primary'",
+            [],
+        )
+        .unwrap();
+        let msg = refuse("bob", &taken_id, None);
+        assert!(msg.contains("(deactivated)"), "{msg}");
+        // The escrow secret, registered.
+        let msg = refuse("bob", &escrow_id, None);
+        assert!(msg.contains("escrow identity's secret"), "{msg}");
+        assert!(msg.contains("ADR-0005"), "{msg}");
+        // The escrow secret, about to be registered (init's order).
+        let msg = refuse("bob", &fresh_id, Some(&fresh_pub));
+        assert!(msg.contains("escrow identity's secret"), "{msg}");
+        // A taken tenant name, an invalid one.
+        let msg = refuse("alice", &fresh_id, None);
+        assert!(msg.contains("alice"), "{msg}");
+        let msg = refuse("../escaped", &fresh_id, None);
+        assert!(msg.contains("invalid tenant name"), "{msg}");
+        // A left-over key file at the path the adopted key would take.
+        let stray = paths.keys_dir.join("carol-primary.age.key");
+        std::fs::write(&stray, "left over\n").unwrap();
+        let files_before_stray = key_files(&paths);
+        let msg = plan_adoption(&conn, &paths, "carol", &fresh_id, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("carol-primary.age.key already exists"),
+            "{msg}"
+        );
+        add_tenant_adopting(&conn, &paths, "carol", None, false, &fresh_id, None).unwrap_err();
+        assert_eq!(counts(&conn), before);
+        assert_eq!(key_files(&paths), files_before_stray);
+        assert_eq!(std::fs::read_to_string(&stray).unwrap(), "left over\n");
     }
 
     // --- operator_name_for_init (issue #357) -------------------------------

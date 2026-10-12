@@ -110,6 +110,15 @@ pub enum Commands {
         /// receipts keep matching.
         #[arg(long, value_name = "KEY_OR_FILE", conflicts_with = "no_escrow")]
         escrow_public_key: Option<String>,
+        /// Adopt this existing age identity file (the SECRET) as the
+        /// operator's primary key instead of minting a pair, as `tenant add
+        /// --adopt-key` does for a tenant: stored byte for byte as
+        /// keys/<operator>-primary.age.key, mode 0600, and nothing is
+        /// minted. A path only, never a key on the command line. Refused
+        /// before anything is created when it is not one X25519 identity,
+        /// or when it is the secret of --escrow-public-key.
+        #[arg(long, value_name = "PATH")]
+        operator_key: Option<std::path::PathBuf>,
     },
 
     /// Manage tenants

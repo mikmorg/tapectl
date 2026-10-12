@@ -9,13 +9,23 @@ use crate::error::Result;
 
 #[derive(Subcommand, Debug)]
 pub enum TenantCommands {
-    /// Add a new tenant (generates keypair automatically)
+    /// Add a new tenant (mints a primary and a backup key pair, or adopts
+    /// an existing identity with --adopt-key)
     Add {
         /// Tenant name
         name: String,
         /// Description
         #[arg(long, short)]
         description: Option<String>,
+        /// Adopt this existing age identity file (the SECRET: one
+        /// AGE-SECRET-KEY-1… line; age-keygen's comment lines are kept) as
+        /// the tenant's primary key instead of minting a pair. It is stored
+        /// byte for byte as keys/<name>-primary.age.key, mode 0600, and is
+        /// the tenant's only key: nothing is minted. Refused: anything but
+        /// one X25519 identity, a public key already registered, and the
+        /// escrow identity's secret.
+        #[arg(long, value_name = "PATH")]
+        adopt_key: Option<std::path::PathBuf>,
     },
 
     /// List all tenants
@@ -75,7 +85,22 @@ pub fn run(
     dry_run: bool,
 ) -> Result<()> {
     match command {
-        TenantCommands::Add { name, description } => {
+        TenantCommands::Add {
+            name,
+            description,
+            adopt_key,
+        } => {
+            if let Some(path) = adopt_key {
+                return add_adopting(
+                    conn,
+                    paths,
+                    name,
+                    description.as_deref(),
+                    path,
+                    json_output,
+                    dry_run,
+                );
+            }
             // Issue #241: the same two facts `add_tenant` itself checks
             // first, reproduced here rather than inside it, so a dry run
             // never generates key material or touches disk. Refuses ahead
@@ -289,6 +314,55 @@ pub fn run(
                 println!("tenant \"{name}\" deleted");
             }
         }
+    }
+    Ok(())
+}
+
+/// `tenant add --adopt-key` (issue #424): every refusal is
+/// `tenant::plan_adoption`'s, so the dry run refuses exactly what the real
+/// add refuses, then stops before writing anything.
+fn add_adopting(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    name: &str,
+    description: Option<&str>,
+    path: &std::path::Path,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let identity = crate::crypto::keys::read_adoptable_identity(path)?;
+    let alias = format!("{name}-primary");
+    let public = &identity.public_key;
+    if dry_run {
+        crate::tenant::plan_adoption(conn, paths, name, &identity, None)?;
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({"name": name, "dry_run": true,
+                                   "adopted_key": alias, "public_key": public})
+            );
+        } else {
+            println!(
+                "would create tenant \"{name}\" adopting {} as \"{alias}\" ({public}); \
+                 nothing would be minted (DRY RUN — no changes made)",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    let id =
+        crate::tenant::add_tenant_adopting(conn, paths, name, description, false, &identity, None)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::json!({"id": id, "name": name, "status": "created",
+                               "adopted_key": alias, "public_key": public})
+        );
+    } else {
+        println!(
+            "tenant \"{name}\" created (id={id}) with the adopted key \"{alias}\" ({public}); \
+             no key was minted"
+        );
     }
     Ok(())
 }
