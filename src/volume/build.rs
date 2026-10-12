@@ -357,24 +357,7 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
     if inputs.catalog_db_path.is_some() {
         // Issue #83: make the operator-only catalog subset discoverable
         // rather than a mystery file next to MANIFEST.toml/PLAN.toml.
-        op_recovery.push_str(
-            "\n## Querying catalog.db\n\n\
-             This envelope also carries `catalog.db`, a small standalone SQLite \
-             database (no tapectl or the source `tapectl.db` needed) covering every \
-             unit written to THIS volume, across all tenants — operator-only, never \
-             in a tenant envelope. Tables: `tenants`, `units`, `snapshots`, \
-             `stage_sets` (with each set's recorded recipient list, `key_fingerprints`), \
-             `stage_slices` (with `sha256_plain`), `files`. Tape positions are NOT here; \
-             MANIFEST.toml beside this file has them. `PRAGMA user_version` on this \
-             file mirrors the schema level of the `tapectl.db` it was generated from. \
-             With the operator or escrow key, `tapectl catalog rebuild --from-volume` \
-             reconstructs the catalog from this envelope. Example:\n\n\
-             ```bash\n\
-             sqlite3 catalog.db 'SELECT u.name, s.version, count(f.id) \
-             FROM units u JOIN snapshots s ON s.unit_id = u.id \
-             LEFT JOIN files f ON f.snapshot_id = s.id GROUP BY u.id;'\n\
-             ```\n",
-        );
+        op_recovery.push_str(RECOVERY_CATALOG_DB);
     }
     let all_catalogs = catalogs_for_all(inputs);
     // PLAN.toml survives the standalone v1 planning-header zone as an
@@ -755,6 +738,44 @@ impl BuiltLayout {
 /// (no `conn`), so this can't reuse `queries::recipient_list_with_escrow`
 /// (which does its own DB lookup) — it operates on the already-resolved
 /// `Option<String>` `BuildInputs.escrow_public_key` instead.
+/// The operator envelope's `RECOVERY.md` section on its `catalog.db`
+/// (issue #83): what the file holds, for an operator with only `sqlite3`,
+/// and queries that work on it. It describes generation 3
+/// (`volume-format-v2.md` §1.4), the shape `db::ontape_catalog::write`
+/// makes; `recovery_md_catalog_db_queries_run_on_what_write_makes` runs each
+/// query against that writer's output.
+const RECOVERY_CATALOG_DB: &str = "\n## Querying catalog.db\n\n\
+     This envelope also carries `catalog.db`, a small standalone SQLite \
+     database (no tapectl or the source `tapectl.db` needed) covering every \
+     unit written to THIS volume, across all tenants — operator-only, never \
+     in a tenant envelope. Tables: `tenants`, `units`, `snapshots`, \
+     `stage_sets` (with each set's recorded recipient list, `key_fingerprints`), \
+     `stage_slices` (with `sha256_plain`), `paths` (each path once per unit, \
+     relative to the snapshot's `source_path`) and `file_versions` (one row per \
+     entry of each version: `kind` 0 directory, 1 regular file, 2 symlink, \
+     3 special file such as a FIFO or device; `size_bytes`; `mtime_ns`, Unix \
+     time in nanoseconds; `sha256` as 32 raw bytes, `lower(hex(sha256))` \
+     prints it; `link_target`, a symlink's target). Permissions, owners and \
+     extended attributes are in the dar catalogues beside this file, not here. \
+     Tape positions are NOT here; MANIFEST.toml beside this file has them. \
+     `PRAGMA user_version` on this file mirrors the schema level of the \
+     `tapectl.db` it was generated from. With the operator or escrow key, \
+     `tapectl catalog rebuild --from-volume` reconstructs the catalog from \
+     this envelope. Examples: each unit's versions and their entry counts, \
+     then one unit's entries (put its name in place of UNIT):\n\n\
+     ```bash\n\
+     sqlite3 catalog.db 'SELECT u.name, s.version, count(fv.path_id) \
+     FROM units u JOIN snapshots s ON s.unit_id = u.id \
+     LEFT JOIN file_versions fv ON fv.snapshot_id = s.id GROUP BY s.id;'\n\
+     sqlite3 catalog.db \"SELECT p.path, CASE fv.kind WHEN 0 THEN 'dir' \
+     WHEN 1 THEN 'regular' WHEN 2 THEN 'symlink' ELSE 'special' END, \
+     fv.size_bytes, lower(hex(fv.sha256)), \
+     datetime(fv.mtime_ns / 1000000000, 'unixepoch'), fv.link_target \
+     FROM file_versions fv JOIN paths p ON p.id = fv.path_id \
+     JOIN snapshots s ON s.id = fv.snapshot_id JOIN units u ON u.id = s.unit_id \
+     WHERE u.name = 'UNIT' ORDER BY s.version, p.path;\"\n\
+     ```\n";
+
 fn with_escrow(mut recipients: Vec<String>, escrow_public_key: &Option<String>) -> Vec<String> {
     if let Some(escrow) = escrow_public_key {
         recipients.push(escrow.clone());
@@ -2085,5 +2106,116 @@ mod tests {
             "backup entry must record the primary's ciphertext hash"
         );
         assert_eq!(backup_entry.size_bytes, Some(op_bytes.len() as u64));
+    }
+
+    /// The heir's side of `catalog.db` (#83; ADR-0012 2026-10-12 item 48):
+    /// every `sqlite3 catalog.db …` line `RECOVERY.md` shows runs, as
+    /// written, against what `db::ontape_catalog::write` makes, and says
+    /// what the section claims — the entry counts, then one unit's entries
+    /// with each kind by name, the hash in hex, the mtime as a date and a
+    /// symlink's target. Run through rusqlite's bundled SQLite, the engine
+    /// the `sqlite3` shell wraps.
+    #[test]
+    fn recovery_md_catalog_db_queries_run_on_what_write_makes() {
+        use crate::db::files::{fixture, FileEntry, FileKind};
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 'alice', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, checksum_mode, encrypt, status)
+                  VALUES (1, 'u-1', 'photos', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count,
+                                    total_size)
+                  VALUES (1, 1, 3, 'staged', '/src/photos', 3, 5);
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size, num_slices)
+                  VALUES (1, 1, 'staged', 1000, 1);",
+        )
+        .unwrap();
+        let at = Some(1_788_264_000_000_000_000);
+        for e in [
+            FileEntry {
+                path: "2019".into(),
+                kind: FileKind::Dir,
+                size_bytes: 0,
+                mtime_ns: at,
+                sha256: None,
+                link_target: None,
+            },
+            FileEntry {
+                path: "2019/a.jpg".into(),
+                kind: FileKind::Regular,
+                size_bytes: 5,
+                mtime_ns: at,
+                sha256: Some([0xAB; 32]),
+                link_target: None,
+            },
+            FileEntry {
+                path: "2019/latest".into(),
+                kind: FileKind::Symlink,
+                size_bytes: 5,
+                mtime_ns: at,
+                sha256: None,
+                link_target: Some("a.jpg".into()),
+            },
+        ] {
+            fixture::insert_entry(&conn, 1, e);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        crate::db::ontape_catalog::write(&conn, &[1], &path).unwrap();
+        let ontape = rusqlite::Connection::open(&path).unwrap();
+
+        let queries: Vec<String> = RECOVERY_CATALOG_DB
+            .lines()
+            .filter_map(|l| l.strip_prefix("sqlite3 catalog.db "))
+            .map(|q| {
+                let quote = q.chars().next().unwrap();
+                assert!(quote == '\'' || quote == '"', "a quoted query: {q}");
+                let inner = q.strip_prefix(quote).unwrap().strip_suffix(quote).unwrap();
+                assert!(
+                    !inner.contains(quote) && !inner.contains('$') && !inner.contains('\\'),
+                    "the shell passes it to sqlite3 unchanged: {inner}"
+                );
+                inner.replace("UNIT", "photos")
+            })
+            .collect();
+        assert_eq!(queries.len(), 2, "{RECOVERY_CATALOG_DB}");
+
+        let rows = |sql: &str| -> Vec<Vec<rusqlite::types::Value>> {
+            let mut stmt = ontape.prepare(sql).unwrap();
+            let n = stmt.column_count();
+            stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        use rusqlite::types::Value::{Integer, Null, Text};
+        let s = |t: &str| Text(t.to_string());
+        assert_eq!(
+            rows(&queries[0]),
+            vec![vec![s("photos"), Integer(3), Integer(3)]]
+        );
+        let when = s("2026-09-01 12:00:00");
+        assert_eq!(
+            rows(&queries[1]),
+            vec![
+                vec![s("2019"), s("dir"), Integer(0), s(""), when.clone(), Null],
+                vec![
+                    s("2019/a.jpg"),
+                    s("regular"),
+                    Integer(5),
+                    s(&"ab".repeat(32)),
+                    when.clone(),
+                    Null
+                ],
+                vec![
+                    s("2019/latest"),
+                    s("symlink"),
+                    Integer(5),
+                    s(""),
+                    when,
+                    s("a.jpg")
+                ],
+            ]
+        );
     }
 }

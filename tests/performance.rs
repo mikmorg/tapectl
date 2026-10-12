@@ -411,19 +411,21 @@ fn perf_fresh_catalog_takes_a_184k_file_version() {
         start.elapsed(),
     );
 
-    // The way `catalog rebuild` reads it back: everything but `files`, then
-    // each version's rows streamed as one range of ids.
+    // The way `catalog rebuild` reads it back: everything but the per-file
+    // rows, then each version's rows streamed as one range of keys.
     let start = Instant::now();
-    let (ontape, _) = db::ontape_catalog::read_all_but_files(&out).unwrap();
-    let spans = db::ontape_catalog::file_id_spans(&ontape).unwrap();
-    let (first, last) = spans[&1];
-    let mut stmt = ontape
-        .prepare(db::ontape_catalog::FILES_OF_SNAPSHOT)
+    let (ontape, cat) = db::ontape_catalog::read_all_but_files(&out).unwrap();
+    let spans = db::ontape_catalog::FileSpans::read(&ontape, cat.generation).unwrap();
+    let rows = spans
+        .stream(&ontape, 1, |entries| {
+            let mut n = 0;
+            for e in entries {
+                e?;
+                n += 1;
+            }
+            Ok(n)
+        })
         .unwrap();
-    let rows = stmt
-        .query_map(params![1, first, last], db::ontape_catalog::file_row)
-        .unwrap()
-        .count();
     assert_eq!(rows, files);
     report(
         "catalog.db stream",

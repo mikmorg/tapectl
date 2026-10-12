@@ -25,31 +25,47 @@
 //! staging time for *this volume's write only*, inside an age envelope
 //! encrypted to operator + escrow, and never a tenant envelope.
 //!
-//! # Two generations exist on shipped tape
+//! # Three generations exist
 //!
-//! A `catalog.db` written between #83's original landing (2026-07) and the
-//! 2026-09-11 decision carries `units`, `snapshots`, `stage_sets`,
-//! `stage_slices` and `files` only. One written after the 2026-09-11
-//! decision (review finding 2) additionally
-//! carries `tenants` (unit ownership), `stage_sets.key_fingerprints` (the
-//! escrow receipt #137 could not otherwise recover) and
-//! `stage_slices.sha256_plain`. `PRAGMA user_version` cannot tell them apart
-//! — it is stamped from the SOURCE database's schema level, which moves
-//! independently of when this file's own shape changed. [`detect_generation`]
-//! probes the actual shape instead; see its doc for why an operator database
-//! at the same `user_version` can still carry either shape of `catalog.db`.
+//! `docs/design/volume-format-v2.md` §1.4 is the normative statement.
+//!
+//! 1. Written between #83's original landing (2026-07) and the 2026-09-11
+//!    decision: `units`, `snapshots`, `stage_sets`, `stage_slices` and
+//!    `files` only.
+//! 2. Written from the 2026-09-11 decision (review finding 2) until 1.1.0:
+//!    additionally `tenants` (unit ownership), `stage_sets.key_fingerprints`
+//!    (the escrow receipt #137 could not otherwise recover) and
+//!    `stage_slices.sha256_plain`.
+//! 3. Written by 1.1.0 and later (ADR-0012 2026-10-12 item 48, #418 R3): as
+//!    2, but `files` is replaced by the main catalog's narrow shape
+//!    (migration 030), `paths` + `file_versions`, which records each entry's
+//!    kind and link target (#381's on-tape half).
+//!
+//! `PRAGMA user_version` cannot tell them apart — it is stamped from the
+//! SOURCE database's schema level, which moves independently of when this
+//! file's own shape changed. [`detect_generation`] probes the actual shape
+//! instead; see its doc for why an operator database at the same
+//! `user_version` can still carry more than one shape of `catalog.db`.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::{params_from_iter, Connection};
 
+use super::files::{self as files_db, FileEntry, FileKind};
 use crate::error::{Result, TapectlError};
 
 /// Table/column subset carried into the snapshot: enough to answer "what
 /// units/snapshots/files landed on this volume" without needing the source
 /// `tapectl.db` — see `RECOVERY.md`'s "Querying `catalog.db`" section for
-/// the schema as documented to the operator.
+/// the schema as documented to the operator, and `volume-format-v2.md` §1.4
+/// for the normative one. This is generation 3; generations 1 and 2 are only
+/// ever read (`tests/fixtures/ontape_catalog/` holds files their own writers
+/// made; [`fixture::downgrade`] approximates them from this writer's output).
+///
+/// `paths` carries no `UNIQUE(unit_id, path)` index, unlike the main
+/// catalog's: nothing reads this file by name, a rebuild interns paths into
+/// its own catalog's index, and the index would store every path twice.
 const SCHEMA: &str = "
 CREATE TABLE tenants (
     id          INTEGER PRIMARY KEY,
@@ -89,15 +105,22 @@ CREATE TABLE stage_slices (
     sha256_plain     TEXT,
     sha256_encrypted TEXT
 );
-CREATE TABLE files (
-    id           INTEGER PRIMARY KEY,
-    snapshot_id  INTEGER NOT NULL,
-    path         TEXT NOT NULL,
-    size_bytes   INTEGER,
-    sha256       TEXT,
-    modified_at  TEXT,
-    is_directory INTEGER
+CREATE TABLE paths (
+    id      INTEGER PRIMARY KEY,
+    unit_id INTEGER NOT NULL,
+    path    TEXT NOT NULL
 );
+CREATE TABLE file_versions (
+    snapshot_id INTEGER NOT NULL,
+    path_id     INTEGER NOT NULL,
+    kind        INTEGER NOT NULL CHECK(kind IN (0, 1, 2, 3)),
+    size_bytes  INTEGER NOT NULL,
+    mtime_ns    INTEGER,
+    sha256      BLOB CHECK(sha256 IS NULL
+                           OR (typeof(sha256) = 'blob' AND length(sha256) = 32)),
+    link_target TEXT,
+    PRIMARY KEY (snapshot_id, path_id)
+) WITHOUT ROWID;
 ";
 
 /// Which shape a `catalog.db` file carries. Named for what each carries, not
@@ -105,14 +128,41 @@ CREATE TABLE files (
 /// database and does not track this file's own shape (see the module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Generation {
-    /// #83's original shape (landed 2026-07): `units`, `snapshots`,
-    /// `stage_sets`, `stage_slices`, `files` only. No `tenants` table, no
-    /// `stage_sets.key_fingerprints`, no `stage_slices.sha256_plain`.
-    Original,
-    /// The 2026-09-11 shape (review finding 2): adds `tenants` (unit
-    /// ownership), `stage_sets.key_fingerprints` (the escrow receipt) and
+    /// Generation 1, #83's original shape (landed 2026-07): `units`,
+    /// `snapshots`, `stage_sets`, `stage_slices`, `files` only. No `tenants`
+    /// table, no `stage_sets.key_fingerprints`, no
     /// `stage_slices.sha256_plain`.
+    Original,
+    /// Generation 2, the 2026-09-11 shape (review finding 2): adds `tenants`
+    /// (unit ownership), `stage_sets.key_fingerprints` (the escrow receipt)
+    /// and `stage_slices.sha256_plain`.
     WithOwnershipAndReceipts,
+    /// Generation 3, 1.1.0's shape (ADR-0012 2026-10-12 item 48): as
+    /// generation 2, with `files` replaced by `paths` + `file_versions`, which
+    /// carry each entry's kind and link target.
+    WithFileKinds,
+}
+
+impl Generation {
+    /// Whether the file carries `tenants`, `stage_sets.key_fingerprints` and
+    /// `stage_slices.sha256_plain` (generation 2 and later). Every reader
+    /// asks this, never `== WithOwnershipAndReceipts`, so a later generation
+    /// cannot silently read as an older one.
+    pub fn carries_ownership_and_receipts(self) -> bool {
+        match self {
+            Generation::Original => false,
+            Generation::WithOwnershipAndReceipts | Generation::WithFileKinds => true,
+        }
+    }
+
+    /// Whether each file's kind and link target are recorded (generation 3).
+    /// Older files record only `is_directory`.
+    pub fn carries_file_kinds(self) -> bool {
+        match self {
+            Generation::Original | Generation::WithOwnershipAndReceipts => false,
+            Generation::WithFileKinds => true,
+        }
+    }
 }
 
 /// True when `table` has a column named `column`, probed via
@@ -127,35 +177,87 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(has)
 }
 
-/// Probe the shape of an already-open `catalog.db` connection: does it carry
-/// a `tenants` table, and does `stage_sets` carry `key_fingerprints`? The two
-/// columns shipped together in the 2026-09-11 change, so they must agree —
-/// if they don't, this is a corrupt or hand-edited file, not a recognized
-/// generation, and this returns an error naming which one is present rather
-/// than guessing.
-pub fn detect_generation(conn: &Connection) -> Result<Generation> {
-    let has_tenants: bool = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tenants'",
-        [],
+fn has_table(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
         |r| r.get::<_, i64>(0),
-    )? > 0;
-    let has_receipts = has_column(conn, "stage_sets", "key_fingerprints")?;
+    )? > 0)
+}
 
-    match (has_tenants, has_receipts) {
-        (true, true) => Ok(Generation::WithOwnershipAndReceipts),
-        (false, false) => Ok(Generation::Original),
-        (true, false) => Err(TapectlError::Other(
-            "catalog.db has a `tenants` table but no `stage_sets.key_fingerprints` \
-             column — a corrupt or hand-edited file, not a recognized generation \
-             (the two shipped together on 2026-09-11)"
-                .to_string(),
-        )),
-        (false, true) => Err(TapectlError::Other(
-            "catalog.db has `stage_sets.key_fingerprints` but no `tenants` table — \
-             a corrupt or hand-edited file, not a recognized generation \
-             (the two shipped together on 2026-09-11)"
-                .to_string(),
-        )),
+/// Probe the shape of an already-open `catalog.db` connection
+/// (`volume-format-v2.md` §1.4):
+///
+/// - the per-file tables: `paths` + `file_versions` with no `files` is
+///   generation 3; `files` with neither of the others is generation 1 or 2;
+/// - for generations 1 and 2, `tenants` and `stage_sets.key_fingerprints`:
+///   both present is 2, both absent is 1. Generation 3 must carry both.
+///
+/// Markers that shipped together must agree. If they don't, this is a
+/// corrupt or hand-edited file, not a recognized generation, and this
+/// returns an error naming what is present rather than guessing.
+pub fn detect_generation(conn: &Connection) -> Result<Generation> {
+    let has_tenants = has_table(conn, "tenants")?;
+    let has_receipts = has_column(conn, "stage_sets", "key_fingerprints")?;
+    let has_files = has_table(conn, "files")?;
+    let has_paths = has_table(conn, "paths")?;
+    let has_file_versions = has_table(conn, "file_versions")?;
+
+    let unrecognized = |what: &str| {
+        Err(TapectlError::Other(format!(
+            "catalog.db {what} — a corrupt or hand-edited file, not a recognized \
+             generation (volume-format-v2.md §1.4)"
+        )))
+    };
+
+    match (has_files, has_paths, has_file_versions) {
+        (false, true, true) => {
+            if has_tenants && has_receipts {
+                Ok(Generation::WithFileKinds)
+            } else {
+                unrecognized(&format!(
+                    "has `paths` and `file_versions` (generation 3) but {}",
+                    match (has_tenants, has_receipts) {
+                        (false, false) =>
+                            "no `tenants` table and no `stage_sets.key_fingerprints` column",
+                        (false, true) => "no `tenants` table",
+                        _ => "no `stage_sets.key_fingerprints` column",
+                    }
+                ))
+            }
+        }
+        (true, false, false) => match (has_tenants, has_receipts) {
+            (true, true) => Ok(Generation::WithOwnershipAndReceipts),
+            (false, false) => Ok(Generation::Original),
+            (true, false) => unrecognized(
+                "has a `tenants` table but no `stage_sets.key_fingerprints` column \
+                 (the two shipped together on 2026-09-11)",
+            ),
+            (false, true) => unrecognized(
+                "has `stage_sets.key_fingerprints` but no `tenants` table \
+                 (the two shipped together on 2026-09-11)",
+            ),
+        },
+        (files, paths, versions) => {
+            let present: Vec<&str> = [
+                (files, "`files`"),
+                (paths, "`paths`"),
+                (versions, "`file_versions`"),
+            ]
+            .iter()
+            .filter(|(p, _)| *p)
+            .map(|(_, n)| *n)
+            .collect();
+            unrecognized(&format!(
+                "has {} as its per-file tables (generations 1 and 2 have `files` \
+                 alone, generation 3 `paths` and `file_versions` together)",
+                if present.is_empty() {
+                    "none".to_string()
+                } else {
+                    present.join(" and ")
+                }
+            ))
+        }
     }
 }
 
@@ -207,20 +309,19 @@ pub struct SliceRow {
     pub sha256_encrypted: String,
 }
 
+/// One entry of one on-tape version, in the catalog's own terms
+/// ([`FileEntry`]) whatever the generation it was read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRow {
-    pub id: i64,
     pub snapshot_id: i64,
-    pub path: String,
-    pub size_bytes: Option<i64>,
-    pub sha256: Option<String>,
-    pub modified_at: Option<String>,
-    pub is_directory: i64,
+    pub entry: FileEntry,
 }
 
 /// Every table of a `catalog.db`, read back typed. `tenants` is empty and
 /// every `key_fingerprints`/`sha256_plain` is `None` when `generation` is
-/// [`Generation::Original`] — that is a real, expected shape, not an error.
+/// [`Generation::Original`], and every file's kind is `Dir` or `Regular`
+/// with no link target before [`Generation::WithFileKinds`] — real,
+/// expected shapes, not errors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnTapeCatalog {
     pub generation: Generation,
@@ -232,69 +333,272 @@ pub struct OnTapeCatalog {
     pub files: Vec<FileRow>,
 }
 
-/// The `files` rows of one on-tape snapshot (`?1`), in `id` order: what
-/// [`file_row`] maps. A rebuild streams them one version at a time (issue
-/// #413) instead of holding every row of the tape in memory.
-///
-/// `?2`/`?3` are the snapshot's lowest and highest `id` from
-/// [`file_id_spans`]. `files` has no index on `snapshot_id` (and this file's
-/// shape is fixed until its 1.2.0 change), so without the bounds each
-/// version would be a scan of every row on the tape, once per unit; with
-/// them it is one range of the table's own b-tree. Both writers put a
-/// version's rows in one run of ids, and a row of another version inside
-/// the range is still excluded by `snapshot_id`.
-pub const FILES_OF_SNAPSHOT: &str =
+/// Generations 1 and 2: one version's `files` rows (`?1`), in `id` order.
+/// `?2`/`?3` are the version's lowest and highest `id`: `files` has no index
+/// on `snapshot_id`, so without the bounds each version would be a scan of
+/// every row on the tape, once per unit (issue #413); with them it is one
+/// range of the table's own b-tree. Every writer of those generations put a
+/// version's rows in one run of ids, and a row of another version inside the
+/// range is still excluded by `snapshot_id`.
+const LEGACY_FILES_OF_SNAPSHOT: &str =
     "SELECT id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory
      FROM files WHERE id BETWEEN ?2 AND ?3 AND snapshot_id = ?1 ORDER BY id";
 
-/// Each snapshot's lowest and highest `files.id`, for [`FILES_OF_SNAPSHOT`]:
-/// one pass over `files`.
-pub fn file_id_spans(conn: &Connection) -> Result<HashMap<i64, (i64, i64)>> {
-    let mut stmt =
-        conn.prepare("SELECT snapshot_id, MIN(id), MAX(id) FROM files GROUP BY snapshot_id")?;
-    let spans = stmt
-        .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
-        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
-    Ok(spans)
+const LEGACY_SPANS: &str = "SELECT snapshot_id, MIN(id), MAX(id) FROM files GROUP BY snapshot_id";
+
+/// Generation 3: one version's rows (`?1`) with their paths, in `path_id`
+/// order: the order the writing catalog first interned each path — walk
+/// order for a unit's first version; in a later version, paths new to the
+/// unit follow all earlier ones. A range of `file_versions`' primary key;
+/// the bounds keep it one even if a planner chose otherwise.
+const FILE_VERSIONS_OF_SNAPSHOT: &str =
+    "SELECT fv.path_id, p.path, fv.kind, fv.size_bytes, fv.mtime_ns, fv.sha256, fv.link_target
+     FROM file_versions fv JOIN paths p ON p.id = fv.path_id
+     WHERE fv.snapshot_id = ?1 AND fv.path_id BETWEEN ?2 AND ?3
+     ORDER BY fv.path_id";
+
+const FILE_VERSIONS_SPANS: &str =
+    "SELECT snapshot_id, MIN(path_id), MAX(path_id) FROM file_versions GROUP BY snapshot_id";
+
+/// Where each version's file rows lie in an open `catalog.db`, so a reader
+/// streams one version at a time (issue #413) instead of holding every row of
+/// the tape in memory: the per-file rows are nearly all of the file (about
+/// 250 MB of rows for a million-file tape in generation 2's shape). One pass
+/// over the per-file table builds it.
+#[derive(Debug, Clone)]
+pub struct FileSpans {
+    generation: Generation,
+    /// snapshot id -> the lowest and highest key its rows occupy: `files.id`
+    /// (generations 1 and 2) or `file_versions.path_id` (generation 3). A
+    /// version with no rows has no entry.
+    spans: HashMap<i64, (i64, i64)>,
 }
 
-/// One row of a `files` SELECT in [`FILES_OF_SNAPSHOT`]'s column order.
-pub fn file_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
-    Ok(FileRow {
-        id: r.get(0)?,
-        snapshot_id: r.get(1)?,
-        path: r.get(2)?,
-        size_bytes: r.get(3)?,
-        sha256: r.get(4)?,
-        modified_at: r.get(5)?,
-        is_directory: r.get(6)?,
-    })
+impl FileSpans {
+    pub fn read(conn: &Connection, generation: Generation) -> Result<Self> {
+        let sql = if generation.carries_file_kinds() {
+            FILE_VERSIONS_SPANS
+        } else {
+            LEGACY_SPANS
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let spans = stmt
+            .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+            .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+        Ok(FileSpans { generation, spans })
+    }
+
+    /// Whether `snapshot_id` has any file rows in this file.
+    pub fn contains(&self, snapshot_id: i64) -> bool {
+        self.spans.contains_key(&snapshot_id)
+    }
+
+    /// The versions with file rows, ascending.
+    pub fn snapshot_ids(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self.spans.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Hand `f` one version's entries as the catalog's own [`FileEntry`] —
+    /// converted here, so no reader knows which generation it read — in the
+    /// order the file keeps them: `files.id` order in generations 1 and 2
+    /// (walk order: the shipped writers copied the catalog's own ids, which
+    /// the walk's inserts numbered); `path_id` order in generation 3, the
+    /// order the writing catalog first interned each path (walk order for a
+    /// unit's first version; in a later version, paths new to the unit
+    /// follow all earlier ones). A version with no rows is an empty
+    /// iterator.
+    ///
+    /// A value that would not come back as what the writer recorded is
+    /// refused, naming the row: a reader does not guess.
+    ///
+    /// - Generations 1 and 2 (path, hex sha256, RFC 3339 mtime,
+    ///   `is_directory`): a sha256 that is not 64 lowercase hex characters,
+    ///   a `modified_at` that is not the walk's own spelling, or a NULL
+    ///   `size_bytes` is refused. One exception: a `modified_at` in the walk's
+    ///   spelling but dated before 1677-09-21 or after 2262-04-11, which no
+    ///   nanosecond count holds, comes back as no mtime — what today's walk
+    ///   records for that same file — rather than failing the rebuild of a
+    ///   tape that cannot be corrected (migration 030 does the same to that
+    ///   value in a catalog: ADR-0012 amendment 2026-10-07 item 9). These
+    ///   generations carry no file type (#381): a non-directory comes back
+    ///   `Regular` with no link target, whatever it was. dar's catalogue on
+    ///   the same tape still holds the real type.
+    /// - Generation 3: a `kind` outside 0–3 or a `sha256` that is not 32
+    ///   bytes is refused; everything else is the catalog's own value.
+    pub fn stream<R>(
+        &self,
+        conn: &Connection,
+        snapshot_id: i64,
+        f: impl FnOnce(&mut dyn Iterator<Item = Result<FileEntry>>) -> Result<R>,
+    ) -> Result<R> {
+        let Some(&(first, last)) = self.spans.get(&snapshot_id) else {
+            return f(&mut std::iter::empty());
+        };
+        let bounds = rusqlite::params![snapshot_id, first, last];
+        if self.generation.carries_file_kinds() {
+            let mut stmt = conn.prepare(FILE_VERSIONS_OF_SNAPSHOT)?;
+            let rows = stmt.query_map(bounds, |r| {
+                Ok(FileVersionRow {
+                    path_id: r.get(0)?,
+                    path: r.get(1)?,
+                    kind: r.get(2)?,
+                    size_bytes: r.get(3)?,
+                    mtime_ns: r.get(4)?,
+                    sha256: r.get(5)?,
+                    link_target: r.get(6)?,
+                })
+            })?;
+            let mut entries = rows.map(|row| row?.into_entry(snapshot_id));
+            f(&mut entries)
+        } else {
+            let mut stmt = conn.prepare(LEGACY_FILES_OF_SNAPSHOT)?;
+            let rows = stmt.query_map(bounds, |r| {
+                Ok(LegacyFileRow {
+                    id: r.get(0)?,
+                    path: r.get(2)?,
+                    size_bytes: r.get(3)?,
+                    sha256: r.get(4)?,
+                    modified_at: r.get(5)?,
+                    is_directory: r.get(6)?,
+                })
+            })?;
+            let mut entries = rows.map(|row| row?.into_entry());
+            f(&mut entries)
+        }
+    }
 }
 
-/// Read every table of the `catalog.db` at `path`, tolerating
-/// [`Generation::Original`] (no `tenants`; `key_fingerprints`/`sha256_plain`
+/// A generation-1/2 `files` row as stored.
+struct LegacyFileRow {
+    id: i64,
+    path: String,
+    size_bytes: Option<i64>,
+    sha256: Option<String>,
+    modified_at: Option<String>,
+    is_directory: i64,
+}
+
+impl LegacyFileRow {
+    fn into_entry(self) -> Result<FileEntry> {
+        let bad = |e: TapectlError| {
+            TapectlError::Other(format!(
+                "catalog.db files row {} ({:?}): {e}",
+                self.id, self.path
+            ))
+        };
+        let size_bytes = self
+            .size_bytes
+            .ok_or_else(|| bad(TapectlError::Other("NULL size_bytes".to_string())))?;
+        let mtime_ns = self
+            .modified_at
+            .as_deref()
+            .map(files_db::mtime_ns_from_rfc3339)
+            .transpose()
+            .map_err(bad)?
+            .flatten();
+        let sha256 = self
+            .sha256
+            .as_deref()
+            .map(files_db::sha256_from_hex)
+            .transpose()
+            .map_err(bad)?;
+        Ok(FileEntry {
+            kind: FileKind::from_is_directory(self.is_directory != 0),
+            path: self.path,
+            size_bytes,
+            mtime_ns,
+            sha256,
+            link_target: None,
+        })
+    }
+}
+
+/// A generation-3 `file_versions` row with its path, as stored. `kind` and
+/// `sha256` are read untyped so a bad value is refused naming the row, not
+/// as a bare type error.
+struct FileVersionRow {
+    path_id: i64,
+    path: String,
+    kind: rusqlite::types::Value,
+    size_bytes: i64,
+    mtime_ns: Option<i64>,
+    sha256: rusqlite::types::Value,
+    link_target: Option<String>,
+}
+
+impl FileVersionRow {
+    fn into_entry(self, snapshot_id: i64) -> Result<FileEntry> {
+        use rusqlite::types::Value;
+        let bad = |what: String| {
+            TapectlError::Other(format!(
+                "catalog.db file_versions row (snapshot {snapshot_id}, path_id {}, {:?}): {what}",
+                self.path_id, self.path
+            ))
+        };
+        let kind = match &self.kind {
+            Value::Integer(code) => FileKind::from_code(*code),
+            _ => None,
+        }
+        .ok_or_else(|| bad(format!("kind {:?} is not 0, 1, 2 or 3", self.kind)))?;
+        let sha256 = match &self.sha256 {
+            Value::Null => None,
+            Value::Blob(b) if b.len() == 32 => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(b);
+                Some(h)
+            }
+            other => {
+                return Err(bad(format!(
+                    "sha256 is not 32 bytes: {}",
+                    match other {
+                        Value::Blob(b) => format!("a {}-byte blob", b.len()),
+                        v => format!("{v:?}"),
+                    }
+                )))
+            }
+        };
+        Ok(FileEntry {
+            path: self.path,
+            kind,
+            size_bytes: self.size_bytes,
+            mtime_ns: self.mtime_ns,
+            sha256,
+            link_target: self.link_target,
+        })
+    }
+}
+
+/// Read every table of the `catalog.db` at `path`, any generation
+/// (generation 1 has no `tenants`, and its `key_fingerprints`/`sha256_plain`
 /// come back as `None`). Rows are returned in `id` order, which is also
-/// insertion order for every table this module writes.
+/// insertion order for every table this module writes, and files version by
+/// version in the order [`FileSpans::stream`] gives them.
 pub fn read(path: &Path) -> Result<OnTapeCatalog> {
     let (conn, mut cat) = read_all_but_files(path)?;
-    let mut stmt = conn.prepare(
-        "SELECT id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory
-         FROM files ORDER BY id",
-    )?;
-    cat.files = stmt
-        .query_map([], file_row)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let spans = FileSpans::read(&conn, cat.generation)?;
+    for snapshot_id in spans.snapshot_ids() {
+        spans.stream(&conn, snapshot_id, |entries| {
+            for entry in entries {
+                cat.files.push(FileRow {
+                    snapshot_id,
+                    entry: entry?,
+                });
+            }
+            Ok(())
+        })?;
+    }
     Ok(cat)
 }
 
-/// [`read`] without the `files` table (left empty), and the open connection,
-/// for a reader that streams the files itself with [`FILES_OF_SNAPSHOT`]:
-/// `files` is nearly all of a `catalog.db` (about 250 MB of rows for a
-/// million-file tape, issue #413).
+/// [`read`] without the per-file rows (left empty), and the open connection,
+/// for a reader that streams them itself through [`FileSpans`]: they are
+/// nearly all of a `catalog.db` (issue #413).
 pub fn read_all_but_files(path: &Path) -> Result<(Connection, OnTapeCatalog)> {
     let conn = Connection::open(path)?;
     let generation = detect_generation(&conn)?;
-    let has_new = generation == Generation::WithOwnershipAndReceipts;
+    let has_new = generation.carries_ownership_and_receipts();
     let has_sha_plain = has_column(&conn, "stage_slices", "sha256_plain")?;
 
     let tenants = if has_new {
@@ -486,9 +790,8 @@ fn open_output(out_path: &Path) -> Result<Connection> {
 /// INSERT per table (issue #399). It used to be one autocommit per row —
 /// about 100 rows/s, so ~5 hours for L6-0001's ~181k `files` rows.
 ///
-/// Same rows in the same order as before: each table's SELECT is unchanged,
-/// and the tables are filled in the same sequence. Nothing pins this file's
-/// bytes; `read` and `catalog rebuild` read it by content.
+/// Nothing pins this file's bytes; `read` and `catalog rebuild` read it by
+/// content, and `volume-format-v2.md` §1.4 specifies its shape.
 pub(crate) fn fill(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Result<()> {
     let tx = out.unchecked_transaction()?;
     tx.execute_batch(SCHEMA)?;
@@ -696,52 +999,183 @@ fn copy_rows(conn: &Connection, stage_set_ids: &[i64], out: &Connection) -> Resu
         }
     }
 
-    // files reachable via those stage_sets' snapshots. The catalog keeps
-    // them interned (`paths` + `file_versions`, migration 030); this file
-    // keeps its own shape (ADR-0012 item 7: its change is 1.2.0), so each
-    // row is mapped back: the sha256 as lowercase hex, the mtime as the
-    // RFC 3339 text the walk always wrote, the kind as `is_directory`. `id`
-    // numbers the rows in (version, interning) order; nothing reads it but
-    // an operator's sqlite3.
+    // Generation 3's per-file rows (ADR-0012 2026-10-12 item 48): the
+    // catalog's own `paths` + `file_versions` (migration 030), verbatim and
+    // under the catalog's own ids, for the versions those stage sets hold.
+    // `paths` gets only the paths those versions use — a unit's other
+    // versions are not on this tape — and a version's rows go in `path_id`
+    // order: the order the catalog first interned each path, which is walk
+    // order for a unit's first version; in a later version, paths new to the
+    // unit follow all earlier ones.
+    let versions = format!("SELECT snapshot_id FROM stage_sets WHERE id IN ({})", ph());
     {
         let sql = format!(
-            "SELECT fv.snapshot_id, p.path, fv.size_bytes, fv.sha256, fv.mtime_ns, fv.kind
-             FROM {}
-             WHERE fv.snapshot_id IN (SELECT snapshot_id FROM stage_sets WHERE id IN ({}))
-             ORDER BY fv.snapshot_id, fv.path_id",
-            super::files::VERSION_FILES,
-            ph()
+            "SELECT p.id, p.unit_id, p.path FROM paths p
+             WHERE p.id IN (SELECT fv.path_id FROM file_versions fv
+                             WHERE fv.snapshot_id IN ({versions}))
+             ORDER BY p.id"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(stage_set_ids.iter()), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut insert =
+            out.prepare("INSERT INTO paths (id, unit_id, path) VALUES (?1, ?2, ?3)")?;
+        for r in rows {
+            let (id, unit_id, path) = r?;
+            insert.execute(rusqlite::params![id, unit_id, path])?;
+        }
+    }
+    {
+        let sql = format!(
+            "SELECT snapshot_id, path_id, kind, size_bytes, mtime_ns, sha256, link_target
+             FROM file_versions
+             WHERE snapshot_id IN ({versions})
+             ORDER BY snapshot_id, path_id"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(stage_set_ids.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
-                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, i64>(3)?,
                 row.get::<_, Option<i64>>(4)?,
-                row.get::<_, super::files::FileKind>(5)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut insert = out.prepare(
-            "INSERT INTO files (id, snapshot_id, path, size_bytes, sha256, modified_at, is_directory)
+            "INSERT INTO file_versions (snapshot_id, path_id, kind, size_bytes, mtime_ns,
+                                        sha256, link_target)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
-        for (n, r) in rows.enumerate() {
-            let (snapshot_id, path, size_bytes, sha256, mtime_ns, kind) = r?;
+        for r in rows {
+            let (snapshot_id, path_id, kind, size_bytes, mtime_ns, sha256, link_target) = r?;
             insert.execute(rusqlite::params![
-                n as i64 + 1,
                 snapshot_id,
-                path,
+                path_id,
+                kind,
                 size_bytes,
-                super::files::sha256_column(sha256),
-                mtime_ns.and_then(super::files::mtime_ns_to_rfc3339),
-                kind.is_dir() as i64,
+                mtime_ns,
+                sha256,
+                link_target
             ])?;
         }
     }
 
     Ok(())
+}
+
+/// The older generations' SHAPE, for tests that need one built around rows
+/// of their own (a sealed `MemStore` tape whose `catalog.db` must name its
+/// slices): [`downgrade`](fixture::downgrade) rewrites a file [`write`]
+/// made into the shape generation 1 or 2 had.
+///
+/// It is not what the shipped writers wrote. It mirrors the post-030
+/// generation-2 writer on master (0b1e790 until generation 3, in no release
+/// tag, so it never wrote a production tape), which numbered `files.id` from
+/// 1 in (version, `path_id`) order. Every writer before it — b3fe31e's
+/// `catalog_snapshot` (generation 1), then 4292cf9's through v1.0.x's
+/// `ontape_catalog::write` (generation 2) — copied the catalog's own
+/// `files.id` verbatim: not necessarily from 1, and gapped between versions.
+/// Files those writers really made are committed under
+/// `tests/fixtures/ontape_catalog/`; the readers of shipped tapes are pinned
+/// against them. Panics on a database error: for tests only.
+#[doc(hidden)]
+pub mod fixture {
+    use super::*;
+
+    /// Rewrite the generation-3 `catalog.db` at `path` into `to`'s shape.
+    ///
+    /// `files` as the never-shipped post-030 writer made it: one row per
+    /// entry, numbered from 1 in (version, `path_id`) order; the sha256 as
+    /// lowercase hex; the mtime as the walk's RFC 3339 text; the kind as
+    /// `is_directory` alone. Generation 1 additionally lacks `tenants`,
+    /// `stage_sets.key_fingerprints` and `stage_slices.sha256_plain`.
+    pub fn downgrade(path: &Path, to: Generation) {
+        assert!(
+            !to.carries_file_kinds(),
+            "downgrade makes generation 1 or 2, not {to:?}"
+        );
+        let conn = Connection::open(path).unwrap();
+        assert_eq!(
+            detect_generation(&conn).unwrap(),
+            Generation::WithFileKinds,
+            "downgrade starts from what `write` makes"
+        );
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch(
+            "CREATE TABLE files (
+                 id           INTEGER PRIMARY KEY,
+                 snapshot_id  INTEGER NOT NULL,
+                 path         TEXT NOT NULL,
+                 size_bytes   INTEGER,
+                 sha256       TEXT,
+                 modified_at  TEXT,
+                 is_directory INTEGER
+             );",
+        )
+        .unwrap();
+        {
+            let mut select = tx
+                .prepare(
+                    "SELECT fv.snapshot_id, p.path, fv.size_bytes, fv.sha256, fv.mtime_ns, fv.kind
+                     FROM file_versions fv JOIN paths p ON p.id = fv.path_id
+                     ORDER BY fv.snapshot_id, fv.path_id",
+                )
+                .unwrap();
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO files (id, snapshot_id, path, size_bytes, sha256, modified_at,
+                                        is_directory)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .unwrap();
+            let rows = select
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, FileKind>(5)?,
+                    ))
+                })
+                .unwrap();
+            for (n, row) in rows.enumerate() {
+                let (snapshot_id, path, size_bytes, sha256, mtime_ns, kind) = row.unwrap();
+                insert
+                    .execute(rusqlite::params![
+                        n as i64 + 1,
+                        snapshot_id,
+                        path,
+                        size_bytes,
+                        files_db::sha256_column(sha256),
+                        mtime_ns.and_then(files_db::mtime_ns_to_rfc3339),
+                        kind.is_dir() as i64,
+                    ])
+                    .unwrap();
+            }
+        }
+        tx.execute_batch("DROP TABLE file_versions; DROP TABLE paths;")
+            .unwrap();
+        if to == Generation::Original {
+            tx.execute_batch(
+                "DROP TABLE tenants;
+                 ALTER TABLE stage_sets DROP COLUMN key_fingerprints;
+                 ALTER TABLE stage_slices DROP COLUMN sha256_plain;",
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        assert_eq!(detect_generation(&conn).unwrap(), to);
+    }
 }
 
 #[cfg(test)]
@@ -933,7 +1367,7 @@ mod tests {
         fill(&conn, &[ss_id], &out).unwrap();
 
         let rows: i64 = out
-            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM file_versions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, FILES as i64 + 1, "positive control: every row landed");
         assert_eq!(
@@ -1035,7 +1469,7 @@ mod tests {
         write(&conn, &[ss_a, ss_b], &out_path).unwrap();
 
         let cat = read(&out_path).unwrap();
-        assert_eq!(cat.generation, Generation::WithOwnershipAndReceipts);
+        assert_eq!(cat.generation, Generation::WithFileKinds);
         assert_eq!(cat.tenants.len(), 2);
         assert_eq!(cat.units.len(), 2);
         assert_eq!(cat.snapshots.len(), 2);
@@ -1064,129 +1498,393 @@ mod tests {
         assert_eq!(slice_for_a.sha256_plain.as_deref(), Some("plainhash"));
     }
 
-    /// The same derivation `tests/catalog_rebuild.rs` uses for its "Old
-    /// shape" fixture: drop the three 2026-09-11 additions from a freshly
-    /// written file. `detect_generation` must call that `Original`.
-    #[test]
-    fn detect_generation_returns_original_after_dropping_the_new_columns() {
-        let conn = crate::db::open_memory().unwrap();
-        let (_unit_a, ss_a) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
-
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("catalog.db");
-        write(&conn, &[ss_a], &out_path).unwrap();
-
-        let out = Connection::open(&out_path).unwrap();
-        out.execute_batch(
-            "DROP TABLE tenants;
-             ALTER TABLE stage_sets DROP COLUMN key_fingerprints;
-             ALTER TABLE stage_slices DROP COLUMN sha256_plain;",
+    fn snapshot_of(conn: &Connection, ss_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+            [ss_id],
+            |r| r.get(0),
         )
-        .unwrap();
-
-        assert_eq!(detect_generation(&out).unwrap(), Generation::Original);
-        let cat = read(&out_path).unwrap();
-        assert_eq!(cat.generation, Generation::Original);
-        assert!(cat.tenants.is_empty());
-        assert!(cat.stage_sets[0].key_fingerprints.is_none());
-        assert!(cat.slices[0].sha256_plain.is_none());
+        .unwrap()
     }
 
-    /// A file with `tenants` but not `key_fingerprints` (or vice versa) is
-    /// corrupt or hand-edited, not a recognized generation — the two shipped
-    /// together and must agree.
+    fn entry(path: &str, kind: FileKind, link_target: Option<&str>) -> FileEntry {
+        FileEntry {
+            path: path.into(),
+            kind,
+            size_bytes: if kind == FileKind::Dir { 0 } else { 7 },
+            mtime_ns: Some(1_788_264_000_000_000_000),
+            sha256: (kind == FileKind::Regular).then_some([0xAB; 32]),
+            link_target: link_target.map(str::to_string),
+        }
+    }
+
+    /// `fixture::downgrade`'s shapes — the derivation `tests/catalog_rebuild.rs`
+    /// uses — are detected and read. What the shipped writers really wrote is
+    /// pinned by `files_written_by_the_shipped_writers_read_back_exactly`.
+    #[test]
+    fn each_older_generation_is_detected_and_read() {
+        let conn = crate::db::open_memory().unwrap();
+        let (_unit_a, ss_a) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
+        conn.execute(
+            "UPDATE stage_sets SET key_fingerprints = '[\"age1x\"]' WHERE id = ?1",
+            [ss_a],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        for to in [Generation::Original, Generation::WithOwnershipAndReceipts] {
+            let out_path = dir.path().join(format!("{to:?}.db"));
+            write(&conn, &[ss_a], &out_path).unwrap();
+            fixture::downgrade(&out_path, to);
+
+            let cat = read(&out_path).unwrap();
+            assert_eq!(cat.generation, to);
+            let newer = to == Generation::WithOwnershipAndReceipts;
+            assert_eq!(cat.tenants.len(), newer as usize);
+            assert_eq!(cat.stage_sets[0].key_fingerprints.is_some(), newer);
+            assert_eq!(cat.slices[0].sha256_plain.is_some(), newer);
+            assert_eq!(
+                cat.files,
+                vec![FileRow {
+                    snapshot_id: snapshot_of(&conn, ss_a),
+                    entry: FileEntry {
+                        path: "a.txt".into(),
+                        kind: FileKind::Regular,
+                        size_bytes: 10,
+                        mtime_ns: None,
+                        sha256: Some([0xde; 32]),
+                        link_target: None,
+                    },
+                }]
+            );
+        }
+    }
+
+    /// A committed `catalog.db` fixture, copied out so nothing can touch the
+    /// committed bytes.
+    fn committed_fixture(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let from = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ontape_catalog")
+            .join(name);
+        let to = dir.path().join(name);
+        std::fs::copy(&from, &to).unwrap();
+        to
+    }
+
+    /// The files of `tests/fixtures/ontape_catalog/gen{1,2}.db`, as the
+    /// catalog's own [`FileEntry`]: both were written from the same source
+    /// rows (that directory's README and `make_fixture.rs`).
+    fn committed_fixture_files() -> Vec<FileRow> {
+        const RECENT: i64 = 1_788_264_000_000_000_000; // 2026-09-01T12:00:00Z
+        const PRE_1970: i64 = -315_619_200_000_000_000; // 1960-01-01T00:00:00Z
+        let row = |snapshot_id, path: &str, kind, size_bytes, mtime_ns, sha256| FileRow {
+            snapshot_id,
+            entry: FileEntry {
+                path: path.into(),
+                kind,
+                size_bytes,
+                mtime_ns: Some(mtime_ns),
+                sha256,
+                link_target: None,
+            },
+        };
+        use FileKind::{Dir, Regular};
+        vec![
+            row(40, "docs", Dir, 0, RECENT, None),
+            row(40, "docs/a.txt", Regular, 11, PRE_1970, Some([0xa1; 32])),
+            // A symlink and a FIFO: these generations record only
+            // `is_directory`, so both come back regular, with no target.
+            row(40, "docs/latest", Regular, 5, RECENT, None),
+            row(40, "docs/pipe", Regular, 0, RECENT, None),
+            row(47, "fy24.csv", Regular, 20, RECENT, Some([0xf2; 32])),
+            row(47, "notes", Dir, 0, RECENT, None),
+            row(47, "notes/q1.txt", Regular, 9, RECENT, Some([0x9e; 32])),
+        ]
+    }
+
+    /// The generations on shipped tape, read from files their own writers
+    /// made (`tests/fixtures/ontape_catalog/`, README there): generation 1
+    /// by b3fe31e's `catalog_snapshot`, generation 2 by v1.0.6's
+    /// `ontape_catalog::write`. Those writers copied the catalog's own
+    /// `files.id` verbatim — here 77001-77004 and 77010-77012, with 77005-
+    /// 77009 belonging to a version not on the tape — so a reader that
+    /// assumed ids from 1, or no gaps, would fail here and not on
+    /// `fixture::downgrade`'s output. A pre-1970 mtime, a directory with no
+    /// sha256, a symlink and a FIFO are among the rows.
+    #[test]
+    fn files_written_by_the_shipped_writers_read_back_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, generation) in [
+            ("gen1.db", Generation::Original),
+            ("gen2.db", Generation::WithOwnershipAndReceipts),
+        ] {
+            let path = committed_fixture(&dir, name);
+            let cat = read(&path).unwrap();
+            assert_eq!(cat.generation, generation, "{name}");
+            assert_eq!(cat.files, committed_fixture_files(), "{name}");
+
+            let gen2 = generation == Generation::WithOwnershipAndReceipts;
+            assert_eq!(
+                cat.tenants,
+                if gen2 {
+                    vec![
+                        TenantRow {
+                            id: 3,
+                            name: "alice".into(),
+                        },
+                        TenantRow {
+                            id: 5,
+                            name: "bob".into(),
+                        },
+                    ]
+                } else {
+                    vec![]
+                },
+                "{name}"
+            );
+            let units: Vec<(i64, &str, i64)> = cat
+                .units
+                .iter()
+                .map(|u| (u.id, u.name.as_str(), u.tenant_id))
+                .collect();
+            assert_eq!(units, vec![(12, "photos", 3), (14, "ledgers", 5)], "{name}");
+            let snapshots: Vec<(i64, i64, i64)> = cat
+                .snapshots
+                .iter()
+                .map(|s| (s.id, s.unit_id, s.version))
+                .collect();
+            assert_eq!(snapshots, vec![(40, 12, 3), (47, 14, 1)], "{name}");
+            let receipts: Vec<(i64, Option<&str>)> = cat
+                .stage_sets
+                .iter()
+                .map(|s| (s.id, s.key_fingerprints.as_deref()))
+                .collect();
+            assert_eq!(
+                receipts,
+                if gen2 {
+                    vec![
+                        (90, Some(r#"["age1alice","age1operator","age1escrow"]"#)),
+                        (93, Some(r#"["age1bob","age1operator","age1escrow"]"#)),
+                    ]
+                } else {
+                    vec![(90, None), (93, None)]
+                },
+                "{name}"
+            );
+            let slices: Vec<(i64, i64, Option<String>, String)> = cat
+                .slices
+                .iter()
+                .map(|s| {
+                    (
+                        s.id,
+                        s.stage_set_id,
+                        s.sha256_plain.clone(),
+                        s.sha256_encrypted.clone(),
+                    )
+                })
+                .collect();
+            let plain = |b: &str| gen2.then(|| b.repeat(32));
+            assert_eq!(
+                slices,
+                vec![
+                    (300, 90, plain("11"), "c1".repeat(32)),
+                    (301, 90, plain("22"), "c2".repeat(32)),
+                    (305, 93, plain("33"), "c3".repeat(32)),
+                ],
+                "{name}"
+            );
+
+            // The streaming reader finds each version's run of verbatim ids
+            // and gives back exactly what `read` does.
+            let (conn, _) = read_all_but_files(&path).unwrap();
+            let spans = FileSpans::read(&conn, generation).unwrap();
+            assert_eq!(
+                spans.spans,
+                HashMap::from([(40, (77001, 77004)), (47, (77010, 77012))]),
+                "{name}"
+            );
+            let mut streamed = Vec::new();
+            for snapshot_id in spans.snapshot_ids() {
+                spans
+                    .stream(&conn, snapshot_id, |entries| {
+                        for entry in entries {
+                            streamed.push(FileRow {
+                                snapshot_id,
+                                entry: entry?,
+                            });
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert_eq!(streamed, cat.files, "{name}");
+        }
+    }
+
+    /// Markers that shipped together must agree; a file whose markers
+    /// disagree is corrupt or hand-edited, not a recognized generation, and
+    /// the refusal names what it found.
     #[test]
     fn a_disagreeing_shape_is_an_error_naming_what_is_present() {
         let conn = crate::db::open_memory().unwrap();
         let (_unit_a, ss_a) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
-
         let dir = tempfile::tempdir().unwrap();
+        let shaped = |name: &str, to: Option<Generation>, sql: &str| {
+            let p = dir.path().join(name);
+            write(&conn, &[ss_a], &p).unwrap();
+            if let Some(to) = to {
+                fixture::downgrade(&p, to);
+            }
+            let out = Connection::open(&p).unwrap();
+            out.execute_batch(sql).unwrap();
+            detect_generation(&out).unwrap_err().to_string()
+        };
+        let gen2 = Some(Generation::WithOwnershipAndReceipts);
 
-        let tenants_only = dir.path().join("tenants_only.db");
-        write(&conn, &[ss_a], &tenants_only).unwrap();
-        let out = Connection::open(&tenants_only).unwrap();
-        out.execute_batch("ALTER TABLE stage_sets DROP COLUMN key_fingerprints;")
-            .unwrap();
-        let err = detect_generation(&out).unwrap_err().to_string();
+        let err = shaped(
+            "g2_tenants_only.db",
+            gen2,
+            "ALTER TABLE stage_sets DROP COLUMN key_fingerprints;",
+        );
         assert!(err.contains("tenants"), "error should name tenants: {err}");
-
-        let receipts_only = dir.path().join("receipts_only.db");
-        write(&conn, &[ss_a], &receipts_only).unwrap();
-        let out = Connection::open(&receipts_only).unwrap();
-        out.execute_batch("DROP TABLE tenants;").unwrap();
-        let err = detect_generation(&out).unwrap_err().to_string();
+        let err = shaped("g2_receipts_only.db", gen2, "DROP TABLE tenants;");
         assert!(
             err.contains("key_fingerprints"),
             "error should name key_fingerprints: {err}"
         );
+
+        let err = shaped("g3_no_tenants.db", None, "DROP TABLE tenants;");
+        assert!(
+            err.contains("generation 3") && err.contains("no `tenants` table"),
+            "{err}"
+        );
+        let err = shaped(
+            "g3_and_files.db",
+            None,
+            "CREATE TABLE files (id INTEGER PRIMARY KEY);",
+        );
+        assert!(
+            err.contains("`files` and `paths` and `file_versions`"),
+            "{err}"
+        );
+        let err = shaped("g3_no_paths.db", None, "DROP TABLE paths;");
+        assert!(err.contains("`file_versions` as its per-file"), "{err}");
     }
 
-    /// ADR-0012 item 7: the catalog's interned rows (migration 030) go onto
-    /// tape in the shape `catalog.db` has always had — the sha256 as
-    /// lowercase hex, the mtime as the walk's RFC 3339 text, the kind as
-    /// `is_directory` — so readers of either generation see what they always
-    /// saw.
+    /// ADR-0012 2026-10-12 item 48 (#381's on-tape half): generation 3
+    /// records each entry exactly as the catalog holds it — kind, link
+    /// target, the raw hash and the nanosecond mtime — so a rebuild keeps
+    /// them. The same version taken down to generation 2's shape reads back
+    /// with only what that shape could say: a directory or a regular file.
     #[test]
-    fn the_interned_rows_go_on_tape_in_the_old_shape() {
-        use crate::db::files::{fixture, FileEntry, FileKind};
+    fn generation_3_records_each_kind_and_link_target() {
         let conn = crate::db::open_memory().unwrap();
         let (_unit, ss_id) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
-        let snap_id: i64 = conn
-            .query_row(
-                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
-                [ss_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let mtime = 1_788_264_000_i64;
-        fixture::insert_entry(
-            &conn,
-            snap_id,
-            FileEntry {
-                path: "docs".into(),
-                kind: FileKind::Dir,
-                size_bytes: 0,
-                mtime_ns: Some(mtime * 1_000_000_000),
-                sha256: None,
-                link_target: None,
-            },
-        );
-        fixture::insert_entry(
-            &conn,
-            snap_id,
-            FileEntry {
-                path: "docs/b.bin".into(),
-                kind: FileKind::Regular,
-                size_bytes: 3,
-                mtime_ns: Some(mtime * 1_000_000_000),
-                sha256: Some([0xAB; 32]),
-                link_target: None,
-            },
-        );
-
+        let snap_id = snapshot_of(&conn, ss_id);
+        let written = vec![
+            entry("docs", FileKind::Dir, None),
+            entry("docs/b.bin", FileKind::Regular, None),
+            entry("docs/latest", FileKind::Symlink, Some("b.bin")),
+            entry("docs/pipe", FileKind::Special, None),
+        ];
+        for e in &written {
+            crate::db::files::fixture::insert_entry(&conn, snap_id, e.clone());
+        }
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("catalog.db");
         write(&conn, &[ss_id], &out_path).unwrap();
+
         let cat = read(&out_path).unwrap();
-        type Shape = (String, Option<i64>, Option<String>, Option<String>, i64);
-        let rows: Vec<Shape> = cat
+        assert_eq!(cat.generation, Generation::WithFileKinds);
+        let entries: Vec<FileEntry> = cat.files.iter().map(|f| f.entry.clone()).collect();
+        let mut expected = vec![FileEntry {
+            path: "a.txt".into(),
+            kind: FileKind::Regular,
+            size_bytes: 10,
+            mtime_ns: None,
+            sha256: Some([0xde; 32]),
+            link_target: None,
+        }];
+        expected.extend(written.iter().cloned());
+        assert_eq!(entries, expected);
+
+        fixture::downgrade(&out_path, Generation::WithOwnershipAndReceipts);
+        let old: Vec<(String, FileKind, Option<String>)> = read(&out_path)
+            .unwrap()
             .files
-            .iter()
-            .map(|f| {
-                (
-                    f.path.clone(),
-                    f.size_bytes,
-                    f.sha256.clone(),
-                    f.modified_at.clone(),
-                    f.is_directory,
-                )
-            })
+            .into_iter()
+            .map(|f| (f.entry.path, f.entry.kind, f.entry.link_target))
             .collect();
+        assert_eq!(
+            old,
+            vec![
+                ("a.txt".into(), FileKind::Regular, None),
+                ("docs".into(), FileKind::Dir, None),
+                ("docs/b.bin".into(), FileKind::Regular, None),
+                ("docs/latest".into(), FileKind::Regular, None),
+                ("docs/pipe".into(), FileKind::Regular, None),
+            ],
+            "generation 2 says only directory or not"
+        );
+    }
+
+    /// `fixture::downgrade`'s generation-2 `files` is what master's post-030
+    /// generation-2 writer (never in a release) wrote: the sha256 as
+    /// lowercase hex, the mtime as the walk's RFC 3339 text, the kind as
+    /// `is_directory`, ids from 1 in (version, `path_id`) order. Shipped
+    /// generation-2 tapes differ in the ids — v1.0.x copied the catalog's own
+    /// `files.id` verbatim — and are pinned by
+    /// `files_written_by_the_shipped_writers_read_back_exactly`.
+    #[test]
+    fn downgrade_mirrors_the_unshipped_post_030_generation_2_writer() {
+        let conn = crate::db::open_memory().unwrap();
+        let (_unit, ss_id) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
+        let snap_id = snapshot_of(&conn, ss_id);
+        for e in [
+            entry("docs", FileKind::Dir, None),
+            entry("docs/b.bin", FileKind::Regular, None),
+        ] {
+            crate::db::files::fixture::insert_entry(&conn, snap_id, e);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("catalog.db");
+        write(&conn, &[ss_id], &out_path).unwrap();
+        fixture::downgrade(&out_path, Generation::WithOwnershipAndReceipts);
+
+        type Shape = (
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            i64,
+        );
+        let rows: Vec<Shape> = Connection::open(&out_path)
+            .unwrap()
+            .prepare(
+                "SELECT id, path, size_bytes, sha256, modified_at, is_directory
+                 FROM files ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         assert_eq!(
             rows,
             vec![
-                ("a.txt".into(), Some(10), Some("de".repeat(32)), None, 0),
+                (1, "a.txt".into(), Some(10), Some("de".repeat(32)), None, 0),
                 (
+                    2,
                     "docs".into(),
                     Some(0),
                     None,
@@ -1194,38 +1892,122 @@ mod tests {
                     1
                 ),
                 (
+                    3,
                     "docs/b.bin".into(),
-                    Some(3),
+                    Some(7),
                     Some("ab".repeat(32)),
                     Some("2026-09-01T12:00:00+00:00".into()),
                     0
                 ),
             ]
         );
-        let ids: Vec<i64> = cat.files.iter().map(|f| f.id).collect();
-        assert_eq!(ids, vec![1, 2, 3]);
     }
 
-    /// Issue #413: a rebuild streams one version's `files` rows at a time,
-    /// and each version is one range of the table's b-tree, not a scan of
-    /// every row on the tape (there is no index on `snapshot_id`, and a
-    /// rebuild reads one version per unit). Streamed version by version,
-    /// the rows are exactly what [`read`] returns, in the same order.
+    /// `paths` carries only the paths of the versions on this tape, under
+    /// the catalog's own ids: a unit's other versions are not on it.
     #[test]
-    fn a_version_streams_as_one_range_of_ids() {
+    fn paths_carry_only_the_written_versions_paths() {
+        let conn = crate::db::open_memory().unwrap();
+        let (unit_id, ss_v1) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
+        let v1 = snapshot_of(&conn, ss_v1);
+        crate::db::files::fixture::insert(&conn, v1, "only-in-v1", 1, "regular", None);
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 2, 'staged', '/tmp', 2, 10)",
+            [unit_id],
+        )
+        .unwrap();
+        let v2 = conn.last_insert_rowid();
+        crate::db::files::fixture::insert(&conn, v2, "a.txt", 10, "regular", None);
+        crate::db::files::fixture::insert(&conn, v2, "only-in-v2", 1, "regular", None);
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices)
+             VALUES (?1, 'staged', 1000, 1)",
+            [v2],
+        )
+        .unwrap();
+        let ss_v2 = conn.last_insert_rowid();
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("catalog.db");
+        write(&conn, &[ss_v2], &out_path).unwrap();
+
+        let catalog_ids: Vec<(i64, String)> = conn
+            .prepare("SELECT id, path FROM paths WHERE path IN ('a.txt', 'only-in-v2') ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let on_tape: Vec<(i64, String)> = Connection::open(&out_path)
+            .unwrap()
+            .prepare("SELECT id, path FROM paths ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(on_tape, catalog_ids);
+        let cat = read(&out_path).unwrap();
+        assert!(cat.files.iter().all(|f| f.snapshot_id == v2));
+        assert_eq!(cat.files.len(), 2);
+    }
+
+    /// A generation-3 value the writer never records is refused, naming
+    /// the row, not guessed at. The file's own CHECKs stop most hand edits;
+    /// a file built without them must still not be misread.
+    #[test]
+    fn a_bad_kind_or_hash_on_tape_is_refused_naming_the_row() {
+        let conn = crate::db::open_memory().unwrap();
+        let (_unit, ss_id) = insert_unit_snapshot_stageset_slice_file(&conn, "unit-a");
+        let dir = tempfile::tempdir().unwrap();
+        for (name, edit, needle) in [
+            (
+                "kind.db",
+                "UPDATE file_versions SET kind = 7",
+                "kind Integer(7)",
+            ),
+            (
+                "hash.db",
+                "UPDATE file_versions SET sha256 = x'00'",
+                "a 1-byte blob",
+            ),
+            (
+                "hextext.db",
+                "UPDATE file_versions SET sha256 = 'abcd'",
+                "sha256 is not 32 bytes",
+            ),
+        ] {
+            let p = dir.path().join(name);
+            write(&conn, &[ss_id], &p).unwrap();
+            let out = Connection::open(&p).unwrap();
+            out.execute_batch(&format!("PRAGMA ignore_check_constraints = 1; {edit};"))
+                .unwrap();
+            drop(out);
+            let err = read(&p).unwrap_err().to_string();
+            assert!(
+                err.contains("catalog.db file_versions row")
+                    && err.contains("\"a.txt\"")
+                    && err.contains(needle),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    /// Issue #413: a rebuild streams one version's rows at a time, and each
+    /// version is one range of a b-tree, not a scan of every row on the tape
+    /// (a rebuild reads one version per unit). Streamed version by version,
+    /// the rows are exactly what [`read`] returns, in the same order — in
+    /// every generation.
+    #[test]
+    fn a_version_streams_as_one_range_in_every_generation() {
         let conn = crate::db::open_memory().unwrap();
         let ss: Vec<i64> = ["unit-a", "unit-b", "unit-c"]
             .iter()
             .map(|u| insert_unit_snapshot_stageset_slice_file(&conn, u).1)
             .collect();
         for (n, &ss_id) in ss.iter().enumerate() {
-            let snap: i64 = conn
-                .query_row(
-                    "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
-                    [ss_id],
-                    |r| r.get(0),
-                )
-                .unwrap();
+            let snap = snapshot_of(&conn, ss_id);
             for i in 0..=n {
                 crate::db::files::fixture::insert(
                     &conn,
@@ -1238,46 +2020,57 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("catalog.db");
-        write(&conn, &ss, &out_path).unwrap();
-        let whole = read(&out_path).unwrap();
+        for generation in [
+            Generation::WithFileKinds,
+            Generation::WithOwnershipAndReceipts,
+            Generation::Original,
+        ] {
+            let out_path = dir.path().join(format!("{generation:?}.db"));
+            write(&conn, &ss, &out_path).unwrap();
+            if !generation.carries_file_kinds() {
+                fixture::downgrade(&out_path, generation);
+            }
+            let whole = read(&out_path).unwrap();
+            assert_eq!(whole.files.len(), 3 + 1 + 2 + 3);
 
-        let (ontape, cat) = read_all_but_files(&out_path).unwrap();
-        assert!(cat.files.is_empty(), "the files are left to the stream");
-        let spans = file_id_spans(&ontape).unwrap();
-        assert_eq!(spans.len(), 3, "one span per version");
-        let mut stmt = ontape.prepare(FILES_OF_SNAPSHOT).unwrap();
-        let mut streamed = Vec::new();
-        let mut snapshots: Vec<i64> = spans.keys().copied().collect();
-        snapshots.sort();
-        for snap in snapshots {
-            let (first, last) = spans[&snap];
-            let rows = stmt
-                .query_map(rusqlite::params![snap, first, last], file_row)
+            let (ontape, cat) = read_all_but_files(&out_path).unwrap();
+            assert_eq!(cat.generation, generation);
+            assert!(cat.files.is_empty(), "the files are left to the stream");
+            let spans = FileSpans::read(&ontape, generation).unwrap();
+            assert_eq!(spans.snapshot_ids().len(), 3, "one span per version");
+            let mut streamed = Vec::new();
+            for snap in spans.snapshot_ids() {
+                spans
+                    .stream(&ontape, snap, |entries| {
+                        for e in entries {
+                            streamed.push(FileRow {
+                                snapshot_id: snap,
+                                entry: e?,
+                            });
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert_eq!(streamed, whole.files, "{generation:?}");
+
+            let sql = if generation.carries_file_kinds() {
+                FILE_VERSIONS_OF_SNAPSHOT
+            } else {
+                LEGACY_FILES_OF_SNAPSHOT
+            };
+            let plan: Vec<String> = ontape
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                 .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
+                .query_map(rusqlite::params![1, 1, 1], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
                 .unwrap();
-            assert!(rows.iter().all(|f| f.snapshot_id == snap));
-            streamed.extend(rows);
+            assert!(
+                plan.iter().all(|d| d.starts_with("SEARCH")),
+                "{generation:?}: one version must be a range of keys, not a scan \
+                 of every row: {plan:?}"
+            );
         }
-        let key = |f: &FileRow| (f.id, f.snapshot_id, f.path.clone(), f.size_bytes);
-        assert_eq!(
-            streamed.iter().map(key).collect::<Vec<_>>(),
-            whole.files.iter().map(key).collect::<Vec<_>>(),
-            "streamed version by version, the rows are the whole table's"
-        );
-
-        let plan: Vec<String> = ontape
-            .prepare(&format!("EXPLAIN QUERY PLAN {FILES_OF_SNAPSHOT}"))
-            .unwrap()
-            .query_map(rusqlite::params![1, 1, 1], |r| r.get::<_, String>(3))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert!(
-            plan.iter().any(|d| d.contains("INTEGER PRIMARY KEY"))
-                && !plan.iter().any(|d| d.starts_with("SCAN files")),
-            "one version must be a range of ids, not a scan of every row: {plan:?}"
-        );
     }
 }

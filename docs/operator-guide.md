@@ -2830,7 +2830,7 @@ What comes back, and from where:
 |---|---|
 | volume identity, media, capacity | the ID thunk (tape file 0) |
 | units, snapshots, slice map, plaintext hashes | each envelope's `MANIFEST.toml` |
-| tenant ownership, escrow receipts, the per-file index | the operator envelope's `catalog.db` (tapes written after 2026-09-11); older tapes give ownership from the tenant envelopes and no receipt |
+| tenant ownership, escrow receipts, the per-file index | the operator envelope's `catalog.db` (tapes written after 2026-09-11); older tapes give ownership from the tenant envelopes and no receipt. Tapes written by 1.1.0 and later also record each file's kind and a symlink's target; on an older tape every non-directory comes back as a regular file |
 | which cartridge this is, and the volume bound to it | File 0's `[media]` table — the chip serial when `cartridge_identity_source = "mam"`, the barcode you typed when `"operator"` |
 
 **Cartridge identity comes back too, but only as far as the tape can prove it.**
