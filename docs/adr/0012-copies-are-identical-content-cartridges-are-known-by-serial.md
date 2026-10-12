@@ -1374,8 +1374,16 @@ Follow-up, ruled the same day:
 43. **The tape-only multiplier applies to every copy and place-count floor** (#423 part 2,
     item 34 extended): `audit`'s copy count and `unit mark-tape-only`'s copy and location floors
     take it, as `snapshot mark-reclaimable` already does, through one rule in `policy::coverage`.
-    A unit cannot be marked tape-only, freeing its source, with fewer copies than tape-only
-    policy demands.
+    A unit is not marked tape-only, freeing its source, with fewer copies than tape-only
+    policy demands, without consent (item 47).
+46. **The multiplier raises copy floors, not the distinct-location count** (ratified
+    2026-10-12, #423 part 2): a tape-only unit needs `min_copies` x the multiplier copies, and
+    `required_locations` names take it per name (item 34), but `min_locations` distinct places
+    stays as set. At the defaults that is 4 copies in 2 places, not 4 in 4. This changes
+    `snapshot mark-reclaimable`, which multiplied the distinct-location count until now.
+47. **A tape-only shortfall stays a consent gate** (ADR-0008 Tier 2, as `unit mark-tape-only`
+    already was): the shortfall is listed, a terminal asks, and `--yes`/`--force` proceed. It is
+    not made absolute (Tier 3); item 43's "cannot" reads "not without consent".
 44. **A backup copy of each tenant envelope goes on tape in 1.1.0** (#418 item 2, brought forward
     from 1.2.0, item 22): the fresh start means every production tape carries it from the first,
     with no mixed fleet. The operator envelope already has two copies. The catalog.db shape change
