@@ -2562,7 +2562,8 @@ catalog growing.
 `db stats` shows what each table weighs, largest first, then how fast each
 journal grew over the trailing 90 days, so the growth can be seen rather than
 guessed. On a fresh home every table is a page or two of empty structure, and
-the only journal rows are the three events `init` wrote:
+the only journal rows are the few events `init` wrote (three here, from
+`init --no-escrow`):
 
 ```text
 $ tapectl db stats
