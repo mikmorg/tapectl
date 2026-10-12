@@ -10,6 +10,8 @@ Verify volume contents via the keyless chain walk (seal \-> front index \-> cont
 .PP
 A full verify that was stopped part\-way CONTINUES when run again: files the volume\*(Aqs latest readback (this command\*(Aqs or a write\*(Aqs `\-\-full\-confirm`) already read back clean are not read again, as long as the front index on the tape is the one they were checked against.
 .PP
+A full verify that passes also records the volume\*(Aqs write figures (bytes written, data files, write dates) when the write that sealed it could not, from the front index it read and the catalog\*(Aqs own rows; figures already recorded are left as they are.
+.PP
 Exit status: 0 = every checked file matched. 2 = the verify PROVED THE MEDIUM BAD: the volume is quarantined and no longer counts as a copy — write its content to another cartridge. 3 = inconclusive: a drive or transport failure, or an error before any verdict (no cartridge loaded, the wrong tape, an unknown label, a mistyped command line); the volume is untouched — check the drive and verify again.
 .SH OPTIONS
 .TP

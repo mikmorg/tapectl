@@ -3817,9 +3817,17 @@ fn record_after_sealed(
             "recording its write figures (bytes_written, num_data_files, last_write) and its \
              write_completed event",
             &e,
-            None,
+            Some(&finish_figures_command(label)),
         )
     })
+}
+
+/// The command that records a sealed copy's write figures when the write
+/// could not (ADR-0012 2026-10-07 item 33, issue #423): a full `volume
+/// verify`, which records them once it passes
+/// ([`super::figures::record_after_verify`]).
+pub(crate) fn finish_figures_command(label: &str) -> String {
+    format!("tapectl volume verify {label} --full")
 }
 
 /// Populate `volumes`' write-summary columns (`bytes_written`,
@@ -4710,11 +4718,17 @@ fn verify_contacted(
     // ADR-0012 2026-10-06 item 24 (#392): a full readback that passed —
     // continued from an interrupted one (#410) or not — has read back every
     // completed write on this volume. A quick verify reads none of them.
+    // ADR-0012 2026-10-07 item 33 (#423): and records whatever the write
+    // that sealed this copy left unrecorded, from the front index it just
+    // proved and the catalog's own rows — in the same transaction, so the
+    // figures and the event saying so stand or fall with this session.
+    let mut figures = None;
     if tier == Tier::Integrity && evidence.mismatches.is_empty() {
         tx.execute(
             "UPDATE writes SET write_verified = 1 WHERE volume_id = ?1 AND status = 'completed'",
             params![volume_id],
         )?;
+        figures = super::figures::record_after_verify(&tx, volume_id, label, &layout, session_id)?;
     }
     tx.commit()?;
 
@@ -4738,6 +4752,7 @@ fn verify_contacted(
         mismatches: evidence.mismatches,
         quarantine,
         cleared,
+        figures,
         // Set by `volume_verify`, which is the only caller with a device and
         // a backend to resolve; this store-injectable half has neither.
         drive_health_note: None,
@@ -5686,6 +5701,12 @@ pub struct VerifyReport {
     /// it reports a real return to service and is `None` on the ordinary
     /// clean verify of a healthy volume, which must not look like an event.
     pub cleared: Option<ConditionCleared>,
+    /// What a passing FULL verify did about the volume's write figures
+    /// (ADR-0012 2026-10-07 item 33, issue #423): recorded the ones the
+    /// write that sealed it left unrecorded, or withheld them because the
+    /// tape and the catalog disagree. `None` on the ordinary verify of a
+    /// volume whose figures were recorded, which changes nothing.
+    pub figures: Option<super::figures::Figures>,
     /// Set when drive-health (`sg_logs`) collection was SKIPPED rather than
     /// attempted (issue #187): no backend resolves for the device verify was
     /// given, so there is no sg node to read. `None` means collection was
@@ -7158,6 +7179,339 @@ mod tests {
             assert_eq!(report.failed, 0, "{tier:?}: {:?}", report.mismatches);
             assert_eq!(verified(), vec![want], "after a passing {tier:?} verify");
         }
+    }
+
+    // ── issue #423: a passing full verify records a sealed copy's figures ──
+
+    const FIG_SLICE: &[u8] = b"a sealed copy's slice, whose figures went unrecorded. ";
+
+    /// A sealed copy of one slice at File 4, written and confirmed by this
+    /// catalog (its write began and completed at fixed times), whose
+    /// figures have not been recorded yet: the state a catalog error in
+    /// [`record_after_sealed`] leaves. Returns the volume id, the tape, and
+    /// the Layout the write recorded its figures from (its one slice).
+    fn sealed_copy_without_figures(conn: &Connection, label: &str) -> (i64, MemStore, Layout) {
+        seed_one_slice_fixture(
+            conn,
+            label,
+            "fig-unit",
+            4,
+            FIG_SLICE,
+            "completed",
+            "current",
+        );
+        let volume_id: i64 = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed', sealed_at = '2026-10-01 18:00:00'
+             WHERE id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE writes SET started_at = '2026-10-01 02:53:12',
+                               completed_at = '2026-10-01 18:06:17'
+             WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        let written = Layout {
+            label: label.to_string(),
+            volume_uuid: String::new(),
+            media_type: "LTO-6".to_string(),
+            block_size: 4096,
+            budget: CapacityBudget {
+                available_bytes: 0,
+                reserve_bytes: 0,
+            },
+            entries: vec![LayoutEntry {
+                position: 4,
+                kind: ZoneKind::Slice { stage_slice_id: 1 },
+                size_bytes: Some(FIG_SLICE.len() as u64),
+                sha256: Some(direct_hash(FIG_SLICE)),
+                source: ContentSource::Generated,
+            }],
+        };
+        (
+            volume_id,
+            mem_store_v2_tape(label, FIG_SLICE, FIG_SLICE),
+            written,
+        )
+    }
+
+    fn verify_tape(
+        conn: &Connection,
+        tape: &MemStore,
+        label: &str,
+        volume_id: i64,
+        tier: Tier,
+    ) -> VerifyReport {
+        use crate::tape::fake::FakeTape;
+        let fake = FakeTape::with_files(tape.files.clone(), 4096);
+        let mut store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        volume_verify_with_store(
+            conn,
+            &mut store,
+            label,
+            volume_id,
+            4096,
+            tier,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap()
+    }
+
+    /// `(bytes_written, num_data_files, has_manifest, first_write,
+    /// last_write)`.
+    type FigureRow = (i64, i64, i64, Option<String>, Option<String>);
+
+    fn figure_row(conn: &Connection, volume_id: i64) -> FigureRow {
+        conn.query_row(
+            "SELECT bytes_written, num_data_files, has_manifest, first_write, last_write
+             FROM volumes WHERE id = ?1",
+            params![volume_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    fn action_details(conn: &Connection, volume_id: i64, action: &str) -> Vec<Option<String>> {
+        conn.prepare(
+            "SELECT details FROM events
+             WHERE entity_type = 'volume' AND entity_id = ?1 AND action = ?2 ORDER BY id",
+        )
+        .unwrap()
+        .query_map(params![volume_id, action], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// ADR-0012 2026-10-07 item 33 (#423), end to end: a catalog error
+    /// after the seal leaves the copy's figures unrecorded, and the warning
+    /// names `volume verify`; that verify, once it passes in full, records
+    /// them from the front index it proved and the catalog's own `writes`
+    /// rows — never the clock — and says so in an event. A second verify
+    /// has nothing left to record.
+    #[test]
+    fn a_passing_full_verify_records_the_figures_the_write_left_unrecorded() {
+        let conn = crate::db::open_memory().unwrap();
+        let (volume_id, tape, written) = sealed_copy_without_figures(&conn, "VR-FIG");
+
+        conn.execute_batch("PRAGMA query_only = ON").unwrap();
+        let warning = record_after_sealed(&conn, volume_id, "VR-FIG", &written, 4096)
+            .expect("a read-only catalog cannot record, and says so");
+        conn.execute_batch("PRAGMA query_only = OFF").unwrap();
+        assert!(
+            warning.ends_with("To finish it: tapectl volume verify VR-FIG --full"),
+            "{warning}"
+        );
+        assert_eq!(figure_row(&conn, volume_id), (0, 0, 0, None, None));
+
+        let report = verify_tape(&conn, &tape, "VR-FIG", volume_id, Tier::Integrity);
+        assert_eq!(report.failed, 0, "{:?}", report.mismatches);
+        let padded = FIG_SLICE.len().div_ceil(4096) as i64 * 4096;
+        assert_eq!(
+            report.figures,
+            Some(crate::volume::figures::Figures::Recorded(vec![
+                format!("bytes_written: 0 -> {padded}"),
+                "num_data_files: 0 -> 1".to_string(),
+                "first_write: (none) -> 2026-10-01 02:53:12".to_string(),
+                "last_write: (none) -> 2026-10-01 18:06:17".to_string(),
+                "write_completed event: (none) -> recorded".to_string(),
+            ]))
+        );
+        assert_eq!(
+            figure_row(&conn, volume_id),
+            (
+                padded,
+                1,
+                // The tape carries no operator envelope, so no manifest:
+                // the figure is not invented.
+                0,
+                Some("2026-10-01 02:53:12".to_string()),
+                Some("2026-10-01 18:06:17".to_string()),
+            )
+        );
+        let completed = action_details(&conn, volume_id, "write_completed");
+        assert_eq!(completed.len(), 1);
+        let details = completed[0].clone().unwrap_or_default();
+        assert!(details.contains("2026-10-01 18:06:17"), "{details}");
+        let session = report.session_id.unwrap();
+        let recorded = action_details(
+            &conn,
+            volume_id,
+            crate::volume::figures::EVENT_FIGURES_RECORDED,
+        );
+        assert_eq!(recorded.len(), 1);
+        let details = recorded[0].clone().unwrap_or_default();
+        assert!(
+            details.contains(&format!("verification session {session}")),
+            "{details}"
+        );
+        assert!(details.contains("num_data_files: 0 -> 1"), "{details}");
+
+        let again = verify_tape(&conn, &tape, "VR-FIG", volume_id, Tier::Integrity);
+        assert_eq!(again.figures, None, "nothing is left to record");
+        assert_eq!(action_details(&conn, volume_id, "write_completed").len(), 1);
+        assert_eq!(
+            action_details(
+                &conn,
+                volume_id,
+                crate::volume::figures::EVENT_FIGURES_RECORDED
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// The other half of #423: a verify on a volume whose write recorded
+    /// its figures (through the very path a sealed copy takes) leaves every
+    /// one of them untouched — `last_write` included, which a verify must
+    /// never restamp — and records no event. Also proves the verify's
+    /// figures equal the write's: were they different, this verify would
+    /// have "corrected" them.
+    #[test]
+    fn a_full_verify_leaves_recorded_figures_untouched() {
+        let conn = crate::db::open_memory().unwrap();
+        let (volume_id, tape, written) = sealed_copy_without_figures(&conn, "VR-REC");
+        assert_eq!(
+            record_after_sealed(&conn, volume_id, "VR-REC", &written, 4096),
+            None
+        );
+        conn.execute(
+            "UPDATE volumes SET last_write = '2026-10-01 18:06:20' WHERE id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        let before = figure_row(&conn, volume_id);
+        assert_eq!(before.1, 1);
+        assert_eq!(before.2, 1, "the write records a manifest");
+
+        let report = verify_tape(&conn, &tape, "VR-REC", volume_id, Tier::Integrity);
+        assert_eq!(report.failed, 0, "{:?}", report.mismatches);
+        assert_eq!(report.figures, None);
+        assert_eq!(figure_row(&conn, volume_id), before);
+        assert_eq!(action_details(&conn, volume_id, "write_completed").len(), 1);
+        assert!(action_details(
+            &conn,
+            volume_id,
+            crate::volume::figures::EVENT_FIGURES_RECORDED
+        )
+        .is_empty());
+    }
+
+    /// A figure that is recorded but disagrees with the tape is provably
+    /// wrong and is corrected; the others, recorded and right, are not
+    /// touched.
+    #[test]
+    fn a_full_verify_corrects_a_figure_the_tape_proves_wrong_and_only_that_one() {
+        let conn = crate::db::open_memory().unwrap();
+        let (volume_id, tape, written) = sealed_copy_without_figures(&conn, "VR-WRONG");
+        assert_eq!(
+            record_after_sealed(&conn, volume_id, "VR-WRONG", &written, 4096),
+            None
+        );
+        conn.execute(
+            "UPDATE volumes SET num_data_files = 7 WHERE id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        let before = figure_row(&conn, volume_id);
+
+        let report = verify_tape(&conn, &tape, "VR-WRONG", volume_id, Tier::Integrity);
+        assert_eq!(
+            report.figures,
+            Some(crate::volume::figures::Figures::Recorded(vec![
+                "num_data_files: 7 -> 1".to_string()
+            ]))
+        );
+        assert_eq!(
+            figure_row(&conn, volume_id),
+            (before.0, 1, before.2, before.3, before.4)
+        );
+        assert_eq!(action_details(&conn, volume_id, "write_completed").len(), 1);
+    }
+
+    /// Only a passing FULL verify records anything: a quick one read no
+    /// slice, and a failed one proved nothing to record from.
+    #[test]
+    fn a_quick_or_failed_verify_records_no_figures() {
+        let conn = crate::db::open_memory().unwrap();
+        let (volume_id, tape, _) = sealed_copy_without_figures(&conn, "VR-QF");
+        let report = verify_tape(&conn, &tape, "VR-QF", volume_id, Tier::Navigable);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.figures, None);
+        assert_eq!(figure_row(&conn, volume_id), (0, 0, 0, None, None));
+
+        let rotten = mem_store_v2_tape("VR-QF", FIG_SLICE, b"rotten bytes");
+        let report = verify_tape(&conn, &rotten, "VR-QF", volume_id, Tier::Integrity);
+        assert!(report.failed > 0);
+        assert_eq!(report.figures, None);
+        assert_eq!(figure_row(&conn, volume_id), (0, 0, 0, None, None));
+        assert!(action_details(&conn, volume_id, "write_completed").is_empty());
+    }
+
+    /// Never a figure the catalog's own rows contradict: when the slice the
+    /// tape carries is not the one this catalog staged for the volume, the
+    /// figures are withheld, with the reason, and nothing is written.
+    #[test]
+    fn figures_are_withheld_when_the_tape_holds_slices_the_catalog_did_not_stage_here() {
+        let conn = crate::db::open_memory().unwrap();
+        let (volume_id, tape, _) = sealed_copy_without_figures(&conn, "VR-DIS");
+        let other = "0".repeat(64);
+        conn.execute(
+            "UPDATE stage_slices SET sha256_encrypted = ?1",
+            params![other],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE write_positions SET sha256_on_volume = ?1",
+            params![other],
+        )
+        .unwrap();
+
+        let report = verify_tape(&conn, &tape, "VR-DIS", volume_id, Tier::Integrity);
+        assert_eq!(report.failed, 0, "the tape itself is sound");
+        match report.figures {
+            Some(crate::volume::figures::Figures::Withheld(why)) => {
+                assert!(why.contains("file 4"), "{why}")
+            }
+            other => panic!("expected the figures withheld, got {other:?}"),
+        }
+        assert_eq!(figure_row(&conn, volume_id), (0, 0, 0, None, None));
+        assert!(action_details(&conn, volume_id, "write_completed").is_empty());
+        assert!(action_details(
+            &conn,
+            volume_id,
+            crate::volume::figures::EVENT_FIGURES_RECORDED
+        )
+        .is_empty());
+    }
+
+    /// A volume `catalog rebuild` made was never written by this catalog:
+    /// its writes have no start, and it keeps the figures the rebuild chose
+    /// (`rebuild.rs` leaves `bytes_written` 0 on purpose) and gets no
+    /// `write_completed` event.
+    #[test]
+    fn a_rebuilt_volume_keeps_the_rebuilds_figures() {
+        let conn = crate::db::open_memory().unwrap();
+        let (volume_id, tape, _) = sealed_copy_without_figures(&conn, "VR-RB");
+        conn.execute(
+            "UPDATE writes SET started_at = NULL WHERE volume_id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        let report = verify_tape(&conn, &tape, "VR-RB", volume_id, Tier::Integrity);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.figures, None);
+        assert_eq!(figure_row(&conn, volume_id), (0, 0, 0, None, None));
+        assert!(action_details(&conn, volume_id, "write_completed").is_empty());
     }
 
     /// Issue #407: `volume verify` opens the drive READ-ONLY, so a sealed
