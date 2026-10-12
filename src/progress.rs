@@ -1006,20 +1006,72 @@ pub fn session_id() -> Option<String> {
 /// bytes once, on the session's thread, where they reach the store or the
 /// sink — a worker running ahead by a queue's worth would make the phase
 /// claim bytes the tape has not yet taken.
-#[derive(Clone, Default)]
-pub struct Handle(Option<Arc<Recorder>>);
+#[derive(Clone)]
+pub struct Handle {
+    rec: Option<Arc<Recorder>>,
+    /// The mode the session's thread creates logs with
+    /// ([`share_logs_with_group`]), carried for [`Handle::start_child`].
+    log_mode: u32,
+}
+
+impl Default for Handle {
+    fn default() -> Self {
+        Self {
+            rec: None,
+            log_mode: 0o600,
+        }
+    }
+}
 
 /// The calling thread's session, as a [`Handle`] (empty with no session).
 pub fn handle() -> Handle {
-    Handle(current())
+    Handle {
+        rec: current(),
+        log_mode: LOG_MODE.with(|m| m.get()),
+    }
 }
 
 impl Handle {
     /// Install this session on the calling thread until the returned guard
     /// drops. A no-op for an empty handle.
     pub fn enter(&self) -> Entered {
-        let previous = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), self.0.clone()));
+        let previous = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), self.rec.clone()));
         Entered { previous }
+    }
+
+    /// Write one line to this session's log, from any thread (nowhere for
+    /// an empty handle).
+    pub fn log(&self, msg: &str) {
+        if let Some(r) = &self.rec {
+            let mut st = r.lock();
+            log_line(&mut st, msg);
+        }
+    }
+
+    /// This session's log file, when it has one.
+    pub fn log_path(&self) -> Option<&Path> {
+        self.rec.as_ref().and_then(|r| r.log_path.as_deref())
+    }
+
+    /// Open a session of its own for `command` on the calling thread: a
+    /// worker doing one of several pieces of work at once (issue #368,
+    /// several units staged at the same time).
+    ///
+    /// Its log sits beside this session's, in the same directory and with
+    /// the same mode, so each piece of work reads as one session from start
+    /// to end — its phases, waits, stalls, progress lines and how it ended,
+    /// never interleaved with another's — and `tapectl status` lists it as
+    /// a session of its own. Its phases are recorded under its own session
+    /// id (`phase_timings.session`), which names that log. It draws
+    /// nothing: the terminal is the command's. Where this session has no
+    /// log (no session at all, or none could be created), the child has
+    /// none either and only records its phases.
+    pub fn start_child(&self, command: &str) -> SessionGuard {
+        let dir = self.log_path().and_then(Path::parent);
+        let mode = LOG_MODE.with(|m| m.replace(self.log_mode));
+        let guard = start_session(dir, command, Display::Off, false);
+        LOG_MODE.with(|m| m.set(mode));
+        guard
     }
 }
 
