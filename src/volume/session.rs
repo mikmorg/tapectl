@@ -964,8 +964,9 @@ pub(crate) fn interrupted_readback(
         .min()
         .expect("rows is not empty: front_index_sha256 came from its first");
     //
-    // The gate is total over any stored interval (nothing bounds
-    // `archive_sets.verify_interval_days`): 0 or below makes every read
+    // The gate is total over any stored interval (`archive-set` refuses a
+    // new one below 1 since #422, but a row written before keeps its
+    // value, and the column has no CHECK): 0 or below makes every read
     // already too old, as `audit` reads it (always overdue); one reaching
     // past any date is no limit; and a `checked_at` that does not parse is
     // read again — never an error, which would block every full confirm and
@@ -7764,9 +7765,11 @@ mod tests {
         );
     }
 
-    /// Nothing bounds `archive_sets.verify_interval_days`: `archive-set
-    /// create/edit` and `sync` store any integer. The age gate is total over
-    /// them — a value of 0 or below means every read is already too old
+    /// The column `archive_sets.verify_interval_days` has no bound:
+    /// `archive-set create/edit` and `sync` refuse a new value below 1
+    /// (#422), but a row written before that keeps whatever it holds, and
+    /// nothing bounds it from above. The age gate is total over any stored
+    /// value — a value of 0 or below means every read is already too old
     /// (as `audit` reads it: always overdue), and one too large for any
     /// date means no limit — rather than an error that blocks every full
     /// confirm and verify of the volume until the set is edited.
