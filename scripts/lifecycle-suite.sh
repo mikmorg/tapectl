@@ -1917,8 +1917,10 @@ scenario_tenant_reassign() {
 # Scenario: tape-only-and-reclaim
 # ============================================================
 # After bootstrap_two_volumes (VOL-A/vault v1, VOL-B/offsite v2): every
-# first-year unit has 2 sealed copies in 2 locations, so mark-tape-only
-# must PASS for them; a freshly-written "solo" unit with only 1 copy must
+# first-year unit has 2 sealed copies in 2 locations, which meets the
+# policy but not the tape-only floors (2x, ADR-0012 2026-10-12 item 43), so
+# mark-tape-only must refuse photos naming the multiplier and pass it with
+# --yes; a freshly-written "solo" unit with only 1 copy must
 # be REFUSED, naming the shortfall. Then reclaim v1 (mark-reclaimable ->
 # purge), staging clean, and prove the LATEST version is still restorable.
 #
@@ -1958,8 +1960,18 @@ tor_mark_tape_only_photos_passes() {
         skip "tor.mark_tape_only_photos_passes" "single-cartridge mode: VOL-A was retired when VOL-B/VOL-SOLO reused its cartridge, so photos genuinely has <2 live copies here"
         return $?
     fi
-    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl unit mark-tape-only photos (>=2 copies in >=2 locations -> PASS)"; return 0; }
-    TCTL unit mark-tape-only photos
+    # ADR-0012 2026-10-12 item 43 (#423 part 2): mark-tape-only holds the unit
+    # to the floors of a TAPE-ONLY unit, every one times the multiplier (2 by
+    # default), so photos' 2 copies in 2 locations are short of 4 and 4. A
+    # bare run (stdin is /dev/null) must refuse naming "(tape-only 2x)"; the
+    # Tier-2 consent (--yes) then marks it, as an operator who accepts the
+    # margin would.
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl unit mark-tape-only photos (2 copies in 2 locations, short of the tape-only 4/4 -> REFUSED naming (tape-only 2x)), then with --yes -> PASS"; return 0; }
+    local out rc
+    out="$(TCTL unit mark-tape-only photos 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "mark-tape-only photos passed without consent below the tape-only floors (2 copies, 2 locations at 2x): $out"; return 1; }
+    echo "$out" | grep "(tape-only 2x)" >/dev/null || { echo "refusal did not name the tape-only multiplier: $out"; return 1; }
+    TCTL unit mark-tape-only photos --yes
 }
 
 tor_mark_tape_only_solo_refused() {

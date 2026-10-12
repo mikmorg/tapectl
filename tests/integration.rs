@@ -3232,6 +3232,12 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
     drop(conn);
 
     let config_path = home.join("config.toml");
+    // Multiplier 1: this test is about the evidence shown, so the unit must
+    // meet its floors. At the default 2x, mark-tape-only asks a tape-only
+    // unit for 4 copies in 4 locations (ADR-0012 2026-10-12 item 43).
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str("\n[compaction]\ntape_only_safety_multiplier = 1\n");
+    std::fs::write(&config_path, config).unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
         .args([
             // --home, not bare --config (issue #109): --config alone still

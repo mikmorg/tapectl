@@ -135,38 +135,24 @@ fn superseding_verdict(
 ) -> Result<ReclaimVerdict> {
     // Precondition 2: Superseding snapshot meets policy
     let resolved = super::resolve(conn, config, unit)?;
-    let mut required_copies = resolved.min_copies;
+    // Precondition 3: tape-only units get multiplied requirements — every
+    // floor here through the one rule in `policy::coverage` (ADR-0012
+    // 2026-10-07 items 15 and 34, 2026-10-12 item 43), which `audit` and
+    // `unit mark-tape-only` ask too. `tape_only_note` names the CONFIGURED
+    // multiplier in the refusal text (issue #215 finding 1: it once
+    // hardcoded "2x").
+    let required_copies = super::coverage::floor(config, resolved.min_copies, &unit.status);
     // The count floor the named locations imply: one distinct place per
-    // distinct name (a name listed twice is one place). The names
-    // themselves are checked below; the tape-only multiplier scales this
-    // count, and the copies each name must hold (ADR-0012, 2026-10-07,
-    // item 15).
-    let mut required_locations = {
+    // distinct name (a name listed twice is one place), multiplied for a
+    // tape-only unit. The names themselves are checked below, each for
+    // `copies_per_named_location` copies.
+    let required_locations = {
         let mut distinct: Vec<&String> = resolved.required_locations.iter().collect();
         distinct.sort();
         distinct.dedup();
-        distinct.len() as i64
+        super::coverage::floor(config, distinct.len() as i64, &unit.status)
     };
-
-    // Precondition 3: tape-only units get multiplied requirements.
-    //
-    // `tape_only_multiplier` is carried past this block (rather than
-    // recomputed at each `if unit.status == "tape_only"` site below) so the
-    // refusal text below can name the CONFIGURED multiplier. Before issue
-    // #215 finding 1, the refusal hardcoded the literal "2x" regardless of
-    // `config.compaction.tape_only_safety_multiplier`'s actual value, so an
-    // operator who had (legitimately) set a different multiplier read a
-    // rule that was not the one actually enforced. `Config::load` now
-    // refuses a multiplier below 1 (`Config::range_problems`), so this is
-    // always `>= 1` here.
-    let tape_only_multiplier = if unit.status == "tape_only" {
-        let multiplier = config.compaction.tape_only_safety_multiplier as i64;
-        required_copies *= multiplier;
-        required_locations *= multiplier;
-        Some(multiplier)
-    } else {
-        None
-    };
+    let tape_only_note = super::coverage::tape_only_note(config, &unit.status);
 
     // ADR-0004 (issue #89): this query previously had no JOIN to
     // volumes at all, so it counted every completed write regardless
@@ -186,12 +172,8 @@ fn superseding_verdict(
             superseding_version: Some(superseding.1),
             freeable_bytes: freeable,
             reason: format!(
-                "superseding v{} has {copy_count} copies, needs {required_copies}{}",
+                "superseding v{} has {copy_count} copies, needs {required_copies}{tape_only_note}",
                 superseding.1,
-                match tape_only_multiplier {
-                    Some(m) => format!(" (tape-only {m}x)"),
-                    None => String::new(),
-                }
             ),
         });
     }
@@ -251,12 +233,9 @@ fn superseding_verdict(
             superseding_version: Some(superseding.1),
             freeable_bytes: freeable,
             reason: format!(
-                "superseding v{} in {location_count} locations, needs {required_locations}{}",
+                "superseding v{} in {location_count} locations, needs \
+                 {required_locations}{tape_only_note}",
                 superseding.1,
-                match tape_only_multiplier {
-                    Some(m) => format!(" (tape-only {m}x)"),
-                    None => String::new(),
-                }
             ),
         });
     }

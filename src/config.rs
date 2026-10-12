@@ -1276,17 +1276,15 @@ impl Config {
     /// ADR-0012 reason: a value accepted here that misbehaves later is
     /// exactly the residue ADR-0012 exists to close.
     ///
-    /// `tape_only_safety_multiplier` MULTIPLIES the base copy/location
-    /// requirement for a `tape_only` unit in
-    /// `policy::reclaimable::assess` (`required_copies *= multiplier`,
-    /// `required_locations *= multiplier`, and each named required location
-    /// must hold `multiplier` copies — ADR-0012, 2026-10-07, item 15) — it
-    /// never replaces it. `0`
-    /// zeroes both requirements outright (the subsequent `copy_count <
-    /// required_copies` and `required_locations > 0 && ...` guards both go
-    /// vacuous), and a negative value is worse: `required_copies` goes
-    /// negative, so `copy_count < required_copies` is false for any
-    /// non-negative `copy_count` and the location guard never even runs.
+    /// `tape_only_safety_multiplier` MULTIPLIES every copy and place-count
+    /// floor of a `tape_only` unit, through the one rule
+    /// `policy::coverage::floor` (the copies, the number of places, and the
+    /// copies each named required location must hold — ADR-0012,
+    /// 2026-10-07, items 15 and 34; 2026-10-12, item 43) — it never
+    /// replaces them. `0`
+    /// zeroes every floor outright (each `copies < floor` guard goes
+    /// vacuous), and a negative value is worse: the floor goes negative, so
+    /// `copies < floor` is false for any non-negative count.
     /// The only value that preserves "multiply, never replace, never
     /// invert" is `>= 1` (`1` is a legitimate "no extra safety margin"
     /// choice — the ordinary `min_copies`/`required_locations` still

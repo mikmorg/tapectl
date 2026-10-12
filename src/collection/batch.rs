@@ -427,11 +427,14 @@ fn under_copied_units(
             copy_count_expr(&CoverageQuery::current_unit("?1"))
         );
         let copies: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
-        if copies < resolved.min_copies {
+        // The floor `staging clean`'s retention gate also asks: the one
+        // tape-only rule (ADR-0012 2026-10-12 item 43).
+        let min_copies = crate::policy::coverage::floor(config, resolved.min_copies, &unit.status);
+        if copies < min_copies {
             under.push(CopyProgress {
                 unit_name: u.name.clone(),
                 copies,
-                min_copies: resolved.min_copies,
+                min_copies,
             });
         }
     }
@@ -636,6 +639,30 @@ mod tests {
         assert_eq!(under[0].unit_name, "testlib/alpha");
         assert_eq!(under[0].copies, 1);
         assert_eq!(under[0].min_copies, 2);
+    }
+
+    /// ADR-0012 2026-10-12 item 43: the release gate asks the floor
+    /// `staging clean` retains by, the one tape-only rule's. One copy meets
+    /// `min_copies = 1` for an active unit (the positive control); tape-only
+    /// at 3x it needs 3.
+    #[test]
+    fn under_copied_units_takes_the_tape_only_multiplier() {
+        let conn = db::open_memory().unwrap();
+        seed_unit_with_one_completed_copy(&conn, "testlib/alpha");
+        let mut config = Config::default();
+        config.defaults.min_copies = 1;
+        config.compaction.tape_only_safety_multiplier = 3;
+        let batch = one_unit_batch("testlib/alpha");
+
+        assert!(under_copied_units(&conn, &config, &batch)
+            .unwrap()
+            .is_empty());
+
+        conn.execute("UPDATE units SET status = 'tape_only'", [])
+            .unwrap();
+        let under = under_copied_units(&conn, &config, &batch).unwrap();
+        assert_eq!(under.len(), 1, "{under:?}");
+        assert_eq!((under[0].copies, under[0].min_copies), (1, 3));
     }
 
     /// Like [`seed_unit_with_one_completed_copy`], but also creates a real

@@ -728,7 +728,9 @@ fn restage_action(
 // Check copy count. Routes through the same ADR-0004 eligibility predicate
 // (issue #89) the gates use, so `audit` and `unit
 // mark-tape-only`/`snapshot mark-reclaimable` can never disagree about how
-// many copies a unit has.
+// many copies a unit has. The floor is `policy::coverage::floor`'s, the one
+// tape-only rule those gates ask too (ADR-0012 2026-10-12 item 43): a
+// tape-only unit needs `min_copies` times the multiplier.
 fn check_copy_count(
     ctx: &Ctx<'_>,
     unit: &Unit,
@@ -737,12 +739,16 @@ fn check_copy_count(
     let resolved = policy.expect("copy_count is a needs_policy check");
     let mut f = Findings::default();
     let copy_count = copy_count_for_unit(ctx.conn, unit.id)?;
+    let needed = policy::coverage::floor(ctx.config, resolved.min_copies, &unit.status);
 
-    if copy_count < resolved.min_copies {
+    if copy_count < needed {
         f.violations.push(AuditFinding {
             unit: unit.name.clone(),
             check: "copy_count".into(),
-            message: format!("has {copy_count} copies, needs {}", resolved.min_copies),
+            message: format!(
+                "has {copy_count} copies, needs {needed}{}",
+                policy::coverage::tape_only_note(ctx.config, &unit.status)
+            ),
             action: additional_copy_action(ctx.conn, unit, "")?,
         });
     }
@@ -3878,6 +3884,42 @@ mod tests {
             // Positive control: two at each meets it.
             add_copy_at(&conn, "V-offsite-2", "offsite");
             assert!(location_findings(&conn).is_empty());
+        }
+
+        fn copy_findings(conn: &Connection, config: &Config) -> Vec<AuditFinding> {
+            let (violations, _warnings) = collect_findings(conn, config, Some("named")).unwrap();
+            violations
+                .into_iter()
+                .filter(|f| f.check == "copy_count")
+                .collect()
+        }
+
+        /// ADR-0012 2026-10-12 item 43 (#423 part 2): `copy_count` asks a
+        /// tape-only unit for `min_copies` times the multiplier, through
+        /// the one rule `unit mark-tape-only` and `snapshot
+        /// mark-reclaimable` ask. Two copies meet the default `min_copies`
+        /// of 2; at 3x (not 2, so a literal cannot pass) a tape-only unit
+        /// needs 6. The same unit active is the positive control: it is
+        /// never multiplied.
+        #[test]
+        fn a_tape_only_unit_needs_the_multiplied_copy_count() {
+            let conn = setup(&["home-rack", "offsite"]);
+            let mut config = Config::default();
+            config.compaction.tape_only_safety_multiplier = 3;
+            assert!(
+                copy_findings(&conn, &config).is_empty(),
+                "an active unit is held to min_copies alone"
+            );
+
+            conn.execute("UPDATE units SET status = 'tape_only'", [])
+                .unwrap();
+            let findings = copy_findings(&conn, &config);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(findings[0].message, "has 2 copies, needs 6 (tape-only 3x)");
+
+            // At 1x the tape-only floor is the policy's own, and met.
+            config.compaction.tape_only_safety_multiplier = 1;
+            assert!(copy_findings(&conn, &config).is_empty());
         }
     }
 

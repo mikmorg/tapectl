@@ -98,8 +98,9 @@ pub enum UnitCommands {
         name: String,
         /// Confirm in advance, as the global --yes does: mark the unit even
         /// though it is short of its policy's min_copies, the [defaults]
-        /// min_locations floor or its required_locations, or is dirty
-        /// (changed since its last snapshot). Without either flag a
+        /// min_locations floor or its required_locations (each at the
+        /// tape-only floor: times [compaction] tape_only_safety_multiplier),
+        /// or is dirty (changed since its last snapshot). Without either flag a
         /// terminal asks, and a non-interactive run refuses, naming each
         /// shortfall. A unit that was never archived is refused whatever
         /// the flags (ADR-0008 Tier 3)
@@ -1225,12 +1226,16 @@ mod mark_tape_only_consent_tests {
     /// `photos`: 2 copies in 2 locations (`coverage::tests`' fixture),
     /// against a `[defaults] min_copies` of 3 — below policy, not dirty and
     /// not never-archived, so only the Tier-2 copy shortfall can stop it.
+    /// The tape-only multiplier is 1, so the floors are the policy's own
+    /// (ADR-0012 2026-10-12 item 43's multiplied floors are tested in
+    /// `cli::operations`' `tape_only_floors`).
     fn below_policy() -> (Connection, TempDir, TapectlPaths, Config) {
         let (conn, _unit, _vol) = crate::policy::coverage::tests::setup_unit_with_deposit("active");
         let tmp = TempDir::new().unwrap();
         let paths = TapectlPaths::new(tmp.path().join("home"));
         let mut config = Config::default();
         config.defaults.min_copies = 3;
+        config.compaction.tape_only_safety_multiplier = 1;
         (conn, tmp, paths, config)
     }
 
