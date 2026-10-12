@@ -333,8 +333,13 @@ fn budget(command: Command) -> (usize, usize, &'static [&'static str]) {
         // Per unit by design today: six statements a unit (its checks run
         // unit by unit), plus one pass over `writes` (w) and `volumes` (v)
         // for the whole-catalog checks. The slope is pinned so a seventh
-        // per-unit statement is a decision, not a drift.
-        Command::Audit => (8 + 6 * LARGE, 6, &["encryption_keys", "v", "w"]),
+        // per-unit statement is a decision, not a drift. `tenancy` (#383)
+        // reads every tenant and its keys and every written stage set once
+        // (`tenant_directory`, `written_stage_sets`: three statements, not
+        // three a unit), and `tape_alert` (#308) reads every TapeAlert on
+        // record, one pass over `health_logs` (h) with no LIMIT by design
+        // (ADR-0013). Measured 2026-10-12 at land4: 13 + 6 a unit.
+        Command::Audit => (13 + 6 * LARGE, 6, &["encryption_keys", "h", "v", "w"]),
         // Per unit by design today: the unit list, then for each unit
         // under the root its policy (`policy::resolve`) and its copy count
         // — three statements a unit.

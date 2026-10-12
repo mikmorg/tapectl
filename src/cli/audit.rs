@@ -122,6 +122,12 @@ struct Ctx<'a> {
     escrow: Option<&'a str>,
     /// `report::dirty_rows`'s scan, computed once for all units.
     dirty_rows: &'a [crate::cli::report::DirtyRow],
+    /// Every tenant's name and keys (`policy::tenancy::tenant_directory`),
+    /// read once for the `tenancy` check rather than per unit.
+    tenants: &'a std::collections::BTreeMap<i64, (String, Vec<String>)>,
+    /// Every unit's written stage sets
+    /// (`policy::tenancy::written_stage_sets`), one read for all units.
+    written_sets: &'a std::collections::BTreeMap<i64, Vec<crate::policy::tenancy::WrittenSet>>,
     unit_filter: Option<&'a str>,
     /// The CURRENT unit's resolved policy (issue #274), while
     /// `collect_findings`'s per-unit loop is running -- `None` outside it
@@ -373,11 +379,16 @@ fn collect_findings(
     let dirty_rows =
         crate::cli::report::dirty_rows(conn, unit_filter, &config.defaults.global_excludes)?;
 
+    let tenants = crate::policy::tenancy::tenant_directory(conn)?;
+    let written_sets = crate::policy::tenancy::written_stage_sets(conn, None)?;
+
     let ctx = Ctx {
         conn,
         config,
         escrow: escrow_pubkey.as_deref(),
         dirty_rows: &dirty_rows,
+        tenants: &tenants,
+        written_sets: &written_sets,
         unit_filter,
         // Set per-unit below, inside the loop -- see `Ctx::resolved`'s doc.
         // The archive-wide checks after the loop read this same base `ctx`
@@ -988,12 +999,15 @@ fn check_escrow_coverage(
 fn check_tenancy(ctx: &Ctx<'_>, unit: &Unit, _policy: Option<&ResolvedPolicy>) -> Result<Findings> {
     use crate::policy::tenancy::Disagreement;
     let mut f = Findings::default();
-    let tenant: String = ctx.conn.query_row(
-        "SELECT name FROM tenants WHERE id = ?1",
-        params![unit.tenant_id],
-        |r| r.get(0),
-    )?;
-    for d in crate::policy::tenancy::disagreements(ctx.conn, unit)? {
+    let Some((tenant, keys)) = ctx.tenants.get(&unit.tenant_id) else {
+        return Ok(f);
+    };
+    let written = ctx
+        .written_sets
+        .get(&unit.id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for d in crate::policy::tenancy::disagreements(unit, tenant, keys, written) {
         let (message, action) = match d {
             Disagreement::Dotfile {
                 path,

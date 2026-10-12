@@ -36,6 +36,7 @@
 //! (`policy::escrow`): the question is about bytes tapectl still accounts
 //! for, and a stage set written in the clear is `encryption`'s finding.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use rusqlite::{params, Connection};
@@ -83,6 +84,57 @@ pub fn tenant_public_keys(conn: &Connection, tenant_id: i64) -> Result<Vec<Strin
     Ok(keys)
 }
 
+/// A written stage set: `(stage_set_id, version, volume_label,
+/// key_fingerprints)`.
+pub type WrittenSet = (i64, i64, String, Option<String>);
+
+/// The written stage sets (completed writes on in-service volumes,
+/// encrypted) of `unit_id`, or of every unit when `None`, keyed by unit, in
+/// volume order: one statement whatever the unit count, so `audit` reads
+/// them once for all units (`tests/catalog_budget.rs`).
+pub fn written_stage_sets(
+    conn: &Connection,
+    unit_id: Option<i64>,
+) -> Result<BTreeMap<i64, Vec<WrittenSet>>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT s.unit_id, ss.id, s.version, v.label, ss.key_fingerprints
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE w.status = 'completed' AND ss.encrypted = 1 AND {}
+           AND (?1 IS NULL OR s.unit_id = ?1)
+         ORDER BY v.label, ss.id",
+        crate::policy::coverage::in_service("v")
+    ))?;
+    let mut out: BTreeMap<i64, Vec<WrittenSet>> = BTreeMap::new();
+    for row in stmt.query_map(params![unit_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            (
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ),
+        ))
+    })? {
+        let (unit, set) = row?;
+        out.entry(unit).or_default().push(set);
+    }
+    Ok(out)
+}
+
+/// Those of `written` that none of `tenant_keys` can open, as
+/// `(stage_set_id, version, volume_label)`.
+fn unreadable(written: &[WrittenSet], tenant_keys: &[String]) -> Vec<(i64, i64, String)> {
+    written
+        .iter()
+        .filter(|(.., fps)| readable_by(fps.as_deref(), tenant_keys) == Some(false))
+        .map(|(id, version, label, _)| (*id, *version, label.clone()))
+        .collect()
+}
+
 /// The written stage sets of `unit_id` (completed writes on in-service
 /// volumes, encrypted) that none of `tenant_keys` can open, as
 /// `(stage_set_id, version, volume_label)`, in volume order.
@@ -91,32 +143,11 @@ pub fn unreadable_stage_sets(
     unit_id: i64,
     tenant_keys: &[String],
 ) -> Result<Vec<(i64, i64, String)>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT ss.id, s.version, v.label, ss.key_fingerprints
-         FROM writes w
-         JOIN stage_sets ss ON ss.id = w.stage_set_id
-         JOIN snapshots s ON s.id = ss.snapshot_id
-         JOIN volumes v ON v.id = w.volume_id
-         WHERE w.status = 'completed' AND ss.encrypted = 1 AND {}
-           AND s.unit_id = ?1
-         ORDER BY v.label, ss.id",
-        crate::policy::coverage::in_service("v")
-    ))?;
-    let rows = stmt
-        .query_map(params![unit_id], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows
-        .into_iter()
-        .filter(|(.., fps)| readable_by(fps.as_deref(), tenant_keys) == Some(false))
-        .map(|(id, version, label, _)| (id, version, label))
-        .collect())
+    let written = written_stage_sets(conn, Some(unit_id))?;
+    Ok(written
+        .get(&unit_id)
+        .map(|w| unreadable(w, tenant_keys))
+        .unwrap_or_default())
 }
 
 /// How many written copies of `from_tenant`'s units none of `to_tenant`'s
@@ -159,20 +190,44 @@ fn dotfile_tenant(unit: &Unit) -> Option<(String, String)> {
     Some((path.display().to_string(), df.tenant))
 }
 
+/// Every tenant's name and public keys, by id: what [`disagreements`]
+/// judges against, read once for a whole audit rather than per unit (two
+/// statements, whatever the unit count; `tests/catalog_budget.rs`).
+pub fn tenant_directory(conn: &Connection) -> Result<BTreeMap<i64, (String, Vec<String>)>> {
+    let mut out: BTreeMap<i64, (String, Vec<String>)> = BTreeMap::new();
+    let mut stmt = conn.prepare("SELECT id, name FROM tenants")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+        let (id, name) = row?;
+        out.insert(id, (name, Vec::new()));
+    }
+    let mut stmt = conn
+        .prepare("SELECT tenant_id, public_key FROM encryption_keys WHERE tenant_id IS NOT NULL")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+        let (id, key) = row?;
+        if let Some((_, keys)) = out.get_mut(&id) {
+            keys.push(key);
+        }
+    }
+    Ok(out)
+}
+
 /// Every place `unit`'s tenancy disagrees with `units.tenant_id`: its
 /// dotfile (an `active` unit only: the directory of a `tape_only` or
 /// `missing` unit is not the unit's to read), then each written stage set
-/// the owning tenant cannot open.
-pub fn disagreements(conn: &Connection, unit: &Unit) -> Result<Vec<Disagreement>> {
-    let tenant_name: String = conn.query_row(
-        "SELECT name FROM tenants WHERE id = ?1",
-        params![unit.tenant_id],
-        |r| r.get(0),
-    )?;
+/// the owning tenant cannot open. `tenant_name` and `keys` are the owning
+/// tenant's, from [`tenant_directory`]; `written` is the unit's own entry
+/// from [`written_stage_sets`]. Neither is read here, so an audit judges
+/// every unit from two whole-catalog reads.
+pub fn disagreements(
+    unit: &Unit,
+    tenant_name: &str,
+    keys: &[String],
+    written: &[WrittenSet],
+) -> Vec<Disagreement> {
     let mut out = Vec::new();
     if unit.status == "active" {
         if let Some((path, dotfile_tenant)) = dotfile_tenant(unit) {
-            if dotfile_tenant != tenant_name {
+            if dotfile_tenant != *tenant_name {
                 out.push(Disagreement::Dotfile {
                     path,
                     dotfile_tenant,
@@ -180,20 +235,27 @@ pub fn disagreements(conn: &Connection, unit: &Unit) -> Result<Vec<Disagreement>
             }
         }
     }
-    let keys = tenant_public_keys(conn, unit.tenant_id)?;
-    for (stage_set_id, version, volume_label) in unreadable_stage_sets(conn, unit.id, &keys)? {
+    for (stage_set_id, version, volume_label) in unreadable(written, keys) {
         out.push(Disagreement::StageSet {
             stage_set_id,
             version,
             volume_label,
         });
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn judge(conn: &Connection, unit: &Unit) -> Vec<Disagreement> {
+        let tenants = tenant_directory(conn).unwrap();
+        let (name, keys) = &tenants[&unit.tenant_id];
+        let written = written_stage_sets(conn, None).unwrap();
+        let mine = written.get(&unit.id).map(Vec::as_slice).unwrap_or_default();
+        disagreements(unit, name, keys, mine)
+    }
 
     #[test]
     fn a_list_naming_any_tenant_key_is_readable() {
@@ -344,7 +406,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            disagreements(&conn, &unit).unwrap(),
+            judge(&conn, &unit),
             vec![Disagreement::Dotfile {
                 path: path.display().to_string(),
                 dotfile_tenant: "alice".into(),
@@ -355,10 +417,10 @@ mod tests {
             status: "missing".into(),
             ..unit.clone()
         };
-        assert!(disagreements(&conn, &missing).unwrap().is_empty());
+        assert!(judge(&conn, &missing).is_empty());
 
         df.tenant = "bob".into();
         crate::unit::dotfile::write_dotfile(&path, &df).unwrap();
-        assert!(disagreements(&conn, &unit).unwrap().is_empty());
+        assert!(judge(&conn, &unit).is_empty());
     }
 }

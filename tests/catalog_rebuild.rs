@@ -1231,7 +1231,9 @@ fn units_are_filed_under_their_real_tenants_not_the_operator_placeholder() {
 /// tenant's real public key clears it.
 #[test]
 fn a_rebuilt_catalog_with_no_tenant_keys_reports_no_tenancy_disagreement() {
-    use tapectl::policy::tenancy::{disagreements, Disagreement};
+    use tapectl::policy::tenancy::{
+        disagreements, tenant_directory, written_stage_sets, Disagreement,
+    };
     let mut vol = build_sealed_volume_with(CatalogDb::New);
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
@@ -1252,8 +1254,11 @@ fn a_rebuilt_catalog_with_no_tenant_keys_reports_no_tenancy_disagreement() {
         let unit = db::queries::get_unit_by_name(conn, unit_name)
             .unwrap()
             .unwrap();
-        disagreements(conn, &unit)
-            .unwrap()
+        let tenants = tenant_directory(conn).unwrap();
+        let (name, keys) = &tenants[&unit.tenant_id];
+        let written = written_stage_sets(conn, None).unwrap();
+        let mine = written.get(&unit.id).map(Vec::as_slice).unwrap_or_default();
+        disagreements(&unit, name, keys, mine)
             .into_iter()
             .filter(|d| matches!(d, Disagreement::StageSet { .. }))
             .count()
