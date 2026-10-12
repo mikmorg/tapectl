@@ -49,7 +49,7 @@
 //! not covered, every gate still refuses — with the attest path named
 //! (#137). Attestation is `catalog rebuild --key <escrow>`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -787,9 +787,15 @@ fn attest_escrow(
 /// A tenant envelope that will not open is routine and silent — an operator
 /// key opens all of them, but running with a tenant key opens exactly one.
 /// The operator envelope failing to open is the one case worth a specific
-/// diagnosis, because it is what a tenant key looks like from here, so it
-/// falls through to `operator_envelope_backup` (the redundant copy exists
-/// precisely for a damaged primary) before giving up.
+/// diagnosis, because it is what a tenant key looks like from here.
+///
+/// Every envelope has a backup copy (`volume-format-v2.md` §1.3: the
+/// operator's since v2's first write, each tenant's since 1.1.0), the same
+/// bytes under the same front-index hash. A backup is opened only when the
+/// envelope it copies could not be — it did not read, or did not decrypt —
+/// and is skipped once a copy with its hash has opened or proved the key is
+/// not a recipient. A copy that failed is an error only when no copy with
+/// its hash opened by the end of the walk.
 /// The HEIR's recipe, and the reason it is a function rather than an inline
 /// string: it names a command, a flag and a FILENAME, and all three are
 /// facts about other modules that can drift. Issue #214's sibling sweep
@@ -833,6 +839,18 @@ fn tenant_key_refusal_message() -> String {
     )
 }
 
+/// The front-index kinds that are envelopes: every primary and its backup
+/// (`volume-format-v2.md` §1.3).
+fn is_envelope_label(label: &str) -> bool {
+    matches!(
+        label,
+        "tenant_envelope"
+            | "operator_envelope"
+            | "operator_envelope_backup"
+            | "tenant_envelope_backup"
+    )
+}
+
 fn open_all_envelopes(
     store: &mut dyn Store,
     entries: &[format::ParsedIndexEntry],
@@ -841,27 +859,41 @@ fn open_all_envelopes(
 ) -> Result<Vec<OpenedEnvelope>> {
     let mut out = Vec::new();
     let mut operator_refused = false;
+    // Front-index hashes of the copies already settled: one opened, or the
+    // key proved not a recipient. A later copy with the same hash is the
+    // same bytes and would only duplicate (or repeat) that answer.
+    let mut settled: HashSet<String> = HashSet::new();
+    // Copies that failed (hash, position, kind, why), in tape order: an
+    // error only if no copy with that hash opens by the end of the walk.
+    let mut failed: Vec<(String, i32, String, TapectlError)> = Vec::new();
 
     for entry in entries {
-        let is_envelope = matches!(
-            entry.type_label.as_str(),
-            "tenant_envelope" | "operator_envelope" | "operator_envelope_backup"
-        );
-        if !is_envelope {
+        if !is_envelope_label(&entry.type_label) {
             continue;
         }
-        // The backup is byte-identical to the primary; opening it when the
-        // primary already parsed would only duplicate every unit.
-        if entry.type_label == "operator_envelope_backup"
-            && out
-                .iter()
-                .any(|e: &OpenedEnvelope| e.manifest.is_operator())
-        {
+        // An envelope with no recorded hash cannot be paired with a copy;
+        // it is its own key, by position.
+        let copy_key = entry
+            .sha256_encrypted
+            .clone()
+            .unwrap_or_else(|| format!("@{}", entry.position));
+        if settled.contains(&copy_key) {
             continue;
         }
 
         match envelope::open_envelope(store, entry, identities, scratch) {
-            Ok(env) => out.push(env),
+            Ok(env) => {
+                if entry.type_label.ends_with("_backup") {
+                    tracing::warn!(
+                        position = entry.position,
+                        type_label = %entry.type_label,
+                        "rebuild: opened the backup copy of an envelope that could not be used"
+                    );
+                }
+                failed.retain(|(k, ..)| k != &copy_key);
+                settled.insert(copy_key);
+                out.push(env);
+            }
             Err(OpenError::NoMatchingKey) => {
                 if entry.type_label.starts_with("operator_envelope") {
                     operator_refused = true;
@@ -871,21 +903,33 @@ fn open_all_envelopes(
                     type_label = %entry.type_label,
                     "rebuild: key is not a recipient of this envelope, skipping"
                 );
+                failed.retain(|(k, ..)| k != &copy_key);
+                settled.insert(copy_key);
             }
             Err(OpenError::Failed(e)) => {
-                if entry.type_label == "operator_envelope" {
-                    // Damaged primary: the backup is the whole reason there
-                    // are two, so carry on rather than aborting the rebuild.
-                    tracing::warn!(
-                        position = entry.position,
-                        error = %e,
-                        "rebuild: operator envelope unreadable, falling back to the backup copy"
-                    );
-                    continue;
-                }
-                return Err(e);
+                // A damaged or unreadable copy: its backup (further on, the
+                // same hash) is the whole reason there are two, so carry on.
+                tracing::warn!(
+                    position = entry.position,
+                    type_label = %entry.type_label,
+                    error = %e,
+                    "rebuild: envelope unreadable, falling back to its backup copy if it has one"
+                );
+                failed.push((copy_key, entry.position, entry.type_label.clone(), e));
             }
         }
+    }
+
+    if let Some((key, position, type_label, e)) = failed.first() {
+        let copies = failed.iter().filter(|(k, ..)| k == key).count();
+        let others = if copies > 1 {
+            "and neither could its backup copy"
+        } else {
+            "and the tape holds no other copy of it"
+        };
+        return Err(TapectlError::Other(format!(
+            "the {type_label} at position {position} could not be opened, {others}: {e}"
+        )));
     }
 
     if operator_refused && !out.iter().any(|e| e.manifest.is_operator()) {

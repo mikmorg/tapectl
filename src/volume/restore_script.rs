@@ -99,15 +99,18 @@ pub(crate) const AWK_CHECK_FILE_LIST: &str = r##"
     }
   "##;
 
-/// Lists tenant/operator envelope positions in on-tape order (the file list
-/// is already position-sorted, and the format's fixed zone order already
-/// puts tenant envelope(s) before the operator envelope before its
-/// backup). Stateless — no accumulator, no `END` block — so by the letter
+/// Lists every envelope position, primaries and backups, in on-tape order
+/// (the file list is already position-sorted, and the format's fixed zone
+/// order puts the tenant envelope(s), then the operator envelope and its
+/// backup, then each tenant envelope's backup: every primary before every
+/// backup, `volume-format-v2.md` sec 1.3). The walk over these skips a
+/// backup whose primary was already tried, by its equal hash, and reads it
+/// when the primary was damaged or would not read. Stateless — no accumulator, no `END` block — so by the letter
 /// of the classification this is plain field extraction; it is named
 /// anyway because it is the one shared discovery step both
 /// `--find-envelope` and `--restore` walk to locate the envelope that
 /// opens under the supplied key.
-pub(crate) const AWK_FIND_ENVELOPE: &str = r##"$2=="tenant_envelope" || $2=="operator_envelope" || $2=="operator_envelope_backup" { print $1 }"##;
+pub(crate) const AWK_FIND_ENVELOPE: &str = r##"$2=="tenant_envelope" || $2=="operator_envelope" || $2=="operator_envelope_backup" || $2=="tenant_envelope_backup" { print $1 }"##;
 
 /// Does an envelope's decrypted `MANIFEST.toml` list a given unit under
 /// `[[units]]`? Issue #127: the escrow recipient (ADR-0005) is on every

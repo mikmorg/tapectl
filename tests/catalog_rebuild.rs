@@ -1496,6 +1496,109 @@ fn a_tape_without_a_catalog_db_still_rebuilds_the_restore_path() {
     );
 }
 
+/// The front index of a `MemStore` tape, parsed from its recorded bytes.
+fn front_index_of(vol: &SealedVolume) -> Vec<tapectl::volume::format::ParsedIndexEntry> {
+    let raw = &vol.store.files[3];
+    let text = String::from_utf8_lossy(raw);
+    tapectl::volume::format::parse_front_index(text.trim_end_matches('\0'))
+        .expect("front index parses")
+}
+
+/// Flip one byte in the middle of tape file `pos`'s ciphertext: age still
+/// matches the key from the header, and the payload no longer authenticates.
+fn damage_file(vol: &mut SealedVolume, pos: i32, size: u64) {
+    vol.store.files[pos as usize][size as usize / 2] ^= 0xff;
+}
+
+/// `volume-format-v2.md` §1.3 (#418 item 2): a damaged tenant envelope falls
+/// back to its backup copy. On a tape without `catalog.db` the tenant
+/// envelopes are where ownership comes from, so a rebuild that gave up on the
+/// damaged primary (as it did before the backup existed) could not file the
+/// tenant's units under it.
+#[test]
+fn a_damaged_tenant_envelope_is_read_from_its_backup() {
+    let mut vol = build_sealed_volume(false);
+    let fi = front_index_of(&vol);
+    let primaries: Vec<_> = fi
+        .iter()
+        .filter(|e| e.type_label == "tenant_envelope")
+        .cloned()
+        .collect();
+    assert_eq!(primaries.len(), 2, "alpha and bravo");
+    for p in &primaries {
+        let backup = fi
+            .iter()
+            .find(|e| {
+                e.type_label == "tenant_envelope_backup" && e.sha256_encrypted == p.sha256_encrypted
+            })
+            .expect("every tenant envelope has a backup on tape");
+        assert!(backup.position > p.position);
+        damage_file(&mut vol, p.position, p.size_bytes.unwrap());
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("both tenant envelopes are damaged, and both backups are whole");
+    assert!(
+        report.units_without_tenant_envelope.is_empty(),
+        "{:?}",
+        report.units_without_tenant_envelope
+    );
+    for (unit_name, tenant_name, _) in UNITS {
+        let got: String = conn
+            .query_row(
+                "SELECT t.name FROM units u JOIN tenants t ON t.id = u.tenant_id
+                 WHERE u.name = ?1",
+                rusqlite::params![unit_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(&got, tenant_name, "unit {unit_name}");
+    }
+}
+
+/// Positive control for the test above: with BOTH copies of a tenant
+/// envelope damaged there is nothing to fall back to, and the rebuild says
+/// so rather than carrying on without that tenant's envelope.
+#[test]
+fn a_tenant_envelope_damaged_in_both_copies_fails_the_rebuild() {
+    let mut vol = build_sealed_volume(false);
+    let fi = front_index_of(&vol);
+    let primary = fi
+        .iter()
+        .find(|e| e.type_label == "tenant_envelope")
+        .unwrap()
+        .clone();
+    let backup = fi
+        .iter()
+        .find(|e| {
+            e.type_label == "tenant_envelope_backup"
+                && e.sha256_encrypted == primary.sha256_encrypted
+        })
+        .unwrap()
+        .clone();
+    damage_file(&mut vol, primary.position, primary.size_bytes.unwrap());
+    damage_file(&mut vol, backup.position, backup.size_bytes.unwrap());
+
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("no whole copy of the envelope is left");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!(
+            "the tenant_envelope at position {} could not be opened, and neither could its backup copy",
+            primary.position
+        )),
+        "the error names the damaged envelope and its backup: {msg}"
+    );
+}
+
 /// Idempotence is the property that makes a rebuild safe to run across a
 /// shelf of cartridges, twice, in any order.
 #[test]

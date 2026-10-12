@@ -107,7 +107,8 @@ from the `tenant_id` sequence so per-position ciphertext hashes don't acquire a
 stable cross-tape tenant mapping. Deterministic and RNG-free, so Layout
 construction stays reproducible (`layout-session.md` determinism rule). Scope:
 tenant envelopes only — the operator envelope + backup keep their fixed
-positions at the end of the middle zone, and slices stay unit-contiguous (they
+positions after them (the tenant envelopes' backups, since 1.1.0, follow the
+operator pair in the primaries' permuted order, `volume-format-v2.md` §1.3), and slices stay unit-contiguous (they
 carry no tenant label; contiguity is what makes restore sequential).
 
 ### 2.2 ContentSource memory model — **materialize-to-staging**
@@ -720,8 +721,9 @@ The modes above stand; RESTORE.sh also:
 - passes dar `-N` everywhere; the rung-3 zero-strip recipe strips only the
   trailing padding (the old `tr -d '\0'` destroyed ciphertext).
 
-Open: a backup copy of each tenant envelope (#412 item 6, research R2) is not
-built; the write path's contact check (session.rs) still locates a foreign
+A backup copy of each tenant envelope (#412 item 6, research R2) is built in
+1.1.0 (ADR-0012 2026-10-12 item 44; `volume-format-v2.md` §1.3). Open: the
+write path's contact check (session.rs) still locates a foreign
 tape's seal by File 0's pointer, not by end of data.
 
 ---

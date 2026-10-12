@@ -182,7 +182,7 @@ pub enum RestoreCommands {
         /// Dump only the files of these front-index types (comma-separated
         /// or repeated): id_thunk, system_guide, restore_sh, front_index,
         /// tenant_envelope, operator_envelope, operator_envelope_backup,
-        /// data_slice, seal_marker
+        /// tenant_envelope_backup, data_slice, seal_marker
         #[arg(long, value_delimiter = ',', value_name = "TYPE")]
         only: Vec<String>,
     },

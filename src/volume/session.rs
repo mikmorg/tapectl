@@ -4140,16 +4140,17 @@ mod tests {
 
         // The fixture's content entries (seal excluded) are, in order:
         // id_thunk, guide, restore_sh, front_index, tenant_envelope,
-        // operator_envelope, operator_envelope_backup, slice_1, slice_2 —
-        // 9 entries, slice_1 at index 7. Fire "interrupted" starting on the
-        // 9th check (0-indexed call count >= 8), i.e. AFTER slice_1 (index 7)
-        // has been fully processed but BEFORE slice_2 (index 8) is even
-        // opened — exercising the two-case cursor rule's more interesting
-        // branch (>=1 slice written) rather than the zero-slices/BOT case.
+        // operator_envelope, operator_envelope_backup,
+        // tenant_envelope_backup, slice_1, slice_2 — 10 entries, slice_1 at
+        // index 8. Fire "interrupted" starting on the 10th check (0-indexed
+        // call count >= 9), i.e. AFTER slice_1 (index 8) has been fully
+        // processed but BEFORE slice_2 (index 9) is even opened — exercising
+        // the two-case cursor rule's more interesting branch (>=1 slice
+        // written) rather than the zero-slices/BOT case.
         let calls = AtomicU32::new(0);
         let is_interrupted = move || {
             let n = calls.fetch_add(1, Ordering::SeqCst);
-            n >= 8
+            n >= 9
         };
 
         let interrupted = match planned
@@ -4194,9 +4195,9 @@ mod tests {
             .unwrap();
         assert_eq!(slice_2_status, "pending");
 
-        // The store itself only has the 8 entries written before the
+        // The store itself only has the 9 entries written before the
         // interruption fired (id_thunk..slice_1), definitely no seal marker.
-        assert_eq!(store.files.len(), 8);
+        assert_eq!(store.files.len(), 9);
 
         // --- Resume, with a predicate that never interrupts ---
         let ready = match interrupted
@@ -4252,7 +4253,7 @@ mod tests {
     }
 
     /// A fresh session of a fixture's `built`, interrupted between entries
-    /// after slice_1 — the SIGINT test's shape: 8 files recorded (id_thunk
+    /// after slice_1 — the SIGINT test's shape: 9 files recorded (id_thunk
     /// .. slice_1), slice_1 `written`, slice_2 `pending`, rows
     /// `interrupted`. For the resume tests below.
     fn interrupt_after_first_slice(
@@ -4269,13 +4270,13 @@ mod tests {
             .plan(conn, volume_id, units)
             .unwrap();
         let calls = AtomicU32::new(0);
-        let is_interrupted = move || calls.fetch_add(1, Ordering::SeqCst) >= 8;
+        let is_interrupted = move || calls.fetch_add(1, Ordering::SeqCst) >= 9;
         match planned
             .execute_checking(conn, &mut store, is_interrupted)
             .unwrap()
         {
             ExecuteOutcome::Interrupted(i) => {
-                assert_eq!(store.files.len(), 8);
+                assert_eq!(store.files.len(), 9);
                 (i, store)
             }
             _ => panic!("expected Interrupted"),
@@ -4316,17 +4317,17 @@ mod tests {
         );
         assert_eq!(
             fake.state().files.len(),
-            8,
+            9,
             "the tape is as the session left it"
         );
         assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["interrupted"]);
     }
 
-    /// Issue #403: the catalog recorded slice_1 `written` (8 files), but
-    /// the tape holds 7 — the immediate filemark after slice_1 was still in
+    /// Issue #403: the catalog recorded slice_1 `written` (9 files), but
+    /// the tape holds 8 — the immediate filemark after slice_1 was still in
     /// the drive's buffer when the power went. Resume used to rewind and
-    /// space 8 filemarks blind, fail at end of data, and leave abort and a
-    /// full rewrite as the only exit. Now it resumes from the medium's 7,
+    /// space 9 filemarks blind, fail at end of data, and leave abort and a
+    /// full rewrite as the only exit. Now it resumes from the medium's 8,
     /// sets slice_1 back to `pending`, writes it again, and seals.
     #[test]
     fn resume_continues_from_the_medium_when_the_tape_is_behind_the_catalog() {
@@ -4356,7 +4357,11 @@ mod tests {
             ConfirmOutcome::Inconclusive(i) => panic!("inconclusive: {:?}", i.evidence.mismatches),
             ConfirmOutcome::Quarantined(q) => panic!("quarantined: {:?}", q.reason),
         }
-        assert_eq!(fake.state().files.len(), 10, "9 content files and the seal");
+        assert_eq!(
+            fake.state().files.len(),
+            11,
+            "10 content files and the seal"
+        );
         assert_eq!(statuses_on(&f.conn, f.volume_id), vec!["completed"]);
         let written: i64 = f
             .conn

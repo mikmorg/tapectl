@@ -20,7 +20,7 @@ and the single source from which *all* on-tape metadata is generated.
 Each entry carries: position index; zone kind (`id_thunk`, `system_guide`,
 `restore_sh`, `front_index`, `slice{stage_slice_id}`,
 `tenant_envelope{tenant_id}`, `operator_envelope`, `operator_envelope_backup`,
-`seal_marker` — the v1 planning header is folded into the operator envelope as
+`tenant_envelope_backup{tenant_id}` (`volume-format-v2.md` §1.3), `seal_marker` — the v1 planning header is folded into the operator envelope as
 `PLAN.toml`, `volume-format-v2.md` §8); byte size (exact for staged slices,
 computed at generation for generated zones); sha256 of the on-tape bytes (from
 `stage_slices` for slices; computed for generated zones); and content source (a

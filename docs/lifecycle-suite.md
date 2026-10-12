@@ -130,7 +130,9 @@ and therefore the failure, is identical.
 
 - **Operator envelope** is a normal restore path, not a refusal — layout.rs's
   `envelope_positions()` lists it alongside tenant envelopes as an equal
-  trial-decrypt candidate.
+  trial-decrypt candidate. The backups (operator, and since 1.1.0 each
+  tenant's) are listed too, and read only when their primary could not be
+  used.
 - **Touch-only is dirty** under the default `mtime_size` checksum_mode — it
   compares mtime AND size, so a same-content/new-mtime edit registers dirty;
   it's blind only to a same-size/same-mtime *content* change.

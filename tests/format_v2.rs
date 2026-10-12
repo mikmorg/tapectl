@@ -812,7 +812,10 @@ fn v2_zone_order_envelopes_precede_slices_no_planning_header() {
         .rposition(|e| {
             matches!(
                 e.type_label.as_str(),
-                "tenant_envelope" | "operator_envelope" | "operator_envelope_backup"
+                "tenant_envelope"
+                    | "operator_envelope"
+                    | "operator_envelope_backup"
+                    | "tenant_envelope_backup"
             )
         })
         .expect("harness must have at least one envelope");
@@ -842,6 +845,52 @@ fn v2_zone_order_envelopes_precede_slices_no_planning_header() {
     assert_eq!(
         tenant_envelope_count, 2,
         "harness must use exactly 2 tenants"
+    );
+
+    // §1.3: the middle zone is the tenant envelopes, the operator envelope
+    // and its backup, then one backup per tenant envelope in the primaries'
+    // order — each the same bytes, so the same size and hash in File 3.
+    let of = |label: &str| -> Vec<&format::ParsedIndexEntry> {
+        parsed.iter().filter(|e| e.type_label == label).collect()
+    };
+    let primaries = of("tenant_envelope");
+    let backups = of("tenant_envelope_backup");
+    let op = of("operator_envelope");
+    let op_backup = of("operator_envelope_backup");
+    assert_eq!(
+        backups.len(),
+        primaries.len(),
+        "one backup per tenant envelope"
+    );
+    assert_eq!((op.len(), op_backup.len()), (1, 1));
+    let expected_positions: Vec<i32> = (4..4 + 2 * primaries.len() as i32 + 2).collect();
+    let actual_positions: Vec<i32> = primaries
+        .iter()
+        .chain(&op)
+        .chain(&op_backup)
+        .chain(&backups)
+        .map(|e| e.position)
+        .collect();
+    assert_eq!(
+        actual_positions, expected_positions,
+        "tenant envelopes, operator envelope, its backup, the tenant backups: contiguous from File 4"
+    );
+    for (p, b) in primaries.iter().zip(&backups) {
+        assert_eq!(
+            (p.size_bytes, &p.sha256_encrypted),
+            (b.size_bytes, &b.sha256_encrypted),
+            "the backup at {} must carry the size and hash of the primary at {}, in order",
+            b.position,
+            p.position
+        );
+        assert_eq!(
+            h.store.files[p.position as usize], h.store.files[b.position as usize],
+            "a tenant envelope's backup is its exact bytes on tape"
+        );
+    }
+    assert_eq!(
+        (op[0].size_bytes, &op[0].sha256_encrypted),
+        (op_backup[0].size_bytes, &op_backup[0].sha256_encrypted)
     );
 }
 
@@ -1123,6 +1172,110 @@ fn keyed_heir_restore_matches_original_plaintext_exactly() {
              bytes for unit {}",
             exp_unit.unit_name
         );
+    }
+}
+
+/// Trial-decrypt one envelope's recorded bytes with `identity`, checking
+/// them against the front index's keyless hash first, as an heir does.
+/// `None` when the bytes do not match File 3 or do not decrypt.
+fn open_recorded_envelope(
+    files: &[Vec<u8>],
+    entry: &format::ParsedIndexEntry,
+    identity: &age::x25519::Identity,
+) -> Option<Vec<u8>> {
+    let size = entry.size_bytes.expect("envelope entry must be sized") as usize;
+    let padded = files.get(entry.position as usize)?;
+    let true_bytes = padded.get(..size)?;
+    if Some(sha256_hex(true_bytes)) != entry.sha256_encrypted {
+        return None;
+    }
+    let decryptor = age::Decryptor::new(true_bytes).ok()?;
+    let mut reader = decryptor
+        .decrypt(std::iter::once(identity as &dyn age::Identity))
+        .ok()?;
+    let mut tar_bytes = Vec::new();
+    reader.read_to_end(&mut tar_bytes).ok()?;
+    Some(tar_bytes)
+}
+
+/// §1.3, #418 item 2: a tenant envelope damaged on tape does not strand the
+/// tenant. Keyless, the heir sees the primary no longer matches File 3; the
+/// `tenant_envelope_backup` with the same hash is the same envelope, and it
+/// opens with the tenant's own key and lists the tenant's units. Recorded
+/// bytes only, as everywhere in this suite.
+#[test]
+fn a_damaged_tenant_envelope_is_recovered_from_its_backup() {
+    let h = shared_harness();
+    let (fi_pos, fi_true_len) = front_index_position_and_true_len(&h.layout);
+    let parsed = parse_front_index_from_recorded_bytes(&h.store.files, fi_pos, fi_true_len);
+    let tenant = &h.tenants[0];
+    let identity: age::x25519::Identity = tenant.secret_key.parse().unwrap();
+
+    // Positive control: on the undamaged tape the primary opens.
+    let primary = parsed
+        .iter()
+        .filter(|e| e.type_label == "tenant_envelope")
+        .find(|e| open_recorded_envelope(&h.store.files, e, &identity).is_some())
+        .expect("the tenant's own primary envelope opens on an undamaged tape")
+        .clone();
+
+    // Damage it: one byte in the middle of the ciphertext.
+    let mut files = h.store.files.clone();
+    let size = primary.size_bytes.unwrap() as usize;
+    files[primary.position as usize][size / 2] ^= 0xff;
+    assert!(
+        open_recorded_envelope(&files, &primary, &identity).is_none(),
+        "the damaged primary must no longer open"
+    );
+
+    // The heir's fallback: the backup carrying the primary's hash.
+    let backup = parsed
+        .iter()
+        .find(|e| {
+            e.type_label == "tenant_envelope_backup"
+                && e.sha256_encrypted == primary.sha256_encrypted
+        })
+        .expect("every tenant envelope has a backup with its hash");
+    assert!(backup.position > primary.position + 1);
+    let tar_bytes = open_recorded_envelope(&files, backup, &identity)
+        .expect("the backup opens with the tenant's own key");
+
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let mut manifest_str = None;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap().to_string_lossy() == "MANIFEST.toml" {
+            let mut s = String::new();
+            entry.read_to_string(&mut s).unwrap();
+            manifest_str = Some(s);
+        }
+    }
+    let manifest: ManifestDoc =
+        toml::from_str(&manifest_str.expect("MANIFEST.toml in the backup")).unwrap();
+    let mut listed: Vec<&str> = manifest.units.iter().map(|u| u.uuid.as_str()).collect();
+    let mut expected: Vec<&str> = h
+        .units
+        .iter()
+        .filter(|u| u.tenant_id == tenant.tenant_id)
+        .map(|u| u.unit_uuid.as_str())
+        .collect();
+    listed.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        listed, expected,
+        "the backup lists exactly this tenant's units"
+    );
+
+    // And the keyless chain names the damage, at the primary.
+    match keyless_chain_walk(&files, fi_pos, fi_true_len) {
+        ChainWalkVerdict::Unsealed { reason } => assert!(
+            reason.contains(&format!(
+                "content hash mismatch at position {}",
+                primary.position
+            )),
+            "{reason}"
+        ),
+        ChainWalkVerdict::Sealed { .. } => panic!("a damaged envelope must fail the chain walk"),
     }
 }
 

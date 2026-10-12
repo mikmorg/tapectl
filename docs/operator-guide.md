@@ -1482,7 +1482,7 @@ tapectl restore raw-volume --device "$TAPE" --to /staging/MHVTLR3 \
 ```
 
 `--from` is a wrong-tape guard against the tape's own reported label, not a
-catalog lookup. Expect output like `dumped 23 files … verified: 21
+catalog lookup. Expect output like `dumped 25 files … verified: 23
 mismatched: 0 unverifiable: 2`. **`mismatched` must be 0.** The two
 unverifiable files are always the front index and the seal marker — neither
 can carry its own hash — so `2` is the correct number, not a warning.
@@ -1492,10 +1492,10 @@ Files land named `{position:04}_{type}.bin`, e.g.:
 ```text
 0000_id_thunk.bin           0006_operator_envelope.bin
 0001_system_guide.bin       0007_operator_envelope_backup.bin
-0002_restore_sh.bin         0008_data_slice.bin  …  0021_data_slice.bin
-0003_front_index.bin        0022_seal_marker.bin
-0004_tenant_envelope.bin
-0005_tenant_envelope.bin
+0002_restore_sh.bin         0008_tenant_envelope_backup.bin
+0003_front_index.bin        0009_tenant_envelope_backup.bin
+0004_tenant_envelope.bin    0010_data_slice.bin  …  0023_data_slice.bin
+0005_tenant_envelope.bin    0024_seal_marker.bin
 ```
 
 **2. Upload, splitting hot from cold.** ADR-0006's zone split is the whole

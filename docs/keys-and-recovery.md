@@ -224,6 +224,7 @@ file:
 | File 0 ID thunk, File 1 guide, File 2 `RESTORE.sh`, File 3 front index, last-file seal marker | nobody (plaintext) | label, layout, sizes and ciphertext hashes. No names, no content |
 | Tenant envelope, one per tenant on the tape | that tenant's active keys **+** operator's active keys **+** escrow (keys active when the volume was written) | `MANIFEST.toml` (units, file list, slice positions, plaintext hashes), `RECOVERY.md`, dar catalogs |
 | Operator envelope and its backup | operator's active keys **+** escrow | the same for *every* tenant on the tape, plus `PLAN.toml` and `catalog.db` (ownership and escrow receipts, used by `catalog rebuild`) |
+| Tenant envelope backup, one per tenant envelope (tapes from 1.1.0) | as the tenant envelope | the same bytes as the tenant envelope it copies; `RESTORE.sh` and `catalog rebuild` read it only when that envelope is damaged or will not read |
 | Data slice | owning tenant's active keys **+** operator's active keys **+** escrow (keys active when the unit was staged) | one dar archive slice |
 
 So:

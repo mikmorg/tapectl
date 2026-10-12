@@ -39,7 +39,8 @@ key fingerprints. The plaintext zones (File 0's ID thunk, File 1's guide,
 File 2's RESTORE.sh, File 3's front index, the seal marker) carry the label,
 the layout, per-file on-tape sizes and per-file **ciphertext** hashes, and
 nothing a tenant can be identified by. What they do give away is counted, not
-named: how many tenants share the tape (one `tenant_envelope` per tenant), how
+named: how many tenants share the tape (one `tenant_envelope` per tenant, and
+one `tenant_envelope_backup` copying it), how
 many slices, and how big each file is. The review's claim that tenant names
 appear in plaintext is false: a `tenant_envelope` entry in the front index is
 labelled only by its kind, and a tenant is found by age trial-decryption, not
