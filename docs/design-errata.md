@@ -7,8 +7,8 @@ design notes `docs/design/volume-format-v2.md` (byte format, governed by
 ADR-0007) and `docs/design/layout-session.md` (state machine)**. Where they
 disagree, the ADRs and normative notes and the verdicts recorded on closed
 renovation tickets take precedence. This file is the complete list of known
-divergences as of 2026-10-07 (the pre-production rulings, ADR-0012, through its
-2026-10-07 amendment); it is maintenance-light
+divergences as of 2026-10-12 (the pre-production rulings, ADR-0012, through its
+2026-10-12 amendment); it is maintenance-light
 by design — a full v5 rewrite is deliberately deferred until after phase 1
 stabilizes the Layout/Session model.
 

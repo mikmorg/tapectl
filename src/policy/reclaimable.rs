@@ -713,9 +713,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// Issue #73 / ADR-0006: the reclaim gate's LOCATION precondition
-    /// must count the warehouse as a distinct location. Both tape
-    /// volumes sit at `home`, so the tape half alone is one location.
+    /// Issue #73 / ADR-0006: the reclaim gate's LOCATION precondition (the
+    /// named `required_locations` predicate) must count a warehouse deposit
+    /// as a copy at its place. Both tape volumes sit at `home`, so the tape
+    /// half alone holds nothing at `glacier`.
     #[test]
     fn a_warehouse_deposit_satisfies_the_location_precondition() {
         let (conn, _unit) = setup("sup-deposit-locs", 2, "sealed", "active");
@@ -752,7 +753,7 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
 
-        // Negative control: without the deposit this blocks at 1 location.
+        // Without the deposit this blocks: no copy at required location glacier.
         let vol: i64 = conn
             .query_row(
                 "SELECT id FROM volumes WHERE label = 'sup-deposit-locs-SEALED'",
