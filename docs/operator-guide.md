@@ -690,7 +690,12 @@ tapectl stage create family/letters family/photos family/video --jobs 2
 ```
 
 Each unit prints a line as it starts and ends, and the `staged:` lines follow;
-while several run there is no live progress line.
+while several run there is no live progress line. With more than one at a time,
+each unit also gets a session log of its own beside the command's
+(`<UTC>-stage-create-<unit>-<pid>.log`, a `/` in the name written as `-`), holding that unit's phases, waits and
+progress lines and how it ended, so no two units interleave in one file; the
+command's log records each unit's start and end and names its log, and
+`tapectl status` lists each unit as its own session.
 Every name is checked before anything is staged. If one unit fails, no further
 unit is started; the ones already running finish and stay staged, and the error
 names what was staged, what failed and what was not started. `collection run
