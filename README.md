@@ -181,6 +181,16 @@ an mhvtl drive of any generation, and on a drive that is not mhvtl it switches t
 real-drive mode that runs only with `--erase short`, `--single-cartridge` and
 `--i-will-lose-the-cartridge SERIAL`, and erases that cartridge.
 
+`scripts/first-run-reentry-mhvtl.sh` is issue #414's acceptance: it drives
+`scripts/first-run.sh` itself (with a throwaway home, `--auto`) through the step-12
+rehearsal, kills the step-13 write part-way, and checks that re-entering with
+`--from 13` resumes the write and finishes the verify, audit, shelf move and Heir
+Kit. It takes an mhvtl drive by name and refuses any other:
+
+```bash
+TAPECTL_MHVTL=1 scripts/first-run-reentry-mhvtl.sh --device /dev/tape/by-id/scsi-XYZZY_A1-nst
+```
+
 Code map: `src/cli/` (commands), `src/db/` (SQLite catalog, migrations),
 `src/staging/` (dar + age pipeline), `src/volume/` (the v2 layout, the write session,
 verify, restore, catalog rebuild), `src/tape/` (st driver ioctls, cartridge memory),
