@@ -1407,6 +1407,18 @@ pub(crate) mod tests {
         let met = shortfall(&conn, unit_id, &policy(&conn, 2, &["home"]), 1).unwrap();
         assert!(!met.any(), "{met:?}");
         assert_eq!(met.describe(), "");
+
+        // ADR-0012 2026-10-07 item 34, as `location_presence` judges it: at
+        // the tape-only multiplier each named location is asked for
+        // `per_name` copies, so one copy at `home` is short of two.
+        let thin = shortfall(&conn, unit_id, &policy(&conn, 2, &["home"]), 2).unwrap();
+        assert!(thin.missing_locations.is_empty());
+        assert_eq!(thin.thin_locations, vec![("home".to_string(), 1)]);
+        assert!(thin.any());
+        assert_eq!(
+            thin.describe(),
+            "1 copy at required location home, needs 2 (tape-only 2x)"
+        );
     }
 
     // ── copy_distinctness (issue #144) ──

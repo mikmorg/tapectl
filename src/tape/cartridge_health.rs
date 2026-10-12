@@ -50,10 +50,10 @@
 //!
 //! # What it does not read
 //!
-//! `cartridges.total_bytes_written`/`total_bytes_read`/`first_use`/
-//! `error_history` and `verification_results.read_errors_*` have no writer
-//! and default to 0 or NULL: a report that read them would assert numbers
-//! nobody observed. No threshold either — ADR-0012 sets none; the reasons
+//! `cartridges.first_use` and `verification_results.read_errors_*` have no
+//! writer and default to 0 or NULL (`total_bytes_written`/`total_bytes_read`/
+//! `error_history` had none either, and migration 033 dropped them): a
+//! report that read them would assert numbers nobody observed. No threshold either — ADR-0012 sets none; the reasons
 //! are facts the hardware or a verify reported.
 
 use std::collections::BTreeMap;
@@ -733,14 +733,11 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO drives (id, serial) VALUES (1, 'DRV1');
              INSERT INTO cartridges (id, barcode, media_type, nominal_capacity, status,
-                                     total_load_count, last_use, total_bytes_written,
-                                     total_bytes_read, first_use, error_history)
+                                     total_load_count, last_use, first_use)
              VALUES (1, 'A-BAD', 'LTO-6', 2500000000000, 'in_use', 14,
-                     '2026-09-01 00:00:00', 987654321, 987654322, '1999-01-01 00:00:00',
-                     'SENTINEL-ERROR-HISTORY'),
-                    (2, 'B-NEW', 'LTO-6', 2500000000000, 'available', NULL, NULL, 0, 0, NULL,
-                     NULL),
-                    (3, 'C-OK', 'LTO-6', 2500000000000, 'in_use', 3, NULL, 0, 0, NULL, NULL);
+                     '2026-09-01 00:00:00', '1999-01-01 00:00:00'),
+                    (2, 'B-NEW', 'LTO-6', 2500000000000, 'available', NULL, NULL, NULL),
+                    (3, 'C-OK', 'LTO-6', 2500000000000, 'in_use', 3, NULL, NULL);
              INSERT INTO volumes (id, label, backend_type, backend_name, media_type,
                                   capacity_bytes, status, observed_condition)
              VALUES (10, 'V-A', 'lto', 'p', 'LTO-6', 1, 'sealed', 'quarantined'),
@@ -1019,12 +1016,9 @@ mod tests {
             .join("\n");
         let json = fleet_json(&f).to_string();
         for out in [&text, &json] {
-            for sentinel in [
-                "987654321",
-                "987654322",
-                "1999-01-01",
-                "SENTINEL-ERROR-HISTORY",
-            ] {
+            // The other three sentinels' columns (`total_bytes_written`,
+            // `total_bytes_read`, `error_history`) left with migration 033.
+            for sentinel in ["1999-01-01"] {
                 assert!(!out.contains(sentinel), "{sentinel} leaked: {out}");
             }
             assert!(out.contains("A-BAD"), "positive control: {out}");
