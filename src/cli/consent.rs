@@ -109,6 +109,87 @@ pub(crate) fn confirm_with(
     }
 }
 
+/// Gate an act on a WORD the operator types, never on y/n — `cartridge
+/// erase` (ADR-0012 2026-10-12 item 51): the label just read from the
+/// tape's File 0 (for a tape tapectl did not write, its chip serial). Typing
+/// the name of the thing about to be destroyed is the consent; `--yes`
+/// cannot stand in for it, so this takes no `assume_yes` at all.
+///
+/// - `supplied` (`--confirm-label`): must equal `expected`, on a terminal or
+///   not, and stdin is never read. A different word refuses, naming both.
+/// - no `supplied`, stdin a terminal: `facts` are shown, the word is asked
+///   for, and only that exact word (surrounding whitespace aside) proceeds.
+/// - no `supplied`, not a terminal: refuses at once, `facts` folded in, and
+///   never reads stdin (issue #33's hang; ADR-0008).
+pub fn confirm_typed(
+    action: &str,
+    facts: &[String],
+    expected: &str,
+    supplied: Option<&str>,
+) -> Result<()> {
+    confirm_typed_with(
+        action,
+        facts,
+        expected,
+        supplied,
+        stdin_is_terminal(),
+        || {
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            Ok(input)
+        },
+    )
+}
+
+/// [`confirm_typed`] with the TTY check and the stdin read injected, as
+/// [`confirm_with`] is for [`confirm`].
+pub(crate) fn confirm_typed_with(
+    action: &str,
+    facts: &[String],
+    expected: &str,
+    supplied: Option<&str>,
+    is_tty: bool,
+    read_answer: impl FnOnce() -> Result<String>,
+) -> Result<()> {
+    if let Some(word) = supplied {
+        if word == expected {
+            return Ok(());
+        }
+        return Err(TapectlError::Other(format!(
+            "{action} refused: --confirm-label \"{word}\" does not match \"{expected}\", \
+             the label read from the tape in the drive. Nothing was written. Check which \
+             cartridge is loaded, then confirm with the label it carries."
+        )));
+    }
+    if !is_tty {
+        let why = if facts.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", facts.join("\n"))
+        };
+        return Err(TapectlError::Other(format!(
+            "{action} refused: non-interactive session and no --confirm-label given. \
+             This consent is the label read from the tape, typed; --yes does not give it. \
+             Re-run with --confirm-label {expected} if that is the cartridge you mean \
+             to erase.{why}"
+        )));
+    }
+    for fact in facts {
+        eprintln!("{fact}");
+    }
+    eprint!("{action} — type {expected} to proceed: ");
+    let _ = std::io::stderr().flush();
+    let input = read_answer()?;
+    if input.trim() == expected {
+        Ok(())
+    } else {
+        Err(TapectlError::Other(format!(
+            "{action}: aborted, \"{}\" is not \"{expected}\"",
+            input.trim()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! These tests exercise `confirm_with` exclusively, never the real
@@ -205,5 +286,60 @@ mod tests {
         // Default must be "no" -- a bare Enter must not be read as consent.
         let result = confirm_with("test op", &[], false, true, || Ok("\n".to_string()));
         assert!(result.is_err());
+    }
+
+    // ── confirm_typed_with: the typed-word gate (`cartridge erase`) ──
+
+    #[test]
+    fn typed_a_matching_flag_proceeds_without_reading_stdin() {
+        confirm_typed_with("erase", &[], "L6-0001", Some("L6-0001"), false, || {
+            panic!("--confirm-label must never read stdin")
+        })
+        .expect("the label the tape carries, given by flag, is consent");
+        confirm_typed_with("erase", &[], "L6-0001", Some("L6-0001"), true, || {
+            panic!("--confirm-label must never read stdin, even on a terminal")
+        })
+        .expect("on a terminal too");
+    }
+
+    #[test]
+    fn typed_a_mismatched_flag_refuses_naming_both_words() {
+        let err = confirm_typed_with("erase", &[], "L6-0001", Some("L6-0002"), true, || {
+            panic!("must never read stdin")
+        })
+        .expect_err("a different label is no consent");
+        let msg = err.to_string();
+        assert!(msg.contains("L6-0002") && msg.contains("L6-0001"), "{msg}");
+    }
+
+    #[test]
+    fn typed_non_tty_without_the_flag_refuses_and_never_reads_stdin() {
+        let facts = vec!["File 0: volume L6-0001".to_string()];
+        let err = confirm_typed_with("erase", &facts, "L6-0001", None, false, || {
+            panic!("must never read stdin when non-TTY")
+        })
+        .expect_err("non-TTY without --confirm-label must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("--confirm-label L6-0001"), "{msg}");
+        assert!(msg.contains("File 0: volume L6-0001"), "the facts: {msg}");
+    }
+
+    #[test]
+    fn typed_tty_takes_only_the_exact_word() {
+        assert!(
+            confirm_typed_with("erase", &[], "L6-0001", None, true, || Ok(
+                " L6-0001\n".to_string()
+            ))
+            .is_ok()
+        );
+        for answer in ["y\n", "yes\n", "\n", "l6-0001\n", "L6-000\n"] {
+            assert!(
+                confirm_typed_with("erase", &[], "L6-0001", None, true, || Ok(
+                    answer.to_string()
+                ))
+                .is_err(),
+                "{answer:?} is not the label"
+            );
+        }
     }
 }

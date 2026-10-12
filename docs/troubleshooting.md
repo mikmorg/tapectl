@@ -47,12 +47,14 @@ A few conventions:
 ## Exit codes
 
 Any command that fails prints `error: <message>` on stderr and exits **2**.
-There are four exceptions. `volume verify` exits **3** on every error
+There are five exceptions. `volume verify` exits **3** on every error
 ([below](#volume-verify-0-2-or-3)), and `audit` exits **70**
 ([below](#audit-0-1-2-or-70)). The commands that write a tape — `volume
 write`, `volume resume`, `collection run`, `quick-archive`, `volume
 compact-write` and `volume compact` — share one table, and exit **2** only
-when nothing was written ([below](#the-write-family-0-2-3-4-5-6-or-75)). A
+when nothing was written ([below](#the-write-family-0-2-3-4-5-6-or-75)).
+`cartridge erase` has a table in the same style
+([below](#cartridge-erase-0-2-3-4-6-or-75)). A
 **busy catalog** exits **75** ([below](#75-catalog-busy)). When one failure
 caused another, the
 message is the whole chain, joined by `: `. For example, a bad config file
@@ -83,8 +85,8 @@ A few commands finish their work and then report a verdict through the exit code
 | [`db fsck`](cli/db.md#tapectl-db-fsck) | clean | problems found (repaired or not) | database integrity is broken (or an error) |
 | [`collection sync/status/plan/run`](cli/collection.md#tapectl-collection) | clean | a unit was refused because its dotfile could not be parsed (or, under `--policy-aware`, holds a `[policy]` value that does not resolve), or (`sync`) a folder could not be registered — an invalid unit name, or a tenant or archive set that does not exist; or (`sync`, `status`) a file, symlink or symlinked folder under the root belongs to no unit (an `OUTSIDE ANY UNIT` line names each); the rest ran, and each failure is an `error:` line | an error (`run`: see [the write family's table](#the-write-family-0-2-3-4-5-6-or-75)) |
 
-Apart from `volume verify`, `audit`, the write family and a busy catalog,
-every other command exits 0 on success and 2 on error.
+Apart from `volume verify`, `audit`, the write family, `cartridge erase` and a
+busy catalog, every other command exits 0 on success and 2 on error.
 
 ### 75: catalog busy
 
@@ -194,6 +196,25 @@ without any quarantine ([above](#exit-codes)). `volume verify --json` reports th
 `quarantine` field (an object when the volume is quarantined, otherwise
 `null`).
 
+### `cartridge erase`: 0, 2, 3, 4, 6 or 75
+
+`cartridge erase` erases the tape in the drive and then reads it back
+(ADR-0012, 2026-10-12, items 51 and 52). Its codes follow the write family's
+where the meaning is the same:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | **erased and verified**: File 0 reads back EMPTY (the default short erase) or blank (`--long`), the chip serial is unchanged, and the catalog records it. Also: a blank tape, or an EMPTY File 0 under the short erase (nothing to erase), and `--dry-run` | nothing; `volume init` comes next (with `--force` after a short erase, [below](#the-cartridge-already-carries-a-sealed-volume)) |
+| 2 | **refused, the tape untouched**: no cartridge, a write-protected one, a volume the catalog still holds (it names `volume retire`), a label that was not confirmed or does not match, a tape and catalog that disagree about which cartridge this is, the chip serial unreadable (the MAM read on `device_sg` failed: `tapectl volume identify` shows what the chip reports, `tapectl config check` checks the drive's `device_sg`), the chip naming a different cartridge just before the erase (one swapped while consent was asked), or a usage error | read the `error:` line, act on it, run the command again |
+| 3 | **unverified**: the erase ran, but the tape could not be reopened to read it back, File 0 could not be read back and the tape does not prove itself blank, or the chip could not be read after it. Nothing was recorded | check the drive, run `cartridge erase` again |
+| 4 | **the erase failed part-way**: the tape may be partly erased. Nothing was recorded | check the drive, run `cartridge erase` again |
+| 6 | **the read-back contradicts the erase**: File 0 still holds what was there, or the chip reports a different serial. Nothing was recorded | check which cartridge is loaded and the drive (clean it), then run it again |
+| 75 | the catalog was busy ([above](#75-catalog-busy)) | run it again once the other command has finished |
+
+A verified erase whose catalog record does not finish (a database error)
+still exits 0: the tape is erased. The command prints a `warning:` line, and
+`tapectl cartridge mark-erased <barcode>` records it.
+
 ---
 
 ## How consent works
@@ -292,6 +313,7 @@ answers a prompt.
 | `cartridge retire`, `cartridge mark-erased` | `--yes` or `--force` |
 | `unit mark-tape-only` | `--yes` or `--force` |
 | `snapshot mark-reclaimable` | `--yes` or `--force` |
+| `cartridge erase` | neither: the label read from the tape's File 0 (its chip serial, for a tape tapectl did not write), typed at the prompt or given as `--confirm-label` |
 
 `snapshot mark-reclaimable` has one refusal that no prompt answers. When no
 current version supersedes the version you name, marking it reclaimable would
@@ -1257,11 +1279,12 @@ re-runs the read-back.
 ```text
 error: refusing to write volume "<label>": the loaded cartridge already carries a SEALED volume — a valid seal
 marker parses at tape position <n>. ADR-0003: sealed volumes are immutable, there is no append, and --force
-cannot override this. If this cartridge should be reused: retire its current volume, erase the tape in the drive
-(a long erase, `mt -f <device> erase`, takes hours on real LTO; a filemark at its start, `mt -f <device> rewind;
-mt -f <device> weof 1`, takes seconds and then needs `volume init --force`), then run `tapectl cartridge
-mark-erased` before writing to it again. Never degauss or bulk-erase an LTO cartridge: that destroys its factory
-servo tracks, and the cartridge with them.
+cannot override this. If this cartridge should be reused: retire its current volume if this catalog holds it
+(`tapectl volume retire <label>`), then `tapectl cartridge erase`, which erases the tape in the drive, reads it
+back and records it — or erase the tape in the drive (a long erase, `mt -f <device> erase`, takes hours on real
+LTO; a filemark at its start, `mt -f <device> rewind; mt -f <device> weof 1`, takes seconds and then needs
+`volume init --force`) yourself and run `tapectl cartridge mark-erased` before writing to it again. Never degauss
+or bulk-erase an LTO cartridge: that destroys its factory servo tracks, and the cartridge with them.
 ```
 
 This is a Tier-3 refusal. A sealed tape is never appended to or written over,
@@ -1269,33 +1292,41 @@ and no flag changes that ([ADR-0003](adr/0003-sealed-volumes-immutable-no-append
 `volume init` finds the seal through the tape's own File 0, so it catches a
 sealed tape of any label. If you really mean to reuse the cartridge:
 
-1. Retire the volume it holds. The command shows which units lose a copy, and
-   it refuses outright if this is a unit's last copy:
+1. If this catalog holds the volume, retire it. The command shows which units
+   lose a copy, and it refuses outright if this is a unit's last copy. A tape
+   whose volume this catalog has never seen (a 1.0.0 tape after a fresh
+   start, a test home's volume) needs no retire:
    ```bash
    tapectl volume retire <old-label>
    ```
-2. Erase the tape **in the drive**. Never use a bulk eraser (degausser) on an
-   LTO cartridge: LTO tape carries servo tracks written at the factory, a
-   degausser wipes them, and no drive can use the cartridge after that. Two
-   ways work:
-   - A long erase overwrites the whole tape and leaves it blank. It takes
-     hours on real LTO:
-     ```bash
-     mt -f "$TAPE" erase
-     ```
-   - A filemark at the start of the tape takes seconds. The old data stays on
-     the tape past it, unreachable to a normal read but not overwritten:
-     ```bash
-     mt -f "$TAPE" rewind
-     mt -f "$TAPE" weof 1
-     ```
-3. Record that its bytes are gone, then initialise it again:
+2. Erase it **in the drive**, with tapectl. It reads the tape first and
+   prints what it holds, refuses a volume the catalog still holds, asks you
+   to type the label it read from File 0, erases, reads the tape back, and
+   records it (the cartridge registered by its chip serial if the catalog did
+   not know it, or its retired volume marked erased):
    ```bash
-   tapectl cartridge mark-erased <barcode>
+   tapectl cartridge erase --device "$TAPE" --dry-run   # what it holds, and the label to confirm
+   tapectl cartridge erase --device "$TAPE"             # asks for that label
+   ```
+   Unattended, `--confirm-label <label>` gives the label instead; `--yes` does
+   not. The default erase writes one filemark at the start of the tape and
+   takes seconds: the old data stays on the tape past it, unreachable to a
+   normal read but not overwritten. `--long` overwrites the whole tape and
+   leaves it blank; it takes hours on real LTO, and is for a cartridge that
+   leaves your hands. Never use a bulk eraser (degausser) on an LTO cartridge:
+   LTO tape carries servo tracks written at the factory, a degausser wipes
+   them, and no drive can use the cartridge after that.
+
+   Without tapectl, `mt -f "$TAPE" rewind; mt -f "$TAPE" weof 1` (or `mt -f
+   "$TAPE" erase` for the long erase) does the same to the tape, but checks
+   nothing first and records nothing: follow it with `tapectl cartridge
+   mark-erased <barcode>`.
+3. Initialise it again:
+   ```bash
    tapectl volume init <new-label> --device "$TAPE"
    ```
    After a long erase the tape is blank and `volume init` needs nothing more.
-   After the filemark the seal is no longer readable, `volume init` reports
+   After the short erase the seal is no longer readable, `volume init` reports
    File 0 as EMPTY, and wants `--force` (see the previous entry):
    ```bash
    tapectl volume init <new-label> --device "$TAPE" --force

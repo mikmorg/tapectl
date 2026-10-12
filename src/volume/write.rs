@@ -3508,7 +3508,7 @@ pub(crate) fn quarantine_on_medium_evidence(
 /// `probe` is the test seam (issue #320): [`HealthProbe::default`] — every
 /// production caller — asks the drive.
 #[allow(clippy::too_many_arguments)]
-fn collect_health_best_effort(
+pub(crate) fn collect_health_best_effort(
     conn: &Connection,
     config: &Config,
     device: &str,
@@ -3954,8 +3954,9 @@ fn seal_recorded_refusal(conn: &Connection, label: &str, volume_id: i64) -> Resu
     }
     msg.push_str(&format!(
         " To reuse the cartridge instead: retire this volume (`tapectl volume retire {label}`), \
-         {ERASE_IN_THE_DRIVE}, then run `tapectl cartridge mark-erased` before writing to it \
-         again. {NEVER_DEGAUSS}"
+         then `tapectl cartridge erase`, which erases the tape in the drive, reads it back and \
+         records it — or {ERASE_IN_THE_DRIVE} yourself and run `tapectl cartridge mark-erased` \
+         before writing to it again. {NEVER_DEGAUSS}"
     ));
     Ok(msg)
 }
@@ -4069,9 +4070,11 @@ fn decide_fresh_write_contact_on(
             "refusing to write volume \"{label}\": the loaded cartridge already carries a SEALED \
              volume — a valid seal marker parses at tape position {seal_position}. ADR-0003: \
              sealed volumes are immutable, there is no append, and --force cannot override this. \
-             If this cartridge should be reused: retire its current volume, \
-             {ERASE_IN_THE_DRIVE}, then run `tapectl cartridge mark-erased` before writing to it \
-             again. {NEVER_DEGAUSS}"
+             If this cartridge should be reused: retire its current volume if this catalog holds \
+             it (`tapectl volume retire <label>`), then `tapectl cartridge erase`, which erases \
+             the tape in the drive, reads it back and records it — or {ERASE_IN_THE_DRIVE} \
+             yourself and run `tapectl cartridge mark-erased` before writing to it again. \
+             {NEVER_DEGAUSS}"
         ))),
         ContactOutcome::IdentityMismatch { found } => {
             let found_desc = describe_file0_identity(found.as_ref());
@@ -12436,6 +12439,7 @@ mod tests {
             assert!(msg.contains("weof 1"), "{msg}");
             assert!(msg.contains("Never degauss"), "{msg}");
             assert!(msg.contains("`tapectl cartridge mark-erased`"), "{msg}");
+            assert!(msg.contains("`tapectl cartridge erase`"), "{msg}");
             assert!(!msg.contains("bulk-erase the"), "{msg}");
         }
     }
@@ -15222,6 +15226,12 @@ mod tests {
 
             let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
             let rebuild = src.join("volume").join("rebuild.rs");
+            // `cartridge erase` (ADR-0012 2026-10-12) is a WRITE-family path
+            // that also opens the drive read-only (to identify, and to read
+            // its erase back): its probe is the write family's
+            // `ensure_medium_loaded`, pinned in order below, not a read
+            // path's `check_read_contact`.
+            let erase = src.join("volume").join("erase.rs");
             let production = |text: &str| -> String {
                 match text.find("#[cfg(test)]\nmod tests") {
                     Some(i) => text[..i].to_string(),
@@ -15235,7 +15245,7 @@ mod tests {
                 .filter_map(|e| e.ok())
             {
                 let path = entry.path();
-                if path == rebuild || path.extension().is_none_or(|x| x != "rs") {
+                if path == rebuild || path == erase || path.extension().is_none_or(|x| x != "rs") {
                     continue;
                 }
                 let text = std::fs::read_to_string(path).unwrap();
@@ -15281,6 +15291,24 @@ mod tests {
                 vec![Medium, OpenRead],
                 "rebuild_from_volume takes its MAM read, then opens its store — its caller's \
                  check covers both"
+            );
+
+            // `cartridge erase`: the no-medium probe, then its first chip
+            // read, then every store it opens — in that order.
+            let erase_prod = production(&std::fs::read_to_string(&erase).unwrap());
+            let at = |needle: &str| {
+                erase_prod
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("erase.rs no longer has {needle:?}"))
+            };
+            let probe = at("ensure_medium_loaded(device)?;");
+            assert!(
+                probe < at("let before = chip();"),
+                "probe before the chip read"
+            );
+            assert!(
+                probe < at("TapeStore::open_read(") && probe < at("TapeStore::open("),
+                "probe before any store"
             );
         }
 

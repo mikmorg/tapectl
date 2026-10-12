@@ -61,6 +61,18 @@ pub enum Hook {
     /// `tape::poll::poll`'s one read (issue #309): the chip of whatever is
     /// loaded when `drive poll` runs — a failed read is the empty drive.
     DrivePoll,
+    /// `cartridge erase`'s first read: the chip serial the erase is
+    /// identified, cross-checked and consented by (ADR-0012 2026-10-12
+    /// item 51).
+    CartridgeErase,
+    /// `cartridge erase`'s second read, with the drive open read-write just
+    /// before the erase: the serial must still be the first read's, or a
+    /// cartridge was swapped while consent was being asked — which File 0
+    /// alone cannot show when it is unreadable.
+    CartridgeEraseRecheck,
+    /// `cartridge erase`'s last read, after the erase: the serial must be
+    /// unchanged, or the cartridge in the drive is not the one erased.
+    CartridgeEraseVerify,
 }
 
 impl Hook {
@@ -72,6 +84,9 @@ impl Hook {
             Hook::CheckReadContact => "check_read_contact",
             Hook::LoadedMediumSerial => "loaded_medium_serial",
             Hook::DrivePoll => "drive_poll",
+            Hook::CartridgeErase => "cartridge_erase",
+            Hook::CartridgeEraseRecheck => "cartridge_erase_recheck",
+            Hook::CartridgeEraseVerify => "cartridge_erase_verify",
         }
     }
 
@@ -83,6 +98,9 @@ impl Hook {
         Hook::CheckReadContact,
         Hook::LoadedMediumSerial,
         Hook::DrivePoll,
+        Hook::CartridgeErase,
+        Hook::CartridgeEraseRecheck,
+        Hook::CartridgeEraseVerify,
     ];
 }
 
@@ -620,6 +638,9 @@ mod tests {
                 "check_read_contact",
                 "loaded_medium_serial",
                 "drive_poll",
+                "cartridge_erase",
+                "cartridge_erase_recheck",
+                "cartridge_erase_verify",
             ]
         );
     }

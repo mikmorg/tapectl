@@ -74,6 +74,9 @@ OPS_GROUP=""           # step 7: a group that may read the session logs (`tapect
 ESCROW_PUBLIC_KEY=""   # step 7: the ORIGINAL escrow public key (age1…, or a .pub path) for init to adopt instead of
                        # minting one — a rebuilt or fresh home that keeps the Heir Kit (ADR-0005, #139). Empty = ask
                        # (or, under --auto, mint).
+ERASE_LABEL=""         # step 13: the File 0 label (or, for a tape tapectl did not write, the chip serial) of a
+                       # SEALED tape step 13 may `cartridge erase` under --auto when `volume init` refuses it. Empty =
+                       # ask interactively, and never erase under --auto (a default is never consent to erase).
 ADOPT_KEYS_FROM=""     # steps 7 and 11: a directory of <tenant>.key age identity files (the SECRETS, copied out of an
                        # old home: docs/keys-and-recovery.md) that the operator and the profile's tenants ADOPT instead
                        # of minting new keys (issue #424). Every one of them must have its file. Empty = mint, as usual.
@@ -124,6 +127,8 @@ Options:
   --adopt-keys-from DIR
                     steps 7 and 11 adopt DIR/<name>.key (an age identity file) as the operator's and
                     each profile tenant's key instead of minting one (docs/keys-and-recovery.md)
+  --erase-label L   step 13: when `volume init` refuses a tape holding a SEALED volume, `cartridge erase`
+                    it under --auto only if L is the label its File 0 carries (ERASE_LABEL in a profile)
   --escrow-public-key KEY
                     step 7 adopts KEY (age1… or a .pub path) as the escrow identity instead of
                     minting one, so an existing Heir Kit stays valid (ESCROW_PUBLIC_KEY in a profile)
@@ -162,6 +167,7 @@ while [ $# -gt 0 ]; do
     --dar) DAR_BIN="$2"; shift 2 ;;
     --adopt-keys-from) ADOPT_KEYS_FROM="$2"; shift 2 ;;
     --escrow-public-key) ESCROW_PUBLIC_KEY="$2"; shift 2 ;;
+    --erase-label) ERASE_LABEL="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -1409,22 +1415,45 @@ volume init refused before touching the tape: the drive's two device nodes in co
 EOF
       die "volume init refused: device_sg does not belong to device_tape — fix the [[backends.lto]] entry, then re-run scripts/first-run.sh --from 13"
     elif grep -q "ADR-0003" "$INIT_OUT"; then
-      # The SEALED case, split out from the mismatch case below (issue #223).
-      #
-      # This branch used to share the one below, whose text named a sealed
-      # volume as "the usual reason" and then prescribed --force. For a genuinely
-      # sealed tape that is impossible: `decide_fresh_write_contact` refuses
-      # `AlreadySealed` outright, and its own message says "--force cannot
-      # override this". The script then ran init --force anyway, failed
-      # identically, and died -- walking the operator into the same wall twice
-      # and naming none of the real remedy.
-      #
-      # tapectl's refusal already says what to do, so this does not repeat it;
-      # it stops rather than offering a flag that cannot work.
+      # The SEALED case (issue #223): --force does not reach it, so it is never
+      # offered. What does is `cartridge erase` (ADR-0012 2026-10-12 items
+      # 51-52): it identifies the tape read-only, refuses a volume THIS catalog
+      # still holds (naming `volume retire`), takes the label File 0 carries
+      # as consent, erases, reads the tape back and records it. Offered here,
+      # after a dry run that shows what the tape holds; then init runs again.
       explain <<'EOF'
-volume init was refused by an ADR-0003 rule — the loaded cartridge already carries a SEALED volume. This is not a consent question and --force does not reach it: a sealed volume is immutable and there is no append. The likeliest case right after step 12 is that the TEST cartridge is still in the drive: unload it and load the production one. If the sealed volume is one THIS catalog knows, the remedy is to retire it, erase the tape IN THE DRIVE (a long erase, `mt -f <dev> erase`, takes hours; `mt -f <dev> rewind; mt -f <dev> weof 1` takes seconds and leaves an EMPTY File 0 that `--force` applies to), then `tapectl cartridge mark-erased`. Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks. If it is a tape no catalog of yours knows (a test volume from a throwaway home), the erase in the drive alone suffices — after `mt -f <dev> rewind; mt -f <dev> weof 1` the tape reads as an EMPTY File 0 and `--force` applies. `tapectl volume identify --device <dev>` says what the tape holds.
+volume init was refused by an ADR-0003 rule — the loaded cartridge already carries a SEALED volume. A sealed volume is immutable, there is no append, and --force does not reach it. The likeliest case right after step 12 is that the TEST cartridge is still in the drive: then do NOT erase anything here — unload it, load the production cartridge, and re-run with --from 13. If this IS the cartridge to reuse (a tape from an old catalog, as after a fresh start), `tapectl cartridge erase` erases it: it reads the tape first and shows what it holds (below), refuses a volume this catalog still counts (retire that first), asks for the label it read from File 0, erases (a filemark at the start of the tape, seconds), reads the tape back to prove it, and records the cartridge. Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo tracks.
 EOF
-      die "volume init refused by ADR-0003 and no flag overrides it. Act on the remedy in the refusal above (for a sealed cartridge: retire, erase, cartridge mark-erased), or load a different cartridge, then re-run scripts/first-run.sh --from 13"
+      EOUT="$(dirname "$LOG")/cartridge-erase-dry-run.out"
+      if ! run_capture "$EOUT" tc cartridge erase --device "$DEVICE" --dry-run; then
+        die "cartridge erase refused this tape (above) — act on its remedy, or load a different cartridge, then re-run scripts/first-run.sh --from 13"
+      fi
+      ERASE_WORD="$(sed -n 's/.*confirm with: --confirm-label \([^ ]*\)$/\1/p' "$EOUT" | head -1)"
+      if [ -z "$ERASE_WORD" ] || [ "$ERASE_WORD" = "(none:" ]; then
+        die "cartridge erase cannot erase this tape: the chip serial could not be read (its note above), and without it nothing proves which cartridge was erased; nothing was erased. Check the drive's device_sg with \`tapectl config check\` and what the chip reports with \`tapectl volume identify --device $DEVICE\`, then re-run scripts/first-run.sh --from 13"
+      fi
+      if [ "$AUTO" = 1 ]; then
+        # A default is never consent to erase: under --auto the label must be
+        # named by the profile (ERASE_LABEL) or --erase-label, and equal what
+        # the tape says.
+        [ -n "$ERASE_LABEL" ] || die "the tape holds $ERASE_WORD (above). Under --auto, cartridge erase runs only when ERASE_LABEL (profile) or --erase-label names the label to overwrite; nothing was erased"
+        [ "$ERASE_LABEL" = "$ERASE_WORD" ] || die "--erase-label $ERASE_LABEL does not match the tape in the drive, which holds $ERASE_WORD — nothing was erased"
+        printf '   ERASE the tape holding %s [auto: named by ERASE_LABEL]\n' "$ERASE_WORD"
+      else
+        confirm_destructive "ERASE the tape in $DEVICE, which holds $ERASE_WORD (shown above)" "$ERASE_WORD" || die "stopped before erasing; nothing was erased"
+      fi
+      erc=0
+      run tc cartridge erase --device "$DEVICE" --confirm-label "$ERASE_WORD" || erc=$?
+      [ "$erc" = 0 ] || die "cartridge erase exited $erc (2 refused, nothing written; 3 unverified; 4 failed part-way; 6 the read-back contradicts the erase): read its message above, then re-run scripts/first-run.sh --from 13"
+      ok "the tape is erased, read back and recorded"
+      # Continue: init again. The short erase leaves File 0 EMPTY, which init
+      # refuses without --force (ADR-0003 fails closed); the erase just proved
+      # that is all the tape holds, and its label was typed, so --force here
+      # overrides exactly that and nothing else.
+      if ! run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE"; then
+        grep -q "File 0 is EMPTY" "$INIT_OUT" || die "volume init still refused after the erase — read the refusal above, then re-run scripts/first-run.sh --from 13"
+        run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" --force || die "volume init failed after the erase"
+      fi
     elif grep -qE "identifies a DIFFERENT volume|File 0 is EMPTY" "$INIT_OUT"; then
       # The only two refusals --force can override (write.rs
       # decide_fresh_write_contact: IdentityMismatch and EmptyFileZero).

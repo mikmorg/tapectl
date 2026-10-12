@@ -96,6 +96,12 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // fixed (issue #230, and the ADR-0012 gated-consent work that followed
     // it) before this branch started — confirmed by reading, not re-fixed.
     (&["cartridge", "edit"], Verdict::Honours),
+    // ADR-0012 2026-10-12: `--dry-run` identifies the tape (read-only) and
+    // cross-checks the catalog, then stops. The read is recorded as every
+    // read path's is (the contact, its MAM journal rows, the sweep); no
+    // cartridge, volume or event row changes, and the tape is never opened
+    // read-write (`volume::erase` tests: a_dry_run_reports_and_touches_nothing).
+    (&["cartridge", "erase"], Verdict::Honours),
     (&["cartridge", "info"], Verdict::ReadOnly),
     // Issue #297: reads `mam_journal`, writes nothing.
     (&["cartridge", "journal"], Verdict::ReadOnly),

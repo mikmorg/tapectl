@@ -641,6 +641,52 @@ pub trait Store {
     fn blank_at_bot(&mut self) -> Result<bool> {
         Ok(false)
     }
+
+    /// Erase the medium (`cartridge erase`, ADR-0012 2026-10-12 items 51
+    /// and 52). Moves the head; the next read repositions as usual.
+    ///
+    /// [`EraseMode::Short`] is the default for every store: rewind, then
+    /// one synchronous filemark at the beginning of the tape — `mt rewind;
+    /// mt weof 1`, what `scripts/lifecycle-suite.sh --erase short` does.
+    /// File 0 then reads EMPTY (`session::ContactOutcome::EmptyFileZero`)
+    /// and the old end of data is gone, so nothing past it can be read or
+    /// mistaken for a volume; the bytes are not overwritten.
+    ///
+    /// [`EraseMode::Long`] is the st driver's long erase of the whole
+    /// medium (`mt erase`): hours on real LTO. A store that cannot do it
+    /// refuses, so the default does.
+    fn erase(&mut self, mode: EraseMode) -> Result<()> {
+        match mode {
+            EraseMode::Short => {
+                self.reposition_for_resume(0)?;
+                self.execute(&mut io::empty(), 0, true)?;
+                Ok(())
+            }
+            EraseMode::Long => Err(TapectlError::Other(
+                "this store cannot long-erase a medium".to_string(),
+            )),
+        }
+    }
+}
+
+/// How [`Store::erase`] erases (ADR-0012 2026-10-12 item 52).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EraseMode {
+    /// A filemark at the beginning of the tape (seconds). The default.
+    Short,
+    /// The whole medium (hours on LTO): for a cartridge that leaves the
+    /// operator's hands.
+    Long,
+}
+
+impl EraseMode {
+    /// The word the report, the event and `--json` use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EraseMode::Short => "short",
+            EraseMode::Long => "long",
+        }
+    }
 }
 
 /// The most bytes a reader holds in memory for one of the small files it
@@ -1337,6 +1383,9 @@ pub(crate) trait TapeOps: Send {
     fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64>;
     fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<(u64, ReadEnd)>;
     fn read_file_head(&mut self, max_bytes: u64, sink: &mut dyn Write) -> Result<(u64, ReadEnd)>;
+    /// The st LONG erase from the head onward (`MTERASE`, count 1): what
+    /// `cartridge erase --long` asks for (ADR-0012 2026-10-12 item 52).
+    fn erase_long(&mut self) -> Result<()>;
 }
 
 impl TapeOps for TapeDevice {
@@ -1360,6 +1409,9 @@ impl TapeOps for TapeDevice {
     }
     fn read_file_head(&mut self, max_bytes: u64, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
         TapeDevice::read_file_head(self, max_bytes, sink)
+    }
+    fn erase_long(&mut self) -> Result<()> {
+        TapeDevice::erase_long(self)
     }
 }
 
@@ -1534,6 +1586,9 @@ impl TapeOps for CountedOps {
     }
     fn read_file_head(&mut self, max_bytes: u64, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
         self.inner.read_file_head(max_bytes, sink)
+    }
+    fn erase_long(&mut self) -> Result<()> {
+        self.inner.erase_long()
     }
 }
 
@@ -1812,6 +1867,25 @@ impl Store for TapeStore {
             }
         }
     }
+    /// Short: the trait's filemark at BOT. Long: rewind, the st long erase,
+    /// rewind. The cursor is `Unknown` after either, so the next read
+    /// rewinds.
+    fn erase(&mut self, mode: EraseMode) -> Result<()> {
+        self.cursor = FileCursor::Unknown;
+        match mode {
+            EraseMode::Short => {
+                self.reposition_for_resume(0)?;
+                self.execute(&mut io::empty(), 0, true)?;
+            }
+            EraseMode::Long => {
+                self.dev.rewind()?;
+                self.dev.erase_long()?;
+                self.dev.rewind()?;
+            }
+        }
+        self.cursor = FileCursor::Unknown;
+        Ok(())
+    }
 }
 
 /// An in-memory store: proves the interface is medium-agnostic (the "second
@@ -1934,6 +2008,22 @@ impl Store for MemStore {
     fn blank_at_bot(&mut self) -> Result<bool> {
         Ok(self.files.is_empty())
     }
+
+    /// Short: the trait's filemark at BOT (one empty file). Long: nothing
+    /// recorded at all.
+    fn erase(&mut self, mode: EraseMode) -> Result<()> {
+        match mode {
+            EraseMode::Short => {
+                self.reposition_for_resume(0)?;
+                self.execute(&mut io::empty(), 0, true)?;
+            }
+            EraseMode::Long => {
+                self.files.clear();
+                self.syncs.clear();
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Test-only: a [`FakeTape`](crate::tape::fake::FakeTape) standing in for the
@@ -1990,6 +2080,75 @@ mod tests {
     use std::path::PathBuf;
 
     const BS: u64 = 512 * 1024;
+
+    // --- erase (ADR-0012 2026-10-12, `cartridge erase`) ------------------
+
+    /// The short erase is one synchronous filemark at BOT, on both stores:
+    /// File 0 then reads EMPTY and nothing follows it; the long erase leaves
+    /// nothing, and the medium proves itself blank.
+    #[test]
+    fn erase_short_leaves_an_empty_file_zero_and_long_leaves_a_blank_tape() {
+        use crate::tape::fake::{FakeTape, Op};
+        let recorded = || vec![vec![1u8; 4096], vec![2u8; 4096], vec![3u8; 4096]];
+
+        let mut mem = MemStore::new(4096);
+        for f in recorded() {
+            mem.execute(&mut Cursor::new(f), 4096, false).unwrap();
+        }
+        mem.erase(EraseMode::Short).unwrap();
+        assert_eq!(mem.files, vec![Vec::<u8>::new()]);
+        assert_eq!(mem.syncs, vec![true], "the filemark is synchronous");
+        assert!(!mem.blank_at_bot().unwrap());
+        mem.erase(EraseMode::Long).unwrap();
+        assert!(mem.files.is_empty() && mem.blank_at_bot().unwrap());
+
+        let fake = FakeTape::with_files(recorded(), 4096);
+        let mut store = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        store.read_file(2, &mut io::sink()).unwrap();
+        store.erase(EraseMode::Short).unwrap();
+        assert_eq!(fake.state().files, vec![Vec::<u8>::new()]);
+        assert!(fake.ops().contains(&Op::Write(0)), "{:?}", fake.ops());
+        let mut file0 = Vec::new();
+        assert_eq!(store.read_file(0, &mut file0).unwrap(), 0, "File 0 EMPTY");
+
+        let fake = FakeTape::with_files(recorded(), 4096);
+        let mut store = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        store.erase(EraseMode::Long).unwrap();
+        assert!(fake.state().files.is_empty());
+        assert!(fake.ops().contains(&Op::Erase(0)), "erased from BOT");
+        assert!(store.blank_at_bot().unwrap());
+    }
+
+    /// A store that cannot long-erase says so rather than pretending.
+    #[test]
+    fn the_default_store_erase_refuses_a_long_erase() {
+        struct Plain(MemStore);
+        impl Store for Plain {
+            fn capacity(&mut self) -> Result<CapacityReport> {
+                self.0.capacity()
+            }
+            fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+                self.0.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.0.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.0.reposition_for_resume(file_index)
+            }
+        }
+        let mut plain = Plain(MemStore::new(4096));
+        plain
+            .execute(&mut Cursor::new(vec![9u8; 10]), 10, false)
+            .unwrap();
+        assert!(plain.erase(EraseMode::Long).is_err());
+        plain.erase(EraseMode::Short).unwrap();
+        assert_eq!(
+            plain.0.files,
+            vec![Vec::<u8>::new()],
+            "short is the default's"
+        );
+    }
 
     // --- basic Store mechanics ------------------------------------------
 

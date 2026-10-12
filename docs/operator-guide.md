@@ -1142,8 +1142,9 @@ Each further copy goes on a different cartridge, because a cartridge holds one
 volume at a time. What stops a second copy landing on copy 1's cartridge is
 `volume init`, not the write. The init's File 0 check refuses a tape that
 carries a sealed volume, with or without `--force` (ADR-0003). Reusing that
-cartridge means saying copy 1 is gone first: `volume retire`, erase the tape in
-the drive, then `cartridge mark-erased`. If the tape was erased some other way
+cartridge means saying copy 1 is gone first: `volume retire`, then `cartridge
+erase` ([Erasing a cartridge](#erasing-a-cartridge)), which erases the tape in
+the drive, reads it back and records it. If the tape was erased some other way
 and its chip serial identifies the cartridge, `volume init` finds it blank and
 goes ahead. It records the displacement, marks
 copy 1's volume `erased`, and warns naming every unit left without a copy
@@ -2370,6 +2371,54 @@ wearing its sticker. Say the bytes are gone first — `volume retire <volume>` o
 `cartridge mark-erased <barcode>` — and run it again. There is no `--force`;
 this is something tapectl cannot know, not a risk for you to accept.
 
+### Erasing a cartridge
+
+`cartridge erase` overwrites the tape in the drive, carefully (ADR-0012,
+2026-10-12). It is the way to reuse a cartridge whose volume is given up, or a
+tape some other catalog wrote, and the way to wipe one before it leaves your
+hands. In order, it:
+
+1. **identifies the tape, read-only**, and prints what it is: the chip serial;
+   File 0's label, uuid, layout version, the tapectl that wrote it and when;
+   the seal and its front-index totals. A tape tapectl did not write is
+   reported as such. A blank tape is reported blank, and the command stops
+   there: there is nothing to erase.
+2. **checks the catalog**, by File 0's uuid and by the chip serial. A volume
+   the catalog still holds is refused, naming `volume retire`: retiring is the
+   only way to give a volume up, and the retire is where its last-copy floor
+   is enforced. `--dry-run` stops here and prints the label to confirm with.
+3. **asks for the label** it just read from File 0 to be typed (for a tape
+   tapectl did not write, its chip serial). Unattended, `--confirm-label`
+   gives it and must match. `--yes` never does. If the chip serial could not
+   be read (the MAM read on the drive's `device_sg` failed), it refuses here
+   instead: nothing else proves afterwards which cartridge was erased.
+4. **erases**, once the chip, read again with the drive held open, still
+   reports the same serial (a cartridge swapped while you were asked is
+   refused, untouched): by default a filemark at the start of the tape, in seconds;
+   File 0 then reads EMPTY and nothing past it can be read. `--long` erases
+   the whole medium, which takes hours on LTO.
+5. **reads it back**: File 0 must be EMPTY (or blank, after `--long`) and the
+   chip serial unchanged. Anything else is an error, and nothing is recorded.
+6. **records it**: an event, the drive contact, and the cartridge. A cartridge
+   the catalog did not know is registered by its chip serial as `available`; a
+   known one has its retired volumes marked `erased` and becomes `available`,
+   as `cartridge mark-erased` would do. A `retired_permanent` cartridge stays
+   retired.
+
+```bash
+tapectl cartridge erase --device "$TAPE" --dry-run          # what is on it, and its label
+tapectl cartridge erase --device "$TAPE"                    # type the label when asked
+tapectl cartridge erase --device "$TAPE" --confirm-label L6-0001   # unattended
+tapectl cartridge erase --device "$TAPE" --long             # the whole medium, hours
+```
+
+After the default erase, `volume init` still refuses the EMPTY File 0 until
+you give it `--force` (ADR-0003 fails closed; [troubleshooting](troubleshooting.md#file-0-identifies-a-different-volume-or-is-empty)).
+After `--long` the tape is blank and `volume init` needs nothing. The exit
+codes are in [troubleshooting](troubleshooting.md#cartridge-erase-0-2-3-4-6-or-75).
+Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo
+tracks.
+
 ### Everything else
 
 ```bash
@@ -2381,7 +2430,8 @@ tapectl cartridge edit L6-0001 --generation LTO-5  # the registration was wrong 
 tapectl cartridge move L6-0001 --to offsite-vault   # the cartridge and every volume on it
 tapectl cartridge retire L6-0001            # worn out or too many errors: never write it again
 tapectl cartridge unretire L6-0001          # you were wrong about the medium; undo the retire
-tapectl cartridge mark-erased L6-0001       # after erasing it in the drive (mt erase; never a degausser)
+tapectl cartridge erase --device "$TAPE"    # erase, verify and record (above)
+tapectl cartridge mark-erased L6-0001       # after erasing it some other way (mt erase; never a degausser)
 tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did not (later commands use the new barcode)
 ```
 

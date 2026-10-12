@@ -661,6 +661,97 @@ fn contradicted_operator_claim(barcode: &str, claimed: &str, loaded: &str) -> Ta
     ))
 }
 
+/// Register the cartridge whose CHIP reported `serial`, with that serial as
+/// both its identity and its placeholder barcode, in `status` — the one
+/// INSERT `volume init`'s auto-registration (`in_use`, a volume is about to
+/// be bound) and `cartridge erase` (`available`, ADR-0012 2026-10-12 item 51)
+/// share. Only a chip-witnessed serial is ever passed here.
+///
+/// Refuses, by name, a serial that is already some row's BARCODE (see the
+/// comment inside); the caller has already found no row by `serial_number`.
+pub(crate) fn register_from_chip(
+    conn: &Connection,
+    s: &str,
+    generation: Generation,
+    mam: &MamInfo,
+    status: &str,
+) -> Result<i64> {
+    // The MAM serial matched no row by `serial_number` (else
+    // `lookup_cartridge` would have returned it here already),
+    // but `barcode` is `TEXT NOT NULL UNIQUE` and this INSERT is
+    // about to bind `s` to BOTH columns. If a row already
+    // carries `s` as its BARCODE -- exactly what an operator
+    // gets by hand-registering a cartridge using the serial
+    // printed on its shell, before it was ever loaded -- the
+    // INSERT below collides. Refuse by name instead of
+    // surfacing the raw UNIQUE constraint failure: silently
+    // adopting that row would rewrite its identity on a guess,
+    // the same mistake `lookup_cartridge` already refuses for
+    // the sibling case above (a `--cartridge` naming a row with
+    // a DIFFERENT recorded serial). This takes no `force` --
+    // it is a fact tapectl cannot resolve on its own, not a
+    // risk to accept.
+    if select_cartridge(conn, "barcode", s)?.is_some() {
+        return Err(TapectlError::Other(format!(
+            "this medium reports serial {s}, which matches no registered \
+                 cartridge — but a cartridge is already registered under the \
+                 barcode \"{s}\". tapectl cannot tell whether that is this same \
+                 physical cartridge, registered by hand before it was ever \
+                 loaded, or a different one whose sticker happens to read the \
+                 same. It will not guess.\n\
+                 \n\
+                 If it IS this cartridge, record that on the row, then \
+                 re-run this command:\n    \
+                 tapectl cartridge edit \"{s}\" --serial {s}\n\
+                 (That writes the OPERATOR's claim, which this lookup then \
+                 finds and the chip's own reading confirms. Unlike \
+                 `--cartridge`, it works from `volume write` too, which has \
+                 no such flag.)\n\
+                 \n\
+                 If it is a DIFFERENT cartridge, give the registered one a \
+                 barcode of its own and retry:\n    \
+                 tapectl cartridge relabel {s} <new-barcode>"
+        )));
+    }
+    // `total_load_count` is bound explicitly (not left to the
+    // schema's `DEFAULT 0`) so a drive that reports no load
+    // count leaves this brand-new row NULL -- "never observed",
+    // not a false "zero loads" (issue #184).
+    //
+    // `nominal_capacity` is the GENERATION TABLE's native figure
+    // for the detected medium, never the caller's resolved
+    // capacity (ADR-0010 decision 3, issue #183). A drive
+    // `capacity_override` sits ABOVE the cartridge row in that
+    // decision's precedence ladder precisely so it can lie about
+    // ONE volume on ONE drive (mhvtl's 2400 MB fiction); writing
+    // that resolved figure onto a brand-new row would make the
+    // next `volume init` — on any drive, override or none — read
+    // the drive's lie back as an operator's declaration at
+    // `cartridge register --capacity`. The row describes the
+    // plastic; only `volumes.capacity_bytes` (written by the
+    // caller before this ever runs) is allowed to carry the
+    // override.
+    conn.execute(
+        "INSERT INTO cartridges
+                (barcode, media_type, manufacturer, serial_number,
+                 tape_length_meters, nominal_capacity, status, total_load_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, ?7)",
+        params![
+            s,
+            generation.as_str(),
+            mam.manufacturer.as_deref(),
+            s,
+            mam.length_meters,
+            generation.native_capacity_bytes() as i64,
+            mam.load_count,
+            status,
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    events::log_created(conn, "cartridge", id, s, None)?;
+    Ok(id)
+}
+
 /// What [`resolve_or_register_cartridge`] found or created — the row
 /// [`mount_and_record`] mounts the volume onto, plus the two facts specific
 /// to RESOLUTION (`auto_registered`, `serial_recorded`) that mounting itself
@@ -718,78 +809,7 @@ fn resolve_or_register_cartridge(
             // wants a human barcode registers the cartridge first and passes
             // --cartridge.
             Some(s) => {
-                // The MAM serial matched no row by `serial_number` (else
-                // `lookup_cartridge` would have returned it here already),
-                // but `barcode` is `TEXT NOT NULL UNIQUE` and this INSERT is
-                // about to bind `s` to BOTH columns. If a row already
-                // carries `s` as its BARCODE -- exactly what an operator
-                // gets by hand-registering a cartridge using the serial
-                // printed on its shell, before it was ever loaded -- the
-                // INSERT below collides. Refuse by name instead of
-                // surfacing the raw UNIQUE constraint failure: silently
-                // adopting that row would rewrite its identity on a guess,
-                // the same mistake `lookup_cartridge` already refuses for
-                // the sibling case above (a `--cartridge` naming a row with
-                // a DIFFERENT recorded serial). This takes no `force` --
-                // it is a fact tapectl cannot resolve on its own, not a
-                // risk to accept.
-                if select_cartridge(conn, "barcode", s)?.is_some() {
-                    return Err(TapectlError::Other(format!(
-                        "this medium reports serial {s}, which matches no registered \
-                         cartridge — but a cartridge is already registered under the \
-                         barcode \"{s}\". tapectl cannot tell whether that is this same \
-                         physical cartridge, registered by hand before it was ever \
-                         loaded, or a different one whose sticker happens to read the \
-                         same. It will not guess.\n\
-                         \n\
-                         If it IS this cartridge, record that on the row, then \
-                         re-run this command:\n    \
-                         tapectl cartridge edit \"{s}\" --serial {s}\n\
-                         (That writes the OPERATOR's claim, which this lookup then \
-                         finds and the chip's own reading confirms. Unlike \
-                         `--cartridge`, it works from `volume write` too, which has \
-                         no such flag.)\n\
-                         \n\
-                         If it is a DIFFERENT cartridge, give the registered one a \
-                         barcode of its own and retry:\n    \
-                         tapectl cartridge relabel {s} <new-barcode>"
-                    )));
-                }
-                // `total_load_count` is bound explicitly (not left to the
-                // schema's `DEFAULT 0`) so a drive that reports no load
-                // count leaves this brand-new row NULL -- "never observed",
-                // not a false "zero loads" (issue #184).
-                //
-                // `nominal_capacity` is the GENERATION TABLE's native figure
-                // for the detected medium, never the caller's resolved
-                // capacity (ADR-0010 decision 3, issue #183). A drive
-                // `capacity_override` sits ABOVE the cartridge row in that
-                // decision's precedence ladder precisely so it can lie about
-                // ONE volume on ONE drive (mhvtl's 2400 MB fiction); writing
-                // that resolved figure onto a brand-new row would make the
-                // next `volume init` — on any drive, override or none — read
-                // the drive's lie back as an operator's declaration at
-                // `cartridge register --capacity`. The row describes the
-                // plastic; only `volumes.capacity_bytes` (written by the
-                // caller before this ever runs) is allowed to carry the
-                // override.
-                conn.execute(
-                    "INSERT INTO cartridges
-                        (barcode, media_type, manufacturer, serial_number,
-                         tape_length_meters, nominal_capacity, status, total_load_count)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'in_use', ?7)",
-                    params![
-                        s,
-                        generation.as_str(),
-                        mam.manufacturer.as_deref(),
-                        s,
-                        mam.length_meters,
-                        generation.native_capacity_bytes() as i64,
-                        mam.load_count,
-                    ],
-                )?;
-                let id = conn.last_insert_rowid();
-                events::log_created(conn, "cartridge", id, s, None)?;
+                let id = register_from_chip(conn, s, generation, mam, "in_use")?;
                 Ok(Some(ResolvedCartridge {
                     id,
                     barcode: s.to_string(),

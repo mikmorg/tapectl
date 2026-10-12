@@ -219,6 +219,11 @@ pub enum Operation {
     /// around it — the drive's health pages and chip, read through the sg
     /// node only, on a timer.
     DrivePoll,
+    /// `tapectl cartridge erase` (ADR-0012 2026-10-12 item 51): one contact
+    /// for the identification, the erase and the read-back that verifies
+    /// it — the store is opened three times inside it (read-only, read-write,
+    /// read-only), all with the same cartridge in the drive.
+    CartridgeErase,
 }
 
 impl Operation {
@@ -237,6 +242,7 @@ impl Operation {
             Operation::RestoreRawVolume => "restore raw-volume",
             Operation::CatalogRebuild => "catalog rebuild",
             Operation::DrivePoll => "drive poll",
+            Operation::CartridgeErase => "cartridge erase",
         }
     }
 
@@ -255,6 +261,7 @@ impl Operation {
         Operation::RestoreRawVolume,
         Operation::CatalogRebuild,
         Operation::DrivePoll,
+        Operation::CartridgeErase,
     ];
 }
 
@@ -1182,6 +1189,7 @@ pub(crate) mod tests {
                 "restore raw-volume",
                 "catalog rebuild",
                 "drive poll",
+                "cartridge erase",
             ],
             "cartridge_contacts.operation is the command VERBATIM — a different \
              vocabulary from health_logs.operation, which says what kind of reading \
