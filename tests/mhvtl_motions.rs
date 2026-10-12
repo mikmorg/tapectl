@@ -55,11 +55,19 @@ fn ensure_media() {
     );
 }
 
-/// st's `other_cnt` for the node, now.
-fn other_cnt() -> u64 {
+/// st's `other_cnt` for the node, now. Every counter is printed raw, so one
+/// failed run says where a difference came from (a surplus on the write
+/// span or the read span, beside the read and write command counts).
+fn other_cnt(at: &str) -> u64 {
     let dir = st_stats::stats_dir(Path::new("/sys/class/scsi_tape"), &tape_dev())
         .expect("a stats directory for the tape node");
     let reading = st_stats::read(&dir).expect("st statistics in sysfs");
+    let raw: Vec<String> = reading
+        .files
+        .iter()
+        .map(|(k, v)| format!("{k}={}", v.trim()))
+        .collect();
+    eprintln!("st stats {at}: {}", raw.join(" "));
     reading
         .files
         .get("other_cnt")
@@ -102,14 +110,14 @@ fn mhvtl_tape_store_counts_the_commands_the_kernel_counts() {
 
     // Writes: one filemark each, the last synchronous.
     let mut store = TapeStore::open(&dev, BLOCK_SIZE, u64::MAX).unwrap();
-    let (m0, k0) = (store.motions(), other_cnt());
+    let (m0, k0) = (store.motions(), other_cnt("before the writes"));
     for i in 0..FILES {
         let bytes = file_bytes(i);
         store
             .execute(&mut &bytes[..], bytes.len() as u64, i == FILES - 1)
             .unwrap();
     }
-    let (m1, k1) = (store.motions(), other_cnt());
+    let (m1, k1) = (store.motions(), other_cnt("after the writes"));
     drop(store);
     let wrote = since(m1, m0);
     eprintln!("write: store {wrote:?}, kernel other_cnt +{}", k1 - k0);
@@ -125,7 +133,7 @@ fn mhvtl_tape_store_counts_the_commands_the_kernel_counts() {
     // cursor needs), then back (a rewind and a space), a head read that
     // stops inside a file, a forward space from inside it, and back again.
     let mut store = TapeStore::open_read(&dev, BLOCK_SIZE).unwrap();
-    let (m0, k0) = (store.motions(), other_cnt());
+    let (m0, k0) = (store.motions(), other_cnt("before the reads"));
     for i in 0..FILES {
         let len = file_bytes(i).len();
         assert_eq!(read_at(&mut store, i)[..len], file_bytes(i)[..]);
@@ -136,7 +144,7 @@ fn mhvtl_tape_store_counts_the_commands_the_kernel_counts() {
     assert_eq!(head, vec![6u8; 1024]);
     read_at(&mut store, 7);
     read_at(&mut store, 1);
-    let (m1, k1) = (store.motions(), other_cnt());
+    let (m1, k1) = (store.motions(), other_cnt("after the reads"));
     drop(store);
     let read = since(m1, m0);
     eprintln!("read: store {read:?}, kernel other_cnt +{}", k1 - k0);

@@ -878,9 +878,12 @@ fn perf_a_100k_file_unit_scales_linearly() {
 /// way to the store and the confirm once more on the way back
 /// (`tests/pass_budget.rs` pins those counts): two hash passes, which the
 /// calibration times on one 256 MiB buffer. The ceiling allows three times
-/// that, for the reads, the copies and the queues between them. A pipeline
-/// that stopped overlapping, or a pass added, shows as a ratio, on a fast
-/// machine or a loaded one. Measured 2026-10-12 on vm-desk1, release:
+/// that, for the reads, the copies and the queues between them: it bounds
+/// throughput against the machine's own sha256, on a fast machine or a
+/// loaded one, and catches an order-of-magnitude slowdown. One added pass or
+/// a pipeline that stopped overlapping stays under it; the exact pass
+/// counts are `tests/pass_budget.rs`'s job, and the ratio printed here is
+/// the figure to compare with `docs/perf-baselines.md`. Measured 2026-10-12 on vm-desk1, release:
 /// 0.82x (the write's hash overlaps its reads, and one calibration run on a
 /// shared VM is noisy, so under 1.0 is normal).
 #[test]
