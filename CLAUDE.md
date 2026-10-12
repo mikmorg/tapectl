@@ -222,8 +222,11 @@ keys.
     (item 46);
   - a tape-only shortfall stays an ADR-0008 Tier-2 consent gate (item 47);
   - #416's pass counters are test-only (item 45).
-- **Status.** 1.1.0 is frozen on master `4342589`, untagged. Next:
-  - the real-drive proof on home2 with a static musl debug build, on the test cartridge;
+- **Status.** 1.1.0 is frozen on master `d91260c` (with `cartridge erase`, items 51-52),
+  untagged. The real-drive proof of `133fd5f` passed on home2 (step 12 50/50, db-loss 6/6;
+  `docs/runs/2026-10-12-1.1.0-real-drive-proof.md`). Next:
+  - `cartridge erase` on the real drive and the #326/#366/#368 measurements (release musl
+    build, CTO-approved for measuring only);
   - the `v1.1.0` tag on the proven commit;
   - the operator's fresh start.
 

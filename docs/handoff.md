@@ -11,7 +11,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 home2 runs 1.0.0. That install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
-1.1.0 fix. 1.1.0 is frozen on master `4342589`, untagged. It changes on-tape bytes and
+1.1.0 fix. 1.1.0 is frozen on master `d91260c`, untagged. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
 upgrading** (item 36):
 - a new catalog from `scripts/first-run.sh` step 1;
@@ -23,12 +23,13 @@ upgrading** (item 36):
 From the erase until two new copies seal and verify, `keepsake` has no copy on tape. Its
 originals stay on disk, and the CTO accepted that window.
 
-The whole chain is green, per #418's landing comment. It ran on land6 `01c4fb8`: fmt,
-clippy (gnu and musl), every ungated test binary, check-docs, mhvtl_e2e 12/12,
-mhvtl_motions, the mhvtl gate against an empty manifest, lifecycle `--all`, and the
-first-run re-entry acceptance. `4342589` then added only the committed gen-1/gen-2
-`catalog.db` fixtures, and the lib test binary was rerun green on it. What 1.1.0 has not
-had is a real drive.
+The whole chain is green on `d91260c` itself (land7): fmt, clippy (gnu and musl), every
+ungated test binary, check-docs, mhvtl_e2e 12/12, mhvtl_motions, the mhvtl gate against an
+empty manifest, lifecycle `--all`, the first-run re-entry acceptance (with the ops-group
+check) and the `cartridge erase` proof (17 checks: identify, every refusal with the tape
+untouched, erase, read-back, records, `--long`, init without `--force`). The real-drive proof
+of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`); step (a)4,
+`cartridge erase` on the real drive, and the measurements follow on `d91260c`.
 
 ## Who does what
 
@@ -192,7 +193,11 @@ You do this on home2, inside tmux, in this order. Read it through once first.
    - **step 9** finds the old kit in `~/tapectl-heir-kit`. Answer **yes** to regenerate it:
      the old kit's `catalog.db.age` is the 1.0.0 catalog;
    - **step 11** mints new keys for `parents` and `family` and registers the `keepsake`
-     collection;
+     collection. Every keepsake folder still holds its 1.0.0 `.tapectl-unit.toml`: `collection
+     sync` adopts each one as written (its uuid, name, tenant `family` and tags) instead of
+     minting a new identity, so the units keep their 1.0.0 uuids. The service user wrote those
+     dotfiles and reads them all; four are unreadable to your own account, which matters only
+     to a sync run as you;
    - **step 12** is required again. Its marker is per binary hash, and the release binary
      from step 3 is not the musl build that (a) proved. It erases EW7VWMVKF6 again.
 7. **Unload the test cartridge, load L6-0001, and run `scripts/first-run.sh --profile
