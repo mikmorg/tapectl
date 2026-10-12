@@ -2,3 +2,5 @@
 *.db
 *.db-wal
 *.db-shm
+# Committed on-tape catalog.db fixtures from the historical writers (#418 R3)
+!tests/fixtures/ontape_catalog/*.db
