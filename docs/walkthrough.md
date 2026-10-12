@@ -594,7 +594,7 @@ tapectl db backup --to /mnt/backup/tapectl.db
 ```
 
 ```text
-database backed up to /mnt/backup/tapectl.db (private keys not included — pass --include-keys to copy them)
+database backed up to /mnt/backup/tapectl.db (464.0 KiB); private keys not included — pass --include-keys to copy them
 ```
 
 The directory (`/mnt/backup` here) must already exist; `db backup` creates none. With
