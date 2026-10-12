@@ -217,6 +217,11 @@ pub enum VolumeCommands {
     /// long as the front index on the tape is the one they were checked
     /// against.
     ///
+    /// A full verify that passes also records the volume's write figures
+    /// (bytes written, data files, write dates) when the write that sealed
+    /// it could not, from the front index it read and the catalog's own
+    /// rows; figures already recorded are left as they are.
+    ///
     /// Exit status: 0 = every checked file matched. 2 = the verify PROVED
     /// THE MEDIUM BAD: the volume is quarantined and no longer counts as a
     /// copy — write its content to another cartridge. 3 = inconclusive: a
@@ -991,6 +996,9 @@ pub fn run(
                             })
                         }),
                         "drive_health_note": report.drive_health_note,
+                        // ADR-0012 2026-10-07 item 33 (#423), additive:
+                        // `null` when this verify recorded nothing.
+                        "figures": figures_json(report.figures.as_ref()),
                     })
                 );
             } else {
@@ -1085,6 +1093,11 @@ pub fn run(
                             );
                         }
                     }
+                }
+                // ADR-0012 2026-10-07 item 33 (#423): what this verify
+                // recorded of the figures the write left unrecorded.
+                if let Some(figures) = &report.figures {
+                    println!("{}", figures_message(label, figures));
                 }
                 // Issue #187: said out loud, not silently omitted.
                 if let Some(note) = &report.drive_health_note {
@@ -2733,6 +2746,33 @@ fn render_write_history(writes: &[WriteRow]) -> String {
     out
 }
 
+/// `volume verify`'s line about the write figures it recorded (ADR-0012
+/// 2026-10-07 item 33, issue #423), or withheld.
+fn figures_message(label: &str, figures: &crate::volume::figures::Figures) -> String {
+    use crate::volume::figures::Figures;
+    match figures {
+        Figures::Recorded(changes) => format!(
+            "volume \"{label}\": recorded the write figures it was missing or had wrong: {}",
+            changes.join("; ")
+        ),
+        Figures::Withheld(why) => format!(
+            "volume \"{label}\": its write figures are missing or wrong, and were NOT recorded: \
+             {why}. The verify itself passed."
+        ),
+    }
+}
+
+/// `volume verify --json`'s `figures` key: `{"recorded": [...]}`,
+/// `{"withheld": "<why>"}`, or `null`.
+fn figures_json(figures: Option<&crate::volume::figures::Figures>) -> serde_json::Value {
+    use crate::volume::figures::Figures;
+    match figures {
+        None => serde_json::Value::Null,
+        Some(Figures::Recorded(changes)) => serde_json::json!({ "recorded": changes }),
+        Some(Figures::Withheld(why)) => serde_json::json!({ "withheld": why }),
+    }
+}
+
 /// `volume info`'s two write-date lines (issue #392): when the first write
 /// began and when the last one completed, each line saying which.
 fn render_write_span(first_write: Option<&str>, last_write: Option<&str>) -> String {
@@ -3585,6 +3625,42 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// ADR-0012 2026-10-07 item 33 (#423): `volume verify` says what it
+    /// recorded of the write figures, or why it withheld them, in both
+    /// outputs; `--json` carries `null` when it recorded nothing.
+    #[test]
+    fn verify_reports_the_write_figures_it_recorded_or_withheld() {
+        use crate::volume::figures::Figures;
+        let recorded = Figures::Recorded(vec![
+            "num_data_files: 0 -> 1".to_string(),
+            "write_completed event: (none) -> recorded".to_string(),
+        ]);
+        assert_eq!(
+            figures_message("L6-0002", &recorded),
+            "volume \"L6-0002\": recorded the write figures it was missing or had wrong: \
+             num_data_files: 0 -> 1; write_completed event: (none) -> recorded"
+        );
+        assert_eq!(
+            figures_json(Some(&recorded)),
+            serde_json::json!({"recorded": [
+                "num_data_files: 0 -> 1",
+                "write_completed event: (none) -> recorded",
+            ]})
+        );
+        let withheld = Figures::Withheld("the catalog records two slices".to_string());
+        let msg = figures_message("L6-0002", &withheld);
+        assert!(
+            msg.contains("NOT recorded: the catalog records two slices"),
+            "{msg}"
+        );
+        assert!(msg.ends_with("The verify itself passed."), "{msg}");
+        assert_eq!(
+            figures_json(Some(&withheld)),
+            serde_json::json!({"withheld": "the catalog records two slices"})
+        );
+        assert_eq!(figures_json(None), serde_json::Value::Null);
     }
 
     #[test]
