@@ -13,10 +13,17 @@ DEVICE=/dev/tape/by-id/scsi-HUJ808A5L4-nst
 
 OPERATOR=mikmorg
 
-# The 1.1.0 fresh start keeps the escrow identity (ADR-0012, 2026-10-12, item 39):
-# set this to the ORIGINAL escrow public key, the age1… line on the Heir Kit's
-# cover sheet, before step 7, so init adopts it instead of minting a new one.
+# The 1.1.0 fresh start keeps the escrow identity (ADR-0012, 2026-10-12, item 39).
+# Its public key is kept OUT of git (item 50): put
+#   ESCROW_PUBLIC_KEY=age1…        (the Heir Kit cover sheet's line)
+# in ~/.config/tapectl/home2.local.profile (or the file TAPECTL_LOCAL_PROFILE
+# names), or pass --escrow-public-key on the command line. A file outside the
+# repo leaves `git describe --dirty`, and so the binary's version, clean.
 ESCROW_PUBLIC_KEY=""
+_local_profile="${TAPECTL_LOCAL_PROFILE:-$HOME/.config/tapectl/home2.local.profile}"
+# shellcheck source=/dev/null
+[ -f "$_local_profile" ] && . "$_local_profile"
+unset _local_profile
 
 # ADOPT_KEYS_FROM is deliberately unset: the 1.1.0 fresh start mints new keys
 # for the operator and every tenant (ADR-0012, 2026-10-12, item 41). Set it

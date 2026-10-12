@@ -122,12 +122,13 @@ You do this on home2, inside tmux, in this order. Read it through once first.
    wrapper, never the user, a home, the binary or the backups. Step 14 installs all three
    timers again, the drive poll among them.
 2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.1.0`.
-3. **The escrow public key** (item 39). Copy the profile out of the checkout and fill in
-   the copy: `cp contrib/hosts/home2.profile ~/home2-1.1.0.profile`, then set
-   `ESCROW_PUBLIC_KEY=` in it to the `age1…` line on the Heir Kit's cover sheet. The public
-   key is not secret. Why a copy: tapectl's build identity is `git describe --tags --dirty`
-   (`build.rs`), so an edit to the tracked `contrib/hosts/home2.profile` would make step 3's
-   binary call itself `v1.1.0-dirty` in every journal row it writes.
+3. **The escrow public key** (items 39 and 50). Keep it out of git: write it to a local file
+   that `contrib/hosts/home2.profile` reads, outside the repository:
+   `mkdir -p ~/.config/tapectl && echo 'ESCROW_PUBLIC_KEY=age1…' > ~/.config/tapectl/home2.local.profile`,
+   with the `age1…` line from the Heir Kit's cover sheet (or pass `--escrow-public-key` to
+   `first-run.sh`). The public key is not secret; it stays out of git by the CTO's choice. A
+   file outside the checkout leaves `git describe --tags --dirty` clean, so step 3's binary
+   calls itself `v1.1.0`, not `v1.1.0-dirty`.
    - Before step 4 deletes the old home, compare the key with the file the old home kept:
      `sudo cat /srv/archive_meta/tapectl/.tapectl/keys/mikmorg-escrow.age.pub`. The two
      must be identical.
@@ -153,14 +154,15 @@ You do this on home2, inside tmux, in this order. Read it through once first.
    pgrep -a -u tapectl                                     # nothing may be running
    sudo rm -rf /srv/archive_meta/tapectl/.tapectl
    sudo find /srv/acache/tapectl-staging -mindepth 1 -delete
+   sudo find /srv/local_backup/tapectl -mindepth 1 -delete   # the 1.0.0 catalog backups (item 49)
    ```
 
-   Keep the two directories themselves. `/srv/archive_meta/tapectl` is the service user's
+   Keep the three directories themselves. `/srv/archive_meta/tapectl` is the service user's
    home, which `home2-prep.sh` moved there, and the staging directory is the profile's.
    This step is required: step 7 skips `init` whenever `<home>/tapectl.db` exists.
 
-   Not ruled: the 1.0.0 catalog copies in `/srv/local_backup/tapectl` (they hold no keys).
-   Ask the CTO whether to keep them.
+   The 1.0.0 catalog backups go too (item 49): once L6-0001 is erased they describe nothing
+   that exists. The new catalog's backups land in the same directory from step 14 on.
 5. **Prepare the host:** `contrib/hosts/home2-prep.sh --apply`. On home2 most of its parts
    report "already done". It does not delete the 1.0.0 home: its part 2 removes only the
    2026-09-13 attempt under `/var/lib/tapectl`. That is why step 4 is by hand.

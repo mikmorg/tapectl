@@ -1397,3 +1397,8 @@ Follow-up, ruled the same day:
     (migration 030) and records each file's kind and link target (#381's on-tape half), so a
     catalog rebuilt from tape keeps them. Rebuild still reads generations 1 and 2 by shape. The
     cross-volume per-tenant index (R4), #420 and #388 stay after the first production write.
+49. **The 1.0.0 catalog backups in `/srv/local_backup/tapectl` are deleted** with the old home
+    (item 38): once L6-0001 is erased they describe nothing that exists.
+50. **The escrow public key stays out of git**: `home2.profile` reads it from a local file outside
+    the repository (`~/.config/tapectl/home2.local.profile`) or the `--escrow-public-key` flag, so
+    the tagged tree and the binary's version stay clean.
