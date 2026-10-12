@@ -475,10 +475,13 @@ fn build_template(tenants: &[TenantSpec]) -> Template {
     }
 
     // Positions: 0-3, a tenant envelope each, the operator envelope and its
-    // backup, every unit's slices contiguously, the seal marker last.
+    // backup, each tenant envelope's backup in the same order
+    // (volume-format-v2.md §1.3), every unit's slices contiguously, the seal
+    // marker last.
     let first_env = 4i64;
     let op_pos = first_env + tenants.len() as i64;
-    let mut next = op_pos + 2;
+    let first_backup = op_pos + 2;
+    let mut next = first_backup + tenants.len() as i64;
     let mut slice_cipher: Vec<(i64, Vec<u8>)> = Vec::new();
     for s in staged.iter_mut() {
         for (i, plain) in s.slices.iter().enumerate() {
@@ -556,11 +559,9 @@ fn build_template(tenants: &[TenantSpec]) -> Template {
     ));
     for (i, t) in tenants.iter().enumerate() {
         let mine: Vec<&Staged> = staged.iter().filter(|s| s.tenant == t.name).collect();
-        files.push((
-            first_env + i as i64,
-            "tenant_envelope",
-            envelope(t.name, &format!("{},op,esc", t.name), &mine),
-        ));
+        let env = envelope(t.name, &format!("{},op,esc", t.name), &mine);
+        files.push((first_env + i as i64, "tenant_envelope", env.clone()));
+        files.push((first_backup + i as i64, "tenant_envelope_backup", env));
     }
     let all: Vec<&Staged> = staged.iter().collect();
     let op_env = envelope("operator", "op,esc", &all);
@@ -1294,13 +1295,23 @@ fn find_envelope_with_a_tenant_key_shows_that_tenants_envelope() {
     );
 }
 
+/// The tape position of the backup of the tenant envelope at `primary`:
+/// past the three tenants' primaries and the operator pair
+/// (`volume-format-v2.md` §1.3). The template has three tenants.
+fn backup_of(primary: i64) -> i64 {
+    primary + 3 + 2
+}
+
 /// A damaged envelope is not a wrong key. The key matched (age got past the
 /// header) but the payload did not decrypt: the script says DAMAGED, and the
-/// headline no longer tells the heir to try their OTHER keys.
+/// headline no longer tells the heir to try their OTHER keys. Both copies
+/// are damaged here: with one good copy left, the backup is used instead
+/// (the tests below).
 #[test]
 fn a_damaged_envelope_is_reported_as_damage_not_as_a_wrong_key() {
     let h = Heir::new();
     damage_envelope(&h, 4); // alice's tenant envelope
+    damage_envelope(&h, backup_of(4)); // and its backup
     let (code, text) = h.run(&["--find-envelope", "--key", &h.key("alice")]);
     assert_ne!(code, 0, "{text}");
     assert!(text.contains("DAMAGED"), "{text}");
@@ -1323,6 +1334,129 @@ fn a_damaged_envelope_is_reported_as_damage_not_as_a_wrong_key() {
     assert_ne!(code, 0, "{text}");
     assert!(text.contains("try your OTHER keys"), "{text}");
     assert!(!text.contains("DAMAGED"), "{text}");
+}
+
+// ---- #418 item 2: every tenant envelope has a backup copy ----
+
+/// The template's own layout: alice's envelope at 4 and its backup after the
+/// operator pair, the same bytes under the same front-index hash. Without
+/// this, the fallback tests below could pass against a tape with no backup.
+#[test]
+fn each_tenant_envelope_has_a_byte_identical_backup_after_the_operator_pair() {
+    let h = Heir::new();
+    let tape = h.dir.join("tape");
+    for primary in [4i64, 5, 6] {
+        let a = std::fs::read(tape.join(primary.to_string())).unwrap();
+        let b = std::fs::read(tape.join(backup_of(primary).to_string())).unwrap();
+        assert_eq!(a, b, "file {} must copy file {primary}", backup_of(primary));
+    }
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("tenant_envelope_backup"), "{text}");
+}
+
+/// With the primary readable, the backup is never read: a restore with the
+/// tenant's key reads alice's envelope and goes straight to the slices.
+#[test]
+fn a_backup_is_not_read_when_the_primary_opens() {
+    let h = Heir::new();
+    let docs = unit("docs");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&docs.src, Path::new(&dest)), "{text}");
+    assert!(
+        !reads(&h).contains(&backup_of(4)),
+        "the backup was read although the primary opened:\n{:#?}",
+        h.ops()
+    );
+    // And an escrow key, which opens every envelope, reads no backup either.
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    let r = reads(&h);
+    for primary in [4i64, 5, 6] {
+        assert!(
+            !r.contains(&backup_of(primary)),
+            "backup of {primary} read:\n{:#?}",
+            h.ops()
+        );
+    }
+}
+
+/// A damaged primary: the restore turns to the backup further on, says so,
+/// and restores byte for byte, still reading forward from one rewind.
+#[test]
+fn a_damaged_tenant_envelope_restores_from_its_backup() {
+    let h = Heir::new();
+    damage_envelope(&h, 4);
+    let photos = unit("photos/2019");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("DAMAGED"), "the damage is named:\n{text}");
+    assert!(
+        text.contains(&format!("File {} is a backup copy", backup_of(4))),
+        "{text}"
+    );
+    assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
+    assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
+
+    // --find-envelope shows the backup's contents the same way.
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("--- MANIFEST.toml ---"), "{text}");
+    assert!(
+        text.contains(&format!("Decrypted envelope at file {}", backup_of(4))),
+        "{text}"
+    );
+}
+
+/// A primary that will not read at all (an I/O error, not bad bytes) no
+/// longer ends the run: it is DAMAGED, and the backup is read instead.
+#[test]
+fn an_unreadable_tenant_envelope_restores_from_its_backup() {
+    let h = Heir::new();
+    let docs = unit("docs");
+    let dest = h.sub("restored");
+    let (code, text) = h.run_env(
+        &[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--unit",
+            "docs",
+            "--to",
+            &dest,
+        ],
+        &[("FAKE_DD_FAIL", "4")],
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("NOTE: reading tape file 4 failed"),
+        "dd's words are kept:\n{text}"
+    );
+    assert!(
+        text.contains("the envelope at file 4 could not be read from the tape"),
+        "{text}"
+    );
+    assert!(same_tree(&docs.src, Path::new(&dest)), "{text}");
+    assert!(reads(&h).contains(&backup_of(4)), "{:#?}", h.ops());
 }
 
 // ---- #412 item 1: streaming restore; item 3: --all and repeated --unit ----

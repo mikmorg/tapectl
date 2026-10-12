@@ -96,5 +96,5 @@ tapectl restore raw-volume [OPTIONS] --to <TO>
 - `--to <TO>` *(required)* — Destination directory
 - `--from <FROM>` — Refuse unless the tape's own reported label matches (wrong-tape guard) — not a database lookup
 - `--positions <N>` — Dump only the files at these tape positions (comma-separated or repeated; File 0 is the ID thunk, 2 RESTORE.sh, 3 the front index). With --only, a file either names is dumped
-- `--only <TYPE>` — Dump only the files of these front-index types (comma-separated or repeated): id_thunk, system_guide, restore_sh, front_index, tenant_envelope, operator_envelope, operator_envelope_backup, data_slice, seal_marker
+- `--only <TYPE>` — Dump only the files of these front-index types (comma-separated or repeated): id_thunk, system_guide, restore_sh, front_index, tenant_envelope, operator_envelope, operator_envelope_backup, tenant_envelope_backup, data_slice, seal_marker
 

@@ -43,6 +43,12 @@ pub enum ZoneKind {
     },
     OperatorEnvelope,
     OperatorEnvelopeBackup,
+    /// A tenant envelope's backup copy (`volume-format-v2.md` §1.3, #418
+    /// item 2): the primary's exact bytes, after the operator pair, in the
+    /// primaries' order. Keyed by `tenants.id` like its primary.
+    TenantEnvelopeBackup {
+        tenant_id: i64,
+    },
     /// The plaintext trailing seal marker (last file, layout v2 — ADR-0007).
     /// Its presence asserts completeness and binds the front index.
     SealMarker,
@@ -68,6 +74,7 @@ impl ZoneKind {
             // format, not a deliberate v1/v2 difference; no test pinned the
             // old value (it only affects the plaintext front/mini index).
             ZoneKind::OperatorEnvelopeBackup => "operator_envelope_backup",
+            ZoneKind::TenantEnvelopeBackup { .. } => "tenant_envelope_backup",
             ZoneKind::SealMarker => "seal_marker",
         }
     }
@@ -95,6 +102,7 @@ impl ZoneKind {
             "tenant_envelope" => ZoneKind::TenantEnvelope { tenant_id: 0 },
             "operator_envelope" => ZoneKind::OperatorEnvelope,
             "operator_envelope_backup" => ZoneKind::OperatorEnvelopeBackup,
+            "tenant_envelope_backup" => ZoneKind::TenantEnvelopeBackup { tenant_id: 0 },
             "seal_marker" => ZoneKind::SealMarker,
             _ => return None,
         })
@@ -1249,6 +1257,19 @@ mod tests {
     }
 
     #[test]
+    fn tenant_envelope_backup_has_a_distinct_type_label() {
+        // volume-format-v2.md §1.3: a reader pairs a backup with its primary
+        // by hash and must be able to tell the two apart by kind, so
+        // RESTORE.sh opens the primary first and the backup only on failure.
+        let kind = ZoneKind::TenantEnvelopeBackup { tenant_id: 3 };
+        assert_eq!(kind.type_label(), "tenant_envelope_backup");
+        assert_ne!(
+            kind.type_label(),
+            ZoneKind::TenantEnvelope { tenant_id: 3 }.type_label()
+        );
+    }
+
+    #[test]
     fn from_type_label_round_trips_every_kind_type_label_produces() {
         // Every string type_label() can produce must round-trip through
         // from_type_label() back to a kind with the SAME type_label() (the
@@ -1264,6 +1285,7 @@ mod tests {
             ZoneKind::TenantEnvelope { tenant_id: 7 },
             ZoneKind::OperatorEnvelope,
             ZoneKind::OperatorEnvelopeBackup,
+            ZoneKind::TenantEnvelopeBackup { tenant_id: 7 },
             ZoneKind::SealMarker,
         ];
         for kind in samples {

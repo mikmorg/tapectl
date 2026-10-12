@@ -520,7 +520,10 @@ fn mhvtl_v2_layout_positions_derived_from_front_index() {
         .filter(|e| {
             matches!(
                 e.type_label.as_str(),
-                "tenant_envelope" | "operator_envelope" | "operator_envelope_backup"
+                "tenant_envelope"
+                    | "operator_envelope"
+                    | "operator_envelope_backup"
+                    | "tenant_envelope_backup"
             )
         })
         .map(|e| e.position)
@@ -1022,6 +1025,32 @@ fn mhvtl_no_plaintext_tenant_metadata() {
         op_envelope_pos + 1,
         "operator envelope backup must immediately follow the operator envelope"
     );
+    // volume-format-v2.md sec 1.3: one backup per tenant envelope, straight
+    // after the operator pair, in the primaries' order, each the same bytes
+    // (so the same size and hash in the front index).
+    let tenant_backups: Vec<&format::ParsedIndexEntry> = parsed
+        .iter()
+        .filter(|e| e.type_label == "tenant_envelope_backup")
+        .collect();
+    assert_eq!(
+        tenant_backups
+            .iter()
+            .map(|e| e.position)
+            .collect::<Vec<_>>(),
+        (op_backup_pos + 1..op_backup_pos + 1 + tenant_envelope_positions.len() as i32)
+            .collect::<Vec<_>>(),
+        "a backup per tenant envelope, straight after the operator pair"
+    );
+    for (primary_pos, backup) in tenant_envelope_positions.iter().zip(&tenant_backups) {
+        let primary = parsed.iter().find(|e| e.position == *primary_pos).unwrap();
+        assert_eq!(
+            (primary.size_bytes, &primary.sha256_encrypted),
+            (backup.size_bytes, &backup.sha256_encrypted),
+            "the backup at {} must copy the tenant envelope at {primary_pos}",
+            backup.position
+        );
+    }
+    let last_envelope_pos = tenant_backups.last().unwrap().position;
     let slice_positions: Vec<i32> = parsed
         .iter()
         .filter(|e| e.type_label == "data_slice")
@@ -1032,7 +1061,7 @@ fn mhvtl_no_plaintext_tenant_metadata() {
         "expected at least one data slice"
     );
     assert!(
-        op_backup_pos < *slice_positions.iter().min().unwrap(),
+        last_envelope_pos < *slice_positions.iter().min().unwrap(),
         "every envelope must precede every data slice (v2 order, format sec 1)"
     );
 

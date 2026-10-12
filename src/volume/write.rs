@@ -569,8 +569,8 @@ fn volume_init_in_contact<'c>(
 
     // Provisional total_files: unknown until the write session builds the
     // real Layout. Format §1's minimum shape is 4 front files + >=1 tenant
-    // envelope + operator + backup + >=1 slice + the seal marker; 8 is a
-    // representative placeholder, thrown away wholesale (not preserved, not
+    // envelope + operator + backup + a backup per tenant envelope (§1.3) +
+    // >=1 slice + the seal marker; 8 is a representative placeholder, thrown away wholesale (not preserved, not
     // interpreted) when the write session rewrites File 0 from BOT.
     const PROVISIONAL_TOTAL_FILES: i32 = 8;
     let created_at = chrono::Utc::now().to_rfc3339();

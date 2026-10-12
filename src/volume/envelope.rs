@@ -19,12 +19,12 @@
 //! simply fails to open it, and [`OpenError::NoMatchingKey`] says so.
 
 use std::fs::{self, File};
-use std::io::{BufWriter, Read};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, TapectlError};
 use crate::store::Store;
-use crate::util::TruncatingWriter;
+use crate::util::{HashingWriter, TruncatingWriter};
 use crate::volume::format::ParsedIndexEntry;
 pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 
@@ -119,6 +119,11 @@ impl From<TapectlError> for OpenError {
 /// trimmed on the way out using the front index's `size_bytes`, exactly as
 /// `volume::raw::restore_raw` does — an envelope without a recorded size is
 /// unreadable as ciphertext and reported as such rather than guessed at.
+///
+/// The trimmed ciphertext is hashed as it streams and checked against the
+/// front index's `sha256_encrypted` before it is decrypted: a mismatch is
+/// [`OpenError::Failed`], never [`OpenError::NoMatchingKey`], so "not a
+/// recipient" is only ever said of bytes the front index vouches for.
 pub fn open_envelope(
     store: &mut dyn Store,
     entry: &ParsedIndexEntry,
@@ -135,12 +140,33 @@ pub fn open_envelope(
 
     fs::create_dir_all(scratch).map_err(TapectlError::from)?;
     let ct_path = scratch.join(format!("{:04}_{}.age", entry.position, entry.type_label));
-    {
+    let read_hash = {
         let out = BufWriter::new(File::create(&ct_path).map_err(TapectlError::from)?);
-        let mut bounded = TruncatingWriter::new(out, true_len);
-        store
-            .read_file(entry.position as u32, &mut bounded)
-            .map_err(OpenError::Failed)?;
+        let mut bounded = TruncatingWriter::new(HashingWriter::new(out), true_len);
+        let read = store.read_file(entry.position as u32, &mut bounded);
+        let mut hashed = bounded.into_inner();
+        read.map_err(OpenError::Failed)?;
+        hashed.flush().map_err(TapectlError::from)?;
+        hashed.finalize_hex()
+    };
+
+    // The front index's hash is checked BEFORE age sees the bytes, because
+    // age cannot tell damage from a stranger: a recipient stanza that fails
+    // to unwrap is, to age 0.11, a stanza for someone else, so a damaged
+    // header comes back as `NoMatchingKeys`. Only bytes that match the front
+    // index make "not a recipient" an answer about the key rather than the
+    // tape (`volume-format-v2.md` §1.3: a copy that "does not match the
+    // front index's hash" turns the reader to its backup, as RESTORE.sh's
+    // `try_envelope` does).
+    if let Some(expected) = &entry.sha256_encrypted {
+        if !read_hash.eq_ignore_ascii_case(expected) {
+            let _ = fs::remove_file(&ct_path);
+            return Err(OpenError::Failed(TapectlError::Other(format!(
+                "the {} at position {} does not match the front index's hash \
+                 (read {read_hash}, the front index records {expected}), so it is damaged",
+                entry.type_label, entry.position
+            ))));
+        }
     }
 
     let result = unpack_envelope(&ct_path, identities, scratch, entry);

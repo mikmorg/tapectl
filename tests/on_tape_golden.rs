@@ -69,6 +69,12 @@
 //! #384). The test checks each item is present. The previous pin was
 //! `6b64da4b…`.
 //!
+//! Re-pinned 2026-10-12 under ADR-0012 2026-10-12 item 44 (within the
+//! 2026-10-07 on-tape authorization): every tenant envelope has a backup
+//! copy on tape (#418 item 2, `volume-format-v2.md` §1.3), which RESTORE.sh
+//! walks, reading a backup only when its primary is damaged or does not
+//! read. The previous pin was `e8ca5902…`.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -85,7 +91,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "e8ca5902f62730f926e310393989d02978ac68a1f19901de0d666793706be9c4";
+const RESTORE_SH_SHA256: &str = "2a09fe98d3b3a10b7a0a9113d23806070f605d8d8c23366d04edc5ffa900e36e";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
