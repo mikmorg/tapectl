@@ -276,13 +276,17 @@ These are the system-wide defaults. They form the bottom layer of
 | `dirty_on_metadata_change` | bool | `false` | Resolved, but not read by any command in this version: dirty detection compares path, size and modification time only. `config check` prints a note when it is `true`. | `config check` (advisory) |
 | `global_excludes` | list of globs | `["*.nfo", "Thumbs.db", ".DS_Store", "*.tmp"]` (written by `init`) | What is never archived from any unit, added to each unit's own `[excludes]` patterns. **The default list applies only when the whole `[defaults]` table is missing.** A `[defaults]` table without this key means `[]`, so nothing is excluded: if you trim `[defaults]` by hand, keep this line. `config check` does not warn about it. Case never matters. A plain pattern (`*.tmp`) matches a file's **name only** and never a directory. A pattern ending in `/` (`.cache/`) excludes the directory of that name, at any depth in the unit, with everything inside it, and a file of that name too. That subtree stays out of the dar archive as well; the directory itself is archived empty. See [`[excludes]`](#excludes-yours-to-edit). | `snapshot create`, `stage create`, `unit status --dirty`, `report dirty`, `audit` (its dirty check), `collection sync/status/plan`, `unit mark-tape-only` |
 | `large_file_warn_threshold` | size (binary) | `"100G"` | `snapshot create` warns about any file bigger than this. It only warns and never refuses. | [`snapshot create`](cli/snapshot.md#tapectl-snapshot-create) |
-| `min_copies` | integer | `2` | The number of Copies each Version of a unit needs, unless the unit's archive set sets its own `min_copies` (a dotfile cannot set this key). It is the bottom layer of every unit's copy requirement. | `audit`, `report summary/fire-risk/pending/supersedable`, `collection status/run`, `staging clean`, `unit mark-tape-only`, `snapshot mark-reclaimable`, and the retire gate of `volume retire`, `cartridge retire` and `volume compact-finish` (see below the table) |
-| `min_locations` | integer | `2` | How many distinct locations a unit's copies must span before [`unit mark-tape-only`](cli/unit.md#tapectl-unit-mark-tape-only) accepts it without asking. It exists only here: an archive set names places with `required_locations` instead. | `unit mark-tape-only` |
+| `min_copies` | integer | `2` | The number of Copies each Version of a unit needs, unless the unit's archive set sets its own `min_copies` (a dotfile cannot set this key). It is the bottom layer of every unit's copy requirement. A tape-only unit needs it times [`tape_only_safety_multiplier`](#compaction) everywhere it is judged. | `audit`, `report summary/fire-risk/pending/supersedable`, `collection status/run`, `staging clean`, `unit mark-tape-only`, `snapshot mark-reclaimable`, and the retire gate of `volume retire`, `cartridge retire` and `volume compact-finish` (see below the table) |
+| `min_locations` | integer | `2` | How many distinct locations a unit's copies must span, times [`tape_only_safety_multiplier`](#compaction), before [`unit mark-tape-only`](cli/unit.md#tapectl-unit-mark-tape-only) accepts it without asking (at the defaults, 4). It exists only here: an archive set names places with `required_locations` instead. | `unit mark-tape-only` |
 | `warehouse_copies` | integer | `0` | How many warehouse deposits each unit should have in addition to its tape copies ([ADR-0006](adr/0006-storage-interface-first-class-stores.md)). `0` means none are expected, and `audit` says nothing about warehouses. | `audit` |
 
-`unit mark-tape-only` checks the unit's resolved `min_copies` (so an archive set
-asking for three copies needs three), every place its `required_locations` names, and
-the `[defaults] min_locations` floor. A unit that falls short of any of them, or is
+`unit mark-tape-only` checks the unit against the floors of a tape-only unit, which
+it is about to be: its resolved `min_copies`, the `[defaults] min_locations` floor,
+and the copies at each place its `required_locations` names, each times
+`[compaction] tape_only_safety_multiplier` (ADR-0012, 2026-10-12). So at 2x an
+archive set asking for three copies needs six, the default location floor of 2 needs
+4 places, and each named place needs two copies. Each fact whose floor the
+multiplier raised ends `(tape-only 2x)`. A unit that falls short of any of them, or is
 dirty, is a Tier-2 shortfall ([ADR-0008](adr/0008-destructive-consent-tiers.md)): a
 terminal is asked to confirm, `--force` or the global `--yes` confirms in advance, and
 a non-interactive run without either refuses and lists the shortfalls. A unit whose
@@ -294,7 +298,10 @@ The retire gate uses the same resolved policy. [`volume retire`](cli/volume.md#t
 of `volume compact`) refuse outright when a live version would be left with no copy,
 and no flag gets past that. When a version would keep some copies but fewer than its
 resolved `min_copies`, or copies at fewer places than its `required_locations`
-names, that is a Tier-2 shortfall. The command lists it and asks on a terminal.
+names, that is a Tier-2 shortfall. For a tape-only unit both numbers are multiplied by
+`[compaction] tape_only_safety_multiplier` (ADR-0012, 2026-10-12), and the fact ends
+`(tape-only Nx)`: `below its policy of 4 (tape-only 2x)`. The command lists it and
+asks on a terminal.
 `--yes` confirms in advance (`--force` too, for `cartridge retire` and the compact
 commands), and a non-interactive run without it refuses. This gate counts places
 only: copies at any two places satisfy two required locations, even when neither
@@ -612,7 +619,7 @@ dirty_on_metadata_change = false
 global_excludes = ["*.nfo", "Thumbs.db", ".DS_Store", "*.tmp"]
 large_file_warn_threshold = "100G"
 min_copies = 2                      # every unit wants two copies...
-min_locations = 2                   # ...in two places before it may go tape-only
+min_locations = 2                   # ...in two places (tape-only: both x tape_only_safety_multiplier)
 warehouse_copies = 0
 
 [discovery]
@@ -886,7 +893,8 @@ shows which layer can carry which field:
 | xattrs, ACLs, FSA | — | `preserve_xattrs`, `preserve_acls`, `preserve_fsa` | `preserve_xattrs`, `preserve_acls`, `preserve_fsa` |
 
 `[defaults] min_locations` is not a layer of this chain. It is a separate floor on the
-number of distinct places, which only `unit mark-tape-only` applies, to every unit.
+number of distinct places, which only `unit mark-tape-only` applies, to every unit, times
+`[compaction] tape_only_safety_multiplier` as for every tape-only floor.
 
 A unit with no dotfile, or whose dotfile has no `[policy]` table, simply defers to
 the next layer. That is normal. What is *not* normal is a dotfile that is present

@@ -3363,6 +3363,134 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
     );
 }
 
+/// ADR-0012 2026-10-12 item 43, through the binary at the DEFAULT
+/// multiplier (2x) — the contract `scripts/lifecycle-suite.sh`'s
+/// `tor.mark_tape_only_photos_passes` relies on, proven without a tape: a
+/// unit with 2 copies in 2 places meets `min_copies`/`min_locations` (2, 2)
+/// but not a tape-only unit's floors (4, 4). Run as the suite runs it
+/// (stdin not a terminal, no `--yes`), the command refuses, leaves the unit
+/// active and names the multiplier; the global `--yes` written AFTER the
+/// subcommand, as the suite writes it, is the Tier-2 consent that marks it.
+#[test]
+fn test_unit_mark_tape_only_at_default_multiplier_refuses_then_yes_marks() {
+    let (_tmp, conn, home) = setup();
+
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+        [],
+    )
+    .unwrap();
+    let tid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+         VALUES ('u1', 'photos', ?1, 'mtime_size', 1, 'active')",
+        [tid],
+    )
+    .unwrap();
+    let unit_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+         VALUES (?1, 1, 'full', 'current', '/tmp/u1')",
+        [unit_id],
+    )
+    .unwrap();
+    let snap_id = conn.last_insert_rowid();
+    for (label, place) in [("L6-A", "vault"), ("L6-B", "offsite")] {
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+             VALUES (?1, 'staged', 104857600)",
+            [snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO locations (name) VALUES (?1)", [place])
+            .unwrap();
+        let loc_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                  status, location_id)
+             VALUES (?1, 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed', ?2)",
+            rusqlite::params![label, loc_id],
+        )
+        .unwrap();
+        let vol_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            rusqlite::params![ss_id, snap_id, vol_id],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    // The default config: no `[compaction]` table, so the multiplier is 2.
+    let config_path = home.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !config.contains("tape_only_safety_multiplier"),
+        "this test is about the default multiplier: {config}"
+    );
+    let run = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+            .args([
+                "--home",
+                home.to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
+                "unit",
+                "mark-tape-only",
+                "photos",
+            ])
+            .args(extra)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to run the tapectl binary")
+    };
+    let status_of_photos = || {
+        tapectl_test_db(&home.join("tapectl.db"))
+            .query_row("SELECT status FROM units WHERE name = 'photos'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap()
+    };
+
+    let bare = run(&[]);
+    let bare_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bare.stdout),
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert!(
+        !bare.status.success(),
+        "2 copies in 2 places is short of tape-only's 4 and 4; a run without consent must \
+         refuse: {bare_out}"
+    );
+    assert!(
+        bare_out.contains(
+            "insufficient copies: 2 < 4 required by unit \"photos\"'s policy \
+             (tape-only 2x)"
+        ),
+        "the copy fact must give the multiplied floor and name the multiplier: {bare_out}"
+    );
+    assert!(
+        bare_out.contains(
+            "insufficient locations: 2 < 4 required ([defaults] location floor) \
+             (tape-only 2x)"
+        ),
+        "the location fact must give the multiplied floor and name the multiplier: {bare_out}"
+    );
+    assert_eq!(status_of_photos(), "active", "a refusal changes nothing");
+
+    let yes = run(&["--yes"]);
+    assert!(
+        yes.status.success(),
+        "the global --yes after the subcommand is the Tier-2 consent: stdout {:?}, stderr {:?}",
+        String::from_utf8_lossy(&yes.stdout),
+        String::from_utf8_lossy(&yes.stderr)
+    );
+    assert_eq!(status_of_photos(), "tape_only");
+}
+
 /// Issue #99: `volume compact-finish` surfaces ADR-0004 evidence for a unit
 /// that retains coverage on another volume after the source volume retires,
 /// without changing the existing no-copy-elsewhere refusal guard or exit
