@@ -66,6 +66,8 @@ BACKUP_DIR="/var/backups/tapectl"  # step 14: where the daily `db backup` copies
 WORK_DIR=""            # build lock + step-12 rehearsal workspace; default /scratch if present, else ~/.cache/tapectl
 STAGING_DIR=""         # step 7: staging.directory default
 STAGING_JOBS=""        # step 7: [staging] jobs, units staged at once (#368); empty = leave the config's value
+# CONTENDER_PROCESSES=(…) step 7: [host_check] contender_processes, the WHOLE list (the built-in one is
+#                        cargo rustc docker Runner.Worker; repeat it when adding). Unset = leave the config's value.
 DAR_BIN=""             # step 2/4/7: the dar to check, test with and write into [dar] binary
 SVC_HOME_WANT=""       # step 5: home for a NEW service user (default /var/lib/<user>)
 LOCATIONS=()           # step 10: "name|description" — the first is the shelf step 13 moves tape 1 to
@@ -750,6 +752,12 @@ if [ -n "$STAGING_JOBS" ]; then
   # #368: units staged at once, measured per host (home2: 2, ADR-0012 2026-10-13).
   run tc config set staging.jobs "$STAGING_JOBS" || die "could not set staging.jobs = $STAGING_JOBS"
   ok "staging.jobs = $STAGING_JOBS (units staged at once)"
+fi
+if declare -p CONTENDER_PROCESSES >/dev/null 2>&1 && [ "${#CONTENDER_PROCESSES[@]}" -gt 0 ]; then
+  # The processes `host check` names before a write (ADR-0012 2026-10-13 item 55).
+  CP_TOML="[$(printf '"%s",' "${CONTENDER_PROCESSES[@]}" | sed 's/,$//')]"
+  run tc config set host_check.contender_processes "$CP_TOML" || die "could not set host_check.contender_processes = $CP_TOML"
+  ok "host check names these processes before a write: ${CONTENDER_PROCESSES[*]}"
 fi
 if [ -n "$DAR_BIN" ]; then
   # [dar] binary: the dar every tapectl command runs, whatever PATH the caller

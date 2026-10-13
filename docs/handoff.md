@@ -11,7 +11,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 home2 runs 1.0.0. That install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
-1.1.0 fix. 1.1.0 is frozen on master `d91260c`, untagged. It changes on-tape bytes and
+1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
 upgrading** (item 36):
 - a new catalog from `scripts/first-run.sh` step 1;
@@ -122,7 +122,7 @@ production cartridge.
 Exit criterion: steps 2, 3 and 4 GREEN on the frozen commit. If either is red, nothing is
 tagged and the fresh start waits.
 
-## (b) Tag v1.1.0
+## (b) Tag v1.1.0 — done 2026-10-13
 
 On the commit (a) proved, by the version rule of 2026-09-30:
 `git tag -a v1.1.0 <sha> -m "tapectl 1.1.0"`, then `git push origin v1.1.0`. If (a) needed a

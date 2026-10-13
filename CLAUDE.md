@@ -222,13 +222,10 @@ keys.
     (item 46);
   - a tape-only shortfall stays an ADR-0008 Tier-2 consent gate (item 47);
   - #416's pass counters are test-only (item 45).
-- **Status.** 1.1.0 is frozen on master `d91260c` (with `cartridge erase`, items 51-52),
-  untagged. The real-drive proof of `133fd5f` passed on home2 (step 12 50/50, db-loss 6/6;
-  `docs/runs/2026-10-12-1.1.0-real-drive-proof.md`). Next:
-  - `cartridge erase` on the real drive and the #326/#366/#368 measurements (release musl
-    build, CTO-approved for measuring only);
-  - the `v1.1.0` tag on the proven commit;
-  - the operator's fresh start.
+- **Status.** 1.1.0 is tagged `v1.1.0` (2026-10-13) after the real-drive proof on home2
+  (step 12 50/50, db-loss 6/6, `cartridge erase` on the real drive, the #326/#366/#368
+  measurements and #426 traced to host contention;
+  `docs/runs/2026-10-12-1.1.0-real-drive-proof.md`). Next: the operator's fresh start.
 
   `docs/handoff.md` has the sequence. The 2026-10-07 on-tape authorization ends when
   v1.1.0 is installed (item 40). Open after it: #420, #418 R4, #425, #388, #326 and the

@@ -24,6 +24,11 @@ ESCROW_PUBLIC_KEY=""
 # #368, measured on home2 2026-10-13 (7 keepsake units, ~35 GiB): 1 job 13m08s,
 # 2 jobs 8m02s, 4 jobs 7m29s. Two at once (ADR-0012, 2026-10-13, item 53).
 STAGING_JOBS=2
+
+# What `host check` names before a write (ADR-0012, 2026-10-13, item 55): the
+# built-in list plus java — the minecraft server here, which on 2026-10-12 made
+# a write use 1.5x its native tape (#426). The whole list: it replaces the default.
+CONTENDER_PROCESSES=(cargo rustc docker Runner.Worker java)
 _local_profile="${TAPECTL_LOCAL_PROFILE:-$HOME/.config/tapectl/home2.local.profile}"
 # shellcheck source=/dev/null
 [ -f "$_local_profile" ] && . "$_local_profile"

@@ -1424,4 +1424,8 @@ Ruled by the CTO, 2026-10-13, on the measurements in `docs/runs/2026-10-12-1.1.0
     `first-run.sh` writes the profile's `STAGING_JOBS`.
 54. **#426 is investigated before `v1.1.0` is tagged**: a 1.1.0 write used 1.505 bytes of native
     tape per data byte. If the cause is in 1.1.0's write pipeline, the fix ships in 1.1.0.
+55. **home2's host check names `java`** (the minecraft server) beside the built-in contenders:
+    #426 traced a write's 1.505 native bytes per data byte to host contention (quiet reruns
+    measured 1.0000). The profile's `CONTENDER_PROCESSES`, written by `first-run.sh` step 7.
+56. **`v1.1.0` is tagged** on master after the real-drive proof (2026-10-13).
 

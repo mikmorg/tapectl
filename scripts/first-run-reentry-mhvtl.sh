@@ -152,6 +152,7 @@ COLLECTIONS=(
 # lacks it, and checks status as the operator with the group.
 OPS_GROUP="$OPS_GROUP"
 STAGING_JOBS=2
+CONTENDER_PROCESSES=(cargo rustc docker Runner.Worker java)
 EOF
 SHELF=fr414-rack
 for u in a b c d; do
@@ -213,6 +214,8 @@ step_phase_a() {
         || { echo "step 12 recorded no rehearsal marker (was it skipped? see phase-A.out)"; return 1; }
     sudo -u "$SVC_USER" -H grep -E '^jobs *= *2$' "$RUN/home/config.toml" >/dev/null \
         || { echo "step 7 did not write STAGING_JOBS=2 as [staging] jobs"; return 1; }
+    sudo -u "$SVC_USER" -H grep -F 'contender_processes = ["cargo","rustc","docker","Runner.Worker","java"]' "$RUN/home/config.toml" >/dev/null \
+        || { echo "step 7 did not write CONTENDER_PROCESSES as [host_check] contender_processes"; return 1; }
     sudo -u "$SVC_USER" -H "$TAPECTL" --home "$RUN/home" config set defaults.slice_size 1M
 }
 check install_and_rehearsal step_phase_a
