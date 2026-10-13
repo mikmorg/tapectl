@@ -581,9 +581,16 @@ pub fn progress_session_name(command: &Commands) -> Option<String> {
     use stage::StageCommands as S;
     use volume::VolumeCommands as V;
     Some(match command {
+        // Issue #427: one unit by name, several as the first and a count.
+        // Joining every name made a 27-unit stage's log name too long for
+        // the filesystem, and the run got no session log at all.
         Commands::Stage {
             command: S::Create { name, .. },
-        } => format!("stage create {}", name.join(" ")),
+        } => match name.as_slice() {
+            [] => "stage create".to_string(),
+            [one] => format!("stage create {one}"),
+            [first, rest @ ..] => format!("stage create {first} +{} more", rest.len()),
+        },
         Commands::QuickArchive { volume, .. } => format!("quick-archive {volume}"),
         Commands::Collection {
             command: C::Run { collection, .. },
@@ -676,6 +683,26 @@ pub(crate) fn refuse_dry_run(command: &str, why: &str) -> crate::error::TapectlE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #427: a several-unit `stage create` names its session by the
+    /// first unit and a count, never by every unit.
+    #[test]
+    fn a_several_unit_stage_names_its_session_by_first_unit_and_count() {
+        use clap::Parser;
+        let name = |args: &[&str]| {
+            let cli = Cli::try_parse_from(std::iter::once("tapectl").chain(args.iter().copied()))
+                .unwrap();
+            progress_session_name(&cli.command)
+        };
+        assert_eq!(
+            name(&["stage", "create", "keepsake/a"]).as_deref(),
+            Some("stage create keepsake/a")
+        );
+        assert_eq!(
+            name(&["stage", "create", "keepsake/a", "keepsake/b", "keepsake/c"]).as_deref(),
+            Some("stage create keepsake/a +2 more")
+        );
+    }
 
     /// ADR-0012, 2026-10-07 items 19 and 20 (issue #408): which commands'
     /// errors take which exit contract — from a parsed command line, and

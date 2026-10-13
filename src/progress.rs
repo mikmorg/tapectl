@@ -692,10 +692,16 @@ impl Drop for SessionGuard {
     }
 }
 
+/// The longest command slug a session id carries (issue #427). With the
+/// stamp, the pid and `.log` the file name stays far under NAME_MAX (255
+/// bytes); a longer slug is cut and given a short hash of the whole
+/// command, so two long commands still name two files.
+pub const MAX_SESSION_SLUG: usize = 120;
+
 /// The session id for `command` started at `at` by process `pid`:
 /// `20260930T120000Z-volume-write-L6-0001-4242`.
 pub fn session_id_for(command: &str, at: DateTime<Utc>, pid: u32) -> String {
-    let slug: String = command
+    let mut slug: String = command
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
@@ -705,6 +711,16 @@ pub fn session_id_for(command: &str, at: DateTime<Utc>, pid: u32) -> String {
             }
         })
         .collect();
+    if slug.len() > MAX_SESSION_SLUG {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(command.as_bytes());
+        let tag: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
+        // The slug is ASCII (every other char became '-'), so any byte
+        // index is a char boundary.
+        slug.truncate(MAX_SESSION_SLUG - tag.len() - 1);
+        slug.push('-');
+        slug.push_str(&tag);
+    }
     format!("{}-{slug}-{pid}", at.format("%Y%m%dT%H%M%SZ"))
 }
 
@@ -1557,6 +1573,38 @@ mod tests {
         assert_eq!(
             session_id_for("volume write L6/0001", at, 42),
             "20260930T120000Z-volume-write-L6-0001-42"
+        );
+    }
+
+    /// Issue #427: a command naming many long units still names a file the
+    /// filesystem can create, keeps its stamp and pid, and two such
+    /// commands differing only past the cut still name two files.
+    #[test]
+    fn a_long_command_names_a_bounded_unique_session_file() {
+        let at = DateTime::parse_from_rfc3339("2026-10-13T18:33:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let units: Vec<String> = (0..27)
+            .map(|i| format!("keepsake/2021{i:02}22_a_long_unit_name_{i}"))
+            .collect();
+        let long = format!("stage create {}", units.join(" "));
+        let id = session_id_for(&long, at, 4291);
+        let file = format!("{id}.log");
+        assert!(file.len() <= 255, "{} bytes: {file}", file.len());
+        assert!(
+            id.starts_with("20261013T183301Z-stage-create-keepsake-"),
+            "{id}"
+        );
+        assert!(id.ends_with("-4291"), "{id}");
+        let other = session_id_for(&format!("{long} keepsake/one-more"), at, 4291);
+        assert_ne!(id, other, "two long commands must name two files");
+        // Positive control: the file really can be created.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(&file), b"").unwrap();
+        // A short command is untouched.
+        assert_eq!(
+            session_id_for("stage create a b", at, 1),
+            "20261013T183301Z-stage-create-a-b-1"
         );
     }
 }
