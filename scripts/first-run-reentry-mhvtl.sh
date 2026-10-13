@@ -151,6 +151,7 @@ COLLECTIONS=(
 # #393 as home2 runs it: step 7 creates the group, grants it traverse where it
 # lacks it, and checks status as the operator with the group.
 OPS_GROUP="$OPS_GROUP"
+STAGING_JOBS=2
 EOF
 SHELF=fr414-rack
 for u in a b c d; do
@@ -210,6 +211,8 @@ step_phase_a() {
         || { tail -40 "$RUN/phase-A.out"; return 1; }
     ls "$RUN/state/tapectl/"rehearsal-ok-* >/dev/null 2>&1 \
         || { echo "step 12 recorded no rehearsal marker (was it skipped? see phase-A.out)"; return 1; }
+    sudo -u "$SVC_USER" -H grep -E '^jobs *= *2$' "$RUN/home/config.toml" >/dev/null \
+        || { echo "step 7 did not write STAGING_JOBS=2 as [staging] jobs"; return 1; }
     sudo -u "$SVC_USER" -H "$TAPECTL" --home "$RUN/home" config set defaults.slice_size 1M
 }
 check install_and_rehearsal step_phase_a

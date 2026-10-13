@@ -98,6 +98,7 @@ any flag still wins. Beyond the flags' own values (`DEVICE`, `OPERATOR`,
 |---|---|---|
 | `WORK_DIR` (`--work-dir`) | 3, 4, 12 | the build lock and the rehearsal's throwaway homes; default `/scratch` if it exists and is writable, else `~/.cache/tapectl` |
 | `STAGING_DIR` (`--staging`) | 7 | the default for `staging.directory` |
+| `STAGING_JOBS` | 7 | `[staging] jobs`, the units staged at once (#368); written with `config set staging.jobs`. Empty leaves the config's value (the code default is 1) |
 | `DAR_BIN` (`--dar`) | 2, 4, 7, 12 | the dar that is checked, tested against, and written into `[dar] binary` |
 | `SVC_HOME_WANT` | 5 | the service user's home; step 5 refuses if an existing account's home differs |
 | `LOCATIONS=("name\|description" …)` | 10 | every shelf; tape 1 is recorded at the first |

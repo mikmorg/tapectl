@@ -20,6 +20,10 @@ OPERATOR=mikmorg
 # names), or pass --escrow-public-key on the command line. A file outside the
 # repo leaves `git describe --dirty`, and so the binary's version, clean.
 ESCROW_PUBLIC_KEY=""
+
+# #368, measured on home2 2026-10-13 (7 keepsake units, ~35 GiB): 1 job 13m08s,
+# 2 jobs 8m02s, 4 jobs 7m29s. Two at once (ADR-0012, 2026-10-13, item 53).
+STAGING_JOBS=2
 _local_profile="${TAPECTL_LOCAL_PROFILE:-$HOME/.config/tapectl/home2.local.profile}"
 # shellcheck source=/dev/null
 [ -f "$_local_profile" ] && . "$_local_profile"

@@ -1413,3 +1413,15 @@ Follow-up, ruled the same day:
     `first-run.sh` step 13 offers it when `volume init` refuses a sealed tape.
 52. **Its default erase is short**; `--long` erases the whole medium, for a cartridge that leaves
     the operator's hands.
+
+## Amendment, 2026-10-13: from the home2 measurements
+
+Ruled by the CTO, 2026-10-13, on the measurements in `docs/runs/2026-10-12-1.1.0-real-drive-proof.md`:
+
+53. **home2 stages two units at once** (`[staging] jobs = 2`, #368: 13 m 08 s at 1 job, 8 m 02 s
+    at 2, 7 m 29 s at 4 on seven keepsake units). `hash_threads` stays 1 (#366: no gain at 2, 4
+    or 8; the bound is the source's second read, #364). The code default stays 1;
+    `first-run.sh` writes the profile's `STAGING_JOBS`.
+54. **#426 is investigated before `v1.1.0` is tagged**: a 1.1.0 write used 1.505 bytes of native
+    tape per data byte. If the cause is in 1.1.0's write pipeline, the fix ships in 1.1.0.
+

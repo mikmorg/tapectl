@@ -65,6 +65,7 @@ BACKUP_DIR="/var/backups/tapectl"  # step 14: where the daily `db backup` copies
 # flags given on the command line still win. Empty = the built-in behaviour.
 WORK_DIR=""            # build lock + step-12 rehearsal workspace; default /scratch if present, else ~/.cache/tapectl
 STAGING_DIR=""         # step 7: staging.directory default
+STAGING_JOBS=""        # step 7: [staging] jobs, units staged at once (#368); empty = leave the config's value
 DAR_BIN=""             # step 2/4/7: the dar to check, test with and write into [dar] binary
 SVC_HOME_WANT=""       # step 5: home for a NEW service user (default /var/lib/<user>)
 LOCATIONS=()           # step 10: "name|description" — the first is the shelf step 13 moves tape 1 to
@@ -745,6 +746,11 @@ fi
 as_svc test -w "$SD_NEW" || die "staging directory $SD_NEW is not writable by $( [ "$SVC_MODE" = 1 ] && echo "$SVC_USER" || echo "$USER" )"
 run as_svc df -h "$SD_NEW"
 ok "staging at $SD_NEW"
+if [ -n "$STAGING_JOBS" ]; then
+  # #368: units staged at once, measured per host (home2: 2, ADR-0012 2026-10-13).
+  run tc config set staging.jobs "$STAGING_JOBS" || die "could not set staging.jobs = $STAGING_JOBS"
+  ok "staging.jobs = $STAGING_JOBS (units staged at once)"
+fi
 if [ -n "$DAR_BIN" ]; then
   # [dar] binary: the dar every tapectl command runs, whatever PATH the caller
   # (sudo's secure_path, a systemd unit) happens to have.
