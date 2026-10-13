@@ -183,7 +183,7 @@ You do this on home2, inside tmux, in this order. Read it through once first.
 5. **Prepare the host:** `contrib/hosts/home2-prep.sh --apply`. On home2 most of its parts
    report "already done". It does not delete the 1.0.0 home: its part 2 removes only the
    2026-09-13 attempt under `/var/lib/tapectl`. That is why step 4 is by hand.
-6. **Run `scripts/first-run.sh --profile ~/home2-1.1.0.profile --to 12`**, from step 1.
+6. **Run `scripts/first-run.sh --profile contrib/hosts/home2.profile --to 12`**, from step 1.
    What differs from a first install:
    - **step 3** builds the release binary from the `v1.1.0` checkout and installs it to
      `/usr/local/bin`. `tapectl --version` should read `1.1.0 (v1.1.0, <date>)`;
@@ -201,7 +201,7 @@ You do this on home2, inside tmux, in this order. Read it through once first.
    - **step 12** is required again. Its marker is per binary hash, and the release binary
      from step 3 is not the musl build that (a) proved. It erases EW7VWMVKF6 again.
 7. **Unload the test cartridge, load L6-0001, and run `scripts/first-run.sh --profile
-   ~/home2-1.1.0.profile --from 13`.** Step 13's `volume init` refuses the sealed 1.0.0
+   contrib/hosts/home2.profile --from 13`.** Step 13's `volume init` refuses the sealed 1.0.0
    volume still on the tape, and step 13 offers `tapectl cartridge erase` ("L6-0001 at its
    volume init", below, says why and what you type). Step 13 then writes L6-0001, verifies
    it in full, audits, moves it to `home2-rack` and regenerates the kit. Step 14 installs
@@ -282,7 +282,7 @@ same day:
    - `tapectl-op staging clean`;
    - `sudo systemctl start tapectl-backup.service`;
    - refresh the Heir Kit with `scripts/first-run.sh --profile
-     ~/home2-1.1.0.profile --from 9 --to 9` and answer yes to regenerate. Reprint
+     contrib/hosts/home2.profile --from 9 --to 9` and answer yes to regenerate. Reprint
      `COVER.txt`, put it with the handwritten escrow secret from the existing sealed
      kit, and keep two copies in independent failure domains.
 
