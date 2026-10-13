@@ -1279,19 +1279,42 @@ mod tests {
         const GROWTH: usize = 512 << 10;
         for threads in [1, 4] {
             let tmp = TempDir::new().unwrap();
-            let mut rows = vec![("a0.bin".to_string(), PLANNED as i64)];
-            std::fs::write(tmp.path().join("a0.bin"), vec![1u8; PLANNED]).unwrap();
-            for i in 1..4 {
-                let name = format!("a{i}.bin");
-                std::fs::write(tmp.path().join(&name), vec![i as u8; 32 << 10]).unwrap();
-                rows.push((name, 32 << 10));
+            let base = tmp.path().to_path_buf();
+            // The plan follows dar's walk, which is the filesystem's directory
+            // order: ask it which name comes first HERE, and make that the
+            // file that grows. (a0.bin came first on vm-desk1 and a3.bin on
+            // home2's ext4; the fixture assumed the former.)
+            let names: Vec<String> = (0..4).map(|i| format!("a{i}.bin")).collect();
+            for (i, name) in names.iter().enumerate() {
+                std::fs::write(base.join(name), vec![i as u8; 32 << 10]).unwrap();
             }
+            let first = {
+                let probe: Vec<(&str, i64, Option<&str>)> =
+                    names.iter().map(|n| (n.as_str(), 32 << 10, None)).collect();
+                let (conn, sid) = setup_conn_with_snapshot(&probe);
+                plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap().files[0]
+                    .rel_path
+                    .clone()
+            };
+            std::fs::write(base.join(&first), vec![1u8; PLANNED]).unwrap();
+            let rows: Vec<(String, i64)> = names
+                .iter()
+                .map(|n| {
+                    (
+                        n.clone(),
+                        if *n == first {
+                            PLANNED as i64
+                        } else {
+                            32 << 10
+                        },
+                    )
+                })
+                .collect();
             let borrowed: Vec<(&str, i64, Option<&str>)> =
                 rows.iter().map(|(n, s)| (n.as_str(), *s, None)).collect();
             let (conn, sid) = setup_conn_with_snapshot(&borrowed);
-            let base = tmp.path().to_path_buf();
             let plan = plan(&conn, sid, base.to_str().unwrap(), &[]).unwrap();
-            assert_eq!(plan.files[0].rel_path, "a0.bin", "fixture: dar's first");
+            assert_eq!(plan.files[0].rel_path, first, "fixture: dar's first");
             let total_after: u64 = plan.total_bytes() + GROWTH as u64;
             let ahead = std::sync::Arc::new(ReadAhead::new(LEAD));
 
@@ -1306,7 +1329,7 @@ mod tests {
             }
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
-                .open(base.join("a0.bin"))
+                .open(base.join(&first))
                 .unwrap();
             f.write_all(&vec![9u8; GROWTH]).unwrap();
             drop(f);
@@ -1342,7 +1365,7 @@ mod tests {
             );
             let err = result.unwrap_err().to_string();
             assert!(
-                err.contains("it changed while it was hashed") && err.contains("a0.bin"),
+                err.contains("it changed while it was hashed") && err.contains(first.as_str()),
                 "{threads} thread(s): {err}"
             );
         }
