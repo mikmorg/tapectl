@@ -118,12 +118,19 @@ pub fn parse_log(
             // `<command> (tapectl <ver>, pid <pid>, display <d>)`
             if let Some((cmd, meta)) = rest.rsplit_once(" (tapectl ") {
                 s.command = Some(cmd.to_string());
-                let mut parts = meta.trim_end_matches(')').split(", ");
-                s.tapectl_version = parts.next().map(str::to_string);
-                s.pid = parts
-                    .next()
-                    .and_then(|p| p.strip_prefix("pid "))
-                    .and_then(|p| p.parse().ok());
+                // The version itself holds ", " in a stamped build
+                // (`1.1.0 (v1.1.0, 2026-10-13)`), so split at ", pid ",
+                // never at the first comma: that read `2026-10-13)` as the
+                // pid and called every running session killed (home2,
+                // 2026-10-14, a live `volume write`).
+                let meta = meta.strip_suffix(')').unwrap_or(meta);
+                match meta.rsplit_once(", pid ") {
+                    Some((version, rest)) => {
+                        s.tapectl_version = Some(version.to_string());
+                        s.pid = rest.split(", ").next().and_then(|p| p.parse().ok());
+                    }
+                    None => s.tapectl_version = Some(meta.to_string()),
+                }
             } else {
                 s.command = Some(rest.to_string());
             }
@@ -488,6 +495,52 @@ mod tests {
     /// written it is "process not visible", listed as running; once the log
     /// has been quiet for a few progress intervals, it ended with no end
     /// line.
+    /// home2, 2026-10-14: a stamped build's version holds ", "
+    /// (`1.1.0 (v1.1.0, 2026-10-13)`), and the pid was read from the first
+    /// comma on, so a live `volume write` showed as killed.
+    #[test]
+    fn a_stamped_version_does_not_hide_the_pid() {
+        let text = "2026-10-14T12:27:06.939Z session start: volume write L6-0001 \
+                    (tapectl 1.1.0 (v1.1.0, 2026-10-13), pid 6109, display Lines)\n\
+                    2026-10-14T12:27:07.018Z phase start: write\n";
+        let s = parse_log("s", Path::new("/l"), text, |pid| pid == 6109, later());
+        assert_eq!(s.pid, Some(6109));
+        assert_eq!(
+            s.tapectl_version.as_deref(),
+            Some("1.1.0 (v1.1.0, 2026-10-13)")
+        );
+        assert_eq!(s.command.as_deref(), Some("volume write L6-0001"));
+        assert!(matches!(s.state, State::Running), "{:?}", s.state);
+    }
+
+    /// The header the session writer really writes parses back to this
+    /// process's pid: the writer and this parser cannot drift apart again.
+    #[test]
+    fn the_writers_own_header_parses_back_to_its_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _session = crate::progress::start_session(
+                Some(dir.path()),
+                "volume write L6-0001",
+                crate::progress::Display::Off,
+                false,
+            );
+        }
+        let log = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let s = parse_log("s", &log, &text, |_| true, later());
+        assert_eq!(s.pid, Some(std::process::id()), "{text}");
+        assert_eq!(
+            s.tapectl_version.as_deref(),
+            Some(crate::build_info::VERSION)
+        );
+    }
+
     #[test]
     fn a_writer_hidden_from_proc_is_not_called_killed_while_its_log_is_fresh() {
         let last_line: chrono::DateTime<chrono::Utc> = "2026-10-01T03:13:13.000Z".parse().unwrap();
