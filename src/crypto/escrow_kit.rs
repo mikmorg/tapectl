@@ -624,7 +624,9 @@ the restored files are written. It measures this before it
 reads any slice. Decrypted slices are kept on disk only for
 --path (one file or folder) and for a dar older than 2.7.9 (or
 than 2.7.21, for a unit with no catalogue); --scratch DIR puts
-those on another disk. Do not restore into /tmp, which is RAM
+those on another disk. A tape written by tapectl before 1.1.0
+carries an older script that decrypts every slice first and
+needs about twice that. Do not restore into /tmp, which is RAM
 on many systems.
 
 WHAT ELSE IS IN THIS ENVELOPE
@@ -1185,6 +1187,7 @@ mod tests {
             "streams each slice from the tape through age into dar",
             "only for --path (one file or folder) and for a dar older than 2.7.9",
             "--scratch DIR puts those on another disk",
+            "A tape written by tapectl before 1.1.0 carries an older script",
         ] {
             assert!(prose.contains(required), "missing {required:?}: {prose}");
         }
