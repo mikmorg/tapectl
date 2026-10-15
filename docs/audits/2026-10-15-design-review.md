@@ -18,8 +18,8 @@ open issues' premises and the research frontier), read every cited line of every
 finding before filing, and corrected one finder (A1 below). Every finding cites a line
 read in this pass; the default verdict was "not a defect".
 
-**Result:** no high-severity defect. 34 raw findings: 8 issues filed (#444–#451), 16
-documentation corrections landed in this commit, 10 recorded here only. The open
+**Result:** no high-severity defect. 34 raw findings: 17 went into 8 issues (#444–#451),
+13 were corrected in documentation in this commit, 5 are recorded here only (§7). The open
 issues' premises are checked below and ten missed concerns and research items are put
 to the CTO as a decision list. **Nothing found holds the `v1.1.1` tag:** no finding is a
 data-loss or consent defect in 1.1.1's code, and the two mediums in its paths (#444, the
@@ -235,8 +235,11 @@ check* only re-examine a ratified ruling's premise.
 - **C4.** RESTORE.sh, the golden pins and dar's recorded command line are byte-identical
   to `v1.1.0`; `create.rs` changed only to add the fadvise-free command and its EPERM retry.
 - **C10.** A 1.1.0 binary rebuilds a 1.1.1 tape (no format file changed, `requires` is
-  empty). A 1.1.0 binary does not open a catalog at schema 036: recorded in the release
-  notes and handoff (f).
+  empty). A binary does not open a catalog ahead of its migration list: verified on a
+  throwaway catalog with `PRAGMA user_version = 99` against the 1.1.1 debug binary, which
+  refuses with "migration error: … a migration number that is too high" (exit 2) while
+  `status`, which never opens the catalog, still runs. Recorded in the release notes and
+  handoff (f).
 - **C14.** age headers show recipient-stanza counts on every file, which groups envelopes
   and slices by recipient-set size, not by name; not in File 1's "what the unencrypted
   parts reveal". Not a defect under the threat model.
@@ -280,8 +283,11 @@ a release binary on home2 with the pinned toolchain under the build lock; step 7
 | B | 10 | B10 (script comment) → #446 | B1, B2, B3, B4, B5, B6, B7, B8, B10 (install.md) | B9 |
 | C | 16 | C5, C6, C11, C12, C13 → #448; C5, C7, C8 → #449; C3 → #450; C9 → #451 | C1, C2, C15, C10 | C4, C14, C16 |
 
-34 raw = 17 in issues + 14 fixed in docs + 7 recorded only, with C5, C10 and B10 each
-counted where they were split. Nothing was dropped.
+Filed: 7 (A) + 1 (B) + 9 (C; C5 is split across #448 and #449 and counted once) = 17.
+Fixed in docs: 9 (B, with B10's install.md half) + 4 (C) = 13. Recorded only: A5, B9,
+C4, C14, C16 = 5. 17 + 13 + 5 = 35 = 34 raw + B10, which is counted twice (its script
+half in #446, its docs half corrected). C10 and B8 appear in §5 for context and are counted
+under "fixed in docs". Nothing was dropped.
 
 ## 8. Not reached
 
