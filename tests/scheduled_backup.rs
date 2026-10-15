@@ -83,7 +83,11 @@ fn written(r: &Run) -> String {
         .find(|l| l.starts_with("backup: /"))
         .unwrap_or_else(|| panic!("no 'backup: <path>' line:\n{}", r.output));
     let path = line["backup: ".len()..].split(' ').next().unwrap();
-    Path::new(path).file_name().unwrap().to_string_lossy().into_owned()
+    Path::new(path)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// #470: with every existing copy named in the future (a clock that went
@@ -98,7 +102,12 @@ fn a_backwards_clock_never_prunes_the_copy_just_written() {
     let r = run(0, 3, &refs);
     assert_eq!(r.code, 0, "{}", r.output);
     let new = written(&r);
-    assert!(r.left.contains(&new), "the copy just written was pruned: {:?}\n{}", r.left, r.output);
+    assert!(
+        r.left.contains(&new),
+        "the copy just written was pruned: {:?}\n{}",
+        r.left,
+        r.output
+    );
     assert_eq!(r.left.len(), 3, "KEEP=3 counts the new copy: {:?}", r.left);
     assert!(
         r.output.contains("named later than this run's copy"),
@@ -118,7 +127,12 @@ fn retention_keeps_the_newest_including_the_new_copy() {
     let r = run(0, 2, &past);
     assert_eq!(r.code, 0, "{}", r.output);
     let new = written(&r);
-    assert_eq!(r.left, vec!["tapectl-20200103T000000Z.db".to_string(), new], "{}", r.output);
+    assert_eq!(
+        r.left,
+        vec!["tapectl-20200103T000000Z.db".to_string(), new],
+        "{}",
+        r.output
+    );
     assert!(!r.output.contains("named later"), "{}", r.output);
 }
 
@@ -128,7 +142,12 @@ fn a_busy_catalog_exits_75_and_prunes_nothing() {
     let past = ["tapectl-20200101T000000Z.db", "tapectl-20200102T000000Z.db"];
     let r = run(75, 1, &past);
     assert_eq!(r.code, 75, "{}", r.output);
-    assert_eq!(r.left.len(), 2, "a busy run pruned or left a file: {:?}", r.left);
+    assert_eq!(
+        r.left.len(),
+        2,
+        "a busy run pruned or left a file: {:?}",
+        r.left
+    );
 }
 
 fn render(backup_dir: &str) -> (i32, String, TempDir) {
@@ -139,7 +158,12 @@ fn render(backup_dir: &str) -> (i32, String, TempDir) {
         .arg(dir.path().join("r"))
         .args(["--user", "tapectl-render-test-nobody", "--home"])
         .arg(dir.path().join("svc"))
-        .args(["--backup-dir", backup_dir, "--tapectl", "/usr/local/bin/tapectl"])
+        .args([
+            "--backup-dir",
+            backup_dir,
+            "--tapectl",
+            "/usr/local/bin/tapectl",
+        ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("bash must be available");
@@ -169,17 +193,24 @@ fn the_rendered_units_take_75_as_success_and_let_the_backup_write() {
     let (code, out, dir) = render("/srv/backups-render-test");
     assert_eq!(code, 0, "{out}");
     let backup = unit_lines(dir.path(), "tapectl-backup.service");
-    assert!(backup.iter().any(|l| l == "SuccessExitStatus=75"), "{backup:?}");
+    assert!(
+        backup.iter().any(|l| l == "SuccessExitStatus=75"),
+        "{backup:?}"
+    );
     let rw = backup
         .iter()
         .find(|l| l.starts_with("ReadWritePaths="))
         .expect("the backup unit has ReadWritePaths");
     assert!(
-        rw.split(['=', ' ']).any(|p| p == "/srv/backups-render-test"),
+        rw.split(['=', ' '])
+            .any(|p| p == "/srv/backups-render-test"),
         "the backup directory is not writable under ProtectSystem=strict: {rw}"
     );
     let audit = unit_lines(dir.path(), "tapectl-audit.service");
-    assert!(audit.iter().any(|l| l == "SuccessExitStatus=1 75"), "{audit:?}");
+    assert!(
+        audit.iter().any(|l| l == "SuccessExitStatus=1 75"),
+        "{audit:?}"
+    );
 }
 
 /// A path the sed rendering cannot carry is refused by name, not rendered
