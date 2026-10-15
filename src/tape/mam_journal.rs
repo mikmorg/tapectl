@@ -73,6 +73,9 @@ pub enum Hook {
     /// `cartridge erase`'s last read, after the erase: the serial must be
     /// unchanged, or the cartridge in the drive is not the one erased.
     CartridgeEraseVerify,
+    /// `drive eject`'s one read (issue #429): the serial its contact and its
+    /// `ejected` event name, read before the unload.
+    DriveEject,
 }
 
 impl Hook {
@@ -87,6 +90,7 @@ impl Hook {
             Hook::CartridgeErase => "cartridge_erase",
             Hook::CartridgeEraseRecheck => "cartridge_erase_recheck",
             Hook::CartridgeEraseVerify => "cartridge_erase_verify",
+            Hook::DriveEject => "drive_eject",
         }
     }
 
@@ -101,6 +105,7 @@ impl Hook {
         Hook::CartridgeErase,
         Hook::CartridgeEraseRecheck,
         Hook::CartridgeEraseVerify,
+        Hook::DriveEject,
     ];
 }
 
@@ -641,6 +646,7 @@ mod tests {
                 "cartridge_erase",
                 "cartridge_erase_recheck",
                 "cartridge_erase_verify",
+                "drive_eject",
             ]
         );
     }

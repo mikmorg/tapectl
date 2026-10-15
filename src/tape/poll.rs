@@ -757,7 +757,13 @@ mod tests {
                 "22 Expired cleaning media",
                 "23 Invalid cleaning tape",
             ]
-            .map(|f| format!("TapeAlert raised: {f} => {CLEAN_THE_DRIVE}")),
+            .map(|f| {
+                // 20/21 ask for a cleaning; 22/23 name the cleaning cartridge.
+                let n: u16 = f.split(' ').next().unwrap().parse().unwrap();
+                let action = alert_flags::cleaning_action(n).unwrap();
+                assert_eq!(action == CLEAN_THE_DRIVE, n <= 21, "{f}: {action}");
+                format!("TapeAlert raised: {f} => {action}")
+            }),
         );
         assert_eq!(report.problems(), want);
     }

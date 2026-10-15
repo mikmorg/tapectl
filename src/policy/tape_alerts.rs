@@ -244,10 +244,10 @@ mod tests {
             (23, "Invalid cleaning tape"),
         ] {
             let m = message(&[(n, name)]);
-            assert!(
-                m.contains(&format!("{n} {name} => {CLEAN_THE_DRIVE}")),
-                "{m}"
-            );
+            // 20/21 ask for a cleaning; 22/23 name the cleaning cartridge.
+            let action = alert_flags::cleaning_action(n.into()).expect("a cleaning flag");
+            assert_eq!(action == CLEAN_THE_DRIVE, n <= 21, "{n}: {action}");
+            assert!(m.contains(&format!("{n} {name} => {action}")), "{m}");
         }
     }
 

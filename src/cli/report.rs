@@ -2471,14 +2471,23 @@ pub(crate) fn tape_alert_line(s: &TapeAlertSighting) -> String {
     let verdict = if s.flags.is_empty() {
         String::new()
     } else {
-        format!(
-            " => {}",
-            s.classes()
-                .iter()
-                .map(|c| c.verdict())
-                .collect::<Vec<_>>()
-                .join(" | ")
-        )
+        // #430: the cleaning class speaks per flag (22/23 are about the
+        // cleaning cartridge, not the drive), from the one text it has.
+        let mut parts: Vec<&str> = Vec::new();
+        for c in s.classes() {
+            if c == crate::tape::alert_flags::AlertClass::Cleaning {
+                for (n, _) in &s.flags {
+                    if let Some(a) = crate::tape::alert_flags::cleaning_action(u16::from(*n)) {
+                        if !parts.contains(&a) {
+                            parts.push(a);
+                        }
+                    }
+                }
+            } else {
+                parts.push(c.verdict());
+            }
+        }
+        format!(" => {}", parts.join(" | "))
     };
     format!(
         "!! TAPE ALERT contact={} op=\"{}\" at={} drive={} cartridge={} {} source={}{}{}",

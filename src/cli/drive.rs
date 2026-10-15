@@ -30,6 +30,7 @@ use crate::tape::contact::{ContactSite, Medium, Operation, OUTCOME_FAILED, OUTCO
 use crate::tape::drive_identity::{self, DriveIdentity};
 use crate::tape::ioctl::{self, CartridgeState, TapeNodeStatus};
 use crate::tape::mam::{self, MamInfo, MamRead};
+use crate::tape::mam_journal::Hook;
 use crate::tape::poll::{self, PollReport, Probe};
 
 #[derive(Subcommand, Debug)]
@@ -1544,6 +1545,7 @@ pub fn eject(
     }
     let guard = site.open(conn, None);
     report.contact_id = guard.id();
+    guard.journal_mam(Operation::DriveEject, Hook::DriveEject, &mam_read.capture);
     let unloaded = match probe.unload.take() {
         Some(unload) => unload(),
         None => ioctl::offline(device),
