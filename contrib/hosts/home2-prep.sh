@@ -23,6 +23,8 @@
 #      password (and nothing else): first-run.sh drives every tapectl command
 #      through `sudo -u tapectl`, and the verify that follows a days-long write
 #      would otherwise sit at a password prompt nobody is there to answer
+#   9  NOT a step: the optional host-side lever for the drive's feed (lowering
+#      vm-desk1's CPU and disk weight) is PRINTED, never applied (issue #432)
 #
 # DRY RUN BY DEFAULT: it prints every command it would run (`would:`) and
 # changes nothing. `--apply` does it, asking before each part; the deletion
@@ -206,6 +208,35 @@ elif part "Install $SUDOERS: '$RULE' (validated with visudo first)?"; then
   rm -f "$TMP_RULE"
   [ "$APPLY" = 1 ] && { sudo -k; sudo -n -u "$SVC" true 2>/dev/null && ok "no password needed as $SVC" || die "the rule did not take — sudo -l shows what is in force"; }
 fi
+
+# ------------------------------------------------------------------ 9
+hdr "9  Optional host lever for the drive's feed (printed, never applied)"
+cat <<EOF
+   tapectl raises its own tape commands' priority (TAPE_NICE / TAPE_IONICE in
+   home2.profile, issue #432). That outranks other work INSIDE this host's
+   scheduler, but $VM is a guest: its vCPUs and its disks compete with the
+   tape feed from outside it. Two libvirt weights narrow that. Both are
+   relative shares, so they slow $VM only while $(hostname) is contended and
+   change nothing when it is quiet:
+
+     virsh -c qemu:///system schedinfo $VM --set cpu_shares=256 --live --config
+         (cpu_shares: the default is 1024; 256 gives $VM a quarter of the
+          weight it has now against everything else on this host)
+     virsh -c qemu:///system blkiotune $VM --weight 100 --live --config
+         (disk weight: the default is 500, the range 100-1000; per disk:
+          --device-weights /dev/<its backing device>,100)
+
+   Read the current values first:
+     virsh -c qemu:///system schedinfo $VM
+     virsh -c qemu:///system blkiotune $VM
+
+   Whether to apply either is a HOST decision between the CTO and homorg's
+   founder, whose work runs in $VM: this script does not do it. The disk weight
+   only bites on a block device whose I/O scheduler honours weights (cfq or bfq:
+   cat /sys/block/<dev>/queue/scheduler). To put a value back:
+     virsh -c qemu:///system schedinfo $VM --set cpu_shares=1024 --live --config
+     virsh -c qemu:///system blkiotune $VM --weight 500 --live --config
+EOF
 
 hdr "Next"
 cat <<EOF
