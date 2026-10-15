@@ -947,17 +947,29 @@ pub(crate) fn refuse_last_eligible_copy(
 /// **Policy comes from the 3-level resolver** (`policy::resolve`: dotfile >
 /// archive_set > defaults), never from `config.defaults` directly — a unit
 /// that carries its own `min_copies` must be gated on ITS number, not on
-/// the fleet default. The location floor is `required_locations.len()`,
-/// which is the resolver's expression of that requirement and exactly what
-/// `audit`'s `location_presence` check compares against; an empty list
-/// means no location requirement was configured, and silence is then
-/// correct rather than a gate on a number nobody set.
+/// the fleet default.
+///
+/// **Locations are judged by NAME, as `audit`, `unit mark-tape-only` and
+/// `snapshot mark-reclaimable` judge them** (issue #463; ADR-0012 2026-10-07
+/// items 15 and 34), asked of the present tense "after this volume is given
+/// up": for each version the act consumes, the names in
+/// `required_locations` where it would hold fewer than
+/// [`copies_per_named_location`](crate::policy::coverage::copies_per_named_location)
+/// copies ([`short_required_locations_excluding`](crate::policy::coverage::short_required_locations_excluding)),
+/// and — for a tape-only unit — fewer distinct places than
+/// `[defaults] min_locations`
+/// ([`short_of_location_floor_excluding`](crate::policy::coverage::short_of_location_floor_excluding)).
+/// A COUNT of locations is not that question: copies at `home`, `garage` and
+/// `offsite`, with `offsite` the volume retired, leave two places and no
+/// copy at the required name `offsite`. An empty `required_locations` and a
+/// status with no place floor mean no location requirement, and silence is
+/// then correct rather than a gate on a number nobody set.
 ///
 /// For a tape-only unit the copy floor is multiplied by the one tape-only
-/// rule (`policy::coverage::copy_floor`, ADR-0012 2026-10-12 item 43), as
-/// every other copy floor is, and its fact names the multiplier. The
-/// location floor is a count of distinct places, which the multiplier never
-/// raises (item 46), so it stays the number of named locations.
+/// rule (`policy::coverage::copy_floor`, ADR-0012 2026-10-12 item 43), and so
+/// is the number of copies each NAME must hold; the place floor is a count
+/// of distinct places, which the multiplier never raises (item 46), so its
+/// fact carries no multiplier note.
 ///
 /// An unresolvable policy PROPAGATES (issue #105's rule, applied at a
 /// destructive moment): tapectl cannot say whether the retirement is within
@@ -968,6 +980,7 @@ pub(crate) fn below_policy_facts(
     config: &Config,
     impacts: &[RetireImpact],
 ) -> Result<Vec<String>> {
+    use crate::policy::coverage;
     let mut facts = Vec::new();
     for impact in impacts {
         // Nothing at stake, or every touched version is Tier 3's business
@@ -978,10 +991,10 @@ pub(crate) fn below_policy_facts(
         let unit = queries::get_unit_by_name(conn, &impact.unit_name)?
             .ok_or_else(|| TapectlError::UnitNotFound(impact.unit_name.clone()))?;
         let policy = crate::policy::resolve(conn, config, &unit)?;
-        let needed_copies =
-            crate::policy::coverage::copy_floor(config, policy.min_copies, &unit.status);
-        let needed_locations = policy.required_locations.len() as i64;
-        let note = crate::policy::coverage::tape_only_note(config, &unit.status);
+        let needed_copies = coverage::copy_floor(config, policy.min_copies, &unit.status);
+        let per_name = coverage::copies_per_named_location(config, &unit.status);
+        let note = coverage::tape_only_note(config, &unit.status);
+        let requires = policy.required_locations.join(", ");
         for version in &impact.at_stake {
             if version.copies_after == 0 {
                 continue;
@@ -993,14 +1006,54 @@ pub(crate) fn below_policy_facts(
                     impact.unit_name, version.version, version.copies_after
                 ));
             }
-            if needed_locations > 0 && version.locations_after < needed_locations {
+            // Each version this act consumes coverage from, with the volume
+            // it gives up excluded: the scope is that ONE version, because
+            // the per-unit form would take the minimum over versions the act
+            // never touches.
+            let scope = coverage::NamedScope::Snapshot(version.snapshot_id);
+            let short = coverage::short_required_locations_excluding(
+                conn,
+                scope,
+                &policy.required_locations,
+                per_name,
+                Some(version.volume_id),
+            )?;
+            let missing = coverage::missing_names(&short);
+            if !missing.is_empty() {
                 facts.push(format!(
-                    "unit \"{}\" v{} would be left in {} location(s), below its policy of \
-                     {needed_locations} ({})",
+                    "unit \"{}\" v{} would be left with no copy at required location(s) {} \
+                     (policy requires {requires})",
                     impact.unit_name,
                     version.version,
-                    version.locations_after,
-                    policy.required_locations.join(", ")
+                    missing.join(", ")
+                ));
+            }
+            // Names that keep a copy but fewer than a tape-only unit needs
+            // there (item 34); a name with none is already named above.
+            let partly: Vec<(String, i64)> = short
+                .iter()
+                .filter(|(_, copies)| *copies > 0)
+                .cloned()
+                .collect();
+            if !partly.is_empty() {
+                facts.push(format!(
+                    "unit \"{}\" v{} would be left with {}{note} (policy requires {requires})",
+                    impact.unit_name,
+                    version.version,
+                    coverage::describe_named_shortfall(&partly, per_name)
+                ));
+            }
+            if let Some(places) = coverage::short_of_location_floor_excluding(
+                conn,
+                config,
+                scope,
+                &unit.status,
+                Some(version.volume_id),
+            )? {
+                facts.push(format!(
+                    "unit \"{}\" v{} would be left in {} location(s), below the {} that \
+                     [defaults] min_locations requires of a tape-only unit",
+                    impact.unit_name, version.version, places.places, places.floor
                 ));
             }
         }
@@ -6501,8 +6554,13 @@ mod tests {
             let err = volume_retire(&conn, &Config::default(), "L6-WHERE", false, false, false)
                 .expect_err("zero locations against two required must gate");
             let msg = err.to_string();
+            // Issue #463: judged by NAME, the way `audit` judges it — not
+            // the old "N location(s), below its policy of 2" count.
             assert!(
-                msg.contains("location(s), below its policy of 2 (home, offsite)"),
+                msg.contains(
+                    "no copy at required location(s) home, offsite \
+                     (policy requires home, offsite)"
+                ),
                 "the required locations, listed plainly: {msg}"
             );
             assert!(
@@ -6540,15 +6598,225 @@ mod tests {
                 msg.contains("copy/copies, below its policy of 6 (tape-only 3x)"),
                 "{msg}"
             );
-            let line = msg
+            // Issue #463 rewrote the location facts from a count of places
+            // to the by-name rule plus the `[defaults] min_locations` floor;
+            // the item-46 pin survives on both: neither is multiplied.
+            let named = msg
                 .lines()
-                .find(|l| l.contains("location(s), below its policy of"))
-                .unwrap_or_else(|| panic!("no location fact: {msg}"));
+                .find(|l| l.contains("no copy at required location(s)"))
+                .unwrap_or_else(|| panic!("no by-name location fact: {msg}"));
             assert!(
-                line.contains("location(s), below its policy of 2 (home, offsite)"),
-                "{line}"
+                named.contains("home, offsite (policy requires home, offsite)"),
+                "{named}"
             );
-            assert!(!line.contains("tape-only"), "{line}");
+            assert!(!named.contains("3x"), "{named}");
+            let floor = msg
+                .lines()
+                .find(|l| l.contains("[defaults] min_locations"))
+                .unwrap_or_else(|| panic!("no place-floor fact: {msg}"));
+            assert!(
+                floor.contains("location(s), below the 2 that [defaults] min_locations"),
+                "the floor is min_locations as set, never 2 x 3: {floor}"
+            );
+            assert!(!floor.contains("3x"), "{floor}");
+        }
+
+        // ── Issue #463: the retire family's location facts are by NAME ──
+
+        /// Locations `(volume label, location name)`, created as needed.
+        fn shelve(conn: &Connection, placements: &[(&str, &str)]) {
+            for (label, place) in placements {
+                conn.execute(
+                    "INSERT OR IGNORE INTO locations (name, kind) VALUES (?1, 'shelf')",
+                    params![place],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = ?1)
+                     WHERE label = ?2",
+                    params![place, label],
+                )
+                .unwrap();
+            }
+        }
+
+        fn require(conn: &Connection, names: &str, unit_status: &str) {
+            conn.execute(
+                "INSERT INTO archive_sets (name, required_locations)
+                 VALUES ('placed', ?1)",
+                params![names],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE units SET archive_set_id = ?1, status = ?2 WHERE name = 'unitA'",
+                params![conn.last_insert_rowid(), unit_status],
+            )
+            .unwrap();
+        }
+
+        fn facts_for(conn: &Connection, config: &Config, label: &str) -> Vec<String> {
+            let vol_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM volumes WHERE label = ?1",
+                    params![label],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let impacts = retire_impacts(conn, vol_id).unwrap();
+            below_policy_facts(conn, config, &impacts).unwrap()
+        }
+
+        /// The case from the issue: required `[home, offsite]`, min_copies 2,
+        /// v1 on `home`, `garage` and `offsite`. Retiring the `offsite`
+        /// volume leaves 2 copies in 2 PLACES — every count satisfied — and
+        /// no copy at the required NAME `offsite`, which `audit` then
+        /// reports. The old count-based fact said nothing and `volume
+        /// retire` never asked.
+        #[test]
+        fn retiring_the_only_copy_at_a_required_name_is_named() {
+            let (conn, vol_id) = setup_sealed("L6-OFF", 2);
+            shelve(
+                &conn,
+                &[
+                    ("L6-OFF", "offsite"),
+                    ("COPY-0", "home"),
+                    ("COPY-1", "garage"),
+                ],
+            );
+            require(&conn, "[\"home\",\"offsite\"]", "active");
+
+            let facts = facts_for(&conn, &Config::default(), "L6-OFF");
+            assert_eq!(facts.len(), 1, "{facts:?}");
+            assert_eq!(
+                facts[0],
+                "unit \"unitA\" v1 would be left with no copy at required location(s) \
+                 offsite (policy requires home, offsite)"
+            );
+
+            let err = volume_retire(&conn, &Config::default(), "L6-OFF", false, false, false)
+                .expect_err("a required name left empty must prompt, and a script must refuse");
+            assert!(err.to_string().contains("offsite"), "{err}");
+            assert_eq!(volume_status(&conn, vol_id), "sealed");
+            // Tier 2 is what `--yes` waives.
+            volume_retire(&conn, &Config::default(), "L6-OFF", true, false, false)
+                .expect("--yes confirms a Tier-2 fact");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        /// The positive control: retiring a volume at a name that keeps
+        /// another copy, with every required name still met, has no fact and
+        /// no prompt — the same layout, the other volume.
+        #[test]
+        fn a_retirement_that_keeps_every_required_name_has_no_fact() {
+            let (conn, vol_id) = setup_sealed("L6-GARAGE", 2);
+            shelve(
+                &conn,
+                &[
+                    ("L6-GARAGE", "garage"),
+                    ("COPY-0", "home"),
+                    ("COPY-1", "offsite"),
+                ],
+            );
+            require(&conn, "[\"home\",\"offsite\"]", "active");
+
+            assert_eq!(
+                facts_for(&conn, &Config::default(), "L6-GARAGE"),
+                Vec::<String>::new()
+            );
+            volume_retire(&conn, &Config::default(), "L6-GARAGE", false, false, false)
+                .expect("a compliant retirement needs no consent");
+            assert_eq!(volume_status(&conn, vol_id), "retired");
+        }
+
+        /// Item 34 reaches the retire family: a tape-only unit's names each
+        /// need `multiplier` copies, so keeping ONE at `home` is a shortfall
+        /// the fact states in the same words `audit` uses, with the note.
+        #[test]
+        fn a_tape_only_unit_is_asked_the_multiplier_per_name() {
+            let (conn, _) = setup_sealed("L6-TO-NAME", 3);
+            shelve(
+                &conn,
+                &[
+                    ("L6-TO-NAME", "offsite"),
+                    ("COPY-0", "home"),
+                    ("COPY-1", "offsite"),
+                    ("COPY-2", "offsite"),
+                ],
+            );
+            require(&conn, "[\"home\",\"offsite\"]", "tape_only");
+            let mut config = Config::default();
+            config.compaction.tape_only_safety_multiplier = 3;
+            config.defaults.min_copies = 1;
+
+            let facts = facts_for(&conn, &config, "L6-TO-NAME");
+            assert_eq!(
+                facts,
+                vec![
+                    "unit \"unitA\" v1 would be left with 1 copy at required location home, \
+                     2 copies at required location offsite, needs 3 at each (tape-only 3x) \
+                     (policy requires home, offsite)"
+                        .to_string()
+                ],
+                "home keeps 1 of 3 and offsite 2 of 3 (the retired volume was a third there)"
+            );
+        }
+
+        /// ADR-0008 lists locations below `min_locations` as Tier 2; for a
+        /// tape-only unit the retire family never asked. Two copies stay,
+        /// both at `home`: copies are met, no names are required, and the
+        /// distinct-place floor (`[defaults] min_locations` = 2) is not.
+        #[test]
+        fn a_tape_only_unit_left_below_min_locations_is_named() {
+            let (conn, vol_id) = setup_sealed("L6-FLOOR", 2);
+            shelve(
+                &conn,
+                &[
+                    ("L6-FLOOR", "offsite"),
+                    ("COPY-0", "home"),
+                    ("COPY-1", "home"),
+                ],
+            );
+            conn.execute("UPDATE units SET status = 'tape_only'", [])
+                .unwrap();
+            let mut config = Config::default();
+            config.compaction.tape_only_safety_multiplier = 1;
+
+            let facts = facts_for(&conn, &config, "L6-FLOOR");
+            assert_eq!(
+                facts,
+                vec![
+                    "unit \"unitA\" v1 would be left in 1 location(s), below the 2 that \
+                     [defaults] min_locations requires of a tape-only unit"
+                        .to_string()
+                ]
+            );
+            volume_retire(&conn, &config, "L6-FLOOR", false, false, false)
+                .expect_err("a place floor shortfall is a consent gate (item 47)");
+            assert_eq!(volume_status(&conn, vol_id), "sealed");
+
+            // The same unit while still `active` has no place floor.
+            conn.execute("UPDATE units SET status = 'active'", [])
+                .unwrap();
+            assert_eq!(facts_for(&conn, &config, "L6-FLOOR"), Vec::<String>::new());
+        }
+
+        /// ...and a tape-only unit that keeps its places is not asked again.
+        #[test]
+        fn a_tape_only_unit_that_keeps_its_places_has_no_fact() {
+            let (conn, _) = setup_sealed("L6-PLACES", 2);
+            shelve(
+                &conn,
+                &[
+                    ("L6-PLACES", "home"),
+                    ("COPY-0", "home"),
+                    ("COPY-1", "offsite"),
+                ],
+            );
+            conn.execute("UPDATE units SET status = 'tape_only'", [])
+                .unwrap();
+            let mut config = Config::default();
+            config.compaction.tape_only_safety_multiplier = 1;
+            assert_eq!(facts_for(&conn, &config, "L6-PLACES"), Vec::<String>::new());
         }
     }
 

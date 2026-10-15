@@ -857,6 +857,19 @@ impl PlaceShortfall {
 /// any current version has, the per-version rule of issue #153.
 /// [`NamedScope::Snapshot`] is one version.
 pub fn places_held(conn: &Connection, scope: NamedScope) -> crate::error::Result<i64> {
+    places_held_excluding(conn, scope, None)
+}
+
+/// [`places_held`] with `exclude_volume` (a volume id) pretended away: the
+/// places the scope's copies WOULD span once that volume is given up —
+/// [`CoverageQuery::exclude_volume`]'s "pretend this volume is not there",
+/// removing its tape claim and any deposit recorded from it. `None` is
+/// [`places_held`] itself.
+pub fn places_held_excluding(
+    conn: &Connection,
+    scope: NamedScope,
+    exclude_volume: Option<i64>,
+) -> crate::error::Result<i64> {
     let (q, id) = match scope {
         NamedScope::Unit(id) => (CoverageQuery::current_unit("?1"), id),
         NamedScope::Snapshot(id) => (
@@ -867,8 +880,16 @@ pub fn places_held(conn: &Connection, scope: NamedScope) -> crate::error::Result
             id,
         ),
     };
+    let q = CoverageQuery {
+        exclude_volume: exclude_volume.map(|_| "?2"),
+        ..q
+    };
     let sql = format!("SELECT {}", location_count_expr(&q));
-    Ok(conn.query_row(&sql, params![id], |row| row.get(0))?)
+    Ok(conn.query_row(
+        &sql,
+        rusqlite::params_from_iter([Some(id), exclude_volume].into_iter().flatten()),
+        |row| row.get(0),
+    )?)
 }
 
 /// **The** distinct-place predicate: `Some` when `scope`'s copies sit in
@@ -888,13 +909,27 @@ pub fn short_of_location_floor(
     scope: NamedScope,
     unit_status: &str,
 ) -> crate::error::Result<Option<PlaceShortfall>> {
+    short_of_location_floor_excluding(conn, config, scope, unit_status, None)
+}
+
+/// [`short_of_location_floor`] asked "after `exclude_volume` is given up"
+/// (see [`places_held_excluding`]) — the question the retire family's
+/// Tier-2 gate puts to each version it consumes coverage from. `None` is
+/// [`short_of_location_floor`] itself.
+pub fn short_of_location_floor_excluding(
+    conn: &Connection,
+    config: &crate::config::Config,
+    scope: NamedScope,
+    unit_status: &str,
+    exclude_volume: Option<i64>,
+) -> crate::error::Result<Option<PlaceShortfall>> {
     if location_floor(config, unit_status) <= 0 {
         return Ok(None);
     }
     Ok(PlaceShortfall::judge(
         config,
         unit_status,
-        places_held(conn, scope)?,
+        places_held_excluding(conn, scope, exclude_volume)?,
     ))
 }
 
@@ -925,6 +960,23 @@ pub fn short_required_locations(
     required: &[String],
     per_name: i64,
 ) -> crate::error::Result<Vec<(String, i64)>> {
+    short_required_locations_excluding(conn, scope, required, per_name, None)
+}
+
+/// [`short_required_locations`] asked "after `exclude_volume` is given up":
+/// the volume (an id) and any deposit recorded from it are pretended away
+/// (see [`places_held_excluding`]). This is the question the retire family's
+/// Tier-2 gate puts to each version a retirement consumes coverage from, by
+/// the same predicate `audit` asks of the present — so a retirement that
+/// leaves a required NAME empty is named, whatever the copy count says.
+/// `None` is [`short_required_locations`] itself.
+pub fn short_required_locations_excluding(
+    conn: &Connection,
+    scope: NamedScope,
+    required: &[String],
+    per_name: i64,
+    exclude_volume: Option<i64>,
+) -> crate::error::Result<Vec<(String, i64)>> {
     let wanted = distinct_names(required);
     if wanted.is_empty() {
         return Ok(Vec::new());
@@ -938,7 +990,7 @@ pub fn short_required_locations(
     };
     let q = CoverageQuery {
         scope: CoverageScope::Snapshot { id_expr: "?1" },
-        exclude_volume: None,
+        exclude_volume: exclude_volume.map(|_| "?2"),
     };
     let sql = format!(
         "SELECT l.name, COUNT(*) FROM (
@@ -958,7 +1010,12 @@ pub fn short_required_locations(
     let mut fewest: Option<std::collections::HashMap<String, i64>> = None;
     for snapshot_id in snapshot_ids {
         let held: std::collections::HashMap<String, i64> = stmt
-            .query_map(params![snapshot_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(
+                rusqlite::params_from_iter(
+                    [Some(snapshot_id), exclude_volume].into_iter().flatten(),
+                ),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?
             .collect::<std::result::Result<_, _>>()?;
         fewest = Some(match fewest {
             None => held,
@@ -1356,6 +1413,15 @@ pub fn copy_distinctness(
 /// a shortfall that already existed.
 #[derive(Debug, Clone)]
 pub struct VersionAtStake {
+    /// `snapshots.id` of the current snapshot — what the by-name location
+    /// predicates ([`short_required_locations_excluding`],
+    /// [`short_of_location_floor_excluding`]) take as `NamedScope::Snapshot`.
+    pub snapshot_id: i64,
+    /// The volume being given up: the one [`versions_at_stake`] excluded to
+    /// get the counts below, carried on the row so a consumer asking a
+    /// further "after this volume is gone" question of the same version
+    /// excludes the same volume (a cartridge's merged impacts span several).
+    pub volume_id: i64,
     /// `snapshots.version` of the current snapshot.
     pub version: i64,
     /// Copies this VERSION would still have, [`copy_count_expr`] with the
@@ -1433,7 +1499,7 @@ pub fn versions_at_stake(
     // the same volume; the two scalar subqueries depend only on `s.id`, so
     // the duplicate rows they would produce are identical.
     let sql = format!(
-        "SELECT DISTINCT s.version, {copies_after} AS copies_after,
+        "SELECT DISTINCT s.id, s.version, {copies_after} AS copies_after,
                 {locations_after} AS locations_after
          FROM snapshots s
          JOIN stage_sets ss ON ss.snapshot_id = s.id
@@ -1449,9 +1515,11 @@ pub fn versions_at_stake(
     let rows = stmt
         .query_map(rusqlite::params![unit_id, volume_id], |row| {
             Ok(VersionAtStake {
-                version: row.get(0)?,
-                copies_after: row.get(1)?,
-                locations_after: row.get(2)?,
+                snapshot_id: row.get(0)?,
+                volume_id,
+                version: row.get(1)?,
+                copies_after: row.get(2)?,
+                locations_after: row.get(3)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1962,6 +2030,59 @@ pub(crate) mod tests {
             describe_named_shortfall(&short[..1], 2),
             "1 copy at required location home, needs 2"
         );
+    }
+
+    /// Issue #463: the retire family asks the by-name and place-floor
+    /// predicates "after this volume is given up". The deposit recorded FROM
+    /// the excluded volume goes with it (`CoverageQuery::exclude_volume`), so
+    /// excluding the tape at `home` empties both names and both places.
+    #[test]
+    fn excluding_a_volume_empties_the_names_and_places_it_and_its_deposit_held() {
+        let (conn, unit_id, vol) = setup_unit_with_deposit("tape_only");
+        let snapshot: i64 = conn
+            .query_row(
+                "SELECT id FROM snapshots WHERE unit_id = ?1",
+                params![unit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let req = names(&["home", "glacier"]);
+        let config = crate::config::Config::default();
+        for scope in [NamedScope::Snapshot(snapshot), NamedScope::Unit(unit_id)] {
+            assert_eq!(places_held_excluding(&conn, scope, None).unwrap(), 2);
+            assert_eq!(places_held(&conn, scope).unwrap(), 2);
+            assert_eq!(places_held_excluding(&conn, scope, Some(vol)).unwrap(), 0);
+            assert!(
+                short_required_locations_excluding(&conn, scope, &req, 1, None)
+                    .unwrap()
+                    .is_empty()
+            );
+            let short =
+                short_required_locations_excluding(&conn, scope, &req, 1, Some(vol)).unwrap();
+            assert_eq!(
+                short,
+                vec![("home".to_string(), 0), ("glacier".to_string(), 0)]
+            );
+            assert_eq!(
+                short_of_location_floor_excluding(&conn, &config, scope, "tape_only", None)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                short_of_location_floor_excluding(&conn, &config, scope, "tape_only", Some(vol))
+                    .unwrap(),
+                Some(PlaceShortfall {
+                    places: 0,
+                    floor: 2
+                })
+            );
+            // An active unit has no place floor, whatever it keeps.
+            assert_eq!(
+                short_of_location_floor_excluding(&conn, &config, scope, "active", Some(vol))
+                    .unwrap(),
+                None
+            );
+        }
     }
 
     /// The per-version rule for counts: a unit holds at a name the FEWEST
