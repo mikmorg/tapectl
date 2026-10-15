@@ -1636,6 +1636,53 @@ check st_stats_recorded step_st_stats_recorded
 # (EIO with and without blank evidence, --force, a chip serial bound to a live
 # volume); the real drive is the only medium that could show it end to end.
 
+# ---------- #444: cartridge erase, then volume init with no --force ----------
+# ADR-0012 2026-10-15 item 57 (#434): a short `cartridge erase` that this
+# catalog verified proves the EMPTY File 0 it leaves blank, so `volume init`
+# needs no --force; a catalog with no such record still refuses. first-run.sh
+# step 13 depends on exactly this (f54964c removed its --force retry), and until
+# #444 no repo harness ran it: the gate and the suites blank with `mt erase`.
+# Three throwaway homes on the gate's cartridge: P writes and seals a volume;
+# C, which knows nothing of it, erases it with typed consent; D, another
+# stranger, must still be refused at init (run BEFORE C's init writes File 0,
+# or D would meet C's identity instead of the empty File 0). The chip proof
+# cannot run here: mhvtl's MAM has no lifetime attributes.
+step_erase_then_init_no_force() {
+    local w="$RUN/erase-proof" h out rc word
+    rm -rf "$w"; mkdir -p "$w/src/u1"; echo "erase proof $CANARY" >"$w/src/u1/f.txt"
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase || { echo "mt erase failed"; return 1; }
+    for h in p c d; do
+        mkdir -p "$w/$h/staging"
+        "$BIN" --home "$w/$h" init --operator "gate-$h" --no-escrow >/dev/null 2>&1 \
+            && "$BIN" --home "$w/$h" backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 >/dev/null 2>&1 \
+            && "$BIN" --home "$w/$h" config set staging.directory "$w/$h/staging" >/dev/null 2>&1 \
+            || { echo "home $h: init/backend add/config set failed"; return 1; }
+    done
+    "$BIN" --home "$w/p" volume init EP-0001 --device "$TAPE_DEV" >"$w/p-init.out" 2>&1 \
+        && "$BIN" --home "$w/p" quick-archive "$w/src/u1" --tenant gate-p --volume EP-0001 --device "$TAPE_DEV" --yes >"$w/p-write.out" 2>&1 \
+        || { echo "home P could not write and seal EP-0001:"; tail -20 "$w"/p-*.out; return 1; }
+    # The dry run names what is on the tape; its JSON carries the consent word.
+    out="$("$BIN" --home "$w/c" cartridge erase --device "$TAPE_DEV" --dry-run --json 2>"$w/c-dry.err")"; rc=$?
+    [ "$rc" = 0 ] || { echo "dry run exit $rc"; cat "$w/c-dry.err"; return 1; }
+    word="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("confirm_label") or "")' <<<"$out")"
+    [ "$word" = EP-0001 ] || { echo "dry run's confirm_label is \"$word\", want EP-0001 (File 0's label)"; return 1; }
+    "$BIN" --home "$w/c" cartridge erase --device "$TAPE_DEV" --confirm-label EP-0001 >"$w/c-erase.out" 2>&1 \
+        || { echo "cartridge erase failed:"; tail -20 "$w/c-erase.out"; return 1; }
+    # Negative control: a catalog that did not erase this cartridge has no proof.
+    "$BIN" --home "$w/d" volume init EP-0005 --device "$TAPE_DEV" >"$w/d-init.out" 2>&1; rc=$?
+    [ "$rc" = 2 ] || { echo "home D's init exit $rc, want 2 (EMPTY File 0, no proof):"; tail -10 "$w/d-init.out"; return 1; }
+    grep -F -- "--force" "$w/d-init.out" >/dev/null || { echo "home D's refusal does not name --force"; return 1; }
+    # The proof: C's own verified erase. No --force anywhere.
+    "$BIN" --home "$w/c" volume init EP-0004 --device "$TAPE_DEV" >"$w/c-init.out" 2>&1; rc=$?
+    [ "$rc" = 0 ] || { echo "home C's init exit $rc, want 0:"; tail -10 "$w/c-init.out"; return 1; }
+    grep -F "blank proven by this catalog" "$w/c-init.out" >/dev/null \
+        || { echo "home C's init did not name the verified-erase proof:"; cat "$w/c-init.out"; return 1; }
+    "$BIN" --home "$w/c" volume identify --device "$TAPE_DEV" 2>&1 | grep -F "EP-0004" >/dev/null \
+        || { echo "File 0 does not name EP-0004 after C's init"; return 1; }
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
+}
+check erase_then_init_no_force step_erase_then_init_no_force
+
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --
 # the only place in the tree that produces medium evidence on real media. So
