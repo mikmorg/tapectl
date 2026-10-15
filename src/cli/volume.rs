@@ -2459,6 +2459,10 @@ struct VolumeInfo {
     writes: Vec<WriteRow>,
     verifications: Vec<VerificationRow>,
     deposits: Vec<DepositRow>,
+    /// Each recorded write's feed ratio, newest first (issue #439): native
+    /// tape bytes per data byte sent, with the verdict it was judged by.
+    /// Empty when the drive gave no reading, and an older write has none.
+    feed_ratios: Vec<crate::cli::report::FeedRatioRow>,
     /// The phases of the most recent write, resume, verify or read session
     /// recorded against this volume (issue #386, migration 028). Human
     /// output only: `--json`'s shape is unchanged.
@@ -2721,6 +2725,7 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         writes,
         verifications,
         deposits,
+        feed_ratios: crate::cli::report::feed_ratio_rows(conn, Some(label))?,
         phase_timings: crate::db::phase_timings::latest_for_volume(conn, vol_id)?,
     })
 }
@@ -2863,6 +2868,10 @@ fn print_volume_info(info: &VolumeInfo) {
         render_write_span(info.first_write.as_deref(), info.last_write.as_deref())
     );
     println!("{}", render_sealed_line(info.sealed_at.as_deref()));
+    print!(
+        "{}",
+        crate::cli::report::render_feed_ratio_lines(&info.feed_ratios, info.last_write.is_some())
+    );
     if let Some(notes) = &info.notes {
         println!("  Notes:       {notes}");
     }

@@ -1,5 +1,6 @@
 use clap::Subcommand;
 use rusqlite::{Connection, OptionalExtension};
+use serde::Serialize;
 
 use crate::config::Config;
 use crate::db::queries;
@@ -1664,7 +1665,8 @@ fn report_health(
         let factor = config.health().read_error_rise_factor;
         println!(
             "{}",
-            serde_json::to_string_pretty(&report_health_json(conn, &rows, factor)?).unwrap()
+            serde_json::to_string_pretty(&report_health_json(conn, &rows, factor, volume_filter)?)
+                .unwrap()
         );
         return Ok(());
     }
@@ -1676,6 +1678,12 @@ fn report_health(
     // Issue #421: each cartridge's corrected read errors per GiB, verify
     // over verify, with a rise past the factor flagged.
     for line in read_error_trend_block(conn, config.health().read_error_rise_factor)? {
+        println!("{line}");
+    }
+    // Issue #439: each write's feed ratio, uneven feeds first. Unlike the two
+    // fleet-wide blocks above (a TapeAlert or a rising cartridge must not be
+    // hidden by a filter), this one is about writes, so `--volume` narrows it.
+    for line in feed_ratio_block(&feed_ratio_rows(conn, volume_filter)?) {
         println!("{line}");
     }
     if rows.is_empty() {
@@ -1742,6 +1750,7 @@ pub(crate) fn report_health_json(
     conn: &Connection,
     rows: &[HealthRow],
     factor: f64,
+    volume_filter: Option<&str>,
 ) -> Result<serde_json::Value> {
     let trends: Vec<serde_json::Value> = crate::tape::read_errors::trends(conn)?
         .iter()
@@ -1787,6 +1796,11 @@ pub(crate) fn report_health_json(
         .iter()
         .map(tape_alert_sighting_json)
         .collect();
+    // Issue #439, additive: every recorded write's feed ratio, newest
+    // first (the text block lists the uneven ones first), narrowed by
+    // `--volume`.
+    doc["feed_ratios"] = serde_json::to_value(feed_ratio_rows(conn, volume_filter)?)
+        .expect("a feed-ratio row serializes");
     Ok(doc)
 }
 
@@ -1812,6 +1826,215 @@ pub(crate) fn read_error_trend_block(conn: &Connection, factor: f64) -> Result<V
         }
     }
     Ok(out)
+}
+
+/// How one recorded write's feed ratio was judged (issue #439), by the
+/// threshold the write itself carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FeedVerdict {
+    /// At or below the threshold the write was judged against.
+    Streamed,
+    /// Above it, and `volume write` raised its warning.
+    AboveThreshold,
+    /// Above it, but the writer suppressed the warning (`suppressed` says
+    /// why): the figure is recorded and shown, and is not a verdict on the
+    /// host.
+    AboveThresholdSuppressed,
+}
+
+/// One `write_feed_ratio` event (`tape::feed_ratio`, issue #338) as `volume
+/// info` and `report health` show it: the native tape a write used per data
+/// byte it sent, with the verdict the write was judged by.
+///
+/// `ratio` and `threshold` are the row's own `details` figures, not the
+/// constant in force today: the writer records the threshold "so a later
+/// change to the constant does not rewrite history", and a reader that
+/// re-judged by the current constant would. `native_bop_to_eod_mb` and
+/// `data_bytes` are the two facts the ratio divides; `None` only on a row
+/// whose `details` is missing or unreadable.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct FeedRatioRow {
+    pub(crate) volume: String,
+    /// When the event was recorded (`events.timestamp`, UTC).
+    pub(crate) at: String,
+    pub(crate) ratio: f64,
+    pub(crate) threshold: f64,
+    pub(crate) verdict: FeedVerdict,
+    /// `details.suppressed`: why the warning was withheld, e.g.
+    /// `capacity_override`. Present on every row written for a drive with a
+    /// declared capacity, whatever its ratio.
+    pub(crate) suppressed: Option<String>,
+    pub(crate) native_bop_to_eod_mb: Option<u64>,
+    pub(crate) data_bytes: Option<u64>,
+}
+
+impl FeedRatioRow {
+    /// Build a row from one event's `new_value` and `details`. `None` when
+    /// no finite ratio can be read from either: `details.ratio` (unrounded)
+    /// first, then `new_value` (the same figure to four places). The writer
+    /// always records both, so only a hand-edited row lands here.
+    fn from_event(
+        volume: String,
+        at: String,
+        new_value: Option<&str>,
+        details: Option<&str>,
+    ) -> Option<FeedRatioRow> {
+        use crate::tape::feed_ratio::FEED_RATIO_WARN_THRESHOLD;
+        let d: Option<serde_json::Value> = details.and_then(|s| serde_json::from_str(s).ok());
+        let get = |k: &str| d.as_ref().and_then(|d| d.get(k));
+        let ratio = get("ratio")
+            .and_then(serde_json::Value::as_f64)
+            .or_else(|| new_value.and_then(|v| v.trim().parse().ok()))
+            .filter(|r: &f64| r.is_finite())?;
+        let threshold = get("threshold")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(FEED_RATIO_WARN_THRESHOLD);
+        let suppressed = get("suppressed")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let verdict = match (ratio > threshold, suppressed.is_some()) {
+            (false, _) => FeedVerdict::Streamed,
+            (true, false) => FeedVerdict::AboveThreshold,
+            (true, true) => FeedVerdict::AboveThresholdSuppressed,
+        };
+        Some(FeedRatioRow {
+            volume,
+            at,
+            ratio,
+            threshold,
+            verdict,
+            suppressed,
+            native_bop_to_eod_mb: get("native_bop_to_eod_mb").and_then(serde_json::Value::as_u64),
+            data_bytes: get("data_bytes").and_then(serde_json::Value::as_u64),
+        })
+    }
+
+    /// The verdict in words, naming the threshold the write was judged by.
+    pub(crate) fn verdict_text(&self) -> String {
+        let t = self.threshold;
+        match self.verdict {
+            FeedVerdict::Streamed => format!("streamed, within {t:.2}"),
+            FeedVerdict::AboveThreshold => format!(
+                "above {t:.2}: the drive was fed unevenly and spent tape repositioning — \
+                 see the operator guide, \"A quiet host while the tape runs\""
+            ),
+            FeedVerdict::AboveThresholdSuppressed => format!(
+                "above {t:.2}, not judged: warning suppressed ({}) — a drive that declares \
+                 its own capacity reports a figure unrelated to the write",
+                self.suppressed.as_deref().unwrap_or("suppressed")
+            ),
+        }
+    }
+}
+
+/// Every recorded write's feed ratio, newest first — the one reader behind
+/// `volume info` and `report health` (issue #439). Read from the
+/// `write_feed_ratio` events `volume write` records
+/// ([`crate::tape::feed_ratio::assess_and_record`]), which link to their
+/// volume by `entity_type = 'volume'` and `entity_id`; the label comes from
+/// `volumes`, so a renamed volume shows its current one.
+///
+/// `volume_label` narrows to one volume. A write whose drive gave no page
+/// 0x0c reading recorded no event and has no row: callers that need to say
+/// so ([`render_feed_ratio_lines`]) know whether the volume was ever written.
+pub(crate) fn feed_ratio_rows(
+    conn: &Connection,
+    volume_label: Option<&str>,
+) -> Result<Vec<FeedRatioRow>> {
+    use crate::tape::feed_ratio::{EVENT_ACTION, EVENT_FIELD};
+    let mut stmt = conn.prepare(
+        "SELECT v.label, e.timestamp, e.new_value, e.details
+         FROM events e
+         JOIN volumes v ON v.id = e.entity_id
+         WHERE e.entity_type = 'volume' AND e.action = ?1 AND e.field = ?2
+           AND (?3 IS NULL OR v.label = ?3)
+         ORDER BY e.timestamp DESC, e.id DESC",
+    )?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![EVENT_ACTION, EVENT_FIELD, volume_label],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(volume, at, new_value, details)| {
+            FeedRatioRow::from_event(volume, at, new_value.as_deref(), details.as_deref())
+        })
+        .collect())
+}
+
+/// `volume info`'s feed-ratio lines: one per recorded write, under a
+/// "Feed ratio:" label. A volume that has been written but has no row says
+/// "not recorded" rather than saying nothing — absence has three causes
+/// (the drive listed no page 0x0c, the write predates the figure, the
+/// volume was rebuilt from tape) and silence reads as "fine". A volume never
+/// written (`written` false) has nothing to record and prints nothing.
+pub(crate) fn render_feed_ratio_lines(rows: &[FeedRatioRow], written: bool) -> String {
+    const LABEL: &str = "  Feed ratio:  ";
+    if rows.is_empty() {
+        return if written {
+            format!(
+                "{LABEL}not recorded — the drive gave no page 0x0c reading for this write, \
+                 or it was written before the figure was kept\n"
+            )
+        } else {
+            String::new()
+        };
+    }
+    let mut out = String::new();
+    for (i, r) in rows.iter().enumerate() {
+        let lead = if i == 0 {
+            LABEL.to_string()
+        } else {
+            " ".repeat(LABEL.len())
+        };
+        out.push_str(&format!(
+            "{lead}{:.4} ({}), recorded {}\n",
+            r.ratio,
+            r.verdict_text(),
+            r.at
+        ));
+    }
+    out
+}
+
+/// `report health`'s feed-ratio block (issue #439): one line per recorded
+/// write — its volume, native tape bytes per data byte sent, and the
+/// verdict naming the threshold — with the writes that were fed unevenly
+/// first and marked `!!`. No truncation: a starved write dropped from the
+/// list would read as fine. Empty when no write recorded one.
+pub(crate) fn feed_ratio_block(rows: &[FeedRatioRow]) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![
+        "Write feed ratio (native tape bytes per data byte sent), uneven feeds first:".to_string(),
+    ];
+    let starved = |r: &&FeedRatioRow| r.verdict == FeedVerdict::AboveThreshold;
+    for r in rows
+        .iter()
+        .filter(starved)
+        .chain(rows.iter().filter(|r| !starved(r)))
+    {
+        out.push(format!(
+            "  {}{}: {:.4} ({}), {}",
+            if starved(&r) { "!! " } else { "   " },
+            r.volume,
+            r.ratio,
+            r.verdict_text(),
+            r.at
+        ));
+    }
+    out
 }
 
 /// What a drive-only reading (no volume, migration 021) prints in the label
@@ -4935,7 +5158,7 @@ Read error counter page  [0x3]
                 &raw,
                 "Tape alert page (ssc-3) [0x2e]\n  Cleaning required: 1\n",
             );
-            let v = report_health_json(&conn, &[], 2.0).unwrap();
+            let v = report_health_json(&conn, &[], 2.0, None).unwrap();
             let raised = v["tape_alerts_raised"].as_array().expect("an array");
             assert_eq!(raised.len(), 1, "{v}");
             assert_eq!(raised[0]["contact_id"], 30);
@@ -5175,14 +5398,14 @@ Read error counter page  [0x3]
     fn report_health_json_carries_the_read_error_trends() {
         use crate::tape::read_errors::{tests::seed_verifies, DEFAULT_RISE_FACTOR};
         let conn = crate::db::open_memory().unwrap();
-        let empty = report_health_json(&conn, &[], DEFAULT_RISE_FACTOR).unwrap();
+        let empty = report_health_json(&conn, &[], DEFAULT_RISE_FACTOR, None).unwrap();
         assert_eq!(empty["readings"], serde_json::json!([]));
         assert_eq!(empty["read_error_trends"], serde_json::json!([]));
 
         seed_verifies(&conn, "C-RISE", &[1, 2, 5]);
         seed_verifies(&conn, "C-FLAT", &[2, 3]);
         let rows = health_rows(&conn, None).unwrap();
-        let v = report_health_json(&conn, &rows, DEFAULT_RISE_FACTOR).unwrap();
+        let v = report_health_json(&conn, &rows, DEFAULT_RISE_FACTOR, None).unwrap();
         assert_eq!(v["readings"], health_json(&rows), "readings unchanged");
         assert_eq!(v["read_error_rise_factor"], DEFAULT_RISE_FACTOR);
         assert_eq!(
