@@ -14,6 +14,8 @@ Which cleaning cartridge: `\-\-cartridge SERIAL`, or, without it, the one in the
 .PP
 Exit 0: recorded. Exit 1: recorded, and the cleaning cartridge is at or past its rated life (a spent cartridge does not clean; replace it). A cartridge near its rated life is a warning with exit 0. Exit 2: not recorded — the drive gave no serial to record against, or the named cartridge is not registered.
 .PP
+The chip read that identifies the cartridge in the drive is kept whole in the MAM journal (`cartridge journal`), against no contact.
+.PP
 `\-\-dry\-run` reports what would be recorded and records nothing. With `\-\-json` the whole of stdout is one JSON object.
 .SH OPTIONS
 .TP

@@ -180,6 +180,9 @@ pub enum DriveCommands {
     /// recorded — the drive gave no serial to record against, or the named
     /// cartridge is not registered.
     ///
+    /// The chip read that identifies the cartridge in the drive is kept
+    /// whole in the MAM journal (`cartridge journal`), against no contact.
+    ///
     /// `--dry-run` reports what would be recorded and records nothing. With
     /// `--json` the whole of stdout is one JSON object.
     Cleaned {
@@ -1871,6 +1874,19 @@ pub fn cleaned(
             let read = probe
                 .mam
                 .unwrap_or_else(|| mam::read_mam(&backend.device_sg));
+            // The read happened, so it is kept whole (ADR-0013: loading
+            // overwrites what the chip held). Contact-less — a cleaning is
+            // no contact — and not on a dry run, which promises to record
+            // nothing.
+            if !dry_run {
+                crate::tape::mam_journal::record(
+                    conn,
+                    None,
+                    "drive cleaned",
+                    Hook::DriveCleaned,
+                    &read.capture,
+                );
+            }
             if let Some(serial) = read.info.serial.as_deref().filter(|s| !s.is_empty()) {
                 match cleaning::find(conn, serial)? {
                     Some(c) => {
@@ -3247,6 +3263,85 @@ mod tests {
     fn count(conn: &Connection, table: &str) -> i64 {
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
             .unwrap()
+    }
+
+    /// `drive cleaned`'s chip read is kept whole in the MAM journal (issue
+    /// #466), against no contact; the read that did not happen (a named
+    /// cartridge, a held drive) and the dry run, which records nothing,
+    /// leave no row.
+    #[test]
+    fn a_cleaned_chip_read_is_journalled_without_a_contact_and_only_when_recorded() {
+        let (_home, paths, conn) = cleaned_home();
+        crate::tape::cleaning::register(&conn, "CLNU01", 50).unwrap();
+        let mam_rows = |conn: &Connection| count(conn, "mam_journal");
+
+        // Positive control: the cartridge in the drive IS a registered
+        // cleaning cartridge, read from its chip.
+        let cleaning_chip = mam::tests_support::LTO6_SAMPLE.replace("EW7VWMVKF6", "CLNU01");
+        let r = do_cleaned(
+            &conn,
+            &paths,
+            None,
+            false,
+            Some(mam_read(Some(&cleaning_chip))),
+            DriveLockState::Free,
+        )
+        .unwrap();
+        assert_eq!(r.identified_by.as_deref(), Some("chip"));
+        assert_eq!(mam_rows(&conn), 1, "the read is kept");
+        let (contact, trigger, hook, serial, raw): (
+            Option<i64>,
+            String,
+            String,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT contact_id, trigger, hook, serial_as_read, raw FROM mam_journal",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(contact, None, "a cleaning is no contact");
+        assert_eq!(
+            (trigger.as_str(), hook.as_str()),
+            ("drive cleaned", "drive_cleaned")
+        );
+        assert_eq!(serial.as_deref(), Some("CLNU01"));
+        assert_eq!(raw, cleaning_chip, "verbatim");
+        assert_eq!(count(&conn, "cartridge_contacts"), 0);
+
+        // A dry run reads the chip and records nothing.
+        do_cleaned(
+            &conn,
+            &paths,
+            None,
+            true,
+            Some(mam_read(Some(&cleaning_chip))),
+            DriveLockState::Free,
+        )
+        .unwrap();
+        assert_eq!(mam_rows(&conn), 1, "a dry run records nothing");
+        // A named cartridge reads no chip; a held drive is not read.
+        do_cleaned(
+            &conn,
+            &paths,
+            Some("CLNU01"),
+            false,
+            None,
+            DriveLockState::Free,
+        )
+        .unwrap();
+        do_cleaned(&conn, &paths, None, false, None, DriveLockState::Held).unwrap();
+        assert_eq!(mam_rows(&conn), 1, "no read, no row");
     }
 
     /// A named cleaning cartridge: one `cleaned` event on the drive naming it,

@@ -76,6 +76,10 @@ pub enum Hook {
     /// `drive eject`'s one read (issue #429): the serial its contact and its
     /// `ejected` event name, read before the unload.
     DriveEject,
+    /// `drive cleaned`'s one read (issue #466): the chip of whatever is in
+    /// the drive, read to see whether it is a registered cleaning cartridge.
+    /// Contact-less — a cleaning is no contact.
+    DriveCleaned,
 }
 
 impl Hook {
@@ -91,6 +95,7 @@ impl Hook {
             Hook::CartridgeEraseRecheck => "cartridge_erase_recheck",
             Hook::CartridgeEraseVerify => "cartridge_erase_verify",
             Hook::DriveEject => "drive_eject",
+            Hook::DriveCleaned => "drive_cleaned",
         }
     }
 
@@ -106,6 +111,7 @@ impl Hook {
         Hook::CartridgeEraseRecheck,
         Hook::CartridgeEraseVerify,
         Hook::DriveEject,
+        Hook::DriveCleaned,
     ];
 }
 
@@ -647,6 +653,7 @@ mod tests {
                 "cartridge_erase_recheck",
                 "cartridge_erase_verify",
                 "drive_eject",
+                "drive_cleaned",
             ]
         );
     }

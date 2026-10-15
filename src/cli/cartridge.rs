@@ -265,11 +265,17 @@ pub enum CartridgeCommands {
     },
     /// Show the MAM journal: every MAM read taken of a cartridge, verbatim
     ///
-    /// ADR-0013: every `sg_read_attr` a command runs is kept
+    /// ADR-0013: every `sg_read_attr` a recording command runs is kept
     /// whole — including the attributes tapectl does not parse, such as the
     /// medium's own ring of the last four drives that loaded it — because
-    /// loading the cartridge overwrites them. Lists the rows, oldest first;
-    /// `--raw <ID>` prints one row's tool output exactly as captured.
+    /// loading the cartridge overwrites them. The recording commands are
+    /// every one that opens a contact (`volume init`, `write`, `resume`,
+    /// `verify`, `identify`, `read-slices`, `compact`, `restore`, `catalog
+    /// rebuild`, `cartridge erase`, `drive eject`), `drive poll`, and `drive
+    /// cleaned` (against no contact). `drive status` records nothing, by
+    /// design, and neither does any `--dry-run`: their reads are not here.
+    /// Lists the rows, oldest first; `--raw <ID>` prints one row's tool
+    /// output exactly as captured.
     ///
     /// A cartridge's rows are found two ways: reads taken in a contact
     /// attributed to it, and reads whose chip serial is its confirmed
