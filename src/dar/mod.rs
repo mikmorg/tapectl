@@ -90,13 +90,13 @@ pub(crate) fn fadvise_filter_available() -> bool {
         match &probed {
             Ok(()) => tracing::info!(
                 "seccomp filters are available: dar's posix_fadvise is a no-op while it \
-                 archives, so the source is read from disk once (issue #441)"
+                 archives, so the source is read from disk once"
             ),
             Err(why) => tracing::warn!(
                 reason = %why,
                 "seccomp filters are not available: dar evicts each source file from the \
                  page cache as it reads it, so stage create may read the source from disk \
-                 twice (issue #441)"
+                 twice"
             ),
         }
         probed.is_ok()

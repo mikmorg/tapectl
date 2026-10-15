@@ -43,12 +43,7 @@ const EXIT_FILES_CHANGED: i32 = 11;
 /// no-op ([`super::command_without_fadvise`], issue #441). The filter is no
 /// argument: dar's argv, and the recorded `dar_command`, are what they were.
 pub fn create_command(params: &DarCreateParams) -> Command {
-    with_create_args(super::command_without_fadvise(params.dar_binary), params)
-}
-
-/// `cmd` (dar, its child set up) with the arguments of `dar -c -` for
-/// `params`.
-fn with_create_args(mut cmd: Command, params: &DarCreateParams) -> Command {
+    let mut cmd = super::command_without_fadvise(params.dar_binary);
     // The archive goes to standard output (issue #370). dar refuses `-s`
     // there ("Slicing (-s option), is not compatible with archive on
     // standard output"), so the slicing is tapectl's (`dar::slice`).
@@ -115,6 +110,15 @@ fn with_create_args(mut cmd: Command, params: &DarCreateParams) -> Command {
     cmd.arg("--retry-on-change").arg("0");
     cmd.arg("-@").arg(params.on_fly_catalogue);
     cmd
+}
+
+/// `cmd`'s program and arguments in a plain [`super::command`]: the same
+/// dar run, without the fadvise filter (issue #441). [`create_command`]
+/// sets no environment or directory, so nothing else is lost.
+fn without_fadvise_filter(cmd: &Command) -> Command {
+    let mut plain = super::command(cmd.get_program());
+    plain.args(cmd.get_args());
+    plain
 }
 
 /// The command as recorded in `stage_sets.dar_command`, which MANIFEST.toml
@@ -187,12 +191,9 @@ pub fn spawn_archive(params: &DarCreateParams) -> Result<DarStream> {
             tracing::warn!(
                 error = %e,
                 "dar could not start under no_new_privs; running it without the \
-                 fadvise filter, so it may read the source from disk twice (issue #441)"
+                 fadvise filter, so it may read the source from disk twice"
             );
-            spawn(&mut with_create_args(
-                super::command(params.dar_binary),
-                params,
-            ))
+            spawn(&mut without_fadvise_filter(&cmd))
         }
         spawned => spawned,
     }
