@@ -334,6 +334,14 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
     --ignored --nocapture --test-threads=1
 ```
 
+**The heir path's only test with real tools is the mhvtl gate** (ADR-0012 item 70,
+#457). `tests/heir_restore_sh.rs` runs RESTORE.sh with `mt`, `dd` and `age` faked (CI
+has no age CLI); only the gate's RESTORE.sh legs (`heir_*`) and home2's real-drive
+proof run it with the real `age`, `dar`, `mt` and `tar`. A release is not proven on
+the heir path until the gate has run; each run record names the age version it used
+(`age --version`). The gate's Rust legs pass only when every test they name ran and
+said `ok`, and a gate run turns an on-media skip into a failure (#471).
+
 ## Architecture
 
 **Three-phase pipeline:** `snapshot create` (fast metadata) → `stage create` (dar + sha256 + encrypt) → `volume write` (tape I/O)

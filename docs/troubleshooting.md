@@ -1138,7 +1138,9 @@ snapshot create <unit>`) and stage that.
 ```
 
 Stop whatever is writing to the source (a sync client, a download, an
-editor's autosave), then stage again.
+editor's autosave), then stage again. For a source that is always in use, stage
+from a read-only filesystem snapshot: the operator guide's "Staging a source
+that is in use" gives the LVM, btrfs and ZFS commands.
 
 For a real edit or a deleted file, take a new snapshot and stage that:
 

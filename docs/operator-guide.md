@@ -462,6 +462,41 @@ Move such a file into a unit folder, replace the symlink with the folder
 itself, or list the name in the collection's `exclude` to say you meant to
 leave it out.
 
+### Staging a source that is in use
+
+Staging reads each unit's files once, while dar archives them, and refuses the
+whole stage if any file changes during that read (ADR-0012, 2026-10-06 item 4:
+dar runs with `--retry-on-change 0`, so a file caught mid-change is never
+archived half-changed). A failed stage starts over (#409): there is no resuming
+it. A unit can be up to half a cartridge, so one stage can take many hours, and
+one file touched by anything in those hours costs the whole stage.
+
+For a source nothing writes to (a finished photo year, a scanned archive) this
+never happens. For a living one, take one of two precautions before `stage
+create` or `collection run`:
+
+- **Stage from a read-only snapshot of the filesystem.** Take the snapshot (LVM:
+  `lvcreate --snapshot --name src-snap --size 20G vg/src` and mount it read-only;
+  btrfs: `btrfs subvolume snapshot -r /srv/src /srv/.snap-src`; ZFS:
+  `zfs snapshot pool/src@stage`, readable at `/pool/src/.zfs/snapshot/stage`).
+  tapectl stages from each unit's registered path, so show it the snapshot AT
+  that path in a private mount namespace, as root, while everything else keeps
+  writing the live directory:
+
+  ```bash
+  sudo unshare --mount sh -c 'mount --bind -o ro /srv/.snap-src /srv/src &&
+      sudo -u tapectl -H tapectl stage create <unit>'
+  ```
+
+  Then remove the snapshot. A per-collection hook that does this for `collection
+  run` is planned for 1.2.0 (#455).
+- **Or hold the source still** for the stage's duration: stop sync clients,
+  downloads and anything that autosaves into it, and do not edit it.
+
+`collection run` stages units in name order (several at once with `[staging]
+jobs`), so the stage report's start and end lines say which folders are being
+read at any moment.
+
 ### Watching a long operation: progress and the session log
 
 `stage create`, `volume write`, `volume resume`, `volume verify`,

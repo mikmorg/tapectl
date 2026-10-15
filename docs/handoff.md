@@ -126,6 +126,10 @@ tagged and the fresh start waits.
 
 ## (b) Tag v1.1.0 — done 2026-10-13
 
+Before any tag: the mhvtl gate on the commit to be tagged, because it is the heir path's
+only test with the real `age`, `dar`, `mt` and `tar` (`tests/heir_restore_sh.rs` fakes
+them; ADR-0012 item 70, #457). Record `age --version` with the run.
+
 On the commit (a) proved, by the version rule of 2026-09-30:
 `git tag -a v1.1.0 <sha> -m "tapectl 1.1.0"`, then `git push origin v1.1.0`. If (a) needed a
 fix, the fix gets its own proof run before the tag. Installing v1.1.0 ends the on-tape
