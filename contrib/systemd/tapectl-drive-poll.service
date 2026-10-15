@@ -21,6 +21,16 @@ Environment=HOME=/var/lib/tapectl
 # Absolute path to the wrapper (adjust to wherever you installed it).
 ExecStart=/usr/local/lib/tapectl/tapectl-scheduled-drive-poll.sh
 
+# Tape commands run at raised CPU and I/O priority (issue #432, ADR-0012
+# 2026-10-15 item 58): the drive wants an even feed. systemd applies these as
+# root before it drops to User=, so no grant is needed. The values are the
+# installer's --tape-nice / --tape-ionice (scripts/install-systemd.sh rewrites
+# them; an empty --tape-nice removes all three lines). This is the only unit
+# that runs a tape command: the audit and backup units stay at normal priority.
+Nice=-10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+
 # 75: a tapectl command holds the drive (or the catalog), so the poll read
 # nothing. Not a failure — the next run tries again.
 SuccessExitStatus=75

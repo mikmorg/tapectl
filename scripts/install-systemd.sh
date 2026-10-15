@@ -18,7 +18,9 @@
 #   /usr/local/lib/tapectl/tapectl-scheduled-drive-poll.sh
 #   <backup dir>                                 created, owned by the service
 #                                                user, mode 0700
-#   /usr/local/bin/tapectl-op                    `exec sudo -u <user> -H <tapectl> "$@"`
+#   /usr/local/bin/tapectl-op                    runs <tapectl> as <user> through sudo; a
+#                                                tape command (volume write, ...) runs at
+#                                                raised CPU/IO priority (see below)
 #   /etc/tapectl/home                            the system home pointer: the
 #                                                tapectl home's path, root 0644, so
 #                                                an [ops] group member's plain
@@ -29,6 +31,20 @@
 # TAPECTL_BACKUP_DIR=, TAPECTL_BACKUP_KEEP= and ReadWritePaths= for the
 # options given, so the INSTALLED copies are always consistent with each
 # other. Edit them by re-running this script, not by hand.
+#
+# Tape-command priority (issue #432, ADR-0012 2026-10-15 item 58): the drive
+# wants an even feed, and a host that is busy elsewhere starves it. Priority can
+# only be RAISED by root, so tapectl-op runs a tape command as
+#   sudo nice -n <N> ionice <ARGS> runuser -u <user> -- <tapectl> ...
+# (raised as root, then dropped to the service user: no limits.d grant, no new
+# sudoers line), and tapectl-drive-poll.service gets Nice= and
+# IOSchedulingClass=/IOSchedulingPriority= from the same two knobs. The tape
+# commands are the ones that stream the drive: volume write, resume, verify,
+# compact-write, compact, read-slices, compact-read; restore unit, file, volume,
+# raw-volume; cartridge erase; collection run; quick-archive; drive poll.
+# Everything else runs exactly as before. --tape-nice '' turns the raise off:
+# tapectl-op then always runs `sudo -u <user> -H <tapectl>`, as it used to, and
+# the drive-poll unit loses its Nice= and IOScheduling lines.
 #
 # What it never does: create the service user (scripts/first-run.sh step 5),
 # install the tapectl binary (step 3), touch a tape or a device node, or —
@@ -45,14 +61,20 @@ TAPECTL_HOME_DIR=""    # default: $SVC_HOME/.tapectl (tapectl's own default)
 BACKUP_DIR="/var/backups/tapectl"
 KEEP=14
 BIN="/usr/local/bin/tapectl"
+# Tape-command priority (issue #432). The environment may set either knob (an
+# empty TAPE_NICE disables the raise); a flag overrides the environment.
+[ "${TAPE_NICE+set}" = set ] || TAPE_NICE=-10
+[ "${TAPE_IONICE+set}" = set ] || TAPE_IONICE="-c2 -n0"
 WRAPPER=1
 START=1
 DRY=0
 UNINSTALL=0
+RENDER_DIR=""
 
 UNITDIR=/etc/systemd/system
 LIBDIR=/usr/local/lib/tapectl
 WRAPPER_PATH=/usr/local/bin/tapectl-op
+WRAPPER_TEMPLATE=tapectl-op.in   # under contrib/systemd/
 # The system home pointer (issue #437). The same variable the tapectl binary
 # reads to find it, so a dry run or a test can aim both at a scratch path.
 POINTER_PATH="${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"
@@ -61,7 +83,7 @@ TIMERS=(tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer)
 SCRIPTS=(tapectl-scheduled-audit.sh tapectl-scheduled-backup.sh tapectl-scheduled-drive-poll.sh)
 
 usage() {
-  sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
   cat <<EOF
 
 Usage: scripts/install-systemd.sh [options]
@@ -72,6 +94,13 @@ Usage: scripts/install-systemd.sh [options]
                       SECOND DISK; the script warns when it shares a filesystem with the home
   --keep N            catalog copies to keep (default: $KEEP)
   --tapectl PATH      the binary the units run and the wrapper execs (default: $BIN)
+  --tape-nice N       nice value (-20..19) for tape commands, raised as root (default: -10; env
+                      TAPE_NICE). Empty turns the raise off: tapectl-op is then the plain sudo -u
+                      wrapper and the drive-poll unit has no Nice= or IOScheduling lines
+  --tape-ionice ARGS  ionice arguments for tape commands, e.g. '-c2 -n0' (default: $TAPE_IONICE;
+                      env TAPE_IONICE). Empty = no I/O priority change. Classes 1-3 only
+  --render-dir DIR    render the six units and tapectl-op into DIR and stop: nothing is installed,
+                      no sudo, no systemd, no service user needed (how the wrapper is tested)
   --no-wrapper        do not install $WRAPPER_PATH
   --no-start          install and enable the timers, but do not start them now
   --dry-run           print what would be done; change nothing
@@ -88,6 +117,9 @@ while [ $# -gt 0 ]; do
     --backup-dir) BACKUP_DIR="$2"; shift 2 ;;
     --keep) KEEP="$2"; shift 2 ;;
     --tapectl) BIN="$2"; shift 2 ;;
+    --tape-nice) TAPE_NICE="$2"; shift 2 ;;
+    --tape-ionice) TAPE_IONICE="$2"; shift 2 ;;
+    --render-dir) RENDER_DIR="$2"; shift 2 ;;
     --no-wrapper) WRAPPER=0; shift ;;
     --no-start) START=0; shift ;;
     --dry-run) DRY=1; shift ;;
@@ -96,6 +128,8 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+[ -z "$RENDER_DIR" ] || DRY=1   # --render-dir installs nothing: every host-changing command only prints
 
 # ---------------------------------------------------------------- plumbing
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -118,7 +152,7 @@ same_as() { [ -f "$1" ] && cmp -s "$1" "$2"; }
 # fs_id PATH: the device id of PATH's nearest existing ancestor.
 fs_id() { local d="$1"; while [ ! -e "$d" ] && [ "$d" != / ]; do d="$(dirname "$d")"; done; stat -c %d "$d" 2>/dev/null || echo "?"; }
 
-for f in "${UNITS[@]}" "${SCRIPTS[@]}"; do [ -f "$SRC/$f" ] || die "$SRC/$f is missing — run this from a tapectl checkout"; done
+for f in "${UNITS[@]}" "${SCRIPTS[@]}" "$WRAPPER_TEMPLATE"; do [ -f "$SRC/$f" ] || die "$SRC/$f is missing — run this from a tapectl checkout"; done
 command -v systemctl >/dev/null 2>&1 || { [ "$DRY" = 1 ] && note "systemctl not found — this host is not running systemd; showing the plan anyway" || die "systemctl not found — this host is not running systemd"; }
 
 # ================================================================ uninstall
@@ -150,6 +184,40 @@ printf '%stapectl systemd install%s — units from %s\n' "$B" "$R" "$SRC"
 # At least 1: with 0 the wrapper would prune the copy it just wrote.
 case "$KEEP" in '' | *[!0-9]* | 0) die "--keep must be an integer >= 1, got '$KEEP'" ;; esac
 
+# --- the tape-command priority knobs (issue #432). Both are baked into the
+# rendered wrapper and units, so they are checked here, once, in the shapes
+# nice(1), ionice(1) and systemd accept; the wrapper then never has to.
+case "$TAPE_NICE" in
+  '' | [0-9] | 1[0-9] | -[0-9] | -1[0-9] | -20) ;;
+  *) die "--tape-nice must be an integer from -20 to 19 (or empty to turn the raise off), got '$TAPE_NICE'" ;;
+esac
+IO_CLASS=""; IO_PRIO=""   # ionice's numbers; systemd's names are derived below
+if [ -n "$TAPE_NICE" ] && [ -n "$TAPE_IONICE" ]; then
+  set -f; set -- $TAPE_IONICE; set +f   # word-split on purpose: it is a list of ionice arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c) [ $# -ge 2 ] || die "--tape-ionice: -c needs a class"; IO_CLASS="$2"; shift 2 ;;
+      -c[0-9]) IO_CLASS="${1#-c}"; shift ;;
+      -n) [ $# -ge 2 ] || die "--tape-ionice: -n needs a level"; IO_PRIO="$2"; shift 2 ;;
+      -n[0-9]) IO_PRIO="${1#-n}"; shift ;;
+      *) die "--tape-ionice takes only -c CLASS and -n LEVEL (e.g. '-c2 -n0'), got '$1' in '$TAPE_IONICE'" ;;
+    esac
+  done
+  case "$IO_CLASS" in
+    1 | 2 | 3) ;;
+    *) die "--tape-ionice needs -c 1 (realtime), 2 (best-effort) or 3 (idle), got '${IO_CLASS:-none}' in '$TAPE_IONICE'" ;;
+  esac
+  case "$IO_PRIO" in
+    '') [ "$IO_CLASS" = 3 ] || die "--tape-ionice class $IO_CLASS needs -n LEVEL (0-7)" ;;
+    [0-7]) [ "$IO_CLASS" != 3 ] || die "--tape-ionice: class 3 (idle) takes no -n level" ;;
+    *) die "--tape-ionice -n must be 0-7, got '$IO_PRIO'" ;;
+  esac
+  case "$IO_CLASS" in 1) IO_CLASS_NAME=realtime ;; 2) IO_CLASS_NAME=best-effort ;; 3) IO_CLASS_NAME=idle ;; esac
+fi
+# What the wrapper bakes in: the validated, normalised form ('-c2 -n0'), or nothing.
+IONICE_ARGS=""; [ -z "$IO_CLASS" ] || IONICE_ARGS="-c$IO_CLASS${IO_PRIO:+ -n$IO_PRIO}"
+case "$SVC_USER$BIN" in *\'* | *\"* | *\\* | *\$* | *\`* | *\|* | *\&*) die "the service user and the binary path may not contain quotes, backslashes, \$, backticks, | or & (they are baked into $WRAPPER_PATH)" ;; esac
+
 # The service user is step 5's job, not this script's: creating an account
 # is a decision about the host, and the units are useless without the home
 # and keys that account owns.
@@ -170,16 +238,22 @@ if [ -x "$BIN" ]; then ok "binary: $BIN"; else note "$BIN is not there (or not e
 printf '   user %s, HOME %s, tapectl home %s\n' "$SVC_USER" "$SVC_HOME" "$THOME"
 printf '   home pointer: %s -> %s\n' "$POINTER_PATH" "$THOME"
 printf '   backups: %s, keep %s\n' "$BACKUP_DIR" "$KEEP"
+if [ -n "$TAPE_NICE" ]; then
+  printf '   tape commands: nice %s%s (tapectl-op, tapectl-drive-poll.service)\n' "$TAPE_NICE" "${IONICE_ARGS:+, ionice $IONICE_ARGS}"
+else
+  printf '   tape commands: priority NOT raised (--tape-nice is empty)\n'
+fi
 
 # --- the backup directory: outside the home, on a second disk
 case "$BACKUP_DIR" in
   "$THOME"|"$THOME"/*) die "--backup-dir $BACKUP_DIR is inside the tapectl home — a backup on the disk that holds the original is not a backup" ;;
 esac
-if [ "$(fs_id "$BACKUP_DIR")" = "$(fs_id "$THOME")" ]; then
+if [ -z "$RENDER_DIR" ] && [ "$(fs_id "$BACKUP_DIR")" = "$(fs_id "$THOME")" ]; then
   note "WARNING: $BACKUP_DIR is on the same filesystem as $THOME. The ruling asks for a second"
   note "disk (ADR-0012, 2026-09-24 amendment, item 5). Re-run with --backup-dir on another disk when you have one."
 fi
-if [ -d "$BACKUP_DIR" ]; then ok "backup dir $BACKUP_DIR exists"; else as_root install -d -m 0700 -o "$SVC_USER" "$BACKUP_DIR"; fi
+if [ -n "$RENDER_DIR" ]; then :   # rendering only: no directory is touched, not even in the plan
+elif [ -d "$BACKUP_DIR" ]; then ok "backup dir $BACKUP_DIR exists"; else as_root install -d -m 0700 -o "$SVC_USER" "$BACKUP_DIR"; fi
 [ "$DRY" = 1 ] || { as_root chown "$SVC_USER" "$BACKUP_DIR"; as_root chmod 0700 "$BACKUP_DIR"; }
 
 # --- render the units for this host
@@ -203,9 +277,38 @@ render() { # render <unit>: contrib copy → $TMP/<unit>, substituted
     [ -n "$TAPECTL_HOME_DIR" ] && sed -i "/^Environment=HOME=/a Environment=TAPECTL_HOME=$TAPECTL_HOME_DIR" "$TMP/$u"
     ;;
   esac
+  # Issue #432: the one unit that runs a tape command (`drive poll`) takes the
+  # same priority tapectl-op gives one. systemd raises it as root before it
+  # drops to User=, so nothing needs a grant. Raise off (empty --tape-nice) =
+  # no lines; no ionice arguments = no I/O lines.
+  case "$u" in tapectl-drive-poll.service)
+    if [ -z "$TAPE_NICE" ]; then
+      sed -i -e '/^Nice=/d' -e '/^IOSchedulingClass=/d' -e '/^IOSchedulingPriority=/d' "$TMP/$u"
+    else
+      sed -i "s|^Nice=.*|Nice=$TAPE_NICE|" "$TMP/$u"
+      if [ -z "$IO_CLASS" ]; then
+        sed -i -e '/^IOSchedulingClass=/d' -e '/^IOSchedulingPriority=/d' "$TMP/$u"
+      else
+        sed -i "s|^IOSchedulingClass=.*|IOSchedulingClass=$IO_CLASS_NAME|" "$TMP/$u"
+        if [ -n "$IO_PRIO" ]; then sed -i "s|^IOSchedulingPriority=.*|IOSchedulingPriority=$IO_PRIO|" "$TMP/$u"; else sed -i '/^IOSchedulingPriority=/d' "$TMP/$u"; fi
+      fi
+    fi
+    ;;
+  esac
   return 0
 }
 for u in "${UNITS[@]}"; do render "$u"; done
+# tapectl-op from its template: the four values validated above, nothing else.
+sed -e "s|@SVC_USER@|$SVC_USER|" -e "s|@TAPECTL@|$BIN|" \
+    -e "s|@TAPE_NICE@|$TAPE_NICE|" -e "s|@TAPE_IONICE@|$IONICE_ARGS|" \
+    "$SRC/$WRAPPER_TEMPLATE" > "$TMP/tapectl-op"
+if [ -n "$RENDER_DIR" ]; then
+  mkdir -p "$RENDER_DIR" || die "cannot create $RENDER_DIR"
+  for u in "${UNITS[@]}"; do cp "$TMP/$u" "$RENDER_DIR/$u"; done
+  install -m 0755 "$TMP/tapectl-op" "$RENDER_DIR/tapectl-op"
+  ok "rendered ${#UNITS[@]} units and tapectl-op into $RENDER_DIR — nothing was installed"
+  exit 0
+fi
 if [ "$DRY" = 1 ]; then
   printf '   rendered settings (lines that differ from contrib/systemd/):\n'
   # diff exits 1 when the files differ, which is the expected case here.
@@ -224,13 +327,6 @@ if [ "$WRAPPER" = 1 ] && [ "$SVC_USER" = "$(id -un)" ]; then
   note "the service user is you — no $WRAPPER_PATH (it would sudo to yourself)"; WRAPPER=0
 fi
 if [ "$WRAPPER" = 1 ]; then
-  cat > "$TMP/tapectl-op" <<EOF
-#!/bin/sh
-# tapectl-op — run tapectl as the service user that owns the catalog and keys.
-# Installed by scripts/install-systemd.sh (docs/install.md); re-run that
-# script to change the user or the binary rather than editing this file.
-exec sudo -u $SVC_USER -H $BIN "\$@"
-EOF
   if same_as "$WRAPPER_PATH" "$TMP/tapectl-op"; then ok "$WRAPPER_PATH unchanged"; else as_root install -D -m 0755 "$TMP/tapectl-op" "$WRAPPER_PATH"; fi
 fi
 

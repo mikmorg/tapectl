@@ -1,0 +1,88 @@
+#!/bin/sh
+# tapectl-op — run tapectl as the service user that owns the catalog and keys.
+# Installed by scripts/install-systemd.sh (docs/install.md), which fills in the
+# four @...@ values below; re-run that script to change the user, the binary or
+# the tape priority rather than editing the installed copy.
+#
+# A TAPE COMMAND (one that streams the drive) runs at raised CPU and I/O
+# priority (issue #432, ADR-0012 2026-10-15 item 58): the drive wants an even
+# feed, and a busy host starves it. A process cannot raise its own priority, so
+# the raise is made as root and the command then drops to the service user:
+#
+#   sudo nice -n N ionice ARGS runuser -u USER -- tapectl ...
+#
+# runuser sets HOME, USER and LOGNAME to the service user's, as `sudo -u USER -H`
+# does, so tapectl finds the same home. Every other command is the plain
+# `sudo -u USER -H tapectl ...` it always was, and so is a tape command when the
+# raise is switched off (an empty TAPE_NICE) or cannot be had (see below).
+SVC_USER='@SVC_USER@'
+TAPECTL='@TAPECTL@'
+TAPE_NICE='@TAPE_NICE@'
+TAPE_IONICE='@TAPE_IONICE@'
+
+# Is this a tape command? Decided by the first two words that are not options.
+# Global options may stand anywhere before them: --config and --home take a
+# value (skipped with it); every other option word starts with '-' and is
+# skipped on its own. The label of a volume can only be a THIRD word
+# (`volume info write` is volume + info), and the scan stops at the second, so
+# a label equal to a tape subcommand's name cannot misfire. If the CLI ever
+# grows another global option that takes a value, add it beside --config; the
+# failure of forgetting is safe (the command runs at normal priority).
+tape=0 skip=0 n=0 first='' second=''
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$a" in
+    --config | --home) skip=1 ;;
+    -*) ;;
+    *)
+      n=$((n + 1))
+      if [ "$n" = 1 ]; then first=$a; else second=$a; break; fi
+      ;;
+  esac
+done
+case "$first" in
+  volume)
+    case "$second" in
+      write | resume | verify | compact-write | compact | read-slices | compact-read) tape=1 ;;
+    esac
+    ;;
+  restore)
+    case "$second" in
+      unit | file | volume | raw-volume) tape=1 ;;
+    esac
+    ;;
+  cartridge) [ "$second" = erase ] && tape=1 ;;
+  collection) [ "$second" = run ] && tape=1 ;;
+  drive) [ "$second" = poll ] && tape=1 ;;
+  quick-archive) tape=1 ;;
+esac
+
+if [ "$tape" = 1 ] && [ -n "$TAPE_NICE" ]; then
+  # The raise needs ROOT's sudo, which is not the operator's usual one: home2's
+  # sudoers rule lets the operator run commands AS the service user without a
+  # password, and root-level sudo still asks. So: use it when it needs no
+  # password (or its timestamp is fresh), ask for the password when there is a
+  # terminal to ask on, and otherwise run at normal priority rather than fail
+  # over a nicety, saying so.
+  raised() {
+    if [ -n "$TAPE_IONICE" ]; then
+      sudo -n nice -n "$TAPE_NICE" ionice $TAPE_IONICE true
+    else
+      sudo -n nice -n "$TAPE_NICE" true
+    fi
+  }
+  ready=0
+  if raised >/dev/null 2>&1; then
+    ready=1
+  elif ( : </dev/tty ) 2>/dev/null && sudo -v && raised >/dev/null 2>&1; then
+    ready=1
+  fi
+  if [ "$ready" = 1 ]; then
+    if [ -n "$TAPE_IONICE" ]; then
+      exec sudo nice -n "$TAPE_NICE" ionice $TAPE_IONICE runuser -u "$SVC_USER" -- "$TAPECTL" "$@"
+    fi
+    exec sudo nice -n "$TAPE_NICE" runuser -u "$SVC_USER" -- "$TAPECTL" "$@"
+  fi
+  echo "tapectl-op: this tape command runs at NORMAL priority: raising it needs root's sudo, which is not available here without a password (docs/install.md, 'The wrapper')" >&2
+fi
+exec sudo -u "$SVC_USER" -H "$TAPECTL" "$@"
