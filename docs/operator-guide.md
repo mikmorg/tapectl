@@ -1328,6 +1328,10 @@ that is not a registered location counts as missing. A tape-only unit needs
 Its `copy_count` is multiplied the same way (ADR-0012, 2026-10-12): a
 tape-only unit with `min_copies = 2` and two copies reads
 `has 2 copies, needs 4 (tape-only 2x)`.
+`location_count` is the places half: a tape-only unit whose current Version sits in
+fewer places than `[defaults] min_locations` (2 by default, never multiplied) reads
+`has copies in 1 location(s), needs 2 ([defaults] min_locations)`.
+`snapshot mark-reclaimable` asks the same of the version that supersedes.
 
 ### Reports
 

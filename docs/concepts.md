@@ -601,7 +601,9 @@ Not every key exists at every layer. A dotfile's `[policy]` can set only
 requirement is the archive set's `min_copies`, or else `[defaults] min_copies`
 (default 2). Named required locations come only from an archive set.
 `[defaults] min_locations` (default 2) is a floor on the number of distinct
-locations. It has no per-set layer, and only `unit mark-tape-only` reads it. A
+locations of a tape-only unit. It has no per-set layer. `unit mark-tape-only` reads
+it, and afterwards `audit` (`location_count`), `snapshot mark-reclaimable` and
+`report supersedable` hold the unit to it. A
 misspelled key at any layer is an error, not a silent fallback to the next
 layer. See [configuration](configuration.md) for every key.
 

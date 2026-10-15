@@ -295,8 +295,8 @@ None of these blocks the fresh start. Each has an issue:
 - **#326, #366, #368:** close them from (a)'s measurements. Set the `[staging]
   hash_threads` and `jobs` defaults from the knees. Plan the write-throughput follow-up
   from #326's numbers.
-- **#425:** `min_locations` is checked only at `mark-tape-only`. The fix is one
-  predicate, used by `audit`, `mark-tape-only` and `mark-reclaimable`.
+- **#425:** built for 1.1.1: one predicate in `policy::coverage`, used by `audit`
+  (`location_count`), `mark-tape-only` and `mark-reclaimable`.
 - **#420:** the short seal, once home2's writes show how much capacity they really use
   and the drive's behaviour past early warning is measured. It is a 1.x on-tape change:
   a CTO decision and a re-pin.
