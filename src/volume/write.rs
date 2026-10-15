@@ -4274,7 +4274,7 @@ fn check_fresh_write_contact_on(
             binding::chip_blank_proof(ev.mam)
         }
         (ContactOutcome::EmptyFileZero, Some(ev)) if live_on_cartridge.is_empty() => {
-            binding::verified_erase_blank_proof(ev.conn, ev.mam.serial.as_deref(), ev.this_contact)?
+            binding::verified_erase_blank_proof(ev.conn, ev.mam, ev.this_contact)?
         }
         _ => None,
     };
@@ -13144,6 +13144,7 @@ mod tests {
             mode: "short".into(),
             erased_at: "2026-10-15 00:00:00".into(),
             erase_contact_id: 7,
+            life_written_mib: None,
         };
         let unreadable = ContactOutcome::FileZeroUnreadable {
             error: "read: Input/output error (os error 5)".into(),
@@ -18421,6 +18422,26 @@ mod tests {
             }
         }
 
+        /// [`chip`], with the verbatim `sg_read_attr` capture a real read
+        /// leaves in `mam_journal` -- the text the lifetime-written figure
+        /// is journaled from (issue #444). The plain [`chip`] carries an
+        /// empty capture, which journals `ok = 0` and no parsed figure.
+        fn chip_reading(serial: &str, life_written_mib: i64) -> Detected {
+            let mut det = chip(Some(serial), Some(life_written_mib));
+            det.capture = MamCapture {
+                stdout: Some(
+                    format!(
+                        "Attribute values:\n  Total MiB written in medium life: \
+                         {life_written_mib}\n  Medium serial number: {serial}\n"
+                    )
+                    .into_bytes(),
+                ),
+                error: None,
+                ..MamCapture::default()
+            };
+            det
+        }
+
         fn padded(mut b: Vec<u8>) -> Vec<u8> {
             b.resize(b.len().div_ceil(BS) * BS, 0);
             b
@@ -18495,6 +18516,41 @@ mod tests {
             let config = config();
             let _drive = InjectedDrive::install(fake);
             let mut chip_fn = || chip(Some(serial), None);
+            let mut slot =
+                ContactSlot::empty().with_drive_identity(drive_identity::DriveIdentity {
+                    serial: Some("HUJ808A5L4".into()),
+                    vendor: Some("HP".into()),
+                    model: Some("Ultrium 6-SCSI".into()),
+                    firmware_rev: Some("35GD".into()),
+                });
+            let r = erase_with(
+                conn,
+                &config,
+                DEVICE,
+                EraseOptions {
+                    mode,
+                    confirm_label: Some(serial),
+                    dry_run: false,
+                    block_size: BS,
+                },
+                &mut slot,
+                &mut chip_fn,
+            );
+            slot.finish_result(r)
+        }
+
+        /// [`erase`], the chip reading `life_written_mib` MiB written in
+        /// its life at every read the erase takes (issue #444).
+        fn erase_reading(
+            conn: &Connection,
+            fake: &FakeTape,
+            mode: EraseMode,
+            serial: &str,
+            life_written_mib: i64,
+        ) -> Result<EraseReport> {
+            let config = config();
+            let _drive = InjectedDrive::install(fake);
+            let mut chip_fn = || chip_reading(serial, life_written_mib);
             let mut slot =
                 ContactSlot::empty().with_drive_identity(drive_identity::DriveIdentity {
                     serial: Some("HUJ808A5L4".into()),
@@ -18817,6 +18873,193 @@ mod tests {
 
             init_with(&conn, "BP-SLIP", &fake, &det, false, None)
                 .expect("the retry is still proven by the erase");
+        }
+
+        // ---- the chip's lifetime-written figure voids the erase proof (#444)
+
+        /// The proof cannot see another tool's writes: a foreign `mt weof`
+        /// plus data after it leaves File 0 EMPTY. The chip can: its
+        /// lifetime total of MiB written, journaled at the erase's verify
+        /// read, has grown. The erase then vouches for nothing.
+        #[test]
+        fn an_erase_is_void_once_the_chip_shows_more_written_since() {
+            for later in [8_i64, 9, 7 + 4096] {
+                let conn = crate::db::open_memory().unwrap();
+                let fake = foreign_tape();
+                erase_reading(&conn, &fake, EraseMode::Short, SERIAL, 7)
+                    .expect("the real erase runs, the chip reading 7 MiB written");
+                let before = fake.state().files.clone();
+
+                let msg = refusal(init_with(
+                    &conn,
+                    "BP-GREW",
+                    &fake,
+                    &chip_reading(SERIAL, later),
+                    false,
+                    None,
+                ));
+                assert!(
+                    msg.contains("File 0 is EMPTY") && msg.contains("--force"),
+                    "{later} MiB written after an erase that read 7: {msg}"
+                );
+                assert_eq!(volume_count(&conn), 0, "{later}: no volume row");
+                assert_eq!(fake.state().files, before, "{later}: tape untouched");
+            }
+        }
+
+        /// The positive control: the same erase, the chip reading the very
+        /// figure it read at the verify -- nothing was written since, so the
+        /// proof stands, and the record names the figure it stood on.
+        #[test]
+        fn an_erase_stands_while_the_chip_reads_the_figure_it_read_at_the_verify() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            erase_reading(&conn, &fake, EraseMode::Short, SERIAL, 7).expect("erased");
+
+            init_with(
+                &conn,
+                "BP-SAME",
+                &fake,
+                &chip_reading(SERIAL, 7),
+                false,
+                None,
+            )
+            .expect("7 MiB then, 7 MiB now: nothing was written");
+            let d = created_details(&conn, "BP-SAME");
+            assert_eq!(d["blank_proof"]["kind"], "verified_erase", "{d}");
+            assert_eq!(d["blank_proof"]["life_written_mib"], 7, "{d}");
+        }
+
+        /// A counter that went BACKWARDS is a different chip or a bad read,
+        /// not "nothing written": no proof.
+        #[test]
+        fn a_lifetime_figure_that_went_backwards_is_no_proof() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            erase_reading(&conn, &fake, EraseMode::Short, SERIAL, 7).expect("erased");
+            let msg = refusal(init_with(
+                &conn,
+                "BP-BACK",
+                &fake,
+                &chip_reading(SERIAL, 6),
+                false,
+                None,
+            ));
+            assert!(msg.contains("File 0 is EMPTY"), "{msg}");
+        }
+
+        /// A reading that should be there and is not is a reading that
+        /// cannot agree: fail closed whichever side lacks it. Only BOTH
+        /// lacking it is "no evidence either way" (below).
+        #[test]
+        fn a_lifetime_figure_missing_on_one_side_only_is_no_proof() {
+            // The erase journaled 7; the chip now reports no such attribute.
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            erase_reading(&conn, &fake, EraseMode::Short, SERIAL, 7).expect("erased");
+            let msg = refusal(init_with(
+                &conn,
+                "BP-GONE",
+                &fake,
+                &chip(Some(SERIAL), None),
+                false,
+                None,
+            ));
+            assert!(msg.contains("File 0 is EMPTY"), "gone now: {msg}");
+
+            // The erase journaled no figure (an empty capture, or a build
+            // that kept none); the chip now reports one.
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            erase(&conn, &fake, EraseMode::Short, SERIAL).expect("erased");
+            let msg = refusal(init_with(
+                &conn,
+                "BP-NEW",
+                &fake,
+                &chip_reading(SERIAL, 7),
+                false,
+                None,
+            ));
+            assert!(msg.contains("File 0 is EMPTY"), "unknown then: {msg}");
+        }
+
+        /// mhvtl reports no lifetime attributes at all: a capture that read
+        /// fine and carries no figure, then a chip with none. That is no
+        /// evidence either way, and the proof it has always had stands --
+        /// the only case where an absent figure does not refuse.
+        #[test]
+        fn no_lifetime_figure_on_either_side_leaves_the_proof_standing() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            let config = config();
+            {
+                let _drive = InjectedDrive::install(&fake);
+                let mut chip_fn = || {
+                    let mut det = chip(Some(SERIAL), None);
+                    det.capture = MamCapture {
+                        stdout: Some(
+                            format!("Attribute values:\n  Medium serial number: {SERIAL}\n")
+                                .into_bytes(),
+                        ),
+                        error: None,
+                        ..MamCapture::default()
+                    };
+                    det
+                };
+                let mut slot =
+                    ContactSlot::empty().with_drive_identity(drive_identity::DriveIdentity {
+                        serial: Some("HUJ808A5L4".into()),
+                        vendor: Some("HP".into()),
+                        model: Some("Ultrium 6-SCSI".into()),
+                        firmware_rev: Some("35GD".into()),
+                    });
+                let r = erase_with(
+                    &conn,
+                    &config,
+                    DEVICE,
+                    EraseOptions {
+                        mode: EraseMode::Short,
+                        confirm_label: Some(SERIAL),
+                        dry_run: false,
+                        block_size: BS,
+                    },
+                    &mut slot,
+                    &mut chip_fn,
+                );
+                slot.finish_result(r).expect("erased");
+            }
+            init_with(
+                &conn,
+                "BP-MHVTL",
+                &fake,
+                &chip(Some(SERIAL), None),
+                false,
+                None,
+            )
+            .expect("no figure at the erase, none now: no evidence either way");
+            let d = created_details(&conn, "BP-MHVTL");
+            assert_eq!(d["blank_proof"]["kind"], "verified_erase", "{d}");
+            assert!(d["blank_proof"]["life_written_mib"].is_null(), "{d}");
+        }
+
+        /// Voiding the proof returns the tape to the unproven state, not to
+        /// a worse one: `--force` is the way past it, as for any EMPTY File 0.
+        #[test]
+        fn a_voided_erase_proof_still_yields_to_force() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            erase_reading(&conn, &fake, EraseMode::Short, SERIAL, 7).expect("erased");
+            init_with(
+                &conn,
+                "BP-FORCED",
+                &fake,
+                &chip_reading(SERIAL, 8),
+                true,
+                None,
+            )
+            .expect("--force overrides the unproven EMPTY File 0 as it always did");
+            let d = created_details(&conn, "BP-FORCED");
+            assert!(d["blank_proof"].is_null(), "no proof was what allowed it: {d}");
         }
 
         /// Unproven stays refused: the same EMPTY tape, no erase on record.

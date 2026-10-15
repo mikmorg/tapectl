@@ -577,6 +577,11 @@ pub(crate) enum BlankProof {
         mode: String,
         erased_at: String,
         erase_contact_id: i64,
+        /// The chip's "Total MiB written in medium life" at the erase's
+        /// verify read AND now, which agreed (issue #444). `None`: neither
+        /// reading carried the attribute (mhvtl), which is no evidence
+        /// either way.
+        life_written_mib: Option<i64>,
     },
 }
 
@@ -619,12 +624,14 @@ impl BlankProof {
                 mode,
                 erased_at,
                 erase_contact_id,
+                life_written_mib,
             } => serde_json::json!({
                 "kind": "verified_erase",
                 "barcode": barcode,
                 "mode": mode,
                 "erased_at": erased_at,
                 "erase_contact_id": erase_contact_id,
+                "life_written_mib": life_written_mib,
             }),
         };
         serde_json::json!({ "blank_proof": proof }).to_string()
@@ -703,16 +710,32 @@ fn operation_may_write_the_medium(op: Operation) -> bool {
 ///    the operator on `--force` after any such slip. One that DID write
 ///    would have left File 0 as an ID thunk, not EMPTY, and this proof would
 ///    not be asked. Still-open (`outcome IS NULL`) contacts count: unknown.
+/// 6. The chip's lifetime-written figure has not moved since the erase
+///    (issue #444). Condition 5 sees only THIS catalog's contacts; another
+///    tool's `mt weof` plus data after it leaves File 0 EMPTY and leaves no
+///    contact here. The chip counts every write by every tool, and the
+///    erase journaled its reading at its verify hook
+///    ([`life_written_at_erase_verify`]). The figures must be EQUAL: more
+///    written since voids the proof, and a counter that went backwards is
+///    a different chip or a bad read, not "nothing written". A figure
+///    present on one side only is a reading that cannot agree, and also
+///    voids it. Only BOTH sides lacking it is "no evidence either way" and
+///    leaves the proof as it was: mhvtl reports no lifetime attributes at
+///    all, and refusing there would end the proof on the only drive the
+///    gate can run.
 ///
 /// A write that left no contact row, or whose cartridge could not be
-/// identified, is not seen; that is this proof's stated limit (the File 0
-/// probe, which just read EMPTY, is the other half of it).
+/// identified, is not seen by 5; 6 closes that for a drive that keeps the
+/// counter (the File 0 probe, which just read EMPTY, is the rest of it).
+/// The counter is MiB, so a write under a MiB can still read equal where
+/// the drive floors; the `initialization_count` tightening waits for a
+/// real-drive measurement (issue #444).
 pub(crate) fn verified_erase_blank_proof(
     conn: &Connection,
-    serial: Option<&str>,
+    mam: &MamInfo,
     this_contact: Option<i64>,
 ) -> Result<Option<BlankProof>> {
-    let Some(serial) = serial else {
+    let Some(serial) = mam.serial.as_deref() else {
         return Ok(None);
     };
     let Some(cartridge) = select_cartridge(conn, "serial_number", serial)? else {
@@ -780,12 +803,48 @@ pub(crate) fn verified_erase_blank_proof(
     if wrote_since > 0 {
         return Ok(None);
     }
+    let life_written_mib = match (
+        life_written_at_erase_verify(conn, erase_contact_id)?,
+        mam.life_written_mib_raw,
+    ) {
+        (None, None) => None,
+        (Some(then), Some(now)) if then == now => Some(now),
+        _ => return Ok(None),
+    };
     Ok(Some(BlankProof::VerifiedErase {
         barcode: cartridge.barcode,
         mode: mode.to_string(),
         erased_at,
         erase_contact_id,
+        life_written_mib,
     }))
+}
+
+/// The chip's "Total MiB written in medium life" as the erase's verify read
+/// journaled it (issue #444): the newest `cartridge_erase_verify` row of
+/// that erase contact that read cleanly, its `life_written` attribute.
+/// `None` when there is no such row (the journal is best-effort, and a row
+/// is written only for the contact that took the read) or the row carries
+/// no integer figure there (mhvtl).
+fn life_written_at_erase_verify(conn: &Connection, erase_contact_id: i64) -> Result<Option<i64>> {
+    let parsed: Option<Option<String>> = conn
+        .query_row(
+            "SELECT parsed_json FROM mam_journal
+             WHERE contact_id = ?1 AND hook = ?2 AND ok = 1
+             ORDER BY id DESC LIMIT 1",
+            params![
+                erase_contact_id,
+                crate::tape::mam_journal::Hook::CartridgeEraseVerify.as_str()
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(Some(parsed)) = parsed else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str::<serde_json::Value>(&parsed)
+        .ok()
+        .and_then(|v| v["life_written"]["value"].as_i64()))
 }
 
 /// Refuse to bind a cartridge the operator has declared unfit (ADR-0011).
