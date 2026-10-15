@@ -202,6 +202,8 @@ tapectl volume retire [OPTIONS] <LABEL>
 
 Read encrypted slices from a volume into staging (then use `volume write` to write them)
 
+Reads the unit's slices off the loaded tape, checks each against its recorded hash, and records where it put them, so `volume write` can write them to another cartridge without the source directory. Every version of the unit on the volume is read except those marked reclaimable or purged; `--version` reads one version, whatever its state. The staging directory is checked for room before the first slice is read, and a read that does not finish removes what it wrote.
+
 ```text
 tapectl volume read-slices [OPTIONS] --from <FROM> --unit <UNIT>
 ```

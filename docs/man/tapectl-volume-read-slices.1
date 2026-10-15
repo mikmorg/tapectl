@@ -4,9 +4,11 @@
 .SH NAME
 tapectl\-volume\-read\-slices \- Read encrypted slices from a volume into staging (then use `volume write` to write them)
 .SH SYNOPSIS
-\fBtapectl volume read\-slices\fR <\fB\-\-from\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl volume read\-slices\fR <\fB\-\-from\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-version\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Read encrypted slices from a volume into staging (then use `volume write` to write them)
+.PP
+Reads the unit\*(Aqs slices off the loaded tape, checks each against its recorded hash, and records where it put them, so `volume write` can write them to another cartridge without the source directory. Every version of the unit on the volume is read except those marked reclaimable or purged; `\-\-version` reads one version, whatever its state. The staging directory is checked for room before the first slice is read, and a read that does not finish removes what it wrote.
 .SH OPTIONS
 .TP
 \fB\-\-from\fR \fI<FROM>\fR
@@ -21,11 +23,14 @@ Show what would be done without making changes. Commands that cannot preview ref
 \fB\-\-unit\fR \fI<UNIT>\fR
 Unit name to read
 .TP
-\fB\-\-device\fR \fI<DEVICE>\fR
-Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
-.TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
+.TP
+\fB\-\-version\fR \fI<N>\fR
+Read only this version of the unit (a reclaimable or purged version is read when named). Without it, every version on the volume except the reclaimable and purged ones is read
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
