@@ -1843,10 +1843,16 @@ mod tests {
         // evict some of the warmed pages on its own, which is not the drop's
         // doing.
         let resident = || crate::dar::resident_map(&big);
+        // A kernel that caches in large folios (up to 2 MiB) cannot drop part
+        // of one: DONTNEED leaves a folio the range only partly covers. So
+        // below the cut, every page under the last 2 MiB boundary must be
+        // gone; the partial folio at the cut may stay.
+        let folio = ((2u64 << 20) / page) as usize;
         let gone_below = |at: u64, before: &[bool]| {
             let map = resident();
             let cut = (at / page) as usize;
-            map[..cut].iter().all(|r| !r)
+            let whole = cut / folio * folio;
+            map[..whole].iter().all(|r| !r)
                 && map[cut..]
                     .iter()
                     .zip(&before[cut..])

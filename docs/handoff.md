@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 runs 1.0.0. That install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgrades it to 1.1.1). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -301,8 +301,10 @@ On home2, inside tmux, with no tapectl command running (`tapectl status`):
 1. **Back up the catalog with 1.1.0:** `tapectl-op db backup` (or let the daily backup run first).
 2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.1.1`.
 3. **Build and install:** `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 3 --to 3`.
-4. **Step 7 again** (`--from 7 --to 7`): it writes the home pointer `/etc/tapectl/home`, so a
-   plain `tapectl status` works from your own account (#437). It also checks that as you.
+4. **Step 7 again** (`--from 7 --to 7`): it finds the home initialised, skips init, and goes on
+   to the ops-group block, which now writes the home pointer `/etc/tapectl/home`, so a plain
+   `tapectl status` works from your own account (#437), and checks that as you. Like the
+   group and ACL steps there, the pointer needs root sudo: expect your password prompt.
 5. **Step 14 again** (`--from 14 --to 14`): it re-renders `tapectl-op`, which now runs tape
    commands at raised priority (#432; one sudo prompt where root sudo asks for one), and the
    drive-poll unit with `Nice=` / `IOSchedulingClass=`.
