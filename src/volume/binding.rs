@@ -82,6 +82,7 @@ use crate::cli::operations::{retire_impacts, RetireImpact};
 use crate::db::events;
 use crate::error::{Result, TapectlError};
 use crate::media::Generation;
+use crate::tape::contact::Operation;
 use crate::tape::mam::MamInfo;
 
 /// The `cartridges` columns `volume init` needs, for the row it matched.
@@ -535,6 +536,254 @@ pub(crate) fn live_volumes_on_serial(
         .query_map(params![serial], |r| r.get(0))?
         .collect::<std::result::Result<Vec<String>, _>>()?;
     Ok(labels)
+}
+
+/// Evidence, other than File 0 itself, that a tape File 0 could not prove
+/// blank IS blank (issue #434; ADR-0012 amendment 2026-10-15, item 57).
+///
+/// ADR-0003 fails closed: a File 0 that cannot be read, or reads EMPTY, is
+/// not consent to write, and `--force` was the way past it. Item 57 narrows
+/// that BY EVIDENCE, for exactly two cases, each paired with the one File 0
+/// outcome it explains:
+///
+/// - [`BlankProof::Chip`] explains an UNREADABLE File 0. A cartridge no drive
+///   ever wrote has no end-of-data mark at its beginning, so the blank probe
+///   cannot prove it blank and st fails the read with the same EIO a
+///   damaged recorded tape gives; the chip's lifetime totals reading zero
+///   MiB written say nothing was ever recorded.
+/// - [`BlankProof::VerifiedErase`] explains an EMPTY File 0. The short
+///   `cartridge erase` leaves a filemark at the beginning of the tape, which
+///   no read can tell from someone else's filemark; this catalog's own
+///   record of having erased THIS cartridge and read it back, with no write
+///   to it since, says whose filemark it is.
+///
+/// Neither reaches a File 0 that READS as something (a mismatch, a sealed
+/// volume), and neither is consulted for a cartridge the catalog binds to a
+/// live volume. They are consulted only where the probe would otherwise
+/// refuse. Every other tape refuses exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BlankProof {
+    /// The MAM lifetime totals read zero MiB written, from a read that also
+    /// named the cartridge.
+    Chip {
+        serial: String,
+        life_written_mib: i64,
+    },
+    /// This catalog's `cartridge erase` of the cartridge with this chip
+    /// serial, verified by reading the tape back, with no write contact on
+    /// it since.
+    VerifiedErase {
+        barcode: String,
+        mode: String,
+        erased_at: String,
+        erase_contact_id: i64,
+    },
+}
+
+impl BlankProof {
+    /// The one line the operator sees, and the log carries.
+    pub(crate) fn operator_line(&self) -> String {
+        match self {
+            BlankProof::Chip {
+                life_written_mib, ..
+            } => format!(
+                "blank proven by the chip: {life_written_mib} MiB ever written \
+                 (the cartridge's lifetime total) -- no --force needed"
+            ),
+            BlankProof::VerifiedErase {
+                barcode,
+                erased_at,
+                mode,
+                ..
+            } => format!(
+                "blank proven by this catalog's verified erase on {erased_at} UTC \
+                 (cartridge {barcode}, {mode} erase, nothing written to it since) -- \
+                 no --force needed"
+            ),
+        }
+    }
+
+    /// The proof as the `created` event's details (`{"blank_proof": ...}`).
+    pub(crate) fn details_json(&self) -> String {
+        let proof = match self {
+            BlankProof::Chip {
+                serial,
+                life_written_mib,
+            } => serde_json::json!({
+                "kind": "chip",
+                "chip_serial": serial,
+                "life_written_mib": life_written_mib,
+            }),
+            BlankProof::VerifiedErase {
+                barcode,
+                mode,
+                erased_at,
+                erase_contact_id,
+            } => serde_json::json!({
+                "kind": "verified_erase",
+                "barcode": barcode,
+                "mode": mode,
+                "erased_at": erased_at,
+                "erase_contact_id": erase_contact_id,
+            }),
+        };
+        serde_json::json!({ "blank_proof": proof }).to_string()
+    }
+}
+
+/// The chip proof: the lifetime total of MiB written reads zero, in a read
+/// that also named the cartridge. Pure on the reading `volume init` already
+/// holds -- there is no second MAM read. A read that failed, or that lacks
+/// the attribute (mhvtl reports none), or that named no serial, proves
+/// nothing: fail closed.
+pub(crate) fn chip_blank_proof(mam: &MamInfo) -> Option<BlankProof> {
+    match (mam.serial.as_deref(), mam.life_written_mib_raw) {
+        (Some(serial), Some(0)) => Some(BlankProof::Chip {
+            serial: serial.to_string(),
+            life_written_mib: 0,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether a contact of this kind can write to the medium. Exhaustive, no
+/// wildcard: a new tape-touching command is a decision here, never a
+/// default -- the catalog proof counts a contact that WROTE as the end of
+/// the erase's word.
+///
+/// `volume write` is also the operation `volume compact-write`, `collection
+/// run` and `quick-archive` record. `volume compact`'s first step reads;
+/// its second is a `volume write` contact. A later `cartridge erase` is not
+/// a write here: a verified one is itself the newest proof, and one that
+/// found the tape already EMPTY (or only identified it) wrote nothing.
+fn operation_may_write_the_medium(op: Operation) -> bool {
+    match op {
+        Operation::VolumeInit | Operation::VolumeWrite | Operation::VolumeResume => true,
+        Operation::VolumeVerify
+        | Operation::VolumeIdentify
+        | Operation::VolumeReadSlices
+        | Operation::VolumeCompactRead
+        | Operation::VolumeCompact
+        | Operation::RestoreUnit
+        | Operation::RestoreVolume
+        | Operation::RestoreRawVolume
+        | Operation::CatalogRebuild
+        | Operation::DrivePoll
+        | Operation::CartridgeErase => false,
+    }
+}
+
+/// The catalog proof, for an EMPTY File 0: this catalog holds a verified
+/// SHORT `cartridge erase` of the cartridge whose chip serial is `serial`,
+/// and no write contact on that cartridge followed it.
+///
+/// What counts, precisely (the SQL is quoted in the issue's report):
+///
+/// 1. The cartridge row is the one whose `serial_number` is `serial` -- the
+///    chip's word, never a typed barcode.
+/// 2. Its NEWEST `erased` event (`events`, `entity_type = 'cartridge'`)
+///    carries `details` naming a `contact_id` and a `mode`. `cartridge
+///    mark-erased` writes the same event with NO details: the operator's
+///    statement, not a read-back, and it proves nothing. Only `cartridge
+///    erase` records the contact, and only after its read-back passed.
+///    Newest, so a later `mark-erased` voids an earlier erase.
+/// 3. `mode` is `short`. A long erase leaves the tape blank, which proves
+///    itself; an EMPTY File 0 after one is a filemark written since.
+/// 4. That contact is a `cartridge erase` contact on this cartridge that
+///    closed `ok`.
+/// 5. No contact on this cartridge with a LATER id (ids, not times: two
+///    contacts can share a second) is a write operation
+///    ([`operation_may_write_the_medium`]) that did not close `failed`,
+///    leaving out `this_contact` -- the contact now asking, which is open
+///    and already attached to the cartridge. A `failed` write contact is an
+///    init that refused or died before it opened the tape (a wrong
+///    generation, a name that matches nothing); counting it would strand
+///    the operator on `--force` after any such slip. One that DID write
+///    would have left File 0 as an ID thunk, not EMPTY, and this proof would
+///    not be asked. Still-open (`outcome IS NULL`) contacts count: unknown.
+///
+/// A write that left no contact row, or whose cartridge could not be
+/// identified, is not seen; that is this proof's stated limit (the File 0
+/// probe, which just read EMPTY, is the other half of it).
+pub(crate) fn verified_erase_blank_proof(
+    conn: &Connection,
+    serial: Option<&str>,
+    this_contact: Option<i64>,
+) -> Result<Option<BlankProof>> {
+    let Some(serial) = serial else {
+        return Ok(None);
+    };
+    let Some(cartridge) = select_cartridge(conn, "serial_number", serial)? else {
+        return Ok(None);
+    };
+    let newest: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT timestamp, details FROM events
+             WHERE entity_type = 'cartridge' AND entity_id = ?1 AND action = 'erased'
+             ORDER BY id DESC LIMIT 1",
+            params![cartridge.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((erased_at, Some(details))) = newest else {
+        return Ok(None);
+    };
+    let Ok(details) = serde_json::from_str::<serde_json::Value>(&details) else {
+        return Ok(None);
+    };
+    let (Some(erase_contact_id), Some(mode)) =
+        (details["contact_id"].as_i64(), details["mode"].as_str())
+    else {
+        return Ok(None);
+    };
+    if mode != "short" {
+        return Ok(None);
+    }
+    let erase_contact: Option<(String, Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT operation, outcome, cartridge_id FROM cartridge_contacts WHERE id = ?1",
+            params![erase_contact_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let verified = matches!(
+        &erase_contact,
+        Some((op, Some(outcome), Some(cid)))
+            if op == Operation::CartridgeErase.as_str()
+                && outcome == crate::tape::contact::OUTCOME_OK
+                && *cid == cartridge.id
+    );
+    if !verified {
+        return Ok(None);
+    }
+    let writers = Operation::ALL
+        .iter()
+        .copied()
+        .filter(|op| operation_may_write_the_medium(*op))
+        .map(|op| format!("'{}'", op.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let wrote_since: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM cartridge_contacts
+             WHERE cartridge_id = ?1 AND id > ?2
+               AND operation IN ({writers})
+               AND (outcome IS NULL OR outcome <> '{failed}')
+               AND (?3 IS NULL OR id <> ?3)",
+            failed = crate::tape::contact::OUTCOME_FAILED
+        ),
+        params![cartridge.id, erase_contact_id, this_contact],
+        |r| r.get(0),
+    )?;
+    if wrote_since > 0 {
+        return Ok(None);
+    }
+    Ok(Some(BlankProof::VerifiedErase {
+        barcode: cartridge.barcode,
+        mode: mode.to_string(),
+        erased_at,
+        erase_contact_id,
+    }))
 }
 
 /// Refuse to bind a cartridge the operator has declared unfit (ADR-0011).

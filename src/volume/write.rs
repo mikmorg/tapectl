@@ -497,14 +497,28 @@ fn volume_init_in_contact<'c>(
     // Issue #400: what the catalog says is on this cartridge, for the one
     // outcome it decides — an unreadable File 0.
     let live_on_cartridge = binding::live_volumes_on_serial(conn, serial)?;
-    check_fresh_write_contact_on(
+    // Issue #434 (ADR-0012 amendment 2026-10-15, item 57): where File 0
+    // cannot prove the tape blank, the chip reading already held in `det`
+    // (no second MAM read) or this catalog's own verified erase may.
+    let blank_proof = check_fresh_write_contact_on(
         store,
         label,
         &candidate_uuid,
         None,
         force,
         &live_on_cartridge,
+        Some(BlankEvidence {
+            conn,
+            mam: &det.mam,
+            this_contact: contact.id(),
+        }),
     )?;
+    if let Some(proof) = &blank_proof {
+        // ONE line, on stderr where the operator is, and the same words in
+        // the log. Not a `warn!`: a proof is not an override.
+        eprintln!("{label}: {}", proof.operator_line());
+        info!(label, proof = %proof.operator_line(), "blank proven without --force");
+    }
     // The check above read File 0 (and possibly moved the physical head on
     // real tape); undo that before the real write, which must start at BOT
     // exactly like an untouched fresh session would (`reposition_for_resume`'s
@@ -539,7 +553,27 @@ fn volume_init_in_contact<'c>(
         generation,
         &det.mam,
     )?;
-    events::log_created(&tx, "volume", volume_id, label, None)?;
+    match &blank_proof {
+        None => {
+            events::log_created(&tx, "volume", volume_id, label, None)?;
+        }
+        // The decision and its evidence, on the volume's own `created`
+        // event: the shape `log_created` writes, plus details.
+        Some(proof) => {
+            events::log_event(
+                &tx,
+                "volume",
+                volume_id,
+                Some(label),
+                "created",
+                None,
+                None,
+                None,
+                Some(&proof.details_json()),
+                None,
+            )?;
+        }
+    }
     tx.commit()?;
     // Issue #376: the volume's session lock, from the moment its row exists
     // until File 0 is on tape and this function returns. Nothing else can
@@ -1695,6 +1729,10 @@ fn volume_write_in_contact<'c>(
     // Issue #400: the live volumes on this cartridge other than the one
     // being written (an `initialized` volume is never live).
     let live_on_cartridge = binding::live_volumes_on_serial(conn, det.mam.serial.as_deref())?;
+    // No blank proof here (issue #434, ADR-0012 item 57 is `volume init`'s):
+    // this volume's File 0 was written by its own init, so a File 0 that now
+    // cannot be read or reads EMPTY is a change since, which only `--force`
+    // may call expendable.
     check_fresh_write_contact_on(
         store,
         label,
@@ -1702,6 +1740,7 @@ fn volume_write_in_contact<'c>(
         seal_position,
         force,
         &live_on_cartridge,
+        None,
     )?;
     // Undo the position change the read-based check above made (TapeStore's
     // read_file leaves the head after the file it read) — the write below
@@ -3972,15 +4011,18 @@ fn seal_recorded_refusal(conn: &Connection, label: &str, volume_id: i64) -> Resu
     Ok(msg)
 }
 
-/// How a cartridge is erased for reuse — the one wording every message that
-/// names the step uses (issue #417), with [`NEVER_DEGAUSS`] beside it. A
-/// long erase leaves the tape blank (`volume init` proceeds); a filemark at
-/// BOT leaves File 0 EMPTY (`volume init --force`), the old bytes past it
-/// unreachable but not overwritten.
+/// How a cartridge is erased for reuse BY HAND — the one wording every message
+/// that names the step uses (issue #417), with [`NEVER_DEGAUSS`] beside it,
+/// and always after `tapectl cartridge erase`, which is the better way: it
+/// reads the tape back and records that, and `volume init` then needs no
+/// `--force` (issue #434). By hand, a long erase leaves the tape blank
+/// (`volume init` proceeds); a filemark at BOT leaves File 0 EMPTY, which
+/// `volume init` takes only with `--force` -- nothing recorded that filemark
+/// as the erase's -- the old bytes past it unreachable but not overwritten.
 pub(crate) const ERASE_IN_THE_DRIVE: &str = "erase the tape in the drive (a long erase, \
      `mt -f <device> erase`, takes hours on real LTO; a filemark at its start, \
-     `mt -f <device> rewind; mt -f <device> weof 1`, takes seconds and then needs \
-     `volume init --force`)";
+     `mt -f <device> rewind; mt -f <device> weof 1`, takes seconds, and \
+     `volume init` then needs `--force` unless `tapectl cartridge erase` did it)";
 
 /// Why the erase is in the drive (issue #417): an LTO cartridge carries
 /// factory-written servo tracks that a bulk eraser (degausser) wipes, and no
@@ -4012,7 +4054,7 @@ fn decide_fresh_write_contact(
     volume_uuid: &str,
     allow_overwrite: bool,
 ) -> Result<()> {
-    decide_fresh_write_contact_on(outcome, label, volume_uuid, allow_overwrite, &[])
+    decide_fresh_write_contact_on(outcome, label, volume_uuid, allow_overwrite, &[], None)
 }
 
 /// [`decide_fresh_write_contact`], knowing `live_on_cartridge`: the live
@@ -4021,12 +4063,23 @@ fn decide_fresh_write_contact(
 /// [`ContactOutcome::FileZeroUnreadable`] (issue #400): an unreadable File 0
 /// on a cartridge the catalog says holds a live volume is that volume, not
 /// a blank, and `--force` is not consulted.
+///
+/// And knowing `proof` (issue #434; ADR-0012 amendment 2026-10-15, item 57):
+/// evidence other than File 0 that the tape is blank, which turns the two
+/// "cannot prove blank" refusals into consent -- a [`binding::BlankProof::Chip`]
+/// for an unreadable File 0, a [`binding::BlankProof::VerifiedErase`] for an
+/// EMPTY one, each only for the outcome it explains. It is gathered by the
+/// caller ([`check_fresh_write_contact_on`]) and only for those two
+/// outcomes; a mismatched pairing is no proof here either. The sealed and
+/// mismatch refusals never look at it, and a live volume on the cartridge
+/// is refused before it is consulted.
 fn decide_fresh_write_contact_on(
     outcome: &ContactOutcome,
     label: &str,
     volume_uuid: &str,
     allow_overwrite: bool,
     live_on_cartridge: &[String],
+    proof: Option<&binding::BlankProof>,
 ) -> Result<()> {
     match outcome {
         ContactOutcome::Blank | ContactOutcome::Matches => Ok(()),
@@ -4055,6 +4108,13 @@ fn decide_fresh_write_contact_on(
                      mark-erased <barcode>`); if this cartridge is to be reused, \
                      {ERASE_IN_THE_DRIVE}. {NEVER_DEGAUSS}"
                 )));
+            }
+            // Issue #434: a chip that reads zero MiB ever written is the
+            // never-written cartridge, whose missing EOD is why File 0 could
+            // not prove blank. Nothing was overridden, so no override is
+            // logged; the caller names the proof.
+            if matches!(proof, Some(binding::BlankProof::Chip { .. })) {
+                return Ok(());
             }
             if allow_overwrite {
                 warn!(
@@ -4113,6 +4173,11 @@ fn decide_fresh_write_contact_on(
         // not corrupt, so "a DIFFERENT volume" / "wrong physical cartridge"
         // would send the operator hunting for a tape they already hold.
         ContactOutcome::EmptyFileZero => {
+            // Issue #434: the filemark is the one this catalog's own verified
+            // `cartridge erase` left. Nothing was overridden.
+            if matches!(proof, Some(binding::BlankProof::VerifiedErase { .. })) {
+                return Ok(());
+            }
             if allow_overwrite {
                 warn!(
                     label,
@@ -4157,11 +4222,29 @@ fn check_fresh_write_contact(
         seal_position,
         allow_overwrite,
         &[],
+        None,
     )
+    .map(|_| ())
+}
+
+/// What `volume init` can weigh a "cannot prove blank" File 0 against
+/// (issue #434): the reading it already holds, the catalog, and the id of
+/// its own open contact (which the catalog proof must not count against
+/// itself).
+pub(crate) struct BlankEvidence<'a> {
+    pub conn: &'a Connection,
+    pub mam: &'a crate::tape::mam::MamInfo,
+    pub this_contact: Option<i64>,
 }
 
 /// [`check_fresh_write_contact`] knowing the live volumes on the loaded
-/// cartridge ([`decide_fresh_write_contact_on`], issue #400).
+/// cartridge ([`decide_fresh_write_contact_on`], issue #400), and -- given
+/// `evidence` -- consulting a blank proof, but ONLY when the probe found
+/// File 0 unreadable or EMPTY and the catalog binds no live volume to the
+/// cartridge: the two refusals ADR-0012's item 57 narrows by evidence.
+/// Returns the proof when it is what allowed the write, so the caller can
+/// say so and record it; `None` when the tape proved itself (or `--force`
+/// overrode a refusal no proof covered).
 fn check_fresh_write_contact_on(
     store: &mut dyn Store,
     label: &str,
@@ -4169,15 +4252,27 @@ fn check_fresh_write_contact_on(
     seal_position: Option<u32>,
     allow_overwrite: bool,
     live_on_cartridge: &[String],
-) -> Result<()> {
+    evidence: Option<BlankEvidence<'_>>,
+) -> Result<Option<binding::BlankProof>> {
     let outcome = check_tape_contact(store, label, volume_uuid, seal_position);
+    let proof = match (&outcome, &evidence) {
+        (ContactOutcome::FileZeroUnreadable { .. }, Some(ev)) if live_on_cartridge.is_empty() => {
+            binding::chip_blank_proof(ev.mam)
+        }
+        (ContactOutcome::EmptyFileZero, Some(ev)) if live_on_cartridge.is_empty() => {
+            binding::verified_erase_blank_proof(ev.conn, ev.mam.serial.as_deref(), ev.this_contact)?
+        }
+        _ => None,
+    };
     decide_fresh_write_contact_on(
         &outcome,
         label,
         volume_uuid,
         allow_overwrite,
         live_on_cartridge,
-    )
+        proof.as_ref(),
+    )?;
+    Ok(proof)
 }
 
 /// Verify a volume via the v2 keyless chain walk
@@ -12542,16 +12637,16 @@ mod tests {
         let outcome = ContactOutcome::FileZeroUnreadable {
             error: "read: Input/output error (os error 5)".into(),
         };
-        let err = decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, false, &[])
+        let err = decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, false, &[], None)
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("not provably") && err.contains("--force"),
             "{err}"
         );
-        decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, true, &[]).unwrap();
+        decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, true, &[], None).unwrap();
         let live = vec!["L6-0001".to_string()];
-        let err = decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, true, &live)
+        let err = decide_fresh_write_contact_on(&outcome, FW_LABEL, FW_UUID, true, &live, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -17521,5 +17616,471 @@ mod tests {
         assert!(v < r, "{done}");
         let facts = abort_consent_facts("L6-0001", &["interrupted"], 3, &yes).join("\n");
         assert!(facts.contains("every byte"), "{facts}");
+    }
+
+    // ---- issue #434 (ADR-0012 amendment 2026-10-15, item 57): a blank
+    // cartridge needs no --force at `volume init` when its blankness is
+    // PROVEN. Driven through `volume_init_in_contact` with a real contact on
+    // the in-memory tape, the chip answered by the test, and -- for the
+    // catalog proof -- the REAL `cartridge erase` run on the same connection
+    // and the same tape, never a hand-written event: a row the real erase
+    // does not write could satisfy a query the real erase never would.
+    mod blank_proof_at_init {
+        use super::*;
+        use crate::media::Generation;
+        use crate::store::injected::InjectedDrive;
+        use crate::store::EraseMode;
+        use crate::tape::fake::FakeTape;
+        use crate::tape::mam::MamCapture;
+        use crate::tape::media_detect::{DetectSource, Detected};
+        use crate::volume::erase::{erase_with, EraseOptions, EraseReport};
+
+        const BS: usize = 4096;
+        const DEVICE: &str = "/nonexistent/tapectl-blank-proof-nst";
+        const SERIAL: &str = "EW7VWMVKF6";
+
+        fn config() -> Config {
+            let mut config = Config::default();
+            config.backends.lto.push(crate::config::LtoBackendConfig {
+                name: "lto6".into(),
+                device_tape: DEVICE.into(),
+                device_sg: "/nonexistent/tapectl-blank-proof-sg".into(),
+                generation: "LTO-6".into(),
+                capacity_override: None,
+                fill_ceiling: 1.0,
+                enospc_buffer: "0".into(),
+            });
+            config
+        }
+
+        /// What the chip read says: its serial and its lifetime-written total.
+        fn chip(serial: Option<&str>, life_written_mib: Option<i64>) -> Detected {
+            Detected {
+                generation: Some(Generation::Lto6),
+                code: Some(0x5a),
+                source: DetectSource::MamMedium,
+                mam: MamInfo {
+                    serial: serial.map(str::to_string),
+                    load_count: Some(1),
+                    life_written_mib_raw: life_written_mib,
+                    ..MamInfo::default()
+                },
+                capture: MamCapture::default(),
+            }
+        }
+
+        fn padded(mut b: Vec<u8>) -> Vec<u8> {
+            b.resize(b.len().div_ceil(BS) * BS, 0);
+            b
+        }
+
+        /// A recorded tape of someone else's whose File 0 cannot be read and
+        /// which does not prove itself blank: what a never-written cartridge
+        /// looks like to the probe (no EOD at its beginning, EIO on the read).
+        fn unreadable_tape() -> FakeTape {
+            let fake = FakeTape::with_files(vec![padded(vec![1u8; 10]), padded(vec![2u8; 10])], BS);
+            fake.state().unreadable = vec![0];
+            fake
+        }
+
+        /// File 0 is only a filemark: what the short erase leaves.
+        fn empty_file_zero_tape() -> FakeTape {
+            FakeTape::with_files(vec![Vec::new()], BS)
+        }
+
+        fn foreign_tape() -> FakeTape {
+            FakeTape::with_files(vec![padded(b"tar archive, not ours".to_vec())], BS)
+        }
+
+        fn init_with(
+            conn: &Connection,
+            label: &str,
+            fake: &FakeTape,
+            det: &Detected,
+            force: bool,
+            cartridge: Option<&str>,
+        ) -> Result<i64> {
+            let config = config();
+            let _drive = InjectedDrive::install(fake);
+            let backend = crate::config::resolve_lto_backend(&config, Some(DEVICE))?;
+            let drive_gen = backend.native_generation()?;
+            let mut slot = ContactSlot::empty();
+            let contact = slot.open(
+                conn,
+                &config,
+                Operation::VolumeInit,
+                DEVICE,
+                None,
+                Medium::Observed {
+                    backend,
+                    mam: &det.mam,
+                },
+            );
+            let r = volume_init_in_contact(
+                conn,
+                label,
+                DEVICE,
+                BS,
+                force,
+                None,
+                cartridge,
+                backend,
+                drive_gen,
+                det,
+                contact,
+                ContactStore::Device,
+            );
+            slot.finish_result(r)
+        }
+
+        /// The REAL `cartridge erase`, over `fake`, the chip answering `serial`.
+        fn erase(
+            conn: &Connection,
+            fake: &FakeTape,
+            mode: EraseMode,
+            serial: &str,
+        ) -> Result<EraseReport> {
+            let config = config();
+            let _drive = InjectedDrive::install(fake);
+            let mut chip_fn = || chip(Some(serial), None);
+            let mut slot =
+                ContactSlot::empty().with_drive_identity(drive_identity::DriveIdentity {
+                    serial: Some("HUJ808A5L4".into()),
+                    vendor: Some("HP".into()),
+                    model: Some("Ultrium 6-SCSI".into()),
+                    firmware_rev: Some("35GD".into()),
+                });
+            let r = erase_with(
+                conn,
+                &config,
+                DEVICE,
+                EraseOptions {
+                    mode,
+                    confirm_label: Some(serial),
+                    dry_run: false,
+                    block_size: BS,
+                },
+                &mut slot,
+                &mut chip_fn,
+            );
+            slot.finish_result(r)
+        }
+
+        fn refusal(r: Result<i64>) -> String {
+            r.expect_err("the init must refuse").to_string()
+        }
+
+        /// The `created` event's details for volume `label`, parsed.
+        fn created_details(conn: &Connection, label: &str) -> serde_json::Value {
+            let details: Option<String> = conn
+                .query_row(
+                    "SELECT details FROM events
+                     WHERE entity_type = 'volume' AND action = 'created' AND entity_label = ?1",
+                    params![label],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            details
+                .map(|d| serde_json::from_str(&d).expect("details is JSON"))
+                .unwrap_or(serde_json::Value::Null)
+        }
+
+        fn volume_count(conn: &Connection) -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM volumes", [], |r| r.get(0))
+                .unwrap()
+        }
+
+        fn file0_text(fake: &FakeTape) -> String {
+            String::from_utf8_lossy(&fake.state().files[0]).into_owned()
+        }
+
+        // ---- the chip proof -------------------------------------------
+
+        /// The routine case that needed `--force` on home2, 2026-10-14: a
+        /// brand-new cartridge. File 0 cannot be read and the tape does not
+        /// prove itself blank, but the chip says nothing was ever written.
+        #[test]
+        fn a_never_written_cartridge_inits_without_force_on_the_chips_word() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = unreadable_tape();
+            let det = chip(Some("SER-NEW"), Some(0));
+
+            let id = init_with(&conn, "BP-NEW", &fake, &det, false, None)
+                .expect("a chip that reads 0 MiB ever written proves the tape blank");
+
+            assert_eq!(volume_count(&conn), 1);
+            assert!(file0_text(&fake).contains("BP-NEW"), "File 0 was written");
+            let status: String = conn
+                .query_row("SELECT status FROM volumes WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(status, "initialized");
+            // The decision and its evidence are on the record.
+            let d = created_details(&conn, "BP-NEW");
+            assert_eq!(d["blank_proof"]["kind"], "chip", "{d}");
+            assert_eq!(d["blank_proof"]["life_written_mib"], 0, "{d}");
+        }
+
+        /// Negative controls for the chip proof: every reading that is not
+        /// a clean zero keeps today's refusal, the tape untouched.
+        #[test]
+        fn a_chip_that_does_not_read_zero_written_proves_nothing() {
+            for (what, det) in [
+                ("data was written", chip(Some("SER-USED"), Some(1))),
+                ("lots was written", chip(Some("SER-USED"), Some(41_230_117))),
+                (
+                    "the attribute is missing (mhvtl, a failed read)",
+                    chip(Some("SER-USED"), None),
+                ),
+                (
+                    "zero written but the read names no cartridge",
+                    chip(None, Some(0)),
+                ),
+            ] {
+                let conn = crate::db::open_memory().unwrap();
+                // A registered cartridge for the case that names no serial,
+                // so the refusal under test is the File 0 one, not the
+                // earlier "no medium serial".
+                conn.execute(
+                    "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                     VALUES ('BC-NAMED', 'LTO-6', 2500000000000, 'available')",
+                    [],
+                )
+                .unwrap();
+                let fake = unreadable_tape();
+                let before = fake.state().files.clone();
+                let msg = refusal(init_with(
+                    &conn,
+                    "BP-USED",
+                    &fake,
+                    &det,
+                    false,
+                    det.mam.serial.is_none().then_some("BC-NAMED"),
+                ));
+                assert!(
+                    msg.contains("not provably blank") && msg.contains("--force"),
+                    "{what}: {msg}"
+                );
+                assert_eq!(volume_count(&conn), 0, "{what}: no volume row");
+                assert_eq!(fake.state().files, before, "{what}: tape untouched");
+            }
+        }
+
+        /// The chip proof is consulted only where File 0 could not be read.
+        /// A File 0 that READS, as someone else's data, contradicts a chip
+        /// that says nothing was written: refused, as it always was.
+        #[test]
+        fn a_chip_proof_does_not_reach_a_file_zero_that_reads_as_something_else() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            let det = chip(Some("SER-NEW"), Some(0));
+            let msg = refusal(init_with(&conn, "BP-FOREIGN", &fake, &det, false, None));
+            assert!(msg.contains("DIFFERENT volume"), "{msg}");
+            assert_eq!(volume_count(&conn), 0);
+        }
+
+        /// ADR-0003 / issue #400: an unreadable File 0 on a cartridge the
+        /// catalog binds to a live volume is that volume, whatever the chip
+        /// says -- and no flag overwrites it.
+        #[test]
+        fn a_chip_proof_never_overrides_a_live_volume_on_the_cartridge() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+                 VALUES ('C1', 'LTO-6', 2500000000000, 'SER-LIVE', 'in_use')",
+                [],
+            )
+            .unwrap();
+            let cid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('L6-LIVE', 'lto', 'lto6', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id, identity_source)
+                 VALUES (?1, ?2, 'mam')",
+                params![cid, conn.last_insert_rowid()],
+            )
+            .unwrap();
+            let fake = unreadable_tape();
+            let det = chip(Some("SER-LIVE"), Some(0));
+            for force in [false, true] {
+                let msg = refusal(init_with(&conn, "BP-OVER", &fake, &det, force, None));
+                assert!(
+                    msg.contains("L6-LIVE") && msg.contains("--force cannot override"),
+                    "force={force}: {msg}"
+                );
+            }
+        }
+
+        /// `--force` and a proof together: the proof is what allowed it, and
+        /// the record says so instead of calling it an override.
+        #[test]
+        fn a_forced_init_over_a_proven_blank_names_the_proof() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = unreadable_tape();
+            let det = chip(Some("SER-NEW"), Some(0));
+            init_with(&conn, "BP-BOTH", &fake, &det, true, None).expect("forced and proven");
+            let d = created_details(&conn, "BP-BOTH");
+            assert_eq!(d["blank_proof"]["kind"], "chip", "{d}");
+        }
+
+        // ---- the catalog proof ----------------------------------------
+
+        /// The 2026-10-15 extension: after `cartridge erase` (the short one:
+        /// a filemark at BOT, File 0 EMPTY) the same catalog, the same chip,
+        /// no write in between -- `volume init` needs no `--force`.
+        #[test]
+        fn a_tape_this_catalog_erased_and_verified_inits_without_force() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            let report =
+                erase(&conn, &fake, EraseMode::Short, SERIAL).expect("the real erase runs");
+            assert_eq!(
+                report.medium_after,
+                Some(crate::volume::erase::MediumKind::Empty)
+            );
+
+            let det = chip(Some(SERIAL), None);
+            init_with(&conn, "BP-ERASED", &fake, &det, false, None)
+                .expect("a verified erase of this very cartridge, with no write since, is proof");
+
+            assert!(file0_text(&fake).contains("BP-ERASED"));
+            let d = created_details(&conn, "BP-ERASED");
+            assert_eq!(d["blank_proof"]["kind"], "verified_erase", "{d}");
+            assert_eq!(d["blank_proof"]["mode"], "short", "{d}");
+            assert!(d["blank_proof"]["erased_at"].is_string(), "{d}");
+        }
+
+        /// The erase is a proof only until something writes to the cartridge:
+        /// once a volume was initialised on it, a File 0 that is EMPTY AGAIN
+        /// is an unrecorded filemark, not the erase's.
+        #[test]
+        fn an_erase_followed_by_a_write_contact_is_no_longer_a_proof() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            erase(&conn, &fake, EraseMode::Short, SERIAL).unwrap();
+            let det = chip(Some(SERIAL), None);
+            init_with(&conn, "BP-FIRST", &fake, &det, false, None).expect("proven once");
+
+            // Out of band, with nothing recorded: a filemark at BOT again.
+            fake.state().files = vec![Vec::new()];
+
+            let msg = refusal(init_with(&conn, "BP-SECOND", &fake, &det, false, None));
+            assert!(
+                msg.contains("File 0 is EMPTY") && msg.contains("--force"),
+                "{msg}"
+            );
+        }
+
+        /// The erase of ANOTHER cartridge says nothing about this one.
+        #[test]
+        fn an_erase_of_a_different_serial_is_no_proof() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            erase(&conn, &fake, EraseMode::Short, "SERIAL-A").unwrap();
+
+            let det = chip(Some("SERIAL-B"), None);
+            let msg = refusal(init_with(&conn, "BP-OTHER", &fake, &det, false, None));
+            assert!(msg.contains("File 0 is EMPTY"), "{msg}");
+        }
+
+        /// `cartridge mark-erased` is the operator's word, written as the same
+        /// `erased` event with no details: it proves nothing about what is on
+        /// the tape.
+        #[test]
+        fn a_mark_erased_statement_is_no_proof() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+                 VALUES ('C1', 'LTO-6', 2500000000000, ?1, 'pending_erase')",
+                params![SERIAL],
+            )
+            .unwrap();
+            let cid = conn.last_insert_rowid();
+            let tx = conn.unchecked_transaction().unwrap();
+            crate::cli::operations::record_cartridge_erased(
+                &tx,
+                cid,
+                "C1",
+                "pending_erase",
+                &[],
+                "available",
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+
+            let fake = empty_file_zero_tape();
+            let det = chip(Some(SERIAL), None);
+            let msg = refusal(init_with(&conn, "BP-STATED", &fake, &det, false, None));
+            assert!(msg.contains("File 0 is EMPTY"), "{msg}");
+        }
+
+        /// A LONG erase leaves the tape blank, which proves itself. An EMPTY
+        /// File 0 after one means a filemark was written since -- the erase
+        /// does not vouch for that.
+        #[test]
+        fn a_long_erase_does_not_vouch_for_a_filemark_written_after_it() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            erase(&conn, &fake, EraseMode::Long, SERIAL).unwrap();
+            fake.state().files = vec![Vec::new()];
+
+            let det = chip(Some(SERIAL), None);
+            let msg = refusal(init_with(&conn, "BP-LONG", &fake, &det, false, None));
+            assert!(msg.contains("File 0 is EMPTY"), "{msg}");
+        }
+
+        /// An init that FAILED before it wrote anything (here: the wrong
+        /// generation of medium in the drive, a fact refusal that precedes
+        /// the tape) is not a write: the retry still has the proof. Without
+        /// this a routine slip after the erase would strand the operator on
+        /// `--force`.
+        #[test]
+        fn an_init_that_failed_before_the_tape_was_touched_does_not_spend_the_proof() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = foreign_tape();
+            erase(&conn, &fake, EraseMode::Short, SERIAL).unwrap();
+            let det = chip(Some(SERIAL), None);
+
+            let mut wrong = chip(Some(SERIAL), None);
+            wrong.generation = Some(Generation::Lto8);
+            wrong.code = Some(0x5c);
+            let msg = refusal(init_with(&conn, "BP-SLIP", &fake, &wrong, false, None));
+            assert!(!msg.contains("File 0"), "a slip before the tape: {msg}");
+            let failed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cartridge_contacts
+                     WHERE operation = 'volume init' AND outcome = 'failed'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(failed, 1, "the slip left a failed init contact on record");
+
+            init_with(&conn, "BP-SLIP", &fake, &det, false, None)
+                .expect("the retry is still proven by the erase");
+        }
+
+        /// Unproven stays refused: the same EMPTY tape, no erase on record.
+        #[test]
+        fn an_empty_file_zero_with_no_erase_on_record_still_refuses() {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = empty_file_zero_tape();
+            let det = chip(Some(SERIAL), Some(0));
+            // Even a chip reading zero does not vouch for an EMPTY File 0:
+            // a filemark is a write the chip's megabytes would not show.
+            let msg = refusal(init_with(&conn, "BP-UNPROVEN", &fake, &det, false, None));
+            assert!(
+                msg.contains("File 0 is EMPTY") && msg.contains("--force"),
+                "{msg}"
+            );
+            assert_eq!(volume_count(&conn), 0);
+        }
     }
 }
