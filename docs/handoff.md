@@ -292,6 +292,32 @@ same day:
 `audit` warns `escrow_kit_stale` after every write session: that is the cue for the next
 refresh.
 
+## (f) Upgrade home2 to 1.1.1, in place
+
+1.1.1 is a patch (`docs/releases/1.1.1.md`): no on-tape change, so no fresh start. It adds one
+catalog migration (036, a new table), applied the first time the new binary opens the catalog.
+On home2, inside tmux, with no tapectl command running (`tapectl status`):
+
+1. **Back up the catalog with 1.1.0:** `tapectl-op db backup` (or let the daily backup run first).
+2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.1.1`.
+3. **Build and install:** `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 3 --to 3`.
+4. **Step 7 again** (`--from 7 --to 7`): it writes the home pointer `/etc/tapectl/home`, so a
+   plain `tapectl status` works from your own account (#437). It also checks that as you.
+5. **Step 14 again** (`--from 14 --to 14`): it re-renders `tapectl-op`, which now runs tape
+   commands at raised priority (#432; one sudo prompt where root sudo asks for one), and the
+   drive-poll unit with `Nice=` / `IOSchedulingClass=`.
+6. **Look:** `tapectl status`, `tapectl-op drive status`, `tapectl-op audit` (the new
+   `location_count` check, #425, should be clean: keepsake is in two places).
+7. **Before the next write,** step 12's rehearsal proves the new binary on the drive (step 13
+   looks for its marker). A write through `tapectl-op volume write` directly does not check it.
+
+Your `[[backends.lto]]` keeps its explicit `device_sg`; it still wins and is still checked
+(#431). Removing the line (`tapectl-op config remove 'backends.lto[NAME].device_sg'`) lets
+tapectl derive it from `device_tape` on every load.
+
+Owed measurements: the next staging run's disk reads (#441: expect about one read of the
+source, was 1.7x) and a write's feed ratio with and without vm-desk1 busy (#432).
+
 ## (e) After: the backlog
 
 None of these blocks the fresh start. Each has an issue:
