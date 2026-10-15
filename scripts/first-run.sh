@@ -1543,14 +1543,12 @@ EOF
       run tc cartridge erase --device "$DEVICE" --confirm-label "$ERASE_WORD" || erc=$?
       [ "$erc" = 0 ] || die "cartridge erase exited $erc (2 refused, nothing written; 3 unverified; 4 failed part-way; 6 the read-back contradicts the erase): read its message above, then re-run scripts/first-run.sh --from 13"
       ok "the tape is erased, read back and recorded"
-      # Continue: init again. The short erase leaves File 0 EMPTY, which init
-      # refuses without --force (ADR-0003 fails closed); the erase just proved
-      # that is all the tape holds, and its label was typed, so --force here
-      # overrides exactly that and nothing else.
-      if ! run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE"; then
-        grep -q "File 0 is EMPTY" "$INIT_OUT" || die "volume init still refused after the erase — read the refusal above, then re-run scripts/first-run.sh --from 13"
-        run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" --force || die "volume init failed after the erase"
-      fi
+      # Continue: init again. The short erase leaves File 0 EMPTY, and this catalog
+      # just recorded the verified erase of this very cartridge with no write since:
+      # volume init takes that as proof of blank (ADR-0012 2026-10-15 item 57, #434),
+      # so no --force. If it still refuses, the proof did not hold -- say so, don't force.
+      run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" \
+        || die "volume init still refused after the erase — read the refusal above, then re-run scripts/first-run.sh --from 13"
     elif grep -qE "identifies a DIFFERENT volume|File 0 is EMPTY" "$INIT_OUT"; then
       # The only two refusals --force can override (write.rs
       # decide_fresh_write_contact: IdentityMismatch and EmptyFileZero).

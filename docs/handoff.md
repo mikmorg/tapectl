@@ -96,7 +96,8 @@ production cartridge.
    - `--confirm-label <the label>` exits 0: File 0 reads back EMPTY, the serial unchanged,
      and the catalog holds the cartridge `available` with an `erased` event and one
      `cartridge erase` contact; run again, it reports nothing to erase and exits 0;
-   - `volume init` then refuses the EMPTY File 0 and proceeds with `--force`.
+   - `volume init` then proceeds without `--force`, printing the verified-erase line
+     (1.1.1, ADR-0012 item 57; 1.1.0 needed `--force` here).
 
    The same tape in the home that wrote it (step 3's, if kept) must exit 2, naming `volume
    retire`. `--long` is not run on the real drive here: it takes hours; mhvtl proves it.
@@ -241,9 +242,9 @@ is what reuses it, and step 13 offers it at that refusal:
    `erased` event and the contact. A different exit than 0 stops step 13 with its meaning
    ([the table](troubleshooting.md#cartridge-erase-0-2-3-4-6-or-75)); nothing is recorded
    then, and re-running `--from 13` starts over.
-4. **Step 13 runs `volume init L6-0001` again.** File 0 is EMPTY, which init refuses
-   without `--force` (ADR-0003 fails closed: an empty File 0 is not provably blank), so
-   step 13 re-runs it with `--force` — the erase just proved that is all the tape holds.
+4. **Step 13 runs `volume init L6-0001` again.** File 0 is EMPTY; on 1.1.1 init takes
+   this catalog's record of the verified erase as proof of blank (ADR-0012 item 57) and
+   needs no `--force` (1.1.0 re-ran it with `--force`).
    Init binds the cartridge the erase registered (no auto-registration this time; its
    placeholder barcode is the serial, and `cartridge relabel <serial> <barcode>` names the
    sticker). The write follows. Then comes `volume verify L6-0001 --full`, the first full

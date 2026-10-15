@@ -2438,9 +2438,12 @@ tapectl cartridge erase --device "$TAPE" --confirm-label L6-0001   # unattended
 tapectl cartridge erase --device "$TAPE" --long             # the whole medium, hours
 ```
 
-After the default erase, `volume init` still refuses the EMPTY File 0 until
-you give it `--force` (ADR-0003 fails closed; [troubleshooting](troubleshooting.md#file-0-identifies-a-different-volume-or-is-empty)).
-After `--long` the tape is blank and `volume init` needs nothing. The exit
+After either erase `volume init` needs no `--force`. After the default short erase
+it reads File 0 as EMPTY and takes this catalog's record of the verified erase, with
+nothing written to the cartridge since, as the proof (ADR-0012 item 57; it prints
+`blank proven by this catalog's verified erase on <date>`). After `--long` the tape is
+blank. A by-hand `mt weof 1` records nothing and still needs `--force`
+([troubleshooting](troubleshooting.md#file-0-identifies-a-different-volume-or-is-empty)). The exit
 codes are in [troubleshooting](troubleshooting.md#cartridge-erase-0-2-3-4-6-or-75).
 Never degauss or bulk-erase an LTO cartridge: that destroys its factory servo
 tracks.

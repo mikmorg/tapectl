@@ -204,7 +204,7 @@ where the meaning is the same:
 
 | Exit | Meaning | What to do |
 |---|---|---|
-| 0 | **erased and verified**: File 0 reads back EMPTY (the default short erase) or blank (`--long`), the chip serial is unchanged, and the catalog records it. Also: a blank tape, or an EMPTY File 0 under the short erase (nothing to erase), and `--dry-run` | nothing; `volume init` comes next (with `--force` after a short erase, [below](#the-cartridge-already-carries-a-sealed-volume)) |
+| 0 | **erased and verified**: File 0 reads back EMPTY (the default short erase) or blank (`--long`), the chip serial is unchanged, and the catalog records it. Also: a blank tape, or an EMPTY File 0 under the short erase (nothing to erase), and `--dry-run` | nothing; `volume init` comes next and needs no `--force`: this catalog's record of the verified erase is the proof (ADR-0012 item 57) |
 | 2 | **refused, the tape untouched**: no cartridge, a write-protected one, a volume the catalog still holds (it names `volume retire`), a label that was not confirmed or does not match, a tape and catalog that disagree about which cartridge this is, the chip serial unreadable (the MAM read on `device_sg` failed: `tapectl volume identify` shows what the chip reports, `tapectl config check` checks the drive's `device_sg`), the chip naming a different cartridge just before the erase (one swapped while consent was asked), or a usage error | read the `error:` line, act on it, run the command again |
 | 3 | **unverified**: the erase ran, but the tape could not be reopened to read it back, File 0 could not be read back and the tape does not prove itself blank, or the chip could not be read after it. Nothing was recorded | check the drive, run `cartridge erase` again |
 | 4 | **the erase failed part-way**: the tape may be partly erased. Nothing was recorded | check the drive, run `cartridge erase` again |
@@ -1291,6 +1291,14 @@ session `interrupted`, so the same `volume resume` can run again once the
 drive reads. A resume whose seal is already recorded is not refused: it only
 re-runs the read-back.
 
+
+A cartridge no drive has ever written has no end-of-data mark, so a brand-new
+cartridge used to need `--force` here. `volume init` now reads the cartridge's
+lifetime totals: when they say 0 MiB were ever written it proceeds and prints
+`blank proven by the chip: 0 MiB ever written` (ADR-0012 item 57). A chip that
+reports anything else, or cannot be read (a virtual tape library reports none),
+keeps this refusal.
+
 ### The cartridge already carries a SEALED volume
 
 ```text
@@ -1299,8 +1307,8 @@ marker parses at tape position <n>. ADR-0003: sealed volumes are immutable, ther
 cannot override this. If this cartridge should be reused: retire its current volume if this catalog holds it
 (`tapectl volume retire <label>`), then `tapectl cartridge erase`, which erases the tape in the drive, reads it
 back and records it — or erase the tape in the drive (a long erase, `mt -f <device> erase`, takes hours on real
-LTO; a filemark at its start, `mt -f <device> rewind; mt -f <device> weof 1`, takes seconds and then needs
-`volume init --force`) yourself and run `tapectl cartridge mark-erased` before writing to it again. Never degauss
+LTO; a filemark at its start, `mt -f <device> rewind; mt -f <device> weof 1`, takes seconds, and `volume init` then
+needs `--force` unless `tapectl cartridge erase` did it) yourself and run `tapectl cartridge mark-erased` before writing to it again. Never degauss
 or bulk-erase an LTO cartridge: that destroys its factory servo tracks, and the cartridge with them.
 ```
 
@@ -1343,10 +1351,12 @@ sealed tape of any label. If you really mean to reuse the cartridge:
    tapectl volume init <new-label> --device "$TAPE"
    ```
    After a long erase the tape is blank and `volume init` needs nothing more.
-   After the short erase the seal is no longer readable, `volume init` reports
-   File 0 as EMPTY, and wants `--force` (see the previous entry):
+   After `tapectl cartridge erase`'s short erase `volume init` needs nothing more
+   either: it prints `blank proven by this catalog's verified erase on <date>`
+   (ADR-0012 item 57). Only a by-hand `mt weof 1`, which records nothing, still
+   wants `--force` (see the previous entry):
    ```bash
-   tapectl volume init <new-label> --device "$TAPE" --force
+   tapectl volume init <new-label> --device "$TAPE"
    ```
 
 ### The drive reports no medium serial: name the cartridge

@@ -139,9 +139,12 @@ pub enum CartridgeCommands {
     ///    available, as `cartridge mark-erased` does (a `retired_permanent`
     ///    cartridge stays retired).
     ///
-    /// After a short erase, `volume init` still refuses the EMPTY File 0
-    /// without `--force` (ADR-0003 fails closed); after a long erase the
-    /// tape is blank and init needs nothing.
+    /// After either erase `volume init` needs no `--force`: a long erase
+    /// leaves the tape blank, and after a short one this catalog's record of
+    /// the verified erase (with no write to the cartridge since) proves the
+    /// EMPTY File 0 is that erase's filemark (ADR-0012, 2026-10-15, item 57).
+    /// An erase done by hand with `mt`, which records nothing, still needs
+    /// `--force`.
     ///
     /// Exit status: 0 = erased and verified (also: nothing to erase, and
     /// `--dry-run`). 2 = refused, the tape untouched (among others: the chip
