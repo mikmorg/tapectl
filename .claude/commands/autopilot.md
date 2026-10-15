@@ -33,7 +33,14 @@ the normative design set named in the Policy block below.
     CTO has not opted into workflows), rules in the scratchpad's `review-1.1/common.md`;
     the coordinator verifies every medium and high by reading the cited lines, then files
     and triages the findings into W1–W4 BEFORE W1 starts.
-  - **W1** #444 ∥ #448 (cover sheet only) ∥ #446. **W2** #445 ∥ #447 ∥ #450.
+  - **W0 DONE 2026-10-15:** `docs/audits/2026-10-15-1.1-diff-review.md`, 66 raw / 1 high
+    (#458) / 18 issues #458–#475. The label `1.1.2` holds the whole queue (30 issues).
+    **The waves were redrawn there** (its "The plan, revised"), superseding the four lines
+    below: W1 rebuild (#458, #459 1–3, #451) ∥ consent facts (#462, #463, #459.4) ∥ proofs
+    (#444 Rust, #460), coordinator #444 gate leg + #446/#469 (branch `w112-scripts`);
+    W2 #461→#445 ∥ #464, #465, #447-dar ∥ #466, #467, #447-config; W3 #448, #454 ∥ #453 ∥
+    #474→#473; W4 #468, #475, #456, #472, #450, coordinator #470, #471, #455, #457.
+  - *(superseded)* **W1** #444 ∥ #448 (cover sheet only) ∥ #446. **W2** #445 ∥ #447 ∥ #450.
     **W3** #454 ∥ #453 part 1 ∥ #451. **W4** #456 ∥ #455 part 1 ∥ #457.
   - **Not 1.1.2:** #449 and #448's File 1 half (they change generated on-tape text: the
     next CTO-approved re-pin, 1.2.0), #453 part 2 and #455 part 2 (1.2.0), #420, #388,
