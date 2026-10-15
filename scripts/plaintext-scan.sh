@@ -119,9 +119,9 @@ ln -s "target-$TOKEN" "$SRC/dir-$TOKEN/deeper/link"
 for i in $(seq 1 100); do printf '%s %d\n' "$TOKEN" "$i" > "$SRC/dir-$TOKEN/deeper/f$i-$TOKEN"; done
 if command -v setfattr >/dev/null 2>&1 \
     && setfattr -n user.scan -v "xattr-$TOKEN" "$SRC/small-$TOKEN.txt" 2>/dev/null; then
-    echo "xattr leg: on"
+    echo "xattr leg: on"; XATTR_LEG=on
 else
-    echo "xattr leg: skipped (no setfattr, or the source filesystem refuses user xattrs)"
+    echo "xattr leg: skipped (no setfattr, or the source filesystem refuses user xattrs)"; XATTR_LEG=skipped
 fi
 
 # The tapectl home (not on the image) and its config.
@@ -150,6 +150,15 @@ if ! T --yes stage create "$UNIT" >"$WORK/stage.log" 2>&1; then
 fi
 echo "staged; staging now holds:"
 ls -la "$MNT"
+# Positive control (#471): the stage's slices must have landed on the image
+# being scanned. A staging directory that pointed elsewhere would leave the
+# image empty of the unit and the scan below trivially clean.
+nslices=$(sudo find "$MNT" -name '*.age' -type f | wc -l)
+if [ "$nslices" -eq 0 ]; then
+    echo "FAIL: no .age slice landed on the scanned staging device; the scan would prove nothing"
+    exit 1
+fi
+echo "positive control: $nslices encrypted slice(s) on the scanned device"
 
 # 4. Scan the raw image.
 sync
@@ -168,5 +177,9 @@ if [ "$token_hits" -ne 0 ]; then
     echo "FAIL: plaintext from the staged unit is on the staging device ($token_hits hit(s))"
     exit 1
 fi
-echo "PASS: no plaintext on the staging device; the canary shows deleted blocks are visible"
+if [ "$XATTR_LEG" = skipped ]; then
+    echo "PASS (xattr leg SKIPPED: user xattrs were not exercised): no plaintext on the staging device; the canary shows deleted blocks are visible"
+else
+    echo "PASS: no plaintext on the staging device; the canary shows deleted blocks are visible"
+fi
 exit 0

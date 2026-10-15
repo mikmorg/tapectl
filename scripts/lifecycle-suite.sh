@@ -620,18 +620,21 @@ lc_dump_whole_tape() { # lc_dump_whole_tape <outfile>
     mt -f "$TAPE_DEV" rewind || { echo "lc_dump_whole_tape: rewind failed"; return 1; }
     : > "$out"
     while [ "$n" -lt 64 ]; do
-        dd if="$TAPE_DEV" bs=512k of="$tmp" 2>/dev/null
+        # A read error is not end of data (#471): dd's status decides,
+        # and only a clean zero-byte read counts toward the EOD stop.
+        dd if="$TAPE_DEV" bs=512k of="$tmp" 2>"$tmp.err" \
+            || { echo "lc_dump_whole_tape: dd failed at file $n: $(cat "$tmp.err")"; return 1; }
         got="$(stat -c %s "$tmp" 2>/dev/null)" || return 1
         if [ "$got" -eq 0 ]; then
             empty=$((empty + 1))
             [ "$empty" -ge 2 ] && break
         else
             empty=0
-            cat "$tmp" >> "$out"
+            cat "$tmp" >> "$out" || { echo "lc_dump_whole_tape: could not append file $n"; return 1; }
         fi
         n=$((n + 1))
     done
-    rm -f "$tmp"
+    rm -f "$tmp" "$tmp.err"
     [ "$n" -lt 64 ] || { echo "lc_dump_whole_tape: hit the 64-file ceiling without reaching EOD"; return 1; }
     mt -f "$TAPE_DEV" rewind || return 1
     echo "lc_dump_whole_tape: $n file(s), $(stat -c %s "$out") bytes"
@@ -667,6 +670,12 @@ lc_leak_scan() { # lc_leak_scan <label>
 
     grep -a -q "label = \"$label\"" "$dump" || {
         echo "lc_leak_scan: volume label $label is NOT in the tape dump -- the scan is broken, not the tape clean"
+        return 1
+    }
+    # The END of the tape too (#471, the gate's #415 control): the seal marker
+    # is a sealed volume's last file, so a dump that stopped early lacks it.
+    grep -a -q "TAPECTL SEAL MARKER" "$dump" || {
+        echo "lc_leak_scan: the seal marker is NOT in the tape dump -- the scan stopped short of the end, not the tape clean"
         return 1
     }
 
@@ -1126,6 +1135,8 @@ rm_step_raw_volume() {
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert d.get("mismatched_count", 1) == 0 and d.get("all_verified", False), d
+# all_verified over zero files proves nothing (#471).
+assert d.get("verified_count", 0) > 0, "raw-volume verified no file: %s" % d
 ' "$RM_WORK/raw.json" || { cat "$RM_WORK/raw.json"; return 1; }
 }
 
@@ -1171,6 +1182,13 @@ PY
         skip "$RM_TAG.isolation" "no live staged slice for $RM_UNIT (already released by staging clean) — crypto isolation already proved by other tags in this run"
         return $?
     fi
+    # Positive control (#471, as the gate's step_crosskey got in #415): the
+    # owner's own key opens this slice, so the slice and the keys are usable
+    # and the refusal below is about the key, not a truncated file.
+    local ownerkey; ownerkey="$(active_key_path "$RM_TENANT" primary)"
+    [ -f "$ownerkey" ] || { echo "owner key missing: $ownerkey"; return 1; }
+    age -d -i "$ownerkey" "$slice" >/dev/null 2>&1 \
+        || { echo "$RM_TENANT's own key cannot decrypt $RM_UNIT's slice: the check below would prove nothing"; return 1; }
     if age -d -i "$otherkey" "$slice" >/dev/null 2>&1; then
         echo "$other's key decrypted $RM_TENANT's ($RM_UNIT) slice — isolation broken"
         return 1
@@ -2341,9 +2359,16 @@ scenario_compaction() {
 rr_mark_erased_before_retire_refused() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl cartridge mark-erased \$barcode (cartridge still 'active', not 'pending_erase' -> Tier-2 refusal without --yes)"; return 0; }
     [ -n "${RR_VOLA_BARCODE:-}" ] || { echo "no barcode captured for VOL-A's cartridge"; return 1; }
+    # The cartridge must exist, or "no such cartridge" would satisfy the
+    # refusal below without reaching the rule under test (#471).
+    TCTL cartridge info "$RR_VOLA_BARCODE" >/dev/null 2>&1 \
+        || { echo "cartridge $RR_VOLA_BARCODE is not registered: the refusal would prove nothing"; return 1; }
     local out rc
     out="$(TCTL cartridge mark-erased "$RR_VOLA_BARCODE" 2>&1)"; rc=$?
     [ "$rc" -ne 0 ] || { echo "cartridge mark-erased unexpectedly succeeded before any retirement: $out"; return 1; }
+    if grep -iE "no such cartridge|not found|unknown cartridge" <<<"$out" >/dev/null; then
+        echo "refused for the wrong reason (the cartridge was not found): $out"; return 1
+    fi
 }
 
 # Two attempts, and the SECOND is the one that matters (issue #223).
@@ -2414,9 +2439,10 @@ rr_write_second_copy_volb() {
     TCTL volume info VOL-B --json 2>/dev/null | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-s = json.dumps(d)
-assert "offsite" in s, f"VOL-B was not moved to offsite: {s[:400]}"
+assert d.get("location") == "offsite", "VOL-B location is %r, want offsite (--move-to)" % d.get("location")
 assert d.get("status") == "sealed", "VOL-B is not sealed: %s" % d.get("status")
+full = [v for v in d.get("verifications", []) if v.get("verify_type") == "full" and v.get("outcome") == "passed"]
+assert full, "no passed full readback recorded for VOL-B, though it was written with --full-confirm: %s" % d.get("verifications")
 '
 }
 
@@ -3382,15 +3408,31 @@ pm_op_restore_latest_and_diff() {
     if [ "$SINGLE_CARTRIDGE" != 1 ]; then
         load_volume_tape "$label" || return 1
     fi
+    local compared=0 on
     for u in photos docs big; do
+        # Whether the unit is on this write is the catalog's answer, decided
+        # BEFORE the restore (#471): a restore that failed must not read as
+        # "not on this tape".
+        on="$(TCTL catalog locate "$u" --json 2>/dev/null | L="$label" python3 -c '
+import json, os, sys
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    print("err"); raise SystemExit
+rows = rows.get("volumes", []) if isinstance(rows, dict) else rows
+print("yes" if any(isinstance(r, dict) and r.get("volume") == os.environ["L"] for r in rows) else "no")')"
+        case "$on" in
+            no) continue ;; # not every write bundles every unit
+            yes) ;;
+            *) echo "catalog locate $u --json unreadable"; return 1 ;;
+        esac
         to="$sd/pm-restore-$label-$u"
-        if TCTL restore unit --unit "$u" --from "$label" --to "$to" --device "$TAPE_DEV" >/dev/null 2>&1; then
-            assert_identical "$sd/pm-snapshot-$label/$u" "$to" || return 1
-        fi
-        # A unit simply not present on this particular write is expected in
-        # a random walk (not every write bundles every unit) — not a
-        # failure, just nothing to check for that unit this time.
+        TCTL restore unit --unit "$u" --from "$label" --to "$to" --device "$TAPE_DEV" >/dev/null 2>&1 \
+            || { echo "restore of $u from $label failed, though the catalog places it there"; return 1; }
+        assert_identical "$sd/pm-snapshot-$label/$u" "$to" || return 1
+        compared=$((compared + 1))
     done
+    [ "$compared" -gt 0 ] || { echo "the catalog places no unit on $label, the latest write: nothing was compared"; return 1; }
 }
 
 # "≥2 written versions" tracked via PM_SNAPSHOT_COUNT rather than a DB
@@ -3405,8 +3447,15 @@ pm_op_mark_reclaimable_oldest() {
         if [ "${PM_SNAPSHOT_COUNT[$u]:-1}" -ge 2 ]; then candidate="$u"; break; fi
     done
     if [ -z "$candidate" ]; then skip "$PM_CHECK_NAME" "no unit has >=2 snapshot versions yet"; return $?; fi
-    TCTL snapshot mark-reclaimable --version 1 "$candidate" 2>&1
-    return 0
+    # The rule is enforced by the command; what this op checks is that the
+    # command answers by its contract (#471): 0 marked, 2 refused by policy.
+    # Anything else (70, a panic's 101) is a failure, not a refusal.
+    local rc=0
+    TCTL snapshot mark-reclaimable --version 1 "$candidate" 2>&1 || rc=$?
+    case "$rc" in
+        0 | 2) return 0 ;;
+        *) echo "snapshot mark-reclaimable exited $rc: neither marked (0) nor refused by policy (2)"; return 1 ;;
+    esac
 }
 
 pm_run_step() { # pm_run_step <line...>
@@ -3516,10 +3565,11 @@ pm_final_copy_count_is_honest() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: audit's copy_count must equal locate's serviceable count at the least-covered current version, and never exceed the volumes carrying it"; return 0; }
     local af="$RUN/log-pm.final.audit.json"
     TCTL audit --json >"$af" 2>"$RUN/log-pm.final.audit.stderr"
-    local u rc=0
+    local u rc=0 compared=0
     for u in photos docs big; do
         local locate_json cur_json derived expected upper
-        locate_json="$(TCTL catalog locate "$u" --json 2>/dev/null)" || continue
+        locate_json="$(TCTL catalog locate "$u" --json 2>/dev/null)" \
+            || { echo "catalog locate $u --json failed (#471: a failure is not a unit to skip)"; rc=1; continue; }
         cur_json="$(TCTL snapshot list --unit "$u" --status current --json 2>/dev/null)" || {
             echo "snapshot list --status current unreadable for $u"; rc=1; continue
         }
@@ -3589,6 +3639,7 @@ print("%d %d" % (len(serviceable[worst]), len(carrying[worst])))
             ERR\ *) echo "${derived#ERR }  (unit $u)"; rc=1; continue ;;
         esac
         expected="${derived%% *}"; upper="${derived##* }"
+        compared=$((compared + 1))
         local claimed
         claimed="$(U="$u" python3 -c '
 import json, os, re, sys
@@ -3616,6 +3667,7 @@ else:
             fi
         fi
     done
+    [ "$compared" -gt 0 ] || { echo "no unit was compared: the check proved nothing"; rc=1; }
     return $rc
 }
 
@@ -3997,6 +4049,12 @@ PY2
     echo "$out" | grep "ADR-0003" >/dev/null || {
         echo "refused, but not by the tape-side seal check: the message does not cite ADR-0003, so the catalog guard fired first and this scenario did not exercise what it claims: $out"
         return 1
+    }
+    # #208's point is the tape: read it back in the ORIGINAL home, which knows
+    # VOL-S as sealed, and require a passing quick verify (File 0, front
+    # index, seal), so "refused" is shown to mean "untouched" (#471).
+    TCTL volume verify VOL-S --quick --device "$TAPE_DEV" >"$sd/sct.after-refusal-verify.txt" 2>&1 || {
+        echo "after the refusal VOL-S no longer verifies: the tape was touched"; cat "$sd/sct.after-refusal-verify.txt"; return 1
     }
 }
 
