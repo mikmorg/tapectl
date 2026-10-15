@@ -325,16 +325,31 @@ pub(crate) fn staged_slice_problems(conn: &Connection, stage_set_id: i64) -> Res
 /// in-service sealed copy when there is one (`read-slices` records every
 /// slice's path again); otherwise, for an active unit, the set released and
 /// the version staged again from source.
+///
+/// `failed_volume_id` is a volume the caller has just failed to read the
+/// version from (issue #474: `compact-read` skipped a slice of it that did
+/// not match its hash). It is never named as the place to read back from —
+/// it would fail the same way — so the remedy names another sealed copy or,
+/// with none, falls through to staging the version again. `None` where no
+/// read has failed.
 pub(crate) fn incomplete_set_remedy(
     conn: &Connection,
     unit_id: i64,
     unit_name: &str,
     version: i64,
     unit_status: &str,
+    failed_volume_id: Option<i64>,
 ) -> Result<String> {
-    let from = crate::policy::coverage::in_service_copy_of_version(conn, unit_id, version)?;
+    let from = crate::policy::coverage::in_service_copy_of_version_excluding(
+        conn,
+        unit_id,
+        version,
+        failed_volume_id,
+    )?;
     Ok(match from {
-        Some(from) => format!("tapectl volume read-slices --from {from} --unit {unit_name}"),
+        Some(from) => format!(
+            "tapectl volume read-slices --from {from} --unit {unit_name} --version {version}"
+        ),
         None if unit_status == "active" => format!(
             "tapectl staging clean --unit {unit_name} --version {version} --force && \
              tapectl stage create {unit_name} --version {version}"
@@ -1951,7 +1966,7 @@ impl Drop for FreeSpaceOverride {
 /// `f_bavail` (not `f_bfree`, which counts root's reserve) in units of
 /// `f_frsize` (POSIX; `f_bsize` is only the preferred I/O size) — the same
 /// arithmetic as `config check`'s staging-space line.
-fn staging_free_bytes(dir: &Path) -> std::result::Result<u64, nix::Error> {
+pub(crate) fn staging_free_bytes(dir: &Path) -> std::result::Result<u64, nix::Error> {
     #[cfg(test)]
     if let Some(free) = STAGING_FREE_OVERRIDE.with(|c| c.get()) {
         return Ok(free);

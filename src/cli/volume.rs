@@ -350,6 +350,14 @@ pub enum VolumeCommands {
     },
 
     /// Read encrypted slices from a volume into staging (then use `volume write` to write them)
+    ///
+    /// Reads the unit's slices off the loaded tape, checks each against its
+    /// recorded hash, and records where it put them, so `volume write` can
+    /// write them to another cartridge without the source directory. Every
+    /// version of the unit on the volume is read except those marked
+    /// reclaimable or purged; `--version` reads one version, whatever its
+    /// state. The staging directory is checked for room before the first
+    /// slice is read, and a read that does not finish removes what it wrote.
     ReadSlices {
         /// Source volume label
         #[arg(long)]
@@ -357,6 +365,11 @@ pub enum VolumeCommands {
         /// Unit name to read
         #[arg(long)]
         unit: String,
+        /// Read only this version of the unit (a reclaimable or purged
+        /// version is read when named). Without it, every version on the
+        /// volume except the reclaimable and purged ones is read.
+        #[arg(long, value_name = "N")]
+        version: Option<i64>,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
         #[arg(long)]
@@ -1993,7 +2006,12 @@ pub fn run(
             crate::cli::operations::volume_retire(conn, config, label, yes, dry_run, json_output)?;
         }
 
-        VolumeCommands::ReadSlices { from, unit, device } => {
+        VolumeCommands::ReadSlices {
+            from,
+            unit,
+            version,
+            device,
+        } => {
             // Issue #241: same reasoning as `volume compact-read` — a real
             // preview would have to open the drive and chain-walk the
             // volume to know what would be staged, which is the entire
@@ -2017,6 +2035,7 @@ pub fn run(
                 config,
                 from,
                 unit,
+                *version,
                 &mut store,
                 ContactSite::new(
                     config,
@@ -2033,18 +2052,26 @@ pub fn run(
                         "from": from, "unit": unit,
                         "slices_read": report.slices_read,
                         "bytes_read": report.bytes_read,
+                        // Issue #474: additive.
+                        "versions": report.versions,
                     })
                 );
             } else {
                 println!(
-                    "read {} slices ({}) from \"{}\" into staging",
+                    "read {} slices ({}) of \"{}\" {} from \"{}\" into staging",
                     report.slices_read,
                     crate::util::format_bytes_binary(report.bytes_read),
+                    unit,
+                    versions_phrase(&report.versions),
                     from,
                 );
+                // Issue #474: a blank cartridge must be `volume init`-ed
+                // first, which `volume write --init` does with the tape
+                // still loaded.
                 println!(
-                    "run `tapectl volume write DEST --device {}` to write to tape",
-                    device
+                    "load the cartridge to copy to and run `tapectl volume write DEST --init \
+                     --device {device}` (a cartridge already set up with `tapectl volume init \
+                     DEST` takes `tapectl volume write DEST`)",
                 );
             }
         }
@@ -3044,6 +3071,12 @@ impl VolumeRow {
             )
         }
     }
+}
+
+/// `(v2)` or `(v1, v2)`: the versions a `read-slices` run read (issue #474).
+fn versions_phrase(versions: &[i64]) -> String {
+    let named: Vec<String> = versions.iter().map(|v| format!("v{v}")).collect();
+    format!("({})", named.join(", "))
 }
 
 fn display_cartridge(v: &Option<String>) -> String {

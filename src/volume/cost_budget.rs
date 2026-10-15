@@ -444,6 +444,7 @@ impl Written {
                     &self.config,
                     LABEL,
                     "narrow",
+                    None,
                     &mut store,
                     self.site(Operation::VolumeReadSlices),
                 )

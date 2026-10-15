@@ -648,6 +648,7 @@ pub fn staging_status(conn: &Connection) -> Result<Vec<StagingInfo>> {
                 &info.unit_name,
                 info.version,
                 &unit_status,
+                None,
             )?);
         }
     }

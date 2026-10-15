@@ -237,10 +237,27 @@ pub fn has_completed_write(conn: &Connection, volume_id: i64) -> crate::error::R
 /// read-slices --from` can pull the identical ciphertext back from without
 /// touching the unit's source directory. Asked by `audit`'s copy remedies
 /// and by `volume write`'s refusal of an incomplete stage set (issue #402).
+///
+/// [`in_service_copy_of_version_excluding`] with nothing excluded.
 pub fn in_service_copy_of_version(
     conn: &Connection,
     unit_id: i64,
     version: i64,
+) -> crate::error::Result<Option<String>> {
+    in_service_copy_of_version_excluding(conn, unit_id, version, None)
+}
+
+/// [`in_service_copy_of_version`], never naming `exclude_volume_id` (issue
+/// #474): a volume that has just failed to give up a slice (`compact-read`
+/// skipped one that did not match its hash) is still in service, and the
+/// newest copy — which is the order this answers in — so naming it as the
+/// place to read the version back from sends the operator to the slice that
+/// just failed.
+pub fn in_service_copy_of_version_excluding(
+    conn: &Connection,
+    unit_id: i64,
+    version: i64,
+    exclude_volume_id: Option<i64>,
 ) -> crate::error::Result<Option<String>> {
     use rusqlite::OptionalExtension;
     conn.query_row(
@@ -250,10 +267,11 @@ pub fn in_service_copy_of_version(
              JOIN snapshots s ON s.id = ss.snapshot_id
              JOIN volumes v ON v.id = w.volume_id
              WHERE s.unit_id = ?1 AND s.version = ?2 AND w.status = 'completed' AND {}
+               AND (?3 IS NULL OR v.id <> ?3)
              ORDER BY w.id DESC LIMIT 1",
             in_service("v")
         ),
-        params![unit_id, version],
+        params![unit_id, version, exclude_volume_id],
         |row| row.get(0),
     )
     .optional()

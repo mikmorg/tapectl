@@ -5273,6 +5273,183 @@ fn stream_verify_slice_to_staging(
     }
 }
 
+/// One slice a recovery read (`read-slices`, `compact-read`) is to pull off
+/// a tape, as the catalog records it.
+struct RecoverySlice {
+    /// The tape file position (`write_positions.position`, text in the catalog).
+    position: String,
+    sha_on_volume: String,
+    encrypted_bytes: i64,
+    sha_encrypted: String,
+    stage_set_id: i64,
+    slice_id: i64,
+    /// The snapshot version this slice belongs to.
+    version: i64,
+}
+
+impl RecoverySlice {
+    /// Columns in this order: `wp.position, wp.sha256_on_volume,
+    /// ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id, ss.id,
+    /// sn.version`.
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            position: row.get(0)?,
+            sha_on_volume: row.get(1)?,
+            encrypted_bytes: row.get(2)?,
+            sha_encrypted: row.get(3)?,
+            stage_set_id: row.get(4)?,
+            slice_id: row.get(5)?,
+            version: row.get(6)?,
+        })
+    }
+
+    /// The hashes the slice may legitimately read back as: what the volume
+    /// recorded for the position, or what staging recorded for the file.
+    fn expected_hashes(&self) -> [&str; 2] {
+        [self.sha_on_volume.as_str(), self.sha_encrypted.as_str()]
+    }
+}
+
+/// A slice file a recovery read wrote into staging, and what
+/// `stage_slices.staging_path` said before the read recorded this one.
+struct StagedFile {
+    slice_id: i64,
+    stage_set_id: i64,
+    path: PathBuf,
+    prior: Option<String>,
+}
+
+/// What a recovery read has put into staging so far (issue #474), so that a
+/// read which does not finish — a checksum mismatch, a tape error, a signal,
+/// a catalog error — can put staging back as it found it. A slice file with
+/// a `staging_path` on a set that stays `cleaned` is invisible to `staging
+/// clean` (which selects `staged` and `failed` sets) and to `staging
+/// status`, so it would be ciphertext on the staging device nothing names.
+#[derive(Default)]
+struct StagedRun {
+    files: Vec<StagedFile>,
+}
+
+impl StagedRun {
+    /// Record `path` as the staged file of `slice_id`: this run's list first,
+    /// then the catalog row, so a failed UPDATE is still undone.
+    fn record(
+        &mut self,
+        conn: &Connection,
+        slice_id: i64,
+        stage_set_id: i64,
+        path: &Path,
+    ) -> Result<()> {
+        let prior: Option<String> = conn.query_row(
+            "SELECT staging_path FROM stage_slices WHERE id = ?1",
+            params![slice_id],
+            |row| row.get(0),
+        )?;
+        self.files.push(StagedFile {
+            slice_id,
+            stage_set_id,
+            path: path.to_path_buf(),
+            prior,
+        });
+        conn.execute(
+            "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+            params![path.to_string_lossy().to_string(), slice_id],
+        )?;
+        Ok(())
+    }
+
+    /// Unlink what this run wrote and put each slice's `staging_path` back
+    /// to what it was before — `NULL` for a released set, which is the case
+    /// that matters. Only the files of `sets` when given, otherwise all.
+    /// Best-effort and silent about what it cannot do beyond a warning: it
+    /// runs on an error path, and the error that got it here is the one the
+    /// operator needs to read.
+    fn undo(&mut self, conn: &Connection, sets: Option<&HashSet<i64>>) {
+        let (undo, keep): (Vec<StagedFile>, Vec<StagedFile>) = std::mem::take(&mut self.files)
+            .into_iter()
+            .partition(|f| sets.is_none_or(|s| s.contains(&f.stage_set_id)));
+        self.files = keep;
+        for f in undo {
+            match fs::remove_file(&f.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(
+                    path = %f.path.display(),
+                    error = %e,
+                    "could not remove a staged slice a failed read had written; \
+                     `tapectl staging clean` removes it once it is old enough"
+                ),
+            }
+            // A prior path equal to this run's own is the file just removed
+            // (an earlier read into the same directory), so it goes too.
+            let restored = f.prior.filter(|p| Path::new(p) != f.path);
+            if let Err(e) = conn.execute(
+                "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+                params![restored, f.slice_id],
+            ) {
+                warn!(
+                    slice_id = f.slice_id,
+                    error = %e,
+                    "could not restore a slice's staging_path after a failed read"
+                );
+            }
+        }
+    }
+}
+
+/// Remove `dir` if nothing is in it — the directory a failed recovery read
+/// made for itself.
+fn remove_dir_if_empty(dir: &Path) {
+    let _ = fs::remove_dir(dir);
+}
+
+/// Refuse a recovery read whose ciphertext the staging directory cannot
+/// hold (issue #474). The need is exact — the slices' recorded encrypted
+/// sizes, less the files already sitting where they will be written — so
+/// this is a refusal naming the figures, not the "may not fit" question
+/// `stage create` asks about an estimate. Checked before the first slice is
+/// read, so a full staging directory costs no tape time.
+fn check_recovery_read_space(
+    staging_dir: &Path,
+    slice_dir: &Path,
+    slices: &[RecoverySlice],
+    what: &str,
+) -> Result<()> {
+    let needed: i64 = slices
+        .iter()
+        .map(|s| {
+            let already = fs::metadata(slice_dir.join(format!("slice_{}.dat", s.slice_id)))
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
+            (s.encrypted_bytes - already).max(0)
+        })
+        .sum();
+    let free = match staging::staging_free_bytes(staging_dir) {
+        Ok(free) => i64::try_from(free).unwrap_or(i64::MAX),
+        Err(e) => {
+            warn!(
+                dir = %staging_dir.display(),
+                error = %e,
+                "could not read the free space of the staging directory; reading without a space check"
+            );
+            return Ok(());
+        }
+    };
+    if free >= needed {
+        return Ok(());
+    }
+    use crate::util::format_bytes_binary as fmt;
+    Err(TapectlError::Other(format!(
+        "refusing to read {what} into staging: staging directory {} has {} free and the \
+         slices need {}. Nothing was read. `tapectl staging status` shows what staging \
+         holds, and `tapectl staging clean` frees what is already on tape; or point \
+         `[staging] directory` at a larger filesystem",
+        staging_dir.display(),
+        fmt(free),
+        fmt(needed),
+    )))
+}
+
 /// Read encrypted slices for a unit from a volume into staging.
 /// After this, use `volume write` to write them to a destination tape
 /// with the full self-describing volume layout.
@@ -5280,6 +5457,11 @@ fn stream_verify_slice_to_staging(
 /// Position-based, driven entirely from `write_positions` (DB), not the
 /// on-tape index — unaffected by the v2 index relocation
 /// (`v2-open-questions.md` §2.7).
+///
+/// `version` names the one snapshot version to read (issue #474). Without
+/// it every version of the unit on the volume is read except those marked
+/// `reclaimable` or `purged` — the ones the operator has said they no longer
+/// want, as `compact_read` skips them; naming one explicitly reads it.
 ///
 /// Takes an already-open `store` (ADR-0006) rather than a device path — the
 /// caller opens `TapeStore::open_read`, so this function is directly
@@ -5289,6 +5471,7 @@ pub fn read_slices(
     config: &Config,
     from_label: &str,
     unit_name: &str,
+    version: Option<i64>,
     store: &mut dyn Store,
     site: ContactSite<'_>,
 ) -> Result<ReadSlicesReport> {
@@ -5314,6 +5497,7 @@ pub fn read_slices(
         config,
         from_label,
         unit_name,
+        version,
         store,
         site.medium_serial(),
     ));
@@ -5338,6 +5522,7 @@ fn read_slices_contacted(
     config: &Config,
     from_label: &str,
     unit_name: &str,
+    version: Option<i64>,
     store: &mut dyn Store,
     medium_serial: Option<&str>,
 ) -> Result<ReadSlicesReport> {
@@ -5363,37 +5548,61 @@ fn read_slices_contacted(
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
-    // Find write positions for this unit on the source volume
+    // Find write positions for this unit on the source volume. Issue #474:
+    // one version when `--version` names it; otherwise the versions still
+    // wanted — a `reclaimable` or `purged` one is the operator's "drop this
+    // when the volume is compacted", and reading it back to write it again
+    // would undo that.
     let mut stmt = conn.prepare(
-        "SELECT wp.position, wp.sha256_on_volume, wp.stage_slice_id,
+        "SELECT wp.position, wp.sha256_on_volume,
                 ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id,
-                ss.id as slice_db_id
+                ss.id as slice_db_id, sn.version
          FROM write_positions wp
          JOIN writes w ON w.id = wp.write_id
          JOIN stage_slices ss ON ss.id = wp.stage_slice_id
          JOIN stage_sets sts ON sts.id = w.stage_set_id
          JOIN snapshots sn ON sn.id = sts.snapshot_id
          WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'
+           AND CASE WHEN ?3 IS NULL THEN sn.status NOT IN ('reclaimable', 'purged')
+                    ELSE sn.version = ?3 END
          ORDER BY CAST(wp.position AS INTEGER)",
     )?;
-    let source_slices: Vec<(String, String, i64, i64, String, i64, i64)> = stmt
-        .query_map(params![from_vol_id, unit.id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            ))
-        })?
+    let source_slices: Vec<RecoverySlice> = stmt
+        .query_map(
+            params![from_vol_id, unit.id, version],
+            RecoverySlice::from_row,
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if source_slices.is_empty() {
-        return Err(TapectlError::Other(format!(
-            "no slices for unit \"{unit_name}\" on volume \"{from_label}\""
-        )));
+        let message = match version {
+            Some(v) => {
+                format!("no slices for unit \"{unit_name}\" version {v} on volume \"{from_label}\"")
+            }
+            None => {
+                // Say so when the unit IS on the volume and only the filter
+                // hid it, so the operator is not left wondering.
+                let hidden: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM write_positions wp
+                     JOIN writes w ON w.id = wp.write_id
+                     JOIN stage_sets sts ON sts.id = w.stage_set_id
+                     JOIN snapshots sn ON sn.id = sts.snapshot_id
+                     WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'",
+                    params![from_vol_id, unit.id],
+                    |row| row.get(0),
+                )?;
+                if hidden > 0 {
+                    format!(
+                        "no slices to read for unit \"{unit_name}\" on volume \"{from_label}\": \
+                         every version of it there is reclaimable or purged. Name one with \
+                         `--version <N>` to read it anyway"
+                    )
+                } else {
+                    format!("no slices for unit \"{unit_name}\" on volume \"{from_label}\"")
+                }
+            }
+        };
+        return Err(TapectlError::Other(message));
     }
 
     info!(
@@ -5403,107 +5612,175 @@ fn read_slices_contacted(
     );
 
     // Read encrypted slices from source tape to staging
-    let staging_dir = &config.staging.directory;
+    let staging_dir = Path::new(&config.staging.directory);
     // Named by the unit's uuid: a unit name is plaintext metadata, and the
     // staging device holds none (ADR-0012 2026-10-06 item 4).
-    let clone_dir =
-        std::path::Path::new(staging_dir).join(format!("clone-{from_label}-{}", unit.uuid));
+    let clone_dir = staging_dir.join(format!("clone-{from_label}-{}", unit.uuid));
+    fs::create_dir_all(staging_dir)?;
+    // Issue #474: before the first slice is read, not after the staging
+    // directory has filled.
+    check_recovery_read_space(
+        staging_dir,
+        &clone_dir,
+        &source_slices,
+        &format!("unit \"{unit_name}\" from volume \"{from_label}\""),
+    )?;
     fs::create_dir_all(&clone_dir)?;
 
-    let mut total_bytes: i64 = 0;
-    let mut slices_read: i64 = 0;
-    let mut affected_stage_sets = HashSet::new();
+    // Issue #474: the slices this run writes are undone, and nothing is
+    // promoted, unless the whole read completes.
+    let mut run = StagedRun::default();
+    let outcome = read_slices_into(
+        conn,
+        store,
+        from_label,
+        unit_name,
+        version,
+        &source_slices,
+        &clone_dir,
+        &mut run,
+    )
+    .and_then(|tally| {
+        // Restore stage_sets status so find_staged_data() picks them up.
+        // Guard: only promote sets that were previously successfully staged.
+        // One transaction: all of the sets or none of them.
+        let tx = conn.unchecked_transaction()?;
+        for ss_id in &tally.stage_sets {
+            tx.execute(
+                "UPDATE stage_sets SET status = 'staged' WHERE id = ?1 AND status IN ('staged', 'cleaned')",
+                params![ss_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(tally)
+    });
+    let tally = match outcome {
+        Ok(tally) => tally,
+        Err(e) => {
+            run.undo(conn, None);
+            remove_dir_if_empty(&clone_dir);
+            return Err(e);
+        }
+    };
 
+    info!(
+        from = from_label,
+        unit = unit_name,
+        slices = tally.slices_read,
+        "read-slices complete — data staged for volume write"
+    );
+
+    Ok(ReadSlicesReport {
+        slices_read: tally.slices_read,
+        bytes_read: tally.bytes_read,
+        versions: tally.versions.into_iter().collect(),
+    })
+}
+
+/// What [`read_slices_into`] read.
+struct ReadSlicesTally {
+    slices_read: i64,
+    bytes_read: i64,
+    stage_sets: std::collections::BTreeSet<i64>,
+    versions: std::collections::BTreeSet<i64>,
+}
+
+/// The slice loop of [`read_slices_contacted`]: each slice off the tape into
+/// `clone_dir`, hashed as it streams, its path recorded in `run`. Promotes
+/// nothing — the caller does that once this returns, and undoes `run` when
+/// it does not.
+#[allow(clippy::too_many_arguments)]
+fn read_slices_into(
+    conn: &Connection,
+    store: &mut dyn Store,
+    from_label: &str,
+    unit_name: &str,
+    version: Option<i64>,
+    source_slices: &[RecoverySlice],
+    clone_dir: &Path,
+    run: &mut StagedRun,
+) -> Result<ReadSlicesTally> {
+    let mut tally = ReadSlicesTally {
+        slices_read: 0,
+        bytes_read: 0,
+        stage_sets: Default::default(),
+        versions: Default::default(),
+    };
     let phase = progress::phase(
         "read",
-        Some(source_slices.iter().map(|s| s.3.max(0) as u64).sum()),
+        Some(
+            source_slices
+                .iter()
+                .map(|s| s.encrypted_bytes.max(0) as u64)
+                .sum(),
+        ),
     );
     let slice_count = source_slices.len();
-    for (
-        pos_str,
-        sha_on_vol,
-        _stage_slice_id,
-        enc_bytes,
-        sha_encrypted,
-        stage_set_id,
-        slice_db_id,
-    ) in &source_slices
-    {
-        let pos: u32 = pos_str.parse().unwrap_or(0);
+    for slice in source_slices {
+        let pos: u32 = slice.position.parse().unwrap_or(0);
         phase.item(format!(
             "{unit_name} slice {} of {slice_count} (file {pos})",
-            slices_read + 1
+            tally.slices_read + 1
         ));
         // Issue #404: between slices. Nothing is promoted until every slice
-        // is read, so a stop leaves the stage set as it was.
+        // is read, so a stop leaves the stage set as it was — and, since
+        // issue #474, takes back the slices already read.
         crate::signal::check(|| {
+            let read_slices = match version {
+                Some(v) => {
+                    format!("read-slices --from {from_label} --unit {unit_name} --version {v}")
+                }
+                None => format!("read-slices --from {from_label} --unit {unit_name}"),
+            };
             format!(
-                "volume read-slices stopped after {slices_read} of {slice_count} slices of \
-                 \"{unit_name}\"; nothing was promoted for writing. Run `tapectl volume \
-                 read-slices --from {from_label} --unit {unit_name}` again."
+                "volume read-slices stopped after {} of {slice_count} slices of \
+                 \"{unit_name}\"; nothing was promoted for writing and the slices already \
+                 read were removed from staging. Run `tapectl volume {read_slices}` again.",
+                tally.slices_read
             )
         })?;
-        let slice_path = clone_dir.join(format!("slice_{slice_db_id}.dat"));
+        let slice_path = clone_dir.join(format!("slice_{}.dat", slice.slice_id));
 
         match stream_verify_slice_to_staging(
             store,
             pos,
-            *enc_bytes as u64,
-            &[sha_on_vol.as_str(), sha_encrypted.as_str()],
+            slice.encrypted_bytes as u64,
+            &slice.expected_hashes(),
             &slice_path,
         )? {
             SliceStreamOutcome::Verified => {}
             SliceStreamOutcome::ChecksumMismatch { actual } => {
                 return Err(TapectlError::Other(format!(
                     "checksum mismatch reading slice at position {pos} from {from_label}: \
-                     got {actual}, expected {sha_on_vol} (or {sha_encrypted})"
+                     got {actual}, expected {} (or {})",
+                    slice.sha_on_volume, slice.sha_encrypted
                 )));
             }
         }
 
         // Update staging_path so volume_write can find this slice
-        conn.execute(
-            "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
-            params![slice_path.to_string_lossy().to_string(), slice_db_id],
-        )?;
+        run.record(conn, slice.slice_id, slice.stage_set_id, &slice_path)?;
 
-        affected_stage_sets.insert(*stage_set_id);
-        total_bytes += *enc_bytes;
-        slices_read += 1;
+        tally.stage_sets.insert(slice.stage_set_id);
+        tally.versions.insert(slice.version);
+        tally.bytes_read += slice.encrypted_bytes;
+        tally.slices_read += 1;
         info!(
             position = pos,
-            slice_id = slice_db_id,
+            slice_id = slice.slice_id,
             "read slice from source"
         );
     }
-
-    // Restore stage_sets status so find_staged_data() picks them up.
-    // Guard: only promote sets that were previously successfully staged.
     phase.done();
-    for ss_id in &affected_stage_sets {
-        conn.execute(
-            "UPDATE stage_sets SET status = 'staged' WHERE id = ?1 AND status IN ('staged', 'cleaned')",
-            params![ss_id],
-        )?;
-    }
-
-    info!(
-        from = from_label,
-        unit = unit_name,
-        slices = slices_read,
-        "read-slices complete — data staged for volume write"
-    );
-
-    Ok(ReadSlicesReport {
-        slices_read,
-        bytes_read: total_bytes,
-    })
+    Ok(tally)
 }
 
 #[derive(Debug, Default)]
 pub struct ReadSlicesReport {
     pub slices_read: i64,
     pub bytes_read: i64,
+    /// The snapshot versions the slices belonged to, ascending (issue #474).
+    pub versions: Vec<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -5595,8 +5872,9 @@ fn compact_read_contacted(
 
     // Find live slices (snapshots not reclaimable/purged)
     let mut stmt = conn.prepare(
-        "SELECT wp.position, wp.sha256_on_volume, wp.stage_slice_id,
-                ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id, ss.id as slice_id
+        "SELECT wp.position, wp.sha256_on_volume,
+                ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id, ss.id as slice_id,
+                s.version
          FROM write_positions wp
          JOIN writes w ON w.id = wp.write_id
          JOIN stage_slices ss ON ss.id = wp.stage_slice_id
@@ -5606,18 +5884,8 @@ fn compact_read_contacted(
            AND s.status NOT IN ('reclaimable', 'purged')
          ORDER BY CAST(wp.position AS INTEGER)",
     )?;
-    let live_slices: Vec<(String, String, i64, i64, String, i64, i64)> = stmt
-        .query_map(params![volume_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-            ))
-        })?
+    let live_slices: Vec<RecoverySlice> = stmt
+        .query_map(params![volume_id], RecoverySlice::from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if live_slices.is_empty() {
@@ -5630,93 +5898,220 @@ fn compact_read_contacted(
     let compact_dir = std::path::Path::new(staging_dir).join(format!("compact-{label}"));
     fs::create_dir_all(&compact_dir)?;
 
-    let mut total_bytes: i64 = 0;
-    let mut slices_read: i64 = 0;
-    let mut slices_skipped: i64 = 0;
-    let mut affected_stage_sets = HashSet::new();
+    // Issue #474: as for `read-slices`, a read that does not finish takes
+    // back the slices it wrote.
+    let mut run = StagedRun::default();
+    let tally = match compact_read_into(conn, store, label, &live_slices, &compact_dir, &mut run) {
+        Ok(tally) => tally,
+        Err(e) => {
+            run.undo(conn, None);
+            remove_dir_if_empty(&compact_dir);
+            return Err(e);
+        }
+    };
 
+    // Restore stage_sets status so find_staged_data() picks them up.
+    // Guard: only promote sets that were previously successfully staged.
+    //
+    // Issue #474: and only sets every slice of which was read and verified
+    // THIS run. A set with a skipped slice (or one with a slice this volume
+    // does not hold) promoted to `staged` is a set `volume write` refuses to
+    // write — its skipped slice has no staged file (#402) — and the remedy it
+    // then names is a read from this same volume. It stays as it was
+    // (`cleaned`), and the slices that were read for it are taken back.
+    let decided = (|| -> Result<(Vec<i64>, std::collections::BTreeSet<i64>)> {
+        let mut left_alone = tally.skipped_sets.clone();
+        let mut whole = Vec::new();
+        for (ss_id, read) in &tally.read_per_set {
+            let recorded: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM stage_slices WHERE stage_set_id = ?1",
+                params![ss_id],
+                |row| row.get(0),
+            )?;
+            if tally.skipped_sets.contains(ss_id) || *read != recorded {
+                left_alone.insert(*ss_id);
+            } else {
+                whole.push(*ss_id);
+            }
+        }
+        let tx = conn.unchecked_transaction()?;
+        for ss_id in &whole {
+            tx.execute(
+                "UPDATE stage_sets SET status = 'staged' WHERE id = ?1 AND status IN ('staged', 'cleaned')",
+                params![ss_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok((whole, left_alone))
+    })();
+    let (whole, left_alone) = match decided {
+        Ok(decided) => decided,
+        Err(e) => {
+            run.undo(conn, None);
+            remove_dir_if_empty(&compact_dir);
+            return Err(e);
+        }
+    };
+    if !left_alone.is_empty() {
+        run.undo(conn, Some(&left_alone.iter().copied().collect()));
+        remove_dir_if_empty(&compact_dir);
+        let mut message = if tally.slices_skipped > 0 {
+            format!(
+                "compact-read \"{label}\": {} slice(s) skipped due to checksum mismatch \
+                 ({} read successfully) — investigate before proceeding with compact-write.",
+                tally.slices_skipped, tally.slices_read,
+            )
+        } else {
+            format!(
+                "compact-read \"{label}\": {} stage set(s) have slices this volume does not \
+                 hold — investigate before proceeding with compact-write.",
+                left_alone.len(),
+            )
+        };
+        message.push_str(&format!(
+            "\n{} stage set(s) read in full are staged. These were NOT staged, because a \
+             slice of each could not be read from \"{label}\" (they stay as they were; what was \
+             read for them was removed):",
+            whole.len()
+        ));
+        for ss_id in &left_alone {
+            message.push_str(&unpromoted_set_line(conn, *ss_id, volume_id)?);
+        }
+        return Err(TapectlError::Other(message));
+    }
+
+    info!(
+        label = label,
+        slices = tally.slices_read,
+        "compact-read complete"
+    );
+
+    Ok(CompactReadReport {
+        slices_read: tally.slices_read,
+        bytes_read: tally.bytes_read,
+        slices_skipped: tally.slices_skipped,
+    })
+}
+
+/// What [`compact_read_into`] read.
+struct CompactReadTally {
+    slices_read: i64,
+    bytes_read: i64,
+    slices_skipped: i64,
+    /// Slices verified this run, per stage set.
+    read_per_set: std::collections::BTreeMap<i64, i64>,
+    /// Stage sets one of whose slices did not match its hash.
+    skipped_sets: std::collections::BTreeSet<i64>,
+}
+
+/// The slice loop of [`compact_read_contacted`]. A slice that does not match
+/// its hash is skipped and counted; everything else that goes wrong (a tape
+/// error, a signal, the catalog) is an `Err` and the caller undoes `run`.
+fn compact_read_into(
+    conn: &Connection,
+    store: &mut dyn Store,
+    label: &str,
+    live_slices: &[RecoverySlice],
+    compact_dir: &Path,
+    run: &mut StagedRun,
+) -> Result<CompactReadTally> {
+    let mut tally = CompactReadTally {
+        slices_read: 0,
+        bytes_read: 0,
+        slices_skipped: 0,
+        read_per_set: Default::default(),
+        skipped_sets: Default::default(),
+    };
     let phase = progress::phase(
         "read",
-        Some(live_slices.iter().map(|s| s.3.max(0) as u64).sum()),
+        Some(
+            live_slices
+                .iter()
+                .map(|s| s.encrypted_bytes.max(0) as u64)
+                .sum(),
+        ),
     );
     let slice_count = live_slices.len();
-    for (pos_str, sha_on_vol, _slice_id, enc_bytes, sha_encrypted, ss_id, slice_db_id) in
-        &live_slices
-    {
-        let pos: u32 = pos_str.parse().unwrap_or(0);
+    for slice in live_slices {
+        let pos: u32 = slice.position.parse().unwrap_or(0);
         phase.item(format!(
             "slice {} of {slice_count} (file {pos})",
-            slices_read + slices_skipped + 1
+            tally.slices_read + tally.slices_skipped + 1
         ));
         // Issue #404: between slices, before any set is promoted.
         crate::signal::check(|| {
             format!(
                 "volume compact-read stopped after {} of {slice_count} slices of \"{label}\"; \
-                 nothing was promoted for writing. Run `tapectl volume compact-read {label}` \
-                 again.",
-                slices_read + slices_skipped
+                 nothing was promoted for writing and the slices already read were removed \
+                 from staging. Run `tapectl volume compact-read {label}` again.",
+                tally.slices_read + tally.slices_skipped
             )
         })?;
-        let slice_path = compact_dir.join(format!("slice_{slice_db_id}.dat"));
+        let slice_path = compact_dir.join(format!("slice_{}.dat", slice.slice_id));
 
         match stream_verify_slice_to_staging(
             store,
             pos,
-            *enc_bytes as u64,
-            &[sha_on_vol.as_str(), sha_encrypted.as_str()],
+            slice.encrypted_bytes as u64,
+            &slice.expected_hashes(),
             &slice_path,
         )? {
             SliceStreamOutcome::Verified => {}
             SliceStreamOutcome::ChecksumMismatch { actual } => {
                 warn!(
                     position = pos,
-                    slice_id = slice_db_id,
+                    slice_id = slice.slice_id,
                     actual = %actual,
-                    expected_a = %sha_on_vol,
-                    expected_b = %sha_encrypted,
+                    expected_a = %slice.sha_on_volume,
+                    expected_b = %slice.sha_encrypted,
                     "checksum mismatch — skipping slice"
                 );
-                slices_skipped += 1;
+                tally.slices_skipped += 1;
+                tally.skipped_sets.insert(slice.stage_set_id);
                 continue;
             }
         }
 
         // Update staging_path so compact-write can find slices
-        conn.execute(
-            "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
-            params![slice_path.to_string_lossy().to_string(), slice_db_id],
-        )?;
+        run.record(conn, slice.slice_id, slice.stage_set_id, &slice_path)?;
 
-        affected_stage_sets.insert(*ss_id);
-        total_bytes += *enc_bytes;
-        slices_read += 1;
-        info!(position = pos, slice_id = slice_db_id, "read live slice");
+        *tally.read_per_set.entry(slice.stage_set_id).or_insert(0) += 1;
+        tally.bytes_read += slice.encrypted_bytes;
+        tally.slices_read += 1;
+        info!(position = pos, slice_id = slice.slice_id, "read live slice");
     }
     phase.done();
+    Ok(tally)
+}
 
-    // Restore stage_sets status so find_staged_data() picks them up.
-    // Guard: only promote sets that were previously successfully staged.
-    for ss_id in &affected_stage_sets {
-        conn.execute(
-            "UPDATE stage_sets SET status = 'staged' WHERE id = ?1 AND status IN ('staged', 'cleaned')",
-            params![ss_id],
-        )?;
-    }
-
-    if slices_skipped > 0 {
-        return Err(TapectlError::Other(format!(
-            "compact-read \"{label}\": {slices_skipped} slice(s) skipped due to checksum mismatch \
-             ({slices_read} read successfully) — investigate before proceeding with compact-write",
-        )));
-    }
-
-    info!(label = label, slices = slices_read, "compact-read complete");
-
-    Ok(CompactReadReport {
-        slices_read,
-        bytes_read: total_bytes,
-        slices_skipped,
-    })
+/// One line of `compact-read`'s account of a set it did not stage: the unit
+/// and version, and the remedy — another sealed copy to read it from, or
+/// the version staged again from source. Never names `failed_volume_id`, the
+/// volume whose slice just failed to read (issue #474).
+fn unpromoted_set_line(
+    conn: &Connection,
+    stage_set_id: i64,
+    failed_volume_id: i64,
+) -> Result<String> {
+    let (unit_id, unit_name, unit_status, version): (i64, String, String, i64) = conn.query_row(
+        "SELECT u.id, u.name, u.status, s.version FROM stage_sets ss
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE ss.id = ?1",
+        params![stage_set_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let remedy = staging::incomplete_set_remedy(
+        conn,
+        unit_id,
+        &unit_name,
+        version,
+        &unit_status,
+        Some(failed_volume_id),
+    )?;
+    Ok(format!(
+        "\n  {unit_name} v{version} (stage set {stage_set_id}):\n    remedy: {remedy}"
+    ))
 }
 
 /// Compact-write: write staged compaction slices to destination volume.
@@ -6275,7 +6670,8 @@ fn check_staged_slices(conn: &Connection) -> Result<()> {
         for p in &problems {
             report.push_str(&format!("\n    - {p}"));
         }
-        let remedy = staging::incomplete_set_remedy(conn, unit_id, &name, version, &unit_status)?;
+        let remedy =
+            staging::incomplete_set_remedy(conn, unit_id, &name, version, &unit_status, None)?;
         report.push_str(&format!("\n    remedy: {remedy}"));
     }
     if report.is_empty() {
@@ -10032,6 +10428,7 @@ mod tests {
             &config,
             "RSLABEL",
             "rs-unit",
+            None,
             &mut store,
             site(Operation::VolumeReadSlices),
         )
@@ -10084,6 +10481,7 @@ mod tests {
             &config,
             "RSUUID",
             "secret-name",
+            None,
             &mut store,
             site(Operation::VolumeReadSlices),
         )
@@ -10126,6 +10524,7 @@ mod tests {
             &config,
             "RSSTOP",
             "rs-stop",
+            None,
             &mut store,
             site(Operation::VolumeReadSlices),
         );
@@ -10173,6 +10572,594 @@ mod tests {
         assert_eq!(report.slices_read, 1);
         assert_eq!(report.slices_skipped, 0);
         assert_eq!(report.bytes_read, data.len() as i64);
+    }
+
+    // ── issue #474: recovery reads ──
+
+    /// A store with each `(position, bytes)` file at its position and a
+    /// one-byte filler in every position before the last.
+    fn mem_store_with_slices(slices: &[(u32, &[u8])]) -> MemStore {
+        let last = slices.iter().map(|(p, _)| *p).max().unwrap();
+        let mut store = MemStore::new(4096);
+        for p in 0..=last {
+            let bytes = slices
+                .iter()
+                .find(|(q, _)| *q == p)
+                .map(|(_, b)| b.to_vec())
+                .unwrap_or_else(|| vec![0u8]);
+            store
+                .execute(&mut Cursor::new(bytes.clone()), bytes.len() as u64, false)
+                .unwrap();
+        }
+        store
+    }
+
+    fn stage_set_of_slice(conn: &Connection, slice_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT stage_set_id FROM stage_slices WHERE id = ?1",
+            params![slice_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A further slice (number `number`) of the stage set
+    /// `seed_one_slice_fixture` made, written at `position` of volume
+    /// `label` and recorded with the hash of `claimed`.
+    fn add_slice_to_set(
+        conn: &Connection,
+        stage_set_id: i64,
+        label: &str,
+        number: i64,
+        position: u32,
+        claimed: &[u8],
+    ) -> i64 {
+        let hash = direct_hash(claimed);
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+             VALUES (?1, ?2, ?3, ?3, ?4, ?4)",
+            params![stage_set_id, number, claimed.len() as i64, hash],
+        )
+        .unwrap();
+        let slice_id = conn.last_insert_rowid();
+        let write_id: i64 = conn
+            .query_row(
+                "SELECT w.id FROM writes w JOIN volumes v ON v.id = w.volume_id
+                 WHERE w.stage_set_id = ?1 AND v.label = ?2",
+                params![stage_set_id, label],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status, sha256_on_volume)
+             VALUES (?1, ?2, ?3, 'written', ?4)",
+            params![write_id, slice_id, position.to_string(), hash],
+        )
+        .unwrap();
+        slice_id
+    }
+
+    /// A further VERSION of `unit_name` (a one-slice, `cleaned` stage set)
+    /// written to volume `label` at `position`. Returns the slice id.
+    fn add_version(
+        conn: &Connection,
+        unit_name: &str,
+        version: i64,
+        snapshot_status: &str,
+        label: &str,
+        position: u32,
+        bytes: &[u8],
+    ) -> i64 {
+        let unit_id: i64 = conn
+            .query_row(
+                "SELECT id FROM units WHERE name = ?1",
+                params![unit_name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, ?2, ?3, '/tmp', 1, ?4)",
+            params![unit_id, version, snapshot_status, bytes.len() as i64],
+        )
+        .unwrap();
+        let snap_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'cleaned', 524288)",
+            params![snap_id],
+        )
+        .unwrap();
+        let ss_id = conn.last_insert_rowid();
+        let hash = direct_hash(bytes);
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted)
+             VALUES (?1, 1, ?2, ?2, ?3, ?3)",
+            params![ss_id, bytes.len() as i64, hash],
+        )
+        .unwrap();
+        let slice_id = conn.last_insert_rowid();
+        let volume_id: i64 = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![ss_id, snap_id, volume_id],
+        )
+        .unwrap();
+        let write_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status, sha256_on_volume)
+             VALUES (?1, ?2, ?3, 'written', ?4)",
+            params![write_id, slice_id, position.to_string(), hash],
+        )
+        .unwrap();
+        slice_id
+    }
+
+    /// A second, sealed volume `label` holding a completed write of
+    /// `stage_set_id` — another copy of the same version.
+    fn add_sealed_copy(conn: &Connection, stage_set_id: i64, label: &str) {
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+            params![label],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                params![stage_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![stage_set_id, snapshot_id, volume_id],
+        )
+        .unwrap();
+    }
+
+    fn slice_staging_path(conn: &Connection, slice_id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT staging_path FROM stage_slices WHERE id = ?1",
+            params![slice_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn stage_set_status(conn: &Connection, stage_set_id: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM stage_sets WHERE id = ?1",
+            params![stage_set_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn staging_config(dir: &Path) -> Config {
+        let mut config = Config::default();
+        config.staging.directory = dir.to_string_lossy().into_owned();
+        config
+    }
+
+    /// A released (`cleaned`) one-unit, two-slice stage set on volume
+    /// `label`, whose second slice reads back from the tape as `rotted`
+    /// rather than the bytes it was recorded with. Returns
+    /// `(good slice id, bad slice id, stage set id, tape)`.
+    fn cleaned_set_with_a_rotted_second_slice(
+        conn: &Connection,
+        label: &str,
+        unit: &str,
+    ) -> (i64, i64, i64, MemStore) {
+        let good = b"the first slice reads back whole. ".repeat(8);
+        let second = b"the second slice, as it was written. ".repeat(8);
+        let rotted = b"the second slice, as the tape gives it back!! ".repeat(8);
+        let first_id = seed_one_slice_fixture(conn, label, unit, 4, &good, "completed", "current");
+        let set_id = stage_set_of_slice(conn, first_id);
+        conn.execute("UPDATE stage_sets SET status = 'cleaned'", [])
+            .unwrap();
+        let second_id = add_slice_to_set(conn, set_id, label, 2, 5, &second);
+        (
+            first_id,
+            second_id,
+            set_id,
+            mem_store_with_slices(&[(4, &good), (5, &rotted)]),
+        )
+    }
+
+    /// Issue #474 item 1: a `compact-read` that skips a slice does not stage
+    /// the set it belonged to. Before, the set was promoted from its good
+    /// slices, `volume write` then refused it (the skipped slice has no
+    /// staged file, #402), and the remedy it named was a read from the very
+    /// volume that had just failed.
+    #[test]
+    fn compact_read_with_one_bad_slice_leaves_the_set_cleaned_and_names_a_remedy_that_can_work() {
+        let conn = crate::db::open_memory().unwrap();
+        let (good_id, bad_id, set_id, mut store) =
+            cleaned_set_with_a_rotted_second_slice(&conn, "CRBAD", "cr-bad");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = staging_config(tmp.path());
+
+        let err = compact_read(
+            &conn,
+            &config,
+            "CRBAD",
+            &mut store,
+            site(Operation::VolumeCompactRead),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("1 slice(s) skipped due to checksum mismatch"),
+            "{err}"
+        );
+        assert_eq!(
+            stage_set_status(&conn, set_id),
+            "cleaned",
+            "a set with a skipped slice is not staged"
+        );
+        assert_eq!(slice_staging_path(&conn, good_id), None, "{err}");
+        assert_eq!(slice_staging_path(&conn, bad_id), None);
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            0,
+            "what was read for the set was removed, directory and all"
+        );
+        // The only copy is the volume that just failed: not named. The
+        // remedy is to stage the version again, which works for an active
+        // unit.
+        assert!(
+            !err.contains("read-slices --from CRBAD"),
+            "the remedy must not send the operator back to the failing volume: {err}"
+        );
+        assert!(
+            err.contains("tapectl staging clean --unit cr-bad --version 1 --force")
+                && err.contains("tapectl stage create cr-bad --version 1"),
+            "{err}"
+        );
+    }
+
+    /// The remedy names ANOTHER sealed copy when there is one, with the
+    /// version it is for.
+    #[test]
+    fn compact_read_remedy_names_another_copy_never_the_failing_volume() {
+        let conn = crate::db::open_memory().unwrap();
+        let (_, _, set_id, mut store) =
+            cleaned_set_with_a_rotted_second_slice(&conn, "CRBAD2", "cr-bad2");
+        add_sealed_copy(&conn, set_id, "CRGOOD2");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = staging_config(tmp.path());
+
+        let err = compact_read(
+            &conn,
+            &config,
+            "CRBAD2",
+            &mut store,
+            site(Operation::VolumeCompactRead),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("tapectl volume read-slices --from CRGOOD2 --unit cr-bad2 --version 1"),
+            "{err}"
+        );
+        assert!(!err.contains("--from CRBAD2"), "{err}");
+    }
+
+    /// The coverage query's exclusion on its own: the newest copy is the
+    /// one excluded, so the older one answers; excluding the only copy
+    /// answers nothing.
+    #[test]
+    fn in_service_copy_of_version_excluding_skips_the_named_volume() {
+        let conn = crate::db::open_memory().unwrap();
+        let data = b"coverage exclusion fixture. ".repeat(4);
+        let slice_id = seed_one_slice_fixture(
+            &conn,
+            "COV-OLD",
+            "cov-unit",
+            4,
+            &data,
+            "completed",
+            "current",
+        );
+        let set_id = stage_set_of_slice(&conn, slice_id);
+        add_sealed_copy(&conn, set_id, "COV-NEW");
+        let (unit_id, old_id, new_id): (i64, i64, i64) = (
+            conn.query_row("SELECT id FROM units WHERE name = 'cov-unit'", [], |r| {
+                r.get(0)
+            })
+            .unwrap(),
+            conn.query_row("SELECT id FROM volumes WHERE label = 'COV-OLD'", [], |r| {
+                r.get(0)
+            })
+            .unwrap(),
+            conn.query_row("SELECT id FROM volumes WHERE label = 'COV-NEW'", [], |r| {
+                r.get(0)
+            })
+            .unwrap(),
+        );
+        let ask = |exclude| {
+            coverage::in_service_copy_of_version_excluding(&conn, unit_id, 1, exclude).unwrap()
+        };
+        assert_eq!(ask(None).as_deref(), Some("COV-NEW"), "newest first");
+        assert_eq!(
+            coverage::in_service_copy_of_version(&conn, unit_id, 1)
+                .unwrap()
+                .as_deref(),
+            Some("COV-NEW")
+        );
+        assert_eq!(ask(Some(new_id)).as_deref(), Some("COV-OLD"));
+        conn.execute(
+            "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+            params![old_id],
+        )
+        .unwrap();
+        assert_eq!(ask(Some(new_id)), None, "nothing else is in service");
+    }
+
+    /// A fully read set IS staged (the promotion this change narrows,
+    /// pinned so narrowing it cannot turn into never doing it).
+    #[test]
+    fn compact_read_stages_a_released_set_it_read_in_full() {
+        let conn = crate::db::open_memory().unwrap();
+        let first = b"compact-read in full, slice one. ".repeat(8);
+        let second = b"compact-read in full, slice two. ".repeat(8);
+        let first_id =
+            seed_one_slice_fixture(&conn, "CROK", "cr-ok", 4, &first, "completed", "current");
+        let set_id = stage_set_of_slice(&conn, first_id);
+        conn.execute("UPDATE stage_sets SET status = 'cleaned'", [])
+            .unwrap();
+        let second_id = add_slice_to_set(&conn, set_id, "CROK", 2, 5, &second);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = staging_config(tmp.path());
+        let mut store = mem_store_with_slices(&[(4, &first), (5, &second)]);
+
+        let report = compact_read(
+            &conn,
+            &config,
+            "CROK",
+            &mut store,
+            site(Operation::VolumeCompactRead),
+        )
+        .unwrap();
+
+        assert_eq!(report.slices_read, 2);
+        assert_eq!(stage_set_status(&conn, set_id), "staged");
+        for id in [first_id, second_id] {
+            let path = slice_staging_path(&conn, id).expect("a staged path");
+            assert!(Path::new(&path).is_file(), "{path}");
+        }
+        assert!(
+            staging::staged_slice_problems(&conn, set_id)
+                .unwrap()
+                .is_empty(),
+            "the staged set is whole on disk"
+        );
+    }
+
+    /// Issue #474 item 2: `--version` reads one version; by default the
+    /// reclaimable and purged ones are left alone, as `compact-read` does.
+    #[test]
+    fn read_slices_reads_the_named_version_and_by_default_skips_reclaimable_and_purged() {
+        let conn = crate::db::open_memory().unwrap();
+        let v1 = b"version one's ciphertext. ".repeat(6);
+        let v2 = b"version two's ciphertext. ".repeat(6);
+        let v3 = b"version three's ciphertext. ".repeat(6);
+        seed_one_slice_fixture(&conn, "RSV", "rs-v", 4, &v1, "completed", "current");
+        conn.execute("UPDATE stage_sets SET status = 'cleaned'", [])
+            .unwrap();
+        let v2_slice = add_version(&conn, "rs-v", 2, "reclaimable", "RSV", 5, &v2);
+        let v3_slice = add_version(&conn, "rs-v", 3, "purged", "RSV", 6, &v3);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = staging_config(tmp.path());
+        let read = |version: Option<i64>| {
+            let mut store = mem_store_with_slices(&[(4, &v1), (5, &v2), (6, &v3)]);
+            read_slices(
+                &conn,
+                &config,
+                "RSV",
+                "rs-v",
+                version,
+                &mut store,
+                site(Operation::VolumeReadSlices),
+            )
+        };
+
+        // Default: version 1 only.
+        let report = read(None).unwrap();
+        assert_eq!(report.versions, vec![1]);
+        assert_eq!(report.slices_read, 1);
+        assert_eq!(slice_staging_path(&conn, v2_slice), None);
+        assert_eq!(slice_staging_path(&conn, v3_slice), None);
+
+        // Named: that version, whatever its state.
+        let report = read(Some(2)).unwrap();
+        assert_eq!(report.versions, vec![2]);
+        assert_eq!(report.slices_read, 1);
+        assert!(slice_staging_path(&conn, v2_slice).is_some());
+        assert_eq!(slice_staging_path(&conn, v3_slice), None);
+
+        // A version the volume does not hold.
+        let err = read(Some(9)).unwrap_err().to_string();
+        assert!(err.contains("version 9"), "{err}");
+    }
+
+    /// With every version reclaimable the unit is on the volume and the
+    /// default hides it: the refusal says so rather than "no slices".
+    #[test]
+    fn read_slices_says_when_the_default_hid_every_version() {
+        let conn = crate::db::open_memory().unwrap();
+        let data = b"every version reclaimable. ".repeat(6);
+        seed_one_slice_fixture(
+            &conn,
+            "RSALL",
+            "rs-all",
+            4,
+            &data,
+            "completed",
+            "reclaimable",
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = staging_config(tmp.path());
+        let mut store = mem_store_with_slice_at(4, &data);
+
+        let err = read_slices(
+            &conn,
+            &config,
+            "RSALL",
+            "rs-all",
+            None,
+            &mut store,
+            site(Operation::VolumeReadSlices),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("reclaimable or purged"), "{err}");
+        assert!(err.contains("--version"), "{err}");
+    }
+
+    /// Issue #474 item 2: the staging directory is checked before the first
+    /// slice is read. The need is exact, so it is a refusal naming both
+    /// figures, and the tape is not touched.
+    #[test]
+    fn read_slices_refuses_before_reading_when_staging_cannot_hold_the_slices() {
+        let conn = crate::db::open_memory().unwrap();
+        let data = b"a slice staging has no room for. ".repeat(10);
+        let slice_id =
+            seed_one_slice_fixture(&conn, "RSFULL", "rs-full", 4, &data, "completed", "staged");
+        conn.execute("UPDATE stage_sets SET status = 'cleaned'", [])
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = staging_config(tmp.path());
+        let mut store = mem_store_with_slice_at(4, &data);
+        let _free = staging::FreeSpaceOverride::set(data.len() as u64 - 1);
+
+        let err = read_slices(
+            &conn,
+            &config,
+            "RSFULL",
+            "rs-full",
+            None,
+            &mut store,
+            site(Operation::VolumeReadSlices),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("refusing to read"), "{err}");
+        assert!(err.contains("free") && err.contains("need"), "{err}");
+        assert_eq!(slice_staging_path(&conn, slice_id), None);
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            0,
+            "no directory was made for a read that never started"
+        );
+        // Room for exactly the bytes: reads.
+        drop(_free);
+        let _free = staging::FreeSpaceOverride::set(data.len() as u64);
+        read_slices(
+            &conn,
+            &config,
+            "RSFULL",
+            "rs-full",
+            None,
+            &mut store,
+            site(Operation::VolumeReadSlices),
+        )
+        .unwrap();
+    }
+
+    /// Issue #474 item 3: a `read-slices` that fails partway leaves nothing
+    /// behind — the slice it had already read is unlinked, its
+    /// `staging_path` is back to what it was, the set is not promoted and
+    /// the directory it made is gone.
+    #[test]
+    fn a_failed_read_slices_leaves_nothing_behind() {
+        let conn = crate::db::open_memory().unwrap();
+        let (good_id, bad_id, set_id, mut store) =
+            cleaned_set_with_a_rotted_second_slice(&conn, "RSFAIL", "rs-fail");
+        // The first slice already had a path recorded (a legitimate file in
+        // the original staging directory of some earlier life of the set).
+        conn.execute(
+            "UPDATE stage_slices SET staging_path = '/original/staging/first.age' WHERE id = ?1",
+            params![good_id],
+        )
+        .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = staging_config(tmp.path());
+
+        let err = read_slices(
+            &conn,
+            &config,
+            "RSFAIL",
+            "rs-fail",
+            None,
+            &mut store,
+            site(Operation::VolumeReadSlices),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("checksum mismatch reading slice at position 5"),
+            "{err}"
+        );
+        assert_eq!(
+            slice_staging_path(&conn, good_id).as_deref(),
+            Some("/original/staging/first.age"),
+            "a path that was there before the read is put back"
+        );
+        assert_eq!(slice_staging_path(&conn, bad_id), None);
+        assert_eq!(stage_set_status(&conn, set_id), "cleaned");
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            0,
+            "the slice read before the failure and its directory are gone"
+        );
+    }
+
+    /// The same, for the interrupt that arrives between slices.
+    #[test]
+    fn an_interrupted_read_slices_leaves_nothing_behind_either() {
+        let conn = crate::db::open_memory().unwrap();
+        let (good_id, _bad_id, set_id, mut store) =
+            cleaned_set_with_a_rotted_second_slice(&conn, "RSINT", "rs-int");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = staging_config(tmp.path());
+
+        crate::signal::interrupt_this_thread(true);
+        let r = read_slices(
+            &conn,
+            &config,
+            "RSINT",
+            "rs-int",
+            Some(1),
+            &mut store,
+            site(Operation::VolumeReadSlices),
+        );
+        crate::signal::interrupt_this_thread(false);
+        let msg = r.unwrap_err().to_string();
+
+        assert!(
+            msg.contains("--version 1"),
+            "the re-run names the version: {msg}"
+        );
+        assert_eq!(slice_staging_path(&conn, good_id), None);
+        assert_eq!(stage_set_status(&conn, set_id), "cleaned");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -14659,6 +15646,7 @@ mod tests {
                 &config,
                 "RS-WANT",
                 "rs-unit2",
+                None,
                 &mut store,
                 site(Operation::VolumeReadSlices),
             )
@@ -15040,6 +16028,7 @@ mod tests {
                 &config,
                 "RSC-OK",
                 "rsc-unit",
+                None,
                 &mut store,
                 site(Operation::VolumeReadSlices),
             )
@@ -15068,6 +16057,7 @@ mod tests {
                 &config,
                 "RSC-WANT",
                 "rsc-w-unit",
+                None,
                 &mut store,
                 site(Operation::VolumeReadSlices),
             )
@@ -15212,7 +16202,8 @@ mod tests {
                         None
                     }
                     Operation::VolumeReadSlices => {
-                        read_slices(&conn, &config, label, "rph-unit", &mut store, site).unwrap();
+                        read_slices(&conn, &config, label, "rph-unit", None, &mut store, site)
+                            .unwrap();
                         Some(volume_id(&conn, label))
                     }
                     _ => {
