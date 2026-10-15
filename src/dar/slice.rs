@@ -637,6 +637,86 @@ mod tests {
         out
     }
 
+    /// `n` bytes of deterministic noise (dar does not compress it away).
+    fn noise(n: usize, seed: u64) -> Vec<u8> {
+        let mut x: u64 = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// dar's `-c -` stream of `src`: what `stage create` cuts.
+    fn dar_stream_of(src: &Path) -> Vec<u8> {
+        run(Command::new("dar").args(["-c", "-", "-R"]).arg(src).args([
+            "-an",
+            "-D",
+            "-Q",
+            "-N",
+            "--retry-on-change",
+            "0",
+        ]))
+        .stdout
+    }
+
+    /// Cut `stream` at `-s size` with tapectl's slicer and with `dar_xform`
+    /// into `work`, and assert they agree: the same slices, byte for byte
+    /// except the internal name `dar_xform` draws afresh, and no further
+    /// slice from `dar_xform`; then `dar -t` accepts tapectl's. Returns the
+    /// slice header's length and what the cut did.
+    fn cut_like_dar_xform(stream: &[u8], size: &str, work: &Path) -> (usize, CutSummary) {
+        let mine = work.join("mine");
+        let theirs = work.join("theirs");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        let tmpl = template("dar", size, &work.join("tmpl")).unwrap();
+        let header_len = parse_header(&mut &tmpl[..]).unwrap().bytes.len();
+        let summary = cut_stream(
+            stream,
+            &tmpl,
+            |n| Ok(std::fs::File::create(mine.join(format!("a.{n}.dar")))?),
+            |_, _| Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(summary.stream_bytes, stream.len() as u64);
+
+        let mut xform = Command::new("dar_xform")
+            .args(["-s", size, "-Q", "-"])
+            .arg(theirs.join("a"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("dar_xform ships with dar");
+        use std::io::Write;
+        xform.stdin.take().unwrap().write_all(stream).unwrap();
+        assert!(xform.wait().unwrap().success(), "dar_xform at {size}");
+
+        for n in 1..=summary.slices {
+            let a = std::fs::read(mine.join(format!("a.{n}.dar"))).unwrap();
+            let b = std::fs::read(theirs.join(format!("a.{n}.dar"))).unwrap();
+            assert_eq!(a.len(), b.len(), "slice {n} at {size}");
+            let differ: Vec<usize> = (0..a.len()).filter(|&j| a[j] != b[j]).collect();
+            assert!(
+                differ.iter().all(|&j| (4..14).contains(&j)),
+                "slice {n} at {size} differs outside the internal name: {differ:?}"
+            );
+        }
+        assert!(
+            !theirs
+                .join(format!("a.{}.dar", summary.slices + 1))
+                .exists(),
+            "dar_xform cut {size} into the same number of slices"
+        );
+        run(Command::new("dar").arg("-t").arg(mine.join("a")).arg("-Q"));
+        (header_len, summary)
+    }
+
     /// The pin a dar upgrade must pass (issue #370): for 1 MiB, 4 MiB, 1 GiB
     /// and 10 GiB slices, tapectl's slices of a real `dar -c -` stream are
     /// `dar_xform`'s slices of the same stream, byte for byte, except the
@@ -646,25 +726,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(src.join("d")).unwrap();
-        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
-        let noise: Vec<u8> = (0..(5 << 20) + 12345)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                x as u8
-            })
-            .collect();
-        std::fs::write(src.join("noise.bin"), &noise).unwrap();
+        std::fs::write(
+            src.join("noise.bin"),
+            noise((5 << 20) + 12345, 0x2545_F491_4F6C_DD1D),
+        )
+        .unwrap();
         std::fs::write(src.join("d/small.txt"), b"small").unwrap();
-        let stream = run(Command::new("dar").args(["-c", "-", "-R"]).arg(&src).args([
-            "-an",
-            "-D",
-            "-Q",
-            "--retry-on-change",
-            "0",
-        ]))
-        .stdout;
+        let stream = dar_stream_of(&src);
 
         // The slice size is an infinint in the header, so the header's length
         // follows it: one 4-byte group up to 4 GiB, two above. 1G is the
@@ -673,56 +741,52 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let work = tmp.path().join(format!("w{i}"));
-            let mine = work.join("mine");
-            let theirs = work.join("theirs");
-            std::fs::create_dir_all(&mine).unwrap();
-            std::fs::create_dir_all(&theirs).unwrap();
-            let tmpl = template("dar", size, &work.join("tmpl")).unwrap();
-            assert_eq!(
-                parse_header(&mut &tmpl[..]).unwrap().bytes.len(),
-                header_len,
-                "dar's slice header at -s {size}"
-            );
-            let summary = cut_stream(
-                &stream[..],
-                &tmpl,
-                |n| Ok(std::fs::File::create(mine.join(format!("a.{n}.dar")))?),
-                |_, _| Ok(()),
-                |_| Ok(()),
-            )
-            .unwrap();
-            assert_eq!(summary.stream_bytes, stream.len() as u64);
-
-            let mut xform = Command::new("dar_xform")
-                .args(["-s", size, "-Q", "-"])
-                .arg(theirs.join("a"))
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("dar_xform ships with dar");
-            use std::io::Write;
-            xform.stdin.take().unwrap().write_all(&stream).unwrap();
-            assert!(xform.wait().unwrap().success(), "dar_xform at {size}");
-
-            for n in 1..=summary.slices {
-                let a = std::fs::read(mine.join(format!("a.{n}.dar"))).unwrap();
-                let b = std::fs::read(theirs.join(format!("a.{n}.dar"))).unwrap();
-                assert_eq!(a.len(), b.len(), "slice {n} at {size}");
-                let differ: Vec<usize> = (0..a.len()).filter(|&j| a[j] != b[j]).collect();
-                assert!(
-                    differ.iter().all(|&j| (4..14).contains(&j)),
-                    "slice {n} at {size} differs outside the internal name: {differ:?}"
-                );
-            }
-            assert!(
-                !theirs
-                    .join(format!("a.{}.dar", summary.slices + 1))
-                    .exists(),
-                "dar_xform cut {size} into the same number of slices"
-            );
-            run(Command::new("dar").arg("-t").arg(mine.join("a")).arg("-Q"));
+            let (found, _) = cut_like_dar_xform(&stream, size, &tmp.path().join(format!("w{i}")));
+            assert_eq!(found, header_len, "dar's slice header at -s {size}");
         }
+    }
+
+    /// Issue #465 item 8: a payload that ends exactly where a slice does is
+    /// asserted by `a_payload_ending_on_a_slice_boundary_marks_the_full_slice_last`
+    /// on a hand-made stream; this is the same case from a real `dar -c -`
+    /// stream, against `dar_xform` and `dar -t`. dar's last-slice flag sits in
+    /// the full slice's trailer, and there is no further, empty slice.
+    ///
+    /// The slice size is chosen to fit the stream: the source is padded a
+    /// byte at a time until the payload (the stream less dar's one header and
+    /// its one trailing flag byte) divides by 3, and `-s` is then three
+    /// payloads plus the slice header and trailer. A bare number is bytes.
+    #[test]
+    fn a_real_archive_ending_on_a_slice_boundary_is_cut_like_dar_xform() {
+        if !matches!(Command::new("dar_xform").arg("--version").output(), Ok(_)) {
+            eprintln!("SKIP boundary test: dar_xform is not on PATH (it ships with dar)");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let body = noise(300_000, 0x9E37_79B9_7F4A_7C15);
+        let (stream, payload) = (0..64)
+            .find_map(|pad| {
+                std::fs::write(src.join("data.bin"), &body[..body.len() - 64 + pad]).unwrap();
+                let stream = dar_stream_of(&src);
+                let header = parse_header(&mut &stream[..]).unwrap().bytes.len();
+                let payload = stream.len() - header - 1;
+                (payload % 3 == 0).then_some((stream, payload))
+            })
+            .expect("a payload that divides by three within 64 bytes of padding");
+        let per_slice = payload / 3;
+        // The slice header is 50 bytes below 4 GiB (asserted below), and each
+        // slice ends in one flag byte.
+        let size = (per_slice + 50 + 1).to_string();
+
+        let (header_len, summary) = cut_like_dar_xform(&stream, &size, tmp.path());
+        assert_eq!(header_len, 50, "the arithmetic above assumes this");
+        assert_eq!(summary.slices, 3, "three full slices and no empty fourth");
+        let last = std::fs::read(tmp.path().join("mine/a.3.dar")).unwrap();
+        assert_eq!(last.len(), per_slice + 51, "the last slice is full");
+        assert_eq!(*last.last().unwrap(), LAST, "and marked last");
+        let second = std::fs::read(tmp.path().join("mine/a.2.dar")).unwrap();
+        assert_eq!(*second.last().unwrap(), NOT_LAST);
     }
 }
