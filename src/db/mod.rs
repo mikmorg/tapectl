@@ -466,6 +466,12 @@ fn migrations() -> Migrations<'static> {
         // device's open, close and failed command (issue #344), against the
         // contact. A new table, no rows touched. See the header.
         M::up(include_str!("migrations/035_mtget_journal.sql")),
+        // 036 registers cleaning cartridges (issue #430; ADR-0012 2026-10-15
+        // item 60): `cleaning_cartridges` (serial, registered_at,
+        // rated_uses). Each cleaning is an event and the uses are derived
+        // from the events; `cartridges` is not rebuilt. A new table, no rows
+        // touched. See the header.
+        M::up(include_str!("migrations/036_cleaning_cartridges.sql")),
     ])
 }
 
@@ -5174,6 +5180,71 @@ mod tests {
         assert!(
             after.contains("USING COVERING INDEX idx_events_action_timestamp"),
             "after 031: {after}"
+        );
+    }
+
+    /// Migration 036 creates `cleaning_cartridges` and touches NOTHING else
+    /// (issue #430; ADR-0012 2026-10-15 item 60: `cartridges` is not
+    /// rebuilt). Pinned by difference against 035, the way 025's is, so a
+    /// later migration cannot move it. The schema's own rules are enforced,
+    /// not merely declared (PRAGMA table_info reports no CHECK): serial is
+    /// unique and non-empty, the rated life positive. A cleaning is an event
+    /// in the existing `events` table, so nothing else is added.
+    #[test]
+    fn migration_036_creates_only_cleaning_cartridges() {
+        let latest_conn = open_memory_at_version(36);
+        let before = schema_objects(&open_memory_at_version(35));
+        let after = schema_objects(&latest_conn);
+        let added: Vec<(&str, &str)> = after
+            .iter()
+            .filter(|o| !before.contains(o))
+            .map(|o| (o.0.as_str(), o.1.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                ("index", "sqlite_autoindex_cleaning_cartridges_1"),
+                ("table", "cleaning_cartridges"),
+            ]
+        );
+        let changed_or_removed: Vec<&(String, String, String, Option<String>)> =
+            before.iter().filter(|o| !after.contains(o)).collect();
+        assert!(
+            changed_or_removed.is_empty(),
+            "036 must alter no existing object (cartridges least of all): {changed_or_removed:?}"
+        );
+        assert_eq!(
+            table_info(&latest_conn, "cleaning_cartridges")
+                .into_iter()
+                .map(|c| c.0)
+                .collect::<Vec<_>>(),
+            ["id", "serial", "registered_at", "rated_uses"]
+        );
+
+        let insert = |serial: &str, rated: i64| {
+            latest_conn.execute(
+                "INSERT INTO cleaning_cartridges (serial, rated_uses) VALUES (?1, ?2)",
+                rusqlite::params![serial, rated],
+            )
+        };
+        insert("CLN-A", 50).expect("positive control: a legal row is accepted");
+        assert!(insert("CLN-A", 50).is_err(), "serial is unique");
+        assert!(insert("", 50).is_err(), "serial may not be empty");
+        assert!(insert("CLN-B", 0).is_err(), "rated_uses must be positive");
+        let registered: String = latest_conn
+            .query_row(
+                "SELECT registered_at FROM cleaning_cartridges WHERE serial = 'CLN-A'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!registered.is_empty(), "registered_at defaults to now");
+
+        let report = crate::cli::operations::db_fsck(&latest_conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "db fsck must be clean after 036: {:?}",
+            report.issues
         );
     }
 
