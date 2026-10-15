@@ -12,9 +12,12 @@
 //!   `old-primary` or `family-old`'s `primary`); `load_tenant_identities`
 //!   settles that from the catalog's key rows, and with no row gives the
 //!   file to every tenant it may belong to (issue #350).
-//! - **Unit name** and **volume label** → the read-slices staging
-//!   directory. `volume::write` joins
-//!   `{staging}/clone-{from_label}-{unit_name}`.
+//! - **Volume label** → the read-slices staging directory. `volume::write`
+//!   joins `{staging}/clone-{from_label}-{unit_uuid}`. It was the unit's
+//!   NAME there until ADR-0012 2026-10-06 item 4 took plaintext names off
+//!   the staging device; the directory is named by the unit's uuid now, so
+//!   a unit name no longer reaches staging. It is validated here all the
+//!   same: it is the path-shaped string `collection sync` generates.
 //!
 //! This is single-operator software running on a machine the operator
 //! owns, so this is not a privilege boundary and is not written as one.
@@ -176,7 +179,7 @@ mod tests {
 
     #[test]
     fn a_volume_label_cannot_escape_the_staging_directory() {
-        // `volume::write` joins `clone-{label}-{unit}` under staging.
+        // `volume::write` joins `clone-{label}-{unit uuid}` under staging.
         assert!(validate_volume_label("../../../tmp/evil").is_err());
     }
 
