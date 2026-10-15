@@ -4493,3 +4493,170 @@ fn a_tenant_named_operator_still_owns_its_units_when_ownership_comes_from_envelo
     assert_eq!(tenant_of_unit(&conn, "photos/2020"), "operator");
     assert_eq!(tenant_of_unit(&conn, "ledgers/fy24"), "bravo");
 }
+
+// ── Issue #451: a tenant envelope unreadable in every copy ───────────────
+//
+// Every envelope has a backup (`volume-format-v2.md` §1.3). When BOTH copies
+// of a tenant's envelope are damaged, a generation 2 or 3 rebuild does not
+// need them: the operator envelope's `catalog.db` names every unit's owner
+// and carries the receipts. It used to refuse anyway.
+
+/// `(type_label, position, sha256_encrypted)` of every envelope in the
+/// front index, in tape order.
+fn envelope_entries(vol: &SealedVolume) -> Vec<(String, i32, Option<String>)> {
+    let fi = String::from_utf8_lossy(&vol.store.files[3]).into_owned();
+    tapectl::volume::format::parse_front_index(&fi)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.type_label.contains("envelope"))
+        .map(|e| (e.type_label, e.position, e.sha256_encrypted))
+        .collect()
+}
+
+/// Damage both copies of the envelope whose primary has the given kind and
+/// is the `nth` of its kind: flip a byte in the primary and in the backup
+/// carrying the same front-index hash. Returns the two positions.
+fn damage_envelope_pair(vol: &mut SealedVolume, primary_kind: &str, nth: usize) -> (i32, i32) {
+    let entries = envelope_entries(vol);
+    let (_, primary, hash) = entries
+        .iter()
+        .filter(|(k, ..)| k == primary_kind)
+        .nth(nth)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {primary_kind} #{nth}: {entries:?}"));
+    let backup_kind = format!("{primary_kind}_backup");
+    let (_, backup, _) = entries
+        .iter()
+        .find(|(k, _, h)| k == &backup_kind && *h == hash)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("premise: {primary_kind} at {primary} has a backup: {entries:?}")
+        });
+    for pos in [primary, backup] {
+        vol.store.files[pos as usize][0] ^= 0xFF;
+    }
+    (primary, backup)
+}
+
+#[test]
+fn a_rebuild_goes_on_without_a_tenant_envelope_unreadable_in_every_copy() {
+    let mut vol = build_sealed_volume_with(CatalogDb::New);
+    let (primary, backup) = damage_envelope_pair(&mut vol, "tenant_envelope", 0);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap_or_else(|e| {
+        panic!(
+            "a generation 3 catalog.db names every owner, so a lost tenant pair is not fatal: {e}"
+        )
+    });
+
+    assert_eq!(report.units, UNITS.len(), "every unit is rebuilt");
+    assert!(
+        report.units_without_tenant_envelope.is_empty(),
+        "ownership came from catalog.db, not from the envelope that was lost: {:?}",
+        report.units_without_tenant_envelope
+    );
+    assert_eq!(tenant_of_unit(&conn, "photos/2019"), "alpha");
+    assert_eq!(tenant_of_unit(&conn, "ledgers/fy24"), "bravo");
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(copies(&conn, unit_name), 1, "{unit_name}");
+    }
+    // The warning names the envelope, where its copies were, and why.
+    let warned = report.unreadable_tenant_envelopes.join("\n");
+    assert_eq!(report.unreadable_tenant_envelopes.len(), 1, "{warned}");
+    assert!(warned.contains(&format!("position {primary}")), "{warned}");
+    assert!(warned.contains(&backup.to_string()), "{warned}");
+    assert!(warned.contains("tenant_envelope"), "{warned}");
+}
+
+/// Generation 2 (2026-09-11 until 1.1.0) names owners too, so it proceeds as
+/// well; `catalog.db` generation 1 and a tape with none do not, and keep
+/// refusing, now saying why and what else to do.
+#[test]
+fn a_lost_tenant_pair_is_survivable_only_where_catalog_db_names_the_owners() {
+    // Generation 2: ownership and receipts ride in catalog.db.
+    let mut vol = build_sealed_volume_with(CatalogDb::Gen2);
+    damage_envelope_pair(&mut vol, "tenant_envelope", 1);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("generation 2 names every unit's owner");
+    assert_eq!(report.unreadable_tenant_envelopes.len(), 1);
+    assert_eq!(report.units, UNITS.len());
+    assert!(report.units_without_tenant_envelope.is_empty());
+
+    // Generation 1 and no catalog.db: the tenant envelopes are the only
+    // record of ownership, so the rebuild still needs every one.
+    for catalog_db in [CatalogDb::Old, CatalogDb::None] {
+        let mut vol = build_sealed_volume_with(catalog_db);
+        damage_envelope_pair(&mut vol, "tenant_envelope", 0);
+        let dir = tempfile::tempdir().unwrap();
+        let conn = fresh_db(dir.path());
+        let scratch = tempfile::tempdir().unwrap();
+        let secret = vol.operator_secret.clone();
+        let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+            .expect_err("without catalog.db ownership a lost tenant pair refuses the rebuild")
+            .to_string();
+        assert!(err.contains("could not be opened"), "{err}");
+        assert!(
+            err.contains("does not name which tenant owns each unit"),
+            "{err}"
+        );
+        assert!(err.contains("RESTORE.sh"), "{err}");
+        for (table, n) in row_counts(&conn) {
+            assert_eq!(n, 0, "nothing was written, but {table} has {n} row(s)");
+        }
+    }
+}
+
+/// The operator envelope is the one a rebuild cannot do without: lose both
+/// of its copies and the rebuild refuses, whatever generation, and says so
+/// in the words it always has.
+#[test]
+fn a_lost_operator_pair_still_refuses_the_rebuild() {
+    let mut vol = build_sealed_volume_with(CatalogDb::New);
+    let (primary, backup) = damage_envelope_pair(&mut vol, "operator_envelope", 0);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("no operator envelope, no rebuild")
+        .to_string();
+    assert!(
+        err.contains(&format!("operator_envelope at position {primary}")),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("backup copy at position {backup}")),
+        "{err}"
+    );
+    for (table, n) in row_counts(&conn) {
+        assert_eq!(n, 0, "{table}");
+    }
+}
+
+/// A pair damaged on TOP of a lost operator pair does not hide it: the
+/// operator envelope is still named.
+#[test]
+fn a_lost_tenant_pair_does_not_mask_a_lost_operator_pair() {
+    let mut vol = build_sealed_volume_with(CatalogDb::New);
+    damage_envelope_pair(&mut vol, "tenant_envelope", 0);
+    let (primary, _) = damage_envelope_pair(&mut vol, "operator_envelope", 0);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("the operator envelope is lost")
+        .to_string();
+    assert!(
+        err.contains(&format!("operator_envelope at position {primary}")),
+        "{err}"
+    );
+}

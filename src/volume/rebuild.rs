@@ -140,6 +140,15 @@ pub struct RebuildReport {
     /// Units whose tenant could not be read from any tenant envelope on this
     /// cartridge, and were therefore filed under `--tenant`'s fallback.
     pub units_without_tenant_envelope: Vec<String>,
+    /// Tenant envelopes no copy of which could be read (issue #451), one
+    /// description each (kind, position, the backup's position, why). The
+    /// rebuild went on without them only because the operator envelope's
+    /// `catalog.db` names every unit's owner (generation 2 or 3): nothing
+    /// else a tenant envelope holds is needed to rebuild the catalog. Empty
+    /// when every envelope read. An unreadable OPERATOR envelope, or any
+    /// unreadable envelope on a tape whose `catalog.db` cannot name owners,
+    /// refuses the rebuild instead.
+    pub unreadable_tenant_envelopes: Vec<String>,
     /// Set (to the status found) when this label already had a `volumes` row
     /// and that row's status was not `sealed` — an imported `active` row, for
     /// instance. `None` when the row was freshly inserted here (`sealed` for a
@@ -591,7 +600,13 @@ fn rebuild_contacted(
     let fi = crate::store::read_small_bytes(store, pointers.front_index as u32, "front index")?;
     let entries = format::parse_front_index(&String::from_utf8_lossy(&fi))?;
 
-    let opened = open_all_envelopes(store, &entries, identities, scratch)?;
+    let EnvelopeWalk { opened, unreadable } =
+        open_all_envelopes(store, &entries, identities, scratch)?;
+    // The operator envelope is the one a rebuild cannot do without, copy or
+    // backup: it names every unit and carries the `catalog.db`.
+    if let Some(op) = unreadable.iter().find(|u| u.is_operator()) {
+        return Err(TapectlError::Other(op.message.clone()));
+    }
     // Issue #458: whether the tape is SEALED, read before any row is written
     // and after the envelopes (the seal marker is the last file, so reading
     // it earlier would pass the head over the slices twice; `volume::
@@ -641,6 +656,34 @@ fn rebuild_contacted(
         Some(path) => Supplement::load(path)?,
         None => Supplement::default(),
     };
+    // Issue #451: a tenant envelope that no copy of could be read is not
+    // needed when the operator envelope's `catalog.db` names each unit's
+    // owner (generation 2 or 3): the operator manifest lists every unit and
+    // every slice, and the receipts ride in `catalog.db`. Without that
+    // table the tenant envelopes are the only record of ownership, and the
+    // rebuild would silently file those units under `--tenant`: refuse, as
+    // before.
+    if let Some(first) = unreadable.first() {
+        if !supplement.has_tenants {
+            return Err(TapectlError::Other(format!(
+                "{} A catalog.db this old (or none at all) does not name which tenant owns \
+                 each unit, so the tenant envelopes are the only record of it and the rebuild \
+                 needs every one. Use another copy of this volume; RESTORE.sh (tape file 2) \
+                 with a tenant key or the escrow key still restores what opens.",
+                first.message
+            )));
+        }
+        for u in &unreadable {
+            tracing::warn!(
+                position = u.position,
+                type_label = %u.type_label,
+                error = %u.message,
+                "rebuild: a tenant envelope is unreadable in every copy; going on without it, \
+                 the operator catalog.db names every unit's owner"
+            );
+        }
+        report.unreadable_tenant_envelopes = unreadable.iter().map(|u| u.describe()).collect();
+    }
     let tenant_of = tenant_index(&opened, &supplement);
     report.tenants_from_catalog_db = supplement.has_tenants;
 
@@ -909,12 +952,106 @@ fn is_envelope_label(label: &str) -> bool {
     )
 }
 
+/// What [`open_all_envelopes`] found: the envelopes that opened, and the
+/// ones no copy of which could be read (issue #451).
+struct EnvelopeWalk {
+    opened: Vec<OpenedEnvelope>,
+    unreadable: Vec<UnreadableEnvelope>,
+}
+
+/// An envelope whose primary and every backup copy failed to read, match the
+/// front index's hash, or decrypt.
+#[derive(Debug, Clone)]
+struct UnreadableEnvelope {
+    /// The front-index kind of the first copy that failed.
+    type_label: String,
+    position: i32,
+    /// The positions of its backup copies, which failed too.
+    backup_positions: Vec<i32>,
+    /// What went wrong, worded as the refusal that names it.
+    message: String,
+}
+
+impl UnreadableEnvelope {
+    /// The operator envelope is the one the rebuild cannot do without.
+    fn is_operator(&self) -> bool {
+        matches!(
+            crate::volume::layout_model::ZoneKind::from_type_label(&self.type_label),
+            Some(
+                crate::volume::layout_model::ZoneKind::OperatorEnvelope
+                    | crate::volume::layout_model::ZoneKind::OperatorEnvelopeBackup
+            )
+        )
+    }
+
+    /// One line for the report: which envelope, where, and why.
+    fn describe(&self) -> String {
+        let backups = if self.backup_positions.is_empty() {
+            "no backup copy".to_string()
+        } else {
+            format!(
+                "backup copy at position {} too",
+                self.backup_positions
+                    .iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        format!(
+            "{} at position {} ({backups}): {}",
+            self.type_label, self.position, self.message
+        )
+    }
+}
+
+/// Group the failed copies by front-index hash, in tape order: one
+/// [`UnreadableEnvelope`] per envelope, its first copy the primary.
+fn unreadable_envelopes(
+    failed: Vec<(String, i32, String, TapectlError)>,
+) -> Vec<UnreadableEnvelope> {
+    let mut keys: Vec<String> = Vec::new();
+    for (key, ..) in &failed {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    keys.into_iter()
+        .map(|key| {
+            let group: Vec<_> = failed.iter().filter(|(k, ..)| k == &key).collect();
+            let (_, position, type_label, e) = group[0];
+            let backups = &group[1..];
+            let message = if backups.is_empty() {
+                format!(
+                    "the {type_label} at position {position} could not be opened, \
+                     and the tape holds no other copy of it: {e}"
+                )
+            } else {
+                let at: Vec<String> = backups.iter().map(|(_, p, ..)| p.to_string()).collect();
+                let why: Vec<String> = backups.iter().map(|(.., e)| e.to_string()).collect();
+                format!(
+                    "the {type_label} at position {position} could not be opened, \
+                     and neither could its backup copy at position {}: {e}; the backup: {}",
+                    at.join(", "),
+                    why.join("; ")
+                )
+            };
+            UnreadableEnvelope {
+                type_label: type_label.clone(),
+                position: *position,
+                backup_positions: backups.iter().map(|(_, p, ..)| *p).collect(),
+                message,
+            }
+        })
+        .collect()
+}
+
 fn open_all_envelopes(
     store: &mut dyn Store,
     entries: &[format::ParsedIndexEntry],
     identities: &[age::x25519::Identity],
     scratch: &Path,
-) -> Result<Vec<OpenedEnvelope>> {
+) -> Result<EnvelopeWalk> {
     let mut out = Vec::new();
     let mut operator_refused = false;
     // Front-index hashes of the copies already settled: one opened, or the
@@ -982,31 +1119,20 @@ fn open_all_envelopes(
         }
     }
 
-    if let Some((key, position, type_label, e)) = failed.first() {
-        let backups: Vec<_> = failed.iter().filter(|(k, ..)| k == key).skip(1).collect();
-        let msg = if backups.is_empty() {
-            format!(
-                "the {type_label} at position {position} could not be opened, \
-                 and the tape holds no other copy of it: {e}"
-            )
-        } else {
-            let at: Vec<String> = backups.iter().map(|(_, p, ..)| p.to_string()).collect();
-            let why: Vec<String> = backups.iter().map(|(.., e)| e.to_string()).collect();
-            format!(
-                "the {type_label} at position {position} could not be opened, \
-                 and neither could its backup copy at position {}: {e}; the backup: {}",
-                at.join(", "),
-                why.join("; ")
-            )
-        };
-        return Err(TapectlError::Other(msg));
-    }
-
+    // A key that opens no operator envelope is a tenant's: that is the
+    // answer, whatever else on the tape is damaged.
     if operator_refused && !out.iter().any(|e| e.is_operator()) {
         return Err(TapectlError::Other(tenant_key_refusal_message()));
     }
 
-    Ok(out)
+    // Issue #451: an envelope whose every copy failed is DATA here, not an
+    // error. Whether the rebuild can do without it depends on what the
+    // operator envelope's `catalog.db` carries, which is not known until it
+    // is open; the caller decides.
+    Ok(EnvelopeWalk {
+        opened: out,
+        unreadable: unreadable_envelopes(failed),
+    })
 }
 
 /// Map each unit name to the tenant that owns it.
@@ -1908,10 +2034,20 @@ fn record_event(
             }
         ),
     };
+    let unreadable_clause = if report.unreadable_tenant_envelopes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} tenant envelope(s) unreadable in every copy, rebuilt without them from the \
+             operator envelope's catalog.db: {}",
+            report.unreadable_tenant_envelopes.len(),
+            report.unreadable_tenant_envelopes.join(" | ")
+        )
+    };
     let detail = format!(
         "catalog rebuild from volume {} (uuid {}) on {}: {} envelope(s) opened; \
          inserted {} tenant(s), {} unit(s), {} snapshot(s), {} stage set(s), {} slice(s), \
-         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}{seal_clause}{cartridge_clause}{displaced_clause}",
+         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}{seal_clause}{unreadable_clause}{cartridge_clause}{displaced_clause}",
         report.label,
         report.uuid,
         device,

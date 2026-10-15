@@ -697,6 +697,10 @@ pub fn run(
                 obj["recorded_as_unsealed"] =
                     serde_json::json!(report.volume_inserted && report.unsealed_reason.is_some());
                 obj["found_volume_status"] = serde_json::json!(report.found_volume_status);
+                // Issue #451: additive. Tenant envelopes no copy of which
+                // could be read, which the rebuild went on without.
+                obj["unreadable_tenant_envelopes"] =
+                    serde_json::json!(report.unreadable_tenant_envelopes);
                 println!("{obj}");
             } else {
                 println!(
@@ -852,6 +856,9 @@ pub fn run(
                          the restore path is complete, but there is no per-file index and \
                          each snapshot's original source path is unknown"
                     );
+                }
+                for line in unreadable_envelope_lines(&report) {
+                    println!("{line}");
                 }
                 if !report.units_without_tenant_envelope.is_empty() {
                     println!(
@@ -1164,6 +1171,39 @@ fn unsealed_tape_lines(report: &RebuildReport) -> Vec<String> {
     lines
 }
 
+/// What `catalog rebuild` says when it went on without tenant envelopes that
+/// no copy of could be read (issue #451): which, that nothing the catalog
+/// needed was lost, and the two things still worth doing. Empty when every
+/// envelope read.
+fn unreadable_envelope_lines(report: &RebuildReport) -> Vec<String> {
+    if report.unreadable_tenant_envelopes.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "  warning: {} tenant envelope(s) on volume \"{}\" could not be read from any copy:",
+        report.unreadable_tenant_envelopes.len(),
+        report.label
+    )];
+    lines.extend(
+        report
+            .unreadable_tenant_envelopes
+            .iter()
+            .map(|e| format!("    {e}")),
+    );
+    lines.push(
+        "    The rebuild went on without them: this tape's catalog.db names every unit's owner, \
+         so every unit was recorded."
+            .to_string(),
+    );
+    lines.push(
+        "    What those envelopes alone held is not restorable from here: restore with \
+         RESTORE.sh (tape file 2) and the owner's key or the escrow key, which opens whatever \
+         still reads, or use another copy of this cartridge."
+            .to_string(),
+    );
+    lines
+}
+
 /// The `note: ...` line `catalog rebuild` prints when this tape's File 0
 /// named one cartridge but the medium's own serial matched a DIFFERENT
 /// registered cartridge (ADR-0012's "the loaded tape *is* that other
@@ -1288,6 +1328,28 @@ mod tests {
             !prod.contains("temp_dir()"),
             "a decrypted catalog.db goes under <home>/tmp, never the system temp directory"
         );
+    }
+
+    /// Issue #451: the rebuild says which tenant envelopes it went on
+    /// without, and that no unit was lost; it says nothing when all read.
+    #[test]
+    fn a_rebuild_that_went_on_without_a_tenant_envelope_says_so() {
+        use crate::volume::rebuild::RebuildReport;
+        let clean = RebuildReport::default();
+        assert!(super::unreadable_envelope_lines(&clean).is_empty());
+        let report = RebuildReport {
+            label: "L6-0009".to_string(),
+            unreadable_tenant_envelopes: vec![
+                "tenant_envelope at position 4 (backup copy at position 8 too): damaged"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+        let text = super::unreadable_envelope_lines(&report).join("\n");
+        assert!(text.contains("1 tenant envelope(s)"), "{text}");
+        assert!(text.contains("position 4"), "{text}");
+        assert!(text.contains("every unit was recorded"), "{text}");
+        assert!(text.contains("RESTORE.sh"), "{text}");
     }
 
     /// Issue #458: a tape with no valid seal is said to be unsealed and not a
