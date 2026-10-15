@@ -86,6 +86,6 @@ if [ "$tape" = 1 ] && [ -n "$TAPE_NICE" ]; then
     fi
     exec sudo nice -n "$TAPE_NICE" runuser -u "$SVC_USER" -- "$TAPECTL" "$@"
   fi
-  echo "tapectl-op: this tape command runs at NORMAL priority: raising it needs root's sudo, which is not available here without a password (docs/install.md, 'The wrapper')" >&2
+  echo "tapectl-op: this tape command runs at NORMAL priority: raising it (sudo nice ionice runuser) did not work here without a password: root's sudo may ask for one, or runuser is not on sudo's PATH (docs/install.md, 'The wrapper')" >&2
 fi
 exec sudo -u "$SVC_USER" -H "$TAPECTL" "$@"

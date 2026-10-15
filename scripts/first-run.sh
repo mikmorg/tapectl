@@ -380,7 +380,7 @@ tape_raise_setup() {
   probe=(sudo -n nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} runuser -u "$SVC_USER" -- true)
   if ! "${probe[@]}" >/dev/null 2>&1; then
     if [ "$AUTO" = 1 ]; then
-      note "tape commands run at NORMAL priority: raising it needs root's sudo, which asks for a password, and --auto has no one to ask"
+      note "tape commands run at NORMAL priority: \`sudo -n nice ... runuser\` did not work here (root's sudo asks for a password, or nice/runuser is unavailable) and --auto has no one to ask"
       return 0
     fi
     note "raising the tape commands' priority needs root's sudo (it asks for YOUR password, once; the ticket is kept warm for this step)"
