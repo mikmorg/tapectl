@@ -75,7 +75,7 @@ tapectl volume write [OPTIONS] [LABEL]
 
 **Options**
 
-- `--loaded` — Write the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is written only when it is one of this catalog's volumes, `initialized` and with nothing written to it; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. The write that follows takes its usual File 0 consent check on its own handle. Cannot be combined with a label or `--init` (issue #435)
+- `--loaded` — Write the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is written only when it is one of this catalog's volumes, `initialized` and with nothing written to it; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. The write that follows takes its usual File 0 consent check on its own handle. Cannot be combined with a label or `--init`
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--force` — See `volume init --force` — same override, same limits. With `--init` it goes to the init only: the write that follows is never forced, so a cartridge swapped in between the two is refused at the write's own File 0 check
 - `--init` — Initialise the loaded cartridge as this volume first (`volume init <label>`: the same function, the same File 0 consent check and refusals, ADR-0003 and ADR-0012 item 57), then write it with the tape still loaded. An init that refuses writes nothing and exits 2. Only `--force` is taken from `volume init`'s flags; when a cartridge needs `--generation` or `--cartridge`, run `volume init` yourself first. ADR-0012 2026-10-15 item 59
@@ -114,7 +114,7 @@ tapectl volume resume [OPTIONS] [LABEL]
 
 **Options**
 
-- `--loaded` — Resume the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is resumed only when it is one of this catalog's volumes with an interrupted write session, a re-confirmable aborted one, or a write the catalog lost; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. Cannot be combined with a label (issue #435)
+- `--loaded` — Resume the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is resumed only when it is one of this catalog's volumes with an interrupted write session, a re-confirmable aborted one, or a write the catalog lost; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. Cannot be combined with a label
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--prewrite-hash` — See `volume write --prewrite-hash`: the revalidation full-hashes every staged slice instead of size-checking it. The session's frozen generated files are re-hashed either way
 - `--full-confirm` — See `volume write --full-confirm`: the confirm this resume runs (or re-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`
@@ -150,7 +150,7 @@ tapectl volume verify [OPTIONS] [LABEL]
 
 **Arguments**
 
-- `[LABEL]` — Volume label. Without it the loaded tape names itself: File 0 is read (the read a verify makes at contact anyway) and the volume is found in this catalog by its uuid; the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says (issue #435)
+- `[LABEL]` — Volume label. Without it the loaded tape names itself: File 0 is read (the read a verify makes at contact anyway) and the volume is found in this catalog by its uuid; the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says
 
 **Options**
 

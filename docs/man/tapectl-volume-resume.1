@@ -27,7 +27,7 @@ Exit status: `volume write`\*(Aqs (0 sealed and confirmed, 2 nothing written, 3 
 Output in JSON format
 .TP
 \fB\-\-loaded\fR
-Resume the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is resumed only when it is one of this catalog\*(Aqs volumes with an interrupted write session, a re\-confirmable aborted one, or a write the catalog lost; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. Cannot be combined with a label (issue #435)
+Resume the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is resumed only when it is one of this catalog\*(Aqs volumes with an interrupted write session, a re\-confirmable aborted one, or a write the catalog lost; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. Cannot be combined with a label
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
 Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured

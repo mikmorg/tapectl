@@ -21,7 +21,7 @@ Exit status, shared by every command that writes a tape: 0 = sealed and confirme
 Output in JSON format
 .TP
 \fB\-\-loaded\fR
-Write the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is written only when it is one of this catalog\*(Aqs volumes, `initialized` and with nothing written to it; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. The write that follows takes its usual File 0 consent check on its own handle. Cannot be combined with a label or `\-\-init` (issue #435)
+Write the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is written only when it is one of this catalog\*(Aqs volumes, `initialized` and with nothing written to it; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. The write that follows takes its usual File 0 consent check on its own handle. Cannot be combined with a label or `\-\-init`
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
 Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured

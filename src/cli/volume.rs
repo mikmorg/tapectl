@@ -102,8 +102,7 @@ pub enum VolumeCommands {
         /// written to it; the volume chosen is printed. Any other state, or
         /// a tape this catalog does not know, is refused naming it. The
         /// write that follows takes its usual File 0 consent check on its
-        /// own handle. Cannot be combined with a label or `--init` (issue
-        /// #435)
+        /// own handle. Cannot be combined with a label or `--init`
         #[arg(long, conflicts_with = "label")]
         loaded: bool,
         /// Tape device (by-id path). Defaults to the only configured drive;
@@ -226,7 +225,7 @@ pub enum VolumeCommands {
         /// session, a re-confirmable aborted one, or a write the catalog
         /// lost; the volume chosen is printed. Any other state, or a tape
         /// this catalog does not know, is refused naming it. Cannot be
-        /// combined with a label (issue #435)
+        /// combined with a label
         #[arg(long, conflicts_with = "label")]
         loaded: bool,
         /// Tape device (by-id path). Defaults to the only configured drive;
@@ -311,7 +310,7 @@ pub enum VolumeCommands {
         /// volume is found in this catalog by its uuid; the one chosen is
         /// printed. A label that is given is checked against File 0 as
         /// ever. A tape this catalog does not know is refused, naming what
-        /// File 0 says (issue #435)
+        /// File 0 says
         label: Option<String>,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.

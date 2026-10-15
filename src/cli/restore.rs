@@ -20,7 +20,7 @@ pub enum RestoreCommands {
         /// the one chosen is printed. A label that is given is checked
         /// against File 0 as ever. A tape this catalog does not know is
         /// refused, naming what File 0 says. Not with --dry-run, which
-        /// opens no drive (issue #435)
+        /// opens no drive
         #[arg(long)]
         from: Option<String>,
         /// Destination directory
@@ -81,7 +81,7 @@ pub enum RestoreCommands {
         /// the one chosen is printed. A label that is given is checked
         /// against File 0 as ever. A tape this catalog does not know is
         /// refused, naming what File 0 says. Not with --dry-run, which
-        /// opens no drive (issue #435)
+        /// opens no drive
         label: Option<String>,
         /// Destination directory: each unit is restored into `DIR/<unit
         /// name>`, which must be empty or new
@@ -137,7 +137,7 @@ pub enum RestoreCommands {
         /// read and the volume is found in this catalog by its uuid, and
         /// the one chosen is printed. A label that is given is checked
         /// against File 0 as ever. A tape this catalog does not know is
-        /// refused, naming what File 0 says (issue #435)
+        /// refused, naming what File 0 says
         #[arg(long)]
         from: Option<String>,
         /// Destination directory
