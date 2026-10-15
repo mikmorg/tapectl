@@ -453,6 +453,11 @@ const DAR_READ_SLACK: u64 = 4 << 20;
 /// `fadvise` per window costs nothing next to the reads.
 const DROP_WINDOW: u64 = 16 << 20;
 
+/// The largest page-cache folio a kernel may cache a file in (2 MiB, a PMD).
+/// `POSIX_FADV_DONTNEED` cannot drop part of a folio, so each window is
+/// advised from the folio boundary below what was dropped before.
+const FOLIO_ALIGN: u64 = 2 << 20;
+
 /// The source's pages dropped from the page cache once both readers are
 /// past them (issue #441).
 ///
@@ -518,10 +523,12 @@ impl DropBehindBoth {
             let start = self.starts[c.file];
             let end = self.starts[c.file + 1];
             if boundary >= end {
-                // Both readers are past the whole file: the rest of it goes.
+                // Both readers are past the whole file: all of it goes. From
+                // 0, not from what is dropped already: re-advising dropped
+                // pages costs nothing, and a large folio a window only partly
+                // covered stayed cached (DONTNEED cannot drop part of one).
                 if end > start {
-                    let from = c.dropped;
-                    self.advise(&mut c, from, 0);
+                    self.advise(&mut c, 0, 0);
                 }
                 c.file += 1;
                 c.dropped = 0;
@@ -531,7 +538,9 @@ impl DropBehindBoth {
             // Inside the file: what both have passed, a window at a time.
             let passed = boundary.saturating_sub(start);
             if passed >= c.dropped.saturating_add(self.window) {
-                let from = c.dropped;
+                // From the last folio boundary, so a large folio the previous
+                // window only partly covered is covered whole this time.
+                let from = c.dropped / FOLIO_ALIGN * FOLIO_ALIGN;
                 self.advise(&mut c, from, passed - from);
                 c.dropped = passed;
             }
