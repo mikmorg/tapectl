@@ -21,7 +21,7 @@ Re\-stage a specific snapshot version instead of the latest unstaged one — for
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-jobs\fR \fI<JOBS>\fR
-How many units to stage at once (1 to 16). Defaults to `[staging] jobs`, itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host\*(Aqs available memory cannot hold that many (each keeps up to 1 GiB of its source in the page cache)
+How many units to stage at once (1 to 16). Defaults to `[staging] jobs`, itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host\*(Aqs available memory cannot hold that many (each keeps up to 128 MiB of its source in the page cache)
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output

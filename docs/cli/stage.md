@@ -32,7 +32,7 @@ tapectl stage create [OPTIONS] <NAME>...
 
 **Options**
 
-- `--jobs <JOBS>` — How many units to stage at once (1 to 16). Defaults to `[staging] jobs`, itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host's available memory cannot hold that many (each keeps up to 1 GiB of its source in the page cache)
+- `--jobs <JOBS>` — How many units to stage at once (1 to 16). Defaults to `[staging] jobs`, itself 1 by default. The largest units start first, each stage prints a line as it starts and ends, and once one fails no further unit is started. Fewer run when the host's available memory cannot hold that many (each keeps up to 128 MiB of its source in the page cache)
 
 ### tapectl stage list
 
