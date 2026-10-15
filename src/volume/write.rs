@@ -5095,6 +5095,13 @@ pub fn volume_identify_corroborated(
 }
 
 /// [`volume_identify_corroborated`] minus the contact bookkeeping.
+///
+/// The catalog is asked about the tape ONCE by uuid ([`loaded::locate`]) and
+/// that one answer yields both the note `identify` prints and the part of the
+/// contradiction that is about the uuid ([`loaded::account`], issue #443);
+/// the corroboration by label (the cartridge's serial, a label reused under a
+/// new uuid) is the other part, unchanged. A tape the catalog knows under
+/// another label used to print "wrong tape" as a note and exit 0.
 fn identify_contacted(
     conn: &Connection,
     store: &mut dyn Store,
@@ -5102,11 +5109,39 @@ fn identify_contacted(
 ) -> Result<Identified> {
     let text = volume_identify(store)?;
     let file0 = binding::file0_facts_from_text(&text);
-    // The volume this tape says it is — not one named on the command line,
-    // because `identify` takes no label. No File 0 label, or a label no row
-    // matches, is an absence: nothing to corroborate, so nothing refused.
+    let account = loaded::account(&loaded::locate(conn, &file0)?, &file0);
+    let by_label = corroborate_identified_by_label(conn, file0, medium_serial)?;
+    // Both are about this tape contradicting the catalog; say both.
+    let contradiction = match (by_label, account.contradiction) {
+        (Some(label), Some(uuid)) => Some(format!("{label}\n{uuid}")),
+        (one, other) => one.or(other),
+    };
+    // A note is the catalog's view of a tape it does not contradict.
+    let catalog_note = if contradiction.is_none() {
+        account.note
+    } else {
+        None
+    };
+    Ok(Identified {
+        text,
+        contradiction,
+        catalog_note,
+    })
+}
+
+/// The corroboration of what File 0 says against the catalog row it names BY
+/// LABEL: `Some(why)` for a contradiction, `None` for agreement or absence.
+///
+/// The volume this tape says it is — not one named on the command line,
+/// because `identify` takes no label. No File 0 label, or a label no row
+/// matches, is an absence: nothing to corroborate, so nothing refused.
+fn corroborate_identified_by_label(
+    conn: &Connection,
+    file0: binding::File0Facts,
+    medium_serial: Option<&str>,
+) -> Result<Option<String>> {
     let Some(label) = file0.label.clone() else {
-        return Ok(Identified::agreed(text));
+        return Ok(None);
     };
     let volume_id: Option<i64> = conn
         .query_row(
@@ -5116,7 +5151,7 @@ fn identify_contacted(
         )
         .optional()?;
     let Some(volume_id) = volume_id else {
-        return Ok(Identified::agreed(text));
+        return Ok(None);
     };
     let medium = binding::MediumFacts::new(medium_serial.map(str::to_string), file0);
     // `identify` REPORTS a contradiction, it does not withhold the answer.
@@ -5126,19 +5161,17 @@ fn identify_contacted(
     // stopped agreeing — so swallowing File 0 here denies them the one fact
     // that resolves it. ADR-0004's advisory rule, and `catalog locate`'s
     // precedent of listing rows it disapproves of rather than hiding them.
-    match binding::corroborate_volume(conn, volume_id, &label, &medium) {
-        Ok(_) => Ok(Identified::agreed(text)),
-        Err(e) => Ok(Identified {
-            text,
-            contradiction: Some(e.to_string()),
-        }),
-    }
+    Ok(
+        binding::corroborate_volume(conn, volume_id, &label, &medium)
+            .err()
+            .map(|e| e.to_string()),
+    )
 }
 
 /// What `volume identify` found: the tape's own File 0 text, and whatever the
 /// catalog says that contradicts it (issue #193).
 ///
-/// Two fields rather than a `Result` because they are not alternatives — a
+/// Fields rather than a `Result` because they are not alternatives — a
 /// contradicted tape still has an identity, and printing it is the whole job.
 /// The caller prints `text` either way and treats `contradiction` as the exit
 /// status, so a human sees the answer and a script can still detect the
@@ -5147,15 +5180,12 @@ fn identify_contacted(
 pub struct Identified {
     pub text: String,
     pub contradiction: Option<String>,
-}
-
-impl Identified {
-    fn agreed(text: String) -> Self {
-        Self {
-            text,
-            contradiction: None,
-        }
-    }
+    /// What the catalog makes of a tape it does NOT contradict, for stderr:
+    /// the volume it is, or that the catalog has not got it (a fact,
+    /// reported, not an error — issue #435). `None` when the tape
+    /// contradicts the catalog (the contradiction is the account then),
+    /// and when File 0 names no uuid.
+    pub catalog_note: Option<String>,
 }
 
 /// Outcome of [`stream_verify_slice_to_staging`]. `write_positions.
@@ -14323,6 +14353,138 @@ mod tests {
                 id.contradiction.is_none(),
                 "an absence is not a contradiction"
             );
+        }
+
+        // ── issue #443: `identify`'s note and its exit status are ONE lookup ──
+
+        /// `identify` against a catalog holding `rows` (label, uuid, status)
+        /// with a tape whose File 0 is `tape_label` / [`MEM_TAPE_UUID`].
+        fn identify_with(rows: &[(&str, &str, &str)], tape_label: &str) -> Identified {
+            let conn = crate::db::open_memory().unwrap();
+            for (label, uuid, status) in rows {
+                conn.execute(
+                    "INSERT INTO volumes (label, uuid, backend_type, backend_name, capacity_bytes, status)
+                     VALUES (?1, ?2, 'lto', 'p', 10485760, ?3)",
+                    params![label, uuid, status],
+                )
+                .unwrap();
+            }
+            let data = b"x".repeat(16);
+            let mut store = mem_store_v2_tape(tape_label, &data, &data);
+            volume_identify_corroborated(
+                &conn,
+                &mut store,
+                site_observed(Operation::VolumeIdentify, &mam_serial("SER-ANY")),
+            )
+            .unwrap()
+        }
+
+        /// A uuid the catalog knows under ANOTHER label is a contradiction —
+        /// the same verdict `volume verify` and `restore` refuse it with
+        /// ("wrong tape") — so `identify` reports it through its exit status
+        /// and says so once, as the contradiction, never as a note beside an
+        /// exit 0 (issue #443).
+        #[test]
+        fn identify_reports_a_uuid_known_under_another_label_as_a_contradiction() {
+            let id = identify_with(&[("IN-CATALOG", MEM_TAPE_UUID, "sealed")], "ON-TAPE");
+
+            let why = id
+                .contradiction
+                .as_deref()
+                .expect("the exit status must report it");
+            assert!(why.contains("wrong tape"), "{why}");
+            assert!(
+                why.contains("\"ON-TAPE\"") && why.contains("\"IN-CATALOG\""),
+                "{why}"
+            );
+            assert_eq!(
+                id.catalog_note, None,
+                "the contradiction is the account; no second, disagreeing line"
+            );
+            // The tape is still printed.
+            assert!(id.text.contains("ON-TAPE"), "{}", id.text);
+
+            // The verdict is the resolver's: the same lookup refuses the same
+            // tape for verify and restore, in the same words.
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, uuid, backend_type, backend_name, capacity_bytes, status)
+                 VALUES ('IN-CATALOG', ?1, 'lto', 'p', 10485760, 'sealed')",
+                params![MEM_TAPE_UUID],
+            )
+            .unwrap();
+            let file0 = binding::file0_facts_from_text(&id.text);
+            let refused = loaded::resolve(&conn, &file0).unwrap_err().to_string();
+            assert_eq!(refused, why, "one derivation, one wording");
+        }
+
+        /// The positive controls: a tape the catalog knows under its own
+        /// label is a note with no contradiction, and a tape it has never
+        /// heard of is a note with no contradiction too (the answer, not a
+        /// contradiction — ADR-0012). The wrong-label test above passes only
+        /// if `identify` can tell these three apart.
+        #[test]
+        fn identify_notes_a_known_tape_and_an_unknown_one_without_contradicting() {
+            let known = identify_with(&[("L6-0002", MEM_TAPE_UUID, "sealed")], "L6-0002");
+            assert_eq!(known.contradiction, None);
+            assert_eq!(
+                known.catalog_note.as_deref(),
+                Some("catalog: this tape is volume \"L6-0002\" (status sealed)")
+            );
+
+            let unknown = identify_with(&[("L6-0002", "some-other-uuid", "sealed")], "L6-0009");
+            assert_eq!(unknown.contradiction, None);
+            let note = unknown.catalog_note.expect("the catalog does not have it");
+            assert!(note.starts_with("catalog: "), "{note}");
+            assert!(
+                note.contains(&format!("\"L6-0009\" (uuid {MEM_TAPE_UUID})"))
+                    && note.contains("no volume with that uuid"),
+                "{note}"
+            );
+        }
+
+        /// A File 0 with no uuid has nothing to look up: no note, no
+        /// contradiction.
+        #[test]
+        fn identify_has_no_note_for_a_file0_that_names_no_uuid() {
+            let conn = crate::db::open_memory().unwrap();
+            let mut store = MemStore::new(4096);
+            let junk = b"not a tapectl tape\n".to_vec();
+            store
+                .execute(&mut Cursor::new(junk.clone()), junk.len() as u64, false)
+                .unwrap();
+            let id = volume_identify_corroborated(
+                &conn,
+                &mut store,
+                site_observed(Operation::VolumeIdentify, &mam_serial("SER-ANY")),
+            )
+            .unwrap();
+            assert_eq!(id.catalog_note, None);
+            assert_eq!(id.contradiction, None);
+        }
+
+        /// A tape that contradicts the catalog TWICE says both: the uuid is
+        /// the catalog's under another label, and the label it names is the
+        /// catalog's under another uuid.
+        #[test]
+        fn identify_reports_every_contradiction_it_finds() {
+            let id = identify_with(
+                &[
+                    ("IN-CATALOG", MEM_TAPE_UUID, "sealed"),
+                    ("ON-TAPE", "a-different-uuid", "sealed"),
+                ],
+                "ON-TAPE",
+            );
+            let why = id.contradiction.expect("contradicted");
+            assert!(
+                why.contains("wrong tape"),
+                "the uuid under another label: {why}"
+            );
+            assert!(
+                why.contains("a-different-uuid"),
+                "the label under another uuid: {why}"
+            );
+            assert_eq!(id.catalog_note, None);
         }
 
         // ── the two device-bound contacts ──

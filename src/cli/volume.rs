@@ -971,22 +971,6 @@ fn resolve_loaded_for(
     Ok(volume.label)
 }
 
-/// `volume identify`'s note on what this catalog makes of the tape it just
-/// printed, for stderr: `None` when File 0 names no uuid (nothing to look
-/// up). A tape the catalog does not know is reported as such, not an error
-/// (issue #435).
-fn identify_catalog_note(conn: &Connection, file0_text: &str) -> Option<String> {
-    let file0 = crate::volume::binding::file0_facts_from_text(file0_text);
-    file0.uuid.as_ref()?;
-    Some(match crate::volume::loaded::resolve(conn, &file0) {
-        Ok(v) => format!(
-            "catalog: this tape is volume \"{}\" (status {})",
-            v.label, v.status
-        ),
-        Err(e) => format!("catalog: {e}"),
-    })
-}
-
 /// What `--move-to` did once a copy was sealed and confirmed (issue #438).
 #[derive(Debug)]
 enum MoveAfterWrite {
@@ -1838,12 +1822,13 @@ pub fn run(
             // contradiction is reported after it and through the exit code,
             // never by withholding the answer the operator asked for.
             println!("{}", id.text);
-            // Issue #435: a tape this catalog does not know is reported as
-            // such. On stderr, so stdout stays File 0 for anything parsing it.
-            if id.contradiction.is_none() {
-                if let Some(note) = identify_catalog_note(conn, &id.text) {
-                    eprintln!("{note}");
-                }
+            // Issue #435: what the catalog makes of the tape — which volume
+            // it is, or that the catalog does not know it (a fact, not an
+            // error). On stderr, so stdout stays File 0 for anything parsing
+            // it. The note and the exit status below come from ONE lookup
+            // (`Identified`, issue #443), so they cannot disagree.
+            if let Some(note) = &id.catalog_note {
+                eprintln!("{note}");
             }
             if let Some(why) = id.contradiction {
                 eprintln!("\nwarning: this tape contradicts the catalog.\n{why}");
@@ -4676,56 +4661,6 @@ mod tests {
                 clap::error::ErrorKind::MissingRequiredArgument,
                 "{err}"
             );
-        }
-
-        fn file0_text(label: &str, uuid: &str) -> String {
-            crate::volume::layout::generate_id_thunk_v2(&crate::volume::layout::IdThunkV2Params {
-                label,
-                uuid,
-                media_type: "LTO-6",
-                tapectl_version: "0.0.0-test",
-                nominal_capacity: 2_500_000_000_000,
-                mam_capacity: 2_400_000_000_000,
-                total_files: 6,
-                mam_manufacturer: "TESTCO",
-                mam_serial: "",
-                mam_length: 846,
-                mam_loads: 1,
-                created_at: "2026-10-15T00:00:00Z",
-                cartridge_identity_source: None,
-            })
-        }
-
-        /// `volume identify` says what the catalog makes of the tape, on
-        /// stderr: the volume and its status, or that the catalog does not
-        /// have it — reported, not an error. A File 0 with no uuid has
-        /// nothing to look up and no note.
-        #[test]
-        fn identify_reports_whether_the_catalog_knows_the_tape() {
-            let conn = crate::db::open_memory().unwrap();
-            conn.execute(
-                "INSERT INTO volumes (label, uuid, backend_type, backend_name, capacity_bytes, status)
-                 VALUES ('L6-0002', 'uuid-known', 'lto', 'p', 10485760, 'sealed')",
-                [],
-            )
-            .unwrap();
-
-            let note = identify_catalog_note(&conn, &file0_text("L6-0002", "uuid-known")).unwrap();
-            assert_eq!(
-                note,
-                "catalog: this tape is volume \"L6-0002\" (status sealed)"
-            );
-
-            let note =
-                identify_catalog_note(&conn, &file0_text("L6-0009", "uuid-unknown")).unwrap();
-            assert!(note.starts_with("catalog: "), "{note}");
-            assert!(
-                note.contains("\"L6-0009\" (uuid uuid-unknown)")
-                    && note.contains("no volume with that uuid"),
-                "{note}"
-            );
-
-            assert_eq!(identify_catalog_note(&conn, "not a tapectl tape\n"), None);
         }
 
         /// The `--loaded` arm's first act is to read the tape, through the

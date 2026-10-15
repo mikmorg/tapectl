@@ -75,22 +75,45 @@ fn what_file0_says(file0: &File0Facts) -> String {
     }
 }
 
-/// Find the volume of this catalog that the loaded tape's File 0 identifies.
+/// What this catalog makes of the tape whose File 0 is `file0`, looked up by
+/// uuid and nothing else — the ONE derivation behind every question the
+/// catalog is asked about a loaded tape (issue #443):
 ///
-/// By uuid only. Refuses, naming what File 0 says, when File 0 carries no
-/// uuid (a blank, damaged or foreign tape), when no volume of this catalog
-/// has that uuid (a tape this catalog does not know — after a lost catalog,
-/// `catalog rebuild --from-volume` attaches it), and when the uuid belongs
-/// to a volume this catalog calls something other than File 0 does, which is
-/// a wrong tape however it came about and is not guessed through.
-pub(crate) fn resolve(conn: &Connection, file0: &File0Facts) -> Result<LoadedVolume> {
+/// - [`resolve`], for `volume verify` / `restore` / `--loaded`, which turn
+///   everything but [`Located::Known`] into a refusal;
+/// - [`account`], for `volume identify`, which turns the same value into the
+///   note it prints AND the contradiction its exit code reports.
+///
+/// Before it, `identify` printed a note from this lookup and took its exit
+/// code from a second one, by label, and the two could disagree: a uuid the
+/// catalog knows under another label was "wrong tape" in the note and exit 0
+/// in the status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Located {
+    /// File 0 carries no uuid (a blank, damaged or foreign tape): nothing to
+    /// look up.
+    NoIdentity,
+    /// No volume of this catalog has that uuid. For `identify` an absence —
+    /// the answer — and for a read that must act on a volume, a refusal.
+    Unknown,
+    /// The catalog's volume with that uuid, and File 0 agrees with it (or
+    /// names no label).
+    Known(LoadedVolume),
+    /// The catalog knows the uuid, as `volume`, and File 0 names it
+    /// `on_tape`: two known facts disagreeing, a wrong tape however it came
+    /// about, not guessed through.
+    UnderAnotherLabel {
+        on_tape: String,
+        volume: LoadedVolume,
+    },
+}
+
+/// Look up the loaded tape's File 0 in this catalog, by uuid only. The uuid
+/// decides, never the label: a label can be reused after a retire, the uuid
+/// cannot. `Err` is only a database error.
+pub(crate) fn locate(conn: &Connection, file0: &File0Facts) -> Result<Located> {
     let Some(uuid) = file0.uuid.as_deref().filter(|u| !u.is_empty()) else {
-        return Err(TapectlError::Other(format!(
-            "the loaded tape does not identify a volume: its File 0 carries {} — it is blank, \
-             damaged or not a tapectl tape. Name the volume on the command line instead. \
-             `tapectl volume identify` prints File 0 as it is.",
-            what_file0_says(file0)
-        )));
+        return Ok(Located::NoIdentity);
     };
     let found: Option<LoadedVolume> = conn
         .query_row(
@@ -108,24 +131,104 @@ pub(crate) fn resolve(conn: &Connection, file0: &File0Facts) -> Result<LoadedVol
         )
         .optional()?;
     let Some(volume) = found else {
-        return Err(TapectlError::Other(format!(
-            "the loaded tape is {} by its File 0, and this catalog has no volume with that \
-             uuid. If this catalog lost it, `tapectl catalog rebuild --from-volume --key <KEY>` \
-             attaches it from the tape; otherwise this is another catalog's tape.",
-            what_file0_says(file0)
-        )));
+        return Ok(Located::Unknown);
     };
     if let Some(on_tape) = &file0.label {
         if on_tape != &volume.label {
-            return Err(TapectlError::Other(format!(
-                "wrong tape: the loaded tape's File 0 names volume \"{on_tape}\", but this \
-                 catalog knows that uuid ({uuid}) as \"{}\". There is no --force for this — it is \
-                 a fact tapectl cannot resolve on its own.",
-                volume.label
-            )));
+            return Ok(Located::UnderAnotherLabel {
+                on_tape: on_tape.clone(),
+                volume,
+            });
         }
     }
-    Ok(volume)
+    Ok(Located::Known(volume))
+}
+
+impl Located {
+    /// The refusal text for everything but [`Located::Known`], naming what
+    /// File 0 says. One wording, whoever shows it: a refusal, or the note
+    /// and contradiction `volume identify` reports.
+    fn refusal(&self, file0: &File0Facts) -> Option<String> {
+        match self {
+            Located::Known(_) => None,
+            Located::NoIdentity => Some(format!(
+                "the loaded tape does not identify a volume: its File 0 carries {} — it is \
+                 blank, damaged or not a tapectl tape. Name the volume on the command line \
+                 instead. `tapectl volume identify` prints File 0 as it is.",
+                what_file0_says(file0)
+            )),
+            Located::Unknown => Some(format!(
+                "the loaded tape is {} by its File 0, and this catalog has no volume with that \
+                 uuid. If this catalog lost it, `tapectl catalog rebuild --from-volume --key \
+                 <KEY>` attaches it from the tape; otherwise this is another catalog's tape.",
+                what_file0_says(file0)
+            )),
+            Located::UnderAnotherLabel { on_tape, volume } => Some(format!(
+                "wrong tape: the loaded tape's File 0 names volume \"{on_tape}\", but this \
+                 catalog knows that uuid ({}) as \"{}\". There is no --force for this — it is \
+                 a fact tapectl cannot resolve on its own.",
+                volume.uuid, volume.label
+            )),
+        }
+    }
+}
+
+/// Find the volume of this catalog that the loaded tape's File 0 identifies.
+///
+/// By uuid only ([`locate`]). Refuses, naming what File 0 says, when File 0
+/// carries no uuid (a blank, damaged or foreign tape), when no volume of this
+/// catalog has that uuid (a tape this catalog does not know — after a lost
+/// catalog, `catalog rebuild --from-volume` attaches it), and when the uuid
+/// belongs to a volume this catalog calls something other than File 0 does,
+/// which is a wrong tape however it came about and is not guessed through.
+pub(crate) fn resolve(conn: &Connection, file0: &File0Facts) -> Result<LoadedVolume> {
+    match locate(conn, file0)? {
+        Located::Known(volume) => Ok(volume),
+        other => Err(TapectlError::Other(
+            other
+                .refusal(file0)
+                .expect("every Located but Known has a refusal"),
+        )),
+    }
+}
+
+/// What `volume identify` says about the catalog's view of the tape — the
+/// same [`Located`] [`resolve`] refuses on, read the way `identify` reads it
+/// (issue #443).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CatalogAccount {
+    /// The line for stderr: which volume this tape is, or that the catalog
+    /// does not have it. Not a contradiction. `None` when File 0 names no
+    /// uuid to look up.
+    pub note: Option<String>,
+    /// A fact that contradicts the catalog, which `identify` reports through
+    /// its exit status: the uuid is the catalog's but under another label.
+    /// The catalog NOT knowing a tape is not one — `identify` is what an
+    /// operator runs precisely when they do not know what is loaded
+    /// (ADR-0012, issue #193) — and neither is File 0 naming nothing.
+    pub contradiction: Option<String>,
+}
+
+/// [`CatalogAccount`] for `located`, the lookup of `file0`.
+pub(crate) fn account(located: &Located, file0: &File0Facts) -> CatalogAccount {
+    match located {
+        Located::NoIdentity => CatalogAccount::default(),
+        Located::Unknown => CatalogAccount {
+            note: located.refusal(file0).map(|why| format!("catalog: {why}")),
+            contradiction: None,
+        },
+        Located::Known(v) => CatalogAccount {
+            note: Some(format!(
+                "catalog: this tape is volume \"{}\" (status {})",
+                v.label, v.status
+            )),
+            contradiction: None,
+        },
+        Located::UnderAnotherLabel { .. } => CatalogAccount {
+            note: None,
+            contradiction: located.refusal(file0),
+        },
+    }
 }
 
 /// Say which volume a command chose, on stderr (stdout stays the command's
@@ -478,6 +581,77 @@ mod tests {
             err.contains("\"L6-0007\"") && err.contains("\"L6-0002\""),
             "{err}"
         );
+    }
+
+    /// `locate` is the one lookup, and `resolve` (refusals) and `account`
+    /// (`volume identify`'s note and contradiction) are two readings of it
+    /// (issue #443): for every File 0 a catalog can be asked about, the
+    /// reading that refuses is the reading that contradicts, and never does a
+    /// note stand beside a contradiction.
+    #[test]
+    fn resolve_and_identifys_account_are_two_readings_of_one_lookup() {
+        let (conn, _) = catalog_with("L6-0002", "uuid-2", "sealed", "ok");
+        let cases = [
+            // (File 0, located, refused by resolve, contradicts, has a note)
+            (
+                file0(Some("L6-0002"), Some("uuid-2")),
+                "known",
+                false,
+                false,
+                true,
+            ),
+            (file0(None, Some("uuid-2")), "known", false, false, true),
+            (
+                file0(Some("L6-0009"), Some("uuid-9")),
+                "unknown",
+                true,
+                false,
+                true,
+            ),
+            (
+                file0(Some("L6-0007"), Some("uuid-2")),
+                "another label",
+                true,
+                true,
+                false,
+            ),
+            (
+                file0(Some("L6-0002"), None),
+                "no identity",
+                true,
+                false,
+                false,
+            ),
+            (file0(None, None), "no identity", true, false, false),
+        ];
+        for (facts, what, refused, contradicts, noted) in cases {
+            let located = locate(&conn, &facts).unwrap();
+            let label = match &located {
+                Located::Known(_) => "known",
+                Located::Unknown => "unknown",
+                Located::UnderAnotherLabel { .. } => "another label",
+                Located::NoIdentity => "no identity",
+            };
+            assert_eq!(label, what, "{facts:?}");
+            let account = account(&located, &facts);
+            assert_eq!(resolve(&conn, &facts).is_err(), refused, "{what}: resolve");
+            assert_eq!(
+                account.contradiction.is_some(),
+                contradicts,
+                "{what}: identify's exit status"
+            );
+            assert_eq!(account.note.is_some(), noted, "{what}: identify's note");
+            // A tape that is refused only for being unknown or unreadable is
+            // an absence for `identify`; a tape refused as a WRONG tape is a
+            // contradiction, in the resolver's own words.
+            if contradicts {
+                assert_eq!(
+                    account.contradiction,
+                    Some(resolve(&conn, &facts).unwrap_err().to_string()),
+                    "{what}"
+                );
+            }
+        }
     }
 
     #[test]
