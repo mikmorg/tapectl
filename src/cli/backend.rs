@@ -26,7 +26,7 @@ pub fn run(
             paths,
             name,
             device_tape,
-            device_sg,
+            device_sg.as_deref(),
             generation,
             capacity_override.as_deref(),
             enospc_buffer.as_deref(),
@@ -47,11 +47,12 @@ pub fn run(
 /// since deleted both from `LtoBackendConfig` entirely, so a table carrying
 /// either would now fail to load. `capacity_override` (ADR-0010) is absent
 /// unless explicitly given — a real drive's capacity follows the loaded
-/// cartridge's detected generation, not this config.
+/// cartridge's detected generation, not this config. `device_sg` is absent
+/// unless given too (issue #431): tapectl derives it from `device_tape`.
 pub fn backend_fields(
     name: &str,
     device_tape: &str,
-    device_sg: &str,
+    device_sg: Option<&str>,
     generation: &str,
     capacity_override: Option<&str>,
     enospc_buffer: Option<&str>,
@@ -62,9 +63,11 @@ pub fn backend_fields(
     let mut fields = vec![
         format!("name={}", q(name)),
         format!("device_tape={}", q(device_tape)),
-        format!("device_sg={}", q(device_sg)),
         format!("generation={}", q(generation)),
     ];
+    if let Some(sg) = device_sg {
+        fields.insert(2, format!("device_sg={}", q(sg)));
+    }
     if let Some(cap) = capacity_override {
         fields.push(format!("capacity_override={}", q(cap)));
     }
@@ -95,7 +98,7 @@ fn add(
     paths: &TapectlPaths,
     name: &str,
     device_tape: &str,
-    device_sg: &str,
+    device_sg: Option<&str>,
     generation: &str,
     capacity_override: Option<&str>,
     enospc_buffer: Option<&str>,
@@ -103,6 +106,13 @@ fn add(
     dry_run: bool,
 ) -> Result<()> {
     crate::naming::validate_backend_name(name)?;
+    if device_sg.is_some_and(|sg| sg.trim().is_empty()) {
+        return Err(TapectlError::Other(
+            "--device-sg is empty. Leave it out and tapectl derives the SCSI generic node \
+             from --device-tape, or give the drive's /dev/sgN."
+                .to_string(),
+        ));
+    }
 
     // Validated here rather than at the next `Config::load`, so a typo is
     // rejected while the operator is still looking at the command that
@@ -168,7 +178,8 @@ fn add(
     // drive before plugging it in, and this box is not the only machine the
     // config may be carried to. Same fail-open rule as #97's dar probe —
     // a helpful check must not become a tool that refuses to run.
-    for (flag, path) in [("--device-tape", device_tape), ("--device-sg", device_sg)] {
+    for (flag, path) in [("--device-tape", Some(device_tape)), ("--device-sg", device_sg)] {
+        let Some(path) = path else { continue };
         if !std::path::Path::new(path).exists() {
             eprintln!(
                 "warning: {flag} {path} does not exist on this machine. \
@@ -177,6 +188,30 @@ fn add(
             );
         }
     }
+    // Issue #431: no --device-sg means "derive it from device_tape at use".
+    // Say what that resolves to today, and warn (never refuse: the drive may
+    // be configured before it is attached) when it resolves to nothing.
+    let derived_sg = match device_sg {
+        Some(_) => None,
+        None => {
+            let node = crate::tape::drive_identity::sg_node_for_tape(device_tape);
+            if node.is_none() {
+                eprintln!(
+                    "warning: no --device-sg given and none can be derived from --device-tape \
+                     {device_tape} on this machine (the kernel's sysfs does not name exactly \
+                     one SCSI generic node for it). Writing the backend without one; commands \
+                     that read the drive refuse until it is attached, or add device_sg = \
+                     \"/dev/sgN\" (`lsscsi -g`)."
+                );
+            }
+            node
+        }
+    };
+    let sg_shown = match (device_sg, &derived_sg) {
+        (Some(sg), _) => sg.to_string(),
+        (None, Some(node)) => format!("{} (derived from device_tape)", node.display()),
+        (None, None) => "(derived from device_tape when the drive is attached)".to_string(),
+    };
 
     // Issue #143: the table is written by the same editor `config add
     // backends.lto` uses — in place, keeping every comment (`Config::save`
@@ -211,13 +246,14 @@ fn add(
             println!(
                 "{}",
                 serde_json::json!({"backend": name, "device_tape": device_tape,
-                                   "device_sg": device_sg, "generation": generation,
-                                   "dry_run": true})
+                                   "device_sg": device_sg,
+                                   "device_sg_derived": derived_sg.as_ref().map(|n| n.display().to_string()),
+                                   "generation": generation, "dry_run": true})
             );
         } else {
             println!(
                 "would add backend \"{name}\" to {} ({generation}, tape={device_tape}, \
-                 sg={device_sg}) (DRY RUN — no changes made)",
+                 sg={sg_shown}) (DRY RUN — no changes made)",
                 paths.config_file.display()
             );
         }
@@ -230,12 +266,13 @@ fn add(
         println!(
             "{}",
             serde_json::json!({"backend": name, "device_tape": device_tape,
-                               "device_sg": device_sg, "generation": generation,
-                               "status": "added"})
+                               "device_sg": device_sg,
+                               "device_sg_derived": derived_sg.as_ref().map(|n| n.display().to_string()),
+                               "generation": generation, "status": "added"})
         );
     } else {
         println!(
-            "backend \"{name}\" added to {} ({generation}, tape={device_tape}, sg={device_sg})",
+            "backend \"{name}\" added to {} ({generation}, tape={device_tape}, sg={sg_shown})",
             paths.config_file.display()
         );
         println!("verify it with: tapectl config check");
@@ -268,7 +305,7 @@ mod tests {
             backend_fields(
                 "hp-lto6",
                 "/dev/tape/by-id/scsi-ABC-nst",
-                "/dev/sg1",
+                Some("/dev/sg1"),
                 "LTO-6",
                 Some("2.5TB"),
                 Some("50M"),
@@ -284,6 +321,26 @@ mod tests {
         assert_eq!(b.enospc_buffer, "50M");
     }
 
+    /// Issue #431: `--device-sg` is optional. Left out, the table carries no
+    /// `device_sg` line at all (not an empty one) and still loads; given, it
+    /// is written as the override it is.
+    #[test]
+    fn the_device_sg_line_is_written_only_when_given() {
+        let without = added(
+            "[dar]\nbinary = \"dar\"\n",
+            backend_fields("b", "/dev/nst0", None, "LTO-6", None, None),
+        );
+        assert!(!without.contains("device_sg"), "{without}");
+        let cfg: Config = toml::from_str(&without).expect("a table without device_sg parses");
+        assert_eq!(cfg.backends.lto[0].device_sg, "");
+
+        let with = added(
+            "[dar]\nbinary = \"dar\"\n",
+            backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
+        );
+        assert!(with.contains("device_sg = \"/dev/sg1\""), "{with}");
+    }
+
     /// Omitted knobs fall back to their serde defaults rather than being
     /// written out as operator choices. `block_size`/`hardware_compression`
     /// are checked for absence still, and now for a stronger reason than
@@ -293,7 +350,7 @@ mod tests {
     fn inert_knobs_are_absent_and_defaulted() {
         let text = added(
             "[dar]\nbinary = \"dar\"\n",
-            backend_fields("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
+            backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
         );
         assert!(!text.contains("block_size"), "{text}");
         assert!(!text.contains("hardware_compression"), "{text}");
@@ -322,7 +379,7 @@ mod tests {
             "[dar]\nbinary = \"dar\"\n\n[backends]\nlto = []\n\n[defaults]\nchecksum_mode = \"sha256\"\n";
         let text = added(
             before,
-            backend_fields("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
+            backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
         );
         assert!(!text.contains("lto = []"), "{text}");
         let cfg: Config = toml::from_str(&text).expect("the edited file must parse");
@@ -338,7 +395,7 @@ mod tests {
         let text = "[dar]\nbinary = \"dar\"\n\n# [[backends.lto]]\n# lto = []\n# name = \"lto6\"\n";
         let after = added(
             text,
-            backend_fields("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
+            backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
         );
         for line in text.lines() {
             assert!(after.contains(line), "{line:?} lost:\n{after}");
@@ -361,7 +418,7 @@ mod tests {
             "# operator note: the drive lives in the basement\n[dar]\nbinary = \"dar\"\n";
         let after = added(
             original,
-            backend_fields("b", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
+            backend_fields("b", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
         );
         assert!(after.starts_with(original), "{after}");
         assert!(toml::from_str::<Config>(&after).is_ok());
@@ -372,7 +429,7 @@ mod tests {
     fn a_numeric_name_is_written_as_a_string() {
         let text = added(
             "",
-            backend_fields("2024", "/dev/nst0", "/dev/sg1", "LTO-6", None, None),
+            backend_fields("2024", "/dev/nst0", Some("/dev/sg1"), "LTO-6", None, None),
         );
         assert!(text.contains("name = \"2024\""), "{text}");
     }
@@ -415,7 +472,7 @@ mod tests {
             &paths,
             "drive-b",
             "/dev/nst0",
-            "/dev/sg1",
+            Some("/dev/sg1"),
             "LTO-6",
             None,
             None,
@@ -451,7 +508,7 @@ mod tests {
             &paths,
             "drive-b",
             by_id.to_str().unwrap(),
-            "/dev/sg1",
+            Some("/dev/sg1"),
             "LTO-6",
             None,
             None,
@@ -479,7 +536,7 @@ mod tests {
             &paths,
             "drive-b",
             real.to_str().unwrap(),
-            "/dev/sg1",
+            Some("/dev/sg1"),
             "LTO-6",
             None,
             None,
@@ -503,7 +560,7 @@ mod tests {
             &paths,
             "drive-b",
             other.to_str().unwrap(),
-            "/dev/sg1",
+            Some("/dev/sg1"),
             "LTO-6",
             None,
             None,
@@ -528,7 +585,7 @@ mod tests {
             &paths,
             "drive-b",
             "/dev/this-drive-is-not-plugged-in",
-            "/dev/sg1",
+            Some("/dev/sg1"),
             "LTO-6",
             None,
             None,
@@ -564,7 +621,7 @@ mod tests {
             &paths,
             "drive-a",
             "/dev/nst0",
-            "/dev/sg0",
+            Some("/dev/sg0"),
             "LTO-7-M8",
             None,
             None,
@@ -595,7 +652,7 @@ mod tests {
             &paths,
             "drive-a",
             "/dev/nst0",
-            "/dev/sg0",
+            Some("/dev/sg0"),
             "LTO-8",
             None,
             None,
@@ -621,7 +678,7 @@ mod tests {
             &paths,
             "drive-a",
             "/dev/nst0",
-            "/dev/sg0",
+            Some("/dev/sg0"),
             "not-a-generation",
             None,
             None,
@@ -630,5 +687,60 @@ mod tests {
         )
         .unwrap_err();
         assert!(!err.to_string().contains("LTO-7-M8"), "{err}");
+    }
+
+    // ---- issue #431: `add` without --device-sg ----
+
+    /// A drive added with only its tape node is written without `device_sg`
+    /// and the file loads: the node is derived at use, so there is no second
+    /// path to keep in step. (A tape node that cannot exist here, so nothing
+    /// real is derived.)
+    #[test]
+    fn add_without_a_device_sg_writes_none_and_the_file_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = empty_config(tmp.path());
+
+        add(
+            &paths,
+            "drive-a",
+            "/nonexistent/tapectl-backend-add/nst-fake-1",
+            None,
+            "LTO-6",
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&paths.config_file).unwrap();
+        assert!(!text.contains("device_sg"), "{text}");
+        let reloaded = Config::load(&paths.config_file).unwrap();
+        assert_eq!(reloaded.backends.lto.len(), 1);
+        assert_eq!(reloaded.backends.lto[0].name, "drive-a");
+    }
+
+    /// An empty `--device-sg` is neither "absent" nor a path: refused, and
+    /// the file is untouched.
+    #[test]
+    fn add_refuses_an_empty_device_sg() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = empty_config(tmp.path());
+
+        let err = add(
+            &paths,
+            "drive-a",
+            "/nonexistent/tapectl-backend-add/nst-fake-1",
+            Some(" "),
+            "LTO-6",
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--device-sg is empty"), "{err}");
+        let reloaded = Config::load(&paths.config_file).unwrap();
+        assert!(reloaded.backends.lto.is_empty());
     }
 }

@@ -3597,7 +3597,7 @@ fn health_backend<'a>(
     config: &'a Config,
     device: &str,
 ) -> std::result::Result<&'a crate::config::LtoBackendConfig, String> {
-    config
+    let backend = config
         .backends
         .lto
         .iter()
@@ -3610,7 +3610,18 @@ fn health_backend<'a>(
                 "device {device} matched no configured [[backends.lto]] entry; drive health \
                  (sg_logs) was not collected and this contact is not attributed to a drive"
             )
-        })
+        })?;
+    // Issue #431: this lookup reaches the backend without `resolve_device`'s
+    // sg check, and an undeclared, underivable `device_sg` is empty — never
+    // sweep log pages through it.
+    if backend.device_sg.is_empty() {
+        return Err(format!(
+            "{} Drive health (sg_logs) was not collected and this contact is not attributed \
+             to a drive.",
+            crate::tape::drive_identity::unresolved_sg_problem(backend)
+        ));
+    }
+    Ok(backend)
 }
 
 /// The hardware half of a health reading: ONE log-page sweep
@@ -8161,6 +8172,31 @@ mod tests {
         let found = health_backend(&config, &by_id.display().to_string())
             .expect("a by-id symlink to the configured node must resolve to its backend");
         assert_eq!(found.name, "by-id-drive");
+    }
+
+    /// Issue #431: a backend that declares no `device_sg` and whose node the
+    /// kernel cannot name has an EMPTY one, and this lookup (which never
+    /// goes through `resolve_device`'s sg check) must say so rather than
+    /// hand `sg_logs` an empty device.
+    #[test]
+    fn a_backend_with_no_sg_node_is_not_swept_and_says_why() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let nst = tmp.path().join("nst1");
+        std::fs::File::create(&nst).unwrap();
+        let mut config = health_backend_config(&nst);
+        let device = nst.display().to_string();
+        // Positive control: with an sg node it resolves.
+        assert!(health_backend(&config, &device).is_ok());
+
+        config.backends.lto[0].device_sg = String::new();
+        let msg = health_backend(&config, &device)
+            .expect_err("an empty device_sg must not resolve for a sweep");
+        assert!(msg.contains("by-id-drive"), "names the backend: {msg}");
+        assert!(msg.contains("device_sg"), "names the field: {msg}");
+        assert!(
+            msg.contains("not attributed to a drive"),
+            "says what was lost: {msg}"
+        );
     }
 
     /// The paired negative for #313: a device no backend claims is LOOKED

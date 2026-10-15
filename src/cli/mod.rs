@@ -357,9 +357,11 @@ pub enum BackendCommands {
     /// Writes a validated `[[backends.lto]]` block in place, so existing
     /// comments survive, through the editor `config add` uses; the file is
     /// checked before it is replaced, and a refusal leaves it untouched.
-    /// Find your drive with `ls -l /dev/tape/by-id/`, and
-    /// `lsscsi -g` for the sg node. Prefer the by-id paths: /dev/nstN
-    /// numbering is not stable across reboots.
+    /// Find your drive with `ls -l /dev/tape/by-id/`. Prefer the by-id
+    /// path: /dev/nstN numbering is not stable across reboots. The SCSI
+    /// generic node (the sg node, used for the cartridge chip and the
+    /// drive's health pages) is derived from the tape node at every use, so
+    /// it need not be given; --device-sg overrides the derivation.
     Add {
         /// Name for this drive, used to select it later. Letters, digits,
         /// dot, underscore and dash.
@@ -368,9 +370,13 @@ pub enum BackendCommands {
         /// Tape device node, e.g. /dev/tape/by-id/scsi-XXXX-nst
         #[arg(long)]
         device_tape: String,
-        /// SCSI generic node used for health/MAM queries, e.g. /dev/sg1
+        /// SCSI generic node used for health/MAM queries, e.g. /dev/sg1.
+        /// Optional: left out, tapectl derives it from --device-tape at use
+        /// (the kernel names the pairing), so a /dev/sgN renumbering never
+        /// matters. Given, it overrides the derivation, and a write still
+        /// refuses a node the kernel proves is another drive's.
         #[arg(long)]
-        device_sg: String,
+        device_sg: Option<String>,
         /// Generation this drive natively writes, e.g. LTO-6 (ADR-0010: a
         /// drive declares only what it can write; the medium's actual
         /// generation is detected at `volume init`, not declared here).

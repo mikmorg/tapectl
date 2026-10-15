@@ -168,7 +168,20 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
     // value remains). Every advisory scan below that needs a `Config`
     // simply has nothing to run against when this is `None`; `report.problems`
     // already says why.
-    let loaded = report.best_effort.as_ref();
+    //
+    // Issue #431: a backend without `device_sg` is shown with the node the
+    // kernel derives for it. A config that loads has been through that
+    // already; the lenient parse of one that does not never was, so it is
+    // done here (idempotent) and the checks below read the same thing every
+    // other command would.
+    let mut best_effort = report.best_effort.clone();
+    if let Some(cfg) = best_effort.as_mut() {
+        cfg.fill_derived_sg_nodes();
+    }
+    let loaded = best_effort.as_ref();
+    let sg_derived = loaded
+        .map(|cfg| derived_sg_nodes(&toml_str, cfg))
+        .unwrap_or_default();
 
     // Advisory scan for pre-existing dotfiles that still shadow an
     // archive_set's policy fields (Recast of v4.0 §2.2,
@@ -275,6 +288,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             staging_check.as_ref(),
             staging_space_check.as_ref(),
             &tape_device_checks,
+            &sg_derived,
             &unsupported_compression_hits,
             &capacity_override_hits,
             host_check.as_ref(),
@@ -292,6 +306,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             staging_check.as_ref(),
             staging_space_check.as_ref(),
             &tape_device_checks,
+            &sg_derived,
             &unsupported_compression_hits,
             &capacity_override_hits,
             host_check.as_ref(),
@@ -306,6 +321,35 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
     })
 }
 
+/// Issue #431: the backends of `cfg` whose `device_sg` the file does not set
+/// but which now carry one — `(backend name, derived node)` — so `config
+/// check` can say it was derived rather than configured. `toml_str` is the
+/// file as written (a loaded `Config` cannot tell the two apart); a file
+/// that does not parse as TOML names none.
+fn derived_sg_nodes(toml_str: &str, cfg: &crate::config::Config) -> Vec<(String, String)> {
+    let Ok(table) = toml_str.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let written: std::collections::HashSet<String> = table
+        .get("backends")
+        .and_then(|b| b.get("lto"))
+        .and_then(|l| l.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e.get("device_sg").is_some())
+                .filter_map(|e| e.get("name")?.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    cfg.backends
+        .lto
+        .iter()
+        .filter(|b| !b.device_sg.is_empty() && !written.contains(&b.name))
+        .map(|b| (b.name.clone(), b.device_sg.clone()))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_json(
     report: &crate::policy::lenient_config::LenientReport,
@@ -317,6 +361,7 @@ fn print_json(
     staging_check: Option<&crate::policy::depth_check::StagingCheck>,
     staging_space_check: Option<&crate::policy::depth_check::StagingSpaceCheck>,
     tape_device_checks: &[crate::policy::depth_check::TapeDeviceCheck],
+    sg_derived: &[(String, String)],
     unsupported_compression_hits: &[crate::policy::compression_capability::UnsupportedCompressionHit],
     capacity_override_hits: &[&str],
     host_check: Option<&(bool, crate::config::HostCheckConfig)>,
@@ -427,6 +472,7 @@ fn print_json(
                 "device_tape": c.device_tape,
                 "device_tape_exists": c.device_tape_exists,
                 "device_sg": c.device_sg,
+                "device_sg_derived": sg_derived.iter().any(|(name, _)| *name == c.backend_name),
                 "device_sg_exists": c.device_sg_exists,
                 "device_sg_pairing_problem": c.pairing_problem,
             })
@@ -478,6 +524,7 @@ fn print_human(
     staging_check: Option<&crate::policy::depth_check::StagingCheck>,
     staging_space_check: Option<&crate::policy::depth_check::StagingSpaceCheck>,
     tape_device_checks: &[crate::policy::depth_check::TapeDeviceCheck],
+    sg_derived: &[(String, String)],
     unsupported_compression_hits: &[crate::policy::compression_capability::UnsupportedCompressionHit],
     capacity_override_hits: &[&str],
     host_check: Option<&(bool, crate::config::HostCheckConfig)>,
@@ -549,6 +596,13 @@ fn print_human(
             "{}",
             crate::policy::depth_check::describe_tape_device(check)
         );
+        if let Some((_, node)) = sg_derived.iter().find(|(name, _)| *name == check.backend_name) {
+            println!(
+                "  backend \"{}\": device_sg is not set; derived {node} from device_tape \
+                 (the kernel's binding, read from sysfs)",
+                check.backend_name
+            );
+        }
     }
     for hit in unknown_key_hits {
         println!("{}", crate::policy::unknown_keys::describe(hit));
@@ -678,6 +732,37 @@ pub(crate) fn describe_host_check(present: bool, hc: &crate::config::HostCheckCo
 mod tests {
     use super::*;
     use crate::config::HostCheckConfig;
+
+    /// Issue #431: `config check` says which backends' `device_sg` it
+    /// derived — those the file does not set, and only those that now carry a
+    /// node. Derivation is faked by a sysfs tree under a temp dir.
+    #[test]
+    fn config_check_names_the_backends_whose_device_sg_was_derived() {
+        let toml_str = "[[backends.lto]]\nname = \"derived\"\n\
+                        device_tape = \"/nonexistent/tapectl-check-sg/nst-fake-7\"\n\
+                        generation = \"LTO-6\"\n\n\
+                        [[backends.lto]]\nname = \"written\"\n\
+                        device_tape = \"/nonexistent/tapectl-check-sg/nst-fake-8\"\n\
+                        device_sg = \"/dev/sg-written\"\ngeneration = \"LTO-6\"\n\n\
+                        [[backends.lto]]\nname = \"underivable\"\n\
+                        device_tape = \"/nonexistent/tapectl-check-sg/nst-fake-9\"\n\
+                        generation = \"LTO-6\"\n";
+        let mut cfg: crate::config::Config = toml::from_str(toml_str).unwrap();
+        let sysfs = tempfile::TempDir::new().unwrap();
+        for (node, sg) in [("nst-fake-7", "sg13"), ("nst-fake-8", "sg14")] {
+            let dir = sysfs.path().join(node).join("device").join("scsi_generic");
+            std::fs::create_dir_all(dir.join(sg)).unwrap();
+        }
+        cfg.fill_derived_sg_nodes_under(sysfs.path());
+
+        assert_eq!(
+            derived_sg_nodes(toml_str, &cfg),
+            vec![("derived".to_string(), "/dev/sg13".to_string())],
+            "only the backend the file leaves without device_sg, and that got one"
+        );
+        // A file that is not TOML names none rather than guessing.
+        assert!(derived_sg_nodes("not [toml", &cfg).is_empty());
+    }
 
     #[test]
     fn config_check_names_the_host_check_limits_and_where_they_come_from() {

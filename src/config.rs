@@ -310,6 +310,25 @@ pub struct DarConfig {
     pub binary: String,
 }
 
+/// `device_sg` as written in the file: a string, never an empty one. Absence
+/// (the `default`) is the supported way to ask for the derived node
+/// (issue #431); an explicit `""` would be indistinguishable from it after
+/// the parse, so it is refused here, by name, with the fix.
+fn de_device_sg<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let s = String::deserialize(deserializer)?;
+    if s.trim().is_empty() {
+        return Err(D::Error::custom(
+            "device_sg is empty — remove the line and tapectl derives the node from \
+             device_tape, or set it to the drive's /dev/sgN",
+        ));
+    }
+    Ok(s)
+}
+
 fn default_dar_binary() -> String {
     // Bare and PATH-resolved (issue #124) -- portable across distros that
     // install dar to /usr/bin, /usr/local/bin, or elsewhere, and honored by
@@ -355,6 +374,32 @@ pub struct BackendsConfig {
 pub struct LtoBackendConfig {
     pub name: String,
     pub device_tape: String,
+    /// The SCSI generic node of the SAME drive, read for its cartridge chip
+    /// (MAM) and health log pages. **Optional in the file** (issue #431: one
+    /// device path per drive): when the key is absent,
+    /// [`Config::fill_derived_sg_nodes`] fills it at load from the node the
+    /// kernel binds to `device_tape`
+    /// ([`crate::tape::drive_identity::sg_node_for_tape`], sysfs only), so a
+    /// `/dev/sgN` renumbering stops mattering. A configured value is an
+    /// override: it is kept as written, and a write still refuses one the
+    /// kernel proves is another drive's (#329).
+    ///
+    /// **Three states after a load, one invariant.** Configured; derived; or
+    /// EMPTY — absent and not derivable (a drive that is not attached, a
+    /// non-st path). Empty is never used: every reader reaches its backend
+    /// through [`resolve_lto_backend`] / [`resolve_device`] (or
+    /// `volume::write::health_backend`), and each refuses or drops an empty
+    /// one by name through
+    /// [`crate::tape::drive_identity::sg_pairing_problem`]. An explicit
+    /// `device_sg = ""` is a load error, so the empty state cannot be
+    /// written on purpose. The derived value is never written back to the
+    /// file (`Config::save` is `init`'s alone; every edit goes through
+    /// `config_edit`).
+    #[serde(
+        default,
+        deserialize_with = "de_device_sg",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub device_sg: String,
     /// The generation this drive natively writes, e.g. `"LTO-6"`. Checked via
     /// [`validate_drive_generation`] — `config check` (and every
@@ -982,6 +1027,39 @@ impl Config {
         cfg
     }
 
+    /// Issue #431: fill every `[[backends.lto]]` entry that declares no
+    /// `device_sg` from the sg node the kernel binds to its `device_tape`
+    /// ([`crate::tape::drive_identity::fill_derived_sg`]; sysfs only, nothing
+    /// opened). Returns the names of the backends it filled. An entry whose
+    /// binding cannot be proven stays empty and is refused by name where it
+    /// is needed ([`crate::tape::drive_identity::sg_pairing_problem`]) — load
+    /// itself never fails over it, so a drive that is not attached does not
+    /// stop `report`, `restore` or `config check`.
+    ///
+    /// Idempotent, and run by every loader ([`Config::load`],
+    /// [`Config::load_tolerating_backend_ambiguity`], [`Config::from_text`]);
+    /// `config check` calls it on the lenient parse of a file that does not
+    /// load, which never passed through them.
+    pub fn fill_derived_sg_nodes(&mut self) -> Vec<String> {
+        self.backends
+            .lto
+            .iter_mut()
+            .filter_map(|b| crate::tape::drive_identity::fill_derived_sg(b).then(|| b.name.clone()))
+            .collect()
+    }
+
+    /// [`Config::fill_derived_sg_nodes`] under a fake sysfs root, for tests.
+    #[cfg(test)]
+    pub(crate) fn fill_derived_sg_nodes_under(&mut self, root: &Path) -> Vec<String> {
+        self.backends
+            .lto
+            .iter_mut()
+            .filter_map(|b| {
+                crate::tape::drive_identity::fill_derived_sg_under(root, b).then(|| b.name.clone())
+            })
+            .collect()
+    }
+
     /// Load config from file, falling back to defaults.
     ///
     /// Every check here is load-bearing (see each validator's own doc
@@ -1082,8 +1160,11 @@ impl Config {
         // `#[serde(deny_unknown_fields)]`, so a typo anywhere in the file —
         // not just `[[backends.lto]]` — fails here by name, naming the FILE
         // too so `config check` and the operator can find it.
-        let config: Config = toml::from_str(content)
+        let mut config: Config = toml::from_str(content)
             .map_err(|e| TapectlError::Config(format!("{}: {e}", path.display())))?;
+        // Issue #431: a backend without `device_sg` gets the node the kernel
+        // binds to its `device_tape`, before any reader sees the config.
+        config.fill_derived_sg_nodes();
         config.validate_sizes(path)?;
         config.validate_closed_sets(path)?;
         config.validate_ranges(path)?;
@@ -1548,15 +1629,15 @@ impl Config {
 pub const LTO_BACKEND_EXAMPLE: &str = r#"
 # ---------------------------------------------------------------------------
 # Tape drive. Uncomment and edit before `volume write` / `collection run`.
-# Find your drive:  ls -l /dev/tape/by-id/   (and `lsscsi -g` for the sg node)
+# Find your drive:  ls -l /dev/tape/by-id/
 #
 # Prefer the by-id paths: /dev/nstN numbering is not stable across reboots.
 # ---------------------------------------------------------------------------
 # [[backends.lto]]
 # name = "lto6"
 # device_tape = "/dev/tape/by-id/scsi-XXXXXXXX-nst"
-# device_sg = "/dev/sg1"
 # generation = "LTO-6"
+# device_sg = "/dev/sg1"   # optional: derived from device_tape when absent
 "#;
 
 /// Error for "tape was asked for, but no drive is configured".
@@ -3062,6 +3143,114 @@ mod tests {
             fill_ceiling: default_fill_ceiling(),
             enospc_buffer: default_enospc_buffer(),
         }
+    }
+
+    // ---- issue #431: device_sg is optional, derived from device_tape ----
+
+    /// The `[[backends.lto]]` table of a drive that cannot be in sysfs (a path
+    /// that does not exist), with or without a declared `device_sg`.
+    fn backend_toml(device_sg: Option<&str>) -> String {
+        let sg = device_sg
+            .map(|sg| format!("device_sg = \"{sg}\"\n"))
+            .unwrap_or_default();
+        format!(
+            "[[backends.lto]]\nname = \"lto1\"\n\
+             device_tape = \"/nonexistent/tapectl-sg-config/nst-fake-7\"\n{sg}generation = \"LTO-6\"\n"
+        )
+    }
+
+    fn fake_sysfs_with(root: &Path, node: &str, sg: &str) {
+        let dir = root.join(node).join("device").join("scsi_generic");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(dir.join(sg)).unwrap();
+    }
+
+    /// A config without `device_sg` is valid — it is the supported way to say
+    /// "derive it" — and the derivation fills it under a (fake) sysfs.
+    #[test]
+    fn a_backend_without_device_sg_loads_and_is_derived() {
+        let text = backend_toml(None);
+        let mut config = Config::from_text(&text, Path::new("config.toml"))
+            .expect("a backend with no device_sg must load");
+        // Nothing in the real /sys names this fake path: it stays empty, and
+        // loading did not fail over it.
+        assert_eq!(config.backends.lto[0].device_sg, "");
+
+        let sysfs = TempDir::new().unwrap();
+        fake_sysfs_with(sysfs.path(), "nst-fake-7", "sg13");
+        let filled = config.fill_derived_sg_nodes_under(sysfs.path());
+        assert_eq!(filled, vec!["lto1".to_string()]);
+        assert_eq!(config.backends.lto[0].device_sg, "/dev/sg13");
+    }
+
+    /// The override wins: a written `device_sg` is kept, whatever sysfs says.
+    #[test]
+    fn a_written_device_sg_is_kept_over_the_derivation() {
+        let text = backend_toml(Some("/dev/sg-written"));
+        let mut config = Config::from_text(&text, Path::new("config.toml")).unwrap();
+        let sysfs = TempDir::new().unwrap();
+        fake_sysfs_with(sysfs.path(), "nst-fake-7", "sg13");
+        assert!(config.fill_derived_sg_nodes_under(sysfs.path()).is_empty());
+        assert_eq!(config.backends.lto[0].device_sg, "/dev/sg-written");
+    }
+
+    /// An explicit empty string cannot be told from an absent key after the
+    /// parse, so it is refused at the parse, by name.
+    #[test]
+    fn an_explicit_empty_device_sg_is_refused_by_name() {
+        let err = Config::from_text(&backend_toml(Some("")), Path::new("config.toml"))
+            .expect_err("device_sg = \"\" must not load");
+        let msg = err.to_string();
+        assert!(msg.contains("device_sg is empty"), "{msg}");
+        assert!(msg.contains("remove the line"), "{msg}");
+    }
+
+    /// The write path refuses an undeclared, underivable `device_sg` naming
+    /// the backend, the field and the remedy — never an empty node.
+    #[test]
+    fn resolve_lto_backend_refuses_an_underivable_device_sg_by_name() {
+        let config =
+            Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
+        for device in [None, Some("/nonexistent/tapectl-sg-config/nst-fake-7")] {
+            let msg = resolve_lto_backend(&config, device).unwrap_err().to_string();
+            assert!(msg.contains("lto1"), "{msg}");
+            assert!(msg.contains("device_sg is not set"), "{msg}");
+            assert!(msg.contains("cannot be derived"), "{msg}");
+            assert!(msg.contains("Set device_sg"), "{msg}");
+        }
+    }
+
+    /// The same config with a declared node resolves — the positive control
+    /// for the refusal above.
+    #[test]
+    fn resolve_lto_backend_accepts_a_declared_device_sg() {
+        let config = Config::from_text(&backend_toml(Some("/dev/sg5")), Path::new("config.toml"))
+            .unwrap();
+        assert_eq!(resolve_lto_backend(&config, None).unwrap().name, "lto1");
+    }
+
+    /// A read path (DR must work) does not refuse: it drops the backend, as it
+    /// does for a proven mismatch, and the device is still the one asked for.
+    #[test]
+    fn resolve_device_drops_a_backend_with_an_underivable_device_sg() {
+        let config =
+            Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
+        let (dev, backend) = resolve_device(&config, None).unwrap();
+        assert_eq!(dev, "/nonexistent/tapectl-sg-config/nst-fake-7");
+        assert!(backend.is_none(), "an unusable sg node leaves no backend");
+    }
+
+    /// The derived node is the process's view of the kernel, never part of
+    /// the file: a config whose `device_sg` is empty serializes without the
+    /// key, so no save can write an empty `device_sg = ""` that would not
+    /// load again.
+    #[test]
+    fn an_empty_device_sg_is_not_serialized() {
+        let config =
+            Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(!text.contains("device_sg"), "{text}");
+        Config::from_text(&text, Path::new("config.toml")).expect("and it loads again");
     }
 
     #[test]

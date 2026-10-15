@@ -267,7 +267,12 @@ pub fn read_identity(backend: &LtoBackendConfig) -> DriveIdentity {
         .and_then(|d| std::fs::read(d.join("vpd_pg80")).ok())
         .as_deref()
         .and_then(parse_vpd_page80)
-        .or_else(|| read_sg_inq_serial(&backend.device_sg));
+        .or_else(|| {
+            // No sg node to ask (issue #431: undeclared and underivable).
+            Some(&backend.device_sg)
+                .filter(|sg| !sg.is_empty())
+                .and_then(|sg| read_sg_inq_serial(sg))
+        });
 
     identity
 }
@@ -313,7 +318,16 @@ fn sysfs_node_name(device_tape: &str) -> Option<String> {
 /// proven (no such sysfs directory, e.g. a test's fake path, or not exactly
 /// one entry), and a caller must then assume nothing either way.
 pub fn sg_node_for_tape(device_tape: &str) -> Option<PathBuf> {
-    let dir = sysfs_device_dir(device_tape)?.join("scsi_generic");
+    sg_node_for_tape_under(Path::new(SCSI_TAPE_SYSFS_ROOT), device_tape)
+}
+
+/// [`sg_node_for_tape`] under an injectable sysfs `root` — [`SCSI_TAPE_SYSFS_ROOT`]
+/// in production — so a test reads a fake tree and never the real `/sys`
+/// (the seam [`sysfs_node_dir`] already gives the st statistics capture).
+pub(crate) fn sg_node_for_tape_under(root: &Path, device_tape: &str) -> Option<PathBuf> {
+    let dir = sysfs_node_dir(root, device_tape)?
+        .join("device")
+        .join("scsi_generic");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .ok()?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
@@ -324,6 +338,57 @@ pub fn sg_node_for_tape(device_tape: &str) -> Option<PathBuf> {
     Some(Path::new("/dev").join(names.remove(0)))
 }
 
+/// Issue #431: give a backend that does not declare `device_sg` the node the
+/// kernel binds to its `device_tape` — one device path per drive, so a
+/// `/dev/sgN` renumbering (a USB stick did it to home2's once) stops mattering.
+///
+/// Fills ONLY an empty `device_sg` (the state `#[serde(default)]` leaves when
+/// the key is absent); a configured one is never touched, so an explicit
+/// override still wins and [`sg_pairing_problem`] still judges it. Returns
+/// whether it filled one. When the binding cannot be proven the field stays
+/// empty — a state every reader refuses by name through
+/// [`sg_pairing_problem`], never one it uses.
+pub fn fill_derived_sg(backend: &mut LtoBackendConfig) -> bool {
+    fill_derived_sg_under(Path::new(SCSI_TAPE_SYSFS_ROOT), backend)
+}
+
+/// [`fill_derived_sg`] under an injectable sysfs `root`.
+pub(crate) fn fill_derived_sg_under(root: &Path, backend: &mut LtoBackendConfig) -> bool {
+    if !backend.device_sg.is_empty() {
+        return false;
+    }
+    match sg_node_for_tape_under(root, &backend.device_tape) {
+        Some(node) => {
+            backend.device_sg = node.display().to_string();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Issue #431: the refusal for a backend whose `device_sg` is empty — the
+/// config did not declare one and the kernel's binding for `device_tape`
+/// could not be proven. Names the backend, why, and how to set it; the
+/// caller decides whether it refuses (a write, `drive poll`), warns and
+/// proceeds as a no-backend read (`resolve_device`) or reports it
+/// (`config check`).
+pub fn unresolved_sg_problem(backend: &LtoBackendConfig) -> String {
+    let why = if Path::new(&backend.device_tape).exists() {
+        "the kernel's sysfs does not name exactly one SCSI generic node for it (is it a \
+         /dev/nstN tape node?)"
+    } else {
+        "it does not exist on this machine (is the drive attached?)"
+    };
+    format!(
+        "backend \"{name}\": device_sg is not set and cannot be derived from device_tape = \
+         {tape} — {why}. The cartridge chip (MAM) and the drive's log pages are read \
+         through the sg node, so tapectl will not guess one. Set device_sg = \"/dev/sgN\" \
+         in this [[backends.lto]] entry (`lsscsi -g` lists the nodes).",
+        name = backend.name,
+        tape = backend.device_tape,
+    )
+}
+
 /// Issue #329: does `backend.device_sg` name the SAME drive as
 /// `backend.device_tape`? A contact's drive identity is read through the
 /// tape node's sysfs, but its MAM and log pages through `device_sg`, so a
@@ -331,9 +396,19 @@ pub fn sg_node_for_tape(device_tape: &str) -> Option<PathBuf> {
 /// on a reboot mixes two drives in one contact row — and, on the write
 /// path, binds and sizes a cartridge from another drive's chip.
 ///
-/// `Some(problem)` only when the mismatch is PROVEN (the kernel's binding is
-/// readable and differs); an unprovable pairing is `None`, never a refusal.
+/// `Some(problem)` when the mismatch is PROVEN (the kernel's binding is
+/// readable and differs) or when `device_sg` is empty (issue #431: not
+/// declared, and [`fill_derived_sg`] could not derive it at load); an
+/// unprovable pairing of a configured node is `None`, never a refusal.
 pub fn sg_pairing_problem(backend: &LtoBackendConfig) -> Option<String> {
+    // Issue #431: an empty `device_sg` is "not declared and not derivable at
+    // load" — no pairing exists to judge, and the one thing a caller must
+    // never do is read a chip through it. Refused here so every gate that
+    // already asks this question (writes, `drive poll`, the lenient read
+    // path, `config check`) refuses it too.
+    if backend.device_sg.is_empty() {
+        return Some(unresolved_sg_problem(backend));
+    }
     let bound = sg_node_for_tape(&backend.device_tape)?;
     pairing_problem(
         &backend.name,
@@ -361,7 +436,8 @@ fn pairing_problem(
         "backend \"{name}\": device_sg = {configured_sg} is not the drive device_tape = \
          {device_tape} names — the kernel binds that tape node to {}. Its cartridge chip (MAM) \
          and log pages would be read from a different device (/dev/sgN numbering moves across \
-         reboots). Set device_sg = \"{}\" in this [[backends.lto]] entry.",
+         reboots). Set device_sg = \"{}\" in this [[backends.lto]] entry, or remove the \
+         device_sg line and tapectl derives it from device_tape.",
         bound.display(),
         bound.display()
     ))
@@ -752,6 +828,118 @@ mod tests {
     fn sg_node_for_tape_is_none_when_sysfs_cannot_prove_it() {
         assert_eq!(sg_node_for_tape("/dev/nst-no-such-node"), None);
         assert_eq!(sg_node_for_tape("memstore"), None);
+    }
+
+    // ── Issue #431: device_sg derived from device_tape ────────────────
+
+    /// A fake sysfs tree: `<root>/<node>/device/scsi_generic/<sg>` for each
+    /// `sg`. Directories stand in for the kernel's symlinks — `read_dir`
+    /// lists the names either way. Touches no `/sys` and no device.
+    fn fake_sysfs(root: &Path, node: &str, sgs: &[&str]) {
+        let dir = root.join(node).join("device").join("scsi_generic");
+        std::fs::create_dir_all(&dir).unwrap();
+        for sg in sgs {
+            std::fs::create_dir(dir.join(sg)).unwrap();
+        }
+    }
+
+    /// A backend whose tape node is a path that cannot exist, so the
+    /// basename fallback names the sysfs node and the REAL `/sys` never
+    /// answers for it.
+    fn backend_for(node: &str, device_sg: &str) -> LtoBackendConfig {
+        LtoBackendConfig {
+            name: "lto0".to_string(),
+            device_tape: format!("/nonexistent/tapectl-sg-derive/{node}"),
+            device_sg: device_sg.to_string(),
+            generation: "LTO-6".to_string(),
+            capacity_override: None,
+            fill_ceiling: 0.95,
+            enospc_buffer: "50M".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_sg_node_is_the_one_entry_sysfs_binds_to_the_tape_node() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fake_sysfs(tmp.path(), "nst-fake-7", &["sg13"]);
+        assert_eq!(
+            sg_node_for_tape_under(tmp.path(), "/nonexistent/tapectl-sg-derive/nst-fake-7"),
+            Some(PathBuf::from("/dev/sg13"))
+        );
+        // Another node under the same root is unaffected by it.
+        assert_eq!(
+            sg_node_for_tape_under(tmp.path(), "/nonexistent/tapectl-sg-derive/nst-fake-8"),
+            None
+        );
+    }
+
+    /// Not exactly one entry is not a proof, so it derives nothing.
+    #[test]
+    fn zero_or_two_sg_entries_derive_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fake_sysfs(tmp.path(), "nst1", &[]);
+        fake_sysfs(tmp.path(), "nst2", &["sg1", "sg2"]);
+        for node in ["nst1", "nst2"] {
+            assert_eq!(
+                sg_node_for_tape_under(tmp.path(), &format!("/nonexistent/x/{node}")),
+                None,
+                "{node}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_device_sg_is_derived() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fake_sysfs(tmp.path(), "nst-fake-7", &["sg13"]);
+        let mut b = backend_for("nst-fake-7", "");
+        assert!(fill_derived_sg_under(tmp.path(), &mut b));
+        assert_eq!(b.device_sg, "/dev/sg13");
+        // Nothing to fill the second time.
+        assert!(!fill_derived_sg_under(tmp.path(), &mut b));
+    }
+
+    /// The override stays: a configured node is never replaced by the
+    /// derivation, even when sysfs names another (that is #329's refusal to
+    /// make, at the gates, not the fill's to paper over).
+    #[test]
+    fn an_explicit_device_sg_wins_over_the_derivation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fake_sysfs(tmp.path(), "nst-fake-7", &["sg13"]);
+        let mut b = backend_for("nst-fake-7", "/dev/sg-explicit");
+        assert!(!fill_derived_sg_under(tmp.path(), &mut b));
+        assert_eq!(b.device_sg, "/dev/sg-explicit");
+        let bound = sg_node_for_tape_under(tmp.path(), &b.device_tape).unwrap();
+        assert!(
+            pairing_problem(&b.name, &b.device_tape, &bound, &b.device_sg).is_some(),
+            "the proven mismatch is still reported for the override"
+        );
+    }
+
+    /// Absent and not provable: it stays EMPTY (never a guess) and the gate
+    /// refuses it by name, with the way out.
+    #[test]
+    fn an_underivable_device_sg_stays_empty_and_is_refused_by_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut b = backend_for("nst-fake-7", "");
+        assert!(!fill_derived_sg_under(tmp.path(), &mut b));
+        assert_eq!(b.device_sg, "");
+
+        let problem = sg_pairing_problem(&b).expect("an empty device_sg is a problem");
+        assert!(problem.contains("backend \"lto0\""), "{problem}");
+        assert!(problem.contains("device_sg is not set"), "{problem}");
+        assert!(problem.contains(&b.device_tape), "{problem}");
+        assert!(problem.contains("Set device_sg"), "{problem}");
+        // The drive is not attached here, and the message says that.
+        assert!(problem.contains("is the drive attached"), "{problem}");
+    }
+
+    /// A configured node is not judged empty: unprovable pairing is still
+    /// `None` (nothing to compare against on a fake path).
+    #[test]
+    fn a_configured_device_sg_on_an_unprovable_node_is_no_problem() {
+        let b = backend_for("nst-fake-7", "/dev/sg5");
+        assert_eq!(sg_pairing_problem(&b), None);
     }
 
     #[test]
