@@ -26,6 +26,11 @@ const MTCOMP: i16 = 32; // MTCOMPRESSION
 /// the count is non-zero (`st.c`: `cmd[1] = (arg ? 1 : 0)`), which is what
 /// `mt erase` does: the whole medium, hours on real LTO.
 const MTERASE: i16 = 13;
+/// `MTOFFL` from <linux/mtio.h>: rewind and unload the cartridge (`mt
+/// offline`). st sends START STOP UNIT with the load bit clear; the command
+/// completes when the drive has put the cartridge out, so a full tape's
+/// rewind is part of the wait.
+const MTOFFL: i16 = 7;
 
 #[repr(C)]
 struct MtOp {
@@ -629,6 +634,54 @@ pub fn status_nonblocking(device: &str) -> io::Result<TapeNodeStatus> {
     })
 }
 
+/// Rewind and unload the cartridge in `device`: `MTOFFL`, the operation `mt
+/// offline` performs (`drive eject`, ADR-0012 2026-10-15 item 61).
+///
+/// STANDALONE, deliberately: not a [`TapeDevice`] method and not in
+/// [`crate::store::TapeOps`]. A `TapeDevice` sends `MTSETBLK` when it opens,
+/// and unloading a cartridge is not an operation a [`crate::store::Store`]
+/// has any business offering — a session that held one could unload the tape
+/// it is writing. The test `the_device_issues_mtoffl_in_one_place` pins the
+/// one call site.
+///
+/// The caller has already read the node's status ([`status_nonblocking`])
+/// and found a ready cartridge, so this open is the blocking one `mt` makes
+/// (the st driver's `check_tape` runs at open) and cannot wait out the
+/// no-medium timeout. A rewinding node (`stN`) is refused unopened, as
+/// [`status_nonblocking`] refuses it, for the same reason: this command
+/// names its drive by the non-rewinding node.
+///
+/// The unload is a named wait ([`crate::progress::waited`]): a full LTO
+/// cartridge rewinds for a minute or more before it comes out.
+pub fn offline(device: &str) -> io::Result<()> {
+    if node_rewinds_on_close(device) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{device} is a rewinding tape node (stN, not nstN); name the non-rewinding \
+                 node (/dev/nstN, or the by-id link ending -nst)"
+            ),
+        ));
+    }
+    let file = crate::progress::waited(
+        || format!("opening {device} to unload its cartridge"),
+        || OpenOptions::new().read(true).open(device),
+    )?;
+    let mtop = MtOp {
+        mt_op: MTOFFL,
+        _pad: 0,
+        mt_count: 0,
+    };
+    let rc = crate::progress::waited(
+        || format!("unloading the cartridge from {device} (rewind, then eject)"),
+        || unsafe { nix::libc::ioctl(file.as_raw_fd(), MTIOCTOP, &mtop as *const MtOp) },
+    );
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `SCSI_TAPE_MAJOR` (`<linux/major.h>`): the st driver's block of device
 /// numbers.
 const SCSI_TAPE_MAJOR: u64 = 9;
@@ -704,6 +757,50 @@ mod density_tests {
             3,
             "density_code and status_nonblocking, each on a descriptor of its own"
         );
+    }
+
+    /// ADR-0012 2026-10-15 item 61: unloading the cartridge is one standalone
+    /// function. The `MTOFFL` op is issued in exactly one place (`offline`),
+    /// no `TapeDevice` method or `TapeOps` impl offers it, and neither does
+    /// the `Store` seam: `src/store.rs` does not so much as name it. The
+    /// positive control is the same scan finding the one call it must.
+    #[test]
+    fn the_device_issues_mtoffl_in_one_place() {
+        let src = include_str!("ioctl.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            body.matches("mt_op: MTOFFL").count(),
+            1,
+            "MTOFFL is issued by `offline` alone"
+        );
+        let offline_at = body.find("pub fn offline(").expect("the one call site");
+        let call_at = body.find("mt_op: MTOFFL").unwrap();
+        assert!(
+            call_at > offline_at,
+            "the MTOFFL op is built inside `offline`, not in a TapeDevice method"
+        );
+        assert!(
+            !body.contains("mt_ioctl(MTOFFL"),
+            "TapeDevice must not offer an unload"
+        );
+        let store = include_str!("../store.rs");
+        let store_body = store.split("#[cfg(test)]").next().unwrap();
+        for word in ["MTOFFL", "ioctl::offline", "unload"] {
+            assert!(
+                !store_body.contains(word),
+                "the Store seam must not offer an unload ({word} found in src/store.rs)"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_of_a_nonexistent_node_is_its_errno_and_a_non_tape_is_refused_by_the_kernel() {
+        let err = offline("/nonexistent/tapectl-drive-eject-test/nst0").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // /dev/null opens, and the ioctl refuses it (ENOTTY): the function
+        // reports the kernel's answer, it does not pretend.
+        let err = offline("/dev/null").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(nix::libc::ENOTTY), "{err}");
     }
 
     #[test]
