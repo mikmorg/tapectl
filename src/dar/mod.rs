@@ -48,12 +48,21 @@ pub(crate) fn command(binary: impl AsRef<OsStr>) -> Command {
                 return Err(std::io::Error::last_os_error());
             }
             if nix::libc::getppid() != parent {
-                return Err(std::io::Error::other("tapectl exited before dar started"));
+                return Err(parent_gone());
             }
             Ok(())
         });
     }
     cmd
+}
+
+/// The error of a child whose parent died before it exec'd dar. Built in the
+/// forked child, so it allocates nothing: `io::Error::other(..)` boxes its
+/// message, and `malloc` after `fork` can deadlock on a lock another thread
+/// of the parent held at the fork (issue #465). Only the errno crosses to the
+/// parent anyway, and `ESRCH` ("No such process") is the closest word.
+fn parent_gone() -> std::io::Error {
+    std::io::Error::from_raw_os_error(nix::libc::ESRCH)
 }
 
 /// [`command`] for `dar -c`, with every `posix_fadvise` dar makes turned
@@ -75,6 +84,16 @@ pub(crate) fn command(binary: impl AsRef<OsStr>) -> Command {
 /// through every call it does not recognise), or when installing it fails
 /// in the child, dar runs as it did before, its advice taken. Only `dar -c`
 /// reads the source, so only it gets the filter.
+///
+/// **A side effect to know about** (issue #465): an unprivileged process may
+/// install a seccomp filter only under `PR_SET_NO_NEW_PRIVS`, and that bit
+/// is inherited across `exec` and cannot be cleared. Under it the kernel
+/// ignores set-user-ID, set-group-ID and **file capabilities** of whatever is
+/// exec'd — a `dar` given capabilities with `setcap` (for example
+/// `cap_dac_read_search` to read a source tree that is not the service user's
+/// own) runs without them, and fails to read what it was granted. Run as a
+/// user who can read the source, or as root. Where an LSM refuses the exec,
+/// `spawn_archive` runs dar without the filter.
 pub(crate) fn command_without_fadvise(binary: impl AsRef<OsStr>) -> Command {
     let mut cmd = command(binary);
     if fadvise_filter_available() {
@@ -113,6 +132,10 @@ pub(crate) fn fadvise_filter_available() -> bool {
 }
 
 /// The seccomp filter of [`command_without_fadvise`].
+///
+/// Installing it sets `PR_SET_NO_NEW_PRIVS` in the child first, which also
+/// drops the file capabilities of a `setcap` dar (see
+/// [`command_without_fadvise`]).
 mod no_fadvise {
     use std::process::Command;
 
@@ -543,6 +566,16 @@ mod tests {
             .any(|(k, v)| k == "LC_ALL" && v == Some(OsStr::new("C"))),
             "the create command goes through the same constructor"
         );
+    }
+
+    /// Issue #465 item 7: the child's "my parent is gone" error is a bare
+    /// errno. `io::Error::other("..")` heap-allocates, which a forked child
+    /// of a multithreaded parent must not do.
+    #[test]
+    fn the_parent_gone_error_is_a_bare_errno_with_no_allocation_behind_it() {
+        let e = parent_gone();
+        assert_eq!(e.raw_os_error(), Some(nix::libc::ESRCH));
+        assert!(e.get_ref().is_none(), "no boxed message: {e:?}");
     }
 
     /// Issue #404: a pending stop ends a running child promptly and is
