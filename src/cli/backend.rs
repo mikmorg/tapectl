@@ -197,7 +197,7 @@ fn add(
     let derived_sg = match device_sg {
         Some(_) => None,
         None => {
-            let node = crate::tape::drive_identity::sg_node_for_tape(device_tape);
+            let node = crate::tape::drive_identity::derive_sg_for(device_tape);
             if node.is_none() {
                 eprintln!(
                     "warning: no --device-sg given and none can be derived from --device-tape \

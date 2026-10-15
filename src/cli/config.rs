@@ -741,22 +741,34 @@ mod tests {
     /// node. Derivation is faked by a sysfs tree under a temp dir.
     #[test]
     fn config_check_names_the_backends_whose_device_sg_was_derived() {
-        let toml_str = "[[backends.lto]]\nname = \"derived\"\n\
-                        device_tape = \"/nonexistent/tapectl-check-sg/nst-fake-7\"\n\
-                        generation = \"LTO-6\"\n\n\
-                        [[backends.lto]]\nname = \"written\"\n\
-                        device_tape = \"/nonexistent/tapectl-check-sg/nst-fake-8\"\n\
-                        device_sg = \"/dev/sg-written\"\ngeneration = \"LTO-6\"\n\n\
-                        [[backends.lto]]\nname = \"underivable\"\n\
-                        device_tape = \"/nonexistent/tapectl-check-sg/nst-fake-9\"\n\
-                        generation = \"LTO-6\"\n";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dev = |node: &str| tmp.path().join(node).display().to_string();
+        // Tape nodes that exist (plain files stand in; nothing opens them),
+        // except the third, which is not attached.
+        for node in ["nst-fake-7", "nst-fake-8"] {
+            std::fs::File::create(tmp.path().join(node)).unwrap();
+        }
+        let toml_str = format!(
+            "[[backends.lto]]\nname = \"derived\"\ndevice_tape = \"{}\"\ngeneration = \"LTO-6\"\n\n\
+             [[backends.lto]]\nname = \"written\"\ndevice_tape = \"{}\"\n\
+             device_sg = \"/dev/sg-written\"\ngeneration = \"LTO-6\"\n\n\
+             [[backends.lto]]\nname = \"underivable\"\ndevice_tape = \"{}\"\ngeneration = \"LTO-6\"\n",
+            dev("nst-fake-7"),
+            dev("nst-fake-8"),
+            dev("nst-fake-9"),
+        );
+        let toml_str = toml_str.as_str();
         let mut cfg: crate::config::Config = toml::from_str(toml_str).unwrap();
-        let sysfs = tempfile::TempDir::new().unwrap();
-        for (node, sg) in [("nst-fake-7", "sg13"), ("nst-fake-8", "sg14")] {
-            let dir = sysfs.path().join(node).join("device").join("scsi_generic");
+        let sysfs = tmp.path().join("sys");
+        for (node, sg) in [
+            ("nst-fake-7", "sg13"),
+            ("nst-fake-8", "sg14"),
+            ("nst-fake-9", "sg15"),
+        ] {
+            let dir = sysfs.join(node).join("device").join("scsi_generic");
             std::fs::create_dir_all(dir.join(sg)).unwrap();
         }
-        cfg.fill_derived_sg_nodes_under(sysfs.path());
+        cfg.fill_derived_sg_nodes_under(&sysfs);
 
         assert_eq!(
             derived_sg_nodes(toml_str, &cfg),

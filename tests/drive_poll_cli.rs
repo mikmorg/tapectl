@@ -127,6 +127,9 @@ fn a_held_drive_is_skipped_with_75_and_a_free_one_is_polled() {
 /// guessed. The poll reads and records nothing.
 #[test]
 fn a_poll_of_a_drive_with_no_derivable_sg_node_refuses_by_name() {
+    // A basename no host's /sys has: a derivation must not borrow a real
+    // drive's sg node for a tape node that does not exist.
+    const NO_SG_TAPE: &str = "/nonexistent/tapectl-drive-poll-test/nst-fake-431";
     let home = TempDir::new().unwrap();
     ok(&run(home.path(), &["init"]), "init");
     ok(
@@ -138,7 +141,7 @@ fn a_poll_of_a_drive_with_no_derivable_sg_node_refuses_by_name() {
                 "--name",
                 "lto0",
                 "--device-tape",
-                TAPE,
+                NO_SG_TAPE,
                 "--generation",
                 "LTO-6",
             ],

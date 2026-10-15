@@ -3166,19 +3166,26 @@ mod tests {
     }
 
     /// A config without `device_sg` is valid — it is the supported way to say
-    /// "derive it" — and the derivation fills it under a (fake) sysfs.
+    /// "derive it" — and the derivation fills it under a (fake) sysfs, for a
+    /// tape node that exists.
     #[test]
     fn a_backend_without_device_sg_loads_and_is_derived() {
         let text = backend_toml(None);
         let mut config = Config::from_text(&text, Path::new("config.toml"))
             .expect("a backend with no device_sg must load");
-        // Nothing in the real /sys names this fake path: it stays empty, and
-        // loading did not fail over it.
+        // The configured node does not exist: nothing is derived (and, with
+        // its basename in no real /sys, nothing real could be), and loading
+        // did not fail over it.
         assert_eq!(config.backends.lto[0].device_sg, "");
 
-        let sysfs = TempDir::new().unwrap();
-        fake_sysfs_with(sysfs.path(), "nst-fake-7", "sg13");
-        let filled = config.fill_derived_sg_nodes_under(sysfs.path());
+        let tmp = TempDir::new().unwrap();
+        let sysfs = tmp.path().join("sys");
+        fake_sysfs_with(&sysfs, "nst-fake-7", "sg13");
+        // Positive control: the same fake tree answers once the node exists.
+        let node = tmp.path().join("nst-fake-7");
+        std::fs::File::create(&node).unwrap();
+        config.backends.lto[0].device_tape = node.display().to_string();
+        let filled = config.fill_derived_sg_nodes_under(&sysfs);
         assert_eq!(filled, vec!["lto1".to_string()]);
         assert_eq!(config.backends.lto[0].device_sg, "/dev/sg13");
     }
@@ -3188,9 +3195,15 @@ mod tests {
     fn a_written_device_sg_is_kept_over_the_derivation() {
         let text = backend_toml(Some("/dev/sg-written"));
         let mut config = Config::from_text(&text, Path::new("config.toml")).unwrap();
-        let sysfs = TempDir::new().unwrap();
-        fake_sysfs_with(sysfs.path(), "nst-fake-7", "sg13");
-        assert!(config.fill_derived_sg_nodes_under(sysfs.path()).is_empty());
+        let tmp = TempDir::new().unwrap();
+        let sysfs = tmp.path().join("sys");
+        fake_sysfs_with(&sysfs, "nst-fake-7", "sg13");
+        // The tape node exists and sysfs names another sg node: the written
+        // one still wins (the gates, not the fill, judge a mismatch).
+        let node = tmp.path().join("nst-fake-7");
+        std::fs::File::create(&node).unwrap();
+        config.backends.lto[0].device_tape = node.display().to_string();
+        assert!(config.fill_derived_sg_nodes_under(&sysfs).is_empty());
         assert_eq!(config.backends.lto[0].device_sg, "/dev/sg-written");
     }
 

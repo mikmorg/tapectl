@@ -338,6 +338,26 @@ pub(crate) fn sg_node_for_tape_under(root: &Path, device_tape: &str) -> Option<P
     Some(Path::new("/dev").join(names.remove(0)))
 }
 
+/// Issue #431: the sg node to DERIVE for a configured `device_tape` — the
+/// kernel's binding ([`sg_node_for_tape`]), but only for a tape node that
+/// exists. [`sysfs_node_name`] falls back to the path's own basename when it
+/// cannot canonicalize, which is harmless for #329's check (it can only
+/// refuse) and wrong for a derivation, which SELECTS a device: a dangling or
+/// misspelled `.../nst3` would otherwise pick up the real drive `nst3`'s
+/// sg node. A node that does not exist has no sysfs entry of its own, so a
+/// detached drive derives nothing and is refused by name where it is needed.
+pub fn derive_sg_for(device_tape: &str) -> Option<PathBuf> {
+    derive_sg_for_under(Path::new(SCSI_TAPE_SYSFS_ROOT), device_tape)
+}
+
+/// [`derive_sg_for`] under an injectable sysfs `root`.
+pub(crate) fn derive_sg_for_under(root: &Path, device_tape: &str) -> Option<PathBuf> {
+    if !Path::new(device_tape).exists() {
+        return None;
+    }
+    sg_node_for_tape_under(root, device_tape)
+}
+
 /// Issue #431: give a backend that does not declare `device_sg` the node the
 /// kernel binds to its `device_tape` — one device path per drive, so a
 /// `/dev/sgN` renumbering (a USB stick did it to home2's once) stops mattering.
@@ -345,8 +365,8 @@ pub(crate) fn sg_node_for_tape_under(root: &Path, device_tape: &str) -> Option<P
 /// Fills ONLY an empty `device_sg` (the state `#[serde(default)]` leaves when
 /// the key is absent); a configured one is never touched, so an explicit
 /// override still wins and [`sg_pairing_problem`] still judges it. Returns
-/// whether it filled one. When the binding cannot be proven the field stays
-/// empty — a state every reader refuses by name through
+/// whether it filled one ([`derive_sg_for`] decides what can be derived). When
+/// the binding cannot be proven the field stays empty — a state every reader refuses by name through
 /// [`sg_pairing_problem`], never one it uses.
 pub fn fill_derived_sg(backend: &mut LtoBackendConfig) -> bool {
     fill_derived_sg_under(Path::new(SCSI_TAPE_SYSFS_ROOT), backend)
@@ -357,7 +377,7 @@ pub(crate) fn fill_derived_sg_under(root: &Path, backend: &mut LtoBackendConfig)
     if !backend.device_sg.is_empty() {
         return false;
     }
-    match sg_node_for_tape_under(root, &backend.device_tape) {
+    match derive_sg_for_under(root, &backend.device_tape) {
         Some(node) => {
             backend.device_sg = node.display().to_string();
             true
@@ -891,12 +911,37 @@ mod tests {
     #[test]
     fn an_absent_device_sg_is_derived() {
         let tmp = tempfile::TempDir::new().unwrap();
-        fake_sysfs(tmp.path(), "nst-fake-7", &["sg13"]);
+        let sys = tmp.path().join("sys");
+        fake_sysfs(&sys, "nst-fake-7", &["sg13"]);
+        // The tape node exists (a plain file stands in for it; nothing opens it).
+        let node = tmp.path().join("nst-fake-7");
+        std::fs::File::create(&node).unwrap();
         let mut b = backend_for("nst-fake-7", "");
-        assert!(fill_derived_sg_under(tmp.path(), &mut b));
+        b.device_tape = node.display().to_string();
+        assert!(fill_derived_sg_under(&sys, &mut b));
         assert_eq!(b.device_sg, "/dev/sg13");
         // Nothing to fill the second time.
+        assert!(!fill_derived_sg_under(&sys, &mut b));
+    }
+
+    /// A derivation SELECTS a device, so it needs a tape node that exists. A
+    /// path that does not — a detached drive's dangling by-id link, a typo —
+    /// must not borrow the sysfs entry of whatever real drive shares its
+    /// basename (`canonicalize` failing falls back to the basename, which
+    /// is fine for #329's refuse-only check and wrong here).
+    #[test]
+    fn a_tape_node_that_does_not_exist_derives_nothing_even_on_a_basename_match() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        fake_sysfs(tmp.path(), "nst-fake-7", &["sg13"]);
+        let mut b = backend_for("nst-fake-7", "");
+        assert_eq!(
+            sg_node_for_tape_under(tmp.path(), &b.device_tape),
+            Some(PathBuf::from("/dev/sg13")),
+            "positive control: the basename fallback does match the fake tree"
+        );
         assert!(!fill_derived_sg_under(tmp.path(), &mut b));
+        assert_eq!(b.device_sg, "");
+        assert_eq!(derive_sg_for_under(tmp.path(), &b.device_tape), None);
     }
 
     /// The override stays: a configured node is never replaced by the
