@@ -130,6 +130,16 @@ if [ "$ENSURE_MEDIA" = "1" ]; then
             || die "cannot unload wrong-generation tape"
         LOADED_TAG=""
     fi
+    # A cartridge the drive itself ejected (`tapectl drive eject`, `mt offline`)
+    # still sits in the drive as far as the changer is concerned, so the changer
+    # says Full while the drive says DR_OPEN (no medium). Put it back in its slot
+    # and load it again, or every caller meets "no cartridge loaded".
+    if [ -n "$LOADED_TAG" ] && mt -f "$TAPE_DEV" status 2>/dev/null | grep DR_OPEN >/dev/null; then
+        ORIGIN="$(echo "$STATUS" | sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p")"
+        [ -n "$ORIGIN" ] || die "the drive ejected $LOADED_TAG and the changer does not name its slot"
+        mtx -f "$CHG_SG" unload "$ORIGIN" "$DTE" >&2 || die "cannot unload the ejected $LOADED_TAG"
+        mtx -f "$CHG_SG" load "$ORIGIN" "$DTE" >&2 || die "mtx load $ORIGIN $DTE failed"
+    fi
     if [ -z "$LOADED_TAG" ]; then
         SLOT="$(echo "$STATUS" | grep -E "Storage Element [0-9]+:Full" \
                 | grep "VolumeTag=[EF][0-9]*$GEN" | head -1 \
