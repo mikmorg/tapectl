@@ -18,7 +18,32 @@
 //!
 //! ## Precedence
 //!
-//! `--home` > `TAPECTL_HOME` > `--config`'s parent directory > `$HOME/.tapectl`.
+//! `--home` > `TAPECTL_HOME` > `--config`'s parent directory > an existing
+//! `$HOME/.tapectl` > the system home pointer (below) > `$HOME/.tapectl`
+//! as the place a new home will be made.
+//!
+//! The **system home pointer** (issue #437, ADR-0012 2026-10-15 item 62) is
+//! `/etc/tapectl/home`: one absolute path, the service user's tapectl home,
+//! written by `scripts/install-systemd.sh` and first-run step 7. It is what
+//! lets an `[ops] group` member run a plain `tapectl status` — their `$HOME`
+//! is their own, not the service user's. It is consulted only when nothing
+//! above it names a home AND this account has no `~/.tapectl` of its own, so
+//! every invocation that resolved before it existed (the mhvtl gate's
+//! `--config` isolation, a test's `HOME=<tmp>`, the service user itself)
+//! resolves exactly as it did. Three rules keep it from changing which
+//! archive is written:
+//!
+//! - **Never as root** (euid 0): root acting on the service home would leave
+//!   root-owned files in it. The pointer is not even read.
+//! - **A pointer that is present but wrong is an error naming the file** — a
+//!   relative path, an empty file, a target that is missing or not a
+//!   directory, a file that cannot be read. Falling through to
+//!   `$HOME/.tapectl` would create a fresh archive somewhere nobody chose.
+//!   A pointer file that is simply absent (`ENOENT`) is "no pointer".
+//! - **The location is a parameter.** `TAPECTL_HOME_POINTER` overrides
+//!   `/etc/tapectl/home`; it is read once, in [`resolve`], like every other
+//!   environment input, so no test touches `/etc` or sets a variable. Point
+//!   it at a path that does not exist to switch the pointer off.
 //!
 //! `--config` on its own relocating the entire home is deliberate and
 //! load-bearing (issue #109): it is how every test harness — and
@@ -53,10 +78,37 @@ pub struct Startup {
 
     /// `Some(home)` when `--config` alone derived the home — the subject of
     /// [`ambiguous_config_notice`]. `None` whenever the home was named
-    /// explicitly (`--home`/`TAPECTL_HOME`) or defaulted, because neither
+    /// explicitly (`--home`/`TAPECTL_HOME`), came from the system home
+    /// pointer, or defaulted, because none of those
     /// is surprising and a notice on the invocation that got it right is
     /// just noise.
     pub ambiguous_config_home: Option<PathBuf>,
+}
+
+/// Where the system-wide home pointer lives unless `TAPECTL_HOME_POINTER`
+/// says otherwise (issue #437).
+pub const DEFAULT_HOME_POINTER: &str = "/etc/tapectl/home";
+
+/// The inputs the system home pointer needs beyond the environment: where it
+/// is, and who is asking. Passed in so the rule is a function of its
+/// arguments — a test names a temp file and any euid it likes, with no root
+/// and no `/etc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomePointer {
+    /// The pointer file: [`DEFAULT_HOME_POINTER`], or `TAPECTL_HOME_POINTER`.
+    pub path: PathBuf,
+    /// The effective uid of this process. 0 switches the pointer off.
+    pub euid: u32,
+}
+
+/// The pointer file's location from `TAPECTL_HOME_POINTER`: unset or empty
+/// is the default, anything else is the path (an empty value is a variable
+/// a wrapper forgot to expand, as with `TAPECTL_HOME`).
+fn pointer_path_from_env(value: Option<&OsStr>) -> PathBuf {
+    match value {
+        Some(raw) if !raw.is_empty() => PathBuf::from(raw),
+        _ => PathBuf::from(DEFAULT_HOME_POINTER),
+    }
 }
 
 /// Resolve against the real process environment. The only impure function
@@ -64,27 +116,37 @@ pub struct Startup {
 pub fn resolve(home_flag: Option<&str>, config_flag: Option<&str>) -> Result<Startup> {
     let tapectl_home = std::env::var_os("TAPECTL_HOME");
     let home_env = std::env::var_os("HOME");
+    let pointer = HomePointer {
+        path: pointer_path_from_env(std::env::var_os("TAPECTL_HOME_POINTER").as_deref()),
+        euid: nix::unistd::geteuid().as_raw(),
+    };
     resolve_from(
         home_flag,
         config_flag,
         tapectl_home.as_deref(),
         home_env.as_deref(),
+        Some(&pointer),
     )
 }
 
-/// The resolution itself — a pure function of exactly four inputs, which is
-/// what lets the input table be a unit test rather than a subprocess.
+/// The resolution itself — a function of exactly five inputs, which is what
+/// lets the input table be a unit test rather than a subprocess.
 ///
 /// `tapectl_home_env` and `home_env` are `OsStr`, not `str`, on purpose:
 /// the difference between "unset", "set to the empty string" and "set to
 /// something that is not UTF-8" is precisely where two of issue #228's
 /// defects lived, and `std::env::var(..).ok()` collapses all three into
 /// `None`-or-`Some`.
+///
+/// `pointer` is the system home pointer (issue #437); `None` switches it off
+/// outright. When it is `Some`, the only filesystem reads are the ones its
+/// rule needs, and only when nothing ranked above it has named a home.
 pub fn resolve_from(
     home_flag: Option<&str>,
     config_flag: Option<&str>,
     tapectl_home_env: Option<&OsStr>,
     home_env: Option<&OsStr>,
+    pointer: Option<&HomePointer>,
 ) -> Result<Startup> {
     // --home wins outright, and is checked BEFORE the environment: an
     // explicit flag must not be blocked by a broken `TAPECTL_HOME` it
@@ -116,10 +178,89 @@ pub fn resolve_from(
         });
     }
 
+    // Nothing named a home. An account that already has a `~/.tapectl` keeps
+    // it (the service user, a developer, every harness that sets HOME); only
+    // an account with none of its own is sent to the system pointer.
+    if let Some(pointer) = pointer.filter(|p| p.euid != 0) {
+        let own_home_exists = config::default_home_from(home_env).is_some_and(|d| exists(&d));
+        if !own_home_exists {
+            if let Some(home) = read_home_pointer(&pointer.path)? {
+                return Ok(Startup {
+                    paths: TapectlPaths::new(home),
+                    ambiguous_config_home: None,
+                });
+            }
+        }
+    }
+
     Ok(Startup {
         paths: TapectlPaths::new(default_home(home_env)?),
         ambiguous_config_home: None,
     })
+}
+
+/// Whether something is at `path`. Only a definite "not there" is false: a
+/// dangling symlink, or a path this account cannot stat, still counts as
+/// present, so the pointer can never redirect an account that has a
+/// `~/.tapectl` it merely cannot read — that account keeps today's error.
+fn exists(path: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// The home the system pointer names: `Ok(None)` when there is no pointer
+/// file, `Ok(Some(dir))` for a usable one, and an error naming the file for
+/// any pointer that is present but wrong (issue #437).
+///
+/// Strict on purpose. The caller has found no home anywhere else, so the
+/// alternative to an error is `$HOME/.tapectl`, which a read-only command
+/// would not create but `init` or `unit init` would — a second, unintended
+/// archive. Only an absent file (`ENOENT`) is "no pointer".
+fn read_home_pointer(file: &Path) -> Result<Option<PathBuf>> {
+    let bad = |why: String| {
+        TapectlError::Config(format!(
+            "the tapectl home pointer {} {why}. It names the tapectl home an account without \
+             a ~/.tapectl uses; fix or remove it, or name the home with --home <dir> \
+             (or TAPECTL_HOME).",
+            file.display()
+        ))
+    };
+    let bytes = match std::fs::read(file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(bad(format!("cannot be read ({e})"))),
+    };
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| bad("is not valid UTF-8".to_string()))?
+        .trim();
+    if text.is_empty() {
+        return Err(bad("is empty; it must hold one absolute path".to_string()));
+    }
+    if text.contains('\n') {
+        return Err(bad("holds more than one line; it must hold one absolute path".to_string()));
+    }
+    let home = PathBuf::from(text);
+    if !home.is_absolute() {
+        return Err(bad(format!(
+            "names '{text}', which is not an absolute path (a relative path would mean a \
+             different home for every directory the command is run from)"
+        )));
+    }
+    match std::fs::metadata(&home) {
+        Ok(meta) if meta.is_dir() => Ok(Some(home)),
+        Ok(_) => Err(bad(format!("names {}, which is not a directory", home.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(bad(format!(
+            "names {}, which does not exist",
+            home.display()
+        ))),
+        Err(e) => Err(bad(format!(
+            "names {}, which this account cannot reach ({e}); an `[ops] group` member can, \
+             anyone else is not meant to",
+            home.display()
+        ))),
+    }
 }
 
 /// The home `--config <path>` implies: the config file's directory.
@@ -342,7 +483,7 @@ mod tests {
     #[test]
     fn neither_flag_defaults_under_home() {
         let home = os("/home/op");
-        let r = resolve_from(None, None, None, Some(&home)).expect("should resolve");
+        let r = resolve_from(None, None, None, Some(&home), None).expect("should resolve");
         assert_eq!(r.paths.home, PathBuf::from("/home/op/.tapectl"));
         assert_eq!(
             r.paths.config_file,
@@ -359,7 +500,7 @@ mod tests {
     #[test]
     fn home_flag_alone_selects_the_archive() {
         let home = os("/home/op");
-        let r = resolve_from(Some("/mnt/archive"), None, None, Some(&home)).expect("resolve");
+        let r = resolve_from(Some("/mnt/archive"), None, None, Some(&home), None).expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
         assert_eq!(
             r.paths.config_file,
@@ -373,7 +514,7 @@ mod tests {
     #[test]
     fn config_flag_alone_relocates_the_home_and_reports_it() {
         let home = os("/home/op");
-        let r = resolve_from(None, Some("/mnt/archive/config.toml"), None, Some(&home))
+        let r = resolve_from(None, Some("/mnt/archive/config.toml"), None, Some(&home), None)
             .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
         assert_eq!(r.paths.db_file, PathBuf::from("/mnt/archive/tapectl.db"));
@@ -389,7 +530,7 @@ mod tests {
     #[test]
     fn config_flag_outside_any_home_still_derives_from_its_parent() {
         let home = os("/home/op");
-        let r = resolve_from(None, Some("/etc/somewhere/config.toml"), None, Some(&home))
+        let r = resolve_from(None, Some("/etc/somewhere/config.toml"), None, Some(&home), None)
             .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/etc/somewhere"));
         assert_eq!(
@@ -408,6 +549,7 @@ mod tests {
             Some("/mnt/archive/config.toml"),
             None,
             Some(&home),
+            None,
         )
         .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
@@ -428,6 +570,7 @@ mod tests {
             Some("/etc/elsewhere/other.toml"),
             None,
             Some(&home),
+            None,
         )
         .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
@@ -446,7 +589,7 @@ mod tests {
     fn relative_config_derives_its_directory() {
         let home = os("/home/op");
         let r =
-            resolve_from(None, Some("sub/dir/config.toml"), None, Some(&home)).expect("resolve");
+            resolve_from(None, Some("sub/dir/config.toml"), None, Some(&home), None).expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("sub/dir"));
         assert_eq!(r.ambiguous_config_home, Some(PathBuf::from("sub/dir")));
     }
@@ -459,7 +602,7 @@ mod tests {
     #[test]
     fn bare_relative_config_yields_dot_not_an_empty_home() {
         let home = os("/home/op");
-        let r = resolve_from(None, Some("config.toml"), None, Some(&home)).expect("resolve");
+        let r = resolve_from(None, Some("config.toml"), None, Some(&home), None).expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("."));
         assert_eq!(r.ambiguous_config_home, Some(PathBuf::from(".")));
         assert!(
@@ -477,7 +620,7 @@ mod tests {
     #[test]
     fn config_at_the_filesystem_root_falls_back_to_dot() {
         let home = os("/home/op");
-        let r = resolve_from(None, Some("/"), None, Some(&home)).expect("resolve");
+        let r = resolve_from(None, Some("/"), None, Some(&home), None).expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("."));
         assert_eq!(r.ambiguous_config_home, Some(PathBuf::from(".")));
     }
@@ -491,7 +634,7 @@ mod tests {
     #[test]
     fn config_alone_discards_a_non_default_basename_pre_existing() {
         let home = os("/home/op");
-        let r = resolve_from(None, Some("/mnt/archive/other.toml"), None, Some(&home))
+        let r = resolve_from(None, Some("/mnt/archive/other.toml"), None, Some(&home), None)
             .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
         assert_eq!(
@@ -506,7 +649,7 @@ mod tests {
     #[test]
     fn empty_config_flag_is_refused() {
         let home = os("/home/op");
-        let err = resolve_from(None, Some(""), None, Some(&home)).expect_err("must refuse");
+        let err = resolve_from(None, Some(""), None, Some(&home), None).expect_err("must refuse");
         assert!(err.to_string().contains("--config"), "{err}");
     }
 
@@ -515,7 +658,7 @@ mod tests {
     #[test]
     fn empty_home_flag_is_refused() {
         let home = os("/home/op");
-        let err = resolve_from(Some(""), None, None, Some(&home)).expect_err("must refuse");
+        let err = resolve_from(Some(""), None, None, Some(&home), None).expect_err("must refuse");
         assert!(err.to_string().contains("--home"), "{err}");
     }
 
@@ -530,6 +673,7 @@ mod tests {
             Some("/mnt/archive/config.toml"),
             None,
             Some(&home),
+            None,
         )
         .expect_err("must refuse");
         assert!(err.to_string().contains("--home"), "{err}");
@@ -540,7 +684,7 @@ mod tests {
     fn tapectl_home_env_selects_the_archive() {
         let home = os("/home/op");
         let env = os("/mnt/archive");
-        let r = resolve_from(None, None, Some(&env), Some(&home)).expect("resolve");
+        let r = resolve_from(None, None, Some(&env), Some(&home), None).expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
         assert!(r.ambiguous_config_home.is_none());
     }
@@ -551,7 +695,7 @@ mod tests {
         let home = os("/home/op");
         let env = os("/mnt/from-env");
         let r =
-            resolve_from(Some("/mnt/from-flag"), None, Some(&env), Some(&home)).expect("resolve");
+            resolve_from(Some("/mnt/from-flag"), None, Some(&env), Some(&home), None).expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/from-flag"));
     }
 
@@ -562,7 +706,7 @@ mod tests {
     fn empty_tapectl_home_env_is_treated_as_unset() {
         let home = os("/home/op");
         let env = os("");
-        let r = resolve_from(None, None, Some(&env), Some(&home)).expect("resolve");
+        let r = resolve_from(None, None, Some(&env), Some(&home), None).expect("resolve");
         assert_eq!(
             r.paths.home,
             PathBuf::from("/home/op/.tapectl"),
@@ -582,6 +726,7 @@ mod tests {
             Some("/mnt/archive/config.toml"),
             Some(&env),
             Some(&home),
+            None,
         )
         .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
@@ -595,7 +740,7 @@ mod tests {
     fn non_utf8_tapectl_home_env_is_refused() {
         let home = os("/home/op");
         let bad = OsString::from(OsStr::from_bytes(b"/mnt/archive-\xff"));
-        let err = resolve_from(None, None, Some(&bad), Some(&home)).expect_err("must refuse");
+        let err = resolve_from(None, None, Some(&bad), Some(&home), None).expect_err("must refuse");
         assert!(
             err.to_string().contains("TAPECTL_HOME"),
             "the refusal must name the variable: {err}"
@@ -609,7 +754,7 @@ mod tests {
     fn non_utf8_tapectl_home_env_does_not_block_an_explicit_home_flag() {
         let home = os("/home/op");
         let bad = OsString::from(OsStr::from_bytes(b"/mnt/archive-\xff"));
-        let r = resolve_from(Some("/mnt/archive"), None, Some(&bad), Some(&home)).expect("resolve");
+        let r = resolve_from(Some("/mnt/archive"), None, Some(&bad), Some(&home), None).expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
     }
 
@@ -617,7 +762,7 @@ mod tests {
     /// mean `/root/.tapectl` — an archive nobody chose.
     #[test]
     fn unset_home_env_is_refused_rather_than_guessed() {
-        let err = resolve_from(None, None, None, None).expect_err("must refuse");
+        let err = resolve_from(None, None, None, None, None).expect_err("must refuse");
         let msg = err.to_string();
         assert!(msg.contains("HOME"), "{msg}");
         assert!(
@@ -630,7 +775,7 @@ mod tests {
     #[test]
     fn empty_home_env_is_refused_rather_than_guessed() {
         let empty = os("");
-        let err = resolve_from(None, None, None, Some(&empty)).expect_err("must refuse");
+        let err = resolve_from(None, None, None, Some(&empty), None).expect_err("must refuse");
         assert!(err.to_string().contains("HOME"), "{err}");
     }
 
@@ -640,15 +785,15 @@ mod tests {
     /// every one of them must keep working.
     #[test]
     fn unset_home_env_is_harmless_when_the_home_comes_from_elsewhere() {
-        let from_flag = resolve_from(Some("/mnt/archive"), None, None, None).expect("--home");
+        let from_flag = resolve_from(Some("/mnt/archive"), None, None, None, None).expect("--home");
         assert_eq!(from_flag.paths.home, PathBuf::from("/mnt/archive"));
 
         let env = os("/mnt/archive");
-        let from_env = resolve_from(None, None, Some(&env), None).expect("TAPECTL_HOME");
+        let from_env = resolve_from(None, None, Some(&env), None, None).expect("TAPECTL_HOME");
         assert_eq!(from_env.paths.home, PathBuf::from("/mnt/archive"));
 
         let from_config =
-            resolve_from(None, Some("/mnt/archive/config.toml"), None, None).expect("--config");
+            resolve_from(None, Some("/mnt/archive/config.toml"), None, None, None).expect("--config");
         assert_eq!(from_config.paths.home, PathBuf::from("/mnt/archive"));
     }
 
@@ -659,7 +804,7 @@ mod tests {
     #[test]
     fn non_utf8_home_env_is_used_as_given() {
         let weird = OsString::from(OsStr::from_bytes(b"/home/op-\xff"));
-        let r = resolve_from(None, None, None, Some(&weird)).expect("resolve");
+        let r = resolve_from(None, None, None, Some(&weird), None).expect("resolve");
         assert_eq!(
             r.paths.home,
             PathBuf::from(OsStr::from_bytes(b"/home/op-\xff/.tapectl"))
@@ -805,7 +950,7 @@ mod tests {
         for (home_flag, config_flag, tapectl_home, home_env, expected_home, expected_ambiguous) in
             rows
         {
-            let r = resolve_from(*home_flag, *config_flag, *tapectl_home, *home_env)
+            let r = resolve_from(*home_flag, *config_flag, *tapectl_home, *home_env, None)
                 .unwrap_or_else(|e| {
                     panic!("row {home_flag:?}/{config_flag:?} should resolve: {e}")
                 });
