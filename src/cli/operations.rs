@@ -2542,13 +2542,6 @@ pub fn unit_mark_tape_only(
     // number for a unit that may carry several.
     let thinnest_version = thinnest_current_version(conn, unit.id)?;
 
-    // Reuses `fingerprint::classify` — the same scan backing `unit status
-    // --dirty` and `report dirty` — so these can never disagree about
-    // whether a unit is dirty. Passing `config.defaults.global_excludes`
-    // keeps this in lockstep with the other two callers (issue #49).
-    let pending =
-        crate::collection::fingerprint::classify(conn, &unit, &config.defaults.global_excludes)?;
-
     // TIER 3 (ADR-0008): zero coverage is ABSOLUTE. Checked BEFORE the
     // consent gate, and deliberately outside it.
     //
@@ -2565,10 +2558,15 @@ pub fn unit_mark_tape_only(
     // never-archived unit only INCIDENTALLY (zero completed writes fails
     // `copy_count < min_copies`), and the resolved `min_copies` is
     // operator-configurable — at 0 that comparison passes vacuously.
-    if matches!(
-        pending.as_ref().map(|p| &p.reason),
-        Some(crate::collection::fingerprint::PendingReason::New)
-    ) {
+    //
+    // Issue #462: "never archived" is a fact about the CATALOG — the unit has
+    // no snapshot row — and is decided from it, not from the directory walk
+    // below. `fingerprint::classify` returns `Ok(None)` for a unit with no
+    // `current_path` or whose directory is not there (vanished, or on an
+    // unmounted filesystem), so reading `PendingReason::New` off it skipped
+    // this refusal for exactly the unit that would then read as tape-only
+    // with no tape copy once the disk came back.
+    if crate::unit::content_match::latest_snapshot(conn, unit.id)?.is_none() {
         return Err(TapectlError::Other(
             "unit has never been archived: no snapshot exists, so there is no tape copy — \
              marking it tape-only would greenlight deleting the only copy. This cannot be \
@@ -2576,6 +2574,16 @@ pub fn unit_mark_tape_only(
                 .to_string(),
         ));
     }
+
+    // Reuses `fingerprint::classify` — the same scan backing `unit status
+    // --dirty` and `report dirty` — so these can never disagree about
+    // whether a unit is dirty. Passing `config.defaults.global_excludes`
+    // keeps this in lockstep with the other two callers (issue #49). Run
+    // only now: a unit with no snapshot has been refused above, so the scan
+    // here is for DIRTY (a snapshot exists and the directory has moved on),
+    // and a unit that has a snapshot is never `New`.
+    let pending =
+        crate::collection::fingerprint::classify(conn, &unit, &config.defaults.global_excludes)?;
 
     // ADR-0004 Tier 1: evidence age for the coverage this unit is about to
     // rely on. Display-only: never gates, never changes the tier logic,
@@ -2600,8 +2608,8 @@ pub fn unit_mark_tape_only(
     // == 0` right here — the SAME zero the Tier-3 guard above would use
     // if it applied. It does not apply. Tier 3 is reserved for
     // INCOHERENCE: a never-archived unit, where no tape ever held the
-    // data at all (caught above via `PendingReason::New`, independent of
-    // this count). A unit whose only copy sits on a quarantined volume is
+    // data at all (caught above from the catalog — no snapshot row —
+    // independent of this count). A unit whose only copy sits on a quarantined volume is
     // DEGRADED, not incoherent — the cartridge still physically exists,
     // and quarantine means "claims unreliable until reconciled at
     // contact," not "gone." So this stays Tier 2 and remains
@@ -4978,6 +4986,88 @@ mod tests {
         );
     }
 
+    /// Issue #462: the Tier-3 never-archived refusal is decided from the
+    /// CATALOG (the unit has no snapshot at all), not from the source
+    /// directory. `fingerprint::classify` returns `Ok(None)` for a unit whose
+    /// directory is not there (vanished, or on an unmounted filesystem) and
+    /// for one with no `current_path`, so the old guard — which read
+    /// `PendingReason::New` off that scan — was skipped for exactly the unit
+    /// whose data is least likely to exist anywhere else. Both kinds are
+    /// refused with `--force` too (`force` is the caller's OR of `--force`
+    /// and `--yes`), under the same Tier-3 text, and a zero `min_copies`
+    /// cannot buy past it.
+    mod issue462_never_archived_without_a_source_directory {
+        use super::*;
+
+        fn assert_refused_at_tier3(conn: &Connection, force: bool) {
+            let err = unit_mark_tape_only(
+                conn,
+                &config_with_zero_tape_only_thresholds(),
+                "unit1",
+                force,
+                false,
+            )
+            .expect_err("a never-archived unit must be refused whatever its directory");
+            let msg = err.to_string();
+            assert!(msg.contains("never been archived"), "{msg}");
+            assert!(msg.contains("cannot be overridden"), "{msg}");
+            assert!(msg.contains("ADR-0008 Tier 3"), "{msg}");
+            assert!(msg.contains("snapshot create"), "{msg}");
+            assert_eq!(
+                unit_status(conn),
+                "active",
+                "a refused mark-tape-only must not have changed unit status"
+            );
+        }
+
+        #[test]
+        fn a_vanished_source_directory_does_not_skip_the_refusal() {
+            let tmp = TempDir::new().unwrap();
+            let gone = tmp.path().join("unmounted-disk");
+            assert!(!gone.exists());
+            let conn = setup_unit_for_tape_only(gone.to_str().unwrap());
+            assert_refused_at_tier3(&conn, false);
+            assert_refused_at_tier3(&conn, true);
+        }
+
+        #[test]
+        fn a_unit_with_no_current_path_does_not_skip_the_refusal() {
+            let conn = setup_unit_for_tape_only("/placeholder");
+            conn.execute("UPDATE units SET current_path = NULL", [])
+                .unwrap();
+            assert_refused_at_tier3(&conn, false);
+            assert_refused_at_tier3(&conn, true);
+        }
+
+        /// The recorded decision stays: a unit that HAS been archived, whose
+        /// copies all became ineligible, is degraded and not incoherent —
+        /// Tier 2, confirmable, even with its directory gone. The positive
+        /// control for the guard above: it must not fire on a snapshot.
+        #[test]
+        fn an_archived_unit_whose_directory_is_gone_stays_tier_two() {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path().join("src");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("f.txt"), b"archived").unwrap();
+            let conn = setup_unit_for_tape_only(dir.to_str().unwrap());
+            crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            // Default policy wants 2 copies and the snapshot is on no tape:
+            // a Tier-2 fact, which `--yes` confirms.
+            let err = unit_mark_tape_only(&conn, &Config::default(), "unit1", false, false)
+                .expect_err("zero copies against min_copies = 2 is a Tier-2 fact");
+            assert!(
+                !err.to_string().contains("never been archived"),
+                "an archived unit is not Tier 3: {err}"
+            );
+            assert_eq!(unit_status(&conn), "active");
+            unit_mark_tape_only(&conn, &Config::default(), "unit1", true, false)
+                .expect("Tier 2 is what --yes confirms");
+            assert_eq!(unit_status(&conn), "tape_only");
+        }
+    }
+
     /// Issue #348: `unit mark-tape-only` read `[defaults]` directly instead
     /// of the unit's resolved policy, checked `required_locations` by count
     /// only (not at all, in fact — only the defaults' count floor), and
@@ -4987,8 +5077,10 @@ mod tests {
     /// Fixture: `coverage::tests::setup_unit_with_deposit` — unit `photos`,
     /// one sealed tape at `home` plus a warehouse deposit at `glacier`: 2
     /// copies in 2 locations, which the DEFAULTS (2/2) accept. The unit has
-    /// no `current_path`, so neither the dirty nor the never-archived guard
-    /// can fire; only the policy under test can refuse.
+    /// no `current_path`, so the dirty guard cannot fire, and it has a
+    /// snapshot, so the never-archived guard (issue #462: decided from the
+    /// catalog, not the directory) does not either; only the policy under
+    /// test can refuse.
     mod issue348_resolved_policy_and_consent {
         use super::*;
 
@@ -6481,8 +6573,10 @@ mod tests {
 
         /// tenant + unit (deliberately no `current_path`: `fingerprint::
         /// classify` returns `Ok(None)` for a unit with no path, so
-        /// `unit_mark_tape_only`'s New/Dirty guards never fire here — only
-        /// the copy/location-count gate under test can refuse) + one
+        /// `unit_mark_tape_only`'s dirty guard never fires here, and the
+        /// snapshot below means the never-archived guard (a catalog fact,
+        /// issue #462) does not either — only the copy/location-count gate
+        /// under test can refuse) + one
         /// 'current' snapshot + one 'staged' stage_set completed-written
         /// to two volumes: `{name}-SEALED` (always `sealed`) and
         /// `{name}-OTHER` (status = `second_volume_status`, the dimension
