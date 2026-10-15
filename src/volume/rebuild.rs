@@ -31,6 +31,19 @@
 //! The slice hashes recorded here are the ones the tape claims for itself —
 //! run `volume verify` afterwards to make them a checked claim.
 //!
+//! **It asserts `sealed` only for a tape it read the seal of** (ADR-0012,
+//! #458). It does verify that one thing, cheaply: the seal marker at File 0's
+//! `[layout] seal_marker` must read, parse, be one this tapectl may read,
+//! name this volume and bind the front index beside it
+//! ([`format::judge_seal`], the judgement `volume resume`'s adoption of a
+//! lost write shares). Without it the tape is an unsealed one — an
+//! interrupted or aborted write, whose slices follow the envelopes and may
+//! never have been laid down — and the rows it inserts are the catalog's own
+//! shape for that: the volume `initialized`, its writes `aborted`, its
+//! positions `pending`. Present, so the data is findable, and ineligible, so
+//! nothing counts it as a copy. A seal this tapectl must not interpret (an
+//! unknown `requires`) refuses the rebuild instead.
+//!
 //! **It inserts only what is missing, and never edits what it finds.** Run it
 //! over ten cartridges in any order, twice, and the result is the same
 //! catalog. This is what makes a rebuild safe to run against a catalog that
@@ -129,8 +142,10 @@ pub struct RebuildReport {
     pub units_without_tenant_envelope: Vec<String>,
     /// Set (to the status found) when this label already had a `volumes` row
     /// and that row's status was not `sealed` — an imported `active` row, for
-    /// instance. `None` when the row was freshly inserted here (always
-    /// `sealed`, see `insert_all`) or was already `sealed`.
+    /// instance. `None` when the row was freshly inserted here (`sealed` for a
+    /// sealed tape, see `insert_all`; for an unsealed one see
+    /// [`Self::unsealed_reason`], which is the report of that, not this) or was
+    /// already `sealed`.
     ///
     /// This is report-only (issue #158): the rebuild proved the tape
     /// readable and complete, but it never edits a row it merely finds — see
@@ -164,7 +179,7 @@ pub struct RebuildReport {
     // `YYYY-MM-DD HH:MM:SS` form — reported whether or not a row was
     // inserted, so an operator rebuilding onto a row they already had can
     // still read them. `None` is "the tape does not say" (a File 0 without
-    // the key, or no readable seal marker), never a stand-in date.
+    // the key, or no valid seal marker), never a stand-in date.
     /// File 0's `created_at`: when `volume write` planned the write that made
     /// this tape (before the tape moved; a resumed write keeps the first
     /// attempt's). Written to an INSERTED row's `created_at` and
@@ -184,6 +199,27 @@ pub struct RebuildReport {
     /// A row with no `sealed_at` (sealed before migration 018) is not a
     /// disagreement — it recorded nothing to disagree with.
     pub volume_sealed_at_mismatch: Option<String>,
+
+    // --- the seal (issue #458) ----------------------------------------------
+    //
+    // ADR-0012: the rebuild "asserts `sealed` only after reading the seal
+    // marker; otherwise the row is present-but-unverified and ineligible".
+    /// `None` when the seal marker at File 0's `[layout] seal_marker` read,
+    /// parsed, is one this tapectl may read, names this volume and binds the
+    /// front index beside it: the tape is sealed, and a row this run inserts
+    /// is `sealed` with `completed` writes. `Some(why)` when it did not: the
+    /// tape is an unsealed one (an interrupted or aborted write). A row this
+    /// run inserts is then `initialized` with `aborted` writes and `pending`
+    /// positions — what the catalog holds for a native aborted write, and
+    /// not a copy — and `why` names the part that failed. A seal this
+    /// tapectl must NOT interpret (an unknown `requires`) is not this: it
+    /// refuses the rebuild, as every other reader of the tape does.
+    pub unsealed_reason: Option<String>,
+    /// The status of the `volumes` row this run FOUND, when it found one.
+    /// `None` when the row was inserted here. Report-only: a found row is
+    /// never edited (#158), so this is how an unsealed tape under a row the
+    /// catalog holds as `sealed` is told apart from one under `initialized`.
+    pub found_volume_status: Option<String>,
 
     // --- cartridge identity (issue #165) -----------------------------------
     //
@@ -556,9 +592,21 @@ fn rebuild_contacted(
     let entries = format::parse_front_index(&String::from_utf8_lossy(&fi))?;
 
     let opened = open_all_envelopes(store, &entries, identities, scratch)?;
-    // Issue #305: the tape's own dates, read before the rows are written so
-    // an inserted row carries them.
-    let dates = tape_dates(store, &thunk_text, &pointers, &entries, &ident.label);
+    // Issue #458: whether the tape is SEALED, read before any row is written
+    // and after the envelopes (the seal marker is the last file, so reading
+    // it earlier would pass the head over the slices twice; `volume::
+    // cost_budget` pins the motion). The same read dates the tape (#305).
+    let seal = read_seal(store, &pointers, &fi, &ident.label);
+    if let format::SealVerdict::Refused(why) = &seal {
+        // Before the transaction, as every other reader of a tape refuses
+        // one it must not interpret (`volume-format-v2.md` §1.2 rule 1).
+        return Err(TapectlError::Other(why.clone()));
+    }
+    let dates = tape_dates(&thunk_text, &entries, &seal);
+    let unsealed_reason = match &seal {
+        format::SealVerdict::Unsealed(why) => Some(why.clone()),
+        _ => None,
+    };
     let operator = opened
         .iter()
         .find(|e| e.manifest.is_operator())
@@ -588,6 +636,7 @@ fn rebuild_contacted(
         written_at: dates.written_at.clone(),
         sealed_at: dates.sealed_at.clone(),
         load_count_at_write: dates.load_count_at_write,
+        unsealed_reason,
         ..Default::default()
     };
 
@@ -697,6 +746,13 @@ fn attest_escrow(
         return Ok(());
     };
     report.key_is_escrow = true;
+    // Issue #458: no slice header is read off a tape whose seal was not read.
+    // Its slices may never have been laid down (the envelopes and the front
+    // index precede them), so a head read would position past what the tape
+    // holds, and coverage of a write that is not a copy is not in question.
+    if report.unsealed_reason.is_some() {
+        return Ok(());
+    }
     let receipt = serde_json::to_string(&[registered.as_str()])
         .map_err(|e| TapectlError::Other(format!("receipt json: {e}")))?;
 
@@ -1115,27 +1171,61 @@ struct TapeDates {
     data_files: i64,
 }
 
-/// Read what the tape says about when it was written: File 0's provenance
-/// (already in hand) and the seal marker's `sealed_at` — one small read at
-/// the position File 0's `[layout]` names. Every failure is an absence: a
+/// Read the seal marker (issue #458): the one small read at the position File
+/// 0's `[layout]` names, judged by [`format::judge_seal`] against the front
+/// index already in hand (`fi`, as read, block padding included).
+///
+/// Every failure to read or to bind is [`format::SealVerdict::Unsealed`]: a
 /// rebuild does not verify the tape (module doc), and a tape with no
-/// readable seal marker, or a File 0 without the keys, rebuilds as it always
-/// did, with those dates unknown. A seal marker naming another volume is
-/// not this tape's and is ignored.
-fn tape_dates(
+/// readable seal marker is an unsealed one. A seal marker that names
+/// another volume is not this tape's seal either. Only a seal this tapectl
+/// must not interpret is [`format::SealVerdict::Refused`].
+fn read_seal(
     store: &mut dyn Store,
-    thunk_text: &str,
     pointers: &format::IdThunkLayoutPointers,
-    entries: &[format::ParsedIndexEntry],
+    fi: &[u8],
     label: &str,
+) -> format::SealVerdict {
+    let Ok(seal_position) = u32::try_from(pointers.seal_marker) else {
+        return format::SealVerdict::Unsealed(format!(
+            "File 0 names seal marker position {}",
+            pointers.seal_marker
+        ));
+    };
+    let seal_read = crate::store::read_small_bytes(store, seal_position, "seal marker")
+        .map_err(|e| e.to_string());
+    match format::judge_seal(
+        seal_read.as_deref().map_err(String::as_str),
+        format::without_nul_padding(fi),
+        pointers.front_index as u32,
+        seal_position,
+    ) {
+        format::SealVerdict::Sealed(seal) if seal.volume != label => {
+            format::SealVerdict::Unsealed(format!(
+                "the seal marker at file {seal_position} names volume \"{}\", not this \
+                 tape's \"{label}\"",
+                seal.volume
+            ))
+        }
+        verdict => verdict,
+    }
+}
+
+/// What the tape says about when it was written: File 0's provenance (already
+/// in hand) and the seal marker's `sealed_at`, which only a seal that bound
+/// this tape's front index gives ([`read_seal`]). Every failure is an
+/// absence: a File 0 without the keys rebuilds as it always did, with those
+/// dates unknown.
+fn tape_dates(
+    thunk_text: &str,
+    entries: &[format::ParsedIndexEntry],
+    seal: &format::SealVerdict,
 ) -> TapeDates {
     let provenance = format::parse_id_thunk_provenance(thunk_text).unwrap_or_default();
-    let sealed_at =
-        crate::store::read_small_bytes(store, pointers.seal_marker as u32, "seal marker")
-            .ok()
-            .and_then(|b| format::parse_seal_marker(&String::from_utf8_lossy(&b)).ok())
-            .filter(|seal| seal.volume == label)
-            .and_then(|seal| format::catalog_timestamp(&seal.sealed_at));
+    let sealed_at = match seal {
+        format::SealVerdict::Sealed(seal) => format::catalog_timestamp(&seal.sealed_at),
+        _ => None,
+    };
     TapeDates {
         written_at: provenance
             .created_at
@@ -1195,8 +1285,12 @@ fn insert_all(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
+    // Issue #458: what this run read of the seal. Everything it inserts below
+    // is `sealed`/`completed` only on a seal that bound the front index.
+    let sealed = report.unsealed_reason.is_none();
     let volume_id = match existing {
         Some((id, status, condition, recorded_sealed_at)) => {
+            report.found_volume_status = Some(status.clone());
             // Issue #305: the third report-only fact. Never edited (#158).
             if let (Some(recorded), Some(tape)) = (&recorded_sealed_at, &dates.sealed_at) {
                 if !sealed_at_agrees(recorded, tape) {
@@ -1205,10 +1299,12 @@ fn insert_all(
             }
             // Same tape, same evidence — but a row this rebuild merely
             // FOUND is never edited (issue #158). `sealed`/`ok` is what the
-            // `None` arm below would have inserted, so anything else is a
-            // fact worth surfacing: an imported `active` row, for instance.
-            // Reported, not repaired — see `RebuildReport::
-            // volume_status_mismatch`.
+            // `None` arm below would have inserted for a sealed tape, so
+            // anything else is a fact worth surfacing: an imported `active`
+            // row, for instance. Reported, not repaired — see
+            // `RebuildReport::volume_status_mismatch`. (For an UNSEALED tape
+            // the found row is the report's `found_volume_status` and
+            // `unsealed_reason`; the two are not the same question.)
             if status != "sealed" {
                 report.volume_status_mismatch = Some(status);
             }
@@ -1237,12 +1333,18 @@ fn insert_all(
             // block-padded bytes and the write's block size is not on the
             // tape, so any figure here would depend on the rebuilding
             // machine (#305's coordinator note). It stays 0, as before.
+            //
+            // Issue #458: `sealed` only on a seal marker that was read and
+            // bound the front index. Without one this is the catalog's own
+            // shape for an aborted write: `initialized`, no seal recorded,
+            // no data file proven (`num_data_files` 0 — the front index
+            // lists the plan, not what was laid down).
             tx.execute(
                 "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
                                       capacity_bytes, mam_capacity_bytes, has_manifest, status,
                                       created_at, first_write, sealed_at, last_write,
                                       num_data_files)
-                 VALUES (?1, ?2, 'lto', ?3, ?4, ?5, ?6, 1, 'sealed',
+                 VALUES (?1, ?2, 'lto', ?3, ?4, ?5, ?6, 1, ?10,
                          COALESCE(?7, datetime('now')), ?7, ?8, ?8, ?9)",
                 params![
                     label,
@@ -1253,7 +1355,8 @@ fn insert_all(
                     meta.mam_capacity_bytes,
                     dates.written_at,
                     dates.sealed_at,
-                    dates.data_files,
+                    if sealed { dates.data_files } else { 0 },
+                    if sealed { "sealed" } else { "initialized" },
                 ],
             )?;
             report.volume_inserted = true;
@@ -1288,9 +1391,9 @@ fn insert_all(
             slice_ids.push((slice, ensure_slice(tx, unit, slice, stage_set_id, report)?));
         }
 
-        let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, report)?;
+        let write_id = ensure_write(tx, stage_set_id, snapshot_id, volume_id, sealed, report)?;
         for (slice, slice_id) in slice_ids {
-            ensure_position(tx, write_id, slice_id, slice, report)?;
+            ensure_position(tx, write_id, slice_id, slice, sealed, report)?;
         }
 
         ensure_files(tx, unit, snapshot_id, supplement, report)?;
@@ -1594,6 +1697,7 @@ fn ensure_write(
     stage_set_id: i64,
     snapshot_id: i64,
     volume_id: i64,
+    sealed: bool,
     report: &mut RebuildReport,
 ) -> Result<i64> {
     if let Some(id) = existing_id(
@@ -1606,12 +1710,28 @@ fn ensure_write(
     // `write_verified = 0`: the tape has not been read back and checked.
     // `volume verify` is what sets that, and a rebuild claiming it would
     // make a verified volume indistinguishable from an assumed one.
+    //
+    // Issue #458: `completed` is what a passing confirm sets after a seal,
+    // and the copy counts read it. A tape whose seal marker was not read
+    // gets the status of a write that did not finish: `aborted`, with no
+    // completion time. `docs/design/layout-session.md`: an aborted session's
+    // tape "is not a copy".
     tx.execute(
         "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status, write_verified,
                              completed_at, notes)
-         VALUES (?1, ?2, ?3, 'completed', 0, datetime('now'),
-                 'rebuilt from the volume itself; never verified by a read-back')",
-        params![stage_set_id, snapshot_id, volume_id],
+         VALUES (?1, ?2, ?3, ?4, 0, CASE WHEN ?4 = 'completed' THEN datetime('now') END, ?5)",
+        params![
+            stage_set_id,
+            snapshot_id,
+            volume_id,
+            if sealed { "completed" } else { "aborted" },
+            if sealed {
+                "rebuilt from the volume itself; never verified by a read-back"
+            } else {
+                "rebuilt from the volume itself; the tape carries no valid seal marker, so \
+                 the write is recorded as aborted and is not a copy"
+            },
+        ],
     )?;
     report.writes += 1;
     Ok(tx.last_insert_rowid())
@@ -1622,6 +1742,7 @@ fn ensure_position(
     write_id: i64,
     stage_slice_id: i64,
     slice: &envelope::ManifestSlice,
+    sealed: bool,
     report: &mut RebuildReport,
 ) -> Result<()> {
     if existing_id(
@@ -1636,17 +1757,31 @@ fn ensure_position(
     // `position` is the TAPE POSITION, never the slice number: slices begin
     // after the envelopes and the two diverge further on a multi-unit
     // volume. Confusing them yields a restore that reads the wrong files.
-    tx.execute(
-        "INSERT INTO write_positions (write_id, stage_slice_id, position, status, written_at,
-                                      sha256_on_volume)
-         VALUES (?1, ?2, ?3, 'written', datetime('now'), ?4)",
-        params![
-            write_id,
-            stage_slice_id,
-            slice.tape_position.to_string(),
-            slice.sha256_encrypted,
-        ],
-    )?;
+    //
+    // Issue #458: on a sealed tape every slice the manifest lists is on it
+    // (the seal marker's presence means every file before it is present).
+    // On an unsealed one the manifest and the front index are the PLAN —
+    // envelopes precede the slices — so the position is recorded `pending`,
+    // with nothing measured on the volume, not `written`.
+    if sealed {
+        tx.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status, written_at,
+                                          sha256_on_volume)
+             VALUES (?1, ?2, ?3, 'written', datetime('now'), ?4)",
+            params![
+                write_id,
+                stage_slice_id,
+                slice.tape_position.to_string(),
+                slice.sha256_encrypted,
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
+             VALUES (?1, ?2, ?3, 'pending')",
+            params![write_id, stage_slice_id, slice.tape_position.to_string()],
+        )?;
+    }
     report.positions += 1;
     Ok(())
 }
@@ -1758,10 +1893,23 @@ fn record_event(
         format!("; displaced from that cartridge: {}", each.join(", "))
     };
 
+    // Issue #458: the claim the rows make, in the ledger. A rebuild that
+    // asserted `sealed` says it read a seal; one that did not says so.
+    let seal_clause = match &report.unsealed_reason {
+        None => String::new(),
+        Some(why) => format!(
+            "; NO VALID SEAL MARKER ({why}): {} — not a copy",
+            if report.volume_inserted {
+                "recorded as an unsealed volume, its writes aborted"
+            } else {
+                "the existing volume row was left alone, the writes this run added are aborted"
+            }
+        ),
+    };
     let detail = format!(
         "catalog rebuild from volume {} (uuid {}) on {}: {} envelope(s) opened; \
          inserted {} tenant(s), {} unit(s), {} snapshot(s), {} stage set(s), {} slice(s), \
-         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}{cartridge_clause}{displaced_clause}",
+         {} write(s), {} position(s), {} file row(s); {} escrow receipt(s) from tape, {} attested; catalog.db {}{seal_clause}{cartridge_clause}{displaced_clause}",
         report.label,
         report.uuid,
         device,

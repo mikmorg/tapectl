@@ -37,9 +37,7 @@
 //! asks it before the tape moves, so a resume with no verify behind it is
 //! refused without a contact. [`adopt`] asks all three in the ruling's order.
 
-use crate::pass_count::Sha256;
 use rusqlite::{params, Connection};
-use sha2::Digest;
 
 use crate::db::events;
 use crate::error::{Result, TapectlError};
@@ -228,31 +226,29 @@ fn sealed_front_index(
 
     let fi_raw = crate::store::read_small_bytes(store, fi_pos, "front index")
         .map_err(|e| format!("the front index (file {fi_pos}) did not read: {e}"))?;
-    let fi_true = &fi_raw[..fi_raw.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1)];
-    let front_index_sha256 = format!("{:x}", Sha256::digest(fi_true));
+    let fi_true = format::without_nul_padding(&fi_raw);
     let entries = format::parse_front_index(&String::from_utf8_lossy(fi_true))
         .map_err(|e| format!("the front index (file {fi_pos}) does not parse: {e}"))?;
 
-    let seal_raw = crate::store::read_small_bytes(store, seal_pos, "seal marker").map_err(|e| {
-        format!("no seal marker reads at file {seal_pos}, where File 0 says it is: {e}")
-    })?;
-    let seal = format::parse_seal_marker(&String::from_utf8_lossy(&seal_raw))
-        .map_err(|e| format!("file {seal_pos} is not a seal marker: {e}"))?;
-    if let Some(why) = seal.refusal() {
-        return Err(why);
+    // The judgement is `format::judge_seal`'s, shared with `catalog rebuild`
+    // (#458): a seal this tapectl may not read, and a seal that binds
+    // nothing here, are both a seal that does not seal THIS tape, for this
+    // adoption's purposes.
+    let seal_read =
+        crate::store::read_small_bytes(store, seal_pos, "seal marker").map_err(|e| e.to_string());
+    match format::judge_seal(
+        seal_read.as_deref().map_err(String::as_str),
+        fi_true,
+        fi_pos,
+        seal_pos,
+    ) {
+        format::SealVerdict::Sealed(seal) => Ok(SealedIndex {
+            entries,
+            sealed_at: seal.sealed_at,
+            front_index_sha256: seal.front_index_sha256,
+        }),
+        format::SealVerdict::Unsealed(why) | format::SealVerdict::Refused(why) => Err(why),
     }
-    if seal.front_index_sha256 != front_index_sha256 {
-        return Err(format!(
-            "the seal marker binds a front index hashing to {}, but the front index (file \
-             {fi_pos}) on this tape hashes to {front_index_sha256}",
-            seal.front_index_sha256
-        ));
-    }
-    Ok(SealedIndex {
-        entries,
-        sealed_at: seal.sealed_at,
-        front_index_sha256,
-    })
 }
 
 /// Condition 3: every slice the tape's front index lists is, at that
@@ -535,11 +531,13 @@ mod tests {
     use crate::config::Config;
     use crate::crypto::keys::generate_keypair;
     use crate::db;
+    use crate::pass_count::Sha256;
     use crate::store::{MemStore, Tier};
     use crate::tape::contact::{ContactSite, Medium, Operation};
     use crate::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
     use crate::volume::layout_model::{KeyAvailability, SliceCheck};
     use crate::volume::session::{ConfirmOutcome, ExecuteOutcome};
+    use sha2::Digest;
     use tempfile::TempDir;
 
     const BS: u64 = 65536;

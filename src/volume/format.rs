@@ -167,6 +167,77 @@ pub fn parse_seal_marker(raw: &str) -> Result<ParsedSeal> {
     })
 }
 
+/// A tape file's true bytes: the block padding a tape read returns after
+/// them (trailing NULs) removed, `volume-format-v2.md` §4.
+pub fn without_nul_padding(raw: &[u8]) -> &[u8] {
+    &raw[..raw.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1)]
+}
+
+/// What a tape's seal marker proves, judged against the front index it ends
+/// (issue #458; `volume-format-v2.md` §4). The ONE judgement: `catalog
+/// rebuild --from-volume` asserts `sealed` only on [`SealVerdict::Sealed`]
+/// (ADR-0012: "asserts `sealed` only after reading the seal marker"), and
+/// `volume resume`'s adoption of a lost write (#360) asks the same question
+/// of the same bytes, so the two can never disagree about what a seal is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealVerdict {
+    /// The seal marker read, parsed, is one this tapectl may read, and its
+    /// `front_index_sha256` is the hash of the front index in hand.
+    Sealed(ParsedSeal),
+    /// No seal marker binds this front index; the string says which part
+    /// failed. The tape is an unsealed one (an interrupted or aborted write)
+    /// or its seal does not belong to the front index beside it.
+    Unsealed(String),
+    /// A seal marker that this tapectl must not interpret: it requires a
+    /// feature, or a layout version, it does not know. Not "unsealed" — the
+    /// tape may well be sealed, by a newer tapectl — so a reader that would
+    /// act on it must refuse, as every other reader of the tape does.
+    Refused(String),
+}
+
+/// Judge the seal marker of the tape whose front index (File 3, `front_index`
+/// = its true bytes, padding removed) sits at `front_index_position`.
+/// `seal_read` is what reading the file at `seal_position` (File 0's
+/// `[layout] seal_marker`) gave: its bytes, or the reason it did not read.
+///
+/// The check order, and the wording, are those `adopt_lost` has always
+/// refused with: a seal that does not read, one that does not parse, one this
+/// tapectl must not read, then one binding a different front index.
+pub fn judge_seal(
+    seal_read: std::result::Result<&[u8], &str>,
+    front_index: &[u8],
+    front_index_position: u32,
+    seal_position: u32,
+) -> SealVerdict {
+    use sha2::Digest;
+    let raw = match seal_read {
+        Ok(raw) => raw,
+        Err(why) => {
+            return SealVerdict::Unsealed(format!(
+                "no seal marker reads at file {seal_position}, where File 0 says it is: {why}"
+            ))
+        }
+    };
+    let seal = match parse_seal_marker(&String::from_utf8_lossy(raw)) {
+        Ok(seal) => seal,
+        Err(e) => {
+            return SealVerdict::Unsealed(format!("file {seal_position} is not a seal marker: {e}"))
+        }
+    };
+    if let Some(why) = seal.refusal() {
+        return SealVerdict::Refused(why);
+    }
+    let front_index_sha256 = format!("{:x}", crate::pass_count::Sha256::digest(front_index));
+    if seal.front_index_sha256 != front_index_sha256 {
+        return SealVerdict::Unsealed(format!(
+            "the seal marker binds a front index hashing to {}, but the front index (file \
+             {front_index_position}) on this tape hashes to {front_index_sha256}",
+            seal.front_index_sha256
+        ));
+    }
+    SealVerdict::Sealed(seal)
+}
+
 /// The layout this tapectl reads (File 0's `layout_version`).
 pub const LAYOUT_VERSION: i64 = 2;
 /// File 0's `magic` for layout 2.
@@ -763,6 +834,59 @@ mod forward_compat_tests {
             sha256_encrypted: None,
         }];
         generate_seal_marker("FC01", 1, "h", &files)
+    }
+
+    /// Issue #458: the one seal judgement. A seal that binds the front index
+    /// in hand is `Sealed`; each way it can fail to is `Unsealed`, with the
+    /// part that failed named; one this tapectl must not interpret is
+    /// `Refused`, never `Unsealed` (it may be a newer tapectl's sealed tape).
+    #[test]
+    fn judge_seal_tells_sealed_from_unsealed_from_refused() {
+        use sha2::Digest;
+        let front_index = b"[index]\nvolume = \"FC01\"\nlayout_version = 2\n";
+        let hash = format!("{:x}", sha2::Sha256::digest(front_index));
+        let files = vec![FrontIndexFile {
+            position: 0,
+            type_label: "seal_marker",
+            size_bytes: None,
+            sha256_encrypted: None,
+        }];
+        let bound = generate_seal_marker("FC01", 1, &hash, &files);
+        // The tape returns block-padded reads; the judgement is on true bytes.
+        let mut padded = bound.clone().into_bytes();
+        padded.extend_from_slice(&[0; 40]);
+
+        match judge_seal(Ok(&padded), front_index, 3, 5) {
+            SealVerdict::Sealed(seal) => assert_eq!(seal.volume, "FC01"),
+            other => panic!("a bound seal is Sealed: {other:?}"),
+        }
+        let SealVerdict::Unsealed(why) = judge_seal(Err("end of data"), front_index, 3, 5) else {
+            panic!("an unread seal is Unsealed")
+        };
+        assert!(why.contains("no seal marker reads at file 5"), "{why}");
+        assert!(why.contains("end of data"), "{why}");
+        let SealVerdict::Unsealed(why) = judge_seal(Ok(b"junk"), front_index, 3, 5) else {
+            panic!("an unparseable seal is Unsealed")
+        };
+        assert!(why.contains("file 5 is not a seal marker"), "{why}");
+        let SealVerdict::Unsealed(why) = judge_seal(Ok(&padded), b"another index", 3, 5) else {
+            panic!("a seal binding another front index is Unsealed")
+        };
+        assert!(why.contains("binds a front index hashing to"), "{why}");
+        assert!(why.contains("front index (file 3)"), "{why}");
+        let required = bound.replace("requires = []", "requires = [\"short-seal\"]");
+        let SealVerdict::Refused(why) = judge_seal(Ok(required.as_bytes()), front_index, 3, 5)
+        else {
+            panic!("an unknown required feature is Refused, not Unsealed")
+        };
+        assert!(why.contains("\"short-seal\""), "{why}");
+    }
+
+    #[test]
+    fn nul_padding_is_stripped_and_only_from_the_end() {
+        assert_eq!(without_nul_padding(b"ab\0c\0\0\0"), b"ab\0c");
+        assert_eq!(without_nul_padding(b"\0\0"), b"");
+        assert_eq!(without_nul_padding(b""), b"");
     }
 
     /// ADR-0012 amendment item 15: a 1.1.0 tape states `requires = []` in

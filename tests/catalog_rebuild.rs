@@ -4001,3 +4001,381 @@ fn a_rebuild_reads_no_tape_while_it_holds_the_write_lock() {
         store.locked_reads
     );
 }
+
+// ── Issue #458: a rebuilt tape with no valid seal is not a copy ──────────
+//
+// ADR-0012: `catalog rebuild --from-volume` "asserts `sealed` only after
+// reading the seal marker; otherwise the row is present-but-unverified and
+// ineligible (#158)". The shape a never-sealed tape rebuilds to is the shape
+// the catalog gives a native aborted write: the volume `initialized`, its
+// seal unrecorded, its writes `aborted`.
+
+/// Remove the seal marker, the last file the write session laid down, as an
+/// interrupted or aborted write leaves the tape. The premise is checked: what
+/// is removed really is a seal marker.
+fn drop_seal_marker(vol: &mut SealedVolume) {
+    let seal = String::from_utf8_lossy(vol.store.files.last().expect("a written tape"));
+    assert!(
+        tapectl::volume::format::parse_seal_marker(&seal).is_ok(),
+        "premise: the last file of the tape is its seal marker"
+    );
+    vol.store.files.pop();
+    vol.store.syncs.pop();
+}
+
+/// `(status, observed_condition, sealed_at)` of a volume row.
+fn volume_state(conn: &rusqlite::Connection, label: &str) -> (String, String, Option<String>) {
+    conn.query_row(
+        "SELECT status, observed_condition, sealed_at FROM volumes WHERE label = ?1",
+        rusqlite::params![label],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .unwrap()
+}
+
+/// How many of a volume's `writes` rows carry `status`, and how many it has.
+fn write_counts(conn: &rusqlite::Connection, label: &str, status: &str) -> (i64, i64) {
+    conn.query_row(
+        "SELECT COALESCE(SUM(w.status = ?2), 0), COUNT(*)
+         FROM writes w JOIN volumes v ON v.id = w.volume_id WHERE v.label = ?1",
+        rusqlite::params![label, status],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// Positions of the volume that claim to be `written`.
+fn written_positions(conn: &rusqlite::Connection, label: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM write_positions wp
+         JOIN writes w ON w.id = wp.write_id JOIN volumes v ON v.id = w.volume_id
+         WHERE v.label = ?1 AND wp.status = 'written'",
+        rusqlite::params![label],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// The catalog ruling itself. Before #458 the new-volume arm hardcoded
+/// `'sealed'` and every write `completed`, so a tape whose write never
+/// finished (envelopes and the front index precede the slices) rebuilt to a
+/// sealed volume with `written` positions for slices that may never have been
+/// laid down, and `audit` and `report copies` counted it.
+#[test]
+fn a_tape_with_no_seal_marker_rebuilds_as_an_aborted_write_that_is_not_a_copy() {
+    let mut vol = build_sealed_volume(true);
+    drop_seal_marker(&mut vol);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect("an unsealed tape still rebuilds: the rows are present, just not a copy");
+    assert!(report.volume_inserted);
+
+    let (status, condition, sealed_at) = volume_state(&conn, LABEL);
+    assert_eq!(
+        status, "initialized",
+        "the rebuild read no seal marker, so it may not assert `sealed`"
+    );
+    assert_eq!(
+        condition, "ok",
+        "an incomplete recording is not a bad medium"
+    );
+    assert_eq!(sealed_at, None, "no seal was read, so none is recorded");
+
+    let (aborted, total) = write_counts(&conn, LABEL, "aborted");
+    assert!(total > 0, "positive control: the writes rows exist");
+    assert_eq!(aborted, total, "every write is an aborted session");
+    assert_eq!(
+        written_positions(&conn, LABEL),
+        0,
+        "the rebuild saw the plan (the front index), not the slices"
+    );
+
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(copies(&conn, unit_name), 0, "{unit_name}: not a copy");
+    }
+    assert!(!tapectl::policy::coverage::counts_as_copy(&conn, LABEL).unwrap());
+    let vol_id: i64 = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            rusqlite::params![LABEL],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!tapectl::policy::coverage::has_completed_write(&conn, vol_id).unwrap());
+    for (unit_name, _, _) in UNITS {
+        assert!(
+            tapectl::policy::coverage::versions_at_stake(&conn, unit_id(&conn, unit_name), vol_id)
+                .unwrap()
+                .is_empty(),
+            "{unit_name}: retiring this volume removes no coverage, so `volume retire` is not \
+             gated on it"
+        );
+    }
+}
+
+fn volume_id_of(conn: &rusqlite::Connection, label: &str) -> i64 {
+    conn.query_row(
+        "SELECT id FROM volumes WHERE label = ?1",
+        rusqlite::params![label],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Rewrite the seal marker (the tape's last file) in place.
+fn edit_seal_marker(vol: &mut SealedVolume, edit: impl FnOnce(&str) -> String) {
+    let file = vol.store.files.last_mut().expect("a written tape");
+    let text = String::from_utf8_lossy(file).into_owned();
+    let edited = edit(&text);
+    assert_ne!(edited, text, "premise: the edit changed the seal marker");
+    *file = edited.into_bytes();
+}
+
+/// The control the test above cannot be: a SEALED tape still rebuilds to a
+/// `sealed` volume with `completed` writes and `written` positions, which
+/// counts as a copy. Without it, "an unsealed tape is not a copy" could be
+/// "nothing is a copy".
+#[test]
+fn a_sealed_tape_rebuilds_sealed_and_counts_as_a_copy() {
+    let mut vol = build_sealed_volume(true);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert_eq!(
+        report.unsealed_reason, None,
+        "the seal read and bound the tape"
+    );
+
+    let (status, condition, sealed_at) = volume_state(&conn, LABEL);
+    assert_eq!((status.as_str(), condition.as_str()), ("sealed", "ok"));
+    assert_eq!(sealed_at.as_deref(), Some(tape_sealed_at(&vol).as_str()));
+    let (completed, total) = write_counts(&conn, LABEL, "completed");
+    assert!(total > 0 && completed == total, "{completed} of {total}");
+    let slices: usize = vol.expected_positions.iter().map(|(_, p)| p.len()).sum();
+    assert_eq!(written_positions(&conn, LABEL), slices as i64);
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(copies(&conn, unit_name), 1, "{unit_name}");
+    }
+    assert!(tapectl::policy::coverage::counts_as_copy(&conn, LABEL).unwrap());
+}
+
+/// The trace of the status chosen for #458 through the commands that read
+/// it, by their own public functions rather than a re-derivation. A never-
+/// sealed rebuilt volume is catalog-identical to a native aborted write, so
+/// every command treats it exactly as it treats that.
+#[test]
+fn an_unsealed_rebuilt_volume_is_what_every_command_expects_of_an_aborted_write() {
+    use tapectl::policy::coverage;
+    use tapectl::volume::session::{resume_admission, AbortedAdoption, ResumeAdmission};
+
+    let mut vol = build_sealed_volume(true);
+    drop_seal_marker(&mut vol);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(
+        report.unsealed_reason.is_some(),
+        "the report says the tape is unsealed: {report:?}"
+    );
+    assert_eq!(
+        report.found_volume_status, None,
+        "the row was inserted here"
+    );
+    let vid = volume_id_of(&conn, LABEL);
+
+    // Not a copy, anywhere: the coverage predicates and `holds_sealed_bytes`.
+    assert!(!coverage::counts_as_copy(&conn, LABEL).unwrap());
+    assert!(!coverage::has_completed_write(&conn, vid).unwrap());
+    let holds: bool = conn
+        .query_row(
+            &format!(
+                "SELECT {} FROM volumes WHERE id = ?1",
+                coverage::holds_sealed_bytes("volumes")
+            ),
+            rusqlite::params![vid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !holds,
+        "no sealed bytes are recorded, so retiring it is not gated on them"
+    );
+
+    // `volume write` / `volume resume`: an `initialized` volume with no
+    // completed write is the target the documented aborted-write remedy
+    // (`volume write` starts over from the beginning of the same tape) uses.
+    let (status, condition, _) = volume_state(&conn, LABEL);
+    assert!(coverage::is_write_target(&status, &condition));
+    // `volume resume` does not adopt it: no seal is recorded, so an aborted
+    // session is never resumable (ADR-0012, 2026-09-23) ...
+    assert_eq!(
+        resume_admission(&conn, vid).unwrap(),
+        ResumeAdmission::Aborted(AbortedAdoption::NotSealed)
+    );
+    // ... and #360's adoption of a lost write needs completed writes only.
+    assert!(!tapectl::volume::adopt_lost::is_lost_write(&conn, vid).unwrap());
+
+    // `cartridge erase` refuses a volume the catalog has not given up; the
+    // way out is `volume retire`, which an aborted write never gates.
+    assert!(!coverage::is_given_up(&conn, vid).unwrap());
+}
+
+/// A seal marker that reads and parses but binds a DIFFERENT front index is
+/// no seal of this tape: the rebuild cannot say what it sealed.
+#[test]
+fn a_seal_marker_binding_another_front_index_does_not_seal_the_tape() {
+    let mut vol = build_sealed_volume(true);
+    edit_seal_marker(&mut vol, |text| {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("front_index_sha256 = "))
+            .expect("the seal binds the front index")
+            .to_string();
+        text.replacen(
+            &line,
+            &format!("front_index_sha256 = \"{}\"", "0".repeat(64)),
+            1,
+        )
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    let why = report.unsealed_reason.as_deref().expect("not sealed");
+    assert!(why.contains("binds a front index hashing to"), "{why}");
+    assert_eq!(report.sealed_at, None, "an unbound seal dates nothing");
+    assert_eq!(volume_state(&conn, LABEL).0, "initialized");
+    assert!(!tapectl::policy::coverage::counts_as_copy(&conn, LABEL).unwrap());
+}
+
+/// ... and so is one that names another volume.
+#[test]
+fn a_seal_marker_naming_another_volume_does_not_seal_the_tape() {
+    let mut vol = build_sealed_volume(true);
+    edit_seal_marker(&mut vol, |text| {
+        text.replacen(
+            &format!("volume = \"{LABEL}\""),
+            "volume = \"SOMEONEELSE\"",
+            1,
+        )
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    let why = report.unsealed_reason.as_deref().expect("not sealed");
+    assert!(why.contains("SOMEONEELSE"), "{why}");
+    assert_eq!(volume_state(&conn, LABEL).0, "initialized");
+    assert!(!tapectl::policy::coverage::counts_as_copy(&conn, LABEL).unwrap());
+}
+
+/// A seal marker requiring a feature this tapectl does not know is REFUSED,
+/// as every other reader of the tape refuses it (`volume-format-v2.md` §1.2
+/// rule 1): it is not an unsealed tape, it may be a sealed one a newer
+/// tapectl wrote, and recording it as an aborted write would be a claim
+/// with no evidence. Nothing is written.
+#[test]
+fn a_seal_marker_requiring_an_unknown_feature_refuses_the_rebuild() {
+    let mut vol = build_sealed_volume(true);
+    edit_seal_marker(&mut vol, |text| {
+        text.replacen("requires = []", "requires = [\"future-feature\"]", 1)
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let err = rebuild(&conn, &mut vol, &secret, scratch.path())
+        .expect_err("a seal this tapectl may not read refuses the rebuild")
+        .to_string();
+    assert!(err.contains("future-feature"), "{err}");
+    assert!(err.contains("the seal marker"), "{err}");
+    for (table, n) in row_counts(&conn) {
+        assert_eq!(n, 0, "nothing was written, but {table} has {n} row(s)");
+    }
+}
+
+/// A second rebuild of the same unsealed tape adds nothing and says the same
+/// thing: the row it finds is the unsealed tape's own shape, which is not a
+/// status mismatch (the #360 advice, "verify, then resume seals it", is for
+/// a sealed tape under an `initialized` row, and would promise what no
+/// verify can do here).
+#[test]
+fn rebuilding_an_unsealed_tape_twice_is_idempotent_and_not_a_status_mismatch_to_fix() {
+    let mut vol = build_sealed_volume(true);
+    drop_seal_marker(&mut vol);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let first = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(first.volume_inserted && !first.is_noop());
+    let counts = row_counts(&conn);
+
+    let second = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(second.is_noop(), "{second:?}");
+    assert_eq!(row_counts(&conn), counts, "a second run inserts nothing");
+    assert_eq!(second.found_volume_status.as_deref(), Some("initialized"));
+    assert!(
+        second.unsealed_reason.is_some(),
+        "it still says why: {second:?}"
+    );
+    assert_eq!(volume_state(&conn, LABEL).0, "initialized");
+    assert_eq!(
+        write_counts(&conn, LABEL, "aborted").0,
+        write_counts(&conn, LABEL, "aborted").1
+    );
+}
+
+/// A row the catalog already held as `initialized` (a backup taken after
+/// `volume init`) under a tape with NO seal: the rebuild leaves the row and
+/// attaches the units as `aborted` writes, so #360's lost-write adoption
+/// (completed writes only, a valid seal) is not entered and nothing counts.
+#[test]
+fn an_unsealed_tape_under_an_initialized_row_attaches_aborted_writes() {
+    let mut vol = build_sealed_volume(true);
+    drop_seal_marker(&mut vol);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    conn.execute(
+        "INSERT INTO volumes (label, uuid, backend_type, backend_name, media_type,
+                              capacity_bytes, status)
+         VALUES (?1, ?2, 'lto', 'lto0', 'LTO-6', 2500000000, 'initialized')",
+        rusqlite::params![LABEL, VOL_UUID],
+    )
+    .unwrap();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(!report.volume_inserted);
+    assert_eq!(report.found_volume_status.as_deref(), Some("initialized"));
+    assert_eq!(
+        report.volume_status_mismatch.as_deref(),
+        Some("initialized"),
+        "the field keeps its meaning: the found row is not sealed"
+    );
+    assert!(report.unsealed_reason.is_some());
+
+    let (aborted, total) = write_counts(&conn, LABEL, "aborted");
+    assert!(total > 0 && aborted == total, "{aborted} of {total}");
+    let vid = volume_id_of(&conn, LABEL);
+    assert!(!tapectl::volume::adopt_lost::is_lost_write(&conn, vid).unwrap());
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(copies(&conn, unit_name), 0, "{unit_name}");
+    }
+}

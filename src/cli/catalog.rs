@@ -597,9 +597,7 @@ pub fn run(
             let report = report?;
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({
+                let mut obj = serde_json::json!({
                         "label": report.label,
                         "uuid": report.uuid,
                         "envelopes_opened": report.envelopes_opened,
@@ -663,8 +661,20 @@ pub fn run(
                         "sealed_at": report.sealed_at,
                         "load_count_at_write": report.load_count_at_write,
                         "volume_sealed_at_mismatch": report.volume_sealed_at_mismatch,
-                    })
-                );
+                });
+                // Issue #458: additive. Whether a seal marker was read and
+                // bound the front index (the row is then `sealed`, its writes
+                // `completed`) or not (an unsealed tape: `initialized`,
+                // writes `aborted`, not a copy), why not, and the status of
+                // a row this run found rather than inserted. Added to the
+                // object, not to the literal above: `json!` recurses once
+                // per key and that literal is at the macro's limit.
+                obj["seal_valid"] = serde_json::json!(report.unsealed_reason.is_none());
+                obj["unsealed_reason"] = serde_json::json!(report.unsealed_reason);
+                obj["recorded_as_unsealed"] =
+                    serde_json::json!(report.volume_inserted && report.unsealed_reason.is_some());
+                obj["found_volume_status"] = serde_json::json!(report.found_volume_status);
+                println!("{obj}");
             } else {
                 println!(
                     "rebuilt from volume \"{}\" (uuid {}), {} envelope(s) opened",
@@ -750,10 +760,21 @@ pub fn run(
                          but its status was left alone (ADR-0011)"
                     );
                 }
+                // Issue #458, outside the is_noop() branch for the same reason
+                // as the warnings below: a second run over the same unsealed
+                // tape changes nothing and must say so every time.
+                for line in unsealed_tape_lines(&report) {
+                    println!("{line}");
+                }
                 // Outside the is_noop() branch on purpose: a second rebuild
                 // onto a row that is still non-sealed is a no-op for row
-                // counts and must still warn every time (issue #158).
-                if let Some(status) = report
+                // counts and must still warn every time (issue #158). Not for
+                // an unsealed tape (#458): there "not sealed" is the tape's
+                // own state, said above, and "verify, then resume seals it"
+                // would promise what no verify can do.
+                if report.unsealed_reason.is_some() {
+                    // said above
+                } else if let Some(status) = report
                     .volume_status_mismatch
                     .as_ref()
                     .filter(|s| s.as_str() == "initialized")
@@ -1071,6 +1092,55 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
     lines
 }
 
+/// What `catalog rebuild` says when the tape carries no valid seal marker
+/// (issue #458), in words an operator can act on in the middle of a disaster:
+/// what was recorded, that it is not a copy, and what to do with the
+/// cartridge. Empty for a sealed tape.
+///
+/// The three arms are the three things a rebuild can have done with the
+/// volume row: inserted it, found it as the unsealed tape's own shape
+/// (`initialized`), or found it as something the tape does not support
+/// (`sealed`, or any other status the operator or an earlier command set).
+/// In none of them did it edit a found row (issue #158).
+fn unsealed_tape_lines(report: &RebuildReport) -> Vec<String> {
+    let Some(why) = &report.unsealed_reason else {
+        return Vec::new();
+    };
+    let label = &report.label;
+    let mut lines = vec![format!(
+        "  warning: volume \"{label}\" has NO VALID SEAL MARKER: {why}"
+    )];
+    match (&report.found_volume_status, report.volume_inserted) {
+        (None, _) => lines.push(format!(
+            "    recorded as an unsealed volume: status \"initialized\", its writes \"aborted\" and \
+             its slice positions \"pending\" — an interrupted or aborted write. It is NOT a \
+             copy: nothing on it counts toward any unit's copies, in `audit` or in `report copies`."
+        )),
+        (Some(status), _) if status == "sealed" => lines.push(format!(
+            "    this catalog already holds \"{label}\" as \"sealed\", which this tape does not \
+             support, and the rebuild left that row alone; the writes it added are \"aborted\". \
+             Run `tapectl volume verify {label}` to see whether the tape is the sealed one."
+        )),
+        (Some(status), _) => lines.push(format!(
+            "    this catalog already holds \"{label}\" as \"{status}\"; the rebuild left that row \
+             alone and attached the units it was missing as \"aborted\" writes. They are NOT \
+             copies."
+        )),
+    }
+    lines.push(
+        "    A full `volume verify` cannot seal it, and its slices may be missing or incomplete \
+         (the envelopes and the front index are laid down before them)."
+            .to_string(),
+    );
+    lines.push(format!(
+        "    To reuse the cartridge: `tapectl volume write {label}` starts over from the \
+         beginning of the same tape, or retire the volume (`tapectl volume retire {label}`) and \
+         run `tapectl cartridge erase`. What the tape does hold restores with RESTORE.sh at its \
+         file 2."
+    ));
+    lines
+}
+
 /// The `note: ...` line `catalog rebuild` prints when this tape's File 0
 /// named one cartridge but the medium's own serial matched a DIFFERENT
 /// registered cartridge (ADR-0012's "the loaded tape *is* that other
@@ -1105,7 +1175,7 @@ fn tape_dates_line(
         written_at.unwrap_or("(unknown — File 0 has no created_at)"),
         sealed_at
             .map(|s| format!("{s} UTC"))
-            .unwrap_or_else(|| "(unknown — no readable seal marker)".to_string()),
+            .unwrap_or_else(|| "(unknown — no valid seal marker)".to_string()),
         load_count_at_write
             .map(|n| n.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
@@ -1158,6 +1228,47 @@ fn displacements_json(report: &crate::volume::rebuild::RebuildReport) -> serde_j
 
 #[cfg(test)]
 mod tests {
+    /// Issue #458: a tape with no valid seal is said to be unsealed and not a
+    /// copy, with what to do with the cartridge; a sealed one says nothing.
+    /// The advice that applies to a lost write the catalog can adopt
+    /// ("verify, then resume seals it") must not appear: no verify seals this.
+    #[test]
+    fn an_unsealed_tape_is_named_as_not_a_copy_and_never_offered_a_resume() {
+        use crate::volume::rebuild::RebuildReport;
+        let sealed = RebuildReport {
+            label: "L6-0009".to_string(),
+            ..Default::default()
+        };
+        assert!(super::unsealed_tape_lines(&sealed).is_empty());
+
+        let inserted = RebuildReport {
+            label: "L6-0009".to_string(),
+            volume_inserted: true,
+            unsealed_reason: Some("no seal marker reads at file 40".to_string()),
+            ..Default::default()
+        };
+        let text = super::unsealed_tape_lines(&inserted).join("\n");
+        assert!(text.contains("NO VALID SEAL MARKER"), "{text}");
+        assert!(text.contains("no seal marker reads at file 40"), "{text}");
+        assert!(text.contains("NOT a"), "{text}");
+        assert!(text.contains("copy"), "{text}");
+        assert!(text.contains("tapectl volume retire L6-0009"), "{text}");
+        assert!(text.contains("tapectl cartridge erase"), "{text}");
+        assert!(
+            !text.contains("volume resume"),
+            "no verify seals it: {text}"
+        );
+
+        let over_sealed = RebuildReport {
+            found_volume_status: Some("sealed".to_string()),
+            ..inserted.clone()
+        };
+        let text = super::unsealed_tape_lines(&over_sealed).join("\n");
+        assert!(text.contains("already holds"), "{text}");
+        assert!(text.contains("\"sealed\""), "{text}");
+        assert!(text.contains("left that row alone"), "{text}");
+    }
+
     /// Issue #305: the tape's dates are printed, and an absent one is named
     /// as unknown rather than dropped.
     #[test]
@@ -1173,7 +1284,7 @@ mod tests {
         );
         let none = super::tape_dates_line(None, None, None);
         assert!(none.contains("File 0 has no created_at"), "{none}");
-        assert!(none.contains("no readable seal marker"), "{none}");
+        assert!(none.contains("no valid seal marker"), "{none}");
         assert!(none.ends_with("chip load count at write unknown"), "{none}");
     }
 
