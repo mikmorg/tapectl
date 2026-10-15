@@ -111,6 +111,13 @@ unit again. Opening the catalog takes the write lock only to recover a
 crashed session, so read-only commands such as `report`, `catalog` and `db
 backup` run while another command writes.
 
+`volume retire`, `cartridge retire`, `cartridge mark-erased`, `volume
+compact-finish` and `volume move` also exit **75** when a live `volume init`,
+`write`, `resume` or `verify` holds the volume's session lock (#461). They wait
+for nothing and change nothing; the message is `error: volume "L" has a live
+session (held by pid N: ...): refusing to ...`. Run the command again once that
+one has finished. A `--dry-run` is not refused.
+
 `volume verify` keeps its own contract: a busy catalog is one more way to
 reach no verdict, so it exits 3. A write that the busy catalog stops after its
 session began exits by the write table instead (4, or 3 during the confirm).
@@ -127,7 +134,7 @@ are left as, so a script knows what to do next without parsing the message:
 | Exit | Meaning | What to do |
 |---|---|---|
 | 0 | **sealed and confirmed** | nothing (`collection run` exits 1 instead when it also refused a unit, [above](#exit-codes)) |
-| 2 | an error, **the medium untouched**: refused before anything was written, or a usage error. That covers an unknown label or one that is not a write target, the wrong cartridge (the File 0 check), an empty drive, a drive that cannot write the medium, a layout over the fill ceiling, the quiet-host pre-flight, `--dry-run`, a resume whose revalidation failed or whose File 0 would not read, a stage that failed before the write (`collection run`, `quick-archive`), and a signal before the tape moved (`--prewrite-hash`'s full hash, a stage). A session that existed before the command is left as it was | read the `error:` line, fix it, run the command again |
+| 2 | an error, **the medium untouched**: refused before anything was written, or a usage error. That covers an unknown label or one that is not a write target, the wrong cartridge (the File 0 check), an empty drive, a drive that cannot write the medium, a layout over the fill ceiling, the quiet-host pre-flight, `--dry-run`, a resume whose revalidation failed or whose File 0 would not read, a stage that failed before the write (`collection run`, `quick-archive`), and a signal before the tape moved (`--prewrite-hash`'s full hash, a stage). A session that existed before the command is left as it was. With `volume write --init`, a refusal only the tape contact can raise (the capacity gate, the quiet-host question) exits 2 although the cartridge was initialised: stderr says the volume stays initialized, and `--json` carries `"initialized": true` and `"volume_status": "initialized"`; run `tapectl volume write L` without `--init`. A refusal the catalog alone can raise (nothing staged, a staged slice missing, a tenant without a key, no escrow) comes before the cartridge is touched and leaves no volume (#445) | read the `error:` line, fix it, run the command again |
 | 3 | **confirm inconclusive**: the seal is on the tape and recorded, and the readback after it reached no verdict (a read or transport failure, as `volume verify`'s 3) | check the drive, reload the same cartridge, `tapectl volume resume <label>` re-enters the confirm |
 | 4 | **interrupted**: a signal, or a drive, staging-disk or catalog error, stopped the session part-way (writing, sealing, or a full confirm stopped by a signal). The tape is left as the session left it | fix the cause, reload the same cartridge, `tapectl volume resume <label>` (with `--full-confirm` when the message says so) |
 | 5 | **aborted**: the session cannot resume — the medium ran out (end of tape) or a staged slice changed while it was written. The tape is left unsealed | write the label again with `tapectl volume write <label>` once the cause is fixed (a full tape needs a smaller batch or another cartridge) |
@@ -1485,7 +1492,9 @@ error: no staged data to write — run `tapectl stage create` first
 ```
 
 Nothing is in staging. Snapshot and stage the units first
-([walkthrough](walkthrough.md#7-stage)).
+([walkthrough](walkthrough.md#7-stage)). `volume write --init` reports it before
+it initialises the cartridge: nothing is written to the tape and no volume row is
+made (#445).
 
 ### `volume write` writes everything in staging
 
