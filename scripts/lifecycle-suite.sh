@@ -2399,6 +2399,26 @@ rr_write_second_copy_volb() {
     vinit VOL-B && TCTL volume write VOL-B --device "$TAPE_DEV" --yes
 }
 
+# #440: VOL-B is copy 2 of every unit's v1, so its own `volume write` releases
+# the staged slices (no --keep-staging). The on-media proof of the release:
+# stage sets exist, at least one is `cleaned`, and none is left `staged`.
+rr_staging_released_by_second_copy() {
+    if [ "$SINGLE_CARTRIDGE" = 1 ]; then
+        skip "rr.staging_released_by_second_copy" "depends on rr.write_second_copy_volb, itself SKIP under --single-cartridge"
+        return $?
+    fi
+    [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl stage list --json; assert stage sets exist, one is cleaned, none staged"; return 0; }
+    TCTL stage list --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+rows = [r for r in (d if isinstance(d, list) else d.get("stage_sets", [])) if isinstance(r, dict)]
+st = [r.get("status") for r in rows]
+assert rows, "stage list is empty: nothing to judge"
+assert "cleaned" in st, f"no stage set was released by the second copy: {st}"
+assert "staged" not in st, f"a stage set is still staged after the copy that completes min_copies: {st}"
+'
+}
+
 rr_retire_vola_succeeds_with_coverage() {
     if [ "$SINGLE_CARTRIDGE" = 1 ]; then
         skip "rr.retire_vola_succeeds_with_coverage" "depends on rr.write_second_copy_volb, itself SKIP under --single-cartridge"
@@ -2524,6 +2544,7 @@ PY
     check rr.mark_erased_before_retire_refused rr_mark_erased_before_retire_refused
     check rr.retire_refused_sole_copy          rr_retire_refused_sole_copy
     check rr.write_second_copy_volb            rr_write_second_copy_volb
+    check rr.staging_released_by_second_copy   rr_staging_released_by_second_copy
     check rr.retire_vola_succeeds_with_coverage rr_retire_vola_succeeds_with_coverage
     check rr.volinit_volx_refused_no_force     rr_volinit_volx_refused_no_force
     check rr.volinit_volx_refused_with_force   rr_volinit_volx_refused_with_force
