@@ -1682,9 +1682,16 @@ fn read_error_trend_findings(conn: &Connection, factor: f64) -> Result<Vec<Audit
                 },
                 check: "read_error_trend".into(),
                 message: crate::tape::read_errors::rise_message(&t, rise, factor),
+                // #468 item 4: `volume write` of a label no `volume init` made
+                // is `VolumeNotFound`, so the fresh cartridge is initialised
+                // as that volume by the write itself (`--init`, ADR-0012
+                // 2026-10-15 item 59) or by `volume init` first, which a
+                // cartridge needing `--generation` or `--cartridge` must do.
                 action: format!(
                     "tapectl volume read-slices --from {volume} --unit <UNIT> for each unit on \
-                     it, then tapectl volume write <NEW_LABEL> on a fresh cartridge"
+                     it, then load a fresh cartridge and run tapectl volume write <NEW_LABEL> \
+                     --init (or tapectl volume init <NEW_LABEL> first, if the cartridge needs \
+                     --generation or --cartridge)"
                 ),
             })
         })
@@ -5734,6 +5741,42 @@ mod tests {
             assert!(
                 !warnings.iter().any(|w| w.check == "read_error_trend"),
                 "{warnings:?}"
+            );
+        }
+
+        /// #468 item 4: the remedy names a write of a NEW volume, and
+        /// `volume write <label>` alone is `VolumeNotFound` for a label no
+        /// `volume init` made. Every command the action names is parsed by
+        /// the CLI's own definition (placeholders filled in), and the
+        /// bare write is not among them.
+        #[test]
+        fn the_remedy_names_commands_the_cli_accepts() {
+            use clap::Parser;
+            let conn = crate::db::open_memory().unwrap();
+            read_errors::tests::seed_verifies(&conn, "C-RISE", &[1, 5]);
+            let findings =
+                read_error_trend_findings(&conn, read_errors::DEFAULT_RISE_FACTOR).unwrap();
+            let action = &findings[0].action;
+
+            for command in [
+                "tapectl volume read-slices --from V-C-RISE --unit <UNIT>",
+                "tapectl volume write <NEW_LABEL> --init",
+                "tapectl volume init <NEW_LABEL>",
+            ] {
+                assert!(action.contains(command), "{command:?} is not in: {action}");
+                let argv: Vec<String> = command
+                    .replace("<UNIT>", "photos")
+                    .replace("<NEW_LABEL>", "L6-0009")
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect();
+                crate::cli::Cli::try_parse_from(&argv)
+                    .unwrap_or_else(|e| panic!("{command:?} is not a command line: {e}"));
+            }
+            assert_eq!(
+                action.matches("volume write <NEW_LABEL>").count(),
+                action.matches("volume write <NEW_LABEL> --init").count(),
+                "every write of the new label carries --init: {action}"
             );
         }
 
