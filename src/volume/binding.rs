@@ -2045,6 +2045,42 @@ mod tests {
         .unwrap();
     }
 
+    /// Issue #434: the chip proof is a clean zero from a read that also
+    /// named the cartridge. A missing attribute (mhvtl, a failed read), a
+    /// non-zero total, or no serial is nothing.
+    #[test]
+    fn the_chip_proves_blank_only_on_a_clean_zero_that_names_its_cartridge() {
+        let mam = |serial: Option<&str>, life: Option<i64>| MamInfo {
+            serial: serial.map(str::to_string),
+            life_written_mib_raw: life,
+            ..MamInfo::default()
+        };
+        assert_eq!(
+            chip_blank_proof(&mam(Some("S"), Some(0))),
+            Some(BlankProof::Chip {
+                serial: "S".into(),
+                life_written_mib: 0
+            })
+        );
+        assert_eq!(chip_blank_proof(&mam(Some("S"), Some(1))), None);
+        assert_eq!(chip_blank_proof(&mam(Some("S"), None)), None);
+        assert_eq!(chip_blank_proof(&mam(None, Some(0))), None);
+        assert_eq!(chip_blank_proof(&MamInfo::default()), None);
+    }
+
+    /// Issue #434: every operation is classified (the match is exhaustive),
+    /// and the writers are exactly the three that open a tape to record on it.
+    #[test]
+    fn only_init_write_and_resume_contacts_count_as_writes() {
+        let writers: Vec<&str> = Operation::ALL
+            .iter()
+            .copied()
+            .filter(|op| operation_may_write_the_medium(*op))
+            .map(Operation::as_str)
+            .collect();
+        assert_eq!(writers, ["volume init", "volume write", "volume resume"]);
+    }
+
     /// Issue #400: the live volumes on the cartridge whose chip serial is
     /// given — sealed and open-mounted counts, an `initialized` or a
     /// closed-mount one does not, and no serial names nothing.

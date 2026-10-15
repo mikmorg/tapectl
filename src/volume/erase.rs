@@ -659,6 +659,22 @@ fn erase_in_contact(
     let mut store = TapeStore::open_read(device, opts.block_size)?;
     let Identified { mut report, file0 } = identify(&mut store, device, opts.mode, serial);
     drop(store);
+    // Issue #434: an unreadable File 0 on a cartridge whose chip reads zero
+    // MiB ever written is not "another block size" or "a medium error" -- it
+    // is a cartridge no drive has written, which has no end-of-data mark to
+    // prove itself blank by. Said as that, and with what `volume init` will
+    // do with it (the same chip reading, `binding::chip_blank_proof`).
+    if report.medium == MediumKind::Unreadable {
+        if let Some(binding::BlankProof::Chip { .. }) = binding::chip_blank_proof(&before.mam) {
+            report.detail = Some(
+                "never written (chip: 0 MiB written in its life): File 0 cannot be read and \
+                 the tape has no end-of-data mark to prove itself blank by, because no drive \
+                 ever wrote it. `volume init` takes the chip's word for it and needs no \
+                 `--force`; there is nothing here to erase."
+                    .to_string(),
+            );
+        }
+    }
 
     let nothing_to_do = match report.medium {
         MediumKind::Blank => true,
@@ -1130,6 +1146,17 @@ mod tests {
         o: EraseOptions<'_>,
         serials: &[Option<&str>],
     ) -> Result<EraseReport> {
+        run_with(conn, fake, o, serials, None)
+    }
+
+    /// [`run`], the chip also reporting `life_written_mib` MiB ever written.
+    fn run_with(
+        conn: &Connection,
+        fake: &FakeTape,
+        o: EraseOptions<'_>,
+        serials: &[Option<&str>],
+        life_written_mib: Option<i64>,
+    ) -> Result<EraseReport> {
         let _drive = InjectedDrive::install(fake);
         let mut reads: std::collections::VecDeque<Option<&str>> = serials.iter().copied().collect();
         let mut last = serials[0];
@@ -1137,7 +1164,9 @@ mod tests {
             if let Some(s) = reads.pop_front() {
                 last = s;
             }
-            detected(last)
+            let mut d = detected(last);
+            d.mam.life_written_mib_raw = life_written_mib;
+            d
         };
         let config = config();
         let mut slot = ContactSlot::empty().with_drive_identity(DriveIdentity {
@@ -1566,6 +1595,40 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("not provably blank"));
+    }
+
+    /// Issue #434: the same unreadable File 0, on a chip that reads zero MiB
+    /// ever written, is a cartridge nobody has written -- reported as that,
+    /// not as another block size or a medium error, and still `Unreadable`
+    /// (the JSON kind is unchanged). A chip that reads anything else, or
+    /// nothing, keeps the old words.
+    #[test]
+    fn an_unreadable_tape_on_a_chip_reading_zero_written_is_reported_never_written() {
+        for (life, never_written) in [(Some(0), true), (Some(5), false), (None, false)] {
+            let conn = crate::db::open_memory().unwrap();
+            let fake = FakeTape::with_files(vec![pad(vec![1u8; 10]), pad(vec![2u8; 10])], BS);
+            fake.state().unreadable = vec![0];
+            let report = run_with(
+                &conn,
+                &fake,
+                opts(EraseMode::Short, None, true),
+                &[Some(SERIAL)],
+                life,
+            )
+            .expect("dry run");
+            assert_eq!(report.medium, MediumKind::Unreadable);
+            let detail = report.detail.as_deref().unwrap();
+            assert_eq!(
+                detail.contains("never written (chip: 0 MiB written in its life)"),
+                never_written,
+                "{life:?}: {detail}"
+            );
+            assert_eq!(
+                detail.contains("not provably blank"),
+                !never_written,
+                "{life:?}: {detail}"
+            );
+        }
     }
 
     /// A blank tape: reported blank, nothing written, nothing recorded, and

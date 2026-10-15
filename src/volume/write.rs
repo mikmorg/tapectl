@@ -142,6 +142,19 @@ fn volume_uuid(conn: &Connection, volume_id: i64) -> Result<String> {
 /// `volume_init`, `volume_write` and `volume_resume` all reach the exact
 /// same message rather than three copies that could drift.
 ///
+/// **Blank proofs (issue #434; ADR-0012 amendment 2026-10-15, item 57).**
+/// File 0 is the consent point (ADR-0003) and it fails closed: where it
+/// cannot be read, or reads EMPTY, `--force` was the only way past. Two
+/// pieces of evidence now stand in for it, each for the one outcome it
+/// explains and consulted only there ([`check_fresh_write_contact_on`]): the
+/// chip reading already held from the MAM read above (lifetime written 0
+/// MiB: a never-written cartridge, which has no EOD to prove itself blank by)
+/// and this catalog's own verified `cartridge erase` with no write since (an
+/// EMPTY File 0 is then that erase's filemark). Both live in
+/// [`binding::BlankProof`]. The proof used is printed once and recorded in
+/// the volume's `created` event details; every tape neither explains refuses
+/// as before. `volume write` consults neither.
+///
 /// **The post-command sweep (issue #339).** ADR-0013's 2026-09-23 evening
 /// amendment rules that every contact takes ONE log-page sweep, `volume
 /// init` included — it is the first contact a cartridge gets on a drive,
@@ -12653,6 +12666,64 @@ mod tests {
             err.contains("L6-0001") && err.contains("--force cannot override"),
             "{err}"
         );
+    }
+
+    /// Issue #434, the pure decision: each blank proof explains exactly the
+    /// File 0 outcome it is paired with and no other; a mismatch or a sealed
+    /// volume never looks at one; a live volume on the cartridge is refused
+    /// before the chip is believed.
+    #[test]
+    fn a_blank_proof_explains_only_the_outcome_it_pairs_with() {
+        let chip = binding::BlankProof::Chip {
+            serial: "SER-1".into(),
+            life_written_mib: 0,
+        };
+        let erase = binding::BlankProof::VerifiedErase {
+            barcode: "SER-1".into(),
+            mode: "short".into(),
+            erased_at: "2026-10-15 00:00:00".into(),
+            erase_contact_id: 7,
+        };
+        let unreadable = ContactOutcome::FileZeroUnreadable {
+            error: "read: Input/output error (os error 5)".into(),
+        };
+        let empty = ContactOutcome::EmptyFileZero;
+        let decide = |outcome: &ContactOutcome, force, live: &[String], p| {
+            decide_fresh_write_contact_on(outcome, FW_LABEL, FW_UUID, force, live, p)
+        };
+
+        // The pairings, without --force.
+        decide(&unreadable, false, &[], Some(&chip)).unwrap();
+        decide(&empty, false, &[], Some(&erase)).unwrap();
+        // The crossed pairings explain nothing.
+        assert!(decide(&unreadable, false, &[], Some(&erase)).is_err());
+        assert!(decide(&empty, false, &[], Some(&chip)).is_err());
+        // No proof is today's refusal.
+        assert!(decide(&unreadable, false, &[], None).is_err());
+        assert!(decide(&empty, false, &[], None).is_err());
+
+        // A live volume on the cartridge is refused before the chip is
+        // believed, force or no force.
+        let live = vec!["L6-0001".to_string()];
+        for force in [false, true] {
+            let err = decide(&unreadable, force, &live, Some(&chip))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--force cannot override"), "{err}");
+        }
+
+        // Neither reaches an outcome that READ as something.
+        let mismatch = ContactOutcome::IdentityMismatch { found: None };
+        let sealed = ContactOutcome::AlreadySealed { seal_position: 12 };
+        for p in [&chip, &erase] {
+            assert!(decide(&mismatch, false, &[], Some(p)).is_err());
+            for force in [false, true] {
+                let err = decide(&sealed, force, &[], Some(p))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("ADR-0003"), "{err}");
+            }
+        }
     }
 
     #[test]
