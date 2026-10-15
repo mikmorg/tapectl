@@ -423,8 +423,8 @@ WARNINGS (1):
 audit: 4 violations, 1 warnings (exit 2)
 ```
 
-One copy is not enough. The staged slices are still on disk (a write does not remove
-them), so the second copy is just another cartridge. With L8-0001 out of the drive
+One copy is not enough. The staged slices are still on disk (a write removes them only once
+every unit has its `min_copies`, and this is the first of two copies), so the second copy is just another cartridge. With L8-0001 out of the drive
 and on its shelf, load a second **blank** one first: `volume init` refuses any tape
 that already carries a volume label, and on a sealed tape `--force` does not change
 that.

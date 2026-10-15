@@ -4370,7 +4370,7 @@ csc_capture_staged() {
 csc_second_copy() {
     next_tape VOL-CS2 || return 1
     vinit VOL-CS2 || return 1
-    TCTL volume write VOL-CS2 --device "$TAPE_DEV" --yes
+    TCTL volume write VOL-CS2 --device "$TAPE_DEV" --yes --keep-staging
 }
 
 csc_same_staged_bytes() {
@@ -4403,9 +4403,11 @@ for r in rows:
 PY2
 }
 
-# Only NOW does staging release -- and it takes the operator asking. `volume
-# write` never calls `clean_staging`; `collection run` did not because #238's
-# gate held. This is the third state, after "retained" and "consumed".
+# Only NOW does staging release -- and it takes the operator asking: the second
+# copy's `volume write` passed --keep-staging, so the fingerprint still has live
+# bytes (without the flag that write releases them itself, #440); `collection run`
+# did not because #238's gate held. This is the third state, after "retained" and
+# "consumed".
 csc_staging_released() {
     [ "$DRY_RUN" = 1 ] && { echo "PLAN: tapectl staging clean; assert every stage set is 'cleaned' and no .age file survives under the staging directory"; return 0; }
     local f="$RUN/log-csc.clean.txt" lf="$RUN/log-csc.staged-final.json"

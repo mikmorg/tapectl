@@ -418,6 +418,12 @@ flags read back the same copy; `--full-confirm-first` says what you mean if
 runs ever write more. A second copy written afterwards with `volume write`
 gets the quick confirm unless you pass it `--full-confirm`.
 
+`volume write` and `volume resume` release staging the same way (#440): once the
+copy they seal brings every unit written to the volume to its `min_copies`, they
+release those units' staged slices, and name any unit still short. Pass
+`--keep-staging` to hold them, for example for a full `volume verify` first, and
+run `staging clean` afterwards.
+
 A collection archives only its units: the real folders at exactly
 `unit_depth` below its root, and everything inside them. Anything else under
 the root down to that depth is in no unit and never reaches a tape: a loose
@@ -738,7 +744,7 @@ total: 4 slices, 50.0 MiB
 ```
 
 That is by design, not a bug: staging happens once and a stage set stays
-`staged` until `staging clean` releases it, which is what lets you write the
+`staged` until the write that completes its copies, or `staging clean`, releases it, which is what lets you write the
 same data to a second and third cartridge without re-archiving it (ADR-0006).
 The consequence is that a stage set left over from last week rides along on
 today's tape. **Read the list.** This is write-once media — a tape that
@@ -1989,7 +1995,8 @@ $ tapectl report verify-status
 **First, every newly written volume.** A write's confirm reads back only the
 front index and the seal marker unless you passed `--full-confirm`, so a new
 volume has had none of its data read back. Give it a full `volume verify`
-soon after the write — best before `staging clean` releases its units, while
+soon after the write — pass `--keep-staging` to the write that completes a unit's
+copies (otherwise that write releases staging), so the verify runs while
 the staged slices can still rewrite a bad copy cheaply. `collection run` gives
 no such window: it releases staging right after its quick confirms, so use its
 `--full-confirm-first` (or `--full-confirm`, every copy) when the data matters (see

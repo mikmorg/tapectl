@@ -274,7 +274,8 @@ same day:
 1. Leave staging alone: the write does not release it. Load a second fresh cartridge,
    which must be a different cartridge from L6-0001.
 2. Run `tapectl-op volume init L6-0002 --device /dev/tape/by-id/scsi-HUJ808A5L4-nst`,
-   then `tapectl-op volume write L6-0002 --device …`, then `tapectl-op volume verify
+   then `tapectl-op volume write L6-0002 --device … --keep-staging` (1.1.1 releases staging
+   after the copy that completes the policy otherwise), then `tapectl-op volume verify
    L6-0002 --device … --full`.
 3. Run `tapectl-op volume move L6-0002 --to offsite`. If step 14 has not installed the
    wrapper yet, use `sudo -u tapectl -H tapectl` in place of `tapectl-op`.

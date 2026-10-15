@@ -1457,3 +1457,10 @@ Decided by the coordinator from existing rulings, recorded so they are not re-op
     records a contact and an event only.
 62. **The ops-group home pointer (`/etc/tapectl/home`) is ignored when the effective uid is 0**
     (#437), so root never acts on the service home and leaves root-owned files in it.
+63. **`volume write` and `volume resume` release staging by `collection run`'s rule** (#440): after
+    a write returns sealed and confirmed (quick or full), every unit with a completed write on the
+    volume is judged by `staging::release::release_if_covered` (the unit's least-covered live
+    version against its copy floor, tape-only multiplier included), all or nothing; otherwise
+    staging is kept and each short unit is named. `--keep-staging` opts out (first-run step 13
+    passes it and runs `staging clean` after its full verify). A failed release is a warning
+    (item 33). `staging clean` is unchanged.

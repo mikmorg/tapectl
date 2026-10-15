@@ -1325,7 +1325,7 @@ THIS VOLUME HAS AN INTERRUPTED WRITE. A run of this step (or a `volume write` by
 EOF
       quiet_host_check
       confirm "Resume the interrupted write of $LABEL on the cartridge in $DEVICE?" || die "stopped before resuming — re-run scripts/first-run.sh --from 13 --label $LABEL when ready"
-      run tc volume resume "$LABEL" --device "$DEVICE" || die "resume did not seal and confirm $LABEL — read the output; the catalog knows exactly why. Re-run scripts/first-run.sh --from 13 --label $LABEL once it is fixed"
+      run tc volume resume "$LABEL" --device "$DEVICE" --keep-staging || die "resume did not seal and confirm $LABEL — read the output; the catalog knows exactly why. Re-run scripts/first-run.sh --from 13 --label $LABEL once it is fixed"
       ;;
     live)
       die "volume $LABEL has a write session in progress RIGHT NOW (another process is writing it — tapectl turns a crashed session into an interrupted one whenever it opens the catalog). Find that process and let it finish; do not start a second writer"
@@ -1591,7 +1591,7 @@ EOF
   # A write that stops (a signal, a dropped session, an error mid-tape) is
   # picked up by re-running this step: it finds the interrupted session and
   # offers `volume resume` (issue #414).
-  run tc volume write "$LABEL" --device "$DEVICE" --yes || die "write did not seal — read the output; the catalog knows exactly why. If it was interrupted, reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session"
+  run tc volume write "$LABEL" --device "$DEVICE" --yes --keep-staging || die "write did not seal — read the output; the catalog knows exactly why. If it was interrupted, reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session"
 fi
   # Issue #265: a failed verify has TWO outcomes and they need opposite
   # responses. ADR-0012's 2026-09-17 amendment: only a mismatch that PROVES the
@@ -1604,6 +1604,10 @@ fi
   VERIFY_ERR="$(dirname "$LOG")/volume-verify-$LABEL.err"
   if run_capture_json_err "$VERIFY_JSON" "$VERIFY_ERR" tc volume verify "$LABEL" --device "$DEVICE" --full --json; then
     ok "$LABEL sealed and verified"
+    # #440: the write above kept staging (--keep-staging) so this full verify ran
+    # while the staged slices could still rewrite a bad copy. Now release what the
+    # policy's copies cover; under-copied units stay staged for the next copy.
+    run tc staging clean || note "staging clean did not finish: run tapectl staging clean when you want the staged slices released"
   else
     # The loaded tape is not this volume: verify corroborates the cartridge
     # before reading anything (src/volume/binding.rs `corroborate_volume`)
@@ -1651,7 +1655,7 @@ EOF
     esac
   fi
   explain <<'EOF'
-`audit` compares the catalog against policy. With one tape and a policy of two copies it will report copy_count violations — that is correct and advisory (exit 2 means "violations", not "broken"). The second copy is the next cartridge, and the staged slices are still on disk (a write does not release them): load a fresh cartridge and run `volume init <label-2>` then `volume write <label-2>`. Only if staging was already cleaned do you need `volume read-slices --from <label-1>` (with the FIRST tape loaded) to bring the slices back before writing the second.
+`audit` compares the catalog against policy. With one tape and a policy of two copies it will report copy_count violations — that is correct and advisory (exit 2 means "violations", not "broken"). The second copy is the next cartridge, and the staged slices are still on disk (staging is released only once every unit has its min_copies): load a fresh cartridge and run `volume init <label-2>` then `volume write <label-2>`. Only if staging was already cleaned do you need `volume read-slices --from <label-1>` (with the FIRST tape loaded) to bring the slices back before writing the second.
 EOF
   run tc audit || true
   if [ -n "$LOCATION" ]; then run tc volume move "$LABEL" --to "$LOCATION" || true; fi

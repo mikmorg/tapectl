@@ -70,7 +70,7 @@ the journal of everything done).
 | `permute` | Seeded random walk over the whole command surface (`--seed`/`--steps`) |
 | `stale-catalog-sealed-tape` | issue #208: a catalog restored from a backup taken before the write still calls the volume `initialized`; `volume write` must be refused by the tape-side seal check (the refusal cites ADR-0003), not by the catalog |
 | `cartridge-displacement` | mhvtl-only: needs two cartridges, and SKIPs like `compaction`. issue #226: erase a cartridge bound to a sealed volume in place and re-init it without `--force` (ADR-0010). The displaced volume becomes `erased`, and the warning must tell the unit left with zero copies apart from the one with a copy elsewhere; a restore matrix off that other copy proves it is real |
-| `collection-second-copy` | mhvtl-only: needs two cartridges, and SKIPs like `compaction`. issues #226/#229: `collection run` refuses a second `--label` before staging anything; one run writes copy 1 and keeps staging, a plain `volume write` makes copy 2 from the same staged bytes, a restore matrix runs off copy 2, then staging is released |
+| `collection-second-copy` | mhvtl-only: needs two cartridges, and SKIPs like `compaction`. issues #226/#229: `collection run` refuses a second `--label` before staging anything; one run writes copy 1 and keeps staging, a `volume write --keep-staging` makes copy 2 from the same staged bytes, a restore matrix runs off copy 2, then staging is released |
 
 ## The restore matrix
 
