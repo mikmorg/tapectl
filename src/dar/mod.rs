@@ -7,6 +7,7 @@ pub mod version;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::error::{Result, TapectlError};
@@ -44,6 +45,213 @@ pub(crate) fn command(binary: impl AsRef<OsStr>) -> Command {
         });
     }
     cmd
+}
+
+/// [`command`] for `dar -c`, with every `posix_fadvise` dar makes turned
+/// into a no-op that succeeds (issue #441).
+///
+/// dar advises `POSIX_FADV_DONTNEED` over each source file as it opens it
+/// and again as it closes it (strace of dar 2.7.13), and has no option to
+/// stop. That evicted the pages the hasher had just read beside it
+/// (`staging::validate`, issue #364), so dar read the source from disk a
+/// second time — 1.6x to 2.0x the source on vm-desk1. A seccomp filter
+/// installed in the child before it execs dar answers dar's `fadvise64`
+/// with 0 without running it, and `staging::validate` drops the source's
+/// pages itself once both readers have passed them. dar's arguments are
+/// untouched.
+///
+/// It fails open and never fails dar: on a kernel without seccomp filters
+/// ([`fadvise_filter_available`]), on an architecture other than x86_64
+/// and aarch64, for a dar of another ABI than tapectl's (the filter lets
+/// through every call it does not recognise), or when installing it fails
+/// in the child, dar runs as it did before, its advice taken. Only `dar -c`
+/// reads the source, so only it gets the filter.
+pub(crate) fn command_without_fadvise(binary: impl AsRef<OsStr>) -> Command {
+    let mut cmd = command(binary);
+    if fadvise_filter_available() {
+        no_fadvise::install(&mut cmd);
+    }
+    cmd
+}
+
+/// Whether [`command_without_fadvise`] can make dar's `posix_fadvise` a
+/// no-op here: probed once per process, and said once in the log.
+///
+/// The probe is systemd's (`is_seccomp_available`,
+/// src/shared/seccomp-util.c): `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER,
+/// NULL)` fails with EFAULT where the kernel has seccomp filters — it copies
+/// the program in before it checks anything else, so nothing is installed —
+/// and with EINVAL where it has none. Any other answer (EPERM from a policy
+/// that forbids the call) counts as none.
+pub(crate) fn fadvise_filter_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let probed = no_fadvise::probe();
+        match &probed {
+            Ok(()) => tracing::info!(
+                "seccomp filters are available: dar's posix_fadvise is a no-op while it \
+                 archives, so the source is read from disk once (issue #441)"
+            ),
+            Err(why) => tracing::warn!(
+                reason = %why,
+                "seccomp filters are not available: dar evicts each source file from the \
+                 page cache as it reads it, so stage create may read the source from disk \
+                 twice (issue #441)"
+            ),
+        }
+        probed.is_ok()
+    })
+}
+
+/// The seccomp filter of [`command_without_fadvise`].
+mod no_fadvise {
+    use std::process::Command;
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    use nix::libc;
+
+    /// `AUDIT_ARCH_X86_64` (linux/audit.h: `EM_X86_64 | __AUDIT_ARCH_64BIT |
+    /// __AUDIT_ARCH_LE`, EM_X86_64 = 62 in linux/elf-em.h). The libc crate
+    /// has no `AUDIT_ARCH_*`.
+    #[cfg(target_arch = "x86_64")]
+    const AUDIT_ARCH: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+    /// `fadvise64` on x86_64 (asm/unistd_64.h: 221).
+    #[cfg(target_arch = "x86_64")]
+    const NR_FADVISE64: u32 = libc::SYS_fadvise64 as u32;
+
+    /// `AUDIT_ARCH_AARCH64` (linux/audit.h: `EM_AARCH64 | __AUDIT_ARCH_64BIT |
+    /// __AUDIT_ARCH_LE`, EM_AARCH64 = 183 in linux/elf-em.h).
+    #[cfg(target_arch = "aarch64")]
+    const AUDIT_ARCH: u32 = 183 | 0x8000_0000 | 0x4000_0000;
+    /// `fadvise64` on aarch64: asm-generic/unistd.h's `__NR3264_fadvise64`,
+    /// 223, which the libc crate does not name for aarch64.
+    #[cfg(target_arch = "aarch64")]
+    const NR_FADVISE64: u32 = 223;
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    const LEN: usize = 6;
+
+    /// linux/filter.h's `BPF_STMT`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn stmt(code: u32, k: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code: code as u16,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+
+    /// linux/filter.h's `BPF_JUMP`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn jump(code: u32, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+        libc::sock_filter {
+            code: code as u16,
+            jt,
+            jf,
+            k,
+        }
+    }
+
+    /// The filter: a call of tapectl's own architecture to `fadvise64`
+    /// returns 0 without running (`SECCOMP_RET_ERRNO` with errno 0); every
+    /// other call, and every call of another architecture, runs.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn program() -> [libc::sock_filter; LEN] {
+        use libc::{
+            BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W, SECCOMP_RET_ALLOW,
+            SECCOMP_RET_ERRNO,
+        };
+        let arch = std::mem::offset_of!(libc::seccomp_data, arch) as u32;
+        let nr = std::mem::offset_of!(libc::seccomp_data, nr) as u32;
+        [
+            stmt(BPF_LD | BPF_W | BPF_ABS, arch),
+            // Another architecture: on to the last instruction, ALLOW.
+            jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH, 0, 3),
+            stmt(BPF_LD | BPF_W | BPF_ABS, nr),
+            jump(BPF_JMP | BPF_JEQ | BPF_K, NR_FADVISE64, 0, 1),
+            // The errno is 0: the call returns 0, success, and does nothing.
+            stmt(BPF_RET | BPF_K, SECCOMP_RET_ERRNO),
+            stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        ]
+    }
+
+    /// See [`super::fadvise_filter_available`].
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub(super) fn probe() -> Result<(), String> {
+        // SAFETY: a null program: the kernel fails the call reading it, and
+        // installs nothing.
+        let r = unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
+        let e = std::io::Error::last_os_error();
+        match (r, e.raw_os_error()) {
+            (r, Some(libc::EFAULT)) if r < 0 => Ok(()),
+            (r, _) if r < 0 => Err(format!("prctl(PR_SET_SECCOMP) probe: {e}")),
+            _ => Err("prctl(PR_SET_SECCOMP) probe unexpectedly succeeded".into()),
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn probe() -> Result<(), String> {
+        Err(format!(
+            "no filter is built for {}, only x86_64 and aarch64",
+            std::env::consts::ARCH
+        ))
+    }
+
+    /// Install the filter in `cmd`'s child, after [`super::command`]'s own
+    /// `pre_exec`.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub(super) fn install(cmd: &mut Command) {
+        use std::os::unix::process::CommandExt;
+        // Built here, before the fork, and moved into the closure: the
+        // child allocates nothing.
+        let mut filter = program();
+        // SAFETY: the closure runs in the forked child before exec. It
+        // allocates nothing — the program was built before the fork and the
+        // `sock_fprog` is on the stack — and calls only `prctl`, a bare
+        // system call, async-signal-safe as `command`'s own `prctl` is.
+        unsafe {
+            cmd.pre_exec(move || {
+                let prog = libc::sock_fprog {
+                    len: LEN as libc::c_ushort,
+                    filter: filter.as_mut_ptr(),
+                };
+                // An unprivileged process installs a filter only under
+                // no_new_privs (seccomp(2)); the kernel refuses
+                // PR_SET_NO_NEW_PRIVS unless arguments 3 to 5 are 0.
+                if libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                ) == 0
+                {
+                    libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                        &prog as *const libc::sock_fprog as libc::c_ulong,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                    );
+                }
+                // Either failing leaves dar as it was, its advice taken:
+                // never a reason not to run it.
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn install(_cmd: &mut Command) {}
 }
 
 /// Run `cmd` to completion like [`Command::output`], but stop it when a
@@ -115,6 +323,62 @@ fn terminate(child: &mut Child) -> Option<ExitStatus> {
     }
     let _ = child.kill();
     child.wait().ok()
+}
+
+/// Test-only: how much of `path` is in the page cache, as `(resident pages,
+/// pages)` — `mincore(2)` over a read-only mapping of it, which faults
+/// nothing in (issue #441).
+#[cfg(test)]
+pub(crate) fn resident_pages(path: &std::path::Path) -> (usize, usize) {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap();
+    let len = file.metadata().unwrap().len() as usize;
+    if len == 0 {
+        return (0, 0);
+    }
+    // SAFETY: `sysconf` has no preconditions.
+    let page = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) } as usize;
+    let pages = len.div_ceil(page);
+    let mut vec = vec![0u8; pages];
+    // SAFETY: a fresh read-only shared mapping of a file this function holds
+    // open, the length its size; `vec` has one byte per page of it, as
+    // `mincore` writes; the mapping is unmapped before returning.
+    unsafe {
+        let addr = nix::libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            nix::libc::PROT_READ,
+            nix::libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        );
+        assert_ne!(addr, nix::libc::MAP_FAILED, "mmap {}", path.display());
+        let r = nix::libc::mincore(addr, len, vec.as_mut_ptr());
+        let e = std::io::Error::last_os_error();
+        nix::libc::munmap(addr, len);
+        assert_eq!(r, 0, "mincore {}: {e}", path.display());
+    }
+    (vec.iter().filter(|b| **b & 1 != 0).count(), pages)
+}
+
+/// Test-only: write `len` bytes to `path`, synced — `POSIX_FADV_DONTNEED`
+/// drops clean pages only — and read them back into the page cache.
+#[cfg(test)]
+pub(crate) fn write_warm(path: &std::path::Path, len: usize) {
+    use std::io::Write;
+    let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8 + 1).collect();
+    let mut f = std::fs::File::create(path).unwrap();
+    f.write_all(&data).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    warm(path);
+}
+
+/// Test-only: read `path` to its end, so its pages are in the page cache.
+#[cfg(test)]
+pub(crate) fn warm(path: &std::path::Path) {
+    let mut f = std::fs::File::open(path).unwrap();
+    std::io::copy(&mut f, &mut std::io::sink()).unwrap();
 }
 
 #[cfg(test)]

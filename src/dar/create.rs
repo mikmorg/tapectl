@@ -39,9 +39,16 @@ pub struct DarCreateParams<'a> {
 /// file that changed during its read is saved once, marked dirty.
 const EXIT_FILES_CHANGED: i32 = 11;
 
-/// The `dar -c -` command for `params`.
+/// The `dar -c -` command for `params`, with dar's `posix_fadvise` a
+/// no-op ([`super::command_without_fadvise`], issue #441). The filter is no
+/// argument: dar's argv, and the recorded `dar_command`, are what they were.
 pub fn create_command(params: &DarCreateParams) -> Command {
-    let mut cmd = super::command(params.dar_binary);
+    with_create_args(super::command_without_fadvise(params.dar_binary), params)
+}
+
+/// `cmd` (dar, its child set up) with the arguments of `dar -c -` for
+/// `params`.
+fn with_create_args(mut cmd: Command, params: &DarCreateParams) -> Command {
     // The archive goes to standard output (issue #370). dar refuses `-s`
     // there ("Slicing (-s option), is not compatible with archive on
     // standard output"), so the slicing is tapectl's (`dar::slice`).
@@ -163,12 +170,31 @@ pub fn spawn_archive(params: &DarCreateParams) -> Result<DarStream> {
     let mut cmd = create_command(params);
     let dar_command = recorded_command(&cmd, params);
     info!(command = %format!("{cmd:?}"), "running dar");
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| TapectlError::Dar(format!("cannot run dar: {e}")))?;
+    let spawn = |cmd: &mut Command| {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    };
+    let mut child = match spawn(&mut cmd) {
+        // The filter needs no_new_privs, under which a security module
+        // (SELinux, AppArmor) refuses an exec that would change dar's
+        // domain, with EPERM. dar runs without the filter then, as it did
+        // before issue #441: the filter is never a reason not to stage.
+        Err(e)
+            if e.raw_os_error() == Some(nix::libc::EPERM)
+                && super::fadvise_filter_available() =>
+        {
+            tracing::warn!(
+                error = %e,
+                "dar could not start under no_new_privs; running it without the \
+                 fadvise filter, so it may read the source from disk twice (issue #441)"
+            );
+            spawn(&mut with_create_args(super::command(params.dar_binary), params))
+        }
+        spawned => spawned,
+    }
+    .map_err(|e| TapectlError::Dar(format!("cannot run dar: {e}")))?;
     let stdout = child.stdout.take();
     let stderr = super::drain(child.stderr.take());
     Ok(DarStream {
@@ -581,6 +607,90 @@ mod tests {
         assert!(!rec.contains("/home/op"), "{rec}");
         assert!(rec.contains("\"-@\" \"<catalogue>\""), "{rec}");
         assert!(rec.contains("\"-c\" \"-\" \"-N\""), "{rec}");
+    }
+
+    /// Issue #441: dar advises `POSIX_FADV_DONTNEED` over every source file
+    /// it opens, evicting what the hasher just read, so dar read the source
+    /// from disk a second time. Through dar's create command a child's
+    /// `posix_fadvise` is a no-op; through the plain [`super::super::command`]
+    /// (the negative control) it evicts the file. dar itself is not run: a
+    /// stand-in in its place ignores dar's arguments and makes the call.
+    #[test]
+    fn the_create_command_keeps_a_childs_fadvise_from_evicting_the_page_cache() {
+        let probe = Command::new("python3").arg("--version").output();
+        if !matches!(&probe, Ok(o) if o.status.success()) {
+            eprintln!("SKIP fadvise filter test: python3 is not on PATH ({probe:?})");
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("warm.bin");
+        crate::dar::write_warm(&file, 4 << 20);
+        let fake_dar = tmp.path().join("fake-dar");
+        std::fs::write(
+            &fake_dar,
+            "#!/usr/bin/env python3\n\
+             import os\n\
+             fd = os.open(os.environ['TAPECTL_TEST_FADVISE_FILE'], os.O_RDONLY)\n\
+             os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_dar, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |mut cmd: Command| {
+            let out = cmd
+                .env("TAPECTL_TEST_FADVISE_FILE", &file)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "the stand-in for dar failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        let (warmed, pages) = crate::dar::resident_pages(&file);
+        if warmed * 4 < pages * 3 {
+            eprintln!(
+                "SKIP fadvise filter test: only {warmed} of {pages} pages of a file just \
+                 read are resident under {}",
+                tmp.path().display()
+            );
+            return;
+        }
+        // The negative control: without the filter the advice evicts.
+        run(super::super::command(&fake_dar));
+        let (plain, _) = crate::dar::resident_pages(&file);
+        if plain * 4 > pages {
+            eprintln!(
+                "SKIP fadvise filter test: POSIX_FADV_DONTNEED left {plain} of {pages} \
+                 pages resident under {} (a filesystem that keeps them, e.g. tmpfs), so \
+                 eviction is not observable here",
+                tmp.path().display()
+            );
+            return;
+        }
+
+        if !crate::dar::fadvise_filter_available() {
+            eprintln!(
+                "SKIP fadvise filter test: this kernel has no seccomp filters, so dar's \
+                 create command runs without one (as it did before issue #441)"
+            );
+            return;
+        }
+        crate::dar::warm(&file);
+        let on_fly = tmp.path().join("onfly");
+        let p = DarCreateParams {
+            dar_binary: fake_dar.to_str().unwrap(),
+            ..params(Path::new("/nonexistent-source"), &on_fly)
+        };
+        run(create_command(&p));
+        let (kept, _) = crate::dar::resident_pages(&file);
+        assert!(
+            kept * 4 >= pages * 3,
+            "through dar's create command the child's DONTNEED must be a no-op: \
+             {kept} of {pages} pages resident (plain command: {plain})"
+        );
     }
 
     /// `dar -l -alist-ea` for the archive at `base`: one line per entry,
