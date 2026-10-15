@@ -476,6 +476,9 @@ pub fn run(
                         // `volume resume` can still re-confirm.
                         "session_dirs_awaiting_reconfirm": report.session_dirs_awaiting_reconfirm,
                         "lockfiles_reclaimed": report.lockfiles_reclaimed,
+                        // Issue #465 item 5: a killed run's catalogue
+                        // directories and <home>/tmp entries a day old.
+                        "home_leftovers_reclaimed": report.home_leftovers_reclaimed,
                         // Issue #108: nothing will ever rediscover these,
                         // so a scripted consumer needs the paths, not a count.
                         "stranded": report.stranded,
@@ -505,11 +508,13 @@ pub fn run(
                     crate::util::format_bytes_binary(report.bytes_freed),
                 );
                 println!(
-                    "  sessions: {} reclaimed, {} retained, {} orphaned; {} lockfiles reclaimed",
+                    "  sessions: {} reclaimed, {} retained, {} orphaned; {} lockfiles reclaimed; \
+                     {} leftovers of killed runs removed",
                     report.session_dirs_reclaimed,
                     report.session_dirs_retained,
                     report.session_dirs_orphaned,
                     report.lockfiles_reclaimed,
+                    report.home_leftovers_reclaimed,
                 );
                 if report.errors > 0 {
                     println!("  {} errors", report.errors);

@@ -1164,6 +1164,51 @@ you archive the new contents, compare the file against a copy you trust.
 and names that version, so a file you edited on purpose since an older
 version is not reported.
 
+### The stage would not archive what the snapshot lists (1.1.2)
+
+Three refusals and one warning keep the catalogue and the tape saying the same
+thing (#464, #465). Each refuses before the stage set is marked staged, so
+nothing is staged and the source is untouched.
+
+```text
+error: the snapshot lists 1 file the unit's exclude patterns now exclude: <path>. dar would skip
+them, but the catalogue would record them as archived. ...
+```
+
+An exclude pattern (the unit's `.tapectl-unit.toml` `[excludes]`, or
+`[defaults] global_excludes`) changed after the snapshot. Take a new snapshot
+(`tapectl snapshot create <unit>`) and stage that, or remove the exclude.
+
+```text
+error: dar's catalogue does not list the files the stage hashed, so the stage set is not marked
+staged. Nothing was staged. dar did not archive 1 file that were hashed: <path>. ...
+```
+
+After dar ran, the files its catalogue lists were compared with the files the
+stage hashed, and they differ. The usual cause is an exclude pattern with a
+wildcard inside a directory name (`a*b/`): tapectl matches it one path component
+at a time, but dar's `*` spans `/`, so dar prunes more. Use a pattern without a
+wildcard inside a directory name. A file that appeared in the source while dar
+was reading it is refused the same way: stage a living source from a snapshot
+(the operator guide's "Staging a source that is in use").
+
+```text
+error: cannot record the file name "caf\xE9.txt" under <unit path>: it is not valid UTF-8, ...
+```
+
+`snapshot create` refuses a file name that is not valid UTF-8, because tapectl
+records and looks up names as text. Rename it (`convmv -f latin1 -t utf8 -r
+--notest <dir>`) or move it out of the unit, then snapshot again.
+
+```text
+warning: dar -c (pid <n>) is running without the fadvise filter (Seccomp: <m> ...)
+```
+
+The filter that keeps dar from evicting the source's pages did not take in the
+dar child (#441, #447). The stage carries on and is correct; the source is read
+from disk twice, as before 1.1.1. A dar with file capabilities (`setcap`) also
+loses them under the filter's `no_new_privs`, so run a plain dar binary.
+
 ### A unit larger than one cartridge
 
 ```text
