@@ -1471,3 +1471,39 @@ Decided by the coordinator from existing rulings, recorded so they are not re-op
     event. A cleaning is one `cleaned` event on the drive (`field = 'cleaning_cartridge'`), no
     contact; `drive cleaned` exits 1 when the cleaning cartridge is at or past its rated uses.
     TapeAlert 22 and 23 name the cleaning cartridge, not the drive, as what to replace.
+
+## Amendment, 2026-10-15 (later): the design review's decision list
+
+Ruled by the CTO, 2026-10-15, on `docs/audits/2026-10-15-design-review.md` §4; its §9 is the
+plan. Nothing below is built yet.
+
+65. **The 1.1.0 and 1.1.1 diff gets an adversarial code review** (`cf4a371..v1.1.1`, #452)
+    before #420 is built: a read-only multi-agent review on the CTO's word, with dimensions drawn
+    from the recent misses, run after the `v1.1.1` tag and before the 1.1.2 queue is worked, so
+    its findings join that queue.
+66. **`verify_interval_days` gains a `[defaults]` level** (#453): 365 on home2 now, through the
+    profile and `first-run.sh` step 7, and a code default of 365 in 1.2.0. An archive set's value
+    still wins over it, and the key is still not a dotfile key.
+67. **`audit` judges verify age per volume as well as per unit** (#454): a `volume_verify_age`
+    warning names each volume, with its cartridge and location, whose newest passing full
+    readback (dated by its start, item 30 of 2026-10-07) is older than the shortest interval among
+    the units on it. The per-unit `verify_age` stays. The operator's remedy for an offsite copy is
+    the yearly swap of the home and offsite copies, written in the guide.
+68. **Staging a living source** (#455): the operator guide says to stage from a read-only
+    snapshot or to hold the source still for the stage's duration, and says what one changed file
+    costs; 1.2.0 adds a per-collection snapshot hook so `collection run` reads a snapshot while
+    recording the unit's real path. #409 stays "not until spanning" (item 11 of 2026-10-07).
+69. **The selector as built is next-fit in name order** (#456): it closes a batch at the first
+    unit that does not fit, which `v2-open-questions.md` §7 and the docstring call first-fit. The
+    behaviour stands (the alphabetical tape spine); the two texts are corrected with the next
+    `src/` change. The §7 premise (2–15 GB units against 2.2 TB bins) is re-examined when any
+    registered unit exceeds a tenth of its cartridge generation's capacity; `collection plan`
+    shows the largest unit's share so the trigger is visible.
+70. **The heir path's only test with real tools is the mhvtl gate** (#457): the ungated suite
+    fakes `age`, `mt` and `dd`. This is stated where releases are made, and each run record names
+    the age CLI version the gate ran with.
+
+Not adopted on 2026-10-15: the review's items 2 (a `key escrow-verify` that proves the paper
+secret), 5 (a drive-generation migration trigger and a `volume copy`), 7 (a compromised-host
+paragraph in the threat model) and 8 (an off-host copy of the catalog backup). The review record
+keeps them as considered.

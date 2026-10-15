@@ -147,8 +147,11 @@ Each open issue was ruled. This checks the premise the ruling rests on, in ADR-0
 ## 4. Missed concerns and research areas — a decision list
 
 Numbered for the CTO. Each has a recommendation and the trigger that would reopen it.
-None is a ruling; the handoff's do-not-re-litigate list applies. Items marked *premise
-check* only re-examine a ratified ruling's premise.
+Items marked *premise check* only re-examine a ratified ruling's premise.
+
+**Ruled 2026-10-15 (later that day):** items 1, 3, 4, 6, 9 and 10 accepted and recorded as
+ADR-0012 amendment "2026-10-15 (later)", items 65–70, with issues #452–#457; items 2, 5, 7
+and 8 not adopted. §9 is the plan. Nothing is built yet.
 
 1. **1.1.0 was never adversarially reviewed as code.** The four recorded reviews
    (`docs/audits/2026-09-17` to `2026-09-23`) end at `cf4a371`. Between it and `v1.1.0`
@@ -298,3 +301,88 @@ read. `operator-guide.md` and `troubleshooting.md` were read where grepped. Whet
 `runuser -u` on util-linux 2.33 sets `HOME` (the wrapper's comment says so; `check-tapectl-op.sh`
 is the proof, now in handoff (f)) and how mhvtl answers a short `cartridge erase` (#444's
 gate leg) are the two facts left to the next run.
+
+## 9. The plan, after the ruling of 2026-10-15 (later)
+
+Ratified: §4 items 1, 3, 4, 6, 9 and 10 (ADR-0012 items 65–70, issues #452–#457). Not
+adopted: 2, 5, 7 and 8. Nothing is started; this section says what is built, in which
+release, in which order, and what each needs on tape.
+
+### Releases
+
+- **v1.1.1** is tagged on this docs tree once the mhvtl gate passes on `4cb98a0`'s code
+  (identical `src/`, `scripts/`, `Cargo.*`). Nothing below goes into it.
+- **1.1.2** (a patch: no generated on-tape byte changes): #444, #445, #446, #447, #448's
+  cover-sheet half, #450, #451, #453 part 1 (the `[defaults]` key and home2's value), #454,
+  #455 part 1 (the guide), #456, #457, and whatever #452's review files at medium or above.
+- **1.2.0** (the next minor, with the next CTO-approved re-pin): #449, #448's File 1 half
+  (File 1 is generated on-tape text, so by the 2026-09-30 version rule it moves with a
+  minor; the CTO can rule its wording not a format change and pull it into 1.1.2), #453
+  part 2 (the code default of 365), #455 part 2 (the snapshot hook), #418 R4, and #420 once
+  its measurement is in.
+
+### Order: five waves, file-disjoint, each landed or escalated before the next
+
+The autopilot rule applies: at most three workers, per-worker target directories, every
+cargo invocation under the build lock, no two items touching one file in a wave.
+
+- **W0 — #452, the diff review**, on the CTO's word, after the tag and before any 1.1.2
+  code. Its confirmed findings are triaged into the waves below before W1 starts; a medium
+  or high in a file a wave already touches joins that wave's worker.
+- **W1 — #444 ∥ #448 (cover sheet) ∥ #446.** #444: `scripts/mhvtl-verify-gate.sh` (the
+  erase-then-init leg, ported from the coordinator's scratchpad erase-proof script, with its
+  negative), `src/volume/binding.rs` (the lifetime-written comparison voiding the erase
+  proof) and `src/tape/mam.rs`; the sub-MiB tightening waits for the measurement below.
+  #448: `src/crypto/escrow_kit.rs`, `src/cli/audit.rs` (`escrow_kit_stale` counts moves),
+  `tests/integration.rs`, `tests/heir_restore_sh.rs`. #446: `scripts/first-run.sh` and
+  `scripts/first-run-reentry-mhvtl.sh`.
+- **W2 — #445 ∥ #447 ∥ #450.** #445: `src/cli/volume.rs` and `src/volume/write.rs` (a
+  catalog-only pre-flight before `steps.init`; the stranded-row test rewritten). #447:
+  `src/dar/mod.rs` (read `/proc/<pid>/status` `Seccomp:` after spawn, warn once) and
+  `src/tape/drive_identity.rs`. #450: `tests/format_v2.rs` (the MemStore plaintext scan
+  with a positive control), `tests/mhvtl_e2e.rs` and the gate's needle list (after W1's
+  gate change).
+- **W3 — #454 ∥ #453 part 1 ∥ #451.** #454: `src/cli/audit.rs` (`volume_verify_age`),
+  `src/policy/evidence.rs`, `tests/catalog_budget.rs`, the guide's "Monthly" section.
+  #453: `src/config.rs`, `src/policy/mod.rs`, `src/config_edit.rs` if the key needs a
+  validator, `contrib/hosts/home2.profile`, `scripts/first-run.sh` step 7 (after W1's
+  first-run change), `docs/configuration.md`. #451: `src/volume/rebuild.rs` and
+  `docs/troubleshooting.md`.
+- **W4 — #456 ∥ #455 part 1 ∥ #457.** #456: `src/collection/selector.rs` (docstring),
+  `docs/design/v2-open-questions.md` §7, `collection plan`'s largest-unit share. #455:
+  the operator guide and `troubleshooting.md` paragraphs. #457: CLAUDE.md Testing and
+  handoff (b). The last two build nothing.
+
+### Gating
+
+- `scripts/` changes (#444, #446 in W1; #450's needles in W2) and the write path (#445 in
+  W2) each take the mhvtl gate after their wave, by the standing rule; the whole chain
+  (fmt, clippy gnu and musl, every ungated test binary, `check-docs`, `mhvtl_e2e`,
+  `mhvtl_motions`, the gate with its new erase leg, lifecycle `--all`, the first-run
+  re-entry) runs on the last commit before the tag. `catalog_budget` and `pass_budget` pins
+  move only with the reason in the commit (#454 adds statements; say so).
+- `v1.1.2` is tagged on the proven commit; home2 upgrades by handoff (f) again, with the
+  pre-upgrade backup named for 1.1.2 and #453's `config set` in step 6.
+
+### The real-drive session (one afternoon on EW7VWMVKF6)
+
+On home2, by the operator or an agent on their go-ahead, with the drive-poll timer stopped
+and `tapectl-op drive status` showing no holder, in this order:
+1. step 12's rehearsal with the 1.1.2 binary (the marker step 13 looks for);
+2. #444: a never-written cartridge's chip reading, then `cartridge erase` followed by
+   `volume init` with no `--force` on the test cartridge, both proofs' stderr lines
+   recorded;
+3. #444: about 100 KB written with `dd` from BOT, then the MAM: whether "Total MiB
+   written" reads 0 and what `initialization_count` reads; the proof is tightened if it
+   floors;
+4. #420: after the first `ENOSPC`, keep writing 512 KiB blocks until `EIO` and count the
+   bytes the drive took past early warning (the fill script, continued past its first
+   error).
+The owed #441 disk-read and #432 feed-ratio figures come from the next production staging
+run and write, not from this session. The record is `docs/runs/<date>-1.1.2-real-drive.md`;
+results go to #444, #420, #441 and #432.
+
+### What waits for the CTO
+
+#452's go (a workflow spend); #449's content at the next re-pin; whether File 1's wording is
+a format change (#448); #420 after step 4 above; and the 1.2.0 scope once 1.1.2 is on home2.

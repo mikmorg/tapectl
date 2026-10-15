@@ -366,7 +366,10 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
 - **#409:** stays "not until spanning".
 - **#364 epic:** re-measure staging on home2 after #441 (the single source read), then
   close it or plan what is left.
-- **The 2026-10-15 review's issues** (`docs/audits/2026-10-15-design-review.md`): 1.1.2.
+- **The 1.1.2 queue, #444–#457:** the waves in `docs/audits/2026-10-15-design-review.md`
+  §9 (ratified 2026-10-15, ADR-0012 items 65–70). #452, the adversarial review of the 1.1
+  diff, runs first and only on your word; the real-drive session at the end of §9 is yours
+  or an agent's on your go-ahead.
 - **2026-10-07 item 6:** the read-error rate assumes the drive clears log page 0x03 at
   load. Check it on home2's first two full verifies (L6-0001 and L6-0002), and revisit
   the rate if the drive keeps the counters.
