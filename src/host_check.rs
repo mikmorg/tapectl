@@ -126,6 +126,41 @@ pub fn parse_systemctl_show(text: &str) -> Option<(String, String, String)> {
     Some((load?, active?, sub?))
 }
 
+/// The longest process name the kernel keeps: `/proc/<pid>/comm` is cut at
+/// 15 bytes (`TASK_COMM_LEN` 16 with its NUL), whatever the executable is
+/// called.
+pub const COMM_LEN: usize = 15;
+
+/// Whether a process whose `/proc/<pid>/comm` is `comm` is the configured
+/// contender `configured`. The kernel cuts `comm` at [`COMM_LEN`] bytes, so
+/// the configured name is cut the same way before it is compared: a longer
+/// one (`Runner.Worker.Service`) could otherwise never match anything.
+pub fn comm_matches(configured: &str, comm: &str) -> bool {
+    let b = configured.as_bytes();
+    b[..b.len().min(COMM_LEN)] == *comm.as_bytes()
+}
+
+/// `config check`'s warning for each configured process name that is longer
+/// than the kernel keeps — it is still matched, on its first
+/// [`COMM_LEN`] bytes, so it also matches any other process that begins the
+/// same way.
+pub fn long_process_name_warnings(cfg: &HostCheckConfig) -> Vec<String> {
+    cfg.contender_processes
+        .iter()
+        .filter(|n| n.len() > COMM_LEN)
+        .map(|n| {
+            let cut = String::from_utf8_lossy(&n.as_bytes()[..COMM_LEN]).into_owned();
+            format!(
+                "warning: [host_check] contender_processes \"{n}\" is {} characters, but the \
+                 kernel keeps {COMM_LEN} of a process name (/proc/<pid>/comm): it is matched on \
+                 \"{cut}\", which also matches any process whose name begins that way. Shorten \
+                 it to what `ps -o comm` shows.",
+                n.len()
+            )
+        })
+        .collect()
+}
+
 /// A unit competes while it is active — for a timer, while it is armed
 /// (`active (waiting)`): the operator guide's remedy is to stop the timer,
 /// not merely to wait for its service to finish.
@@ -188,10 +223,16 @@ pub fn assess(snapshot: &HostSnapshot, cfg: &HostCheckConfig) -> Vec<Finding> {
 
     // Grouped by name, in the configured order, so ten `rustc`s are one
     // finding naming ten pids, not ten findings.
+    // Keyed by the CONFIGURED name (the name the finding and the lookup below
+    // use), matched on the first [`COMM_LEN`] bytes the kernel keeps.
     let mut running: BTreeMap<&str, Vec<u32>> = BTreeMap::new();
     for (pid, comm) in &snapshot.processes {
-        if cfg.contender_processes.iter().any(|c| c == comm) {
-            running.entry(comm.as_str()).or_default().push(*pid);
+        if let Some(name) = cfg
+            .contender_processes
+            .iter()
+            .find(|c| comm_matches(c, comm))
+        {
+            running.entry(name.as_str()).or_default().push(*pid);
         }
     }
     for name in &cfg.contender_processes {
@@ -212,6 +253,18 @@ pub fn assess(snapshot: &HostSnapshot, cfg: &HostCheckConfig) -> Vec<Finding> {
 
     for unit in &snapshot.units {
         match &unit.state {
+            // systemd answers `show` for a unit it has never heard of, with
+            // LoadState=not-found and nothing active: a typo, or a unit that
+            // lives on another machine. Reading that as "quiet" would report
+            // a check that never ran as one that passed (issue #467).
+            Ok((load, _, _)) if load == "not-found" => findings.push(Finding {
+                what: format!("unit {}", unit.name),
+                measured: "could not be checked: systemd has no unit by this name \
+                           (LoadState=not-found)"
+                    .into(),
+                threshold: "listed in contender_units; fix the name or drop it from the list"
+                    .into(),
+            }),
             Ok((_, active, sub)) if unit_is_active(active) => findings.push(Finding {
                 what: format!("unit {}", unit.name),
                 measured: format!("{active} ({sub})"),
@@ -531,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn an_active_contender_unit_is_a_finding_and_an_inactive_or_missing_one_is_not() {
+    fn an_active_contender_unit_is_a_finding_and_an_inactive_one_is_not_and_a_missing_one_is_one() {
         let mut s = quiet();
         let st = |l: &str, a: &str, sub: &str| Ok((l.into(), a.into(), sub.into()));
         s.units = vec![
@@ -554,13 +607,72 @@ mod tests {
         ];
         let findings = assess(&s, &HostCheckConfig::default());
         let whats: Vec<&str> = findings.iter().map(|f| f.what.as_str()).collect();
+        // Configured order. `no-such.timer` was pinned as NOT a finding until
+        // issue #467: a typo in `contender_units` then read as "checked".
         assert_eq!(
             whats,
-            ["unit homorg-db-suite.timer", "unit unaskable.timer"],
+            [
+                "unit homorg-db-suite.timer",
+                "unit no-such.timer",
+                "unit unaskable.timer"
+            ],
             "{findings:?}"
         );
         assert_eq!(findings[0].measured, "active (waiting)");
-        assert!(findings[1].measured.contains("could not be checked"));
+        assert!(
+            findings[1].measured.contains("could not be checked")
+                && findings[1].measured.contains("LoadState=not-found"),
+            "{findings:?}"
+        );
+        assert!(findings[2].measured.contains("could not be checked"));
+        // The inactive, loaded unit stays quiet: the control for the above.
+        assert!(
+            !whats.contains(&"unit homorg-prune-target.timer"),
+            "{findings:?}"
+        );
+    }
+
+    /// `/proc/<pid>/comm` is cut at 15 bytes, so a configured name longer
+    /// than that — which could never equal a comm — is compared on its first
+    /// 15, still groups under its configured name, and `config check` says
+    /// so (issue #467).
+    #[test]
+    fn a_process_name_longer_than_the_kernel_keeps_is_matched_on_its_first_15() {
+        let cfg = HostCheckConfig {
+            contender_processes: vec!["Runner.Worker.Service".into(), "cargo".into()],
+            ..HostCheckConfig::default()
+        };
+        let mut s = quiet();
+        // What the kernel shows for that executable.
+        s.processes.push((4001, "Runner.Worker.S".into()));
+        s.processes.push((4002, "Runner.Worker.S".into()));
+        let findings = assess(&s, &cfg);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].what, "process \"Runner.Worker.Service\"");
+        assert!(
+            findings[0]
+                .measured
+                .starts_with("2 running (pid 4001, 4002"),
+            "{findings:?}"
+        );
+        // Not a prefix match in general: shorter names stay exact.
+        assert!(comm_matches("cargo", "cargo"));
+        assert!(!comm_matches("cargo", "cargo-watch"));
+        assert!(!comm_matches("Runner.Worker.Service", "Runner.Worker"));
+        // Exactly 15 is not long.
+        assert!(long_process_name_warnings(&HostCheckConfig {
+            contender_processes: vec!["Runner.Listener".into()],
+            ..HostCheckConfig::default()
+        })
+        .is_empty());
+        let warnings = long_process_name_warnings(&cfg);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("Runner.Worker.Service")
+                && warnings[0].contains("Runner.Worker.S"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].starts_with("warning:"));
     }
 
     #[test]

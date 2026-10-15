@@ -506,6 +506,7 @@ fn print_json(
             "host_check": host_check.map(|(present, hc)| serde_json::json!({
                 "table_present": present,
                 "effective": hc,
+                "warnings": crate::host_check::long_process_name_warnings(hc),
             })),
             "ops": ops_lines,
         })
@@ -625,6 +626,9 @@ fn print_human(
     }
     if let Some((present, hc)) = host_check {
         println!("{}", describe_host_check(*present, hc));
+        for line in crate::host_check::long_process_name_warnings(hc) {
+            println!("{line}");
+        }
     }
     for line in ops_lines {
         println!("{line}");
