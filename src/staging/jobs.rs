@@ -40,7 +40,8 @@ pub const MAX_JOBS: usize = 16;
 
 /// What one stage in flight may hold of the host's memory: the source it
 /// keeps in the page cache between dar's read and the hasher's
-/// (`validate::READ_AHEAD_BYTES`, 128 MiB), and its own buffers and queues —
+/// (`validate::READ_AHEAD_BYTES`, 128 MiB) and behind both until it is
+/// dropped (a 16 MiB window, issue #441), and its own buffers and queues —
 /// dar's stream buffer, the slice file's, and the bounded hash queues — with
 /// room to spare: 192 MiB in all.
 pub const MEMORY_PER_JOB: u64 = super::validate::READ_AHEAD_BYTES + (64 << 20);

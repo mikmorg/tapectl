@@ -276,6 +276,14 @@ pub(crate) struct ReadAhead {
     /// writes out (zeros it stores as holes, data that compresses well)
     /// does not leave the hasher waiting on a stale position.
     dar_pid: AtomicU64,
+    /// dar's own read count (`rchar`) and nothing else (issue #441): where
+    /// the source's pages may go behind dar. `dar_read` may be the archive's
+    /// length instead, which runs ahead of dar's place in the source by
+    /// dar's own headers.
+    dar_rchar: AtomicU64,
+    /// Drops the source's pages behind both readers (issue #441); `None`
+    /// where nothing should.
+    behind: Option<DropBehindBoth>,
 }
 
 impl ReadAhead {
@@ -289,7 +297,20 @@ impl ReadAhead {
             hasher_failed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             dar_pid: AtomicU64::new(0),
+            dar_rchar: AtomicU64::new(0),
+            behind: None,
         }
+    }
+
+    /// Drop the source's pages from the page cache behind both readers
+    /// (issue #441): `plan`'s files, under `base`.
+    pub(crate) fn dropping_behind(
+        mut self,
+        base: std::path::PathBuf,
+        plan: std::sync::Arc<SourcePlan>,
+    ) -> Self {
+        self.behind = Some(DropBehindBoth::new(base, plan, DROP_WINDOW));
+        self
     }
 
     /// dar is running as `pid`.
@@ -327,6 +348,59 @@ impl ReadAhead {
         {
             std::thread::sleep(Duration::from_millis(5));
         }
+        // On every tick of dar's consumer, what both readers have passed
+        // goes (issue #441).
+        if self.behind.is_some() {
+            self.probe_dar();
+            self.drop_passed();
+        }
+    }
+
+    /// dar's read count, where the kernel says it, into both of dar's
+    /// positions.
+    fn probe_dar(&self) {
+        let pid = self.dar_pid.load(Ordering::Acquire);
+        if let Some(read) = u32::try_from(pid)
+            .ok()
+            .filter(|&p| p != 0)
+            .and_then(crate::dar::create::bytes_read)
+        {
+            self.dar_read.fetch_max(read, Ordering::AcqRel);
+            self.dar_rchar.fetch_max(read, Ordering::AcqRel);
+        }
+    }
+
+    /// Drop the source's pages both readers have passed (issue #441): every
+    /// byte before the hasher's low-water mark that is also [`DAR_READ_SLACK`]
+    /// behind dar's read count — or, once dar has finished, before the
+    /// low-water mark alone. Where the kernel gives no read count, nothing
+    /// goes until the end ([`ReadAhead::drop_everything_read`]).
+    fn drop_passed(&self) {
+        let Some(behind) = &self.behind else {
+            return;
+        };
+        let dar = if self.dar_done.load(Ordering::Acquire) {
+            u64::MAX
+        } else {
+            self.dar_rchar
+                .load(Ordering::Acquire)
+                .saturating_sub(DAR_READ_SLACK)
+        };
+        behind.drop_to(self.hashed.load(Ordering::Acquire).min(dar));
+    }
+
+    /// Nothing reads the source any more — the hasher has ended and dar with
+    /// it — so every page either reader read goes (issue #441).
+    fn drop_everything_read(&self) {
+        let Some(behind) = &self.behind else {
+            return;
+        };
+        let read = self
+            .hashed
+            .load(Ordering::Acquire)
+            .max(self.dar_read.load(Ordering::Acquire))
+            .max(self.dar_rchar.load(Ordering::Acquire));
+        behind.drop_to(read);
     }
 
     /// dar has read everything it will: the hasher need not wait for it.
@@ -361,15 +435,135 @@ impl ReadAhead {
             {
                 return true;
             }
-            let pid = self.dar_pid.load(Ordering::Acquire);
-            if let Some(read) = u32::try_from(pid)
-                .ok()
-                .filter(|&p| p != 0)
-                .and_then(crate::dar::create::bytes_read)
-            {
-                self.dar_read.fetch_max(read, Ordering::AcqRel);
-            }
+            self.probe_dar();
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// How far behind dar's read count the source's pages are kept (issue
+/// #441). The count (`rchar`) is every byte dar reads, and dar reads a
+/// little besides the source — its libraries' headers, locale and SSL
+/// configuration: 96 KiB measured for dar 2.7.13 — so it runs ahead of
+/// dar's place in the source by about that much.
+const DAR_READ_SLACK: u64 = 4 << 20;
+
+/// How much of a large source file is dropped from the page cache at once
+/// behind both readers (issue #441): little next to the lead, and a single
+/// `fadvise` per window costs nothing next to the reads.
+const DROP_WINDOW: u64 = 16 << 20;
+
+/// The source's pages dropped from the page cache once both readers are
+/// past them (issue #441).
+///
+/// dar drops each file it archives itself, at its open and its close
+/// (`POSIX_FADV_DONTNEED`), which evicted what the hasher had read before
+/// dar could use it. With that made a no-op
+/// ([`crate::dar::command_without_fadvise`]) this does it instead, after
+/// both reads, so a stage still leaves no more of its source in the page
+/// cache than the lead and a window (issue #417).
+///
+/// A cursor walks the plan in dar's order. A file both readers are past is
+/// dropped whole; inside a large file, what both have passed is dropped a
+/// window at a time. Each file is opened again for it: the hasher has
+/// closed it by then, and keeping every file of the lead open would hold a
+/// descriptor per small file. Advice only — a file that cannot be opened,
+/// or is no longer a regular file, is passed over.
+#[derive(Debug)]
+struct DropBehindBoth {
+    base: std::path::PathBuf,
+    plan: std::sync::Arc<SourcePlan>,
+    /// Each file's offset in dar's order, and the unit's total at the end.
+    starts: Vec<u64>,
+    window: u64,
+    cursor: std::sync::Mutex<DropCursor>,
+}
+
+#[derive(Debug, Default)]
+struct DropCursor {
+    /// The first file not yet dropped whole.
+    file: usize,
+    /// How much of it is dropped.
+    dropped: u64,
+    /// It, open, while it is dropped a window at a time.
+    open: Option<std::fs::File>,
+}
+
+impl DropBehindBoth {
+    fn new(base: std::path::PathBuf, plan: std::sync::Arc<SourcePlan>, window: u64) -> Self {
+        let mut starts = Vec::with_capacity(plan.files.len() + 1);
+        let mut at = 0u64;
+        for f in &plan.files {
+            starts.push(at);
+            at = at.saturating_add(f.expected_size.max(0) as u64);
+        }
+        starts.push(at);
+        Self {
+            base,
+            plan,
+            starts,
+            window: window.max(1),
+            cursor: std::sync::Mutex::new(DropCursor::default()),
+        }
+    }
+
+    /// Drop every page before `boundary`, an offset in dar's order, that is
+    /// not dropped yet.
+    fn drop_to(&self, boundary: u64) {
+        let mut c = self
+            .cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while c.file < self.plan.files.len() {
+            let start = self.starts[c.file];
+            let end = self.starts[c.file + 1];
+            if boundary >= end {
+                // Both readers are past the whole file: the rest of it goes.
+                if end > start {
+                    let from = c.dropped;
+                    self.advise(&mut c, from, 0);
+                }
+                c.file += 1;
+                c.dropped = 0;
+                c.open = None;
+                continue;
+            }
+            // Inside the file: what both have passed, a window at a time.
+            let passed = boundary.saturating_sub(start);
+            if passed >= c.dropped.saturating_add(self.window) {
+                let from = c.dropped;
+                self.advise(&mut c, from, passed - from);
+                c.dropped = passed;
+            }
+            break;
+        }
+    }
+
+    /// `POSIX_FADV_DONTNEED` over `len` bytes of the cursor's file from
+    /// `offset` (0: to its end).
+    fn advise(&self, c: &mut DropCursor, offset: u64, len: u64) {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        if c.open.is_none() {
+            let path = self.base.join(&self.plan.files[c.file].rel_path);
+            // Never open what is not a regular file now: a FIFO blocks the
+            // open, a device acts on it (the hasher's own guard, #33/H7).
+            if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+                return;
+            }
+            c.open = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW)
+                .open(&path)
+                .ok();
+        }
+        if let Some(file) = &c.open {
+            let _ = nix::fcntl::posix_fadvise(
+                file.as_raw_fd(),
+                offset as nix::libc::off_t,
+                len as nix::libc::off_t,
+                nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+            );
         }
     }
 }
@@ -751,7 +945,9 @@ fn hash_one(
 
 /// [`hash_files`] on its own thread, beside dar: what `stage create` runs
 /// (issue #364). Dropping it unfinished stops the hasher and waits for it,
-/// so no thread outlives a failed stage.
+/// so no thread outlives a failed stage. Either way the source's pages are
+/// dropped from the page cache behind both readers as they go, and what is
+/// left of them at the end (issue #441, [`DropBehindBoth`]).
 pub(crate) struct ConcurrentHash {
     ahead: std::sync::Arc<ReadAhead>,
     handle: Option<std::thread::JoinHandle<Result<Hashed>>>,
@@ -764,7 +960,10 @@ impl ConcurrentHash {
         plan: SourcePlan,
         threads: usize,
     ) -> Result<Self> {
-        let ahead = std::sync::Arc::new(ReadAhead::new(READ_AHEAD_BYTES));
+        let plan = std::sync::Arc::new(plan);
+        let ahead = std::sync::Arc::new(
+            ReadAhead::new(READ_AHEAD_BYTES).dropping_behind(base.clone(), plan.clone()),
+        );
         let shared = ahead.clone();
         let handle = std::thread::Builder::new()
             .name("tapectl-source-hash".into())
@@ -780,12 +979,15 @@ impl ConcurrentHash {
         &self.ahead
     }
 
-    /// Wait for the hasher and take what it read, or its refusal.
+    /// Wait for the hasher and take what it read, or its refusal. What is
+    /// left of the source in the page cache goes (issue #441).
     pub(crate) fn finish(mut self) -> Result<Hashed> {
         let handle = self.handle.take().expect("finished once");
-        handle
+        let hashed = handle
             .join()
-            .unwrap_or_else(|_| Err(TapectlError::Other("the source hasher panicked".into())))
+            .unwrap_or_else(|_| Err(TapectlError::Other("the source hasher panicked".into())));
+        self.ahead.drop_everything_read();
+        hashed
     }
 }
 
@@ -794,6 +996,7 @@ impl Drop for ConcurrentHash {
         if let Some(handle) = self.handle.take() {
             self.ahead.stop();
             let _ = handle.join();
+            self.ahead.drop_everything_read();
         }
     }
 }
@@ -1493,6 +1696,176 @@ mod tests {
         assert!(
             ahead.hasher_may_read(50),
             "the hasher goes on without a tick"
+        );
+    }
+
+    /// Whether `POSIX_FADV_DONTNEED` visibly evicts a file under `dir`
+    /// (issue #441): not on tmpfs, whose pages are its storage. Says why
+    /// when it does not, for the caller to skip.
+    fn dontneed_is_observable(dir: &Path) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let probe = dir.join("dontneed-probe");
+        crate::dar::write_warm(&probe, 1 << 20);
+        let (warm, pages) = crate::dar::resident_pages(&probe);
+        let f = std::fs::File::open(&probe).unwrap();
+        let _ = nix::fcntl::posix_fadvise(
+            f.as_raw_fd(),
+            0,
+            0,
+            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+        );
+        drop(f);
+        let (after, _) = crate::dar::resident_pages(&probe);
+        std::fs::remove_file(&probe).unwrap();
+        if warm * 4 < pages * 3 || after * 4 > pages {
+            eprintln!(
+                "SKIP: page cache residency is not observable under {} ({warm} of {pages} \
+                 pages resident after a read, {after} after POSIX_FADV_DONTNEED)",
+                dir.display()
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Most of `path`'s pages are in the page cache.
+    fn cached(path: &Path) -> bool {
+        let (resident, pages) = crate::dar::resident_pages(path);
+        resident * 2 > pages
+    }
+
+    /// Two files of `size` bytes, written and warm, planned in dar's order.
+    fn two_warm_files(
+        size: usize,
+    ) -> (TempDir, std::sync::Arc<SourcePlan>, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        for name in ["a.bin", "b.bin"] {
+            crate::dar::write_warm(&tmp.path().join(name), size);
+        }
+        let (conn, sid) =
+            setup_conn_with_snapshot(&[("a.bin", size as i64, None), ("b.bin", size as i64, None)]);
+        let plan = plan(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap();
+        let first = tmp.path().join(&plan.files[0].rel_path);
+        let second = tmp.path().join(&plan.files[1].rel_path);
+        (tmp, std::sync::Arc::new(plan), first, second)
+    }
+
+    /// Issue #441: with dar's own eviction a no-op, the source's pages are
+    /// dropped behind both readers — a file once the hasher has read it AND
+    /// dar's read count is past it by the slack for what dar reads besides
+    /// the source — never while either reader still has it ahead.
+    #[test]
+    fn source_pages_go_once_both_readers_have_passed_them() {
+        const SIZE: usize = 1 << 20;
+        let (tmp, plan, first, second) = two_warm_files(SIZE);
+        if !dontneed_is_observable(tmp.path()) {
+            return;
+        }
+        let base = tmp.path().to_path_buf();
+        let total = 2 * SIZE as u64;
+
+        // The hasher ahead, dar behind it.
+        let ahead = ReadAhead::new(READ_AHEAD_BYTES).dropping_behind(base.clone(), plan.clone());
+        ahead.hashed.store(total, Ordering::Release);
+        ahead.drop_passed();
+        assert!(cached(&first) && cached(&second), "dar has read nothing: both stay");
+        ahead
+            .dar_rchar
+            .store(SIZE as u64 + DAR_READ_SLACK / 2, Ordering::Release);
+        ahead.drop_passed();
+        assert!(
+            cached(&first),
+            "dar's count is past the first file by less than the slack: it stays"
+        );
+        ahead
+            .dar_rchar
+            .store(SIZE as u64 + DAR_READ_SLACK, Ordering::Release);
+        ahead.drop_passed();
+        assert!(!cached(&first), "both are past the first file: it goes");
+        assert!(cached(&second), "dar is not past the second: it stays");
+
+        // dar ahead, the hasher behind it.
+        crate::dar::warm(&first);
+        let ahead = ReadAhead::new(READ_AHEAD_BYTES).dropping_behind(base.clone(), plan.clone());
+        ahead
+            .dar_rchar
+            .store(total + DAR_READ_SLACK, Ordering::Release);
+        ahead.drop_passed();
+        assert!(
+            cached(&first) && cached(&second),
+            "the hasher has read nothing: both stay"
+        );
+        ahead.hashed.store(SIZE as u64, Ordering::Release);
+        ahead.drop_passed();
+        assert!(!cached(&first), "both are past the first file: it goes");
+        assert!(cached(&second), "the hasher is not past the second: it stays");
+
+        // dar done: the hasher's place alone decides.
+        ahead.dar_finished();
+        ahead.hashed.store(total, Ordering::Release);
+        ahead.drop_passed();
+        assert!(!cached(&second), "both are done: everything goes");
+    }
+
+    /// Inside a large file the pages go a window at a time as both readers
+    /// pass them, not only at the file's end: a unit is often one large
+    /// file (issue #441).
+    #[test]
+    fn a_large_files_pages_go_a_window_at_a_time_behind_both_readers() {
+        const SIZE: usize = 4 << 20;
+        const WINDOW: u64 = 1 << 20;
+        let tmp = TempDir::new().unwrap();
+        let big = tmp.path().join("big.bin");
+        crate::dar::write_warm(&big, SIZE);
+        if !dontneed_is_observable(tmp.path()) {
+            return;
+        }
+        let (conn, sid) = setup_conn_with_snapshot(&[("big.bin", SIZE as i64, None)]);
+        let plan = std::sync::Arc::new(plan(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap());
+        let mut ahead = ReadAhead::new(READ_AHEAD_BYTES);
+        ahead.behind = Some(DropBehindBoth::new(tmp.path().to_path_buf(), plan, WINDOW));
+        let page = crate::dar::page_size() as u64;
+        let gone_below = |at: u64| {
+            let map = crate::dar::resident_map(&big);
+            let cut = (at / page) as usize;
+            map[..cut].iter().all(|r| !r) && map[cut..].iter().all(|r| *r)
+        };
+
+        // The hasher at 3 MiB, dar at 2.5 MiB: the first 2.5 MiB go.
+        ahead.hashed.store(3 << 20, Ordering::Release);
+        ahead
+            .dar_rchar
+            .store((5 << 19) + DAR_READ_SLACK, Ordering::Release);
+        ahead.drop_passed();
+        assert!(gone_below(5 << 19), "what both passed goes, nothing past it");
+        // Half a window further: nothing more yet.
+        ahead
+            .dar_rchar
+            .store((3 << 20) + DAR_READ_SLACK, Ordering::Release);
+        ahead.drop_passed();
+        assert!(gone_below(5 << 19), "less than a window more: it waits");
+        // The end of the stage: everything read goes.
+        ahead.hashed.store(SIZE as u64, Ordering::Release);
+        ahead.drop_everything_read();
+        assert!(gone_below(SIZE as u64), "the stage is over: all of it goes");
+    }
+
+    /// The hasher beside dar ([`ConcurrentHash`]) drops whatever is left of
+    /// the source once it is finished, or dropped unfinished (issue #441).
+    #[test]
+    fn the_source_left_in_the_page_cache_goes_when_the_hash_ends() {
+        const SIZE: usize = 1 << 20;
+        let (tmp, plan, first, second) = two_warm_files(SIZE);
+        if !dontneed_is_observable(tmp.path()) {
+            return;
+        }
+        let plan = std::sync::Arc::into_inner(plan).unwrap();
+        let hashing = ConcurrentHash::spawn(tmp.path().to_path_buf(), plan, 1).unwrap();
+        hashing.ahead().dar_finished();
+        hashing.finish().unwrap();
+        assert!(
+            !cached(&first) && !cached(&second),
+            "the hash finished: the source is out of the page cache"
         );
     }
 

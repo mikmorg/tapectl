@@ -326,19 +326,25 @@ fn terminate(child: &mut Child) -> Option<ExitStatus> {
 }
 
 /// Test-only: how much of `path` is in the page cache, as `(resident pages,
-/// pages)` — `mincore(2)` over a read-only mapping of it, which faults
-/// nothing in (issue #441).
+/// pages)` (issue #441).
 #[cfg(test)]
 pub(crate) fn resident_pages(path: &std::path::Path) -> (usize, usize) {
+    let map = resident_map(path);
+    (map.iter().filter(|r| **r).count(), map.len())
+}
+
+/// Test-only: whether each page of `path` is in the page cache —
+/// `mincore(2)` over a read-only mapping of it, which faults nothing in
+/// (issue #441).
+#[cfg(test)]
+pub(crate) fn resident_map(path: &std::path::Path) -> Vec<bool> {
     use std::os::fd::AsRawFd;
     let file = std::fs::File::open(path).unwrap();
     let len = file.metadata().unwrap().len() as usize;
     if len == 0 {
-        return (0, 0);
+        return Vec::new();
     }
-    // SAFETY: `sysconf` has no preconditions.
-    let page = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) } as usize;
-    let pages = len.div_ceil(page);
+    let pages = len.div_ceil(page_size());
     let mut vec = vec![0u8; pages];
     // SAFETY: a fresh read-only shared mapping of a file this function holds
     // open, the length its size; `vec` has one byte per page of it, as
@@ -358,7 +364,14 @@ pub(crate) fn resident_pages(path: &std::path::Path) -> (usize, usize) {
         nix::libc::munmap(addr, len);
         assert_eq!(r, 0, "mincore {}: {e}", path.display());
     }
-    (vec.iter().filter(|b| **b & 1 != 0).count(), pages)
+    vec.iter().map(|b| b & 1 != 0).collect()
+}
+
+/// Test-only: the system's page size.
+#[cfg(test)]
+pub(crate) fn page_size() -> usize {
+    // SAFETY: `sysconf` has no preconditions.
+    unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as usize }
 }
 
 /// Test-only: write `len` bytes to `path`, synced — `POSIX_FADV_DONTNEED`
