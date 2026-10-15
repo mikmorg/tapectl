@@ -108,6 +108,7 @@ any flag still wins. Beyond the flags' own values (`DEVICE`, `OPERATOR`,
 | `ADOPT_KEYS_FROM` (`--adopt-keys-from`) | 7, 11 | a directory of `<name>.key` age identity files: `init` adopts `<operator>.key` (`--operator-key`) and each `TENANTS` entry still to be created adopts `<tenant>.key` (`tenant add --adopt-key`) instead of minting keys, each previewed with `--dry-run` first. A missing or unreadable file stops the step before anything is created. The copy-out is in [keys-and-recovery.md](keys-and-recovery.md#f-keeping-existing-keys-on-a-fresh-home) |
 | `COLLECTIONS=("name\|root\|tenant\|depth" …)` | 11 | granted by ACL, written as `[[collections]]`, then `collection sync` |
 | `CONTENDER_UNITS=(…)` | 13 | the systemd units `host check` treats as contenders; unset means the dev VM's homorg timers |
+| `TAPE_NICE` (`--tape-nice`), `TAPE_IONICE` (`--tape-ionice`) | 13, 14 | the priority the tape commands (`volume write`, `resume`, `verify`, `cartridge erase`) run at: default `-10` and `-c2 -n0` (best-effort, level 0), raised as root and then dropped to the service user (#432, ADR-0012 2026-10-15 item 58). Step 14 hands the same values to `install-systemd.sh`. An empty `TAPE_NICE` never raises. Root's `sudo` is needed for it: [the wrapper](#7-the-timers-and-the-operator-wrapper) says what happens without |
 
 **home2** (the production host, ADR-0012's 2026-09-28 amendment) has a one-time
 preparation first, dry-run by default:
@@ -128,6 +129,14 @@ operator run commands *as the service user* (and only as it) without a password.
 Every `tapectl` call in `first-run.sh` outside the step-12 rehearsal goes through
 `sudo -u tapectl`, and on a host whose sudo asks for a password the verify that
 follows a days-long write would otherwise wait at a prompt until sudo gives up.
+
+That rule does not cover the one thing that needs root: raising the tape
+commands' priority (`TAPE_NICE`, above). Step 13 therefore asks for *your* sudo
+password once, before its first tape command, and keeps the sudo ticket warm
+until step 13 ends, so the verify after a days-long write finds it still valid.
+Under `--auto`, or if sudo refuses, the tape commands run at normal priority and
+the step says so; the priority helps the drive's feed and is never a reason to
+fail a write.
 
 
 ---
@@ -371,7 +380,10 @@ Options: `--user NAME` (default `tapectl`; must already exist — the script
 refuses to create an account), `--home DIR` (that account's home), `--tapectl-home DIR`
 (a tapectl home that is not `<home>/.tapectl`; sets `TAPECTL_HOME=` in the
 units), `--backup-dir DIR`, `--keep N`, `--tapectl PATH` (default
-`/usr/local/bin/tapectl`), `--no-wrapper`, `--no-start`.
+`/usr/local/bin/tapectl`), `--tape-nice N` and `--tape-ionice ARGS` (the tape
+commands' priority; below), `--no-wrapper`, `--no-start`, and `--render-dir DIR`
+(render the units and the wrapper into `DIR` and stop: nothing is installed and
+no sudo is needed).
 
 It renders `contrib/systemd/` for the host — `User=`, `HOME=`, `TAPECTL_BIN=`,
 `TAPECTL_BACKUP_DIR=`, `TAPECTL_BACKUP_KEEP=`, `ReadWritePaths=` — installs
@@ -449,15 +461,46 @@ command holds the catalog's write lock longer than the backup will wait,
 backup this run" instead of a failure. To move the time, edit `OnCalendar=`
 in `contrib/systemd/tapectl-backup.timer` and re-run the installer.
 
-**The wrapper.** `/usr/local/bin/tapectl-op` is
+**The wrapper.** `/usr/local/bin/tapectl-op` runs tapectl as the service user:
+`sudo -u tapectl -H /usr/local/bin/tapectl "$@"`. It is installed by
+`install-systemd.sh` (so by step 14), rendered with the user and binary you gave
+it, and skipped when the service user is the account running the installer.
+`tapectl-op audit`, `tapectl-op report summary`, and so on.
+
+A **tape command** is the exception: `volume write`, `resume`, `verify`,
+`compact-write`, `compact`, `read-slices` and `compact-read`; `restore unit`,
+`file`, `volume` and `raw-volume`; `cartridge erase`; `collection run`;
+`quick-archive`; and `drive poll`. They stream the drive, which wants an even
+feed, and a busy host starves it (a write once used 1.505 bytes of tape per byte
+of data, #426). A process cannot raise its own priority, so the wrapper raises
+it as root and then drops to the service user:
 
 ```sh
-exec sudo -u tapectl -H /usr/local/bin/tapectl "$@"
+sudo nice -n -10 ionice -c2 -n0 runuser -u tapectl -- /usr/local/bin/tapectl "$@"
 ```
 
-installed by `install-systemd.sh` (so by step 14), rendered with the user and
-binary you gave it, and skipped when the service user is the account running
-the installer. `tapectl-op audit`, `tapectl-op report summary`, and so on.
+`-10` and `-c2 -n0` are the defaults of `--tape-nice` and `--tape-ionice`
+(`TAPE_NICE` and `TAPE_IONICE` in the environment or a profile); the values are
+baked into the wrapper when the installer renders it, and an empty `--tape-nice`
+turns the raise off. The wrapper finds the command from the first two words that
+are not options (`--home X` and `--config X` skip their value), so
+`tapectl-op volume info write` — a volume *labelled* `write` — stays at normal
+priority, as does everything that is not in the list above. `runuser` gives
+tapectl the same user, groups and `HOME` that `sudo -u -H` does, so the command
+finds the same home and the same drive. `volume init` is not in the list: it
+writes the ID thunk and reads the chip, a few seconds of tape contact that
+stream nothing. `tapectl-drive-poll.service` carries the same priority as
+`Nice=`, `IOSchedulingClass=` and `IOSchedulingPriority=`; systemd applies it as
+root before it drops to `User=`. The audit and backup units are unchanged.
+
+The raise needs **root's** sudo, which is not the rule `home2-prep.sh` installs
+(that one lets you run commands *as the service user* without a password). So
+`tapectl-op` raises when `sudo -n` allows it, asks for your password when there
+is a terminal to ask on, and otherwise runs the command at normal priority and
+says so on stderr. A hand-typed `tapectl-op volume verify` therefore prompts for
+your password if your sudo ticket is not fresh; run `sudo -v` first when you
+want it unattended. `scripts/check-tapectl-op.sh` proves all of this without a
+tape, against a probe in place of tapectl.
 
 Checking: `systemctl list-timers --all 'tapectl-*'`,
 `systemctl status tapectl-backup.service`, `journalctl -u tapectl-audit.service -n 50`,

@@ -80,8 +80,12 @@ user reads every tenant's data and encrypts each to its own key.
 `first-run.sh` creates the account (home `/var/lib/tapectl`, so the tapectl
 home is `/var/lib/tapectl/.tapectl`), adds it to the group that owns the drive
 nodes, gives it the staging directory, and installs the wrapper
-`/usr/local/bin/tapectl-op`, which is simply
-`exec sudo -u tapectl -H /usr/local/bin/tapectl "$@"`. A restore destination
+`/usr/local/bin/tapectl-op`, which is
+`sudo -u tapectl -H /usr/local/bin/tapectl "$@"` — except that a tape command
+(`volume write`, `resume`, `verify`, `cartridge erase`, `collection run`, …)
+runs at raised CPU and I/O priority, raised as root and then dropped to the
+service user ([install.md §7](install.md#7-the-timers-and-the-operator-wrapper)).
+A restore destination
 must be writable by `tapectl`; restore itself needs no root (dar runs with
 `-O`), and restored files are owned by the service user.
 `first-run.sh --no-service-user` keeps a run-as-yourself layout for a
@@ -915,6 +919,17 @@ and pause them for the write with `sudo systemctl stop <unit>…` (`start` them
 again afterwards). `tapectl host check --unit <unit>` checks a unit once
 without editing the config; `first-run.sh` step 13 does exactly that for the
 host profile's `CONTENDER_UNITS` before its WRITE confirmation.
+
+The tape commands also run at a higher priority than the work they compete with
+(#432): the wrapper `tapectl-op` and `first-run.sh` step 13 raise them to
+`nice -10` and best-effort I/O level 0 — as root, then dropped to the service
+user — and `tapectl-drive-poll.service` sets the same with `Nice=` and
+`IOSchedulingClass=`. That outranks other processes *on this host*; it does not
+replace the quiet, and it cannot help against a guest or another host sharing
+the CPUs or the disks. To see what a running write got, find its process
+(`pgrep -x tapectl`) and read `ps -o pid,ni -p <pid>` and `ionice -p <pid>`. On
+home2 the remaining lever, lowering the weight of the guest `vm-desk1`, is
+printed (never applied) by `contrib/hosts/home2-prep.sh`; it is a host decision.
 
 The write itself needs no supervision once it is streaming; the drive's
 counters afterwards (`report health`, which compares the tape the drive
