@@ -82,9 +82,10 @@ TAPE_IONICE="-c2 -n0"  # the ionice arguments that go with it (best-effort, leve
 ESCROW_PUBLIC_KEY=""   # step 7: the ORIGINAL escrow public key (age1…, or a .pub path) for init to adopt instead of
                        # minting one — a rebuilt or fresh home that keeps the Heir Kit (ADR-0005, #139). Empty = ask
                        # (or, under --auto, mint).
-ERASE_LABEL=""         # step 13: the File 0 label (or, for a tape tapectl did not write, the chip serial) of a
-                       # SEALED tape step 13 may `cartridge erase` under --auto when `volume init` refuses it. Empty =
-                       # ask interactively, and never erase under --auto (a default is never consent to erase).
+ERASE_LABEL=""         # step 13: set by --erase-label ONLY, never by a profile (#469): the File 0 label (or, for a
+                       # tape tapectl did not write, the chip serial) of a SEALED tape step 13 may `cartridge erase`
+                       # under --auto when `volume init` refuses it. Empty = ask interactively, and never erase
+                       # under --auto (a default is never consent to erase).
 ADOPT_KEYS_FROM=""     # steps 7 and 11: a directory of <tenant>.key age identity files (the SECRETS, copied out of an
                        # old home: docs/keys-and-recovery.md) that the operator and the profile's tenants ADOPT instead
                        # of minting new keys (issue #424). Every one of them must have its file. Empty = mint, as usual.
@@ -101,6 +102,12 @@ if [ -n "$PROFILE" ]; then
   # shellcheck disable=SC1090
   . "$PROFILE"
 fi
+# ERASE_LABEL is consent to erase a cartridge holding a SEALED volume, so it is
+# taken from --erase-label only (#469): a word left in a profile is standing
+# consent, and in a run whose catalog is gone (a rebuild, a DR install) it would
+# erase that cartridge the moment it is loaded. A profile's value is kept only
+# to say why it is not used.
+PROFILE_ERASE_LABEL="${ERASE_LABEL:-}"; ERASE_LABEL=""
 usage() {
   # The step list ends at the "then what to do next" line; keep the range on it.
   sed -n '2,/then what to do next/p' "$0" | sed 's/^# \{0,1\}//'
@@ -139,7 +146,8 @@ Options:
                     steps 7 and 11 adopt DIR/<name>.key (an age identity file) as the operator's and
                     each profile tenant's key instead of minting one (docs/keys-and-recovery.md)
   --erase-label L   step 13: when \`volume init\` refuses a tape holding a SEALED volume, \`cartridge erase\`
-                    it under --auto only if L is the label its File 0 carries (ERASE_LABEL in a profile)
+                    it under --auto only if L is the label its File 0 carries (a flag only: a profile's
+                    ERASE_LABEL is ignored, because a word in a file would be standing consent)
   --escrow-public-key KEY
                     step 7 adopts KEY (age1… or a .pub path) as the escrow identity instead of
                     minting one, so an existing Heir Kit stays valid (ESCROW_PUBLIC_KEY in a profile)
@@ -207,6 +215,12 @@ BUILD_LOCK="$WORK_DIR/tapectl-build.lock"
 DAR="${DAR_BIN:-dar}"
 if [ -t 1 ]; then B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'; Y=$'\e[33m'; G=$'\e[32m'; RD=$'\e[31m'; else B=""; D=""; R=""; Y=""; G=""; RD=""; fi
 [ "$SVC_MODE" = 1 ] && [ "$SVC_USER" = "$USER" ] && SVC_MODE=0
+# The command an operator types for a catalog command, named in every remedy
+# this script prints (#469): in service-user mode the catalog is the service
+# user's (0600), so a bare `tapectl` from your own account is refused. Step 14
+# switches its summary to tapectl-op once the wrapper is installed.
+SUDO_PREFIX="$( [ "$SVC_MODE" = 1 ] && printf 'sudo -u %s -H ' "$SVC_USER" )"
+OP_CMD="${SUDO_PREFIX}tapectl"
 # as_svc: THE privilege seam. Every tapectl invocation and every read/write of
 # tapectl-owned state (the 0700 home, the 0600 config) goes through it; the
 # rest of the script stays you, with sudo for root work.
@@ -988,7 +1002,10 @@ EOF
 ask KIT_OUT "kit output directory" "${KIT_OUT:-$HOME/heir-kit}"
 if [ -f "$KIT_OUT/COVER.txt" ] && ! confirm "A kit already exists in $KIT_OUT — regenerate?"; then ok "keeping the existing kit"; else
   kit_prepare "$KIT_OUT"
-  run tc key escrow-kit --out "$KIT_OUT"; kit_finish "$KIT_OUT"
+  # kit_finish runs whatever the kit command did, so a failure never leaves
+  # the kit directory owned by the service user (#469).
+  kerc=0; run tc key escrow-kit --out "$KIT_OUT" || kerc=$?; kit_finish "$KIT_OUT"
+  [ "$kerc" = 0 ] || die "key escrow-kit exited $kerc (above); fix that and re-run scripts/first-run.sh --from 9 --to 9"
   [ -r "$KIT_OUT/COVER.txt" ] || die "$KIT_OUT/COVER.txt is not readable by $USER"
 fi
 note "Print: $KIT_OUT/COVER.txt   (and/or open $KIT_OUT/escrow-kit.html and print)"
@@ -1263,9 +1280,11 @@ EOF
   # Issue #428: tapectl's own read-only look at the drive (one O_NONBLOCK MTIOCGET,
   # the chip and the catalog's record of that cartridge; never moves the tape).
   run tc drive status --device "$DEVICE" || true
+  # `|| true`: drive status exits 2 for an absent or unreadable tape node, and
+  # under pipefail that would end this script before the note below (#469).
   CART_STATE="$(tc drive status --device "$DEVICE" --json 2>/dev/null | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["tape_node"]["cartridge"] or "")
-except Exception: pass')"
+except Exception: pass')" || true
   [ "$CART_STATE" = "empty" ] && die "no cartridge loaded in $DEVICE"
   [ "$CART_STATE" = "loaded" ] || note "drive status could not confirm a loaded cartridge (${CART_STATE:-no answer}); volume init refuses an empty drive on its own"
   ask LABEL "volume label" "${LABEL:-L6-0001}"
@@ -1331,7 +1350,7 @@ EOF
       die "volume $LABEL has a write session in progress RIGHT NOW (another process is writing it — tapectl turns a crashed session into an interrupted one whenever it opens the catalog). Find that process and let it finish; do not start a second writer"
       ;;
     planned)
-      die "volume $LABEL has a write session that was planned and never reached the tape. Clear it with \`tapectl volume abort $LABEL\`, then re-run under a NEW label: scripts/first-run.sh --from 13 --label <new>. This label cannot be written again once its session is aborted. The cartridge's File 0 still names $LABEL, so the new label's init asks before overwriting it, and marks $LABEL erased"
+      die "volume $LABEL has a write session that was planned and never reached the tape. Clear it with \`$OP_CMD volume abort $LABEL\`, then re-run under a NEW label: scripts/first-run.sh --from 13 --label <new>. This label cannot be written again once its session is aborted. The cartridge's File 0 still names $LABEL, so the new label's init asks before overwriting it, and marks $LABEL erased"
       ;;
     sealed)
       ok "volume $LABEL is already sealed — going on to the verify, audit, shelf and Heir Kit steps it is still owed"
@@ -1348,9 +1367,9 @@ except Exception: print("unknown")' "$VINFO" 2>/dev/null || echo unknown)"
         explain <<'EOF'
 THIS VOLUME'S WRITE SESSION WAS ABORTED AFTER ITS SEAL WAS WRITTEN. The cartridge is sealed, so it is never written again (ADR-0003) — and it does not need to be: `volume resume` re-confirms an aborted session whose seal is recorded, once a clean FULL verify has been recorded after the abort, and the volume then counts as a copy like any other. Keep its staged slices in place: the resume checks the tape against them. Load the SAME cartridge, run the two commands below, then re-run this step with the same label; it finds the volume sealed and carries on with the steps after the write.
 EOF
-        die "volume $LABEL ($VSTAT): run \`tapectl volume verify $LABEL --device $DEVICE --full\`, then \`tapectl volume resume $LABEL --device $DEVICE\`, then scripts/first-run.sh --from 13 --label $LABEL"
+        die "volume $LABEL ($VSTAT): run \`$OP_CMD volume verify $LABEL --device $DEVICE --full\`, then \`$OP_CMD volume resume $LABEL --device $DEVICE\`, then scripts/first-run.sh --from 13 --label $LABEL"
       fi
-      die "volume $LABEL already exists ($VSTAT) and is neither unwritten, interrupted nor sealed — \`tapectl volume info $LABEL\` shows its history. Choose a new label: scripts/first-run.sh --from 13 --label <new>"
+      die "volume $LABEL already exists ($VSTAT) and is neither unwritten, interrupted nor sealed — \`$OP_CMD volume info $LABEL\` shows its history. Choose a new label: scripts/first-run.sh --from 13 --label <new>"
       ;;
   esac
 if [ "$VSTATE" = absent ] || [ "$VSTATE" = fresh ]; then
@@ -1517,7 +1536,7 @@ EOF
       # Issue #431: no device_sg line and none derivable from device_tape (the
       # drive is not attached, or device_tape is not a /dev/nstN tape node).
       die "volume init refused: no sg node can be derived from device_tape $DEVICE — attach the drive (lsscsi -g), or set device_sg in [[backends.lto]], then re-run scripts/first-run.sh --from 13"
-    elif grep -q "ADR-0003" "$INIT_OUT"; then
+    elif grep -F "already carries a SEALED volume" "$INIT_OUT" >/dev/null; then
       # The SEALED case (issue #223): --force does not reach it, so it is never
       # offered. What does is `cartridge erase` (ADR-0012 2026-10-12 items
       # 51-52): it identifies the tape read-only, refuses a volume THIS catalog
@@ -1531,17 +1550,27 @@ EOF
       if ! run_capture "$EOUT" tc cartridge erase --device "$DEVICE" --dry-run; then
         die "cartridge erase refused this tape (above) — act on its remedy, or load a different cartridge, then re-run scripts/first-run.sh --from 13"
       fi
-      ERASE_WORD="$(sed -n 's/.*confirm with: --confirm-label \([^ ]*\)$/\1/p' "$EOUT" | head -1)"
-      if [ -z "$ERASE_WORD" ] || [ "$ERASE_WORD" = "(none:" ]; then
+      # The consent word from the report's own field (#469), never from the
+      # human line: `confirm_label` is null when the chip serial could not be read.
+      EJSON="$(dirname "$LOG")/cartridge-erase-dry-run.json"
+      run_capture_json "$EJSON" tc cartridge erase --device "$DEVICE" --dry-run --json \
+        || die "cartridge erase --dry-run --json refused this tape (above); re-run scripts/first-run.sh --from 13"
+      ERASE_WORD="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get("confirm_label") or "")
+except Exception: pass' "$EJSON")"
+      if [ -z "$ERASE_WORD" ]; then
         die "cartridge erase cannot erase this tape: the chip serial could not be read (its note above), and without it nothing proves which cartridge was erased; nothing was erased. Check the drive's device_sg with \`tapectl config check\` and what the chip reports with \`tapectl volume identify --device $DEVICE\`, then re-run scripts/first-run.sh --from 13"
       fi
       if [ "$AUTO" = 1 ]; then
         # A default is never consent to erase: under --auto the label must be
-        # named by the profile (ERASE_LABEL) or --erase-label, and equal what
+        # named by --erase-label (never a profile, #469), and equal what
         # the tape says.
-        [ -n "$ERASE_LABEL" ] || die "the tape holds $ERASE_WORD (above). Under --auto, cartridge erase runs only when ERASE_LABEL (profile) or --erase-label names the label to overwrite; nothing was erased"
+        if [ -z "$ERASE_LABEL" ]; then
+          [ -n "$PROFILE_ERASE_LABEL" ] && note "the profile sets ERASE_LABEL=$PROFILE_ERASE_LABEL, which is not consent: pass --erase-label (#469)"
+          die "the tape holds $ERASE_WORD (above). Under --auto, cartridge erase runs only when --erase-label names the label to overwrite; nothing was erased"
+        fi
         [ "$ERASE_LABEL" = "$ERASE_WORD" ] || die "--erase-label $ERASE_LABEL does not match the tape in the drive, which holds $ERASE_WORD — nothing was erased"
-        printf '   ERASE the tape holding %s [auto: named by ERASE_LABEL]\n' "$ERASE_WORD"
+        printf '   ERASE the tape holding %s [auto: named by --erase-label]\n' "$ERASE_WORD"
       else
         confirm_destructive "ERASE the tape in $DEVICE, which holds $ERASE_WORD (shown above)" "$ERASE_WORD" || die "stopped before erasing; nothing was erased"
       fi
@@ -1555,11 +1584,14 @@ EOF
       # so no --force. If it still refuses, the proof did not hold -- say so, don't force.
       run_capture "$INIT_OUT" tc volume init "$LABEL" --device "$DEVICE" \
         || die "volume init still refused after the erase — read the refusal above, then re-run scripts/first-run.sh --from 13"
-    elif grep -qE "identifies a DIFFERENT volume|File 0 is EMPTY" "$INIT_OUT"; then
-      # The only two refusals --force can override (write.rs
-      # decide_fresh_write_contact: IdentityMismatch and EmptyFileZero).
+    elif grep -E "identifies a DIFFERENT volume|File 0 is EMPTY|is not provably blank" "$INIT_OUT" >/dev/null; then
+      # The refusals --force can override (write.rs decide_fresh_write_contact_on:
+      # IdentityMismatch, EmptyFileZero, and an unreadable File 0 on a tape that is
+      # not provably blank and not bound to a live volume). Routed by phrase, never
+      # by "ADR-0003", which the unreadable-File-0 refusals also cite (#446); the
+      # phrases are pinned by tests/first_run_refusal_phrases.rs.
       explain <<'EOF'
-volume init refused. The cartridge's File 0 identifies a DIFFERENT volume that is NOT sealed (a stale or foreign tape), or is EMPTY (a filemark at the beginning of the tape, e.g. after `mt weof`); tapectl's refusal above says which. tapectl will not overwrite either by accident. If this cartridge is genuinely expendable (a retired volume, a test tape), re-run init with --force; if you are not sure, stop and check `tapectl volume identify --device <dev>` first. (A SEALED tape is a different case and --force would not help there; this is not that.)
+volume init refused. The cartridge's File 0 identifies a DIFFERENT volume that is NOT sealed (a stale or foreign tape), or is EMPTY (a filemark at the beginning of the tape, e.g. after `mt weof`), or could not be read on a tape that is not provably blank (a drive that needs cleaning, a medium error, or a tape written in another block size: check the drive and the cartridge first); tapectl's refusal above says which. tapectl will not overwrite either by accident. If this cartridge is genuinely expendable (a retired volume, a test tape), re-run init with --force; if you are not sure, stop and check `tapectl volume identify --device <dev>` first. (A SEALED tape is a different case and --force would not help there; this is not that.)
 EOF
       [ "$AUTO" = 1 ] && die "volume init refused under --auto; not forcing"
       confirm_destructive "OVERWRITE whatever is on this cartridge with $LABEL" "$LABEL" "$LABEL_FROM_FLAG" || die "stopped"
@@ -1578,7 +1610,7 @@ EOF
   CART_BOUND="${CART_NEW:-$(sed -n 's/^volume "[^"]*" bound to cartridge \(.*\)$/\1/p' "$INIT_OUT" | head -1)}"
   if [ -n "$CART_NEW" ]; then
     ok "cartridge $CART_NEW registered from its chip; that serial is its placeholder barcode"
-    note "When you put a sticker on it:  tapectl cartridge relabel $CART_NEW <your-barcode>"
+    note "When you put a sticker on it:  $OP_CMD cartridge relabel $CART_NEW <your-barcode>"
   elif [ -n "$CART_BOUND" ]; then
     ok "volume $LABEL bound to the already-registered cartridge $CART_BOUND"
   fi
@@ -1616,7 +1648,7 @@ fi
     if grep -E "wrong (tape|cartridge):" "$VERIFY_ERR" >/dev/null 2>&1; then
       note "The cartridge in $DEVICE is not $LABEL's: the verify refused before reading it (above)."
       note "This is a different cartridge loaded, not a drive or a medium problem; nothing was recorded."
-      die "load $LABEL's cartridge (\`tapectl volume info $LABEL\` names it), then re-run scripts/first-run.sh --from 13 --label $LABEL"
+      die "load $LABEL's cartridge (\`$OP_CMD volume info $LABEL\` names it), then re-run scripts/first-run.sh --from 13 --label $LABEL"
     fi
     # `quarantined` is the discriminator (src/cli/volume.rs, `volume verify
     # --json`): true = the medium was proved bad and the volume is now out of
@@ -1669,7 +1701,7 @@ fi
 # ================================================================ step 14
 hdr 14 "Timers, the operator wrapper, and what comes next"
 explain <<EOF
-Three timers and a wrapper finish the installation (ADR-0012, 2026-09-24 and 2026-10-07): a WEEKLY advisory audit (Monday 09:00, read-only, no tape; exit 1 = warnings is not a failure), a DAILY drive health poll (06:30: the drive's log pages and chip through /dev/sg* only — never the tape node, never a motion; a raised TapeAlert is a failure) and a DAILY catalog backup at 03:00 — \`tapectl db backup\` to $BACKUP_DIR, newest 14 kept, the copy checked for a SQLite header and the live catalog fsck'd — so the catalog outlives this disk. Put that directory on a SECOND disk (--backup-dir); the installer warns when it is on the same one. After a write session, \`sudo systemctl start tapectl-backup.service\` takes a copy at once. The wrapper /usr/local/bin/tapectl-op is \`sudo -u $SVC_USER -H tapectl\`, so you need not type the prefix. scripts/install-systemd.sh does all of it, idempotently — re-run it to change anything, --uninstall reverses it — and nothing in it moves a tape. docs/install.md is the runbook.
+Three timers and a wrapper finish the installation (ADR-0012, 2026-09-24 and 2026-10-07): a WEEKLY advisory audit (Monday 09:00, read-only, no tape; exit 1 = warnings is not a failure), a DAILY drive health poll (06:30: the drive's log pages and chip through /dev/sg* only — never the tape node, never a motion; a raised TapeAlert is a failure) and a DAILY catalog backup at 03:00 — \`tapectl db backup\` to $BACKUP_DIR, newest 14 kept, the copy checked for a SQLite header and the live catalog fsck'd — so the catalog outlives this disk. Put that directory on a SECOND disk (--backup-dir); the installer warns when it is on the same one. After a write session, \`sudo systemctl start tapectl-backup.service\` takes a copy at once. The wrapper /usr/local/bin/tapectl-op runs tapectl as $SVC_USER, so you need not type the prefix; a tape command (write, resume, verify, restore, init, erase, eject) goes through \`sudo nice -n $TAPE_NICE ionice $TAPE_IONICE runuser -u $SVC_USER -- tapectl\` at raised priority (one sudo prompt where root sudo asks for one), and falls back to \`sudo -u $SVC_USER -H tapectl\` at normal priority with a notice if that is refused. scripts/install-systemd.sh does all of it, idempotently — re-run it to change anything, --uninstall reverses it — and nothing in it moves a tape. docs/install.md is the runbook.
 EOF
 INSTALL_ARGS=(--tapectl "$TAPECTL" --backup-dir "$BACKUP_DIR" --tape-nice "$TAPE_NICE" --tape-ionice "$TAPE_IONICE")
 if [ "$SVC_MODE" = 1 ]; then INSTALL_ARGS+=(--user "$SVC_USER"); else INSTALL_ARGS+=(--user "$USER"); fi
@@ -1685,20 +1717,20 @@ elif confirm "Install the audit and backup timers and /usr/local/bin/tapectl-op 
     ok "timers installed — systemctl list-timers 'tapectl-*' shows them"
   else note "install-systemd.sh failed — fix what it printed and re-run it by hand: scripts/install-systemd.sh $(printf '%q ' "${INSTALL_ARGS[@]}")"; fi
 else note "skipped — later: scripts/install-systemd.sh $(printf '%q ' "${INSTALL_ARGS[@]}")"; fi
-SUDO_PREFIX="$( [ "$SVC_MODE" = 1 ] && printf 'sudo -u %s -H ' "$SVC_USER" )"
-OP_CMD="${SUDO_PREFIX}tapectl"; [ "$WRAPPER_INSTALLED" = 1 ] && OP_CMD="tapectl-op"
+[ "$WRAPPER_INSTALLED" = 1 ] && OP_CMD="tapectl-op"
 cat <<EOF
    • Every tapectl command from now on: ${OP_CMD} <command>$( [ "$WRAPPER_INSTALLED" = 1 ] || printf '   (alias it)' ). Its home: $EFFECTIVE_HOME
    • A restore destination must be writable by ${SVC_USER}; new unit trees need the same ACL grant as step 11.
    • Eject with: ${OP_CMD} drive eject (it tells the catalog; a write or verify in progress refuses it). Write the label on the cartridge.
      Then tell the catalog what the sticker says (ADR-0012 — the serial stays its identity):
-     ${SUDO_PREFIX}tapectl cartridge relabel ${CART_BOUND:-<medium-serial>} <the-barcode-you-wrote>
+     ${OP_CMD} cartridge relabel ${CART_BOUND:-<medium-serial>} <the-barcode-you-wrote>
    • Second copy, other location: the staged slices are still on disk, so load a fresh cartridge,
-     \`tapectl volume init <label-2>\`, \`tapectl volume write <label-2>\`, then \`volume move <label-2> --to <other shelf>\`.
+     \`${OP_CMD} volume init <label-2>\`, \`${OP_CMD} volume write <label-2> --keep-staging\`, then \`volume move <label-2> --to <other shelf>\`
+     (or both in one: \`${OP_CMD} volume write <label-2> --init --full-confirm --move-to <other shelf>\`).
      (Only if staging was cleaned: load tape 1 first and \`volume read-slices --from ${LABEL:-<label>} --unit <unit>\` per unit.)
    • \`tapectl audit\` runs weekly and the catalog is copied daily to $BACKUP_DIR (systemctl list-timers 'tapectl-*');
      after each session: sudo systemctl start tapectl-backup.service, and regenerate the heir kit (step 9).
-   • \`tapectl report summary\`, \`report fire-risk\`, \`catalog locate <unit>\` answer the operator questions;
+   • \`${OP_CMD} report summary\`, \`report fire-risk\`, \`catalog locate <unit>\` answer the operator questions;
      \`report health\` shows the drive's error counters from every tape contact (ADR-0013).
    • Disaster recovery, the whole procedure: docs/operator-guide.md, "Disaster Recovery".
    • Reinstall, move to another host, uninstall: docs/install.md.
