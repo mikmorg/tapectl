@@ -448,9 +448,10 @@ fn density_phrase(code: Option<u8>) -> String {
 /// sentence goes looking for the wrong cartridge, when the cartridge is fine
 /// and the config is not.
 ///
-/// Names the block, the drive it claims to be and the device path, because
-/// there is no `backend edit` (ADR-0012, #143): the repair is editing
-/// config.toml by hand, and the operator needs to know which block.
+/// Names the block, the drive it claims to be and the device path, and the
+/// exact `config set` that corrects it (issue #467; there is no `backend
+/// edit`, but `config set 'backends.lto[NAME].generation'` has done the job
+/// since 1.1.0): the operator needs to know which block.
 fn cannot_write_message(
     drive_gen: Generation,
     medium_gen: Generation,
@@ -461,10 +462,12 @@ fn cannot_write_message(
          limit of the drive, not a policy — --force does not override it. Load a \
          {drive_gen}-writable cartridge, or write this one in a drive that can.\n\n\
          If this drive is not really an {drive_gen}, `generation` in the \
-         [[backends.lto]] block named \"{}\" ({}) is wrong — edit config.toml \
-         (`tapectl config show` prints it; there is no `backend edit`, by decision: \
-         ADR-0012) and run `tapectl config check`.",
-        backend.name, backend.device_tape,
+         [[backends.lto]] block named \"{name}\" ({tape}) is wrong — correct it with \
+         `tapectl config set 'backends.lto[{name}].generation' LTO-N` (N is the drive's \
+         own generation; `tapectl config show` prints the file) and run `tapectl \
+         config check`.",
+        name = backend.name,
+        tape = backend.device_tape,
     )
 }
 
@@ -487,10 +490,12 @@ fn cannot_read_message(
          of the drive, not a policy. Read this tape in a drive that can, or move it to \
          one that can before restoring, verifying, or rebuilding from it.\n\n\
          If this drive is not really an {drive_gen}, `generation` in the \
-         [[backends.lto]] block named \"{}\" ({}) is wrong — edit config.toml \
-         (`tapectl config show` prints it; there is no `backend edit`, by decision: \
-         ADR-0012) and run `tapectl config check`.",
-        backend.name, backend.device_tape,
+         [[backends.lto]] block named \"{name}\" ({tape}) is wrong — correct it with \
+         `tapectl config set 'backends.lto[{name}].generation' LTO-N` (N is the drive's \
+         own generation; `tapectl config show` prints the file) and run `tapectl \
+         config check`.",
+        name = backend.name,
+        tape = backend.device_tape,
     )
 }
 
@@ -877,8 +882,8 @@ mod tests {
     /// `[[backends.lto]].generation` is wrong — which is precisely what
     /// `first-run.sh` used to produce by defaulting the DRIVE's generation from
     /// whatever tape happened to be loaded during setup. There is no
-    /// `backend edit` (ADR-0012, #143), so the message has to say which block
-    /// to edit by hand.
+    /// `backend edit`, so the message has to say which block, and the
+    /// `config set` that corrects it (issue #467).
     #[test]
     fn cannot_write_message_names_the_backend_block_and_keeps_the_physics() {
         let backend = test_backend("lto6", "/dev/tape/by-id/scsi-EXAMPLE-nst", "LTO-5");
@@ -897,23 +902,33 @@ mod tests {
         assert!(msg.contains("/dev/tape/by-id/scsi-EXAMPLE-nst"), "{msg}");
         assert!(msg.contains("config check"), "{msg}");
 
-        // Issue #357: the ruling is cited by its ADR, which tells an operator
-        // why; the tracker number (`#143`) told them nothing.
-        assert!(msg.contains("by decision: ADR-0012)"), "{msg}");
+        // Issue #467: the repair is the command that does it — not "edit
+        // config.toml by hand ... there is no `backend edit`".
+        assert!(
+            msg.contains("`tapectl config set 'backends.lto[lto6].generation' LTO-N`"),
+            "{msg}"
+        );
+        assert!(!msg.contains("backend edit"), "{msg}");
+        assert!(!msg.contains("edit config.toml"), "{msg}");
+        // Issue #357: no tracker numbers in a runtime message.
         assert!(
             !msg.contains('#'),
             "no issue numbers in a runtime message: {msg}"
         );
     }
 
-    /// The read-side twin carries the same config half, so the same #357
-    /// rule: the ADR stays, the issue number does not.
+    /// The read-side twin carries the same config half: the same #357 rule
+    /// (no issue number) and the same #467 repair (the `config set`).
     #[test]
-    fn cannot_read_message_cites_the_adr_not_an_issue_number() {
+    fn cannot_read_message_names_the_config_set_and_carries_no_issue_number() {
         let backend = test_backend("lto5", "/dev/tape/by-id/scsi-EXAMPLE-nst", "LTO-5");
         let msg = cannot_read_message(Generation::Lto5, Generation::Lto7, &backend);
         assert!(msg.contains("cannot read LTO-7 media"), "{msg}");
-        assert!(msg.contains("by decision: ADR-0012)"), "{msg}");
+        assert!(
+            msg.contains("`tapectl config set 'backends.lto[lto5].generation' LTO-N`"),
+            "{msg}"
+        );
+        assert!(!msg.contains("backend edit"), "{msg}");
         assert!(
             !msg.contains('#'),
             "no issue numbers in a runtime message: {msg}"
