@@ -7,14 +7,20 @@
 //! is the opposite kind of command: it records nothing (no contact, no log
 //! page, no journal row), takes no lock, and is the one drive command meant
 //! to be run WHILE something else has the drive. See [`status`].
+//!
+//! `tapectl drive eject` — unload the cartridge, with the catalog told (issue
+//! #429; ADR-0012 2026-10-15 item 61). The one drive command that moves a
+//! cartridge, so the one that refuses first. See [`eject`].
 
 use clap::Subcommand;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+use std::path::Path;
 
 use crate::config::{Config, LtoBackendConfig, TapectlPaths};
 use crate::error::{Result, TapectlError, EXIT_SUCCESS};
 use crate::staging::lock::{self, DriveLockState};
+use crate::tape::contact::{ContactSite, Medium, Operation, OUTCOME_FAILED, OUTCOME_OK};
 use crate::tape::drive_identity::{self, DriveIdentity};
 use crate::tape::ioctl::{self, CartridgeState, TapeNodeStatus};
 use crate::tape::mam::{self, MamInfo, MamRead};
@@ -94,6 +100,53 @@ pub enum DriveCommands {
         #[arg(long)]
         device: Option<String>,
     },
+
+    /// Unload the cartridge from the drive, and tell the catalog it left
+    ///
+    /// Reads the cartridge chip's serial (READ ATTRIBUTE through the SCSI
+    /// generic node; no motion), then rewinds and unloads the cartridge
+    /// (`MTOFFL`, what `mt offline` sends) — and records it: one contact
+    /// (`drive eject`) naming the cartridge and the drive, and one
+    /// `ejected` event on the cartridge (on the drive when the chip is not
+    /// registered). It changes nothing else: the cartridge's volumes stay
+    /// bound to it (an ejected cartridge is on a shelf, not displaced), and
+    /// its place stays what `cartridge move` last said. When the cartridge
+    /// is going somewhere else, the output names the command.
+    ///
+    /// Refuses while any tapectl command holds the drive or a volume (a
+    /// write, a verify, a restore, a poll): exit 75, naming the holder's pid
+    /// and command, with nothing sent to the drive and nothing recorded.
+    /// There is no `--force`. Once it has the drive it holds the drive's lock
+    /// until it exits, so no command can start a tape operation mid-eject.
+    /// The tape node being open in a process that is not tapectl is refused
+    /// the same way (exit 75).
+    ///
+    /// Strict, like every command that moves a cartridge: the drive must be
+    /// a configured backend (`tapectl backend add`), whose SCSI generic node
+    /// is checked to be the same drive as its tape node. On a machine with
+    /// no backend, `mt -f <device> offline` still works; the catalog is not
+    /// told.
+    ///
+    /// Exit 0: unloaded and recorded, or nothing to do because the drive was
+    /// already empty (no contact, no event: no cartridge was in the drive).
+    /// Exit 75: refused, a tapectl command or another process has the drive.
+    /// Exit 2: not unloaded — the tape node could not be read, a cartridge is
+    /// present and the drive is not ready (loading, or faulted), or the
+    /// unload failed (the contact is recorded as failed; there is no event).
+    /// A catalog that cannot record the event after a good unload is a
+    /// warning, not a failure.
+    ///
+    /// `--dry-run` does everything up to the unload: it checks for a holder,
+    /// reads the node and the chip, and reports what it would eject; it takes
+    /// no lock, sends no unload and records nothing. With `--json` the whole
+    /// of stdout is one JSON object.
+    Eject {
+        /// The drive to eject from, by its tape node path as configured
+        /// (`[[backends.lto]].device_tape`; a by-id link). Defaults to the
+        /// only configured drive.
+        #[arg(long)]
+        device: Option<String>,
+    },
 }
 
 /// Exit 1: the reading was recorded and the drive reported a problem.
@@ -165,6 +218,26 @@ pub fn run(
                 }
             }
             Ok(code)
+        }
+        // Honours `--dry-run` (tests/dry_run_contract.rs): it checks and
+        // reports, and sends and records nothing. STRICT, unlike `status`:
+        // the command moves a cartridge, and the record it makes names the
+        // cartridge by the chip read through `device_sg`, so a backend whose
+        // sg node is another drive (#329) must refuse here, not record the
+        // wrong cartridge as ejected.
+        DriveCommands::Eject { device } => {
+            let backend = crate::config::resolve_lto_backend(config, device.as_deref())?;
+            let conn = crate::db::open(&paths.db_file)?;
+            let report = eject(
+                &conn,
+                paths,
+                config,
+                backend,
+                dry_run,
+                EjectProbe::default(),
+            )?;
+            render_eject(&report, json_output);
+            Ok(eject_exit_code(&report))
         }
     }
 }
@@ -528,19 +601,14 @@ pub fn status(
             Err(e) => {
                 let node = &mut report.tape_node;
                 node.error = Some(e.to_string());
-                node.probe = match e.raw_os_error() {
-                    Some(nix::libc::EBUSY) => {
-                        report.notes.push(
-                            "the tape node is open in another process (the st driver allows \
-                             one opener): nothing was sent to the drive"
-                                .into(),
-                        );
-                        NodeProbe::InUse
-                    }
-                    Some(nix::libc::ENODEV) | Some(nix::libc::ENXIO) => NodeProbe::Absent,
-                    _ if e.kind() == std::io::ErrorKind::NotFound => NodeProbe::Absent,
-                    _ => NodeProbe::Unreadable,
-                };
+                node.probe = node_probe_of(&e);
+                if node.probe == NodeProbe::InUse {
+                    report.notes.push(
+                        "the tape node is open in another process (the st driver allows \
+                         one opener): nothing was sent to the drive"
+                            .into(),
+                    );
+                }
             }
         }
     }
@@ -590,6 +658,19 @@ pub fn status(
     report.catalog.last_contact_on_device =
         last_contact_on_device(conn, device, report.drive.serial.as_deref());
     report
+}
+
+/// What a failed open or `MTIOCGET` of the tape node means: `EBUSY` is
+/// another opener (st allows one), `ENOENT`/`ENODEV`/`ENXIO` no drive, and
+/// anything else a node that exists and would not answer. Shared by `drive
+/// status` and `drive eject`, which must agree about what a node is.
+fn node_probe_of(e: &std::io::Error) -> NodeProbe {
+    match e.raw_os_error() {
+        Some(nix::libc::EBUSY) => NodeProbe::InUse,
+        Some(nix::libc::ENODEV) | Some(nix::libc::ENXIO) => NodeProbe::Absent,
+        _ if e.kind() == std::io::ErrorKind::NotFound => NodeProbe::Absent,
+        _ => NodeProbe::Unreadable,
+    }
 }
 
 /// Fold the st driver's answer into the report's tape-node section.
@@ -810,6 +891,30 @@ pub fn status_exit_code(report: &StatusReport) -> i32 {
     }
 }
 
+/// One holder as a line: what it holds, its pid, its command and phase, and
+/// for a volume the cartridge the catalog has it on. Shared by `drive
+/// status` and the refusals of `drive eject`.
+fn holder_line(h: &Holder) -> String {
+    format!(
+        "{} {}{}{}{}{}",
+        h.kind,
+        h.name,
+        h.pid.map(|p| format!(", pid {p}")).unwrap_or_default(),
+        h.command
+            .as_deref()
+            .map(|c| format!(", `{c}`"))
+            .unwrap_or_default(),
+        h.phase
+            .as_deref()
+            .map(|p| format!(", {p}"))
+            .unwrap_or_default(),
+        h.cartridge
+            .as_deref()
+            .map(|c| format!(", on cartridge {c}"))
+            .unwrap_or_default(),
+    )
+}
+
 fn render_status(report: &StatusReport, json_output: bool) {
     if json_output {
         println!("{}", serde_json::to_string(report).unwrap_or_default());
@@ -880,25 +985,7 @@ pub fn status_text(report: &StatusReport) -> String {
         }
     }
     for h in &report.holders {
-        let _ = writeln!(
-            out,
-            "             {} {}{}{}{}{}",
-            h.kind,
-            h.name,
-            h.pid.map(|p| format!(", pid {p}")).unwrap_or_default(),
-            h.command
-                .as_deref()
-                .map(|c| format!(", `{c}`"))
-                .unwrap_or_default(),
-            h.phase
-                .as_deref()
-                .map(|p| format!(", {p}"))
-                .unwrap_or_default(),
-            h.cartridge
-                .as_deref()
-                .map(|c| format!(", on cartridge {c}"))
-                .unwrap_or_default(),
-        );
+        let _ = writeln!(out, "             {}", holder_line(h));
     }
     // The tape node.
     let n = &report.tape_node;
@@ -1048,6 +1135,398 @@ pub fn status_text(report: &StatusReport) -> String {
     }
     for note in &report.notes {
         let _ = writeln!(out, "  note: {note}");
+    }
+    out
+}
+
+// ── `drive eject` (issue #429) ──────────────────────────────────────────────
+
+/// How an eject ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EjectOutcome {
+    /// The cartridge was unloaded, and the contact and event recorded.
+    Ejected,
+    /// `--dry-run`: every check ran, nothing was sent or recorded.
+    WouldEject,
+    /// No cartridge in the drive: the end state already holds. Nothing was
+    /// sent and nothing recorded — no cartridge was in the drive, so there
+    /// was no contact.
+    NoCartridge,
+    /// A tapectl command holds the drive or a volume.
+    RefusedHeld,
+    /// The tape node is open in a process that is not holding tapectl's lock.
+    RefusedNodeInUse,
+    /// A cartridge is present and the drive is not ready: loading, or
+    /// faulted. Its chip cannot be read, so the record could not name it.
+    RefusedNotReady,
+    /// The tape node could not be read (no such drive, no permission).
+    NodeUnreadable,
+    /// The unload failed; the contact is recorded as failed.
+    UnloadFailed,
+}
+
+/// What `tapectl drive eject` did and found.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EjectReport {
+    pub device: String,
+    pub backend: String,
+    pub dry_run: bool,
+    pub outcome: EjectOutcome,
+    /// The outcome in words: what was done, or why not and what to do.
+    pub message: String,
+    /// Who held the drive or a volume, for a refusal.
+    pub holders: Vec<Holder>,
+    /// The chip's serial, when the chip answered.
+    pub chip_serial: Option<String>,
+    /// The cartridge the catalog has under that serial.
+    pub cartridge: Option<CartridgeFacts>,
+    /// The `drive eject` contact, `None` unless one was opened.
+    pub contact_id: Option<i64>,
+    /// The `ejected` event, `None` unless one was written.
+    pub event_id: Option<i64>,
+    pub warnings: Vec<String>,
+}
+
+/// Where `drive eject`'s hardware and process answers come from.
+/// `EjectProbe::default()` — the production value — asks the machine; a test
+/// supplies each answer, and the unload itself.
+#[derive(Default)]
+pub struct EjectProbe<'a> {
+    pub node: Option<std::io::Result<TapeNodeStatus>>,
+    pub mam: Option<MamRead>,
+    pub identity: Option<DriveIdentity>,
+    pub holders: Option<Vec<Holder>>,
+    /// The unload. `None`, the production value, is [`ioctl::offline`].
+    pub unload: Option<&'a mut dyn FnMut() -> std::io::Result<()>>,
+    pub sysfs_root: Option<&'a Path>,
+}
+
+/// Eject the cartridge from the drive `backend` names, and record that it
+/// left.
+///
+/// THE ORDER IS THE SAFETY ARGUMENT. Nothing is sent to the drive until a
+/// check has said no tapectl command has it:
+///
+/// 1. **The drive lock is TAKEN**, not tested ([`lock::try_hold_drive`], one
+///    atomic step: a test followed by a take would leave a gap in which a
+///    write's contact could start). A failure to take it names the holder
+///    and refuses. A dry run only tests it ([`lock::drive_lock_state`]) and
+///    keeps nothing. Once taken it is kept until the process exits, which is
+///    what stops a command from starting a tape operation mid-eject: a
+///    contact waits for it ([`lock::hold_drive_for_contact`]).
+/// 2. Any live volume session refuses too. A session holds its volume's lock
+///    from before its contact opens (a write's staging check, a verify's
+///    open), and a volume lock cannot say which drive it will use.
+/// 3. The tape node is read ([`ioctl::status_nonblocking`], `MTIOCGET`).
+///    Open elsewhere (`EBUSY`) refuses; empty is nothing to do; present but
+///    not ready refuses.
+/// 4. The chip is read (READ ATTRIBUTE through the sg node; no motion), so the
+///    contact can name the cartridge. A chip that does not answer does not
+///    stop the eject; the contact records why it has no cartridge.
+/// 5. The contact opens, the cartridge is unloaded, the contact closes
+///    (`ok`, or `failed` with the error), and only a good unload writes the
+///    event.
+///
+/// It never touches `cartridge_volumes` (ADR-0012 2026-10-15 item 61):
+/// migration 020 reserves `unmounted_at` for displacement, and coverage reads
+/// `unmounted_at IS NULL` as "bound" — a cartridge on a shelf is still bound.
+///
+/// Errors only for what makes the lock unobtainable (an unwritable `locks/`);
+/// every other outcome is a report.
+pub fn eject(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    backend: &LtoBackendConfig,
+    dry_run: bool,
+    mut probe: EjectProbe<'_>,
+) -> Result<EjectReport> {
+    let device = backend.device_tape.as_str();
+    let mut report = EjectReport {
+        device: device.to_string(),
+        backend: backend.name.clone(),
+        dry_run,
+        outcome: EjectOutcome::NoCartridge,
+        message: String::new(),
+        holders: Vec::new(),
+        chip_serial: None,
+        cartridge: None,
+        contact_id: None,
+        event_id: None,
+        warnings: Vec::new(),
+    };
+
+    // 1 and 2. Who has the drive, and who has a volume.
+    let drive_held = if dry_run {
+        match lock::drive_lock_state(&paths.db_file, device) {
+            DriveLockState::Free => false,
+            DriveLockState::Held => true,
+            DriveLockState::Unknown(why) => {
+                return Err(TapectlError::Other(format!(
+                    "drive eject: the drive lock for {device} could not be tested ({why}); \
+                     refusing — the lock is what keeps a command from starting a tape \
+                     operation under an eject"
+                )))
+            }
+        }
+    } else {
+        !lock::try_hold_drive(&paths.db_file, device)?
+    };
+    let lock_state = if drive_held {
+        DriveLockState::Held
+    } else {
+        DriveLockState::Free
+    };
+    report.holders = probe
+        .holders
+        .take()
+        .unwrap_or_else(|| find_holders(conn, paths, device, &lock_state));
+    if drive_held || !report.holders.is_empty() {
+        let who: Vec<String> = report.holders.iter().map(holder_line).collect();
+        report.outcome = EjectOutcome::RefusedHeld;
+        let held_by = if who.is_empty() {
+            "a tapectl command holds the drive".to_string()
+        } else {
+            format!("held by {}", who.join("; "))
+        };
+        report.message = format!(
+            "drive eject: refused — {held_by}. Nothing was sent to {device} and nothing was \
+             recorded; `tapectl status` shows what is running. Run this again when it has \
+             finished (there is no --force)."
+        );
+        return Ok(report);
+    }
+
+    // 3. What the tape node says.
+    let status = match probe
+        .node
+        .take()
+        .unwrap_or_else(|| ioctl::status_nonblocking(device))
+    {
+        Ok(status) => status,
+        Err(e) => {
+            match node_probe_of(&e) {
+                NodeProbe::InUse => {
+                    report.outcome = EjectOutcome::RefusedNodeInUse;
+                    report.message = format!(
+                        "drive eject: refused — {device} is open in another process (the st \
+                         driver allows one opener) that is not holding tapectl's drive lock. \
+                         Nothing was sent to the drive. Close whatever has it open and run \
+                         this again."
+                    );
+                }
+                NodeProbe::Absent => {
+                    report.outcome = EjectOutcome::NodeUnreadable;
+                    report.message = format!("drive eject: no drive answers at {device}: {e}");
+                }
+                _ => {
+                    report.outcome = EjectOutcome::NodeUnreadable;
+                    report.message = format!("drive eject: {device} cannot be read: {e}");
+                }
+            }
+            return Ok(report);
+        }
+    };
+    match status.cartridge() {
+        CartridgeState::Empty => {
+            report.outcome = EjectOutcome::NoCartridge;
+            report.message = format!("no cartridge is loaded in {device}; nothing to eject");
+            return Ok(report);
+        }
+        CartridgeState::NotReady => {
+            report.outcome = EjectOutcome::RefusedNotReady;
+            report.message = format!(
+                "drive eject: a cartridge is present in {device} and the drive is not ready \
+                 (loading, or faulted), so its chip cannot be read and the record could not \
+                 name what leaves. Nothing was sent. Try again in a minute; if the drive is \
+                 faulted, `mt -f {device} offline` unloads it without telling the catalog."
+            );
+            return Ok(report);
+        }
+        CartridgeState::Loaded => {}
+    }
+
+    // 4. Which cartridge: the chip's serial, never a guess from the catalog.
+    let mam_read = probe
+        .mam
+        .take()
+        .unwrap_or_else(|| mam::read_mam(&backend.device_sg));
+    report.chip_serial = mam_read.info.serial.clone().filter(|s| !s.is_empty());
+    report.cartridge = report
+        .chip_serial
+        .as_deref()
+        .and_then(|serial| cartridge_facts(conn, serial));
+    let what = match (&report.cartridge, &report.chip_serial) {
+        (Some(c), Some(serial)) => format!("cartridge {} (chip {serial})", c.barcode),
+        (None, Some(serial)) => {
+            format!("a cartridge whose chip serial {serial} is not registered in this catalog")
+        }
+        (_, None) => "a cartridge whose chip serial could not be read".to_string(),
+    };
+    if dry_run {
+        report.outcome = EjectOutcome::WouldEject;
+        report.message = format!(
+            "dry run: would unload {what} from {device} and record a `drive eject` contact \
+             and an `ejected` event. Nothing was sent to the drive and nothing was recorded."
+        );
+        return Ok(report);
+    }
+
+    // 5. The contact, the unload, the event.
+    let mut site = ContactSite::new(
+        config,
+        Operation::DriveEject,
+        device,
+        Medium::Observed {
+            backend,
+            mam: &mam_read.info,
+        },
+    );
+    if let Some(identity) = probe.identity.as_ref() {
+        site = site.with_drive_identity(identity);
+    }
+    if let Some(root) = probe.sysfs_root {
+        site = site.with_sysfs_root(root);
+    }
+    let guard = site.open(conn, None);
+    report.contact_id = guard.id();
+    let unloaded = match probe.unload.take() {
+        Some(unload) => unload(),
+        None => ioctl::offline(device),
+    };
+    match unloaded {
+        Ok(()) => {
+            guard.finish(OUTCOME_OK, Some(&format!("unloaded {what}")));
+            report.outcome = EjectOutcome::Ejected;
+            report.message = format!("ejected {what} from {device}");
+            match record_ejected(conn, &report, device) {
+                Ok(id) => report.event_id = id,
+                Err(e) => report.warnings.push(format!(
+                    "the cartridge was unloaded, but the catalog could not record the \
+                     `ejected` event: {e}"
+                )),
+            }
+            if report.event_id.is_none() && report.warnings.is_empty() {
+                report.warnings.push(
+                    "the cartridge was unloaded; no `ejected` event was written because \
+                     neither the cartridge nor the drive is identified in this catalog (the \
+                     `drive eject` contact is the record)"
+                        .into(),
+                );
+            }
+        }
+        Err(e) => {
+            guard.finish(OUTCOME_FAILED, Some(&e.to_string()));
+            report.outcome = EjectOutcome::UnloadFailed;
+            report.message = format!(
+                "drive eject: unloading {what} from {device} failed: {e}. The contact is \
+                 recorded as failed and nothing else in the catalog changed; check the drive \
+                 (`tapectl drive status`)."
+            );
+        }
+    }
+    Ok(report)
+}
+
+/// Write the `ejected` event for a good unload, and return its id. The
+/// subject is the cartridge the contact was attributed to, else the drive
+/// it was attributed to (an unregistered chip); with neither there is no
+/// entity to hang an event on and none is written (`Ok(None)`).
+fn record_ejected(conn: &Connection, report: &EjectReport, device: &str) -> Result<Option<i64>> {
+    let Some(contact_id) = report.contact_id else {
+        return Ok(None);
+    };
+    let (cartridge, barcode, drive, drive_serial): (
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    ) = conn.query_row(
+        "SELECT cc.cartridge_id, c.barcode, cc.drive_id, d.serial
+           FROM cartridge_contacts cc
+           LEFT JOIN cartridges c ON c.id = cc.cartridge_id
+           LEFT JOIN drives d ON d.id = cc.drive_id
+          WHERE cc.id = ?1",
+        params![contact_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    let (entity, id, label) = match (cartridge, drive) {
+        (Some(id), _) => ("cartridge", id, barcode),
+        (None, Some(id)) => ("drive", id, drive_serial.clone()),
+        (None, None) => return Ok(None),
+    };
+    let details = serde_json::json!({
+        "contact_id": contact_id,
+        "device": device,
+        "chip_serial": report.chip_serial,
+        "drive_serial": drive_serial,
+    })
+    .to_string();
+    Ok(Some(crate::db::events::log_event(
+        conn,
+        entity,
+        id,
+        label.as_deref(),
+        "ejected",
+        Some("device"),
+        None,
+        Some(device),
+        Some(&details),
+        None,
+    )?))
+}
+
+/// The exit code for an eject: 0 when the cartridge is out or never was in,
+/// 75 when it was refused because the drive is in use (retry when it is
+/// free), 2 when it could not be done.
+pub fn eject_exit_code(report: &EjectReport) -> i32 {
+    match report.outcome {
+        EjectOutcome::Ejected | EjectOutcome::WouldEject | EjectOutcome::NoCartridge => {
+            EXIT_SUCCESS
+        }
+        EjectOutcome::RefusedHeld | EjectOutcome::RefusedNodeInUse => EXIT_DRIVE_BUSY,
+        EjectOutcome::RefusedNotReady
+        | EjectOutcome::NodeUnreadable
+        | EjectOutcome::UnloadFailed => crate::error::EXIT_ERROR,
+    }
+}
+
+fn render_eject(report: &EjectReport, json_output: bool) {
+    if json_output {
+        println!("{}", serde_json::to_string(report).unwrap_or_default());
+        return;
+    }
+    let text = eject_text(report);
+    // A refusal or a failure is an error and goes to stderr, where a script
+    // that checks the exit code looks for the reason.
+    if eject_exit_code(report) == EXIT_SUCCESS {
+        print!("{text}");
+    } else {
+        eprint!("{text}");
+    }
+}
+
+/// The human form of an eject.
+pub fn eject_text(report: &EjectReport) -> String {
+    use std::fmt::Write;
+    let mut out = format!("{}\n", report.message);
+    if report.outcome == EjectOutcome::Ejected {
+        if let Some(c) = &report.cartridge {
+            let _ = writeln!(
+                out,
+                "  it is recorded at {}; its volumes stay bound to it. If it is going \
+                 elsewhere: tapectl cartridge move {} --to <location>",
+                c.location.as_deref().unwrap_or("(no place)"),
+                c.barcode
+            );
+        }
+        if let Some(cid) = report.contact_id {
+            let _ = writeln!(out, "  recorded as contact {cid} (tapectl cartridge info)");
+        }
+    }
+    for w in &report.warnings {
+        let _ = writeln!(out, "  warning: {w}");
     }
     out
 }
@@ -1576,5 +2055,515 @@ mod tests {
             "{:?}",
             r.notes
         );
+    }
+
+    // ── `drive eject` (issue #429) ──────────────────────────────────────────
+
+    use std::cell::Cell;
+
+    /// A catalog in a real file under a temp home (the drive lock and the
+    /// volume locks are files beside it), an empty fake sysfs, and a config.
+    struct EjectEnv {
+        _home: tempfile::TempDir,
+        sysfs: tempfile::TempDir,
+        paths: TapectlPaths,
+        conn: Connection,
+        config: Config,
+    }
+
+    fn eject_env() -> EjectEnv {
+        let home = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        let conn = crate::db::open(&paths.db_file).unwrap();
+        EjectEnv {
+            sysfs: tempfile::TempDir::new().unwrap(),
+            paths,
+            conn,
+            config: Config::default(),
+            _home: home,
+        }
+    }
+
+    /// Run an eject on `env` with the node, chip and unload supplied. The
+    /// unload is counted in `unloads` (and returns `unload_result`), and
+    /// notes whether the drive lock was held while it ran.
+    fn run_eject(
+        env: &EjectEnv,
+        dry_run: bool,
+        node: Option<std::io::Result<TapeNodeStatus>>,
+        mam: Option<MamRead>,
+        unloads: &Cell<u32>,
+        lock_held_during: &Cell<Option<bool>>,
+        unload_result: std::io::Result<()>,
+    ) -> EjectReport {
+        let mut unload_result = Some(unload_result);
+        let mut unload = || {
+            unloads.set(unloads.get() + 1);
+            lock_held_during.set(Some(
+                lock::drive_lock_state(&env.paths.db_file, DEVICE) == DriveLockState::Held,
+            ));
+            unload_result.take().unwrap_or(Ok(()))
+        };
+        eject(
+            &env.conn,
+            &env.paths,
+            &env.config,
+            &lto6_backend(),
+            dry_run,
+            EjectProbe {
+                node,
+                mam,
+                identity: Some(hp_drive()),
+                holders: None,
+                unload: Some(&mut unload),
+                sysfs_root: Some(env.sysfs.path()),
+            },
+        )
+        .expect("the lock is obtainable under a temp home")
+    }
+
+    fn loaded() -> Option<std::io::Result<TapeNodeStatus>> {
+        Some(node(GMT_BOT | GMT_ONLINE))
+    }
+
+    fn chip() -> Option<MamRead> {
+        Some(mam_read(Some(mam::tests_support::LTO6_SAMPLE)))
+    }
+
+    /// Every row an eject could write, plus the binding it must not touch.
+    fn eject_rows(conn: &Connection) -> i64 {
+        rows_written(conn)
+    }
+
+    fn bindings(conn: &Connection) -> Vec<(i64, i64, String, Option<String>)> {
+        conn.prepare(
+            "SELECT cartridge_id, volume_id, mounted_at, unmounted_at
+               FROM cartridge_volumes ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// A foreign holder: another open file description flocking `path`, as
+    /// another process would (the in-process registry would hide it).
+    fn foreign_flock(path: &std::path::Path) -> nix::fcntl::Flock<std::fs::File> {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .unwrap();
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).unwrap()
+    }
+
+    /// THE test for the command's job: the cartridge is unloaded with the
+    /// drive lock held, one contact and one event name it, and — the item 61
+    /// negative — the binding is exactly what it was. `unmounted_at` is the
+    /// displacement record; an ejected cartridge is on a shelf.
+    #[test]
+    fn an_eject_unloads_under_the_drive_lock_and_records_a_contact_and_an_event_only() {
+        let env = eject_env();
+        let cart = register_cartridge(&env.conn, "CART01L6", "EW7VWMVKF6");
+        put_volume_on(&env.conn, cart, "L6-0001", "sealed");
+        let bound = bindings(&env.conn);
+        assert_eq!(bound.len(), 1, "positive control: the cartridge is bound");
+        assert_eq!(bound[0].3, None, "positive control: the mount is open");
+        let status_before: String = env
+            .conn
+            .query_row("SELECT status FROM cartridges WHERE id = ?1", [cart], |r| {
+                r.get(0)
+            })
+            .unwrap();
+
+        let (unloads, during) = (Cell::new(0), Cell::new(None));
+        let r = run_eject(&env, false, loaded(), chip(), &unloads, &during, Ok(()));
+
+        assert_eq!(r.outcome, EjectOutcome::Ejected, "{}", r.message);
+        assert_eq!(eject_exit_code(&r), 0);
+        assert_eq!(unloads.get(), 1, "one unload");
+        assert_eq!(
+            during.get(),
+            Some(true),
+            "the drive lock was held while the cartridge was being unloaded"
+        );
+        assert_eq!(
+            lock::drive_lock_state(&env.paths.db_file, DEVICE),
+            DriveLockState::Held,
+            "and it is kept until the process exits"
+        );
+        assert_eq!(r.chip_serial.as_deref(), Some("EW7VWMVKF6"));
+        assert_eq!(r.cartridge.as_ref().unwrap().barcode, "CART01L6");
+
+        // The contact: one, closed ok, naming the cartridge and the drive.
+        let contacts: Vec<(i64, String, Option<String>, Option<i64>, Option<i64>)> = env
+            .conn
+            .prepare(
+                "SELECT id, operation, outcome, cartridge_id, drive_id FROM cartridge_contacts",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(contacts.len(), 1, "{contacts:?}");
+        assert_eq!(contacts[0].1, "drive eject");
+        assert_eq!(contacts[0].2.as_deref(), Some("ok"));
+        assert_eq!(contacts[0].3, Some(cart));
+        assert!(contacts[0].4.is_some(), "the drive is named");
+        assert_eq!(r.contact_id, Some(contacts[0].0));
+
+        // The event: one, on the cartridge, carrying the contact.
+        let events: Vec<(String, i64, String, String)> = env
+            .conn
+            .prepare("SELECT entity_type, entity_id, action, details FROM events")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(
+            (events[0].0.as_str(), events[0].1, events[0].2.as_str()),
+            ("cartridge", cart, "ejected")
+        );
+        let details: serde_json::Value = serde_json::from_str(&events[0].3).unwrap();
+        assert_eq!(details["contact_id"], contacts[0].0);
+        assert_eq!(details["chip_serial"], "EW7VWMVKF6");
+        assert_eq!(details["drive_serial"], "HUJ808A5L4");
+        assert!(r.event_id.is_some());
+
+        // Item 61: nothing else moved.
+        assert_eq!(bindings(&env.conn), bound, "unmounted_at is not an eject's");
+        let status_after: String = env
+            .conn
+            .query_row("SELECT status FROM cartridges WHERE id = ?1", [cart], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status_after, status_before);
+        let vol_status: String = env
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE label = 'L6-0001'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vol_status, "sealed");
+
+        let text = eject_text(&r);
+        assert!(
+            text.contains("ejected cartridge CART01L6") && text.contains("cartridge move CART01L6"),
+            "{text}"
+        );
+    }
+
+    /// A failed unload is a failed contact and nothing else: no event, the
+    /// binding as it was, and exit 2.
+    #[test]
+    fn a_failed_unload_is_a_failed_contact_with_no_event() {
+        let env = eject_env();
+        let cart = register_cartridge(&env.conn, "CART01L6", "EW7VWMVKF6");
+        put_volume_on(&env.conn, cart, "L6-0001", "sealed");
+        let bound = bindings(&env.conn);
+
+        let (unloads, during) = (Cell::new(0), Cell::new(None));
+        let r = run_eject(
+            &env,
+            false,
+            loaded(),
+            chip(),
+            &unloads,
+            &during,
+            Err(std::io::Error::from_raw_os_error(nix::libc::EIO)),
+        );
+
+        assert_eq!(r.outcome, EjectOutcome::UnloadFailed);
+        assert_eq!(eject_exit_code(&r), crate::error::EXIT_ERROR);
+        assert_eq!(unloads.get(), 1, "positive control: it did try");
+        let (outcome, detail): (Option<String>, Option<String>) = env
+            .conn
+            .query_row(
+                "SELECT outcome, detail FROM cartridge_contacts WHERE operation = 'drive eject'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(outcome.as_deref(), Some("failed"));
+        assert!(detail.unwrap().contains("Input/output error"));
+        let events: i64 = env
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 0, "a failed eject writes no event");
+        assert_eq!(r.event_id, None);
+        assert_eq!(bindings(&env.conn), bound);
+        assert!(r.message.contains("failed"), "{}", r.message);
+    }
+
+    /// Nothing in the drive is the end state already: exit 0, no unload, and
+    /// no contact (no cartridge was in the drive) and no event.
+    #[test]
+    fn an_empty_drive_is_nothing_to_eject_and_records_nothing() {
+        let env = eject_env();
+        let (unloads, during) = (Cell::new(0), Cell::new(None));
+        let r = run_eject(
+            &env,
+            false,
+            Some(node(GMT_DR_OPEN | GMT_ONLINE)),
+            chip(),
+            &unloads,
+            &during,
+            Ok(()),
+        );
+        assert_eq!(r.outcome, EjectOutcome::NoCartridge);
+        assert_eq!(eject_exit_code(&r), 0);
+        assert_eq!(unloads.get(), 0, "no unload to an empty drive");
+        assert_eq!(eject_rows(&env.conn), 0);
+        assert!(r.message.contains("nothing to eject"), "{}", r.message);
+    }
+
+    /// A cartridge present in a drive that is not ready (loading, faulted) is
+    /// refused: its chip cannot be read, so the record could not name what
+    /// leaves. Nothing is sent and nothing recorded; exit 2.
+    #[test]
+    fn a_drive_that_is_not_ready_is_refused_untouched() {
+        let env = eject_env();
+        let (unloads, during) = (Cell::new(0), Cell::new(None));
+        let r = run_eject(
+            &env,
+            false,
+            Some(node(0)),
+            chip(),
+            &unloads,
+            &during,
+            Ok(()),
+        );
+        assert_eq!(r.outcome, EjectOutcome::RefusedNotReady);
+        assert_eq!(eject_exit_code(&r), crate::error::EXIT_ERROR);
+        assert_eq!(unloads.get(), 0);
+        assert_eq!(eject_rows(&env.conn), 0);
+    }
+
+    /// A node open in another process (st allows one opener) is refused with
+    /// 75, and a node that does not answer is 2; neither sends anything.
+    #[test]
+    fn a_node_that_is_busy_or_absent_is_refused_untouched() {
+        for (e, outcome, code) in [
+            (nix::libc::EBUSY, EjectOutcome::RefusedNodeInUse, 75),
+            (nix::libc::ENOENT, EjectOutcome::NodeUnreadable, 2),
+            (nix::libc::EACCES, EjectOutcome::NodeUnreadable, 2),
+        ] {
+            let env = eject_env();
+            let (unloads, during) = (Cell::new(0), Cell::new(None));
+            let r = run_eject(
+                &env,
+                false,
+                Some(errno(e)),
+                chip(),
+                &unloads,
+                &during,
+                Ok(()),
+            );
+            assert_eq!(r.outcome, outcome, "errno {e}");
+            assert_eq!(eject_exit_code(&r), code, "errno {e}");
+            assert_eq!(unloads.get(), 0, "errno {e}");
+            assert_eq!(eject_rows(&env.conn), 0, "errno {e}");
+        }
+    }
+
+    /// A drive another process holds is refused with the holder named, and
+    /// the tape node is not even read (the same eject with the drive free is
+    /// the control: it reaches the node and finds none). Once the holder
+    /// lets go, the same call goes through.
+    #[test]
+    fn a_held_drive_is_refused_with_its_holder_named_before_the_node_is_read() {
+        let env = eject_env();
+        let lockfile = lock::drive_lock_path(&env.paths.db_file, DEVICE);
+        let holder = foreign_flock(&lockfile);
+        let unloads = Cell::new(0);
+        let mut unload = || {
+            unloads.set(unloads.get() + 1);
+            Ok(())
+        };
+        let r = eject(
+            &env.conn,
+            &env.paths,
+            &env.config,
+            &lto6_backend(),
+            false,
+            EjectProbe {
+                // The real node read, of a path that does not exist: if the
+                // refusal came after it, the outcome would be NodeUnreadable.
+                node: None,
+                mam: chip(),
+                identity: Some(hp_drive()),
+                holders: None,
+                unload: Some(&mut unload),
+                sysfs_root: Some(env.sysfs.path()),
+            },
+        )
+        .unwrap();
+        assert_eq!(r.outcome, EjectOutcome::RefusedHeld, "{}", r.message);
+        assert_eq!(eject_exit_code(&r), EXIT_DRIVE_BUSY);
+        assert_eq!(unloads.get(), 0);
+        assert_eq!(r.holders.len(), 1, "{:?}", r.holders);
+        assert_eq!(r.holders[0].kind, "drive");
+        assert_eq!(
+            r.holders[0].pid,
+            Some(std::process::id()),
+            "/proc/locks names the holder"
+        );
+        assert!(
+            r.message.contains(&format!("pid {}", std::process::id())),
+            "{}",
+            r.message
+        );
+        assert_eq!(eject_rows(&env.conn), 0, "a refusal records nothing");
+
+        // Positive control: the holder lets go and the same eject goes through.
+        drop(holder);
+        let (unloads, during) = (Cell::new(0), Cell::new(None));
+        let r = run_eject(&env, false, loaded(), chip(), &unloads, &during, Ok(()));
+        assert_eq!(r.outcome, EjectOutcome::Ejected, "{}", r.message);
+        assert_eq!(unloads.get(), 1);
+    }
+
+    /// A live volume session refuses too, named by the volume — a write holds
+    /// its volume's lock before its contact (and the drive lock) exists.
+    #[test]
+    fn a_live_volume_session_refuses_an_eject() {
+        let env = eject_env();
+        let cart = register_cartridge(&env.conn, "CART01L6", "EW7VWMVKF6");
+        put_volume_on(&env.conn, cart, "L6-0042", "initialized");
+        let vol: i64 = env
+            .conn
+            .query_row("SELECT id FROM volumes WHERE label = 'L6-0042'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let _session = foreign_flock(&lock::volume_lock_path(&env.paths.db_file, vol));
+
+        let (unloads, during) = (Cell::new(0), Cell::new(None));
+        let r = run_eject(&env, false, loaded(), chip(), &unloads, &during, Ok(()));
+        assert_eq!(r.outcome, EjectOutcome::RefusedHeld, "{}", r.message);
+        assert_eq!(eject_exit_code(&r), 75);
+        assert_eq!(unloads.get(), 0);
+        assert_eq!(r.holders.len(), 1, "{:?}", r.holders);
+        assert_eq!(r.holders[0].kind, "volume");
+        assert_eq!(r.holders[0].name, "L6-0042");
+        assert!(r.message.contains("L6-0042"), "{}", r.message);
+        assert_eq!(
+            eject_rows(&env.conn),
+            0,
+            "a refusal records nothing (and the binding is untouched)"
+        );
+    }
+
+    /// `--dry-run` does every check and sends and records nothing — and takes
+    /// no lock: the drive reads Free afterwards. A held drive is still refused
+    /// by it, because that is what the real run would say.
+    #[test]
+    fn a_dry_run_reports_what_it_would_eject_and_changes_nothing() {
+        let env = eject_env();
+        let cart = register_cartridge(&env.conn, "CART01L6", "EW7VWMVKF6");
+        put_volume_on(&env.conn, cart, "L6-0001", "sealed");
+        let bound = bindings(&env.conn);
+
+        let (unloads, during) = (Cell::new(0), Cell::new(None));
+        let r = run_eject(&env, true, loaded(), chip(), &unloads, &during, Ok(()));
+        assert_eq!(r.outcome, EjectOutcome::WouldEject, "{}", r.message);
+        assert_eq!(eject_exit_code(&r), 0);
+        assert!(r.dry_run);
+        assert_eq!(unloads.get(), 0, "a dry run unloads nothing");
+        assert_eq!(eject_rows(&env.conn), 0, "and records nothing");
+        assert_eq!(bindings(&env.conn), bound);
+        assert_eq!(
+            lock::drive_lock_state(&env.paths.db_file, DEVICE),
+            DriveLockState::Free,
+            "and keeps no lock"
+        );
+        assert_eq!(r.cartridge.as_ref().unwrap().barcode, "CART01L6");
+        assert!(r.message.starts_with("dry run:"), "{}", r.message);
+
+        let holder = foreign_flock(&lock::drive_lock_path(&env.paths.db_file, DEVICE));
+        let r = run_eject(&env, true, loaded(), chip(), &unloads, &during, Ok(()));
+        assert_eq!(r.outcome, EjectOutcome::RefusedHeld);
+        drop(holder);
+    }
+
+    /// A chip that will not answer does not stop the eject: the contact says
+    /// why it names no cartridge, and the event hangs on the drive.
+    #[test]
+    fn an_unreadable_or_unregistered_chip_still_ejects_and_the_event_hangs_on_the_drive() {
+        for mam in [Some(mam_read(None)), chip()] {
+            let env = eject_env();
+            let (unloads, during) = (Cell::new(0), Cell::new(None));
+            let r = run_eject(&env, false, loaded(), mam, &unloads, &during, Ok(()));
+            assert_eq!(r.outcome, EjectOutcome::Ejected, "{}", r.message);
+            assert!(r.cartridge.is_none());
+            let (cartridge, reason): (Option<i64>, Option<String>) = env
+                .conn
+                .query_row(
+                    "SELECT cartridge_id, identity_reason FROM cartridge_contacts",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(cartridge, None);
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("medium serial")),
+                "{reason:?}"
+            );
+            let (entity, label): (String, Option<String>) = env
+                .conn
+                .query_row("SELECT entity_type, entity_label FROM events", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(entity, "drive");
+            assert_eq!(label.as_deref(), Some("HUJ808A5L4"));
+        }
+    }
+
+    #[test]
+    fn the_eject_json_report_has_the_documented_shape() {
+        let env = eject_env();
+        let (unloads, during) = (Cell::new(0), Cell::new(None));
+        let r = run_eject(&env, false, loaded(), chip(), &unloads, &during, Ok(()));
+        let v = serde_json::to_value(&r).unwrap();
+        for key in [
+            "device",
+            "backend",
+            "dry_run",
+            "outcome",
+            "message",
+            "holders",
+            "chip_serial",
+            "cartridge",
+            "contact_id",
+            "event_id",
+            "warnings",
+        ] {
+            assert!(v.get(key).is_some(), "missing {key}: {v}");
+        }
+        assert_eq!(v["outcome"], "ejected");
+        assert_eq!(v["chip_serial"], "EW7VWMVKF6");
     }
 }

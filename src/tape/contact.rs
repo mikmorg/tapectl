@@ -224,6 +224,13 @@ pub enum Operation {
     /// it — the store is opened three times inside it (read-only, read-write,
     /// read-only), all with the same cartridge in the drive.
     CartridgeErase,
+    /// `tapectl drive eject` (issue #429; ADR-0012 2026-10-15 item 61): the
+    /// cartridge in the drive was named by its chip and unloaded. One
+    /// contact, because the cartridge was in the drive until it left it.
+    /// It writes nothing to the medium, and it does NOT touch
+    /// `cartridge_volumes.unmounted_at` — that column is the displacement
+    /// record, and a shelved cartridge is still bound to its volumes.
+    DriveEject,
 }
 
 impl Operation {
@@ -243,6 +250,7 @@ impl Operation {
             Operation::CatalogRebuild => "catalog rebuild",
             Operation::DrivePoll => "drive poll",
             Operation::CartridgeErase => "cartridge erase",
+            Operation::DriveEject => "drive eject",
         }
     }
 
@@ -262,6 +270,7 @@ impl Operation {
         Operation::CatalogRebuild,
         Operation::DrivePoll,
         Operation::CartridgeErase,
+        Operation::DriveEject,
     ];
 }
 
@@ -1190,6 +1199,7 @@ pub(crate) mod tests {
                 "catalog rebuild",
                 "drive poll",
                 "cartridge erase",
+                "drive eject",
             ],
             "cartridge_contacts.operation is the command VERBATIM — a different \
              vocabulary from health_logs.operation, which says what kind of reading \

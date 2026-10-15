@@ -655,7 +655,8 @@ pub(crate) fn chip_blank_proof(mam: &MamInfo) -> Option<BlankProof> {
 /// run` and `quick-archive` record. `volume compact`'s first step reads;
 /// its second is a `volume write` contact. A later `cartridge erase` is not
 /// a write here: a verified one is itself the newest proof, and one that
-/// found the tape already EMPTY (or only identified it) wrote nothing.
+/// found the tape already EMPTY (or only identified it) wrote nothing. A
+/// `drive eject` reads the chip and unloads: it writes nothing either.
 fn operation_may_write_the_medium(op: Operation) -> bool {
     match op {
         Operation::VolumeInit | Operation::VolumeWrite | Operation::VolumeResume => true,
@@ -669,7 +670,8 @@ fn operation_may_write_the_medium(op: Operation) -> bool {
         | Operation::RestoreRawVolume
         | Operation::CatalogRebuild
         | Operation::DrivePoll
-        | Operation::CartridgeErase => false,
+        | Operation::CartridgeErase
+        | Operation::DriveEject => false,
     }
 }
 

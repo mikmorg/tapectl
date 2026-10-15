@@ -153,6 +153,12 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // #241's file scope), never fixed here, only moved out of `Excluded`.
     (&["db", "import"], Verdict::Honours),
     (&["db", "stats"], Verdict::ReadOnly),
+    // Issue #429: `--dry-run` checks for a holder, reads the node and the
+    // chip and reports what it would eject; it takes no lock, unloads
+    // nothing and records nothing. Proven in `tests/drive_eject_cli.rs` (a
+    // held drive is refused under it) and `cli::drive`'s unit tests
+    // (a_dry_run_reports_what_it_would_eject_and_changes_nothing).
+    (&["drive", "eject"], Verdict::Honours),
     // Issue #309: a poll is one read of the drive and a record of it; a
     // preview would have to read the drive too. Refused before the backend
     // is resolved, so the refusal never reaches a device.
