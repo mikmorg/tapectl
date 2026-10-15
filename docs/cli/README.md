@@ -144,8 +144,9 @@ Accepted by every command, before or after the subcommand.
 | [`quick-archive`](quick-archive.md) | Quick archive: create + stage + write in one flow |
 | [`backend`](backend.md) | Tape drive backends |
 | &nbsp;&nbsp;[`backend add`](backend.md#tapectl-backend-add) | Add an LTO tape drive to the config |
-| [`drive`](drive.md) | The drive itself: read its health on a schedule (`drive poll`) |
+| [`drive`](drive.md) | The drive itself: what is in it now (`drive status`), its health on a schedule (`drive poll`) |
 | &nbsp;&nbsp;[`drive poll`](drive.md#tapectl-drive-poll) | Read the drive's health pages (and the cartridge chip, when one is loaded) and record them — read-only, through the SCSI generic node only |
+| &nbsp;&nbsp;[`drive status`](drive.md#tapectl-drive-status) | Show what is in the drive right now, without touching it or the tape |
 | [`db`](db.md) | Database operations |
 | &nbsp;&nbsp;[`db backup`](db.md#tapectl-db-backup) | Back up the database, and optionally the private key directory |
 | &nbsp;&nbsp;[`db fsck`](db.md#tapectl-db-fsck) | Check database integrity |

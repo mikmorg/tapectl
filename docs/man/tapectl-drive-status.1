@@ -1,0 +1,49 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-drive-status 1  "tapectl-drive-status " 
+.SH NAME
+tapectl\-drive\-status \- Show what is in the drive right now, without touching it or the tape
+.SH SYNOPSIS
+\fBtapectl drive status\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Show what is in the drive right now, without touching it or the tape
+.PP
+Reads, and records nothing: the st driver\*(Aqs own status for the tape node (`MTIOCGET`, through a read\-only `O_NONBLOCK` open, the open `mt status` makes) — empty or loaded, ready, the write\-protect tab, the position st holds, a cleaning request — then, when a cartridge is loaded and ready, the drive\*(Aqs identity and the cartridge chip\*(Aqs MAM (INQUIRY and READ ATTRIBUTE through the SCSI generic node), and the catalog\*(Aqs record of that chip serial: the cartridge it names (barcode, status, location) and the volumes it holds, or "unknown to this catalog". Also names any tapectl command holding the drive or a volume right now, with its pid and command where they can be learned.
+.PP
+It never moves the tape: no rewind, no read of File 0, no space, no load or eject, no MTSETBLK. It takes no lock and writes nothing to the catalog — no contact, no log page, no journal row — so it is safe to run while a write is in progress: a drive held by another tapectl command, or whose tape node another process has open, is reported as such and gets no SCSI command at all. (Like `mt status`, its MTIOCGET clears the st driver\*(Aqs recovered\-error count; the count it held is printed as `recovered_errors`.)
+.PP
+Exit 0: the probe ran, whatever it found — an empty drive, a held drive and a cartridge the catalog does not know are all answers. Exit 2: the tape node could not be read (no such drive, no permission) or no drive is configured; with `\-\-json` the report is still printed, with the reason in it. There is no exit 1 (it gives no health verdict; `drive poll` does) and no exit 75 (it never waits for the catalog).
+.PP
+With `\-\-json` the whole of stdout is one JSON object; warnings go to stderr.
+.SH OPTIONS
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+The drive to look at, by its tape node path as configured (`[[backends.lto]].device_tape`; a by\-id link). Defaults to the only configured drive. A path no backend claims is looked at too, without the cartridge chip unless the kernel binds a SCSI generic node to it
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)

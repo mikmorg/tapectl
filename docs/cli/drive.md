@@ -4,7 +4,7 @@
 
 [All commands](README.md)
 
-The drive itself: read its health on a schedule (`drive poll`)
+The drive itself: what is in it now (`drive status`), its health on a schedule (`drive poll`)
 
 ```text
 tapectl drive [OPTIONS] <COMMAND>
@@ -13,6 +13,7 @@ tapectl drive [OPTIONS] <COMMAND>
 **Subcommands**
 
 - [`poll`](#tapectl-drive-poll) — Read the drive's health pages (and the cartridge chip, when one is loaded) and record them — read-only, through the SCSI generic node only
+- [`status`](#tapectl-drive-status) — Show what is in the drive right now, without touching it or the tape
 
 ### tapectl drive poll
 
@@ -29,4 +30,24 @@ tapectl drive poll [OPTIONS]
 **Options**
 
 - `--device <DEVICE>` — The drive to poll, by its tape node path as configured (`[[backends.lto]].device_tape`; a by-id link). Defaults to the only configured drive. The tape node itself is never opened
+
+### tapectl drive status
+
+Show what is in the drive right now, without touching it or the tape
+
+Reads, and records nothing: the st driver's own status for the tape node (`MTIOCGET`, through a read-only `O_NONBLOCK` open, the open `mt status` makes) — empty or loaded, ready, the write-protect tab, the position st holds, a cleaning request — then, when a cartridge is loaded and ready, the drive's identity and the cartridge chip's MAM (INQUIRY and READ ATTRIBUTE through the SCSI generic node), and the catalog's record of that chip serial: the cartridge it names (barcode, status, location) and the volumes it holds, or "unknown to this catalog". Also names any tapectl command holding the drive or a volume right now, with its pid and command where they can be learned.
+
+It never moves the tape: no rewind, no read of File 0, no space, no load or eject, no MTSETBLK. It takes no lock and writes nothing to the catalog — no contact, no log page, no journal row — so it is safe to run while a write is in progress: a drive held by another tapectl command, or whose tape node another process has open, is reported as such and gets no SCSI command at all. (Like `mt status`, its MTIOCGET clears the st driver's recovered-error count; the count it held is printed as `recovered_errors`.)
+
+Exit 0: the probe ran, whatever it found — an empty drive, a held drive and a cartridge the catalog does not know are all answers. Exit 2: the tape node could not be read (no such drive, no permission) or no drive is configured; with `--json` the report is still printed, with the reason in it. There is no exit 1 (it gives no health verdict; `drive poll` does) and no exit 75 (it never waits for the catalog).
+
+With `--json` the whole of stdout is one JSON object; warnings go to stderr.
+
+```text
+tapectl drive status [OPTIONS]
+```
+
+**Options**
+
+- `--device <DEVICE>` — The drive to look at, by its tape node path as configured (`[[backends.lto]].device_tape`; a by-id link). Defaults to the only configured drive. A path no backend claims is looked at too, without the cartridge chip unless the kernel binds a SCSI generic node to it
 
