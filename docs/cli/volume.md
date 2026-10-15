@@ -61,6 +61,8 @@ Refuses any volume not left `initialized` by `volume init` — a sealed, retired
 
 Once the volume is sealed and confirmed, staging is released if every unit written has reached its resolved `min_copies` (ADR-0012, 2026-10-07 item 2: after a quick confirm too); otherwise it is kept and the output names each unit that is still short. A release that fails is a warning and the exit status stays 0. `--keep-staging` never releases; `staging clean` does it later.
 
+A further copy in one command (ADR-0012 2026-10-15 item 59): `tapectl volume write L6-0003 --init --full-confirm --move-to offsite` initialises the loaded cartridge, writes the volume, reads every file back, and moves the sealed volume (and its cartridge) to `offsite`. Each step keeps its own checks and the command stops at the first one that fails: an init that refuses writes nothing, and nothing moves unless the write sealed and confirmed.
+
 Exit status, shared by every command that writes a tape: 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re-enters the confirm. 4 = interrupted part-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
 
 ```text
@@ -74,7 +76,9 @@ tapectl volume write [OPTIONS] <LABEL>
 **Options**
 
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
-- `--force` — See `volume init --force` — same override, same limits
+- `--force` — See `volume init --force` — same override, same limits. With `--init` it goes to the init only: the write that follows is never forced, so a cartridge swapped in between the two is refused at the write's own File 0 check
+- `--init` — Initialise the loaded cartridge as this volume first (`volume init <label>`: the same function, the same File 0 consent check and refusals, ADR-0003 and ADR-0012 item 57), then write it with the tape still loaded. An init that refuses writes nothing and exits 2. Only `--force` is taken from `volume init`'s flags; when a cartridge needs `--generation` or `--cartridge`, run `volume init` yourself first. ADR-0012 2026-10-15 item 59
+- `--move-to <LOCATION>` — Move the volume, with its cartridge, to this location once it is sealed and confirmed (`volume move <label> --to LOCATION`). The location is checked before anything is written. Nothing moves unless the write sealed and confirmed. A move that then fails is a warning naming the `volume move` command that finishes it; the copy stands and the exit status stays 0
 - `--allow-missing-escrow` — Seal slices that were staged before the escrow recipient existed (ADR-0005). Only reachable for tapes copied forward via `read-slices`/`compact-read`, since `stage create` refuses to stage without escrow; use it to migrate a dying pre-escrow cartridge, knowing the copy stays unrecoverable by the escrow key
 - `--prewrite-hash` — Full-hash every staged slice from disk before the tape moves (tri-layer L1). Off by default (ADR-0012, 2026-09-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch
 - `--fill-ceiling <FILL_CEILING>` — Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012). The pre-write check refuses a layout above the ceiling and names by how much

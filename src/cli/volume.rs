@@ -75,6 +75,14 @@ pub enum VolumeCommands {
     /// fails is a warning and the exit status stays 0. `--keep-staging`
     /// never releases; `staging clean` does it later.
     ///
+    /// A further copy in one command (ADR-0012 2026-10-15 item 59):
+    /// `tapectl volume write L6-0003 --init --full-confirm --move-to
+    /// offsite` initialises the loaded cartridge, writes the volume, reads
+    /// every file back, and moves the sealed volume (and its cartridge) to
+    /// `offsite`. Each step keeps its own checks and the command stops at
+    /// the first one that fails: an init that refuses writes nothing, and
+    /// nothing moves unless the write sealed and confirmed.
+    ///
     /// Exit status, shared by every command that writes a tape: 0 = sealed
     /// and confirmed. 2 = an error with the medium untouched: nothing was
     /// written (or a usage error). 3 = the confirm was inconclusive: the
@@ -89,9 +97,29 @@ pub enum VolumeCommands {
         /// required when more than one is configured.
         #[arg(long)]
         device: Option<String>,
-        /// See `volume init --force` — same override, same limits.
+        /// See `volume init --force` — same override, same limits. With
+        /// `--init` it goes to the init only: the write that follows is
+        /// never forced, so a cartridge swapped in between the two is
+        /// refused at the write's own File 0 check.
         #[arg(long)]
         force: bool,
+        /// Initialise the loaded cartridge as this volume first
+        /// (`volume init <label>`: the same function, the same File 0
+        /// consent check and refusals, ADR-0003 and ADR-0012 item 57), then
+        /// write it with the tape still loaded. An init that refuses writes
+        /// nothing and exits 2. Only `--force` is taken from `volume init`'s
+        /// flags; when a cartridge needs `--generation` or `--cartridge`,
+        /// run `volume init` yourself first. ADR-0012 2026-10-15 item 59.
+        #[arg(long)]
+        init: bool,
+        /// Move the volume, with its cartridge, to this location once it is
+        /// sealed and confirmed (`volume move <label> --to LOCATION`). The
+        /// location is checked before anything is written. Nothing moves
+        /// unless the write sealed and confirmed. A move that then fails is
+        /// a warning naming the `volume move` command that finishes it; the
+        /// copy stands and the exit status stays 0.
+        #[arg(long, value_name = "LOCATION")]
+        move_to: Option<String>,
         /// Seal slices that were staged before the escrow recipient existed
         /// (ADR-0005). Only reachable for tapes copied forward via
         /// `read-slices`/`compact-read`, since `stage create` refuses to
@@ -832,6 +860,283 @@ fn print_staging_release(label: &str, release: &StagingRelease) {
     }
 }
 
+/// What `--move-to` did once a copy was sealed and confirmed (issue #438).
+#[derive(Debug)]
+enum MoveAfterWrite {
+    /// `--move-to` was not given.
+    NotAsked,
+    /// The volume and its cartridge now sit at `to`.
+    Moved {
+        to: String,
+        outcome: crate::cli::location::MoveOutcome,
+    },
+    /// The move failed after the copy stood (ADR-0012 2026-10-07 item 33):
+    /// the warning to print, naming the `volume move` that finishes it. The
+    /// write's exit status is unchanged.
+    Failed { to: String, warning: String },
+}
+
+/// The move step of `volume write --move-to`, run only after the write
+/// returned `Ok` — sealed and confirmed, quick or full. The one mover
+/// `volume move` and `cartridge move` share
+/// ([`crate::cli::location::move_volume`]), so the shelf and the catalog
+/// cannot drift (ADR-0011). Never fails the write: an error becomes
+/// [`MoveAfterWrite::Failed`].
+fn move_after_write(conn: &Connection, label: &str, move_to: Option<&str>) -> MoveAfterWrite {
+    let Some(to) = move_to else {
+        return MoveAfterWrite::NotAsked;
+    };
+    match crate::cli::location::move_volume(conn, label, to, false) {
+        Ok(outcome) => MoveAfterWrite::Moved {
+            to: to.trim().to_string(),
+            outcome,
+        },
+        Err(e) => MoveAfterWrite::Failed {
+            to: to.to_string(),
+            warning: crate::error::unfinished_after_seal(
+                label,
+                "moving the volume",
+                &e,
+                Some(&format!("tapectl volume move {label} --to {to}")),
+            ),
+        },
+    }
+}
+
+/// Refuse a `--move-to` the real move would refuse for its DESTINATION,
+/// before the tape is touched: a mistyped location found after hours of
+/// writing is a warning about a copy that is already done, and one found
+/// first costs nothing. Only the two facts about the destination are asked
+/// (it exists; it is not a warehouse, which no physical cartridge can be
+/// moved into); the mover itself, [`move_after_write`], still decides the
+/// move and reports whatever else it finds as a warning.
+fn check_move_destination(conn: &Connection, location: &str) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    let name = location.trim();
+    let kind: Option<String> = conn
+        .query_row("SELECT kind FROM locations WHERE name = ?1", [name], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    match kind.as_deref() {
+        Some("warehouse") => Err(TapectlError::Other(format!(
+            "--move-to \"{name}\" is a warehouse location, and a physical cartridge cannot be \
+             moved into one. Nothing was written."
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            let mut stmt = conn.prepare("SELECT name FROM locations ORDER BY name")?;
+            let known: Vec<String> = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let list = if known.is_empty() {
+                "no locations are defined yet — add one with `tapectl location add <NAME>`"
+                    .to_string()
+            } else {
+                format!("known locations: {}", known.join(", "))
+            };
+            Err(TapectlError::Other(format!(
+                "--move-to location \"{name}\" not found ({list}). Nothing was written."
+            )))
+        }
+    }
+}
+
+/// The human lines for [`MoveAfterWrite`], printed after the staging lines
+/// so a warning — which carries the command that finishes the step — is the
+/// last thing on the screen. The moved lines are `volume move`'s own.
+fn print_move_after_write(label: &str, moved: &MoveAfterWrite) {
+    match moved {
+        MoveAfterWrite::NotAsked => {}
+        MoveAfterWrite::Moved { to, outcome } => {
+            println!("volume \"{label}\" moved to \"{to}\"");
+            if let Some(barcode) = &outcome.cartridge {
+                println!("  cartridge \"{barcode}\" moved with it");
+                let others: Vec<&str> = outcome
+                    .volumes
+                    .iter()
+                    .filter(|l| l.as_str() != label)
+                    .map(|l| l.as_str())
+                    .collect();
+                if !others.is_empty() {
+                    println!(
+                        "  {} other volume(s) on that cartridge moved too: {}",
+                        others.len(),
+                        others.join(", ")
+                    );
+                }
+            }
+        }
+        MoveAfterWrite::Failed { to, warning } => {
+            println!("volume \"{label}\" NOT moved to \"{to}\"");
+            eprintln!("{warning}");
+        }
+    }
+}
+
+/// The two library calls of a `volume write` that touch the drive, as a
+/// seam: the arm's own logic — what runs after what, and what does not run
+/// when a step stops — is then testable with no tape, as the write path's
+/// own `ContactStore` seam does for the library. Production is
+/// [`DriveWriteSteps`].
+trait WriteSteps {
+    /// `volume init <label>`; returns the new volume's id.
+    fn init(&self, label: &str, force: bool) -> Result<i64>;
+    /// `volume write <label>`; `Ok` only when sealed and confirmed.
+    fn write(&self, label: &str, force: bool) -> Result<()>;
+}
+
+/// [`WriteSteps`] on the real drive.
+struct DriveWriteSteps<'a> {
+    conn: &'a Connection,
+    paths: &'a TapectlPaths,
+    config: &'a Config,
+    device: &'a str,
+    allow_missing_escrow: bool,
+    prewrite_hash: bool,
+    full_confirm: bool,
+    assume_yes: bool,
+}
+
+impl WriteSteps for DriveWriteSteps<'_> {
+    fn init(&self, label: &str, force: bool) -> Result<i64> {
+        write::volume_init(
+            self.conn,
+            self.config,
+            label,
+            self.device,
+            DEFAULT_BLOCK_SIZE,
+            force,
+            None,
+            None,
+        )
+    }
+
+    fn write(&self, label: &str, force: bool) -> Result<()> {
+        write::volume_write(
+            self.conn,
+            self.paths,
+            self.config,
+            label,
+            self.device,
+            DEFAULT_BLOCK_SIZE,
+            force,
+            self.allow_missing_escrow,
+            self.prewrite_hash,
+            self.full_confirm,
+            self.assume_yes,
+        )
+    }
+}
+
+/// What the operator asked of one `volume write`.
+struct WriteRequest<'a> {
+    label: &'a str,
+    init: bool,
+    force: bool,
+    move_to: Option<&'a str>,
+    keep_staging: bool,
+}
+
+/// What one `volume write` did, once the volume was sealed and confirmed.
+#[derive(Debug)]
+struct WriteDone {
+    /// The volume id `--init` created, when it ran.
+    initialized: Option<i64>,
+    release: StagingRelease,
+    moved: MoveAfterWrite,
+}
+
+/// `volume write`, with its optional `--init` before and `--move-to` after
+/// (issue #438, ADR-0012 2026-10-15 item 59).
+///
+/// Strictly in order, each step behind the previous one's `?`: the init, the
+/// write, and only once the write returned `Ok` — sealed AND confirmed; every
+/// other outcome left through that `?` — the two post-write steps. An init
+/// that refuses returns before the write is attempted, so nothing is written
+/// and the error exits by the write family's table (an unclassified error:
+/// 2, or 75 for a busy catalog).
+///
+/// `--force` goes to the init only. The write that follows is never forced:
+/// the init has just written File 0, so a force there could only matter if
+/// the cartridge had been swapped in between, and that is exactly the case
+/// the write's own File 0 check exists to refuse.
+///
+/// The staging release runs before the move. Neither depends on the other —
+/// the release counts copies (`policy::coverage::copy_count_expr` has no
+/// location term) and the move changes only where the cartridge sits — so
+/// the order is for the operator: the move's warning, which carries the
+/// command that finishes it, is then the last thing printed.
+fn write_and_follow(
+    conn: &Connection,
+    config: &Config,
+    steps: &dyn WriteSteps,
+    req: &WriteRequest<'_>,
+) -> Result<WriteDone> {
+    let initialized = if req.init {
+        let id = steps.init(req.label, req.force)?;
+        // stderr, so `--json` keeps stdout to the one document. The write
+        // below may stop; the operator is told what stands and how to go on.
+        eprintln!(
+            "volume \"{0}\" initialized (id={id}); writing it now. If the write does not \
+             complete the volume stays initialized: `tapectl volume write {0}` (without \
+             --init) writes it, `tapectl volume resume {0}` continues an interrupted write.",
+            req.label
+        );
+        Some(id)
+    } else {
+        None
+    };
+    steps.write(req.label, req.force && !req.init)?;
+    // Reached only when the write above returned `Ok` — sealed AND
+    // confirmed. Issues #440 and #438.
+    let release = release_staging_after_write(conn, config, req.label, req.keep_staging);
+    let moved = move_after_write(conn, req.label, req.move_to);
+    Ok(WriteDone {
+        initialized,
+        release,
+        moved,
+    })
+}
+
+/// `volume write --json`: the keys it always had, plus the staging release's
+/// (issue #440) and — all additive — `initialized`, `moved_to`,
+/// `move_warning`, `moved_cartridge` and `volumes_moved` (issue #438). Always
+/// present, so a scripted consumer never branches on whether a key exists:
+/// `moved_to` and `move_warning` are null unless `--move-to` moved or failed.
+fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
+    let mut base = staging_release_json(
+        serde_json::json!({
+            "label": label,
+            "status": "completed",
+            "initialized": done.initialized.is_some(),
+        }),
+        &done.release,
+    );
+    let (moved_to, warning, cartridge, volumes): (
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+        Vec<&str>,
+    ) = match &done.moved {
+        MoveAfterWrite::NotAsked => (None, None, None, Vec::new()),
+        MoveAfterWrite::Moved { to, outcome } => (
+            Some(to.as_str()),
+            None,
+            outcome.cartridge.as_deref(),
+            outcome.volumes.iter().map(String::as_str).collect(),
+        ),
+        MoveAfterWrite::Failed { warning, .. } => (None, Some(warning.as_str()), None, Vec::new()),
+    };
+    if let Some(obj) = base.as_object_mut() {
+        obj.insert("moved_to".into(), moved_to.into());
+        obj.insert("move_warning".into(), warning.into());
+        obj.insert("moved_cartridge".into(), cartridge.into());
+        obj.insert("volumes_moved".into(), volumes.into());
+    }
+    base
+}
+
 /// Run a volume subcommand. Returns the process exit code (issue #45/H10),
 /// mirroring the `audit` convention (`src/cli/audit.rs`): 0=clean,
 /// 1=warning, 2=violation. Every arm but `Verify` has no exit-code
@@ -893,6 +1198,8 @@ pub fn run(
             label,
             device,
             force,
+            init,
+            move_to,
             allow_missing_escrow,
             prewrite_hash,
             fill_ceiling,
@@ -912,36 +1219,42 @@ pub fn run(
                      `volume plan` estimates tapes needed with no drive required.",
                 ));
             }
+            // Issue #438: a mistyped `--move-to` is refused before the tape
+            // is touched, not found after the copy is done.
+            if let Some(to) = move_to {
+                check_move_destination(conn, to)?;
+            }
             let device = write_device(config, device.as_deref())?;
             // Issue #391: `--fill-ceiling` for this write only.
             let config = &config.with_fill_ceiling(*fill_ceiling);
-            write::volume_write(
+            let steps = DriveWriteSteps {
                 conn,
                 paths,
                 config,
-                label,
-                &device,
-                DEFAULT_BLOCK_SIZE,
-                *force,
-                *allow_missing_escrow,
-                *prewrite_hash,
-                *full_confirm,
-                yes,
+                device: &device,
+                allow_missing_escrow: *allow_missing_escrow,
+                prewrite_hash: *prewrite_hash,
+                full_confirm: *full_confirm,
+                assume_yes: yes,
+            };
+            let done = write_and_follow(
+                conn,
+                config,
+                &steps,
+                &WriteRequest {
+                    label,
+                    init: *init,
+                    force: *force,
+                    move_to: move_to.as_deref(),
+                    keep_staging: *keep_staging,
+                },
             )?;
-            // Reached only when the write above returned `Ok` — sealed AND
-            // confirmed; every other outcome left through the `?`. Issue #440.
-            let release = release_staging_after_write(conn, config, label, *keep_staging);
             if json_output {
-                println!(
-                    "{}",
-                    staging_release_json(
-                        serde_json::json!({"label": label, "status": "completed"}),
-                        &release
-                    )
-                );
+                println!("{}", write_done_json(label, &done));
             } else {
                 println!("volume \"{label}\" write completed");
-                print_staging_release(label, &release);
+                print_staging_release(label, &done.release);
+                print_move_after_write(label, &done.moved);
             }
         }
 
@@ -3369,6 +3682,8 @@ mod tests {
                 label: s.volumes[1].clone(),
                 device: Some("/nonexistent/tapectl-release-nst".into()),
                 force: false,
+                init: false,
+                move_to: None,
                 allow_missing_escrow: false,
                 prewrite_hash: false,
                 fill_ceiling: None,
@@ -3407,6 +3722,8 @@ mod tests {
                     label: s.volumes[1].clone(),
                     device: None,
                     force: false,
+                    init: false,
+                    move_to: None,
                     allow_missing_escrow: false,
                     prewrite_hash: false,
                     fill_ceiling: None,
@@ -3436,23 +3753,66 @@ mod tests {
         /// driven without a drive): in both arms the release is the statement
         /// AFTER the write's own `?` — every failed, aborted, interrupted or
         /// inconclusive outcome returns at that `?` — and `--keep-staging`
-        /// reaches it.
+        /// reaches it. For `volume write` that sequence lives in
+        /// `write_and_follow` (issue #438): the init, then the write, and
+        /// only behind the write's `?` the release and the `--move-to` move.
         #[test]
         fn both_arms_release_only_after_the_write_returns_ok() {
             const SRC: &str = include_str!("volume.rs");
             let run_body = &SRC[SRC.find("pub fn run(").unwrap()..];
-            for (arm, next, write_call) in [
-                (
-                    "VolumeCommands::Write {\n",
-                    "VolumeCommands::Resume {\n",
-                    "write::volume_write(",
-                ),
-                (
-                    "VolumeCommands::Resume {\n",
-                    "VolumeCommands::Abort {",
-                    "write::volume_resume(",
-                ),
-            ] {
+
+            // `volume write`: the arm hands the whole sequence to
+            // `write_and_follow`, which is where the order is pinned.
+            let start = run_body.find("VolumeCommands::Write {\n").unwrap();
+            let arm = &run_body[start..start + run_body[start..].find("VolumeCommands::Resume {\n").unwrap()];
+            assert_eq!(
+                arm.matches("write_and_follow(").count(),
+                1,
+                "the Write arm runs its steps through write_and_follow"
+            );
+            assert!(
+                !arm.contains("release_staging_after_write(") && !arm.contains(" move_after_write("),
+                "the arm itself releases and moves nothing: write_and_follow does, after the write"
+            );
+            let seq_start = SRC.find("fn write_and_follow(").unwrap();
+            let seq = &SRC[seq_start..seq_start + SRC[seq_start..].find("\n}\n").unwrap()];
+            let init = seq.find("steps.init(").expect("write_and_follow inits");
+            let call = seq.find("steps.write(").expect("write_and_follow writes");
+            let question = call + seq[call..].find(")?;").expect("the write's own `?`");
+            let release = seq
+                .find("release_staging_after_write(conn, config, req.label, req.keep_staging)")
+                .expect("the release honours --keep-staging");
+            let moved = seq
+                .find("move_after_write(conn, req.label, req.move_to)")
+                .expect("the move is requested");
+            assert!(init < call, "the init comes before the write");
+            assert!(
+                release > question && moved > question,
+                "the release and the move must come after the write's `?`, not before it"
+            );
+            assert!(
+                release < moved,
+                "the staging release runs before the move, whose warning is printed last"
+            );
+            assert_eq!(seq.matches("release_staging_after_write(").count(), 1);
+            assert_eq!(seq.matches("move_after_write(").count(), 1);
+            assert!(
+                seq.contains("req.force && !req.init"),
+                "--force goes to the init only: the write after it is never forced"
+            );
+            let drive = SRC.find("impl WriteSteps for DriveWriteSteps").unwrap();
+            assert!(
+                SRC[drive..drive + 1500].contains("write::volume_write(")
+                    && SRC[drive..drive + 1500].contains("write::volume_init("),
+                "DriveWriteSteps is the real init and the real write"
+            );
+
+            // `volume resume`.
+            for (arm, next, write_call) in [(
+                "VolumeCommands::Resume {\n",
+                "VolumeCommands::Abort {",
+                "write::volume_resume(",
+            )] {
                 let start = run_body.find(arm).unwrap();
                 let body = &run_body[start..start + run_body[start..].find(next).unwrap()];
                 let call = body
@@ -3480,6 +3840,508 @@ mod tests {
                 !write_rs.contains("staging::release"),
                 "volume::write must not release staging itself"
             );
+        }
+    }
+
+    /// Issue #438 (ADR-0012 2026-10-15 item 59): `volume write --init
+    /// --full-confirm --move-to <location>`. The two library calls that
+    /// touch the drive are scripted through [`WriteSteps`]; everything else
+    /// is the arm's real logic on a real catalog.
+    mod write_one_command {
+        use super::*;
+        use crate::error::{ErrorContract, WriteOutcome};
+        use crate::staging::release::fixtures::*;
+        use std::cell::RefCell;
+
+        const NEW: &str = "V-NEW";
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Fail {
+            Nothing,
+            /// `volume init` refuses (a File 0 that is not blank, say).
+            Init,
+            /// The write is interrupted part-way: exit 4, not sealed.
+            Write,
+        }
+
+        /// The drive, scripted: `init` leaves the volume row `volume init`
+        /// leaves; `write` leaves the catalog as a sealed, confirmed write
+        /// does — a completed `writes` row and the volume `sealed`.
+        struct FakeSteps<'a> {
+            conn: &'a Connection,
+            staged: &'a Staged,
+            fail: Fail,
+            log: RefCell<Vec<String>>,
+        }
+
+        impl FakeSteps<'_> {
+            fn log(&self) -> Vec<String> {
+                self.log.borrow().clone()
+            }
+        }
+
+        impl WriteSteps for FakeSteps<'_> {
+            fn init(&self, label: &str, force: bool) -> Result<i64> {
+                self.log.borrow_mut().push(format!("init {label} force={force}"));
+                if self.fail == Fail::Init {
+                    return Err(TapectlError::Other(
+                        "volume init refused: the loaded cartridge's File 0 identifies a \
+                         DIFFERENT volume"
+                            .into(),
+                    ));
+                }
+                self.conn
+                    .execute(
+                        "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+                         VALUES (?1, 'lto', 'p', 10485760, 'initialized')",
+                        [label],
+                    )
+                    .unwrap();
+                Ok(self.conn.last_insert_rowid())
+            }
+
+            fn write(&self, label: &str, force: bool) -> Result<()> {
+                self.log.borrow_mut().push(format!("write {label} force={force}"));
+                if self.fail == Fail::Write {
+                    return Err(TapectlError::WriteInterrupted("the tape stopped".into()));
+                }
+                add_write(self.conn, self.staged, label, "initialized", "completed");
+                self.conn
+                    .execute("UPDATE volumes SET status = 'sealed' WHERE label = ?1", [label])
+                    .unwrap();
+                Ok(())
+            }
+        }
+
+        fn exit_code(err: TapectlError) -> i32 {
+            ErrorContract::Write.exit_code(&anyhow::Error::from(err))
+        }
+
+        fn add_shelf(conn: &Connection, name: &str) -> i64 {
+            conn.execute("INSERT INTO locations (name, kind) VALUES (?1, 'shelf')", [name])
+                .unwrap();
+            conn.last_insert_rowid()
+        }
+
+        fn location_of(conn: &Connection, label: &str) -> Option<i64> {
+            conn.query_row(
+                "SELECT location_id FROM volumes WHERE label = ?1",
+                [label],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        fn request<'a>(init: bool, force: bool, move_to: Option<&'a str>) -> WriteRequest<'a> {
+            WriteRequest {
+                label: NEW,
+                init,
+                force,
+                move_to,
+                keep_staging: false,
+            }
+        }
+
+        /// The whole one-command form: init, write, then the release and the
+        /// move, in that order, each only behind the one before it.
+        #[test]
+        fn init_write_release_and_move_run_in_order_and_succeed() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            let config = config(dir.path(), 2);
+            let offsite = add_shelf(&conn, "offsite");
+            let steps = FakeSteps {
+                conn: &conn,
+                staged: &s,
+                fail: Fail::Nothing,
+                log: RefCell::default(),
+            };
+
+            let done =
+                write_and_follow(&conn, &config, &steps, &request(true, true, Some("offsite")))
+                    .unwrap();
+
+            // `--force` went to the init only.
+            assert_eq!(
+                steps.log(),
+                ["init V-NEW force=true", "write V-NEW force=false"]
+            );
+            assert!(done.initialized.is_some());
+            assert!(
+                matches!(done.release, StagingRelease::Released(_)),
+                "the write brought the unit to its second copy: {:?}",
+                done.release
+            );
+            assert!(!s.file.exists());
+            let MoveAfterWrite::Moved { to, .. } = &done.moved else {
+                panic!("the sealed volume moves: {:?}", done.moved);
+            };
+            assert_eq!(to, "offsite");
+            assert_eq!(location_of(&conn, NEW), Some(offsite));
+
+            let json = write_done_json(NEW, &done);
+            // Keys that always existed keep their names and meaning.
+            assert_eq!(json["label"], NEW);
+            assert_eq!(json["status"], "completed");
+            assert_eq!(json["staging_released"], true);
+            // The additive keys.
+            assert_eq!(json["initialized"], true);
+            assert_eq!(json["moved_to"], "offsite");
+            assert!(json["move_warning"].is_null());
+            assert_eq!(json["volumes_moved"], serde_json::json!([NEW]));
+        }
+
+        /// No `--init`, no `--move-to`: the command is exactly what it was.
+        #[test]
+        fn without_the_new_flags_only_the_write_runs() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            let config = config(dir.path(), 2);
+            // The volume already exists, as `volume init` left it.
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+                 VALUES (?1, 'lto', 'p', 10485760, 'initialized')",
+                [NEW],
+            )
+            .unwrap();
+            let steps = FakeSteps {
+                conn: &conn,
+                staged: &s,
+                fail: Fail::Nothing,
+                log: RefCell::default(),
+            };
+
+            let done = write_and_follow(&conn, &config, &steps, &request(false, true, None)).unwrap();
+
+            // Positive control for the force test below: with no `--init`,
+            // `--force` still reaches the write.
+            assert_eq!(steps.log(), ["write V-NEW force=true"]);
+            assert!(done.initialized.is_none());
+            assert!(matches!(done.moved, MoveAfterWrite::NotAsked));
+            let json = write_done_json(NEW, &done);
+            assert_eq!(json["initialized"], false);
+            assert!(json["moved_to"].is_null() && json["move_warning"].is_null());
+            assert_eq!(json["volumes_moved"], serde_json::json!([]));
+        }
+
+        /// An init that refuses: the write is never attempted, nothing is
+        /// recorded, and the error exits by the write family's table — 2,
+        /// nothing written.
+        #[test]
+        fn an_init_that_refuses_writes_nothing_and_exits_2() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            let config = config(dir.path(), 2);
+            add_shelf(&conn, "offsite");
+            let steps = FakeSteps {
+                conn: &conn,
+                staged: &s,
+                fail: Fail::Init,
+                log: RefCell::default(),
+            };
+
+            let err = write_and_follow(&conn, &config, &steps, &request(true, false, Some("offsite")))
+                .unwrap_err();
+
+            assert!(err.to_string().contains("DIFFERENT volume"), "{err}");
+            assert_eq!(steps.log(), ["init V-NEW force=false"], "the write never ran");
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM volumes WHERE label = ?1", [NEW], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "no volume row: nothing was initialised");
+            assert!(s.file.exists(), "nothing was released");
+            assert_eq!(exit_code(err), crate::error::EXIT_ERROR);
+        }
+
+        /// A write that does not seal and confirm: nothing moves and nothing
+        /// is released, and the exit is the write's own (4 interrupted). The
+        /// volume stays initialised, which the operator was told after the
+        /// init. The control is the same catalog with the write succeeding.
+        #[test]
+        fn a_write_that_fails_does_not_move_or_release() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            let config = config(dir.path(), 2);
+            add_shelf(&conn, "offsite");
+            let steps = FakeSteps {
+                conn: &conn,
+                staged: &s,
+                fail: Fail::Write,
+                log: RefCell::default(),
+            };
+
+            let err = write_and_follow(&conn, &config, &steps, &request(true, false, Some("offsite")))
+                .unwrap_err();
+
+            assert_eq!(
+                steps.log(),
+                ["init V-NEW force=false", "write V-NEW force=false"]
+            );
+            assert_eq!(location_of(&conn, NEW), None, "an unsealed volume is not moved");
+            assert!(s.file.exists(), "nothing was released");
+            assert_eq!(WriteOutcome::of(&anyhow::Error::from(err)), Some(WriteOutcome::Interrupted));
+
+            // Control: the same request with a write that seals DOES move.
+            let conn = crate::db::open_memory().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            let offsite = add_shelf(&conn, "offsite");
+            let steps = FakeSteps {
+                conn: &conn,
+                staged: &s,
+                fail: Fail::Nothing,
+                log: RefCell::default(),
+            };
+            write_and_follow(&conn, &config, &steps, &request(true, false, Some("offsite"))).unwrap();
+            assert_eq!(location_of(&conn, NEW), Some(offsite));
+        }
+
+        /// A move that fails once the copy is sealed and confirmed is a
+        /// warning, not a failed write: the copy stands, the result is `Ok`
+        /// (so the arm exits 0), and the warning carries the `volume move`
+        /// that finishes it. `--json` says so too.
+        #[test]
+        fn a_failed_move_is_a_warning_naming_volume_move_and_the_write_stands() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            let config = config(dir.path(), 2);
+            // No location named "gone": the destination vanished after the
+            // arm's up-front check, say, or the check was bypassed.
+            let steps = FakeSteps {
+                conn: &conn,
+                staged: &s,
+                fail: Fail::Nothing,
+                log: RefCell::default(),
+            };
+
+            let done = write_and_follow(&conn, &config, &steps, &request(true, false, Some("gone")))
+                .expect("a move that fails after the seal does not fail the write");
+
+            let MoveAfterWrite::Failed { to, warning } = &done.moved else {
+                panic!("the move failed: {:?}", done.moved);
+            };
+            assert_eq!(to, "gone");
+            assert!(
+                warning.starts_with(
+                    "warning: volume \"V-NEW\" is sealed and confirmed and counts as a copy, \
+                     but moving the volume did not finish: "
+                ),
+                "{warning}"
+            );
+            assert!(
+                warning.ends_with("To finish it: tapectl volume move V-NEW --to gone"),
+                "{warning}"
+            );
+            assert_eq!(location_of(&conn, NEW), None);
+            let sealed: String = conn
+                .query_row("SELECT status FROM volumes WHERE label = ?1", [NEW], |r| r.get(0))
+                .unwrap();
+            assert_eq!(sealed, "sealed", "the copy stands");
+            assert!(
+                matches!(done.release, StagingRelease::Released(_)),
+                "a failed move leaves the release as it was"
+            );
+            let json = write_done_json(NEW, &done);
+            assert_eq!(json["status"], "completed");
+            assert!(json["moved_to"].is_null());
+            assert_eq!(json["move_warning"], serde_json::json!(warning));
+        }
+
+        /// The destination is checked before anything is written: a typo, a
+        /// location never added, or a warehouse (no cartridge goes there).
+        #[test]
+        fn the_move_destination_is_checked_before_the_tape_is_touched() {
+            let conn = crate::db::open_memory().unwrap();
+            add_shelf(&conn, "offsite");
+            conn.execute(
+                "INSERT INTO locations (name, kind) VALUES ('glacier', 'warehouse')",
+                [],
+            )
+            .unwrap();
+
+            check_move_destination(&conn, "offsite").unwrap();
+            check_move_destination(&conn, " offsite ").unwrap();
+
+            let err = check_move_destination(&conn, "ofsite").unwrap_err().to_string();
+            assert!(err.contains("\"ofsite\" not found"), "{err}");
+            assert!(err.contains("known locations: glacier, offsite"), "{err}");
+            assert!(err.contains("Nothing was written"), "{err}");
+
+            let err = check_move_destination(&conn, "glacier").unwrap_err().to_string();
+            assert!(err.contains("warehouse location"), "{err}");
+            assert!(err.contains("Nothing was written"), "{err}");
+        }
+
+        /// The flag surface: `--init` and `--move-to` parse beside the write's
+        /// own flags and default off.
+        #[test]
+        fn the_new_flags_parse_beside_the_writes_own() {
+            use clap::Parser;
+            let parse = |args: &[&str]| {
+                let mut argv = vec!["tapectl", "volume", "write"];
+                argv.extend_from_slice(args);
+                match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+                    crate::cli::Commands::Volume { command } => command,
+                    other => panic!("not a volume command: {other:?}"),
+                }
+            };
+            let VolumeCommands::Write {
+                label,
+                init,
+                move_to,
+                full_confirm,
+                force,
+                ..
+            } = parse(&[
+                "L6-0003",
+                "--init",
+                "--full-confirm",
+                "--move-to",
+                "offsite",
+                "--force",
+            ])
+            else {
+                panic!("a write");
+            };
+            assert_eq!(label, "L6-0003");
+            assert!(init && full_confirm && force);
+            assert_eq!(move_to.as_deref(), Some("offsite"));
+
+            let VolumeCommands::Write { init, move_to, .. } = parse(&["L6-0003"]) else {
+                panic!("a write");
+            };
+            assert!(!init && move_to.is_none(), "both default off");
+        }
+
+        fn drive_config(dir: &std::path::Path) -> Config {
+            let mut c = config(dir, 2);
+            c.backends.lto.push(crate::config::LtoBackendConfig {
+                name: "lto0".into(),
+                device_tape: "/nonexistent/tapectl-438-nst".into(),
+                device_sg: "/nonexistent/tapectl-438-sg".into(),
+                generation: "LTO-6".into(),
+                capacity_override: None,
+                fill_ceiling: 1.0,
+                enospc_buffer: "0".into(),
+            });
+            c
+        }
+
+        fn write_cmd(label: &str, init: bool, move_to: Option<&str>) -> VolumeCommands {
+            VolumeCommands::Write {
+                label: label.into(),
+                device: Some("/nonexistent/tapectl-438-nst".into()),
+                force: false,
+                init,
+                move_to: move_to.map(str::to_string),
+                allow_missing_escrow: false,
+                prewrite_hash: false,
+                fill_ceiling: None,
+                full_confirm: false,
+                keep_staging: false,
+            }
+        }
+
+        /// Through the real arm and the real `volume init`: an init that is
+        /// refused (there is no cartridge or drive here) leaves the catalog
+        /// untouched — no volume row, no write row — and the error is the
+        /// init's, not the write's "volume not found", so the write was
+        /// never attempted. Exit 2.
+        #[test]
+        fn the_real_arm_stops_at_a_refused_init_with_nothing_written() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let config = drive_config(dir.path());
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            add_shelf(&conn, "offsite");
+
+            let err = run(
+                &conn,
+                &paths,
+                &config,
+                &write_cmd(NEW, true, Some("offsite")),
+                false,
+                true,
+                false,
+            )
+            .expect_err("no cartridge: the init is refused");
+
+            let text = err.to_string();
+            assert!(
+                !text.contains("volume not found"),
+                "the init failed, not the write: {text}"
+            );
+            for table in ["volumes", "writes"] {
+                let n: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(n, 0, "{table}: nothing was recorded");
+            }
+            assert_eq!(exit_code(err), crate::error::EXIT_ERROR);
+        }
+
+        /// A `--move-to` that names no location is refused first — before
+        /// the device is resolved (this config has none), before the init.
+        #[test]
+        fn the_real_arm_refuses_an_unknown_move_to_before_anything_else() {
+            let conn = crate::db::open_memory().unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let no_drive = Config::default();
+
+            let err = run(
+                &conn,
+                &paths,
+                &no_drive,
+                &write_cmd(NEW, true, Some("nowhere")),
+                false,
+                true,
+                false,
+            )
+            .expect_err("unknown location");
+
+            let text = err.to_string();
+            assert!(text.contains("--move-to location \"nowhere\" not found"), "{text}");
+            assert_eq!(exit_code(err), crate::error::EXIT_ERROR);
+        }
+
+        /// Through the real arm: a write that is refused (a sealed volume is
+        /// no write target) moves nothing, `--move-to` or not.
+        #[test]
+        fn the_real_arm_moves_nothing_when_the_write_is_refused() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 2);
+            let config = drive_config(dir.path());
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            add_shelf(&conn, "offsite");
+
+            let err = run(
+                &conn,
+                &paths,
+                &config,
+                &write_cmd(&s.volumes[1], false, Some("offsite")),
+                false,
+                true,
+                false,
+            )
+            .expect_err("a sealed volume is not a write target");
+
+            assert!(matches!(err, TapectlError::VolumeNotWriteTarget { .. }), "{err:?}");
+            assert_eq!(location_of(&conn, &s.volumes[1]), None);
         }
     }
 
@@ -4286,6 +5148,8 @@ mod tests {
                 label: "L".into(),
                 device: None,
                 force: false,
+                init: false,
+                move_to: None,
                 allow_missing_escrow: false,
                 prewrite_hash: false,
                 fill_ceiling: None,

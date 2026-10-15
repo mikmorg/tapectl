@@ -63,6 +63,20 @@ fn each_write_command_refused_before_the_tape_moved_exits_2() {
     let src = src.to_str().unwrap();
     for args in [
         &["volume", "write", "NOSUCH", "--device", NO_DRIVE][..],
+        // Issue #438: the one-command form refuses the same way — an init
+        // that cannot run, and a `--move-to` naming no location, both
+        // before the tape moved.
+        &["volume", "write", "NOSUCH", "--init", "--device", NO_DRIVE][..],
+        &[
+            "volume",
+            "write",
+            "NOSUCH",
+            "--init",
+            "--move-to",
+            "nowhere",
+            "--device",
+            NO_DRIVE,
+        ][..],
         &["volume", "resume", "NOSUCH", "--device", NO_DRIVE][..],
         &[
             "volume",
