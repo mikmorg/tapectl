@@ -997,6 +997,17 @@ mod tests {
     // Every test names its pointer file inside a temp dir and its euid as a
     // parameter: nothing here reads /etc, sets a variable, or needs root.
 
+    /// A row of the pointer's ranking: `--home`, `--config`, `TAPECTL_HOME`,
+    /// `HOME`, the expected home, and what the row demonstrates.
+    type PointerRow<'a> = (
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a OsStr>,
+        &'a OsStr,
+        PathBuf,
+        &'a str,
+    );
+
     /// A service home, an account with a `~/.tapectl` of its own, an account
     /// without one, and a way to write the pointer file.
     struct Pointer {
@@ -1075,15 +1086,7 @@ mod tests {
         let own = fx.home_with_own();
         let none = fx.home_without_own();
         let own_default = PathBuf::from(&own).join(".tapectl");
-        // (home flag, config flag, TAPECTL_HOME, HOME, expected home)
-        let rows: Vec<(
-            Option<&str>,
-            Option<&str>,
-            Option<&OsStr>,
-            &OsStr,
-            PathBuf,
-            &str,
-        )> = vec![
+        let rows: Vec<PointerRow<'_>> = vec![
             (
                 Some("/mnt/flag"),
                 None,
