@@ -485,6 +485,141 @@ pub fn density_code(device: &str) -> Result<Option<u8>> {
     Ok(density_from_dsreg(mtget.mt_dsreg))
 }
 
+/// `GMT_*` bits of `mt_gstat` that [`TapeNodeStatus`] names, from
+/// `<linux/mtio.h>`. `mtget_journal::GSTAT_BITS` lists the same bits by
+/// name for the journal; these are the ones `drive status` branches on.
+const GMT_BOT: i64 = 0x4000_0000;
+const GMT_EOT: i64 = 0x2000_0000;
+const GMT_WR_PROT: i64 = 0x0400_0000;
+const GMT_ONLINE: i64 = 0x0100_0000;
+const GMT_DR_OPEN: i64 = 0x0004_0000;
+const GMT_CLN: i64 = 0x0000_8000;
+
+/// What the st driver says is in the drive (`MTIOCGET`, read by
+/// [`status_nonblocking`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CartridgeState {
+    /// `GMT_DR_OPEN`: "the drive does not have a tape in place". Checked
+    /// first because mhvtl (and some real drives) report `DR_OPEN` together
+    /// with `ONLINE` when empty.
+    Empty,
+    /// `GMT_ONLINE` without `DR_OPEN`: a cartridge is loaded and ready.
+    Loaded,
+    /// Neither: a cartridge is present and the drive is not ready (still
+    /// loading or calibrating, or faulted).
+    NotReady,
+}
+
+/// The st driver's `MTIOCGET` answer, read through a descriptor that does
+/// nothing else ([`status_nonblocking`]), decoded for `drive status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapeNodeStatus {
+    pub raw: crate::tape::mtget_journal::MtStatus,
+}
+
+impl TapeNodeStatus {
+    pub fn cartridge(&self) -> CartridgeState {
+        if self.raw.mt_gstat & GMT_DR_OPEN != 0 {
+            CartridgeState::Empty
+        } else if self.raw.mt_gstat & GMT_ONLINE != 0 {
+            CartridgeState::Loaded
+        } else {
+            CartridgeState::NotReady
+        }
+    }
+
+    /// The cartridge's write-protect tab, or `None` when no ready cartridge
+    /// makes the bit mean anything (st leaves it stale on an empty drive).
+    pub fn write_protected(&self) -> Option<bool> {
+        (self.cartridge() == CartridgeState::Loaded)
+            .then_some(self.raw.mt_gstat & GMT_WR_PROT != 0)
+    }
+
+    /// st's own file count, `None` where it has lost track (`-1`) or there
+    /// is no ready cartridge to be positioned on.
+    pub fn file_number(&self) -> Option<i32> {
+        (self.cartridge() == CartridgeState::Loaded && self.raw.mt_fileno >= 0)
+            .then_some(self.raw.mt_fileno)
+    }
+
+    /// st's own block count within the file, with [`Self::file_number`]'s
+    /// caveats.
+    pub fn block_number(&self) -> Option<i32> {
+        (self.cartridge() == CartridgeState::Loaded && self.raw.mt_blkno >= 0)
+            .then_some(self.raw.mt_blkno)
+    }
+
+    /// `GMT_BOT`: st believes the head is at the beginning of tape.
+    pub fn at_bot(&self) -> bool {
+        self.cartridge() == CartridgeState::Loaded && self.raw.mt_gstat & GMT_BOT != 0
+    }
+
+    pub fn at_eod(&self) -> bool {
+        self.cartridge() == CartridgeState::Loaded && self.raw.mt_gstat & GMT_EOD != 0
+    }
+
+    pub fn at_eot(&self) -> bool {
+        self.cartridge() == CartridgeState::Loaded && self.raw.mt_gstat & GMT_EOT != 0
+    }
+
+    /// `GMT_CLN`: the drive has asked to be cleaned.
+    pub fn cleaning_requested(&self) -> bool {
+        self.raw.mt_gstat & GMT_CLN != 0
+    }
+
+    /// The density code st last saw, from `mt_dsreg`'s top byte.
+    pub fn density_code(&self) -> Option<u8> {
+        density_from_dsreg(self.raw.mt_dsreg)
+    }
+
+    /// The block size st holds (`mt_dsreg`'s low 24 bits; 0 is variable).
+    pub fn block_size(&self) -> i64 {
+        self.raw.mt_dsreg & 0xff_ffff
+    }
+}
+
+/// Read what is in the drive: open `device` read-only with `O_NONBLOCK`,
+/// issue `MTIOCGET`, close (`drive status`, issue #428).
+///
+/// The same open `mt status` makes, and the same one
+/// `media_detect::probe_no_medium` makes: `O_NONBLOCK` skips the st driver's
+/// wait for the drive to become ready, so an empty drive answers at once
+/// instead of after `ST_BLOCK_SECONDS`. Deliberately NOT via
+/// [`TapeDevice::open_read`], whose construction sends `MTSETBLK`; and no
+/// rewind, no read, no write: nothing here moves tape or changes a mode.
+///
+/// Errors are the open's or the ioctl's own errno, unwrapped, because the
+/// caller tells them apart: `ENOENT`/`ENODEV`/`ENXIO` (no such drive),
+/// `EBUSY` (st allows one opener: another process has the drive open) and
+/// `EACCES` (not in the tape group) are different answers for the operator.
+///
+/// Like every `MTIOCGET`, it clears st's recovered-error register; the count
+/// it held is in the answer ([`TapeNodeStatus::raw`]'s `mt_erreg`).
+pub fn status_nonblocking(device: &str) -> io::Result<TapeNodeStatus> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(device)?;
+    let mut m = MtGet::default();
+    let rc = unsafe { nix::libc::ioctl(file.as_raw_fd(), MTIOCGET, &mut m as *mut MtGet) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(TapeNodeStatus {
+        raw: crate::tape::mtget_journal::MtStatus {
+            mt_type: m.mt_type,
+            mt_resid: m.mt_resid,
+            mt_dsreg: m.mt_dsreg,
+            mt_gstat: m.mt_gstat,
+            mt_erreg: m.mt_erreg,
+            mt_fileno: m.mt_fileno,
+            mt_blkno: m.mt_blkno,
+        },
+    })
+}
+
 /// Extract the density code byte from `MTIOCGET`'s `mt_dsreg` register: the
 /// top byte, `(dsreg >> 24) & 0xff`. `0` means "not reported" and is
 /// normalized to `None` rather than the misleading byte value `0x00`.
@@ -525,7 +660,14 @@ mod density_tests {
             1,
             "TapeDevice issues MTIOCGET only through read_status"
         );
-        assert_eq!(body.matches(", MTIOCGET,").count(), 2, "and density_code");
+        // Issue #428: `status_nonblocking` is the third (`drive status`),
+        // on its own descriptor like `density_code` — never on a
+        // `TapeDevice`'s, whose tally it would bypass.
+        assert_eq!(
+            body.matches(", MTIOCGET,").count(),
+            3,
+            "density_code and status_nonblocking, each on a descriptor of its own"
+        );
     }
 
     #[test]
@@ -555,5 +697,79 @@ mod density_tests {
     fn density_code_on_a_nonexistent_device_errors_without_panicking() {
         let err = density_code("/nonexistent/tapectl-media-detect-test-device").unwrap_err();
         assert!(format!("{err}").contains("open"));
+    }
+    fn node(gstat: i64, fileno: i32, blkno: i32) -> TapeNodeStatus {
+        TapeNodeStatus {
+            raw: crate::tape::mtget_journal::MtStatus {
+                mt_gstat: gstat,
+                mt_dsreg: 0x5a00_0000 | 524_288,
+                mt_fileno: fileno,
+                mt_blkno: blkno,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Issue #428: the states `drive status` reports, from the `mt_gstat`
+    /// shapes `media_detect`'s tests record. `DR_OPEN` wins over `ONLINE`
+    /// (an empty mhvtl drive carries both).
+    #[test]
+    fn the_cartridge_state_is_read_from_the_gstat_bits() {
+        let empty = node(GMT_DR_OPEN | GMT_ONLINE, 0, 0);
+        assert_eq!(empty.cartridge(), CartridgeState::Empty);
+        assert_eq!(empty.write_protected(), None, "no cartridge, no tab");
+        assert_eq!(empty.file_number(), None, "no cartridge, no position");
+        assert!(!empty.at_bot());
+
+        let loaded = node(GMT_BOT | GMT_ONLINE, 0, 0);
+        assert_eq!(loaded.cartridge(), CartridgeState::Loaded);
+        assert!(loaded.at_bot());
+        assert_eq!(loaded.write_protected(), Some(false));
+        assert_eq!(loaded.file_number(), Some(0));
+        assert_eq!(loaded.block_size(), 524_288);
+        assert_eq!(loaded.density_code(), Some(0x5a));
+
+        let tab = node(GMT_BOT | GMT_ONLINE | GMT_WR_PROT, 0, 0);
+        assert_eq!(tab.write_protected(), Some(true));
+
+        let loading = node(0, -1, -1);
+        assert_eq!(loading.cartridge(), CartridgeState::NotReady);
+        assert_eq!(loading.write_protected(), None);
+    }
+
+    #[test]
+    fn a_position_st_has_lost_is_not_reported_as_a_number() {
+        let lost = node(GMT_ONLINE, -1, -1);
+        assert_eq!(lost.file_number(), None);
+        assert_eq!(lost.block_number(), None);
+        let mid = node(GMT_ONLINE | GMT_EOD, 4, 12);
+        assert_eq!((mid.file_number(), mid.block_number()), (Some(4), Some(12)));
+        assert!(mid.at_eod() && !mid.at_eot() && !mid.at_bot());
+    }
+
+    #[test]
+    fn cleaning_is_requested_by_the_cln_bit_alone() {
+        assert!(node(GMT_ONLINE | GMT_CLN, 0, 0).cleaning_requested());
+        assert!(!node(GMT_ONLINE, 0, 0).cleaning_requested());
+    }
+
+    /// The gstat constants here are the ones the journal names, so a status
+    /// reading and a journalled one can never disagree about a bit.
+    #[test]
+    fn the_status_bits_agree_with_the_journals() {
+        let all = crate::tape::mtget_journal::MtStatus {
+            mt_gstat: GMT_BOT | GMT_EOT | GMT_WR_PROT | GMT_ONLINE | GMT_DR_OPEN | GMT_CLN,
+            ..Default::default()
+        };
+        assert_eq!(
+            all.gstat_flags(),
+            ["BOT", "EOT", "WR_PROT", "ONLINE", "DR_OPEN", "CLN"]
+        );
+    }
+
+    #[test]
+    fn status_of_a_nonexistent_node_is_its_errno_not_a_panic() {
+        let err = status_nonblocking("/nonexistent/tapectl-drive-status-test/nst0").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }
