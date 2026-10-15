@@ -1193,7 +1193,9 @@ fn unsealed_tape_lines(report: &RebuildReport) -> Vec<String> {
     }
     lines.push(
         "    A full `volume verify` cannot seal it, and its slices may be missing or incomplete \
-         (the envelopes and the front index are laid down before them)."
+         (the envelopes and the front index are laid down before them). A verify records what \
+         it finds against those slice positions, and `volume write` will not clear positions \
+         that hold results: write over the tape, or retire it, before verifying it."
             .to_string(),
     );
     lines.push(format!(

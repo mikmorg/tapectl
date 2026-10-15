@@ -5,8 +5,9 @@
 //! but before `volume write` began holds the volume as `initialized` with no
 //! `writes` rows, while the tape itself was sealed and confirmed. `catalog
 //! rebuild --from-volume` attaches its units — `completed` writes rows, never
-//! verified — but never changes a status it finds (the 2026-09-16 ruling,
-//! which stands). Before this module nothing could make such a volume count:
+//! verified, for a tape whose seal marker it read (#458: a tape without one
+//! gets `aborted` rows, which this never adopts) — but never changes a status
+//! it finds (the 2026-09-16 ruling, which stands). Before this module nothing could make such a volume count:
 //! `volume resume` had no session to adopt, and refused the row as
 //! `VolumeHasRecordedWrite`.
 //!
