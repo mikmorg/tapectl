@@ -1478,7 +1478,7 @@ pub(crate) mod tests {
     /// nothing fails.
     #[test]
     fn finish_past_the_bound_gives_up_without_failing() {
-        use crate::tape::log_pages::tests::{file_catalog, hold_write_lock};
+        use crate::tape::log_pages::tests::{file_catalog, hold_write_lock_until_released};
         let (dir, conn) = file_catalog();
         let config = config_with_backend();
         let mam = mam_with_serial(None, Some(7));
@@ -1493,7 +1493,9 @@ pub(crate) mod tests {
                 mam: &mam,
             },
         );
-        let release = hold_write_lock(&dir, std::time::Duration::from_millis(600));
+        // Held until the close has given up and returned, so a slow machine
+        // cannot free the lock early and let the close through (#466).
+        let held = hold_write_lock_until_released(&dir);
         guard.finish_with_policy(
             BusyPolicy {
                 budget: std::time::Duration::from_millis(100),
@@ -1503,7 +1505,7 @@ pub(crate) mod tests {
             OUTCOME_OK,
             None,
         );
-        release.join().unwrap();
+        held.release();
         assert_eq!(only_row(&conn).8, None, "the close was given up on");
     }
 
