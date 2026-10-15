@@ -641,6 +641,13 @@ unreadable because of a real flaw, the overwrite can fail partway and convert a
 drive-side read failure into medium-side destruction: the inversion of this ADR's own
 premise that a readback which did not succeed is not a verdict about the medium.
 
+*Fact correction, 2026-10-15 (#460).* The conflation is correct only where the tape is
+positively blank at that position. A failed read now counts as an absent seal only on that
+evidence: the tape is blank at BOT, or the medium's own END OF DATA is at or before the
+position (`Store::eod_at_or_before`). Any other failure is `ContactOutcome::SealUnreadable`,
+which a fresh write refuses with no flag to override it, and which a resume treats by the
+recorded seal below: re-confirm if `sealed_at` is set, otherwise refuse and write nothing.
+
 **Why no cleverer probe fixes it.** Two states are indistinguishable to the tape *and*,
 today, to the catalog:
 

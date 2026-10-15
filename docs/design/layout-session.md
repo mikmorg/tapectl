@@ -253,7 +253,14 @@ Rules that hold in every path:
   session's own `seal()` returned `Ok`: set → re-enter `confirm`, never
   reposition and never seal; NULL → the seal is genuinely still owed and the
   cursor rule above applies unchanged. The tape-side probes remain as defence
-  in depth, not as the decision.
+  in depth, not as the decision. Since #460 they no longer read a failed read
+  as an absent seal: a seal position that errors counts as absent only when
+  the medium shows END OF DATA at or before it (`Store::eod_at_or_before`) or
+  is blank at BOT. Any other failure is `ContactOutcome::SealUnreadable`: a
+  fresh write refuses it, `--force` included, and a resume re-enters `confirm`
+  if `sealed_at` is recorded and otherwise refuses, writing nothing. A resume
+  that finds its own tape sealed records `sealed_at` from the seal marker's
+  time.
 - **Resume across a process restart** (#25): the rule above is scoped "same
   session", meaning the `InterruptedSession` value `execute` returned. When the
   process itself is gone, that value must be rebuilt — and it is **rehydrated,

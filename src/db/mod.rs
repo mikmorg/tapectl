@@ -287,6 +287,10 @@ fn migrations() -> Migrations<'static> {
         // of them wrong -- rewriting a physically sealed cartridge, ADR-0003
         // bypassed. Set once, at the single `seal()` call site
         // (`write::finish_session`), never cleared by any confirm outcome.
+        // Since #460 the probe is tri-state (a failed read is an absent seal
+        // only on END OF DATA or a blank BOT), and a resume that finds its
+        // own seal records it once more, write-once
+        // (`session::record_seal_found_at_resume`).
         // Plain ADD COLUMN, no rebuild -- see the migration header for why
         // none of 017's rebuild machinery is needed here.
         M::up(include_str!("migrations/018_volume_sealed_at.sql")),
