@@ -213,6 +213,15 @@ keys.
   v1.1.0 is installed (item 40). Open after it: #420, #418 R4, #425, #388, #326 and the
   #364 staging epic.
 
+**2026-10-15: 1.1.1, a patch for home2** (ADR-0012 amendment "2026-10-15", items 57–64;
+`docs/releases/1.1.1.md`). No on-tape change; migration 036 adds `cleaning_cartridges`. In
+it: `drive status`/`eject`/`cleaned`, `device_sg` derived from `device_tape`, proven-blank
+init without `--force`, `volume write` releasing staging (`--keep-staging`), the one-command
+copy `volume write --init --full-confirm --move-to`, optional labels for reads, raised
+priority for tape commands, the `/etc/tapectl/home` pointer, and a single source read
+(dar's `fadvise` neutralised by a seccomp filter on `dar -c`, #441). home2 upgrades in
+place (take `db backup` with 1.1.0 first).
+
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
