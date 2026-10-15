@@ -38,7 +38,7 @@ pub enum ReportCommands {
         #[arg(long)]
         volume: Option<String>,
     },
-    /// Drive error trends
+    /// Drive error trends, and drive cleanings
     Health {
         /// Filter to specific volume
         #[arg(long)]
@@ -1680,6 +1680,13 @@ fn report_health(
     for line in read_error_trend_block(conn, config.health().read_error_rise_factor)? {
         println!("{line}");
     }
+    // Issue #430: each drive's last cleaning, and each cleaning cartridge's
+    // recorded uses against its rated life. Fleet-wide like the two blocks
+    // above, and absent until a cleaning cartridge is registered or a
+    // cleaning recorded.
+    for line in crate::tape::cleaning::block(conn)? {
+        println!("{line}");
+    }
     // Issue #439: each write's feed ratio, uneven feeds first. Unlike the two
     // fleet-wide blocks above (a TapeAlert or a rising cartridge must not be
     // hidden by a filter), this one is about writes, so `--volume` narrows it.
@@ -1805,6 +1812,13 @@ pub(crate) fn report_health_json(
     // `--volume`.
     doc["feed_ratios"] = serde_json::to_value(feed_ratio_rows(conn, volume_filter)?)
         .expect("a feed-ratio row serializes");
+    // Issue #430, additive and ABSENT until the feature is used (a cleaning
+    // cartridge registered or a cleaning recorded): each drive's cleanings
+    // and each cleaning cartridge's uses against its rated life — the text
+    // block as data. Fleet-wide, whatever `--volume` says.
+    if let Some(cleanings) = crate::tape::cleaning::json(conn)? {
+        doc["cleanings"] = cleanings;
+    }
     Ok(doc)
 }
 
