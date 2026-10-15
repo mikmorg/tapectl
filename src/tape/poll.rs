@@ -168,11 +168,17 @@ fn cleaning_action_of(entry: &str) -> Option<&'static str> {
     alert_flags::cleaning_action(number.parse().ok()?)
 }
 
-/// The TapeAlert flags a decoded page 0x2E raised, `<number> <name>`, in
-/// page order — through `report health`'s one flag parser, so the poll and
-/// the report can never name a flag differently.
-fn raised_tape_alerts(decoded_0x2e: &str) -> Vec<String> {
-    crate::cli::report::raised_tape_alert_flags(decoded_0x2e)
+/// The TapeAlert flags a 0x2E capture raised, `<number> <name>`, in page
+/// order — through `report health`'s and `audit`'s one flag reader
+/// ([`crate::cli::report::journal_flags`], issue #303), so the poll, the
+/// report and the audit can never name a flag differently. The number is the
+/// parameter CODE from the page's bytes, not the ordinal of the decode's
+/// line: a drive that lists fewer than all 64 parameters would otherwise
+/// have its flag mis-numbered, and [`cleaning_action_of`] words the wrong
+/// action. Without whole bytes the decode's line order is all there is.
+fn raised_tape_alerts(raw: Option<&[u8]>, decoded: Option<&str>) -> Vec<String> {
+    crate::cli::report::journal_flags(raw, decoded)
+        .0
         .into_iter()
         .map(|(n, name)| format!("{n} {name}"))
         .collect()
@@ -285,8 +291,7 @@ pub fn poll(
     let counters = sweep.health(None).map(|(c, _)| c).unwrap_or_default();
     let raised_alerts = sweep
         .page(0x2e)
-        .and_then(|c| c.decoded.as_deref())
-        .map(raised_tape_alerts)
+        .map(|c| raised_tape_alerts(c.raw.as_deref(), c.decoded.as_deref()))
         .unwrap_or_default();
 
     let medium_serial = mam_read.info.serial.clone();
@@ -494,6 +499,28 @@ mod tests {
             .to_string()
     }
 
+    /// The mhvtl fixture's page 0x2E bytes with the flags `codes` raised:
+    /// 64 parameters of five bytes (code, control, length, value) after the
+    /// four-byte header, the flag in the value byte's bit 0.
+    fn fixture_bytes_0x2e_raising(codes: &[u16]) -> Vec<u8> {
+        let mut bytes = crate::tape::log_pages::tests::fixture_pages()
+            .into_iter()
+            .find(|(p, _, _)| *p == 0x2e)
+            .unwrap()
+            .1
+            .to_vec();
+        for code in codes {
+            let value_at = 4 + (*code as usize - 1) * 5 + 4;
+            assert_eq!(
+                u16::from_be_bytes([bytes[value_at - 4], bytes[value_at - 3]]),
+                *code,
+                "positive control: the fixture lists parameter {code} in order"
+            );
+            bytes[value_at] = 1;
+        }
+        bytes
+    }
+
     fn run(conn: &Connection, source: FixtureSource, mam_read: MamRead) -> PollReport {
         let cell = RefCell::new(source);
         poll(
@@ -648,6 +675,7 @@ mod tests {
             .replace("  Media: 0", "  Media: 1")
             .replace("  Cleaning required: 0", "  Cleaning required: 1");
         src.text.insert(0x2e, p2e);
+        src.bytes.insert(0x2e, fixture_bytes_0x2e_raising(&[4, 20]));
         let report = run(&conn, src, mam(None));
         assert_eq!(
             report.raised_alerts,
@@ -695,6 +723,43 @@ mod tests {
         assert_eq!(report.problems().len(), 1, "{:?}", report.problems());
     }
 
+    /// Issue #467: a flag's number is its parameter CODE from the page's
+    /// bytes (as `audit` and `report health` read it), not the ordinal of
+    /// its line in the decode. A drive that lists only some of the 64
+    /// parameters would otherwise have "Cleaning required" (code 20) called
+    /// flag 2, and `cleaning_action_of` would word nothing for it.
+    #[test]
+    fn a_short_parameter_list_does_not_misnumber_the_flag() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut src = FixtureSource::default();
+        // Two parameters only: code 1 (clear) and code 20 (raised).
+        src.bytes.insert(
+            0x2e,
+            vec![
+                0x2e, 0x00, 0x00, 0x0a, // header: 10 bytes of parameters
+                0x00, 0x01, 0xc0, 0x01, 0x00, // parameter 0x0001, not raised
+                0x00, 0x14, 0xc0, 0x01, 0x01, // parameter 0x0014, raised
+            ],
+        );
+        src.text.insert(
+            0x2e,
+            "Tape alert page  [0x2e]\n  Read warning: 0\n  Cleaning required: 1\n".into(),
+        );
+        let report = run(&conn, src, mam(None));
+        assert_eq!(
+            report.raised_alerts,
+            vec!["20 Cleaning required"],
+            "numbered by the bytes' parameter code, not by line position (2)"
+        );
+        assert_eq!(
+            report.problems(),
+            vec![format!(
+                "TapeAlert raised: 20 Cleaning required => {CLEAN_THE_DRIVE}"
+            )],
+            "and so the cleaning action is worded"
+        );
+    }
+
     /// `alert_flags`' action for a cleaning flag, verbatim — the words this
     /// test module expects a poll to print, written once.
     const CLEAN_THE_DRIVE: &str = "clean the drive: nothing is wrong with the data";
@@ -710,6 +775,7 @@ mod tests {
             0x2e,
             fixture_decode(0x2e).replace("  Cleaning required: 0", "  Cleaning required: 1"),
         );
+        src.bytes.insert(0x2e, fixture_bytes_0x2e_raising(&[20]));
         let report = run(&conn, src, mam(None));
         assert_eq!(
             crate::cli::drive::exit_code(&report).unwrap(),
