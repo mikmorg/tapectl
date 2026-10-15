@@ -114,7 +114,8 @@ pub fn create_command(params: &DarCreateParams) -> Command {
 
 /// `cmd`'s program and arguments in a plain [`super::command`]: the same
 /// dar run, without the fadvise filter (issue #441). [`create_command`]
-/// sets no environment or directory, so nothing else is lost.
+/// sets no environment or directory of its own (`super::command` sets
+/// `LC_ALL`, which the plain command sets again), so nothing else is lost.
 fn without_fadvise_filter(cmd: &Command) -> Command {
     let mut plain = super::command(cmd.get_program());
     plain.args(cmd.get_args());
@@ -548,6 +549,9 @@ pub fn reisolate_catalogue(
     catalogue_base: &Path,
 ) -> Result<()> {
     let output = super::command(dar_binary)
+        // -N: no darrc, whose `isolate:` section could change the catalogue
+        // this produces (#412 item 9, #465).
+        .arg("-N")
         .arg("-C")
         .arg(catalogue_base)
         .arg("-A")

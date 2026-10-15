@@ -23,10 +23,18 @@ use crate::error::{Result, TapectlError};
 /// [`run_interruptible`]), so that thread outlives dar. If tapectl died
 /// between the fork and the `prctl`, the parent is already someone else,
 /// and the child refuses to exec.
+///
+/// It also runs dar in the C locale (`LC_ALL=C`, issue #465): dar's output
+/// is parsed in English (`dar::restore`'s skipped-file marker, the exit-11
+/// text) and Debian's dar ships French and Swedish translations. gettext
+/// ignores `LANGUAGE` under `LC_ALL=C`, so one variable is enough. Every dar
+/// spawn goes through here, `create_command` and the rebuilt plain command
+/// of its EPERM fallback included.
 pub(crate) fn command(binary: impl AsRef<OsStr>) -> Command {
     use std::os::unix::process::CommandExt;
 
     let mut cmd = Command::new(binary);
+    cmd.env("LC_ALL", "C");
     let parent = std::process::id() as nix::libc::pid_t;
     // SAFETY: the closure runs in the forked child before exec and calls
     // only async-signal-safe functions (`prctl`, `getppid`).
@@ -428,6 +436,113 @@ mod tests {
         let status = status.expect("the child outlived the thread that spawned it");
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(status.signal(), Some(nix::libc::SIGKILL), "{status:?}");
+    }
+
+    /// Issue #465 items 1 and 2: every way tapectl starts dar reads no darrc
+    /// (`-N`: a host's `~/.darrc` or `/etc/darrc` with an `all:`, `create:`
+    /// or `isolate:` section would otherwise change slice sizes or the
+    /// catalogue, #412 item 9) and runs it in the C locale (`LC_ALL=C`: dar's
+    /// output is parsed in English and Debian ships fr and sv translations).
+    ///
+    /// A stand-in for dar records its environment and arguments, so each
+    /// public function that spawns dar is run for real and its command line
+    /// read back, not inferred from its source. `create_command` is one of
+    /// them, through `spawn_archive`.
+    #[test]
+    fn every_dar_invocation_reads_no_darrc_and_runs_in_the_c_locale() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("invocations.log");
+        let fake = tmp.path().join("dar");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\n\
+                 {{ printf 'LC_ALL=%s' \"$LC_ALL\"; for a in \"$@\"; do printf '\\t%s' \"$a\"; done; \
+                 printf '\\n'; }} >> '{}'\n\
+                 for a in \"$@\"; do [ \"$a\" = --version ] && echo 'dar version 2.7.13, Copyright'; done\n\
+                 exit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dar = fake.to_str().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        let dest = tmp.path().join("dest");
+
+        // Results are not the point (a stand-in dar archives nothing); the
+        // command lines are.
+        let _ = version::check(dar);
+        let _ = version::capabilities(dar);
+        let _ = slice::template(dar, "1M", &tmp.path().join("work"));
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let params = create::DarCreateParams {
+            dar_binary: dar,
+            source_path: &src,
+            compression: "none",
+            exclude_patterns: &[],
+            exclude_paths: &[],
+            preserve_xattrs: true,
+            preserve_fsa: true,
+            on_fly_catalogue: &tmp.path().join("onfly"),
+        };
+        // Read to its end so the stand-in has logged before dar is reaped.
+        let mut stream = create::spawn_archive(&params).unwrap();
+        let _ = stream.take_stdout().read_to_end(&mut Vec::new());
+        let _ = stream.finish();
+        let _ = create::test_archive(dar, &a);
+        let _ = create::extract_catalog(dar, &a, &b);
+        let _ = create::reisolate_catalogue(dar, &a, &b);
+        let _ = restore::extract(dar, &a, &dest);
+        let _ = restore::extract_reported(dar, &a, &dest, true);
+        let _ = restore::extract_file(dar, &a, "x/y", &dest);
+        let _ = restore::entry_slices(dar, &a, "x/y");
+        if let Ok(seq) = restore::SequentialExtract::spawn(dar, &a, &b, &dest, true) {
+            let _ = seq.finish();
+        }
+        let _ = list::regular_files(dar, &a, &mut |_| {});
+
+        let log = std::fs::read_to_string(&log).unwrap();
+        let runs: Vec<Vec<&str>> = log.lines().map(|l| l.split('\t').collect()).collect();
+        // check, capabilities, template, spawn_archive (version, create),
+        // test_archive, extract_catalog, reisolate_catalogue, extract,
+        // extract_reported, extract_file, entry_slices, SequentialExtract,
+        // regular_files.
+        assert_eq!(runs.len(), 14, "every dar spawn ran once: {log}");
+        for run in &runs {
+            assert_eq!(run[0], "LC_ALL=C", "{run:?}");
+            assert!(run[1..].contains(&"-N"), "no -N: {run:?}");
+        }
+    }
+
+    /// Issue #465 item 2: `command` sets the locale itself, over whatever
+    /// the operator's environment says.
+    #[test]
+    fn a_dar_command_sets_lc_all_to_c() {
+        let cmd = command("dar");
+        let lc_all: Vec<_> = cmd
+            .get_envs()
+            .filter(|(k, _)| *k == "LC_ALL")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(lc_all, [Some(OsStr::new("C"))]);
+        assert!(
+            create::create_command(&create::DarCreateParams {
+                dar_binary: "dar",
+                source_path: std::path::Path::new("/src"),
+                compression: "none",
+                exclude_patterns: &[],
+                exclude_paths: &[],
+                preserve_xattrs: true,
+                preserve_fsa: true,
+                on_fly_catalogue: std::path::Path::new("/onfly"),
+            })
+            .get_envs()
+            .any(|(k, v)| k == "LC_ALL" && v == Some(OsStr::new("C"))),
+            "the create command goes through the same constructor"
+        );
     }
 
     /// Issue #404: a pending stop ends a running child promptly and is

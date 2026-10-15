@@ -286,7 +286,10 @@ pub fn template(dar_binary: &str, slice_size: &str, work_dir: &Path) -> Result<V
     std::fs::create_dir_all(&empty)?;
     let base = work_dir.join("template");
     let mut cmd = super::command(dar_binary);
-    cmd.arg("-c")
+    // -N: no darrc, whose `all:`/`create:` section could change the slice
+    // size or the header this template is cut from (#412 item 9, #465).
+    cmd.arg("-N")
+        .arg("-c")
         .arg(&base)
         .arg("-R")
         .arg(&empty)

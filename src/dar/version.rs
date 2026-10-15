@@ -13,8 +13,11 @@ pub struct DarVersion {
 
 /// Check dar version and return parsed version info.
 pub fn check(dar_binary: &str) -> Result<DarVersion> {
+    // -N after the flag: no darrc (#465); the flag stays first for anything
+    // that answers by its first argument.
     let output = super::command(dar_binary)
         .arg("--version")
+        .arg("-N")
         .output()
         .map_err(|_| TapectlError::DarNotFound(dar_binary.to_string()))?;
 
@@ -137,6 +140,7 @@ pub fn parse_capabilities(version_output: &str) -> DarCapabilities {
 pub fn capabilities(dar_binary: &str) -> Result<DarCapabilities> {
     let output = super::command(dar_binary)
         .arg("-V")
+        .arg("-N") // no darrc (#465); `-V` stays first, see `check`
         .output()
         .map_err(|_| TapectlError::DarNotFound(dar_binary.to_string()))?;
 
