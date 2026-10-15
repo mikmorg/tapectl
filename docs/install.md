@@ -134,9 +134,9 @@ That rule does not cover the one thing that needs root: raising the tape
 commands' priority (`TAPE_NICE`, above). Step 13 therefore asks for *your* sudo
 password once, before its first tape command, and keeps the sudo ticket warm
 until step 13 ends, so the verify after a days-long write finds it still valid.
-Under `--auto`, or if sudo refuses, the tape commands run at normal priority and
-the step says so; the priority helps the drive's feed and is never a reason to
-fail a write.
+Each tape command re-checks it first; under `--auto`, if sudo refuses, or if the
+ticket has lapsed, that command runs at normal priority and the step says so.
+The priority helps the drive's feed and is never a reason to fail a write.
 
 
 ---
