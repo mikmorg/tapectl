@@ -758,7 +758,7 @@ mod tests {
     /// payloads plus the slice header and trailer. A bare number is bytes.
     #[test]
     fn a_real_archive_ending_on_a_slice_boundary_is_cut_like_dar_xform() {
-        if !matches!(Command::new("dar_xform").arg("--version").output(), Ok(_)) {
+        if Command::new("dar_xform").arg("--version").output().is_err() {
             eprintln!("SKIP boundary test: dar_xform is not on PATH (it ships with dar)");
             return;
         }
@@ -772,7 +772,7 @@ mod tests {
                 let stream = dar_stream_of(&src);
                 let header = parse_header(&mut &stream[..]).unwrap().bytes.len();
                 let payload = stream.len() - header - 1;
-                (payload % 3 == 0).then_some((stream, payload))
+                payload.is_multiple_of(3).then_some((stream, payload))
             })
             .expect("a payload that divides by three within 64 bytes of padding");
         let per_slice = payload / 3;
