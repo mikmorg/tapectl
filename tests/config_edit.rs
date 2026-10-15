@@ -488,10 +488,8 @@ fn a_backend_without_device_sg_loads_and_config_check_names_what_it_lacks() {
     }
     assert!(human.contains("cannot be derived"), "{human}");
 
-    let json: serde_json::Value = serde_json::from_slice(
-        &ok(home.path(), &["config", "check", "--json"]).stdout,
-    )
-    .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&ok(home.path(), &["config", "check", "--json"]).stdout).unwrap();
     let devices = json["tape_devices"].as_array().unwrap();
     assert_eq!(devices.len(), 2, "{json}");
     for d in devices {
@@ -508,12 +506,7 @@ fn a_backend_without_device_sg_loads_and_config_check_names_what_it_lacks() {
     // An explicit empty value is not a way to spell "absent".
     refused(
         home.path(),
-        &[
-            "config",
-            "set",
-            "backends.lto[drive-a].device_sg",
-            "",
-        ],
+        &["config", "set", "backends.lto[drive-a].device_sg", ""],
     );
 }
 

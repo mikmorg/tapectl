@@ -154,7 +154,10 @@ fn a_poll_of_a_drive_with_no_derivable_sg_node_refuses_by_name() {
         stderr.contains("device_sg is not set") && stderr.contains("cannot be derived"),
         "says why: {stderr}"
     );
-    assert!(stderr.contains("Set device_sg"), "says how to fix it: {stderr}");
+    assert!(
+        stderr.contains("Set device_sg"),
+        "says how to fix it: {stderr}"
+    );
     assert!(
         contacts(home.path()).is_empty(),
         "a refused poll records no contact"

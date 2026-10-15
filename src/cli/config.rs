@@ -596,7 +596,10 @@ fn print_human(
             "{}",
             crate::policy::depth_check::describe_tape_device(check)
         );
-        if let Some((_, node)) = sg_derived.iter().find(|(name, _)| *name == check.backend_name) {
+        if let Some((_, node)) = sg_derived
+            .iter()
+            .find(|(name, _)| *name == check.backend_name)
+        {
             println!(
                 "  backend \"{}\": device_sg is not set; derived {node} from device_tape \
                  (the kernel's binding, read from sysfs)",

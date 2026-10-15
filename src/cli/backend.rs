@@ -178,7 +178,10 @@ fn add(
     // drive before plugging it in, and this box is not the only machine the
     // config may be carried to. Same fail-open rule as #97's dar probe —
     // a helpful check must not become a tool that refuses to run.
-    for (flag, path) in [("--device-tape", Some(device_tape)), ("--device-sg", device_sg)] {
+    for (flag, path) in [
+        ("--device-tape", Some(device_tape)),
+        ("--device-sg", device_sg),
+    ] {
         let Some(path) = path else { continue };
         if !std::path::Path::new(path).exists() {
             eprintln!(

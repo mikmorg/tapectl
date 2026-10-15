@@ -3209,10 +3209,11 @@ mod tests {
     /// the backend, the field and the remedy — never an empty node.
     #[test]
     fn resolve_lto_backend_refuses_an_underivable_device_sg_by_name() {
-        let config =
-            Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
+        let config = Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
         for device in [None, Some("/nonexistent/tapectl-sg-config/nst-fake-7")] {
-            let msg = resolve_lto_backend(&config, device).unwrap_err().to_string();
+            let msg = resolve_lto_backend(&config, device)
+                .unwrap_err()
+                .to_string();
             assert!(msg.contains("lto1"), "{msg}");
             assert!(msg.contains("device_sg is not set"), "{msg}");
             assert!(msg.contains("cannot be derived"), "{msg}");
@@ -3224,8 +3225,8 @@ mod tests {
     /// for the refusal above.
     #[test]
     fn resolve_lto_backend_accepts_a_declared_device_sg() {
-        let config = Config::from_text(&backend_toml(Some("/dev/sg5")), Path::new("config.toml"))
-            .unwrap();
+        let config =
+            Config::from_text(&backend_toml(Some("/dev/sg5")), Path::new("config.toml")).unwrap();
         assert_eq!(resolve_lto_backend(&config, None).unwrap().name, "lto1");
     }
 
@@ -3233,8 +3234,7 @@ mod tests {
     /// does for a proven mismatch, and the device is still the one asked for.
     #[test]
     fn resolve_device_drops_a_backend_with_an_underivable_device_sg() {
-        let config =
-            Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
+        let config = Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
         let (dev, backend) = resolve_device(&config, None).unwrap();
         assert_eq!(dev, "/nonexistent/tapectl-sg-config/nst-fake-7");
         assert!(backend.is_none(), "an unusable sg node leaves no backend");
@@ -3246,8 +3246,7 @@ mod tests {
     /// load again.
     #[test]
     fn an_empty_device_sg_is_not_serialized() {
-        let config =
-            Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
+        let config = Config::from_text(&backend_toml(None), Path::new("config.toml")).unwrap();
         let text = toml::to_string_pretty(&config).unwrap();
         assert!(!text.contains("device_sg"), "{text}");
         Config::from_text(&text, Path::new("config.toml")).expect("and it loads again");
