@@ -63,6 +63,13 @@ pub enum VolumeCommands {
     /// sealed, retired, erased or quarantined volume is not a write target
     /// (ADR-0012); no flag overrides it.
     ///
+    /// Once the volume is sealed and confirmed, staging is released if every
+    /// unit written has reached its resolved `min_copies` (ADR-0012,
+    /// 2026-10-06 item 2: after a quick confirm too); otherwise it is kept
+    /// and the output names each unit that is still short. A release that
+    /// fails is a warning and the exit status stays 0. `--keep-staging`
+    /// never releases; `staging clean` does it later.
+    ///
     /// Exit status, shared by every command that writes a tape: 0 = sealed
     /// and confirmed. 2 = an error with the medium untouched: nothing was
     /// written (or a usage error). 3 = the confirm was inconclusive: the
@@ -108,6 +115,12 @@ pub enum VolumeCommands {
         /// verify-status` name it until `volume verify` runs one.
         #[arg(long)]
         full_confirm: bool,
+        /// Keep the staged slices after the write seals and confirms, even
+        /// when every unit written has reached its resolved `min_copies`.
+        /// Without this flag the staging is released then; release it later
+        /// with `tapectl staging clean`.
+        #[arg(long)]
+        keep_staging: bool,
     },
 
     /// Resume an interrupted write session. Reload the SAME
@@ -150,6 +163,9 @@ pub enum VolumeCommands {
     /// That is a different question from whether the loaded TAPE carries a
     /// seal marker, which is what the re-confirm path above is about.
     ///
+    /// Once the resumed volume is sealed and confirmed, staging is released
+    /// or kept exactly as `volume write` does it (`--keep-staging` opts out).
+    ///
     /// Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing
     /// written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6
     /// quarantined, 75 catalog busy). A resume refused before it changed
@@ -175,6 +191,10 @@ pub enum VolumeCommands {
         /// verify`.
         #[arg(long)]
         full_confirm: bool,
+        /// See `volume write --keep-staging`: the staged slices stay even
+        /// when this resume completes the last copy the policy asks for.
+        #[arg(long)]
+        keep_staging: bool,
     },
 
     /// Deliberately abandon a volume's unfinished write session:
@@ -644,6 +664,166 @@ fn returned_to_service_json(cleared: bool, counts_as_copy: bool) -> bool {
     cleared && counts_as_copy
 }
 
+/// What `volume write` / `volume resume` did about staging once the copy
+/// was sealed and confirmed (issue #440).
+#[derive(Debug)]
+enum StagingRelease {
+    /// `--keep-staging`: nothing was looked at, nothing released.
+    Kept,
+    /// Every unit written now meets its resolved `min_copies`: the report of
+    /// the release (which may count zero sets when none was eligible).
+    Released(crate::staging::clean::CleanReport),
+    /// At least one unit written is still short: staging was kept, and these
+    /// are the units that keep it.
+    Retained(Vec<crate::staging::release::CopyProgress>),
+    /// The volume has no unit with a completed write: nothing to judge.
+    NothingWritten,
+    /// The release failed after the copy stood (ADR-0012 2026-10-07 item
+    /// 33): the warning to print. The write's exit status is unchanged.
+    Failed(String),
+}
+
+/// The release step of `volume write` / `volume resume`, run only after the
+/// write returned `Ok` — sealed and confirmed, quick or full. The rule is
+/// the one `collection run` applies, through the same function
+/// ([`crate::staging::release::release_if_covered`]), over the units the
+/// volume now holds a completed write of. Never fails the write: an error
+/// becomes [`StagingRelease::Failed`], the warning naming the step and
+/// `tapectl staging clean`, which finishes it.
+fn release_staging_after_write(
+    conn: &Connection,
+    config: &Config,
+    label: &str,
+    keep_staging: bool,
+) -> StagingRelease {
+    if keep_staging {
+        return StagingRelease::Kept;
+    }
+    let outcome = crate::staging::release::unit_ids_written_to(conn, label).and_then(|ids| {
+        if ids.is_empty() {
+            Ok(None)
+        } else {
+            crate::staging::release::release_if_covered(conn, config, &ids).map(Some)
+        }
+    });
+    match outcome {
+        Ok(None) => StagingRelease::NothingWritten,
+        Ok(Some(o)) => match o.cleaned {
+            Some(cleaned) => StagingRelease::Released(cleaned),
+            None => StagingRelease::Retained(o.under_copied),
+        },
+        Err(e) => StagingRelease::Failed(crate::error::unfinished_after_seal(
+            label,
+            "releasing staging",
+            &e,
+            Some("tapectl staging clean"),
+        )),
+    }
+}
+
+/// `base` with the release's keys added (issue #440), the names
+/// `collection run --json` already uses where they mean the same thing.
+/// Always present so a scripted consumer never branches on whether a key
+/// exists: `staging_released`, `stage_sets_released`, `bytes_freed`,
+/// `under_copied` (empty unless a unit kept the staging), `keep_staging`
+/// and `release_warning` (null unless the release failed).
+fn staging_release_json(mut base: serde_json::Value, release: &StagingRelease) -> serde_json::Value {
+    let (released, sets, bytes) = match release {
+        StagingRelease::Released(c) => (true, c.sets_cleaned, c.bytes_freed),
+        _ => (false, 0, 0),
+    };
+    let under: Vec<serde_json::Value> = match release {
+        StagingRelease::Retained(units) => units
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "unit": p.unit_name,
+                    "copies": p.copies,
+                    "min_copies": p.min_copies,
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let warning = match release {
+        StagingRelease::Failed(w) => Some(w.as_str()),
+        _ => None,
+    };
+    if let Some(obj) = base.as_object_mut() {
+        obj.insert("staging_released".into(), released.into());
+        obj.insert("stage_sets_released".into(), sets.into());
+        obj.insert("bytes_freed".into(), bytes.into());
+        obj.insert("under_copied".into(), under.into());
+        obj.insert(
+            "keep_staging".into(),
+            matches!(release, StagingRelease::Kept).into(),
+        );
+        obj.insert("release_warning".into(), warning.into());
+    }
+    base
+}
+
+/// The human lines for [`StagingRelease`], printed after the write's own
+/// "write completed" line (which the gate greps and stays unchanged).
+/// Problems — a failed release, a file that could not be unlinked — go to
+/// stderr, as warnings.
+fn print_staging_release(label: &str, release: &StagingRelease) {
+    match release {
+        StagingRelease::Kept => println!(
+            "staging kept (--keep-staging); `tapectl staging clean` releases it when you want it gone"
+        ),
+        StagingRelease::NothingWritten => {}
+        StagingRelease::Retained(units) => {
+            println!(
+                "staging kept: not every unit written has its policy's copies yet, and the next \
+                 copy reuses these staged slices:"
+            );
+            for p in units {
+                println!("  {}", p.describe());
+            }
+            println!(
+                "  write another copy with `tapectl volume write <label>`; `tapectl staging \
+                 clean` releases the units that are covered"
+            );
+        }
+        StagingRelease::Released(r) => {
+            if r.sets_cleaned == 0 {
+                println!("staging: no stage set was eligible for release");
+            } else {
+                println!(
+                    "staging released: {} stage set(s), {} freed (every unit written has its \
+                     policy's copies)",
+                    r.sets_cleaned,
+                    crate::util::format_bytes_binary(r.bytes_freed),
+                );
+            }
+            for (id, labels) in &r.held_by_live_session {
+                println!(
+                    "  stage set {id} kept: a live session is using it on volume(s) {}",
+                    labels.join(", ")
+                );
+            }
+            if !r.stranded.is_empty() {
+                // `staging_path` is nulled before the unlink (issue #108), so
+                // no later `staging clean` can find these: name them.
+                eprintln!(
+                    "warning: volume \"{label}\" is sealed and confirmed and counts as a copy, \
+                     but {} staged file(s) could NOT be removed and no later `staging clean` \
+                     can find them. Remove by hand:",
+                    r.stranded.len()
+                );
+                for p in &r.stranded {
+                    eprintln!("  {}", p.display());
+                }
+            }
+        }
+        StagingRelease::Failed(warning) => {
+            println!("staging NOT released");
+            eprintln!("{warning}");
+        }
+    }
+}
+
 /// Run a volume subcommand. Returns the process exit code (issue #45/H10),
 /// mirroring the `audit` convention (`src/cli/audit.rs`): 0=clean,
 /// 1=warning, 2=violation. Every arm but `Verify` has no exit-code
@@ -709,6 +889,7 @@ pub fn run(
             prewrite_hash,
             fill_ceiling,
             full_confirm,
+            keep_staging,
         } => {
             // Issue #241: a real preview would have to open the drive and
             // re-derive the whole layout (session build/validate/plan) —
@@ -739,13 +920,20 @@ pub fn run(
                 *full_confirm,
                 yes,
             )?;
+            // Reached only when the write above returned `Ok` — sealed AND
+            // confirmed; every other outcome left through the `?`. Issue #440.
+            let release = release_staging_after_write(conn, config, label, *keep_staging);
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"label": label, "status": "completed"})
+                    staging_release_json(
+                        serde_json::json!({"label": label, "status": "completed"}),
+                        &release
+                    )
                 );
             } else {
                 println!("volume \"{label}\" write completed");
+                print_staging_release(label, &release);
             }
         }
 
@@ -754,6 +942,7 @@ pub fn run(
             device,
             prewrite_hash,
             full_confirm,
+            keep_staging,
         } => {
             // Issue #241: same reasoning as `volume write` — resuming
             // reopens the drive and revalidates the frozen staging files
@@ -777,13 +966,20 @@ pub fn run(
                 *prewrite_hash,
                 *full_confirm,
             )?;
+            // As for `volume write`: only an `Ok` resume (sealed and
+            // confirmed, whichever of its three routes) gets here. Issue #440.
+            let release = release_staging_after_write(conn, config, label, *keep_staging);
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"label": label, "status": "completed", "resumed": true})
+                    staging_release_json(
+                        serde_json::json!({"label": label, "status": "completed", "resumed": true}),
+                        &release
+                    )
                 );
             } else {
                 println!("volume \"{label}\" write resumed and completed");
+                print_staging_release(label, &release);
             }
         }
 
@@ -3821,12 +4017,14 @@ mod tests {
                 prewrite_hash: false,
                 fill_ceiling: None,
                 full_confirm: false,
+                keep_staging: false,
             },
             VolumeCommands::Resume {
                 label: "L".into(),
                 device: None,
                 prewrite_hash: false,
                 full_confirm: false,
+                keep_staging: false,
             },
             VolumeCommands::CompactWrite {
                 destination: "L".into(),
