@@ -336,9 +336,10 @@ a third:
    written before 1.1.0 record no file kinds or link targets; the rebuild
    records their non-directories as regular files.
 3. **Never on the tape:** where the cartridge is, whether it has been
-   verified and when, what policy applies to a unit, warehouse deposits, and
-   any fact the catalog knows only because the operator did something after
-   the write. Those survive a lost database only through `db backup` and the
+   verified and when, what policy applies to a unit, warehouse deposits, the
+   cleaning-cartridge registry and its events, each write's feed ratio
+   (1.1.1), and any fact the catalog knows only because the operator did
+   something after the write. Those survive a lost database only through `db backup` and the
    Heir Kit (ADR-0009).
 
 **Accepted disclosure (operator ruling, 2026-07-22).** Encryption overhead is
@@ -499,9 +500,10 @@ The integrity tier was the seal default from 2026-07-22 to 2026-10-06, on the
 asymmetry of when a bad copy is found: at seal time the staged slices still exist on
 disk, so a failed readback costs a fresh cartridge and hours — discovered years
 later, the source may be gone. That argument is why `--full-confirm` exists and why
-the operator guide asks for a full `volume verify` soon after each write, before
-`staging clean` releases the staged slices (on home2 a full readback cost ~2.3 h
-per tape). The tiers map onto the existing
+the operator guide asks for a full `volume verify` soon after each write, while
+the staged slices are still held (`--keep-staging` on the write that completes a
+unit's copies: since 1.1.1 that write releases staging itself otherwise; on home2
+a full readback cost ~2.3 h per tape). The tiers map onto the existing
 `verification_sessions.verify_type` column: integrity → `full`, navigable → `quick`
 (no schema change).
 

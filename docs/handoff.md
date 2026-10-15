@@ -40,6 +40,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (c) | The fresh start on home2 | **you** (sudo, the escrow key, the cartridges) |
 | (d) | `keepsake` on two cartridges the same day, then the Heir Kit | **you** |
 | (e) | The backlog | agents, in the order below |
+| (f) | Upgrade home2 to 1.1.1, in place | **you**, once `v1.1.1` is tagged |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -274,10 +275,11 @@ same day:
 1. Leave staging alone (1.1.0's write does not release it; on 1.1.1 the write that
    completes the policy does, unless given `--keep-staging`). Load a second fresh cartridge,
    which must be a different cartridge from L6-0001.
-2. Run `tapectl-op volume init L6-0002`,
-   then `tapectl-op volume write L6-0002 --keep-staging` (1.1.1 releases staging
-   after the copy that completes the policy otherwise), then `tapectl-op volume verify
-   L6-0002 --full`.
+2. Run `tapectl-op volume init L6-0002`, then the write, then `tapectl-op volume verify
+   L6-0002 --full`. On 1.1.0 the write is `tapectl-op volume write L6-0002`: it keeps
+   staging, and `--keep-staging` does not exist yet (clap refuses it). On 1.1.1 it is
+   `tapectl-op volume write L6-0002 --keep-staging`, because the copy that completes the
+   policy releases staging otherwise.
 3. Run `tapectl-op volume move L6-0002 --to offsite`. If step 14 has not installed the
    wrapper yet, use `sudo -u tapectl -H tapectl` in place of `tapectl-op`.
 4. `tapectl-op audit` should now find `keepsake` at two copies in two places (the
@@ -296,49 +298,75 @@ refresh.
 
 1.1.1 is a patch (`docs/releases/1.1.1.md`): no on-tape change, so no fresh start. It adds one
 catalog migration (036, a new table), applied the first time the new binary opens the catalog.
-On home2, inside tmux, with no tapectl command running (`tapectl status`):
+There is no downgrade: a 1.1.0 binary refuses a catalog that is ahead of its migration list,
+so the rollback is the 1.1.0 binary kept in step 3 plus `db import` of the backup from step 1,
+losing whatever the catalog recorded in between. Wait for `v1.1.1` to be tagged (the mhvtl gate
+on its commit, then the tag; the review that preceded it is
+`docs/audits/2026-10-15-design-review.md`).
 
-1. **Back up the catalog with 1.1.0:** `tapectl-op db backup` (or let the daily backup run first).
+On home2, inside tmux, with no tapectl command running. Check that with `tapectl-op status`:
+the plain `tapectl status` from your own account works only from 1.1.1 on, through the home
+pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your account has a
+`~/.tapectl` of its own, the pointer is bypassed even on 1.1.1: rename it first.
+
+1. **Back up the catalog with 1.1.0:** `tapectl-op db backup --to
+   /srv/local_backup/tapectl/tapectl-pre-1.1.1.db` (`--to` is required; the daily backup's
+   pruning never touches a file named like this), or `sudo systemctl start
+   tapectl-backup.service`.
 2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.1.1`.
-3. **Build and install:** `scripts/first-run.sh --profile contrib/hosts/home2.profile --from 3 --to 3`.
+3. **Keep the old binary, then build and install:** `sudo cp -p /usr/local/bin/tapectl
+   /usr/local/bin/tapectl-1.1.0`, then `scripts/first-run.sh --profile
+   contrib/hosts/home2.profile --from 3 --to 3` (a release build on home2 from the checkout,
+   installed to `/usr/local/bin`; `tapectl --version` should read `1.1.1 (v1.1.1, <date>)`).
+   The timers pick the new binary up at their next firing.
 4. **Step 7 again** (`--from 7 --to 7`): it finds the home initialised, skips init, and goes on
    to the ops-group block, which now writes the home pointer `/etc/tapectl/home`, so a plain
    `tapectl status` works from your own account (#437), and checks that as you. Like the
-   group and ACL steps there, the pointer needs root sudo: expect your password prompt.
+   group and ACL steps there, the pointer needs root sudo: expect your password prompt. Step 7
+   also re-asserts the profile's `staging.jobs`, contender list and dar path in config.toml,
+   so anything hand-tuned since 1.1.0 is reset to the profile's values. Its `config check`,
+   run as the service user, is the first open of the catalog and applies migration 036.
 5. **Step 14 again** (`--from 14 --to 14`): it re-renders `tapectl-op`, which now runs tape
    commands at raised priority (#432; one sudo prompt where root sudo asks for one), and the
-   drive-poll unit with `Nice=` / `IOSchedulingClass=`.
+   drive-poll unit with `Nice=` / `IOSchedulingClass=`. Then prove the wrapper on this host
+   once, from a normal shell: `sudo -v && scripts/check-tapectl-op.sh --tapectl
+   /usr/local/bin/tapectl` (the raised and the fallback paths must resolve the same home and
+   user; `drive status` through the wrapper is not a tape command and does not exercise it).
 6. **Look:** `tapectl status`, `tapectl-op drive status`, `tapectl-op audit` (the new
    `location_count` check, #425, should be clean: keepsake is in two places).
 7. **Before the next write,** step 12's rehearsal proves the new binary on the drive (step 13
    looks for its marker). A write through `tapectl-op volume write` directly does not check it.
+   Stop the drive-poll timer for the rehearsal (`sudo systemctl stop tapectl-drive-poll.timer`,
+   and start it again after): the 06:30 poll opens the drive's sg node, would journal the test
+   cartridge into the production catalog, and reads the TapeAlert page the rehearsal's own
+   sweep expects to see first. Nothing enforces "no production process" for you;
+   `tapectl-op drive status` names a holder. The rehearsal is also the first run of 1.1.1's
+   proven-blank `volume init` on the real drive (ADR-0012 item 57; mhvtl has proved it, the HP
+   drive has not): until it has run, expect to need `--force` on a new cartridge if the chip's
+   lifetime figures read differently from the fixtures.
 
 Your `[[backends.lto]]` keeps its explicit `device_sg`; it still wins and is still checked
 (#431). Removing the line (`tapectl-op config remove 'backends.lto[NAME].device_sg'`) lets
-tapectl derive it from `device_tape` on every load.
+tapectl derive it from `device_tape` on every load, which a `/dev/sgN` renumbering after a
+reboot can no longer break.
 
 Owed measurements: the next staging run's disk reads (#441: expect about one read of the
 source, was 1.7x) and a write's feed ratio with and without vm-desk1 busy (#432).
 
 ## (e) After: the backlog
 
-None of these blocks the fresh start. Each has an issue:
-- **#326, #366, #368:** close them from (a)'s measurements. Set the `[staging]
-  hash_threads` and `jobs` defaults from the knees. Plan the write-throughput follow-up
-  from #326's numbers.
-- **#425:** built for 1.1.1: one predicate in `policy::coverage`, used by `audit`
-  (`location_count`), `mark-tape-only` and `mark-reclaimable`.
+None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369, #371,
+#393, #416 and #425 closed between 2026-10-13 and 2026-10-15):
 - **#420:** the short seal, once home2's writes show how much capacity they really use
-  and the drive's behaviour past early warning is measured. It is a 1.x on-tape change:
-  a CTO decision and a re-pin.
+  and the drive's behaviour past early warning is measured (the 2026-09-23 fill stopped at
+  the first `ENOSPC`; whether st accepts writes after it is the open measurement). It is a
+  1.x on-tape change: a CTO decision and a re-pin.
 - **#418 R4:** the cross-volume per-tenant index (1.2.0 or later).
 - **#388:** Logical Block Protection: research, then a prototype on EW7VWMVKF6 only.
 - **#409:** stays "not until spanning".
-- **#416:** the perf leg inside the gate, and `mhvtl_motions` in the gate's Rust leg.
-  Both are `scripts/` changes, so they need the whole gate chain.
-- **#364 epic:** #369 (tune the dar invocation) and #371 (chunk-parallel age, only if
-  still the bottleneck).
-- **#393:** closes on the check in step 8 of (c).
+- **#364 epic:** re-measure staging on home2 after #441 (the single source read), then
+  close it or plan what is left.
+- **The 2026-10-15 review's issues** (`docs/audits/2026-10-15-design-review.md`): 1.1.2.
 - **2026-10-07 item 6:** the read-error rate assumes the drive clears log page 0x03 at
   load. Check it on home2's first two full verifies (L6-0001 and L6-0002), and revisit
   the rate if the drive keeps the counters.
@@ -384,11 +412,14 @@ None of these blocks the fresh start. Each has an issue:
 - **The drive belongs to home2.** Lending it to vm-desk1 means attaching
   `contrib/hosts/home2-lto6-hostdev.xml` there. The two hosts share no tape lock, so
   detach it again before any production contact.
-- **The proof (a) runs on the production host.** Run it only while no production tapectl
-  process runs, and keep it on EW7VWMVKF6. The tape lock `/tmp/tapectl-tape.lock` is per
-  host, so the lifecycle suite and a production command exclude each other on home2: a
-  second user is refused, not queued. The 1.0.0 audit and backup timers never open the
-  drive. vm-desk1 shares home2's CPUs, so keep it quiet while home2's tape runs.
+- **The proof (a) and step 12 run on the production host.** Run them only while no
+  production tapectl process runs, and keep them on EW7VWMVKF6. Nothing enforces the first
+  rule: the scripts' tape lock (`/tmp/tapectl-tape.lock`) is taken by scripts only, and the
+  binary's drive lock lives under each catalog's home, so a throwaway-home harness and a
+  production command do not see each other. Check `tapectl-op drive status` (it names a
+  holder's pid) and stop the drive-poll timer, which opens the sg node daily at 06:30, for
+  the duration. The audit and backup timers never open the drive. vm-desk1 shares home2's
+  CPUs, so keep it quiet while home2's tape runs.
 - **The 1.1.0 release still refuses a sealed tape whatever its label** (above): erase it
   in the drive with `tapectl cartridge erase`, never with a degausser.
 - **MAM's "remaining capacity" is not host-writable space.** The drive stops host writes
@@ -398,9 +429,10 @@ None of these blocks the fresh start. Each has an issue:
   until #420.
 - **A bursty host feed costs tape** (1.48 native bytes per data byte measured); a steady
   one does not. Keep the host quiet (`tapectl host check`).
-- **The write's confirm is quick by default.** Run `volume verify --full` on each new
-  copy before `staging clean`, or write with `--full-confirm` (on 1.1.1, a further copy in
-  one command: `volume write L --init --full-confirm --move-to <location>`), which records
-  the full readback as part of the write.
+- **The write's confirm is quick by default.** Write with `--full-confirm` (on 1.1.1, a
+  further copy in one command: `volume write L --init --full-confirm --move-to <location>`),
+  which records the full readback as part of the write; or pass `--keep-staging` to the
+  write that completes a unit's copies and run `volume verify --full` before `staging
+  clean`. On 1.1.1 the write that completes the policy releases staging itself otherwise.
 - **The on-tape authorization ends with the v1.1.0 install.** After it, a failing
   `tests/on_tape_golden.rs` is a CTO decision, never an agent's re-pin.

@@ -45,9 +45,16 @@ many slices, and how big each file is. The review's claim that tenant names
 appear in plaintext is false: a `tenant_envelope` entry in the front index is
 labelled only by its kind, and a tenant is found by age trial-decryption, not
 by a name (`keys-and-recovery.md`, "Who can open what on a tape").
-`tests/tenant_isolation.rs` scans raw tape bytes for plaintext leaks, and the
-gated plaintext scan (`scripts/plaintext-scan.sh`) does the same on a real
-tape with a planted canary as its positive control.
+Which test proves what (corrected 2026-10-15): `tests/mhvtl_e2e.rs`
+(`mhvtl_no_plaintext_tenant_metadata`) and the mhvtl gate's leak-scan leg scan
+a real volume's raw bytes for tenant names, unit names, file names and
+plaintext hashes, with a planted name as the positive control;
+`tests/tenant_isolation.rs` pins the key boundary (a tenant key cannot open
+another tenant's ciphertext) without any tape; `scripts/plaintext-scan.sh`
+scans the staging device's image, not a tape, for plaintext that staging
+must never write. No ungated test scans tape bytes, and no scan looks for key
+fingerprints or `age1…` strings, though the invariant names them
+(`volume-format-v2.md` §2); the 2026-10-15 review filed that gap.
 
 ### 1.2 Integrity is not authenticity
 
@@ -123,11 +130,16 @@ on purpose.
 
 **The st driver (`/dev/nstN`, `src/tape/ioctl.rs`) does all data I/O and every
 movement of the medium.** Reads and writes in fixed 512 KiB blocks, filemarks,
-rewinds and spaces are all `MTIOCTOP` ioctls and `read`/`write` on the st
-node, so the st driver's own position accounting (file and block number) is
-always the result of tapectl's own commands. `TapeDevice::open` and
-`open_read` set the block size (`MTSETBLK`) on every open, so a block size
-left behind by another program never applies.
+rewinds, spaces and the unload (`drive eject`, 1.1.1: `MTOFFL`, issued in one
+place and pinned by a test) are all `MTIOCTOP` ioctls and `read`/`write` on
+the st node, so the st driver's own position accounting (file and block
+number) is always the result of tapectl's own commands. `TapeDevice::open` and
+`open_read` set the block size (`MTSETBLK`) on every open that moves data, so
+a block size left behind by another program never applies; the opens that
+move none (the non-blocking status read behind `drive status`, the unload,
+the density probe) leave it alone. The one other kernel-facing mechanism is
+the seccomp filter installed in the `dar -c` child (#441), which neutralises
+dar's `fadvise` and touches no device.
 
 **SCSI generic (`/dev/sgN`) is used only to ask the drive and the cartridge
 questions**, through three sg3-utils tools and no others:
@@ -206,11 +218,13 @@ itself: its own guide, RESTORE.sh, front index, envelopes, slices and seal. No
 tape needs another to be read, and losing one costs exactly its own copies.
 
 `collection plan` refuses a unit larger than the per-tape budget
-(`collection::selector::OversizedUnit`). The same refusal at `stage create`,
-naming the limit for the cartridge's generation, is ruled (ADR-0012,
-2026-10-06, item 17) and not yet built (#395): today `stage create` stages
-an oversized unit in full, and only `volume write`'s pre-flight capacity gate
-refuses it, before any byte reaches the tape. Planned spanning — the planner splitting a unit's slices across
+(`collection::selector::OversizedUnit`). The same refusal at `stage create`
+is built (#395, ADR-0012 2026-10-06 item 17): `staging::check_unit_fits_one_tape`
+compares the snapshot's source size, before compression, with the largest
+configured drive's budget (capacity x fill ceiling, less the reserve) and
+refuses before the stage set is created and before dar runs. With no drive
+configured nothing is refused there, and `volume write`'s pre-flight capacity
+gate is the backstop, before any byte reaches the tape. Planned spanning — the planner splitting a unit's slices across
 a named set of cartridges — is designed once any unit passes about half a
 cartridge, and §4's mechanism lets it arrive without breaking older readers.
 A drive running out mid-unit is not a split: mid-write handover was rejected

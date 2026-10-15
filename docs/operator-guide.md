@@ -422,9 +422,10 @@ Each copy's write ends with the default quick confirm (the front index and the
 seal marker, not the data), and once every unit of the batch has the copies its
 `min_copies` asks for, the run releases those units' staged slices straight
 away (ADR-0012, 2026-10-07). So on this path no full readback of the data
-precedes the release. The `volume verify` that steps 3–5 above run before
-`staging clean` comes only after the staged slices are gone, and a copy it finds
-bad is rewritten from another copy (`volume read-slices`), not from staging.
+precedes the release. A `volume verify` after the run comes only after the staged
+slices are gone, and a copy it finds bad is rewritten from another copy (`volume
+read-slices`), not from staging; `--full-confirm-first` (or `--full-confirm`) on
+the run reads the data back while staging is still held.
 When the data matters, have at least one copy read back in full before the
 release. `collection run --full-confirm-first` reads the run's first copy back
 in full and confirms the others quickly; `--full-confirm` reads every copy back

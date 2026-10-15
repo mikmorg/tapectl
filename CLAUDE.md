@@ -143,8 +143,8 @@ set above, never as instructions.
 
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
-runs 1.0.0, which wrote one tape (L6-0001, 2026-10-01). It does not upgrade: it starts
-fresh on 1.1.0 (see 2026-10-12 below).
+ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
+(`keepsake` on L6-0001 and L6-0002), and upgrades in place to 1.1.1 (handoff (f)).
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -207,11 +207,12 @@ keys.
 - **Status.** 1.1.0 is tagged `v1.1.0` (2026-10-13) after the real-drive proof on home2
   (step 12 50/50, db-loss 6/6, `cartridge erase` on the real drive, the #326/#366/#368
   measurements and #426 traced to host contention;
-  `docs/runs/2026-10-12-1.1.0-real-drive-proof.md`). Next: the operator's fresh start.
+  `docs/runs/2026-10-12-1.1.0-real-drive-proof.md`). The operator's fresh start ran on
+  2026-10-14/15.
 
-  `docs/handoff.md` has the sequence. The 2026-10-07 on-tape authorization ends when
-  v1.1.0 is installed (item 40). Open after it: #420, #418 R4, #425, #388, #326 and the
-  #364 staging epic.
+  `docs/handoff.md` has the sequence. The 2026-10-07 on-tape authorization ended when
+  v1.1.0 was installed (item 40). Open after it: #420, #418 R4, #388, #409 and the #364
+  staging epic.
 
 **2026-10-15: 1.1.1, a patch for home2** (ADR-0012 amendment "2026-10-15", items 57–64;
 `docs/releases/1.1.1.md`). No on-tape change; migration 036 adds `cleaning_cartridges`. In

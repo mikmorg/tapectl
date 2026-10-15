@@ -34,7 +34,7 @@ by `contrib/hosts/home2-prep.sh` (ADR-0012, 2026-09-28 amendment).
 | `dar` >= 2.6 (2.7.20+ recommended), `mt-st`, `sg3-utils`, `acl`, `python3`, `lsscsi` | archives, drive control, MAM and health pages, ACL grants, the scripts' JSON parsing, device discovery | step 2 offers `sudo apt install dar mt-st sg3-utils acl python3 lsscsi` |
 | `age` (the CLI) — optional | not used by the binary (it uses the `rage` crate); needed by the on-tape `RESTORE.sh` and so by the step-12 rehearsal | step 2 offers the upstream v1.3.2 release into `/usr/local/bin` |
 | **paper and a pen** | step 7 prints the escrow *secret* exactly once and stores it nowhere (ADR-0005) | the script asks "paper ready?" before `init` |
-| on a **reinstall**: the original heir kit's cover sheet | so `init` adopts the original escrow public key instead of minting a new one — no command replaces a registered escrow identity | step 7 asks for it, but only without `--auto`: no flag or profile variable carries the key, so an `--auto` run mints a new identity (§6) |
+| on a **reinstall**: the original heir kit's cover sheet | so `init` adopts the original escrow public key instead of minting a new one — no command replaces a registered escrow identity | step 7 asks for it without `--auto`; with `--auto` it reads the profile's `ESCROW_PUBLIC_KEY` or `--escrow-public-key`, and mints a new identity when neither is set (§6) |
 | a second disk for catalog backups | the ruling says "a timer-driven `db backup` to a second disk" (ADR-0012, item 5) | step 14 warns when the backup dir shares a filesystem with the home |
 | a test cartridge you are willing to erase | the step-12 rehearsal is required before the first production write (ADR-0012, 2026-09-23) | step 12 asks for its medium serial and refuses any other cartridge |
 | free space for staging | a tape is written in one session, so staging must hold everything one tape will carry (2.5 TB for a full LTO-6) | step 7 asks for the directory, then shows what is free there |
@@ -329,10 +329,11 @@ named key by hand instead (delete it, or rename it as the message says).
 step 7 does run `init` interactively, it asks for an existing escrow **public**
 key to adopt (`age1…`, or a `.pub` path). Answer with the one on the heir kit's
 cover sheet and `init` registers it instead of minting a new identity. **Under
-`--auto` there is no such prompt**, and no flag or profile variable carries the
-key, so an `--auto` run's `init` mints a new identity. On a reinstall, run step 7
-without `--auto`, or run `init` by hand before step 7 (which then finds the
-database and leaves it alone):
+`--auto` there is no such prompt**: the key comes from the profile's
+`ESCROW_PUBLIC_KEY` or from `--escrow-public-key` (both since 1.1.0), and when
+neither is set an `--auto` run's `init` mints a new identity. On a reinstall, set
+one of them, run step 7 without `--auto`, or run `init` by hand before step 7
+(which then finds the database and leaves it alone):
 
 ```bash
 sudo -u tapectl -H tapectl init --operator <name> --escrow-public-key age1…
