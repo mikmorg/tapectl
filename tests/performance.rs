@@ -528,7 +528,7 @@ fn perf_rebuild_from_a_tape_carrying_a_184k_file_version() {
     src.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
                               status)
-         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
         params![LABEL],
     )
     .unwrap();
@@ -952,7 +952,7 @@ fn perf_a_2gib_write_and_full_confirm_through_a_store() {
         .execute(
             "INSERT INTO volumes (label, backend_type, backend_name, media_type,
                                   capacity_bytes, status)
-             VALUES ('PERF-2G', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+             VALUES ('PERF-2G', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
             [],
         )
         .unwrap();

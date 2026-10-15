@@ -117,7 +117,7 @@ fn staged() -> Staged {
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
                               status)
-         VALUES ('PASS01', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+         VALUES ('PASS01', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
         [],
     )
     .unwrap();

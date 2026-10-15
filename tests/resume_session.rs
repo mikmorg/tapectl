@@ -149,7 +149,7 @@ fn make_fixture() -> Fixture {
 
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES ('RESUMETEST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+         VALUES ('RESUMETEST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
         [],
     )
     .unwrap();

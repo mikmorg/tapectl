@@ -152,7 +152,7 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
 
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES ('T7MICRO', 'lto', 'lto0', 'LTO-6', 2500000000, 'active')",
+         VALUES ('T7MICRO', 'lto', 'lto0', 'LTO-6', 2500000000, 'initialized')",
         [],
     )
     .unwrap();

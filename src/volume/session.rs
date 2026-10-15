@@ -2400,10 +2400,42 @@ impl SealedPending {
                         }
                     }
                 }
-                tx.execute(
-                    "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
+                // Issue #461: the same guard `adopt_lost` puts on this
+                // UPDATE. A write session's volume is `initialized` from
+                // `volume init` to this line (`is_write_target`), and a
+                // `volume retire` or `cartridge retire` that landed during
+                // an hours-long readback has moved it. Unguarded, this
+                // statement set the retired volume back to `sealed`, and
+                // it counted as a copy again. The `sealed_at IS NULL`
+                // clause `adopt_lost` also has is NOT here: the seal is
+                // already recorded on the row by the time confirm runs
+                // (issue #330).
+                let sealed = tx.execute(
+                    "UPDATE volumes SET status = 'sealed'
+                     WHERE id = ?1 AND status = 'initialized'",
                     params![self.volume_id],
                 )?;
+                if sealed == 0 {
+                    // As for the `writes` guard above: dropping `tx` rolls
+                    // back the completed `writes` rows and the snapshot
+                    // promotions; nothing is recorded over the change.
+                    let now: Option<String> = tx
+                        .query_row(
+                            "SELECT status FROM volumes WHERE id = ?1",
+                            params![self.volume_id],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    return Err(TapectlError::Other(format!(
+                        "volume \"{}\": the confirm readback passed, but the volume changed \
+                         while it ran (it was `initialized` when the session began, now `{}`) — \
+                         most likely `tapectl volume retire` or `cartridge retire`. The catalog \
+                         was NOT updated to sealed over it: the volume keeps the status it was \
+                         given and does not count as a copy. The tape itself is sealed.",
+                        self.built.layout.label,
+                        now.as_deref().unwrap_or("gone"),
+                    )));
+                }
                 tx.commit()?;
                 Ok(promoted)
             })?;
@@ -3055,7 +3087,7 @@ mod tests {
 
         conn.execute(
             "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-             VALUES ('SESSTEST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'active')",
+             VALUES ('SESSTEST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
             [],
         )
         .unwrap();
@@ -3190,15 +3222,18 @@ mod tests {
         }
     }
 
-    /// A `MemStore` whose readback lets an operator's `volume abort` land in
-    /// the middle of confirm — the race issue #376 (c) names.
-    struct AbortsDuringConfirm<'c> {
+    /// A `MemStore` whose readback lets another command's catalog write land
+    /// in the middle of confirm: an operator's `volume abort` (the race issue
+    /// #376 (c) names) or a `volume retire` (issue #461). `sql` takes the
+    /// volume id as `?1`.
+    struct ChangesDuringConfirm<'c> {
         inner: MemStore,
         conn: &'c Connection,
         volume_id: i64,
+        sql: &'static str,
     }
 
-    impl Store for AbortsDuringConfirm<'_> {
+    impl Store for ChangesDuringConfirm<'_> {
         fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
             self.inner.capacity()
         }
@@ -3217,10 +3252,7 @@ mod tests {
             plan: ConfirmPlan,
         ) -> Result<Evidence> {
             self.conn
-                .execute(
-                    "UPDATE writes SET status = 'aborted' WHERE volume_id = ?1",
-                    params![self.volume_id],
-                )
+                .execute(self.sql, params![self.volume_id])
                 .unwrap();
             self.inner.confirm_with(layout, plan)
         }
@@ -3244,10 +3276,11 @@ mod tests {
             _ => panic!("expected Ready on a happy-path MemStore run"),
         };
         let sealed_pending = ready.seal(&mut store).unwrap();
-        let mut racing = AbortsDuringConfirm {
+        let mut racing = ChangesDuringConfirm {
             inner: store,
             conn: &f.conn,
             volume_id: f.volume_id,
+            sql: "UPDATE writes SET status = 'aborted' WHERE volume_id = ?1",
         };
         let err = match sealed_pending.confirm(&f.conn, &mut racing, Tier::Integrity) {
             Err(e) => e,
@@ -3275,6 +3308,73 @@ mod tests {
             )
             .unwrap();
         assert_ne!(volume_status, "sealed", "nothing sealed over the abort");
+    }
+
+    /// Issue #461: confirm's seal UPDATE is guarded by `status =
+    /// 'initialized'`. A `volume retire` that lands during the readback moves
+    /// the volume to `retired`; the readback still passes, but the seal
+    /// transaction finds the volume changed, rolls back and says so. The
+    /// retired volume stays `retired` (it is not resurrected as a copy),
+    /// the `writes` rows are not completed and no snapshot is promoted.
+    #[test]
+    fn confirm_does_not_seal_a_volume_retired_during_its_readback() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned.execute(&f.conn, &mut store).unwrap() {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let sealed_pending = ready.seal(&mut store).unwrap();
+        let mut racing = ChangesDuringConfirm {
+            inner: store,
+            conn: &f.conn,
+            volume_id: f.volume_id,
+            sql: "UPDATE volumes SET status = 'retired' WHERE id = ?1",
+        };
+        let err = match sealed_pending.confirm(&f.conn, &mut racing, Tier::Integrity) {
+            Err(e) => e,
+            Ok(_) => panic!("confirm must not seal a volume retired under it"),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("the volume changed while it ran") && text.contains("now `retired`"),
+            "must name the change that got there first: {text}"
+        );
+        let volume_status: String = f
+            .conn
+            .query_row(
+                "SELECT status FROM volumes WHERE id = ?1",
+                params![f.volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(volume_status, "retired", "not resurrected as sealed");
+        let writes: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !writes.is_empty() && writes.iter().all(|s| s != "completed"),
+            "the seal transaction rolled back, so no write completed: {writes:?}"
+        );
+        let promoted: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshots WHERE status = 'current'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(promoted, 0, "no snapshot was promoted over the retirement");
     }
 
     /// A `MemStore` that, on the first entry it is asked to write, has
@@ -4888,7 +4988,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            status, "active",
+            status, "initialized",
             "resume's Confirming arm must never touch status"
         );
         assert_eq!(
@@ -5017,7 +5117,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            status, "active",
+            status, "initialized",
             "the resume writer must never touch status"
         );
         assert_eq!(condition, "quarantined");
@@ -5339,9 +5439,9 @@ mod tests {
             .unwrap();
         // ADR-0012's 2026-09-17 amendment (issue #242): the identity check's
         // finding is observed, not chosen -- it moves `observed_condition`
-        // only, leaving `status` exactly as the fixture set it ('active').
+        // only, leaving `status` exactly as the fixture set it ('initialized').
         assert_eq!(
-            volume_status, "active",
+            volume_status, "initialized",
             "the resume writer must never touch status"
         );
         assert_eq!(volume_condition, "quarantined");
@@ -5452,9 +5552,9 @@ mod tests {
         // ADR-0012's 2026-09-17 amendment (issue #242): the chain walk's
         // finding is observed, not chosen -- `status` is never touched by a
         // failed confirm (only the passing branch's transaction flips it to
-        // 'sealed'), so it stays exactly what the fixture set ('active').
+        // 'sealed'), so it stays exactly what the fixture set ('initialized').
         assert_eq!(
-            volume_status, "active",
+            volume_status, "initialized",
             "the confirm writer must never touch status"
         );
         assert_eq!(volume_condition, "quarantined");
@@ -5579,7 +5679,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            volume_status, "active",
+            volume_status, "initialized",
             "Inconclusive must never touch status"
         );
         assert_eq!(

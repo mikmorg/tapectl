@@ -323,7 +323,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
 
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
-         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'active')",
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'initialized')",
         rusqlite::params![label],
     )
     .unwrap();
