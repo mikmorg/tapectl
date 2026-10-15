@@ -3585,9 +3585,11 @@ mod tests {
         );
         let status_of = |id: i64| -> String {
             f.conn
-                .query_row("SELECT status FROM writes WHERE id = ?1", params![id], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT status FROM writes WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
                 .unwrap()
         };
         assert_eq!(

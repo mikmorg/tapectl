@@ -1213,15 +1213,10 @@ fn volume_write_contacted<'c>(
         )?));
     }
 
-    let units = find_staged_data(conn)?;
-    // Issue #402: every staged set whole, on disk, before anything below
-    // touches a backend, a MAM or the drive.
-    check_staged_slices(conn)?;
-    if units.is_empty() {
-        return Err(TapectlError::Other(
-            "no staged data to write — run `tapectl stage create` first".into(),
-        ));
-    }
+    // The write's staged-data facts, from the catalog and the disk alone
+    // (issues #402, #445): shared with `volume write --init`, which asks
+    // them BEFORE it initialises a cartridge ([`write_catalog_preflight`]).
+    let units = checked_staged_units(conn)?;
     // Issue #201: say what is about to happen before anything below touches
     // a backend, a MAM, or the drive. See `announce_staged_selection`'s doc
     // comment for why this is stderr and why it changes no selection logic.
@@ -1269,10 +1264,7 @@ fn volume_write_contacted<'c>(
     // the parser itself, so a successful `Ok` is already non-negative.
     let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
 
-    let mut distinct_tenant_ids: Vec<i64> = units.iter().map(|u| u.tenant_id).collect();
-    distinct_tenant_ids.sort_unstable();
-    distinct_tenant_ids.dedup();
-    let session = assemble_session_keys(conn, &distinct_tenant_ids, &stage_set_ids)?;
+    let session = assemble_keys_for_units(conn, &units, &stage_set_ids)?;
 
     // An empty drive is refused here, at once, by name (issue #355) — after
     // every fact check above, so a write refused for its own reason still
@@ -6056,6 +6048,67 @@ pub struct VerifyReport {
     pub drive_health_note: Option<String>,
 }
 
+/// The staged batch a write would put on tape, with the refusals the
+/// catalog and the disk can raise on their own: every staged set whole and
+/// at its recorded size on disk (issue #402), and at least one of them. The
+/// first half of what `volume write` can know before it touches a backend, a
+/// MAM or the drive; [`write_catalog_preflight`] runs it, and then
+/// [`assemble_keys_for_units`], ahead of `volume write --init`'s `volume
+/// init` (issue #445).
+fn checked_staged_units(conn: &Connection) -> Result<Vec<BuildUnit>> {
+    let units = find_staged_data(conn)?;
+    // Issue #402: every staged set whole, on disk, before anything below
+    // touches a backend, a MAM or the drive.
+    check_staged_slices(conn)?;
+    if units.is_empty() {
+        return Err(TapectlError::Other(
+            "no staged data to write — run `tapectl stage create` first".into(),
+        ));
+    }
+    Ok(units)
+}
+
+/// The session's keys and recipients for `units`' tenants and stage sets
+/// (`stage_set_ids` is `units`' own, in order): every tenant's active key,
+/// the operator's, the escrow recipient and each stage set's escrow
+/// receipt. The second half of the write's catalog-only refusals
+/// ([`checked_staged_units`] is the first).
+fn assemble_keys_for_units(
+    conn: &Connection,
+    units: &[BuildUnit],
+    stage_set_ids: &[i64],
+) -> Result<SessionKeys> {
+    let mut distinct_tenant_ids: Vec<i64> = units.iter().map(|u| u.tenant_id).collect();
+    distinct_tenant_ids.sort_unstable();
+    distinct_tenant_ids.dedup();
+    assemble_session_keys(conn, &distinct_tenant_ids, stage_set_ids)
+}
+
+/// What `volume write` refuses from the catalog and the disk alone, asked
+/// of a volume that does not exist yet (issue #445, ADR-0012 2026-10-15
+/// item 59): `volume write --init` runs it BEFORE `volume init` writes File
+/// 0, binds the cartridge and creates the row, so a write that was going to
+/// refuse for a reason the catalog already knew — nothing staged (a first
+/// copy released its staging), a staged slice missing or short, a tenant
+/// without a key, no escrow recipient — refuses with the tape untouched and
+/// no volume row, instead of stranding an `initialized` one.
+///
+/// It runs the same two steps `volume write` runs, from the same functions
+/// ([`checked_staged_units`], [`assemble_keys_for_units`]). Two checks of the
+/// write are not here, each for its own reason: copy distinctness
+/// (`coverage::copy_distinctness`) compares the batch with a volume's
+/// cartridge and location, and this volume has neither until `volume init`
+/// binds it — its cartridge half only ever fires on an inconsistent catalog
+/// (init erased any copy on the cartridge), its location half is a warning;
+/// and the quiet-host question and the capacity gate need the contact, so
+/// they stay in the write.
+pub(crate) fn write_catalog_preflight(conn: &Connection) -> Result<()> {
+    let units = checked_staged_units(conn)?;
+    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+    assemble_keys_for_units(conn, &units, &stage_set_ids)?;
+    Ok(())
+}
+
 /// Gather the staged batch as `BuildUnit`s, ready for `build::build`.
 /// `ORDER BY u.name` stays — the alphabetical first-fit ordering ruled in
 /// sheet §7 (`docs/design/v2-open-questions.md`); `build()` never reorders
@@ -8892,8 +8945,11 @@ mod tests {
             body.find(needle).unwrap()
         };
         let preflight = at("crate::host_check::preflight(");
-        let last_fact = at("assemble_session_keys(conn,");
-        let staged = at("find_staged_data(conn)?");
+        // Issue #445: the staged-data and key facts live in two helpers
+        // `volume write --init` also calls, and the call sites are pinned
+        // here in their stead.
+        let last_fact = at("assemble_keys_for_units(conn,");
+        let staged = at("checked_staged_units(conn)?");
         let drive = at("crate::tape::media_detect::detect(device");
         assert!(
             staged < preflight && last_fact < preflight,
@@ -10373,6 +10429,66 @@ mod tests {
         assert_eq!(v[0].0, stage_set_id);
         assert_eq!(v[0].1, "photos", "the verdict must name the unit");
         assert_eq!(v[0].2, "encrypted without the current escrow recipient");
+    }
+
+    /// Issue #445: `volume write --init` asks the write's catalog-only
+    /// refusals before it initialises a cartridge. The real function, over a
+    /// real catalog: nothing staged, a staged slice missing from disk and a
+    /// tenant with no active key each refuse, and the control — the same
+    /// catalog with all of it in place — passes. It reads and writes nothing:
+    /// no volume row appears, whichever way it answers.
+    #[test]
+    fn the_init_preflight_refuses_what_the_catalog_alone_can_and_passes_otherwise() {
+        let conn = crate::db::open_memory().unwrap();
+        let err = write_catalog_preflight(&conn).unwrap_err().to_string();
+        assert!(err.contains("no staged data to write"), "{err}");
+
+        let (tenant_id, stage_set_id) = seed_escrow_check_fixture(&conn);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let slice = tmp.path().join("p.dar.age");
+        std::fs::write(&slice, b"0123456789").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices
+                (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 10, 10, 'a', 'b', ?2)",
+            params![stage_set_id, slice.to_string_lossy()],
+        )
+        .unwrap();
+        let escrow_pk = register_escrow(&conn);
+        set_key_fingerprints(
+            &conn,
+            stage_set_id,
+            Some(&serde_json::to_string(&vec![escrow_pk]).unwrap()),
+        );
+
+        // A staged slice that is not on the disk.
+        std::fs::remove_file(&slice).unwrap();
+        let err = write_catalog_preflight(&conn).unwrap_err().to_string();
+        assert!(
+            err.contains("p.dar.age") || err.to_lowercase().contains("missing"),
+            "the staged-slice check refused: {err}"
+        );
+        std::fs::write(&slice, b"0123456789").unwrap();
+
+        // A tenant whose only key is no longer active.
+        conn.execute(
+            "UPDATE encryption_keys SET is_active = 0 WHERE tenant_id = ?1",
+            params![tenant_id],
+        )
+        .unwrap();
+        let err = write_catalog_preflight(&conn).unwrap_err().to_string();
+        assert!(err.contains("has no active key"), "{err}");
+        conn.execute(
+            "UPDATE encryption_keys SET is_active = 1 WHERE tenant_id = ?1",
+            params![tenant_id],
+        )
+        .unwrap();
+
+        write_catalog_preflight(&conn).expect("with the batch, the files and the keys, it passes");
+        let volumes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM volumes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(volumes, 0, "the pre-flight creates nothing");
     }
 
     #[test]

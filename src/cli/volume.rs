@@ -1091,6 +1091,9 @@ fn print_move_after_write(label: &str, moved: &MoveAfterWrite) {
 /// own `ContactStore` seam does for the library. Production is
 /// [`DriveWriteSteps`].
 trait WriteSteps {
+    /// What the write refuses from the catalog and the disk alone, asked
+    /// before `--init` initialises anything (issue #445).
+    fn preflight(&self) -> Result<()>;
     /// `volume init <label>`; returns the new volume's id.
     fn init(&self, label: &str, force: bool) -> Result<i64>;
     /// `volume write <label>`; `Ok` only when sealed and confirmed.
@@ -1110,6 +1113,10 @@ struct DriveWriteSteps<'a> {
 }
 
 impl WriteSteps for DriveWriteSteps<'_> {
+    fn preflight(&self) -> Result<()> {
+        write::write_catalog_preflight(self.conn)
+    }
+
     fn init(&self, label: &str, force: bool) -> Result<i64> {
         write::volume_init(
             self.conn,
@@ -1149,6 +1156,9 @@ struct WriteRequest<'a> {
     force: bool,
     move_to: Option<&'a str>,
     keep_staging: bool,
+    /// `--json`: a write that fails after `--init` initialised the volume
+    /// says so on stdout ([`left_initialized_json`]).
+    json_output: bool,
 }
 
 /// What one `volume write` did, once the volume was sealed and confirmed.
@@ -1165,12 +1175,24 @@ struct WriteDone {
 /// `volume write`, with its optional `--init` before and `--move-to` after
 /// (issue #438, ADR-0012 2026-10-15 item 59).
 ///
-/// Strictly in order, each step behind the previous one's `?`: the init, the
-/// write, and only once the write returned `Ok` — sealed AND confirmed; every
-/// other outcome left through that `?` — the two post-write steps. An init
-/// that refuses returns before the write is attempted, so nothing is written
-/// and the error exits by the write family's table (an unclassified error:
-/// 2, or 75 for a busy catalog).
+/// Strictly in order, each step behind the previous one's `?`: with `--init`
+/// the write's catalog-only pre-flight (issue #445), the init, the write, and
+/// only once the write returned `Ok` — sealed AND confirmed; every other
+/// outcome left through that `?` — the two post-write steps. A pre-flight
+/// or an init that refuses returns before the write is attempted, so nothing
+/// is written and the error exits by the write family's table (an
+/// unclassified error: 2, or 75 for a busy catalog).
+///
+/// The pre-flight is what `volume write` would refuse from the catalog and
+/// the disk alone — nothing staged, a staged slice missing, a tenant with no
+/// key — asked before the cartridge is initialised, so such a refusal leaves
+/// the tape untouched and no volume row. What only the contact can raise (the
+/// quiet-host question, the capacity gate, a File 0 that changed since the
+/// init) still comes after the init, and a write that refuses there exits by
+/// the write family's table as it always did — 2 for a refusal before the
+/// tape moved — though the volume IS initialised. Exit 2 does not say so;
+/// the stderr line and `--json`'s `initialized: true`
+/// ([`left_initialized_json`]) do, and are the contract for a script.
 ///
 /// `--force` goes to the init only. The write that follows is never forced:
 /// the init has just written File 0, so a force there could only matter if
@@ -1189,6 +1211,8 @@ fn write_and_follow(
     req: &WriteRequest<'_>,
 ) -> Result<WriteDone> {
     let initialized = if req.init {
+        // Issue #445: before the cartridge is touched.
+        steps.preflight()?;
         let id = steps.init(req.label, req.force)?;
         // stderr, so `--json` keeps stdout to the one document. The write
         // below may stop; the operator is told what stands and how to go on.
@@ -1202,7 +1226,13 @@ fn write_and_follow(
     } else {
         None
     };
-    steps.write(req.label, req.force && !req.init)?;
+    let written = steps.write(req.label, req.force && !req.init);
+    // Issue #445: a write that fails leaves the volume this command
+    // initialised initialised, and says so before the error is printed.
+    if let (Err(e), Some(id)) = (&written, initialized) {
+        report_left_initialized(req, id, e);
+    }
+    written?;
     // Reached only when the write above returned `Ok` — sealed AND
     // confirmed. Issues #440 and #438.
     let release = release_staging_after_write(conn, config, req.label, req.keep_staging);
@@ -1213,6 +1243,41 @@ fn write_and_follow(
         release,
         moved,
     })
+}
+
+/// What `volume write --init --json` prints on stdout when its write half
+/// failed after the init half had initialised the volume (issue #445): the
+/// exit code is the write's, and a refusal before the tape moved exits 2,
+/// the code that elsewhere means "the medium untouched". `initialized` is
+/// the key the success document already has; `volume_status` is what the
+/// catalog holds now.
+fn left_initialized_json(label: &str, volume_id: i64, error: &TapectlError) -> serde_json::Value {
+    serde_json::json!({
+        "label": label,
+        "status": "failed",
+        "initialized": true,
+        "volume_id": volume_id,
+        "volume_status": "initialized",
+        "error": error.to_string(),
+    })
+}
+
+/// A write that failed after `--init` initialised the volume: say so, on
+/// stderr, and with `--json` on stdout (issue #445). The pre-write line told
+/// the operator the volume would stay initialised; this one is the verdict,
+/// printed after the write stopped and before the error itself, and names
+/// the exact retry — `--init` again would be refused, the volume exists.
+fn report_left_initialized(req: &WriteRequest<'_>, volume_id: i64, error: &TapectlError) {
+    eprintln!(
+        "volume \"{0}\" was initialized by this command (id={volume_id}) and stays \
+         initialized, whatever the write that followed did: its exit code describes the write, \
+         not the init. `tapectl volume write {0}` (without --init, which would be refused: the \
+         volume exists) writes it; `tapectl volume resume {0}` continues an interrupted write.",
+        req.label
+    );
+    if req.json_output {
+        println!("{}", left_initialized_json(req.label, volume_id, error));
+    }
 }
 
 /// `volume write --json`: the keys it always had, plus the staging release's
@@ -1384,6 +1449,7 @@ pub fn run(
                     force: *force,
                     move_to: move_to.as_deref(),
                     keep_staging: *keep_staging,
+                    json_output,
                 },
             )?;
             if json_output {
@@ -3983,7 +4049,9 @@ mod tests {
             let seq = &SRC[seq_start..seq_start + SRC[seq_start..].find("\n}\n").unwrap()];
             let init = seq.find("steps.init(").expect("write_and_follow inits");
             let call = seq.find("steps.write(").expect("write_and_follow writes");
-            let question = call + seq[call..].find(")?;").expect("the write's own `?`");
+            // The write's result is held while a failure after `--init` is
+            // reported (issue #445), then returned through its own `?`.
+            let question = call + seq[call..].find("written?;").expect("the write's own `?`");
             let release = seq
                 .find("release_staging_after_write(conn, config, req.label, req.keep_staging)")
                 .expect("the release honours --keep-staging");
@@ -3991,6 +4059,13 @@ mod tests {
                 .find("move_after_write(conn, req.label, req.move_to)")
                 .expect("the move is requested");
             assert!(init < call, "the init comes before the write");
+            let preflight = seq
+                .find("steps.preflight()?")
+                .expect("write_and_follow asks the write's catalog-only refusals");
+            assert!(
+                preflight < init,
+                "the catalog-only pre-flight comes before the init (issue #445)"
+            );
             assert!(
                 release > question && moved > question,
                 "the release and the move must come after the write's `?`, not before it"
@@ -4063,6 +4138,13 @@ mod tests {
             Init,
             /// The write is interrupted part-way: exit 4, not sealed.
             Write,
+            /// The write refuses for a reason only the contact can raise
+            /// (the capacity gate, here): before the tape moved, so exit 2.
+            Contact,
+            /// The staged version was released (a first copy's staging, item
+            /// 63): the catalog alone knows the write has nothing to write,
+            /// and the pre-flight is the REAL library function asking it.
+            Unstaged,
         }
 
         /// The drive, scripted: `init` leaves the volume row `volume init`
@@ -4073,6 +4155,8 @@ mod tests {
             staged: &'a Staged,
             fail: Fail,
             log: RefCell<Vec<String>>,
+            /// The cartridge: `init` writes File 0 to it, as the real one does.
+            tape: RefCell<crate::store::MemStore>,
         }
 
         impl FakeSteps<'_> {
@@ -4082,6 +4166,14 @@ mod tests {
         }
 
         impl WriteSteps for FakeSteps<'_> {
+            fn preflight(&self) -> Result<()> {
+                self.log.borrow_mut().push("preflight".to_string());
+                if self.fail == Fail::Unstaged {
+                    return crate::volume::write::write_catalog_preflight(self.conn);
+                }
+                Ok(())
+            }
+
             fn init(&self, label: &str, force: bool) -> Result<i64> {
                 self.log
                     .borrow_mut()
@@ -4100,6 +4192,8 @@ mod tests {
                         [label],
                     )
                     .unwrap();
+                // File 0, as the real init writes it.
+                self.tape.borrow_mut().files.push(b"File 0".to_vec());
                 Ok(self.conn.last_insert_rowid())
             }
 
@@ -4109,6 +4203,12 @@ mod tests {
                     .push(format!("write {label} force={force}"));
                 if self.fail == Fail::Write {
                     return Err(TapectlError::WriteInterrupted("the tape stopped".into()));
+                }
+                if self.fail == Fail::Contact {
+                    return Err(TapectlError::Other(
+                        "volume write refused: the batch does not fit the cartridge's capacity"
+                            .into(),
+                    ));
                 }
                 add_write(self.conn, self.staged, label, "initialized", "completed");
                 self.conn
@@ -4151,6 +4251,7 @@ mod tests {
                 force,
                 move_to,
                 keep_staging: false,
+                json_output: false,
             }
         }
 
@@ -4169,6 +4270,7 @@ mod tests {
                 staged: &s,
                 fail: Fail::Nothing,
                 log: RefCell::default(),
+                tape: RefCell::new(crate::store::MemStore::new(4096)),
             };
 
             let done = write_and_follow(
@@ -4182,7 +4284,12 @@ mod tests {
             // `--force` went to the init only.
             assert_eq!(
                 steps.log(),
-                ["init V-NEW force=true", "write V-NEW force=false"]
+                [
+                    "preflight",
+                    "init V-NEW force=true",
+                    "write V-NEW force=false"
+                ],
+                "the pre-flight comes first, and `--force` goes to the init only"
             );
             assert!(done.initialized.is_some());
             assert!(
@@ -4229,13 +4336,15 @@ mod tests {
                 staged: &s,
                 fail: Fail::Nothing,
                 log: RefCell::default(),
+                tape: RefCell::new(crate::store::MemStore::new(4096)),
             };
 
             let done =
                 write_and_follow(&conn, &config, &steps, &request(false, true, None)).unwrap();
 
             // Positive control for the force test below: with no `--init`,
-            // `--force` still reaches the write.
+            // `--force` still reaches the write. And no pre-flight: the
+            // write itself runs those checks (issue #445).
             assert_eq!(steps.log(), ["write V-NEW force=true"]);
             assert!(done.initialized.is_none());
             assert!(matches!(done.moved, MoveAfterWrite::NotAsked));
@@ -4261,6 +4370,7 @@ mod tests {
                 staged: &s,
                 fail: Fail::Init,
                 log: RefCell::default(),
+                tape: RefCell::new(crate::store::MemStore::new(4096)),
             };
 
             let err = write_and_follow(
@@ -4274,7 +4384,7 @@ mod tests {
             assert!(err.to_string().contains("DIFFERENT volume"), "{err}");
             assert_eq!(
                 steps.log(),
-                ["init V-NEW force=false"],
+                ["preflight", "init V-NEW force=false"],
                 "the write never ran"
             );
             let rows: i64 = conn
@@ -4293,6 +4403,13 @@ mod tests {
         /// is released, and the exit is the write's own (4 interrupted). The
         /// volume stays initialised, which the operator was told after the
         /// init. The control is the same catalog with the write succeeding.
+        ///
+        /// Issue #445 rewrote what this pins. It used to be the stranded
+        /// `initialized` row of ANY refusal after the init, the catalog-only
+        /// ones included; those are now refused by the pre-flight before the
+        /// init (below). What is left, deliberately, is a failure only the
+        /// contact can raise: the tape stopping part-way (here), or a refusal
+        /// at the contact (the next test).
         #[test]
         fn a_write_that_fails_does_not_move_or_release() {
             let conn = crate::db::open_memory().unwrap();
@@ -4306,6 +4423,7 @@ mod tests {
                 staged: &s,
                 fail: Fail::Write,
                 log: RefCell::default(),
+                tape: RefCell::new(crate::store::MemStore::new(4096)),
             };
 
             let err = write_and_follow(
@@ -4318,7 +4436,11 @@ mod tests {
 
             assert_eq!(
                 steps.log(),
-                ["init V-NEW force=false", "write V-NEW force=false"]
+                [
+                    "preflight",
+                    "init V-NEW force=false",
+                    "write V-NEW force=false"
+                ]
             );
             assert_eq!(
                 location_of(&conn, NEW),
@@ -4341,6 +4463,7 @@ mod tests {
                 staged: &s,
                 fail: Fail::Nothing,
                 log: RefCell::default(),
+                tape: RefCell::new(crate::store::MemStore::new(4096)),
             };
             write_and_follow(
                 &conn,
@@ -4350,6 +4473,126 @@ mod tests {
             )
             .unwrap();
             assert_eq!(location_of(&conn, NEW), Some(offsite));
+        }
+
+        /// Issue #445: `--init` with nothing staged — a first copy released
+        /// its staging, item 63 — refuses before the cartridge is touched:
+        /// the pre-flight is the real library function over a real catalog
+        /// whose only staged version was cleaned, `init` and `write` are
+        /// never called, the cartridge holds nothing, no volume row exists
+        /// and the exit is 2 (nothing written). It used to rewrite File 0,
+        /// bind the cartridge and strand an `initialized` row first.
+        #[test]
+        fn an_init_with_nothing_staged_refuses_before_the_cartridge_is_touched() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            // The staging was released after the first copy.
+            conn.execute("UPDATE stage_sets SET status = 'cleaned'", [])
+                .unwrap();
+            let config = config(dir.path(), 2);
+            add_shelf(&conn, "offsite");
+            let steps = FakeSteps {
+                conn: &conn,
+                staged: &s,
+                fail: Fail::Unstaged,
+                log: RefCell::default(),
+                tape: RefCell::new(crate::store::MemStore::new(4096)),
+            };
+
+            let err = write_and_follow(
+                &conn,
+                &config,
+                &steps,
+                &request(true, false, Some("offsite")),
+            )
+            .unwrap_err();
+
+            assert!(
+                err.to_string().contains("no staged data to write"),
+                "the write's own refusal, from the pre-flight: {err}"
+            );
+            assert_eq!(steps.log(), ["preflight"], "neither init nor write ran");
+            assert!(
+                steps.tape.borrow().files.is_empty(),
+                "the cartridge was not touched: no File 0"
+            );
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM volumes WHERE label = ?1",
+                    [NEW],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "no volume row");
+            assert_eq!(exit_code(err), crate::error::EXIT_ERROR, "nothing written");
+        }
+
+        /// Issue #445: a refusal only the contact can raise (the capacity
+        /// gate here) comes after the init, so the volume IS initialised
+        /// while the exit is 2, the code that elsewhere means "the medium
+        /// untouched". The contract that tells a script is the pair this
+        /// pins: `--json` carries `initialized: true` and the volume left,
+        /// and the stderr line names it. The control is the pre-flight
+        /// refusing the same request when the catalog alone can.
+        #[test]
+        fn a_refusal_only_the_contact_can_raise_leaves_the_volume_initialized_and_says_so() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+            let config = config(dir.path(), 2);
+            add_shelf(&conn, "offsite");
+            let steps = FakeSteps {
+                conn: &conn,
+                staged: &s,
+                fail: Fail::Contact,
+                log: RefCell::default(),
+                tape: RefCell::new(crate::store::MemStore::new(4096)),
+            };
+
+            let err = write_and_follow(
+                &conn,
+                &config,
+                &steps,
+                &request(true, false, Some("offsite")),
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                steps.log(),
+                [
+                    "preflight",
+                    "init V-NEW force=false",
+                    "write V-NEW force=false"
+                ]
+            );
+            assert_eq!(steps.tape.borrow().files.len(), 1, "File 0 was written");
+            let status: String = conn
+                .query_row("SELECT status FROM volumes WHERE label = ?1", [NEW], |r| {
+                    r.get(0)
+                })
+                .expect("the volume row exists");
+            assert_eq!(status, "initialized", "left initialized");
+            assert_eq!(location_of(&conn, NEW), None, "nothing moved");
+            assert!(s.file.exists(), "nothing was released");
+
+            // The code is the write's: 2, a refusal before the tape moved.
+            let json = left_initialized_json(NEW, 7, &err);
+            assert_eq!(exit_code(err), crate::error::EXIT_ERROR);
+            assert_eq!(json["initialized"], true);
+            assert_eq!(json["volume_status"], "initialized");
+            assert_eq!(json["label"], NEW);
+            assert_eq!(json["volume_id"], 7);
+            assert_eq!(json["status"], "failed");
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("does not fit the cartridge"),
+                "{json}"
+            );
         }
 
         /// A move that fails once the copy is sealed and confirmed is a
@@ -4370,6 +4613,7 @@ mod tests {
                 staged: &s,
                 fail: Fail::Nothing,
                 log: RefCell::default(),
+                tape: RefCell::new(crate::store::MemStore::new(4096)),
             };
 
             let done =

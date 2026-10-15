@@ -234,8 +234,7 @@ fn compact_finish_is_refused_while_a_session_holds_the_source() {
     assert_eq!(f.events(), events_before);
 
     drop(held);
-    compact_finish(&f.conn, &Config::default(), LABEL, true)
-        .expect("a free lock does not refuse");
+    compact_finish(&f.conn, &Config::default(), LABEL, true).expect("a free lock does not refuse");
     assert_eq!(f.volume_status(), "retired");
 }
 
