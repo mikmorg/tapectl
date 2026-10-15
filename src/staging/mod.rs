@@ -690,12 +690,8 @@ fn stage_create_inner(
     // fails rolls back and drops its lock.
     let (stage_set_id, stage_lock) = busy::retry(BusyPolicy::DEFAULT, "the new stage set", || {
         let insert_tx = busy::immediate_tx(conn)?;
-        insert_tx.execute(
-            "INSERT INTO stage_sets (snapshot_id, slice_size, compression, encrypted)
-                 VALUES (?1, ?2, ?3, 1)",
-            params![snapshot_id, resolved.slice_size, compression],
-        )?;
-        let stage_set_id = insert_tx.last_insert_rowid();
+        let stage_set_id =
+            insert_stage_set(&insert_tx, snapshot_id, resolved.slice_size, &compression)?;
         let stage_lock = lock::acquire(&paths.db_file, stage_set_id)?;
         insert_tx.commit()?;
         Ok((stage_set_id, stage_lock))
@@ -1097,6 +1093,56 @@ fn stage_create_inner(
     Ok(stage_set_id)
 }
 
+/// The `meta` key holding the highest `stage_sets.id` ever handed out.
+const STAGE_SET_HIGH_WATER: &str = "stage_set_id_high_water";
+
+/// INSERT a stage set in `staging` and return its id, which is never one
+/// that was handed out before (issue #465).
+///
+/// `stage_sets.id` is a bare `INTEGER PRIMARY KEY`, so SQLite's own choice
+/// is `MAX(id) + 1`: after `snapshot delete --force` removes the highest
+/// row the next stage set would take its id back — and with it the stage's
+/// lock path (`locks/stage-<id>.lock`), the `_s<id>` prefix of its files in
+/// staging, the `events` entity id, and the stage report's name. AUTOINCREMENT
+/// would fix that in the table, but adding it rebuilds the table
+/// (a migration), so the highest id ever issued is kept in `meta` instead
+/// and the new id is one above both it and the table's own maximum.
+///
+/// Call it inside the transaction that inserts the row: that transaction is
+/// IMMEDIATE, so the write lock serialises two stages reading the mark.
+fn insert_stage_set(
+    tx: &Connection,
+    snapshot_id: i64,
+    slice_size: i64,
+    compression: &str,
+) -> Result<i64> {
+    use rusqlite::OptionalExtension;
+    let marked: i64 = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![STAGE_SET_HIGH_WATER],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let held: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM stage_sets", [], |row| {
+        row.get(0)
+    })?;
+    let id = marked.max(held) + 1;
+    tx.execute(
+        "INSERT INTO stage_sets (id, snapshot_id, slice_size, compression, encrypted)
+         VALUES (?1, ?2, ?3, ?4, 1)",
+        params![id, snapshot_id, slice_size, compression],
+    )?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![STAGE_SET_HIGH_WATER, id.to_string()],
+    )?;
+    Ok(id)
+}
+
 /// Record one encrypted slice: its `stage_slices` row (issue #377). The
 /// INSERT is retried on a busy catalog for `policy`'s budget. If it cannot be
 /// written, the `.age` is removed again: no row would ever name it. There is
@@ -1346,15 +1392,44 @@ fn cleanup_failed_stage_set(
 /// plain `fs::write` at whatever mode the process umask hands out.
 /// Factored out of `stage_create` so it's testable without a real dar
 /// binary or a full stage pipeline.
+///
+/// The name is `<YYYYMMDD>_<stage set id>.txt`. A report is never written over
+/// another (issue #465): if that name is taken — an id reused before ids were
+/// kept rising, or a restored catalog — the new report is `…_<id>-2.txt`, and
+/// so on, and the older one keeps its bytes.
 fn write_stage_report(paths: &TapectlPaths, stage_set_id: i64, report: &str) -> Result<PathBuf> {
-    let report_path = paths.stage_reports_dir.join(format!(
-        "{}_{}.txt",
-        chrono::Utc::now().format("%Y%m%d"),
-        stage_set_id
-    ));
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     fs::create_dir_all(&paths.stage_reports_dir)?;
-    crate::config::write_private_file(&report_path, report.as_bytes(), 0o600)?;
-    Ok(report_path)
+    let stem = format!("{}_{}", chrono::Utc::now().format("%Y%m%d"), stage_set_id);
+    for attempt in 1..=1000u32 {
+        let name = if attempt == 1 {
+            format!("{stem}.txt")
+        } else {
+            format!("{stem}-{attempt}.txt")
+        };
+        let report_path = paths.stage_reports_dir.join(name);
+        // Created 0600 from the first `open()` (issue #41), and never over an
+        // existing file.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&report_path)
+        {
+            Ok(mut file) => {
+                file.write_all(report.as_bytes())?;
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                return Ok(report_path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(TapectlError::Other(format!(
+        "cannot name a stage report for stage set {stage_set_id} in {}: 1000 reports of that \
+         name and day exist",
+        paths.stage_reports_dir.display()
+    )))
 }
 
 /// Best-effort tighten every regular file dar's `-C` catalog extraction
@@ -4630,6 +4705,82 @@ mod tests {
         );
     }
 
+    /// A snapshot row to hang stage sets on, in a bare in-memory catalog.
+    fn bare_snapshot(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('uuid', 'u', ?1, '/tmp/u', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'created', '/tmp/u', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Issue #465 item 6: `stage_sets.id` is a bare `INTEGER PRIMARY KEY`, so
+    /// SQLite hands out `MAX(id) + 1` and deleting the highest row (`snapshot
+    /// delete --force`) made the next stage set reuse its id — and with it
+    /// the lock path, the `_s<id>` file prefix, the `events` entity id and
+    /// the stage report name of the one that was deleted. A high-water mark
+    /// in `meta` (no AUTOINCREMENT: that would rebuild the table) keeps ids
+    /// rising.
+    #[test]
+    fn a_stage_set_id_is_never_reused_after_the_highest_is_deleted() {
+        let conn = crate::db::open_memory().unwrap();
+        let snapshot_id = bare_snapshot(&conn);
+        let insert = || insert_stage_set(&conn, snapshot_id, 1 << 20, "none").unwrap();
+
+        assert_eq!((insert(), insert(), insert()), (1, 2, 3));
+        // The highest goes, then the next two: the old behaviour gave 3 back.
+        conn.execute("DELETE FROM stage_sets WHERE id = 3", [])
+            .unwrap();
+        assert_eq!(insert(), 4, "3 was handed out once");
+        conn.execute("DELETE FROM stage_sets", []).unwrap();
+        assert_eq!(insert(), 5, "an empty table does not restart the count");
+    }
+
+    /// The mark never lowers an id the table already holds: rows inserted
+    /// another way (a catalog rebuild, a restored backup from before the
+    /// mark existed) still win, so ids stay unique.
+    #[test]
+    fn a_stage_set_id_is_above_every_row_already_in_the_table() {
+        let conn = crate::db::open_memory().unwrap();
+        let snapshot_id = bare_snapshot(&conn);
+        conn.execute(
+            "INSERT INTO stage_sets (id, snapshot_id, status, slice_size)
+             VALUES (41, ?1, 'staged', 524288)",
+            params![snapshot_id],
+        )
+        .unwrap();
+        assert_eq!(
+            insert_stage_set(&conn, snapshot_id, 1 << 20, "none").unwrap(),
+            42,
+            "no mark yet: one above the table's highest"
+        );
+        conn.execute(
+            "UPDATE meta SET value = '10' WHERE key = 'stage_set_id_high_water'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            insert_stage_set(&conn, snapshot_id, 1 << 20, "none").unwrap(),
+            43,
+            "a stale mark below the table's highest changes nothing"
+        );
+    }
+
     /// Rewrite the unit dotfile's `[excludes]` after the snapshot was taken:
     /// what an operator does between `snapshot create` and `stage create`.
     /// A dotfile edit mints no version (ADR-0012 2026-10-07 item 24).
@@ -5731,6 +5882,36 @@ mod tests {
             assert!(path.exists());
             assert_eq!(fs::read_to_string(&path).unwrap(), "report body\n");
             assert_eq!(mode_of(&path), 0o600, "stage report should be 0600");
+        }
+
+        /// Issue #465 item 6: a second report for the same stage set id on
+        /// the same day (an id reused after `snapshot delete --force`, or a
+        /// restored catalog) used to truncate the first. The first report
+        /// keeps its name and its bytes; the second takes a suffix.
+        #[test]
+        fn a_second_stage_report_for_the_same_id_and_day_does_not_truncate_the_first() {
+            let tmp = TempDir::new().unwrap();
+            let paths = test_paths(&tmp);
+
+            let first = write_stage_report(&paths, 5, "first report\n").unwrap();
+            let second = write_stage_report(&paths, 5, "second report\n").unwrap();
+            let third = write_stage_report(&paths, 5, "third report\n").unwrap();
+
+            assert_eq!(fs::read_to_string(&first).unwrap(), "first report\n");
+            assert_eq!(fs::read_to_string(&second).unwrap(), "second report\n");
+            assert_eq!(fs::read_to_string(&third).unwrap(), "third report\n");
+            let names: std::collections::BTreeSet<_> = [&first, &second, &third]
+                .iter()
+                .map(|p| p.file_name().unwrap().to_owned())
+                .collect();
+            assert_eq!(names.len(), 3, "three reports, three names");
+            // The documented name (`<YYYYMMDD>_<stage set id>.txt`) is the
+            // first one's.
+            let first_name = first.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(first_name.ends_with("_5.txt"), "{first_name}");
+            for p in [&first, &second, &third] {
+                assert_eq!(mode_of(p), 0o600);
+            }
         }
 
         #[test]
