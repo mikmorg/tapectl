@@ -4851,6 +4851,31 @@ mod tests {
         }
     }
 
+    /// The same refusal for `[defaults] global_excludes`, the other layer of
+    /// the stage-time patterns: added to the config after the snapshot.
+    #[test]
+    fn a_file_the_global_excludes_now_exclude_refuses_the_stage_too() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("keep.dat"), b"kept content").unwrap();
+        fs::write(src.join("draft.globalext"), b"listed by the snapshot").unwrap();
+        let snap = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+
+        config
+            .defaults
+            .global_excludes
+            .push("*.globalext".to_string());
+        let msg = stage_create(&conn, &paths, &config, snap, false)
+            .expect_err("the snapshot lists a file the global excludes now exclude")
+            .to_string();
+        assert!(msg.contains("draft.globalext"), "{msg}");
+        assert!(msg.contains("snapshot create"), "{msg}");
+
+        // The remedy, under the same config: the new snapshot stages.
+        let fresh = snapshot_create(&conn, "unit1", &config).unwrap();
+        stage_create(&conn, &paths, &config, fresh, false).expect("a fresh snapshot stages");
+    }
+
     /// Issue #464: the tapectl walk matches a directory pattern one path
     /// component at a time; dar matches its `-P` mask against the whole
     /// relative path, and dar's `*` spans `/` (`staging::exclude`'s module
