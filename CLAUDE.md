@@ -314,7 +314,7 @@ TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
     cargo test --test mhvtl_e2e -- --ignored --nocapture
 
 # TapeStore's own command count held to the kernel's other_cnt (#416 item 12). Same
-# gating; it writes the loaded cartridge. Not run by the gate.
+# gating; it writes the loaded cartridge. The gate runs it as its last leg, rust_motions.
 TAPECTL_GATE_TAPE=/dev/nst3 TAPECTL_MHVTL=1 \
     cargo test --test mhvtl_motions -- --ignored --nocapture
 

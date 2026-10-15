@@ -1658,6 +1658,16 @@ step_rust_e2e() {
 }
 check rust_e2e          step_rust_e2e
 
+# Issue #416 item 12: TapeStore's own command count held to the kernel's
+# other_cnt. It writes the loaded cartridge, so it runs after every leg that
+# reads what the earlier legs wrote.
+step_rust_motions() {
+    flock -w 1200 -E 99 /scratch/tapectl-build.lock \
+        env TAPECTL_GATE_TAPE="$TAPE_DEV" TAPECTL_MHVTL=1 \
+        cargo test --test mhvtl_motions -- --ignored --nocapture
+}
+check rust_motions      step_rust_motions
+
 # ---------- verdict: compare against the EXPECTED_FAIL manifest ----------
 echo
 echo "== gate verdict =="
