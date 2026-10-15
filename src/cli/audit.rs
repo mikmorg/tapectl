@@ -335,6 +335,16 @@ const CHECKS: &[Check] = &[
         },
     },
     Check {
+        // Issue #454 (ADR-0012 2026-10-15 (later) item 67): the per-VOLUME
+        // clock. `verify_age` judges a unit by its newest readback anywhere,
+        // so a fresh home copy hides an offsite copy nobody has read for
+        // years; this names the stale volume and where to fetch it.
+        name: "volume_verify_age",
+        scope: Scope::Archive {
+            run: check_volume_verify_age,
+        },
+    },
+    Check {
         // Issue #308 (ADR-0012, 2026-10-07 item 29): a raised TapeAlert
         // on a live volume's cartridge (`policy::tape_alerts`).
         name: "tape_alert",
@@ -1719,6 +1729,99 @@ fn no_full_verify_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
             })
             .collect(),
     )
+}
+
+// VOLUME VERIFY AGE (#454, ADR-0012 2026-10-15 (later) item 67).
+//
+// `verify_age` takes the newest passing full readback over EVERY volume that
+// holds a unit, so the home copy keeps the unit's clock fresh while the
+// offsite copy goes unread for years. This is the per-volume view: for each
+// volume that counts as a copy (`coverage::eligible`) and holds a completed
+// write, the newest passing FULL readback, dated by its start
+// (`evidence::full_readback_date`, ADR-0012 2026-10-07 item 30), against the
+// shortest `verify_interval_days` among the archive sets of the units on it
+// (the rule `volume_verify_interval_days` applies to a continued readback;
+// only an archive set carries the key). Past it, the volume is named with its
+// cartridge and its place, so the operator knows which tape to fetch.
+//
+// A volume with no passing full readback at all is `no_full_verify`'s, named
+// once there, not twice here; a volume no unit gives an interval has no
+// clock. One statement however many volumes there are (the budget pin in
+// `tests/catalog_budget.rs`). A warning, never a violation (ADR-0004).
+fn check_volume_verify_age(ctx: &Ctx<'_>) -> Result<Findings> {
+    Ok(Findings {
+        violations: Vec::new(),
+        warnings: volume_verify_age_findings(ctx.conn)?,
+    })
+}
+
+fn volume_verify_age_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT v.label, c.barcode, l.name,
+                MAX({dated}) AS last_full,
+                (SELECT MIN(a.verify_interval_days)
+                   FROM writes w2
+                   JOIN snapshots s2 ON s2.id = w2.snapshot_id
+                   JOIN units u2 ON u2.id = s2.unit_id
+                   JOIN archive_sets a ON a.id = u2.archive_set_id
+                  WHERE w2.volume_id = v.id AND w2.status = 'completed') AS interval_days
+           FROM volumes v
+           JOIN verification_sessions vs
+             ON vs.volume_id = v.id AND vs.outcome = 'passed' AND vs.verify_type = 'full'
+           LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
+           LEFT JOIN cartridges c ON c.id = cv.cartridge_id
+           LEFT JOIN locations l ON l.id = v.location_id
+          WHERE {eligible}
+            AND EXISTS (SELECT 1 FROM writes w
+                         WHERE w.volume_id = v.id AND w.status = 'completed')
+          GROUP BY v.id
+          ORDER BY v.label",
+        dated = policy::evidence::full_readback_date("vs"),
+        eligible = policy::coverage::eligible("v"),
+    ))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let now = chrono::Utc::now().naive_utc();
+    let mut out = Vec::new();
+    for (label, barcode, place, last_full, interval) in rows {
+        let Some(days) = interval else {
+            continue; // no unit on it gives the volume a clock
+        };
+        // The same rule as the per-unit `verify_age`: whole days, strictly
+        // more than the interval; a date that does not parse is overdue.
+        let age_days = chrono::NaiveDateTime::parse_from_str(&last_full, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|dt| (now - dt).num_days());
+        if age_days.is_some_and(|age| age <= days) {
+            continue;
+        }
+        let age = age_days.map_or_else(String::new, |a| format!(", {a} days ago"));
+        out.push(AuditFinding {
+            unit: format!("volume:{label}"),
+            check: "volume_verify_age".into(),
+            message: format!(
+                "volume \"{label}\" ({cartridge}, {at}) was last read back in full on \
+                 {last_full}{age}: past the {days}-day verify interval of the tightest \
+                 archive set on it, whatever the unit's other copies show",
+                cartridge = barcode.map_or("no cartridge recorded".to_string(), |b| format!(
+                    "cartridge {b}"
+                )),
+                at = place.map_or("no place recorded".to_string(), |p| format!("at {p}")),
+            ),
+            action: format!("tapectl volume verify {label}"),
+        });
+    }
+    Ok(out)
 }
 
 // TAPE ALERT (#308). One warning per live volume whose cartridge raised a
@@ -4616,6 +4719,292 @@ mod tests {
         }
     }
 
+    /// Issue #454 (ADR-0012 2026-10-15 (later) item 67): `volume_verify_age`
+    /// judges each volume by its own newest full readback against the
+    /// shortest `verify_interval_days` of the units on it, so a fresh home
+    /// copy no longer hides an offsite copy nobody has read for years.
+    mod volume_verify_age_is_per_volume {
+        use super::*;
+
+        fn days_ago(days: i64) -> String {
+            (chrono::Utc::now().naive_utc() - chrono::Duration::days(days))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        }
+
+        /// Unit `aged` in an archive set verifying every `interval` days
+        /// (`None`: no interval), one current version staged, locations
+        /// `home` and `offsite`.
+        fn world(interval: Option<i64>) -> Connection {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('set', ?1)",
+                params![interval],
+            )
+            .unwrap();
+            let set_id = conn.last_insert_rowid();
+            add_unit(&conn, tid, "aged", set_id);
+            conn.execute_batch("INSERT INTO locations (name) VALUES ('home'), ('offsite');")
+                .unwrap();
+            conn
+        }
+
+        /// A unit with one current version, staged once, in `set_id`.
+        fn add_unit(conn: &Connection, tid: i64, name: &str, set_id: i64) {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status, archive_set_id)
+                 VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active', ?4)",
+                params![format!("u-{name}"), name, tid, set_id],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, 1, 'full', 'current', '/src')",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+        }
+
+        /// A volume holding a completed write of EVERY staged unit, with an
+        /// optional cartridge barcode, an optional place, and one passed
+        /// FULL readback `full_days_ago` days old (started when completed).
+        fn add_volume(
+            conn: &Connection,
+            label: &str,
+            status: &str,
+            place: Option<&str>,
+            barcode: Option<&str>,
+            full_days_ago: Option<i64>,
+        ) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, location_id)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, ?2,
+                         (SELECT id FROM locations WHERE name = ?3))",
+                params![label, status, place],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 SELECT ss.id, ss.snapshot_id, ?1, 'completed' FROM stage_sets ss",
+                params![vol_id],
+            )
+            .unwrap();
+            if let Some(b) = barcode {
+                conn.execute(
+                    "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                     VALUES (?1, 'LTO-6', 2500000000000, 'in_use')",
+                    params![b],
+                )
+                .unwrap();
+                let cart = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                    params![cart, vol_id],
+                )
+                .unwrap();
+            }
+            if let Some(days) = full_days_ago {
+                let at = days_ago(days);
+                conn.execute(
+                    "INSERT INTO verification_sessions
+                         (volume_id, verify_type, outcome, started_at, completed_at)
+                     VALUES (?1, 'full', 'passed', ?2, ?2)",
+                    params![vol_id, at],
+                )
+                .unwrap();
+            }
+        }
+
+        fn warnings_of(conn: &Connection, check: &str) -> Vec<AuditFinding> {
+            let (violations, warnings) = collect_findings(conn, &Config::default(), None).unwrap();
+            assert!(
+                violations.iter().all(|f| f.check != check),
+                "{check} is a warning, never a violation (exit 1, not 2): {violations:?}"
+            );
+            warnings.into_iter().filter(|f| f.check == check).collect()
+        }
+
+        /// The acceptance case: a fresh home copy and a two-year-old offsite
+        /// copy. The unit's clock (`verify_age`) is satisfied by the home
+        /// copy; the offsite VOLUME is named, with its cartridge and place.
+        #[test]
+        fn a_fresh_home_copy_does_not_hide_a_two_year_old_offsite_copy() {
+            let conn = world(Some(30));
+            add_volume(
+                &conn,
+                "L6-HOME",
+                "sealed",
+                Some("home"),
+                Some("BC-HOME"),
+                Some(2),
+            );
+            add_volume(
+                &conn,
+                "L6-OFF",
+                "sealed",
+                Some("offsite"),
+                Some("BC-OFF"),
+                Some(730),
+            );
+
+            assert!(
+                warnings_of(&conn, "verify_age").is_empty(),
+                "the unit's own clock is satisfied by the home copy"
+            );
+            let found = warnings_of(&conn, "volume_verify_age");
+            assert_eq!(found.len(), 1, "{found:?}");
+            let f = &found[0];
+            assert_eq!(f.unit, "volume:L6-OFF");
+            for named in ["\"L6-OFF\"", "BC-OFF", "offsite", "30-day"] {
+                assert!(f.message.contains(named), "{named}: {}", f.message);
+            }
+            assert!(!f.message.contains("L6-HOME") && !f.message.contains("BC-HOME"));
+            assert_eq!(f.action, "tapectl volume verify L6-OFF");
+        }
+
+        /// Positive control: both volumes inside the interval, nothing.
+        #[test]
+        fn volumes_inside_the_interval_are_not_named() {
+            let conn = world(Some(30));
+            add_volume(&conn, "L6-HOME", "sealed", Some("home"), None, Some(2));
+            add_volume(&conn, "L6-OFF", "sealed", Some("offsite"), None, Some(29));
+            assert!(warnings_of(&conn, "volume_verify_age").is_empty());
+        }
+
+        /// A volume never read back is `no_full_verify`'s, named once; a
+        /// volume whose only readback was a quick one is the same case.
+        #[test]
+        fn a_volume_never_read_back_is_named_once_by_no_full_verify() {
+            let conn = world(Some(30));
+            add_volume(&conn, "L6-NEVER", "sealed", Some("home"), None, None);
+            add_volume(&conn, "L6-QUICK", "sealed", Some("home"), None, None);
+            conn.execute(
+                "INSERT INTO verification_sessions
+                     (volume_id, verify_type, outcome, started_at, completed_at)
+                 VALUES ((SELECT id FROM volumes WHERE label = 'L6-QUICK'),
+                         'quick', 'passed', ?1, ?1)",
+                params![days_ago(900)],
+            )
+            .unwrap();
+
+            let (_violations, warnings) =
+                collect_findings(&conn, &Config::default(), None).unwrap();
+            for label in ["L6-NEVER", "L6-QUICK"] {
+                let naming: Vec<&str> = warnings
+                    .iter()
+                    .filter(|f| f.message.contains(&format!("\"{label}\"")))
+                    .map(|f| f.check.as_str())
+                    .collect();
+                assert_eq!(
+                    naming,
+                    ["no_full_verify"],
+                    "{label}: named once, by that check"
+                );
+            }
+        }
+
+        /// The interval is the SHORTEST among the units on the volume.
+        #[test]
+        fn the_tightest_unit_on_the_volume_sets_the_interval() {
+            let conn = world(Some(365));
+            let tid: i64 = conn
+                .query_row("SELECT id FROM tenants", [], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('tight', 30)",
+                [],
+            )
+            .unwrap();
+            let tight = conn.last_insert_rowid();
+            add_unit(&conn, tid, "tight-unit", tight);
+            add_volume(&conn, "L6-ONE", "sealed", Some("home"), None, Some(100));
+            let found = warnings_of(&conn, "volume_verify_age");
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].message.contains("30-day"), "{}", found[0].message);
+
+            // Without the 30-day unit the same readback is inside 365.
+            let conn = world(Some(365));
+            add_volume(&conn, "L6-ONE", "sealed", Some("home"), None, Some(100));
+            assert!(warnings_of(&conn, "volume_verify_age").is_empty());
+        }
+
+        /// No unit on the volume gives it an interval: no clock, no finding.
+        #[test]
+        fn a_volume_whose_units_have_no_interval_has_no_clock() {
+            let conn = world(None);
+            add_volume(&conn, "L6-OLD", "sealed", Some("home"), None, Some(2000));
+            assert!(warnings_of(&conn, "volume_verify_age").is_empty());
+        }
+
+        /// A volume that is not a copy (retired) is not asked about.
+        #[test]
+        fn a_retired_volume_is_not_named() {
+            let conn = world(Some(30));
+            add_volume(&conn, "L6-GONE", "retired", Some("home"), None, Some(2000));
+            assert!(warnings_of(&conn, "volume_verify_age").is_empty());
+        }
+
+        /// A volume with no recorded cartridge or place is still named, and
+        /// says so rather than printing nothing.
+        #[test]
+        fn a_volume_with_no_cartridge_or_place_says_so() {
+            let conn = world(Some(30));
+            add_volume(&conn, "L6-BARE", "sealed", None, None, Some(400));
+            let found = warnings_of(&conn, "volume_verify_age");
+            assert_eq!(found.len(), 1);
+            assert!(found[0].message.contains("no cartridge recorded"));
+            assert!(found[0].message.contains("no place recorded"));
+        }
+
+        /// `--json` carries the finding like every other check, as a warning
+        /// (exit 1).
+        #[test]
+        fn the_json_output_carries_it_as_a_warning() {
+            let conn = world(Some(30));
+            add_volume(
+                &conn,
+                "L6-OFF",
+                "sealed",
+                Some("offsite"),
+                Some("BC-OFF"),
+                Some(730),
+            );
+            let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+            let exit = if !violations.is_empty() {
+                2
+            } else if !warnings.is_empty() {
+                1
+            } else {
+                0
+            };
+            let out = render(&violations, &warnings, exit, false, true);
+            let json: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+            let finding = json["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["check"] == "volume_verify_age")
+                .expect("--json carries volume_verify_age");
+            assert_eq!(finding["severity"], "warning");
+            assert_eq!(finding["unit"], "volume:L6-OFF");
+        }
+    }
+
     /// Issue #387 (ADR-0012, 2026-10-06 item 1): a volume sealed by a quick
     /// confirm counts as a copy with none of its bytes read back, and audit
     /// names it until a full verify passes — a quick verify, a failed full
@@ -4891,7 +5280,7 @@ mod tests {
     mod checks_table {
         use super::*;
 
-        /// The 18 distinct `check` name literals this file's findings can
+        /// The 19 distinct `check` name literals this file's findings can
         /// carry (grep-verified against every `check: "..."` / `check ==
         /// "..."` in this file, non-test code). Every `CHECKS` row name
         /// must be one of these, and every one of these must be covered by
@@ -4914,6 +5303,7 @@ mod tests {
             "escrow_identity_mismatch",
             "read_error_trend",
             "no_full_verify",
+            "volume_verify_age",
             "tape_alert",
         ];
 
@@ -4930,13 +5320,13 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 10 per-unit checks + 6 archive-wide checks. `policy_unresolvable`
+            // 10 per-unit checks + 7 archive-wide checks. `policy_unresolvable`
             // is not one of them (see below), and `escrow_kit_missing`/
             // `escrow_kit_stale` share one row.
             assert_eq!(
                 names.len(),
-                16,
-                "expected 10 per-unit + 6 archive-wide CHECKS rows, got: {names:?}"
+                17,
+                "expected 10 per-unit + 7 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {
