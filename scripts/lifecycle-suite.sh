@@ -917,6 +917,14 @@ rm_step_unit() {
     assert_identical "$RM_SRC" "$to"
 }
 
+# #435: the same restore with no --from: the loaded tape's File 0 names the volume.
+rm_step_unit_loaded() {
+    local to="$RM_WORK/unit-loaded"
+    TCTL restore unit --unit "$RM_UNIT" --to "$to" --device "$TAPE_DEV" || return 1
+    [ "$DRY_RUN" = 1 ] && return 0
+    assert_identical "$RM_SRC" "$to"
+}
+
 # `restore volume` (the disaster-recovery path: one pass over the tape, each
 # unit into DIR/<unit name>), asked for this matrix's one unit by --unit. A
 # whole-volume restore would also try every other unit on the volume, which
@@ -1178,12 +1186,15 @@ rm_step_verify() {
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$RM_WORK/verify_full.json" || return 1
     TCTL volume verify "$RM_LABEL" --quick --device "$TAPE_DEV" --json >"$RM_WORK/verify_quick.json" 2>"$RM_WORK/verify_quick.json.err" || { cat "$RM_WORK/verify_quick.json.err" "$RM_WORK/verify_quick.json"; return 1; }
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("failed",1)==0, d' "$RM_WORK/verify_quick.json" || return 1
+    # #435: no label -- File 0 of the loaded tape names the volume verified.
+    TCTL volume verify --quick --device "$TAPE_DEV" --json >"$RM_WORK/verify_loaded.json" 2>"$RM_WORK/verify_loaded.json.err" || { cat "$RM_WORK/verify_loaded.json.err" "$RM_WORK/verify_loaded.json"; return 1; }
+    grep -q "$RM_LABEL" "$RM_WORK/verify_loaded.json" "$RM_WORK/verify_loaded.json.err" || { echo "verify with no label did not name $RM_LABEL"; return 1; }
     TCTL report verify-status --json >"$RM_WORK/verify_status.json" 2>"$RM_WORK/verify_status.json.err" || return 1
     grep -q "\"$RM_LABEL\"" "$RM_WORK/verify_status.json" || { echo "volume $RM_LABEL not listed in report verify-status"; return 1; }
 }
 
 # restore_matrix <label> <unit> <tenant> <expected_src_dir> <tag> [other_tenant]
-# Runs all 11 methods as separate `check`s named "<tag>.<method>". Call
+# Runs all 12 methods as separate `check`s named "<tag>.<method>". Call
 # after a volume is sealed and while its cartridge is (or can be) reloaded.
 # restore_matrix <label> <unit> <tenant> <src> <tag> [other-tenant]
 #
@@ -1206,6 +1217,7 @@ restore_matrix() {
     fi
 
     check "$RM_TAG.unit"               rm_step_unit
+    check "$RM_TAG.unit_loaded"        rm_step_unit_loaded
     check "$RM_TAG.volume"             rm_step_volume
     check "$RM_TAG.file"               rm_step_file
     check "$RM_TAG.restore_sh_dd"      rm_step_restore_sh_dd
@@ -2396,7 +2408,16 @@ rr_write_second_copy_volb() {
         return $?
     fi
     next_tape VOL-B || return 1
-    vinit VOL-B && TCTL volume write VOL-B --device "$TAPE_DEV" --yes
+    # #438: the further copy in one command -- init, write, full readback, move.
+    TCTL volume write VOL-B --init --full-confirm --move-to offsite --device "$TAPE_DEV" --yes $REUSE_FORCE || return 1
+    [ "$DRY_RUN" = 1 ] && return 0
+    TCTL volume info VOL-B --json 2>/dev/null | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+s = json.dumps(d)
+assert "offsite" in s, f"VOL-B was not moved to offsite: {s[:400]}"
+assert d.get("status") == "sealed", "VOL-B is not sealed: %s" % d.get("status")
+'
 }
 
 # #440: VOL-B is copy 2 of every unit's v1, so its own `volume write` releases

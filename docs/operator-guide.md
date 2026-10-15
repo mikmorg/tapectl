@@ -270,17 +270,17 @@ tapectl stage create family/letters
 # 2. What will go on tape, and how many cartridges?
 tapectl volume plan --copies 2
 
-# 3. First copy: load a blank cartridge
-tapectl volume init L8-0001 --device "$TAPE"
-tapectl volume write L8-0001 --device "$TAPE"
-tapectl volume verify L8-0001 --device "$TAPE"
-tapectl volume move L8-0001 --to home-rack
+# 3. First copy: load a blank cartridge. One command initialises it, writes the
+#    volume, reads every file back, and moves it to the shelf once it is confirmed
+tapectl volume write L8-0001 --init --full-confirm --move-to home-rack --device "$TAPE"
 
-# 4. Second copy: swap in another blank cartridge
-tapectl volume init L8-0002 --device "$TAPE"
-tapectl volume write L8-0002 --device "$TAPE"
-tapectl volume verify L8-0002 --device "$TAPE"
-tapectl volume move L8-0002 --to offsite
+# 4. Second copy: swap in another blank cartridge. This write completes the
+#    policy's copies, so it also releases the staged slices (after its full readback)
+tapectl volume write L8-0002 --init --full-confirm --move-to offsite --device "$TAPE"
+
+# (the long form still works: volume init, volume write, volume verify --full,
+#  volume move; `tapectl volume verify --device "$TAPE"` with no label verifies
+#  whichever volume is loaded)
 
 # 5. Check, release staging, refresh the Heir Kit, back up the catalog
 tapectl audit

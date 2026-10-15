@@ -271,7 +271,8 @@ went with the old home. The new catalog starts its record at the erase's contact
 
 `keepsake` has no copy on tape until both new copies seal (item 37), so write copy 2 the
 same day:
-1. Leave staging alone: the write does not release it. Load a second fresh cartridge,
+1. Leave staging alone (1.1.0's write does not release it; on 1.1.1 the write that
+   completes the policy does, unless given `--keep-staging`). Load a second fresh cartridge,
    which must be a different cartridge from L6-0001.
 2. Run `tapectl-op volume init L6-0002 --device /dev/tape/by-id/scsi-HUJ808A5L4-nst`,
    then `tapectl-op volume write L6-0002 --device … --keep-staging` (1.1.1 releases staging
@@ -370,6 +371,8 @@ None of these blocks the fresh start. Each has an issue:
 - **A bursty host feed costs tape** (1.48 native bytes per data byte measured); a steady
   one does not. Keep the host quiet (`tapectl host check`).
 - **The write's confirm is quick by default.** Run `volume verify --full` on each new
-  copy before `staging clean`.
+  copy before `staging clean`, or write with `--full-confirm` (on 1.1.1, a further copy in
+  one command: `volume write L --init --full-confirm --move-to <location>`), which records
+  the full readback as part of the write.
 - **The on-tape authorization ends with the v1.1.0 install.** After it, a failing
   `tests/on_tape_golden.rs` is a CTO decision, never an agent's re-pin.
