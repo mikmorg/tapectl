@@ -620,10 +620,11 @@ lc_dump_whole_tape() { # lc_dump_whole_tape <outfile>
     mt -f "$TAPE_DEV" rewind || { echo "lc_dump_whole_tape: rewind failed"; return 1; }
     : > "$out"
     while [ "$n" -lt 64 ]; do
-        # A read error is not end of data (#471): dd's status decides,
-        # and only a clean zero-byte read counts toward the EOD stop.
-        dd if="$TAPE_DEV" bs=512k of="$tmp" 2>"$tmp.err" \
-            || { echo "lc_dump_whole_tape: dd failed at file $n: $(cat "$tmp.err")"; return 1; }
+        # dd's status is not the test: at end of data st answers a read with
+        # EIO and nothing, exactly as it does a blank region. A dump that
+        # stopped early is caught instead by lc_leak_scan's seal-marker
+        # control, as the gate's dump_whole_tape is (#415, #471).
+        dd if="$TAPE_DEV" bs=512k of="$tmp" 2>/dev/null
         got="$(stat -c %s "$tmp" 2>/dev/null)" || return 1
         if [ "$got" -eq 0 ]; then
             empty=$((empty + 1))
@@ -634,7 +635,7 @@ lc_dump_whole_tape() { # lc_dump_whole_tape <outfile>
         fi
         n=$((n + 1))
     done
-    rm -f "$tmp" "$tmp.err"
+    rm -f "$tmp"
     [ "$n" -lt 64 ] || { echo "lc_dump_whole_tape: hit the 64-file ceiling without reaching EOD"; return 1; }
     mt -f "$TAPE_DEV" rewind || return 1
     echo "lc_dump_whole_tape: $n file(s), $(stat -c %s "$out") bytes"
@@ -3427,6 +3428,10 @@ print("yes" if any(isinstance(r, dict) and r.get("volume") == os.environ["L"] fo
             *) echo "catalog locate $u --json unreadable"; return 1 ;;
         esac
         to="$sd/pm-restore-$label-$u"
+        # Two restore steps can meet the same latest write; restore refuses a
+        # non-empty --to (#405), which the old check read as "not on this
+        # tape" and so compared nothing (#471). Each step starts empty.
+        rm -rf "$to"
         TCTL restore unit --unit "$u" --from "$label" --to "$to" --device "$TAPE_DEV" >/dev/null 2>&1 \
             || { echo "restore of $u from $label failed, though the catalog places it there"; return 1; }
         assert_identical "$sd/pm-snapshot-$label/$u" "$to" || return 1
