@@ -36,6 +36,17 @@
 #   D      first-run.sh --from 13 a third time: the `sealed` path goes straight
 #          to the post-write block, writes nothing, and exits 0.
 #
+# Issue #432 rides on the same run: tape commands run at raised CPU and I/O
+# priority from every launcher. Before phase A a `tapectl_op_priority` check runs
+# scripts/check-tapectl-op.sh (the wrapper against a probe: no tape). In every
+# phase a sampler running as the service user records the nice value and I/O
+# class of each tapectl process the run starts (RUN/prio-<phase>.tsv), and a
+# check per phase asserts them: `volume write` (B), `volume resume` and `volume
+# verify` (C), `volume verify` (D) at the profile's TAPE_NICE/TAPE_IONICE, and,
+# as the positive control, every non-tape tapectl command seen (stage create,
+# volume info, ...) at the harness's own priority. Phase B also reads the
+# write's priority from /proc/PID/stat and `ionice -p` just before it signals.
+#
 # It never takes /tmp/tapectl-tape.lock itself: first-run.sh step 13 takes it
 # with `flock -n` (and step 12's lifecycle suite takes it too), so a parent
 # holding it would make every child die. It only checks the lock is free
@@ -64,6 +75,10 @@ UNIT_MIB=24
 WORKSPACE=/scratch/tapectl-fr414
 KEEP=0
 SVC_USER=tapectl
+# Issue #432: the profile's tape priority, and what `ionice -p` prints for it.
+TAPE_NICE_RUN=-10
+TAPE_IONICE_RUN="-c2 -n0"
+WANT_IO="best-effort: prio 0"
 
 die() { echo "FR414 PRECONDITION FAILED: $*" >&2; exit 2; }
 while [ $# -gt 0 ]; do
@@ -99,6 +114,11 @@ for bin in lsscsi mtx mt dar age sha256sum python3 cargo flock sudo; do
 done
 id "$SVC_USER" >/dev/null 2>&1 || die "no '$SVC_USER' service user — run scripts/first-run.sh --from 5 --to 5 once, or create it"
 sudo -n true 2>/dev/null || die "sudo needs a password here; first-run.sh and the catalog reads need non-interactive sudo"
+# The positive control only means something if this shell is NOT already at the
+# raised priority: a raised tape command and an unraised one would look alike.
+BASE_NICE="$(nice)"; BASE_IO="$(ionice -p $$ | tr -d '\n')"
+{ [ "$BASE_NICE" != "$TAPE_NICE_RUN" ] && [ "$BASE_IO" != "$WANT_IO" ]; } \
+    || die "this shell already runs at nice $BASE_NICE / '$BASE_IO', the priority a tape command is raised to; run the scenario from a shell at normal priority"
 # Free now, and NOT held by us from here on (see the header).
 ( flock -n 9 || exit 1 ) 9>/tmp/tapectl-tape.lock || die "another process holds /tmp/tapectl-tape.lock — a gate, a rehearsal or a fill is using a drive; wait for it"
 
@@ -153,7 +173,117 @@ COLLECTIONS=(
 OPS_GROUP="$OPS_GROUP"
 STAGING_JOBS=2
 CONTENDER_PROCESSES=(cargo rustc docker Runner.Worker java)
+# #432: tape commands at raised priority, set explicitly so the assertions below
+# compare against what the profile says, not against a default.
+TAPE_NICE=$TAPE_NICE_RUN
+TAPE_IONICE="$TAPE_IONICE_RUN"
 EOF
+# The #432 probe, run as the service user (its processes are the only ones whose
+# /proc entries it needs): helper functions for phase B's poller, and, run
+# directly, a sampler that records every tapectl process once, with the nice
+# value and I/O class it was started with, until a stop file appears.
+cat >"$RUN/tapectl_prio.py" <<'PY'
+import os, subprocess, sys, time
+
+def tapectl_procs(uid):
+    """(pid, argv) of each process of uid whose argv[0] is a path ending in tapectl."""
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{d}").st_uid != uid:
+                continue
+            argv = [a.decode("utf-8", "replace")
+                    for a in open(f"/proc/{d}/cmdline", "rb").read().split(b"\0") if a]
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]) == "tapectl":
+            yield int(d), argv
+
+def words(argv):
+    """The first two words after the binary that are not options (--home and
+    --config take a value: the CLI's only two such global options)."""
+    out, skip = [], False
+    for a in argv[1:]:
+        if skip:
+            skip = False
+        elif a in ("--home", "--config"):
+            skip = True
+        elif not a.startswith("-"):
+            out.append(a)
+            if len(out) == 2:
+                break
+    return " ".join(out)
+
+def nice_of(pid):
+    """Field 19 of /proc/PID/stat; the fields after the ')' that ends the
+    command name start at field 3."""
+    with open(f"/proc/{pid}/stat") as f:
+        st = f.read()
+    return int(st[st.rindex(")") + 2:].split()[16])
+
+def io_of(pid):
+    """ionice -p PID, e.g. 'best-effort: prio 0'; '' if the process is gone."""
+    r = subprocess.run(["ionice", "-p", str(pid)], capture_output=True, text=True)
+    return r.stdout.strip()
+
+if __name__ == "__main__":
+    stop, uid, seen = sys.argv[1], os.getuid(), set()
+    while not os.path.exists(stop):
+        for pid, argv in tapectl_procs(uid):
+            if pid in seen:
+                continue
+            try:
+                n, io = nice_of(pid), io_of(pid)
+            except (OSError, ValueError, IndexError):
+                continue
+            if io:
+                seen.add(pid)
+                print(f"{pid}\t{words(argv)}\t{n}\t{io}", flush=True)
+        time.sleep(0.02)
+PY
+chmod 0644 "$RUN/tapectl_prio.py"
+sampler_start() { # sampler_start <name>: record each tapectl process's priority until sampler_stop
+    rm -f "$RUN/prio-$1.stop"
+    # shellcheck disable=SC2024  # the redirects are ours on purpose: the service user cannot write $RUN
+    sudo -u "$SVC_USER" -H python3 "$RUN/tapectl_prio.py" "$RUN/prio-$1.stop" >"$RUN/prio-$1.tsv" 2>"$RUN/prio-$1.err" &
+    SAMPLER_PID=$!
+}
+sampler_stop() { touch "$RUN/prio-$1.stop"; chmod 0644 "$RUN/prio-$1.stop"; wait "$SAMPLER_PID" 2>/dev/null; }
+# assert_prio <name> <tape commands that must have been seen>...: the sampler's
+# record against the profile. Every `volume write/resume/verify` and `cartridge
+# erase` is raised; every other tapectl command is at THIS shell's priority; and
+# at least one of each kind was seen, or the check proves nothing.
+assert_prio() {
+    local name="$1"; shift
+    [ -s "$RUN/prio-$name.tsv" ] || { echo "the sampler recorded nothing (prio-$name.err: $(cat "$RUN/prio-$name.err" 2>/dev/null))"; return 1; }
+    python3 - "$RUN/prio-$name.tsv" "$TAPE_NICE_RUN" "$WANT_IO" "$BASE_NICE" "$BASE_IO" "$@" <<'PY'
+import sys
+tsv, want_nice, want_io, base_nice, base_io, *required = sys.argv[1:]
+TAPE = {"volume write", "volume resume", "volume verify", "cartridge erase"}
+rows = [l.rstrip("\n").split("\t") for l in open(tsv) if l.strip()]
+bad, tape, non = [], {}, {}
+for pid, cmd, nice, io in rows:
+    if cmd in TAPE:
+        tape.setdefault(cmd, []).append((nice, io))
+        if nice != want_nice or io != want_io:
+            bad.append(f"NOT RAISED: pid {pid} '{cmd}' ran at nice {nice}, '{io}' (want {want_nice}, '{want_io}')")
+    else:
+        non.setdefault(cmd, []).append((nice, io))
+        if nice != base_nice or io != base_io:
+            bad.append(f"RAISED BY MISTAKE: pid {pid} '{cmd}' ran at nice {nice}, '{io}' (want {base_nice}, '{base_io}')")
+for cmd in required:
+    if cmd not in tape:
+        bad.append(f"never saw '{cmd}' (saw tape commands: {sorted(tape) or 'none'})")
+if not non:
+    bad.append("saw no non-tape tapectl command, so 'left alone' is unproven")
+print("tape commands raised:   " + (", ".join(f"{c} x{len(v)}" for c, v in sorted(tape.items())) or "none"))
+print("other commands at base: " + (", ".join(f"{c} x{len(v)}" for c, v in sorted(non.items())) or "none"))
+print("\n".join(bad))
+sys.exit(1 if bad else 0)
+PY
+}
+
 SHELF=fr414-rack
 for u in a b c d; do
     mkdir -p "$RUN/src/keepsake/$u"
@@ -198,7 +328,7 @@ finish() {
     for n in "${CHECKS[@]}"; do [ "${RESULT[$n]}" = PASS ] || failed=$((failed + 1)); done
     echo "fr414: ${#CHECKS[@]} checks, $failed failed — signal $SIG, drive $DEVICE"
     if [ "$failed" -eq 0 ] && [ "${1:-}" != stop ]; then
-        echo "fr414: GREEN — issue #414's acceptance holds"
+        echo "fr414: GREEN — issue #414's acceptance holds, and so does #432's (tape commands raised, the rest left alone)"
         if [ "$KEEP" = 0 ]; then sudo rm -rf "$RUN"; sudo groupdel "$OPS_GROUP" 2>/dev/null; echo "fr414: workspace removed (--keep keeps it)"; fi
         exit 0
     fi
@@ -207,6 +337,13 @@ finish() {
 }
 # A phase whose check failed leaves the next one nothing to prove.
 must() { [ "${RESULT[$1]}" = PASS ] || finish stop; }
+
+# ---------- #432: the wrapper, with no tape ----------
+echo "fr414: tapectl-op priority (scripts/check-tapectl-op.sh, no tape)"
+step_wrapper_priority() {
+    "$REPO/scripts/check-tapectl-op.sh" --user "$SVC_USER" --tape-nice "$TAPE_NICE_RUN" --tape-ionice "$TAPE_IONICE_RUN" --tapectl "$TAPECTL"
+}
+check tapectl_op_priority step_wrapper_priority
 
 # ---------- phase A: the install and the rehearsal ----------
 echo "fr414: phase A — first-run.sh --to 12 (install + rehearsal); output $RUN/phase-A.out"
@@ -258,13 +395,17 @@ must blank_tape
 echo "fr414: phase B — first-run.sh --from 13, $SIG once the write is part-way; output $RUN/phase-B.out"
 step_phase_b() {
     local fr_pid poll_rc fr_rc
+    sampler_start B
     first_run --from 13 --to 13 </dev/null >"$RUN/phase-B.out" 2>&1 &
     fr_pid=$!
     # The poller runs as the service user so it can read the 0700 catalog and
     # signal the tapectl process (same uid) the moment the state is right.
-    sudo -u "$SVC_USER" -H python3 - "$DB" "$LABEL" "$SIG" "$fr_pid" <<'PY'
+    sudo -u "$SVC_USER" -H python3 - "$DB" "$LABEL" "$SIG" "$fr_pid" "$RUN" "$TAPE_NICE_RUN" "$WANT_IO" <<'PY'
 import os, signal, sqlite3, sys, time
 db, label, sig, fr_pid = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+run, want_nice, want_io = sys.argv[5], int(sys.argv[6]), sys.argv[7]
+sys.path.insert(0, run)
+import tapectl_prio as tp
 deadline = time.time() + 3600  # staging a few hundred MiB on a debug build, then the write
 Q = """SELECT SUM(wp.status IN ('written','verified')), SUM(wp.status IN ('pending','writing'))
        FROM write_positions wp JOIN writes w ON w.id = wp.write_id
@@ -301,8 +442,19 @@ while time.time() < deadline:
     if row and (row[0] or 0) >= 1 and (row[1] or 0) >= 1:
         pid = writer_pid()
         if pid:
+            # #432: read the write's priority from the kernel BEFORE it is
+            # signalled — /proc/PID/stat field 19 and ionice -p — and judge it
+            # after, so a failure still cuts the write short.
+            try:
+                nice, io = tp.nice_of(pid), tp.io_of(pid)
+            except (OSError, ValueError, IndexError):
+                nice, io = None, ""
             os.kill(pid, getattr(signal, "SIG" + sig))
             print(f"signalled tapectl pid {pid} with SIG{sig}: {row[0]} slice(s) written, {row[1]} not yet")
+            print(f"priority of the write (pid {pid}): nice {nice}, '{io}'; the profile says nice {want_nice}, '{want_io}'")
+            if nice != want_nice or io != want_io:
+                print("THE WRITE WAS NOT RAISED to the profile's TAPE_NICE/TAPE_IONICE (#432)")
+                sys.exit(3)
             sys.exit(0)
     time.sleep(0.05)
 print("TIMEOUT: the write never reached a part-way state within the hour")
@@ -310,6 +462,7 @@ sys.exit(1)
 PY
     poll_rc=$?
     wait "$fr_pid"; fr_rc=$?
+    sampler_stop B
     echo "first-run.sh exited $fr_rc"
     [ "$poll_rc" -eq 0 ] || return 1
     # first-run.sh must have died at the write, not carried on.
@@ -319,6 +472,7 @@ PY
 }
 check write_cut_short step_phase_b
 must write_cut_short
+check priority_phase_b assert_prio B "volume write"
 # The positive control: the catalog must show the session cut short. A KILL
 # leaves the rows `in_progress` (nothing could mark them; the startup sweep
 # turns them `interrupted` at the next catalog open, which is step 13's own
@@ -379,10 +533,12 @@ assert_post_write_block() { # assert_post_write_block <verify-id-before> <phase-
 
 echo "fr414: phase C — the re-entry, first-run.sh --from 13; output $RUN/phase-C.out"
 step_phase_c() {
-    local before
+    local before rc
     before="$(max_verify_id)"; touch "$RUN/phase-C.start"; sleep 1
-    first_run --from 13 </dev/null >"$RUN/phase-C.out" 2>&1 \
-        || { echo "the re-entry exited non-zero"; tail -40 "$RUN/phase-C.out"; return 1; }
+    sampler_start C
+    first_run --from 13 </dev/null >"$RUN/phase-C.out" 2>&1; rc=$?
+    sampler_stop C
+    [ "$rc" -eq 0 ] || { echo "the re-entry exited non-zero"; tail -40 "$RUN/phase-C.out"; return 1; }
     grep "step 13: volume $LABEL is resume" "$FR_LOG" >/dev/null \
         || { echo "step 13 did not classify $LABEL as an interrupted write (first-run log)"; return 1; }
     grep -E "^ +\\\$ .* volume resume $LABEL " "$RUN/phase-C.out" >/dev/null \
@@ -394,14 +550,17 @@ step_phase_c() {
 }
 check reentry_resumes_and_finishes step_phase_c
 must reentry_resumes_and_finishes
+check priority_phase_c assert_prio C "volume resume" "volume verify"
 
 # ---------- phase D: the sealed path ----------
 echo "fr414: phase D — first-run.sh --from 13 on the sealed volume; output $RUN/phase-D.out"
 step_phase_d() {
-    local before nwrites
+    local before nwrites rc
     before="$(max_verify_id)"; nwrites="$(writes_count)"; touch "$RUN/phase-D.start"; sleep 1
-    first_run --from 13 --to 13 </dev/null >"$RUN/phase-D.out" 2>&1 \
-        || { echo "the sealed re-entry exited non-zero"; tail -40 "$RUN/phase-D.out"; return 1; }
+    sampler_start D
+    first_run --from 13 --to 13 </dev/null >"$RUN/phase-D.out" 2>&1; rc=$?
+    sampler_stop D
+    [ "$rc" -eq 0 ] || { echo "the sealed re-entry exited non-zero"; tail -40 "$RUN/phase-D.out"; return 1; }
     grep "step 13: volume $LABEL is sealed" "$FR_LOG" >/dev/null \
         || { echo "step 13 did not classify $LABEL as sealed (first-run log)"; return 1; }
     if grep -E "^ +\\\$ .* (volume write|volume resume|volume init|stage create) " "$RUN/phase-D.out" >/dev/null; then
@@ -411,5 +570,6 @@ step_phase_d() {
     assert_post_write_block "$before" "$RUN/phase-D.start" "$RUN/phase-D.out"
 }
 check sealed_reentry_runs_only_the_post_write_block step_phase_d
+check priority_phase_d assert_prio D "volume verify"
 
 finish
