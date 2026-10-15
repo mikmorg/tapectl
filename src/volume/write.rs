@@ -15235,6 +15235,83 @@ mod tests {
             assert_each_page_read_once(&src.borrow().reads);
         }
 
+        /// A verify with no label that is refused after File 0 (a tape the
+        /// catalog does not know) closes its contact `failed` AND takes the
+        /// contact's one sweep, as a labelled verify that failed does
+        /// (issue #442): once, against that contact, naming no volume —
+        /// the catalog has none for this tape.
+        #[test]
+        fn a_no_label_verify_refused_after_file0_is_swept_once_too() {
+            use crate::tape::log_pages::tests::{
+                assert_each_page_read_once, FixtureSource, LISTED,
+            };
+            let conn = crate::db::open_memory().unwrap();
+            let data = b"no-label refusal sweep fixture bytes. ".repeat(4);
+            let mut store = mem_store_v2_tape("NOT-IN-CATALOG", &data, &data);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = swept_config(tmp.path());
+            let src = std::cell::RefCell::new(FixtureSource::default());
+            let identity = identity_with_serial(Some("XYZZY_A1"));
+
+            let err = verify_loaded_with_store(
+                &conn,
+                &mut store,
+                4096,
+                Tier::Integrity,
+                ContactSite::new(
+                    &config,
+                    Operation::VolumeVerify,
+                    TEST_DEVICE,
+                    Medium::NoBackend,
+                )
+                .with_drive_identity(&identity)
+                .with_log_source(&src),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("no volume with that uuid"), "{err}");
+
+            let (operation, outcome, detail) = only_contact(&conn);
+            assert_eq!(operation, "volume verify");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            assert!(
+                detail
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("no volume with that uuid"),
+                "{detail:?}"
+            );
+            let cid: i64 = conn
+                .query_row("SELECT id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_each_page_read_once(&src.borrow().reads);
+            let swept_pages: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM log_page_journal WHERE contact_id = ?1",
+                    params![cid],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                swept_pages as usize,
+                LISTED.len(),
+                "page 0x00 then every listed page (LISTED opens with 0x00), once, against \
+                 THIS contact"
+            );
+            let health: Vec<(Option<i64>, Option<i64>)> = conn
+                .prepare("SELECT contact_id, volume_id FROM health_logs")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                health,
+                vec![(Some(cid), None)],
+                "one health reading, on the contact, naming no volume"
+            );
+        }
+
         /// Every read seam takes its reading through the ONE helper, once,
         /// and nothing else in production calls it — so backend resolution
         /// (`health_backend`, #313) is identical on every read path.
