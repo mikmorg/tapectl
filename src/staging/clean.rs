@@ -688,6 +688,10 @@ pub struct CleanReport {
     /// `locks/stage-<id>.lock` files removed because their stage_set
     /// reached a terminal state (`staged`, `failed`, `cleaned`).
     pub lockfiles_reclaimed: usize,
+    /// What a hard kill leaves in the tapectl home (issue #465): the
+    /// catalogue directories of stage sets that never staged, and `<home>/tmp`
+    /// entries older than a day — see `reclaim_home_leftovers`.
+    pub home_leftovers_reclaimed: usize,
     /// Stage sets NOT released because a live session holds the lock of a
     /// volume they are planned onto (issue #376), with those volumes'
     /// labels. `--force` does not release them; they wait for the session.
@@ -695,7 +699,8 @@ pub struct CleanReport {
 }
 
 /// Reclaim `{staging.directory}/sessions/*` directories and terminal
-/// `locks/stage-<id>.lock` files (issue #95).
+/// `locks/stage-<id>.lock` files (issue #95), and what a hard-killed run
+/// left in the tapectl home ([`reclaim_home_leftovers`], issue #465).
 ///
 /// ## Session directories
 ///
@@ -759,7 +764,115 @@ pub fn reclaim_session_dirs_and_lockfiles(
 ) -> Result<()> {
     reclaim_session_dirs(conn, config, force, report)?;
     reclaim_lockfiles(conn, db_file, report)?;
+    reclaim_home_leftovers(conn, db_file, report)?;
     Ok(())
+}
+
+/// How old an entry of `<home>/tmp` must be, by the newest change anywhere
+/// in it, to be called a leftover. A live stage or write uses `tmp` for
+/// minutes to hours (a tape write is the longest), so a day is well clear.
+const HOME_TMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// What `cleanup_failed_stage_set` and `TempDir`'s drop remove in-process
+/// and a SIGKILL or a power loss does not (issue #465; `threat-model.md` §3
+/// promises `staging clean` handles what was left):
+///
+/// - **`<home>/catalogs/<uuid8>/s<id>/`** (issue #419) of a stage set that
+///   never staged: `staged_at IS NULL`, and `failed` — or `cleaned`, because
+///   `clean_staging` releases failed sets before this runs. A set that was
+///   staged keeps its catalogue even when released: `restore` reads it
+///   (`dar::restore::entry_slices`). A set still `staging` is live.
+/// - **`<home>/tmp/*`** (`staging::home_work_dir`: dar's slice template, the
+///   write's `catalog.db`), when nothing in the entry changed for
+///   [`HOME_TMP_MAX_AGE`]. Never a younger one: a live run is using it.
+///
+/// The home is the directory holding the catalog, as for the lockfiles.
+fn reclaim_home_leftovers(
+    conn: &Connection,
+    db_file: &Path,
+    report: &mut CleanReport,
+) -> Result<()> {
+    let Some(home) = db_file.parent() else {
+        return Ok(());
+    };
+    let never_staged: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT ss.id, u.uuid FROM stage_sets ss
+             JOIN snapshots sn ON sn.id = ss.snapshot_id
+             JOIN units u ON u.id = sn.unit_id
+             WHERE ss.status IN ('failed', 'cleaned') AND ss.staged_at IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let paths = crate::config::TapectlPaths::new(home.to_path_buf());
+    for (stage_set_id, uuid) in never_staged {
+        let dir = crate::staging::stage_set_catalogue_dir(&paths, &uuid, stage_set_id);
+        if dir.is_dir() {
+            remove_leftover(&dir, report);
+        }
+    }
+
+    let now = std::time::SystemTime::now();
+    if let Ok(entries) = fs::read_dir(home.join("tmp")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let old = newest_change(&path)
+                .and_then(|changed| now.duration_since(changed).ok())
+                .is_some_and(|age| age >= HOME_TMP_MAX_AGE);
+            if old {
+                remove_leftover(&path, report);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The newest modification time of `path` and, for a directory, of
+/// everything under it (symlinks are not followed). `None` where it cannot
+/// be read, which keeps the entry.
+fn newest_change(path: &Path) -> Option<std::time::SystemTime> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    let mut newest = meta.modified().ok()?;
+    if meta.is_dir() {
+        for entry in fs::read_dir(path).ok()?.flatten() {
+            newest = newest.max(newest_change(&entry.path())?);
+        }
+    }
+    Some(newest)
+}
+
+/// Remove a leftover file or directory tree (never following a symlink),
+/// counting it and its size, or the failure.
+fn remove_leftover(path: &Path, report: &mut CleanReport) {
+    let is_dir = fs::symlink_metadata(path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    let size = if is_dir {
+        dir_size(path)
+    } else {
+        fs::symlink_metadata(path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(0)
+    };
+    let removed = if is_dir {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match removed {
+        Ok(()) => {
+            tracing::info!(path = %path.display(), "removed a leftover of a killed run");
+            report.home_leftovers_reclaimed += 1;
+            report.bytes_freed += size;
+        }
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "failed to remove a leftover");
+            report.errors += 1;
+        }
+    }
 }
 
 fn reclaim_session_dirs(
@@ -2190,6 +2303,156 @@ mod tests {
             );
             assert_eq!(report.lockfiles_reclaimed, 1);
         }
+    }
+
+    /// Issue #465 item 5: a SIGKILL or a power loss mid-stage leaves the
+    /// stage set's catalogue directory (`<home>/catalogs/<uuid8>/s<id>/`,
+    /// issue #419) behind — `cleanup_failed_stage_set` runs only in-process.
+    /// `staging clean` removes it for a set that never reached `staged`. The
+    /// set is `failed` when the sweep looks, or already `cleaned` (the same
+    /// command's `clean_staging` releases failed sets first); either way
+    /// `staged_at` is NULL. A set that was staged keeps its catalogue — it
+    /// serves `restore` (`entry_slices`) — released or not; a set still
+    /// `staging` is live.
+    #[test]
+    fn staging_clean_removes_the_catalogue_directory_of_a_set_that_never_staged() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+             VALUES ('abcdef01-2345-6789-abcd-ef0123456789', 'u', ?1, '/tmp/u', 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp/u', 1, 10)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snapshot_id = conn.last_insert_rowid();
+        let home = tempfile::tempdir().unwrap();
+        let db_file = home.path().join("tapectl.db");
+        let catalogue_dir = |id: i64| home.path().join(format!("catalogs/abcdef01/s{id}"));
+
+        let mut sets = Vec::new();
+        for (status, staged) in [
+            ("failed", false),
+            ("cleaned", false),
+            ("cleaned", true),
+            ("staged", true),
+            ("staging", false),
+        ] {
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size, staged_at)
+                 VALUES (?1, ?2, 524288, CASE WHEN ?3 THEN datetime('now') END)",
+                params![snapshot_id, status, staged],
+            )
+            .unwrap();
+            let id = conn.last_insert_rowid();
+            let dir = catalogue_dir(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("abcdef01_v1.1.dar"), b"catalogue").unwrap();
+            sets.push((id, status, staged));
+        }
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs_and_lockfiles(
+            &conn,
+            &config_for(home.path()),
+            &db_file,
+            false,
+            &mut report,
+        )
+        .unwrap();
+
+        for (id, status, staged) in sets {
+            let gone = !staged && matches!(status, "failed" | "cleaned");
+            assert_eq!(
+                catalogue_dir(id).exists(),
+                !gone,
+                "{status} (staged: {staged}): its catalogue directory {}",
+                if gone { "is removed" } else { "is kept" }
+            );
+        }
+        assert_eq!(report.home_leftovers_reclaimed, 2);
+        assert_eq!(report.errors, 0);
+    }
+
+    /// Issue #465 item 5: `<home>/tmp` holds the plaintext of a stage or a
+    /// write for a moment (dar's slice template, the write's `catalog.db`);
+    /// a hard kill leaves it. `staging clean` removes what is older than a
+    /// day — by the newest change anywhere in it, since a live write's file
+    /// is rewritten inside a directory whose own mtime stays put — and
+    /// never what is younger, which a live run is using.
+    #[test]
+    fn staging_clean_removes_home_tmp_entries_older_than_a_day_and_only_those() {
+        let conn = db::open_memory().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let db_file = home.path().join("tapectl.db");
+        let tmp = home.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let ago = |secs: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        let age = |path: &Path, secs: u64| {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(ago(secs))
+                .unwrap();
+        };
+        let (day, hour) = (24 * 3600, 3600);
+
+        // An old work directory and an old stray file: removed.
+        let old_dir = tmp.join(".dar-slice-template-old");
+        std::fs::create_dir_all(old_dir.join("empty")).unwrap();
+        std::fs::write(old_dir.join("template.1.dar"), b"x").unwrap();
+        for p in [
+            old_dir.join("template.1.dar"),
+            old_dir.join("empty"),
+            old_dir.clone(),
+        ] {
+            age(&p, 3 * day);
+        }
+        let old_file = tmp.join("catalog-old.db");
+        std::fs::write(&old_file, b"x").unwrap();
+        age(&old_file, 2 * day);
+        // A young directory and file: kept.
+        let young_dir = tmp.join(".dar-slice-template-young");
+        std::fs::create_dir_all(&young_dir).unwrap();
+        age(&young_dir, hour);
+        let young_file = tmp.join("catalog-young.db");
+        std::fs::write(&young_file, b"x").unwrap();
+        // The directory's own mtime is old, but a file inside it changed an
+        // hour ago: a live run is writing there. Kept.
+        let busy_dir = tmp.join(".tapectl-write-busy");
+        std::fs::create_dir_all(&busy_dir).unwrap();
+        std::fs::write(busy_dir.join("catalog.db"), b"x").unwrap();
+        age(&busy_dir.join("catalog.db"), hour);
+        age(&busy_dir, 3 * day);
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs_and_lockfiles(
+            &conn,
+            &config_for(home.path()),
+            &db_file,
+            false,
+            &mut report,
+        )
+        .unwrap();
+
+        assert!(!old_dir.exists(), "an old work directory is removed");
+        assert!(!old_file.exists(), "an old file is removed");
+        assert!(young_dir.exists(), "a young directory is kept");
+        assert!(young_file.exists(), "a young file is kept");
+        assert!(busy_dir.exists(), "a directory written to lately is kept");
+        assert_eq!(report.home_leftovers_reclaimed, 2);
+        assert!(report.bytes_freed >= 2, "{}", report.bytes_freed);
+        assert!(tmp.exists(), "`tmp` itself stays");
     }
 
     /// A sibling stage_set's plaintext files must never be swept up by
