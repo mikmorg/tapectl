@@ -39,6 +39,10 @@ Environment=TAPECTL_BACKUP_KEEP=14
 # Absolute path to the wrapper (adjust to wherever you installed it).
 ExecStart=/usr/local/lib/tapectl/tapectl-scheduled-backup.sh
 
+# Exit 75 is "the catalog was busy; retry later", not a failure (the wrapper's
+# header, the timer, docs/install.md): no backup this run, and no failed unit.
+SuccessExitStatus=75
+
 # No tape device, no writes outside the tapectl home and the backup
 # directory. The home itself must be writable: the database is in WAL mode,
 # so even a read-only open writes the -wal/-shm sidecars beside tapectl.db.

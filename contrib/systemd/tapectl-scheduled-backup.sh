@@ -31,7 +31,11 @@
 #
 # Retention prunes ONLY files this script named (tapectl-<UTC stamp>.db),
 # newest first by name, which sorts by time because the stamp is ISO-8601
-# basic. Anything else in the directory is left alone.
+# basic. Anything else in the directory is left alone. The copy this run just
+# wrote is never pruned and counts toward $TAPECTL_BACKUP_KEEP (#470): with a
+# clock that went backwards (a dead CMOS battery, a timer firing before NTP)
+# it would otherwise sort last and be deleted by its own run. A copy named
+# later than this run's stamp is reported, since it holds a retention slot.
 #
 # Exit status: nonzero if the backup failed its header check, or fsck
 # reported problems. 75 (with no /fail ping) if the catalog was busy — another
@@ -117,9 +121,12 @@ echo "== retention: keep newest $KEEP in $DIR =="
 # Newest first by name (the stamp sorts chronologically); everything after
 # the first $KEEP is pruned. `-maxdepth 1` and the exact glob mean nothing
 # this script did not write is ever a candidate.
-n=0
+n=1 # the copy just written, always kept
 pruned=0
 while IFS= read -r f; do
+	[ "$f" = "$OUT" ] && continue
+	[[ "$(basename "$f")" > "$(basename "$OUT")" ]] \
+		&& echo "retention: $(basename "$f") is named later than this run's copy: the clock was ahead when it was written, or is behind now" >&2
 	n=$((n + 1))
 	[ "$n" -le "$KEEP" ] && continue
 	if rm -f -- "$f"; then
@@ -131,6 +138,7 @@ while IFS= read -r f; do
 	fi
 done < <(find "$DIR" -maxdepth 1 -type f -name 'tapectl-[0-9]*T[0-9]*Z.db' -print | sort -r)
 echo "retention: $((n - pruned)) kept, $pruned pruned"
+[ -f "$OUT" ] || fail "the copy just written ($OUT) is gone after retention"
 
 if [ "$fsck_rc" -eq 75 ]; then
 	echo "backup: ok; db fsck skipped — catalog busy (another tapectl command holds it), retry later" >&2

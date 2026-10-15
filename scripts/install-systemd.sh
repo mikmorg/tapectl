@@ -234,6 +234,11 @@ THOME="${TAPECTL_HOME_DIR:-$SVC_HOME/.tapectl}"
 # The pointer holds this path, and tapectl refuses a relative one.
 case "$THOME" in /*) ;; *) die "the tapectl home '$THOME' is not an absolute path — pass absolute --home / --tapectl-home" ;; esac
 for p in "$SVC_HOME" "$THOME" "$BACKUP_DIR" "$BIN"; do case "$p" in *[[:space:]]*) die "path '$p' contains whitespace, which systemd's Environment= and ReadWritePaths= would split" ;; esac; done
+# These are substituted into the units with sed (`s|...|$p|`), where | & and \
+# are special: refuse them by name, as the user and binary are refused above (#470).
+for p in "$SVC_HOME" "$THOME" "$BACKUP_DIR" "$LIBDIR" "${TAPECTL_HOME_DIR:-}"; do
+  case "$p" in *\|* | *\&* | *\\*) die "path '$p' contains | & or \\, which the unit rendering cannot carry" ;; esac
+done
 if [ -x "$BIN" ]; then ok "binary: $BIN"; else note "$BIN is not there (or not executable) — the timers will fail until it is (first-run step 3 installs it)"; fi
 printf '   user %s, HOME %s, tapectl home %s\n' "$SVC_USER" "$SVC_HOME" "$THOME"
 printf '   home pointer: %s -> %s\n' "$POINTER_PATH" "$THOME"

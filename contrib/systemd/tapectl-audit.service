@@ -25,8 +25,9 @@ ExecStart=/usr/local/lib/tapectl/tapectl-scheduled-audit.sh
 # The wrapper propagates `tapectl audit`'s real exit code so it is visible in
 # `systemctl status`, but exit 1 means "advisory warnings" and must not be a
 # unit failure — ADR-0004's audit warns, it never blocks. Only exit 2
-# (violations) is a real failure.
-SuccessExitStatus=1
+# (violations) is a real failure. Exit 75 is "the catalog was busy; retry
+# later", not a verdict and not a failure (#470).
+SuccessExitStatus=1 75
 
 # Read-only advisory work: no tape device, no writes outside the tapectl home.
 # `audit` still walks each active unit's source directory, so reads must stay

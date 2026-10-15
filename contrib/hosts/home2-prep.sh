@@ -81,12 +81,14 @@ id "$SVC" >/dev/null 2>&1 || die "no $SVC user — scripts/first-run.sh step 5 c
 
 # ------------------------------------------------------------------ 1
 hdr "1  The drive belongs to home2"
-NST_DEV="$(readlink -f /sys/class/scsi_tape/nst0/device 2>/dev/null || true)"
-case "$NST_DEV" in
-  */4:0:4:0) ok "the LTO-6 is nst0 at 4:0:4:0 here — scsi_host4 target 4 unit 0, as $HOSTDEV_XML says" ;;
-  *) die "nst0 is not at 4:0:4:0 (${NST_DEV:-absent}) — the SCSI numbering moved; fix $HOSTDEV_XML (lsscsi -g) before detaching" ;;
-esac
 if virsh -c qemu:///system dumpxml "$VM" 2>/dev/null | grep "adapter name='scsi_host4'" >/dev/null; then
+  # Checked only when there is something to detach (#470): on a prepared
+  # host a renumbered nst0 is no reason to stop before parts 2-9.
+  NST_DEV="$(readlink -f /sys/class/scsi_tape/nst0/device 2>/dev/null || true)"
+  case "$NST_DEV" in
+    */4:0:4:0) ok "the LTO-6 is nst0 at 4:0:4:0 here — scsi_host4 target 4 unit 0, as $HOSTDEV_XML says" ;;
+    *) die "nst0 is not at 4:0:4:0 (${NST_DEV:-absent}) — the SCSI numbering moved; fix $HOSTDEV_XML (lsscsi -g) before detaching" ;;
+  esac
   note "$VM still has the drive as a hostdev: two hosts can open it, and they share no tape lock"
   note "before detaching: nothing on $VM may be using it (no gate, lifecycle suite, fill or tapectl run)"
   if part "Detach the LTO-6 from $VM now (live and persistent)?"; then
