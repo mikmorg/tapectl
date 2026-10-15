@@ -416,9 +416,35 @@ fn rebuild_scratch(paths: &crate::config::TapectlPaths) -> Result<tempfile::Temp
     Ok(work)
 }
 
+/// Run a `catalog` command that needs no tapectl home. `catalog rebuild`
+/// does (it decrypts into one) and is refused here; the binary calls
+/// [`run_with_paths`], which runs every command.
 pub fn run(
     conn: &Connection,
+    config: &crate::config::Config,
+    command: &CatalogCommands,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<()> {
+    dispatch(conn, None, config, command, json_output, dry_run)
+}
+
+/// Run any `catalog` command, `catalog rebuild` included, in the tapectl home
+/// `paths` names.
+pub fn run_with_paths(
+    conn: &Connection,
     paths: &crate::config::TapectlPaths,
+    config: &crate::config::Config,
+    command: &CatalogCommands,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<()> {
+    dispatch(conn, Some(paths), config, command, json_output, dry_run)
+}
+
+fn dispatch(
+    conn: &Connection,
+    paths: Option<&crate::config::TapectlPaths>,
     config: &crate::config::Config,
     command: &CatalogCommands,
     json_output: bool,
@@ -602,6 +628,13 @@ pub fn run(
             // Removed when `work` drops, on every path out, success or
             // failure, exactly as `RestoreScratch` does for decrypted slices
             // (#102): it holds decrypted MANIFEST/catalog.db copies.
+            let paths = paths.ok_or_else(|| {
+                TapectlError::Other(
+                    "catalog rebuild decrypts into the tapectl home and was not given one \
+                     (call it through run_with_paths)"
+                        .to_string(),
+                )
+            })?;
             let work = rebuild_scratch(paths)?;
             let scratch = work.path().to_path_buf();
             let report = crate::volume::rebuild::rebuild_from_volume(
@@ -1141,11 +1174,12 @@ fn unsealed_tape_lines(report: &RebuildReport) -> Vec<String> {
         "  warning: volume \"{label}\" has NO VALID SEAL MARKER: {why}"
     )];
     match (&report.found_volume_status, report.volume_inserted) {
-        (None, _) => lines.push(format!(
+        (None, _) => lines.push(
             "    recorded as an unsealed volume: status \"initialized\", its writes \"aborted\" and \
              its slice positions \"pending\" — an interrupted or aborted write. It is NOT a \
              copy: nothing on it counts toward any unit's copies, in `audit` or in `report copies`."
-        )),
+                .to_string(),
+        ),
         (Some(status), _) if status == "sealed" => lines.push(format!(
             "    this catalog already holds \"{label}\" as \"sealed\", which this tape does not \
              support, and the rebuild left that row alone; the writes it added are \"aborted\". \
