@@ -144,10 +144,14 @@ fn superseding_verdict(
     //
     // Item 46: the multiplier never raises a count of distinct places. Until
     // it, this gate also asked a tape-only unit's superseding version for
-    // (distinct named locations x multiplier) distinct places; that check is
-    // gone, not merely unmultiplied — once every name holds its copies (the
-    // check below), the distinct-place count is at least the number of
-    // names, so an unmultiplied place count could never bind.
+    // (distinct named locations x multiplier) distinct places; that check
+    // was removed, not merely unmultiplied — once every name holds its
+    // copies (the check below), the distinct-place count is at least the
+    // number of names, so an unmultiplied count OF NAMES could never bind.
+    // `[defaults] min_locations` is a different number and does bind (issue
+    // #425): it applies with no names at all, or one, so it is asked last,
+    // as set, through the one predicate `audit`'s `location_count` and `unit
+    // mark-tape-only` ask too.
     let required_copies = super::coverage::copy_floor(config, resolved.min_copies, &unit.status);
     let tape_only_note = super::coverage::tape_only_note(config, &unit.status);
 
@@ -216,6 +220,28 @@ fn superseding_verdict(
                 superseding.1,
                 super::coverage::describe_named_shortfall(&short, per_name),
             ),
+        });
+    }
+
+    // Issue #425 (ADR-0012 2026-10-12 items 46 and 47): `[defaults]
+    // min_locations`, the distinct-place floor of a tape-only unit, asked of
+    // the SUPERSEDING version alone — the version that must carry the unit
+    // once the released one is gone. Until now only `unit mark-tape-only`
+    // read it, so the older version was released while the version superseding
+    // it sat entirely in one place, as long as the copy and per-name floors
+    // were met. Asked after the more specific named-location blockers, and
+    // never multiplied. The shortfall is a Tier-2 fact like every other
+    // blocker here (`snapshot mark-reclaimable` puts it to the consent gate).
+    if let Some(short) = super::coverage::short_of_location_floor(
+        conn,
+        config,
+        super::coverage::NamedScope::Snapshot(superseding.0),
+        &unit.status,
+    )? {
+        return Ok(ReclaimVerdict::Blocked {
+            superseding_version: Some(superseding.1),
+            freeable_bytes: freeable,
+            reason: format!("superseding v{} has {}", superseding.1, short.describe()),
         });
     }
 
@@ -938,6 +964,11 @@ pub(crate) mod tests {
         // only (1 x 2 copies, 2 at `offsite`), never the count of distinct
         // places, so one place meets the one name and the release stands.
         // (Until item 46 the place count was multiplied to 2 and blocked.)
+        // `min_locations` is set to 1 to isolate that question: at the
+        // default 2 these three copies in one place are short of the
+        // `[defaults]` place floor, which issue #425 made this gate ask (see
+        // `tape_only_four_copies_in_one_place_is_blocked_by_the_place_floor`).
+        config.defaults.min_locations = 1;
         conn.execute(
             "UPDATE volume_deposits SET location_id = (SELECT id FROM locations WHERE name = 'offsite')",
             [],
@@ -955,7 +986,7 @@ pub(crate) mod tests {
 
     /// One more sealed volume `label` at location `loc` (created if new),
     /// holding the HIGHEST version of [`setup`]'s unit `name`.
-    fn add_copy_of_top(conn: &Connection, name: &str, label: &str, loc: &str) {
+    pub(crate) fn add_copy_of_top(conn: &Connection, name: &str, label: &str, loc: &str) {
         conn.execute(
             "INSERT OR IGNORE INTO locations (name, kind) VALUES (?1, 'shelf')",
             params![loc],
@@ -1010,6 +1041,109 @@ pub(crate) mod tests {
                 freeable_bytes: 1000,
             },
             "4 copies in 2 places, 2 at each name, meets a tape-only unit's floors"
+        );
+    }
+
+    /// Issue #425 (ADR-0012 2026-10-12 items 46 and 47) at the DEFAULTS:
+    /// `[defaults] min_locations` was read only by `unit mark-tape-only`, so
+    /// `snapshot mark-reclaimable` released the older version of a tape-only
+    /// unit while the version superseding it sat entirely in one place, as
+    /// long as the copy floor was met. 4 copies in 1 place meets 2 x 2
+    /// copies and is short of 2 places; moving one to another place meets it.
+    /// The verdict is `candidates`' too (`report supersedable`).
+    #[test]
+    fn tape_only_four_copies_in_one_place_is_blocked_by_the_place_floor() {
+        let name = "sup-four-in-one";
+        let (conn, unit) = setup(name, 2, "sealed", "tape_only");
+        // `setup`'s volumes are unplaced; shelve them, and two more copies
+        // of the superseding version, all at `home`.
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('home', 'shelf')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'home')",
+            [],
+        )
+        .unwrap();
+        add_copy_of_top(&conn, name, "sup-four-in-one-HOME3", "home");
+        add_copy_of_top(&conn, name, "sup-four-in-one-HOME4", "home");
+        let config = Config::default();
+        assert_eq!(config.defaults.min_locations, 2);
+
+        let blocked = ReclaimVerdict::Blocked {
+            superseding_version: Some(2),
+            freeable_bytes: 1000,
+            reason: "superseding v2 has copies in 1 location(s), needs 2 \
+                     ([defaults] min_locations)"
+                .to_string(),
+        };
+        assert_eq!(assess(&conn, &config, &unit, 1).unwrap(), blocked);
+        let found = candidates(&conn, &config).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].verdict, blocked,
+            "`report supersedable` must advertise exactly what the gate refuses"
+        );
+
+        // Not multiplied: at 3x the copy floor is 6 (the unit holds 4), and
+        // the place floor stays 2 — the copy shortfall is what is reported.
+        let mut config3 = Config::default();
+        config3.compaction.tape_only_safety_multiplier = 3;
+        match assess(&conn, &config3, &unit, 1).unwrap() {
+            ReclaimVerdict::Blocked { reason, .. } => {
+                assert!(reason.contains("has 4 copies, needs 6"), "{reason}")
+            }
+            other => panic!("expected the copy shortfall first at 3x: {other:?}"),
+        }
+
+        // Positive control: one copy shelved elsewhere is 4 copies in 2
+        // places, and the release stands.
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('offsite', 'shelf')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'offsite')
+             WHERE label = 'sup-four-in-one-HOME4'",
+            [],
+        )
+        .unwrap();
+        let releasable = ReclaimVerdict::Releasable {
+            superseding_version: 2,
+            freeable_bytes: 1000,
+        };
+        assert_eq!(assess(&conn, &config, &unit, 1).unwrap(), releasable);
+        assert_eq!(candidates(&conn, &config).unwrap()[0].verdict, releasable);
+    }
+
+    /// The place floor is a tape-only floor (`policy::coverage::
+    /// location_floor`): the same catalog under an ACTIVE unit — copies
+    /// enough, all in one place — still releases. This is also what keeps a
+    /// catalog that never ran `location add` (every volume unplaced, 0
+    /// places) from blocking every release.
+    #[test]
+    fn an_active_unit_is_not_held_to_the_place_floor() {
+        let name = "sup-active-one-place";
+        let (conn, unit) = setup(name, 2, "sealed", "active");
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('home', 'shelf')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'home')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            assess(&conn, &Config::default(), &unit, 1).unwrap(),
+            ReclaimVerdict::Releasable {
+                superseding_version: 2,
+                freeable_bytes: 1000,
+            }
         );
     }
 

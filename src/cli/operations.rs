@@ -7198,6 +7198,57 @@ mod tests {
             snapshot_mark_reclaimable(&conn, &config, "agree-ok", 1, false, false, false)
                 .expect("assess said Releasable, so the gate must accept");
         }
+
+        /// Issue #425 (ADR-0012 2026-10-12 items 46 and 47): a tape-only
+        /// unit whose superseding version holds 4 copies in ONE place meets
+        /// the copy floor (2 x 2) and is short of `min_locations` 2, which
+        /// only `unit mark-tape-only` used to read. The gate refuses with
+        /// `assess`'s reason — the same one `report supersedable` prints —
+        /// and it stays a Tier-2 consent gate: `--force` proceeds.
+        #[test]
+        fn four_copies_in_one_place_refuses_a_tape_only_release_until_consent() {
+            use crate::policy::reclaimable::tests::add_copy_of_top;
+            let name = "agree-one-place";
+            let (conn, unit) = setup(name, 2, "sealed", "tape_only");
+            conn.execute(
+                "INSERT INTO locations (name, kind) VALUES ('home', 'shelf')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE volumes SET location_id = (SELECT id FROM locations WHERE name = 'home')",
+                [],
+            )
+            .unwrap();
+            add_copy_of_top(&conn, name, "agree-one-place-HOME3", "home");
+            add_copy_of_top(&conn, name, "agree-one-place-HOME4", "home");
+            let config = Config::default();
+            let reason = match assess(&conn, &config, &unit, 1).unwrap() {
+                ReclaimVerdict::Blocked { reason, .. } => reason,
+                other => panic!("expected Blocked on the place floor, got {other:?}"),
+            };
+            assert_eq!(
+                reason,
+                "superseding v2 has copies in 1 location(s), needs 2 ([defaults] min_locations)"
+            );
+
+            let err = snapshot_mark_reclaimable(&conn, &config, name, 1, false, false, false)
+                .expect_err("one place is short of min_locations 2");
+            let msg = err.to_string();
+            assert!(msg.contains(&format!("\n{reason}\n")), "{msg}");
+            assert!(msg.contains("refused: non-interactive session"), "{msg}");
+            let status = |conn: &Connection| -> String {
+                conn.query_row("SELECT status FROM snapshots WHERE version = 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+            };
+            assert_eq!(status(&conn), "current");
+
+            snapshot_mark_reclaimable(&conn, &config, name, 1, true, false, false)
+                .expect("Tier 2: --force confirms the shortfall in advance");
+            assert_eq!(status(&conn), "reclaimable");
+        }
     }
 
     /// ADR-0011 / issue #148: `cartridge retire` — the writer
