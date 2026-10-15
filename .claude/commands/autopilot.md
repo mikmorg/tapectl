@@ -19,6 +19,37 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
+- **QUEUE STATE 2026-10-15 (NEWEST; everything below it is history) — THE 1.1.2 QUEUE.**
+  Production is home2 on 1.1.0, upgrading in place to 1.1.1 (`docs/handoff.md` (f)).
+  `v1.1.1` goes on master `d165ef7` once the mhvtl gate passes on it (its `src/`,
+  `scripts/`, `Cargo.*` are byte-identical to `4cb98a0`, the last code commit).
+  **The queue is issues #444–#457**, planned in `docs/audits/2026-10-15-design-review.md`
+  §9 and ruled in ADR-0012 amendment "2026-10-15 (later)", items 65–70. Read §9: it names
+  the release each item ships in (1.1.2 patch vs 1.2.0 re-pin), the files each touches and
+  the waves:
+  - **W0 #452** — the adversarial review of `cf4a371..v1.1.1` (1.1.0 was never reviewed as
+    code). CTO said go 2026-10-15 ("/autopilot go" after the plan named it as waiting on
+    them). Run as six read-only sonnet finders through the Agent tool (no Workflow: the
+    CTO has not opted into workflows), rules in the scratchpad's `review-1.1/common.md`;
+    the coordinator verifies every medium and high by reading the cited lines, then files
+    and triages the findings into W1–W4 BEFORE W1 starts.
+  - **W1** #444 ∥ #448 (cover sheet only) ∥ #446. **W2** #445 ∥ #447 ∥ #450.
+    **W3** #454 ∥ #453 part 1 ∥ #451. **W4** #456 ∥ #455 part 1 ∥ #457.
+  - **Not 1.1.2:** #449 and #448's File 1 half (they change generated on-tape text: the
+    next CTO-approved re-pin, 1.2.0), #453 part 2 and #455 part 2 (1.2.0), #420, #388,
+    #418 R4, #409, #364.
+  - **Real drive:** never from this VM. The one afternoon on EW7VWMVKF6 that §9 lists
+    (#444's two measurements, #420's past-EW count) is the CTO's or an agent's on home2 on
+    their go-ahead.
+  Standing directions still in force: commit autonomously; tapectl has priority on the
+  shared build lock with homorg (`/scratch/tapectl-build.lock`), but ask before taking a
+  window homorg was promised; debug/check builds only; keep token use moderate; a
+  `scripts/` change is proven by the whole chain before it lands. The worker template is
+  `.claude/commands/worktree-agent.md`; the 1.1.1 batch's worker rules are in the
+  scratchpad's `w111/common.md`. mhvtl devices: nst3/nst4 are the LTO-8 drives (A1/A2,
+  the gate's), nst1/nst2 LTO-6; the real drive is on home2. The next migration number is
+  037 (verify with `ls src/db/migrations | tail -1`).
+
 - **HOW TO RUN THE QUEUE — CTO rulings 2026-09-15. Read with the queue entry
   below; these six answers govern it.**
   1. **No separate verification pass; verify at pickup.** The adversarial check
