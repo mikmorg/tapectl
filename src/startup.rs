@@ -239,7 +239,9 @@ fn read_home_pointer(file: &Path) -> Result<Option<PathBuf>> {
         return Err(bad("is empty; it must hold one absolute path".to_string()));
     }
     if text.contains('\n') {
-        return Err(bad("holds more than one line; it must hold one absolute path".to_string()));
+        return Err(bad(
+            "holds more than one line; it must hold one absolute path".to_string(),
+        ));
     }
     let home = PathBuf::from(text);
     if !home.is_absolute() {
@@ -250,7 +252,10 @@ fn read_home_pointer(file: &Path) -> Result<Option<PathBuf>> {
     }
     match std::fs::metadata(&home) {
         Ok(meta) if meta.is_dir() => Ok(Some(home)),
-        Ok(_) => Err(bad(format!("names {}, which is not a directory", home.display()))),
+        Ok(_) => Err(bad(format!(
+            "names {}, which is not a directory",
+            home.display()
+        ))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(bad(format!(
             "names {}, which does not exist",
             home.display()
@@ -514,8 +519,14 @@ mod tests {
     #[test]
     fn config_flag_alone_relocates_the_home_and_reports_it() {
         let home = os("/home/op");
-        let r = resolve_from(None, Some("/mnt/archive/config.toml"), None, Some(&home), None)
-            .expect("resolve");
+        let r = resolve_from(
+            None,
+            Some("/mnt/archive/config.toml"),
+            None,
+            Some(&home),
+            None,
+        )
+        .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
         assert_eq!(r.paths.db_file, PathBuf::from("/mnt/archive/tapectl.db"));
         assert_eq!(
@@ -530,8 +541,14 @@ mod tests {
     #[test]
     fn config_flag_outside_any_home_still_derives_from_its_parent() {
         let home = os("/home/op");
-        let r = resolve_from(None, Some("/etc/somewhere/config.toml"), None, Some(&home), None)
-            .expect("resolve");
+        let r = resolve_from(
+            None,
+            Some("/etc/somewhere/config.toml"),
+            None,
+            Some(&home),
+            None,
+        )
+        .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/etc/somewhere"));
         assert_eq!(
             r.ambiguous_config_home,
@@ -588,8 +605,8 @@ mod tests {
     #[test]
     fn relative_config_derives_its_directory() {
         let home = os("/home/op");
-        let r =
-            resolve_from(None, Some("sub/dir/config.toml"), None, Some(&home), None).expect("resolve");
+        let r = resolve_from(None, Some("sub/dir/config.toml"), None, Some(&home), None)
+            .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("sub/dir"));
         assert_eq!(r.ambiguous_config_home, Some(PathBuf::from("sub/dir")));
     }
@@ -634,8 +651,14 @@ mod tests {
     #[test]
     fn config_alone_discards_a_non_default_basename_pre_existing() {
         let home = os("/home/op");
-        let r = resolve_from(None, Some("/mnt/archive/other.toml"), None, Some(&home), None)
-            .expect("resolve");
+        let r = resolve_from(
+            None,
+            Some("/mnt/archive/other.toml"),
+            None,
+            Some(&home),
+            None,
+        )
+        .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
         assert_eq!(
             r.paths.config_file,
@@ -694,8 +717,8 @@ mod tests {
     fn home_flag_outranks_the_env_var() {
         let home = os("/home/op");
         let env = os("/mnt/from-env");
-        let r =
-            resolve_from(Some("/mnt/from-flag"), None, Some(&env), Some(&home), None).expect("resolve");
+        let r = resolve_from(Some("/mnt/from-flag"), None, Some(&env), Some(&home), None)
+            .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/from-flag"));
     }
 
@@ -754,7 +777,8 @@ mod tests {
     fn non_utf8_tapectl_home_env_does_not_block_an_explicit_home_flag() {
         let home = os("/home/op");
         let bad = OsString::from(OsStr::from_bytes(b"/mnt/archive-\xff"));
-        let r = resolve_from(Some("/mnt/archive"), None, Some(&bad), Some(&home), None).expect("resolve");
+        let r = resolve_from(Some("/mnt/archive"), None, Some(&bad), Some(&home), None)
+            .expect("resolve");
         assert_eq!(r.paths.home, PathBuf::from("/mnt/archive"));
     }
 
@@ -792,8 +816,8 @@ mod tests {
         let from_env = resolve_from(None, None, Some(&env), None, None).expect("TAPECTL_HOME");
         assert_eq!(from_env.paths.home, PathBuf::from("/mnt/archive"));
 
-        let from_config =
-            resolve_from(None, Some("/mnt/archive/config.toml"), None, None, None).expect("--config");
+        let from_config = resolve_from(None, Some("/mnt/archive/config.toml"), None, None, None)
+            .expect("--config");
         assert_eq!(from_config.paths.home, PathBuf::from("/mnt/archive"));
     }
 
@@ -966,6 +990,390 @@ mod tests {
                 "row {home_flag:?}/{config_flag:?} disagreed on ambiguous_config_home"
             );
         }
+    }
+
+    // ---- the system home pointer (issue #437) ----
+    //
+    // Every test names its pointer file inside a temp dir and its euid as a
+    // parameter: nothing here reads /etc, sets a variable, or needs root.
+
+    /// A service home, an account with a `~/.tapectl` of its own, an account
+    /// without one, and a way to write the pointer file.
+    struct Pointer {
+        dir: tempfile::TempDir,
+        written: std::cell::Cell<usize>,
+    }
+
+    impl Pointer {
+        const OPERATOR: u32 = 1000;
+
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("svc/.tapectl")).unwrap();
+            std::fs::create_dir_all(dir.path().join("dev/.tapectl")).unwrap();
+            std::fs::create_dir_all(dir.path().join("op")).unwrap();
+            Pointer {
+                dir,
+                written: std::cell::Cell::new(0),
+            }
+        }
+
+        /// The service user's tapectl home, which a good pointer names.
+        fn svc(&self) -> PathBuf {
+            self.dir.path().join("svc/.tapectl")
+        }
+
+        /// `HOME` of an account with a `~/.tapectl` already.
+        fn home_with_own(&self) -> OsString {
+            self.dir.path().join("dev").into_os_string()
+        }
+
+        /// `HOME` of an account (the operator) with no `~/.tapectl`.
+        fn home_without_own(&self) -> OsString {
+            self.dir.path().join("op").into_os_string()
+        }
+
+        /// `<HOME>/.tapectl` for the account without one: where a fresh
+        /// home would be made, and so what a fall-through would produce.
+        fn fresh_default(&self) -> PathBuf {
+            self.dir.path().join("op/.tapectl")
+        }
+
+        /// Write a pointer file holding `content` and return the input. Each
+        /// call writes its own file, so a table of them can be built first.
+        fn file(&self, content: impl AsRef<[u8]>, euid: u32) -> HomePointer {
+            self.written.set(self.written.get() + 1);
+            let path = self
+                .dir
+                .path()
+                .join(format!("pointer-{}", self.written.get()));
+            std::fs::write(&path, content).unwrap();
+            HomePointer { path, euid }
+        }
+
+        /// A pointer whose file was never written.
+        fn absent(&self, euid: u32) -> HomePointer {
+            HomePointer {
+                path: self.dir.path().join("no-such-pointer"),
+                euid,
+            }
+        }
+
+        fn good(&self) -> HomePointer {
+            self.file(format!("{}\n", self.svc().display()), Self::OPERATOR)
+        }
+    }
+
+    /// The whole ranking, one row per source that can compete with the
+    /// pointer. The pointer is valid in every row, so each row shows what
+    /// outranks it and the last shows it winning when nothing does.
+    #[test]
+    fn the_pointer_ranks_below_every_other_source() {
+        let fx = Pointer::new();
+        let ptr = fx.good();
+        let env = os("/mnt/from-env");
+        let own = fx.home_with_own();
+        let none = fx.home_without_own();
+        let own_default = PathBuf::from(&own).join(".tapectl");
+        // (home flag, config flag, TAPECTL_HOME, HOME, expected home)
+        let rows: Vec<(
+            Option<&str>,
+            Option<&str>,
+            Option<&OsStr>,
+            &OsStr,
+            PathBuf,
+            &str,
+        )> = vec![
+            (
+                Some("/mnt/flag"),
+                None,
+                None,
+                none.as_os_str(),
+                PathBuf::from("/mnt/flag"),
+                "--home",
+            ),
+            (
+                Some("/mnt/flag"),
+                None,
+                Some(env.as_os_str()),
+                none.as_os_str(),
+                PathBuf::from("/mnt/flag"),
+                "--home over TAPECTL_HOME",
+            ),
+            (
+                None,
+                None,
+                Some(env.as_os_str()),
+                none.as_os_str(),
+                PathBuf::from("/mnt/from-env"),
+                "TAPECTL_HOME",
+            ),
+            (
+                None,
+                Some("/mnt/cfg/config.toml"),
+                None,
+                none.as_os_str(),
+                PathBuf::from("/mnt/cfg"),
+                "--config alone (the gate's isolation)",
+            ),
+            (
+                None,
+                None,
+                None,
+                own.as_os_str(),
+                own_default.clone(),
+                "an existing ~/.tapectl",
+            ),
+            (
+                None,
+                None,
+                None,
+                none.as_os_str(),
+                fx.svc(),
+                "nothing else: the pointer",
+            ),
+        ];
+        for (home_flag, config_flag, env_home, home_env, expected, what) in rows {
+            let r = resolve_from(home_flag, config_flag, env_home, Some(home_env), Some(&ptr))
+                .unwrap_or_else(|e| panic!("{what}: should resolve: {e}"));
+            assert_eq!(r.paths.home, expected, "{what}");
+        }
+    }
+
+    /// Wiring: a pointer resolves like `--home` does — its config and
+    /// database are inside it — and is not an ambiguous `--config`.
+    #[test]
+    fn a_pointer_home_is_an_ordinary_home() {
+        let fx = Pointer::new();
+        let home = fx.home_without_own();
+        let r = resolve_from(None, None, None, Some(&home), Some(&fx.good())).unwrap();
+        assert_eq!(r.paths.config_file, fx.svc().join("config.toml"));
+        assert_eq!(r.paths.db_file, fx.svc().join("tapectl.db"));
+        assert!(r.ambiguous_config_home.is_none());
+    }
+
+    /// Everything above the pointer wins even when the pointer is broken:
+    /// a bad pointer must not turn a working invocation into an error.
+    #[test]
+    fn a_broken_pointer_cannot_break_what_outranks_it() {
+        let fx = Pointer::new();
+        let broken = fx.file("relative/home\n", Pointer::OPERATOR);
+        let env = os("/mnt/from-env");
+        let none = fx.home_without_own();
+        let own = fx.home_with_own();
+        let ok = |home_flag, config_flag, env_home, home_env: &OsString| {
+            resolve_from(
+                home_flag,
+                config_flag,
+                env_home,
+                Some(home_env),
+                Some(&broken),
+            )
+            .expect("outranks the pointer, so the pointer is never read")
+        };
+        assert_eq!(
+            ok(Some("/mnt/flag"), None, None, &none).paths.home,
+            PathBuf::from("/mnt/flag")
+        );
+        assert_eq!(
+            ok(None, None, Some(env.as_os_str()), &none).paths.home,
+            PathBuf::from("/mnt/from-env")
+        );
+        assert_eq!(
+            ok(None, Some("/mnt/cfg/config.toml"), None, &none)
+                .paths
+                .home,
+            PathBuf::from("/mnt/cfg")
+        );
+        assert_eq!(
+            ok(None, None, None, &own).paths.home,
+            PathBuf::from(&own).join(".tapectl")
+        );
+    }
+
+    /// ADR-0012 2026-10-15 item 62: as root the pointer is ignored — not
+    /// read, so not even a broken one is an error — and the home is the one
+    /// root would have had without it.
+    #[test]
+    fn root_ignores_the_pointer_entirely() {
+        let fx = Pointer::new();
+        let none = fx.home_without_own();
+        for (what, ptr) in [
+            ("a valid pointer", fx.file(fx.svc().to_str().unwrap(), 0)),
+            ("a broken pointer", fx.file("relative\n", 0)),
+        ] {
+            let r = resolve_from(None, None, None, Some(&none), Some(&ptr))
+                .unwrap_or_else(|e| panic!("root with {what} must resolve: {e}"));
+            assert_eq!(r.paths.home, fx.fresh_default(), "root with {what}");
+        }
+        // The same valid pointer for a non-root euid is what root skipped.
+        let operator = fx.good();
+        let r = resolve_from(None, None, None, Some(&none), Some(&operator)).unwrap();
+        assert_eq!(
+            r.paths.home,
+            fx.svc(),
+            "positive control: euid 1000 uses it"
+        );
+    }
+
+    /// The pointer being switched off (`None`) is the pre-#437 behaviour.
+    #[test]
+    fn no_pointer_input_is_the_old_resolution() {
+        let fx = Pointer::new();
+        let none = fx.home_without_own();
+        let r = resolve_from(None, None, None, Some(&none), None).unwrap();
+        assert_eq!(r.paths.home, fx.fresh_default());
+    }
+
+    /// No pointer FILE is "no pointer" — every developer box and every
+    /// harness — and resolves exactly as before, a fresh `~/.tapectl`.
+    #[test]
+    fn an_absent_pointer_file_changes_nothing() {
+        let fx = Pointer::new();
+        let none = fx.home_without_own();
+        let r = resolve_from(
+            None,
+            None,
+            None,
+            Some(&none),
+            Some(&fx.absent(Pointer::OPERATOR)),
+        )
+        .unwrap();
+        assert_eq!(r.paths.home, fx.fresh_default());
+    }
+
+    /// A pointer that is present but wrong stops the command, naming the
+    /// file — never a quiet fresh `~/.tapectl`.
+    #[test]
+    fn a_pointer_that_is_present_but_wrong_is_an_error_naming_it() {
+        let fx = Pointer::new();
+        let none = fx.home_without_own();
+        let a_file = fx.dir.path().join("a-file");
+        std::fs::write(&a_file, "x").unwrap();
+        let missing = fx.dir.path().join("svc/gone");
+        let cases: Vec<(&str, HomePointer, &str)> = vec![
+            (
+                "relative path",
+                fx.file("svc/.tapectl", 1000),
+                "not an absolute path",
+            ),
+            (
+                "dot-relative path",
+                fx.file("./svc/.tapectl\n", 1000),
+                "not an absolute path",
+            ),
+            ("empty file", fx.file("", 1000), "empty"),
+            ("blank file", fx.file("  \n\n", 1000), "empty"),
+            (
+                "two lines",
+                fx.file(format!("{}\n/srv/other\n", fx.svc().display()), 1000),
+                "more than one line",
+            ),
+            (
+                "missing target",
+                fx.file(missing.to_str().unwrap(), 1000),
+                "does not exist",
+            ),
+            (
+                "target is a file",
+                fx.file(a_file.to_str().unwrap(), 1000),
+                "not a directory",
+            ),
+            (
+                "not UTF-8",
+                fx.file(b"/srv/\xff\xfe", 1000),
+                "not valid UTF-8",
+            ),
+            (
+                // Readable by no one: a directory in the file's place.
+                "unreadable",
+                HomePointer {
+                    path: fx.dir.path().join("svc"),
+                    euid: 1000,
+                },
+                "cannot be read",
+            ),
+        ];
+        for (what, ptr, reason) in cases {
+            let err = resolve_from(None, None, None, Some(&none), Some(&ptr))
+                .expect_err(&format!("{what}: must refuse"))
+                .to_string();
+            assert!(
+                err.contains(&ptr.path.display().to_string()),
+                "{what}: must name the pointer file: {err}"
+            );
+            assert!(err.contains(reason), "{what}: want '{reason}': {err}");
+            assert!(err.contains("--home"), "{what}: must say how out: {err}");
+            assert!(
+                !fx.fresh_default().exists(),
+                "{what}: resolving must not create a home"
+            );
+        }
+    }
+
+    /// Surrounding blanks and the newline `echo` adds are not part of the
+    /// path.
+    #[test]
+    fn the_pointer_path_is_trimmed() {
+        let fx = Pointer::new();
+        let none = fx.home_without_own();
+        for content in [
+            format!("{}", fx.svc().display()),
+            format!("{}\n", fx.svc().display()),
+            format!("  {}  \r\n", fx.svc().display()),
+        ] {
+            let ptr = fx.file(content.as_bytes(), 1000);
+            let r = resolve_from(None, None, None, Some(&none), Some(&ptr)).unwrap();
+            assert_eq!(r.paths.home, fx.svc(), "{content:?}");
+        }
+    }
+
+    /// A dangling `~/.tapectl` (or one this account cannot stat) is still
+    /// "has a `~/.tapectl`": the pointer never redirects it.
+    #[test]
+    fn a_dangling_own_home_still_outranks_the_pointer() {
+        let fx = Pointer::new();
+        let dangling = fx.dir.path().join("dangling");
+        std::fs::create_dir_all(&dangling).unwrap();
+        std::os::unix::fs::symlink(fx.dir.path().join("nowhere"), dangling.join(".tapectl"))
+            .unwrap();
+        let home = dangling.clone().into_os_string();
+        let r = resolve_from(None, None, None, Some(&home), Some(&fx.good())).unwrap();
+        assert_eq!(r.paths.home, dangling.join(".tapectl"));
+    }
+
+    /// No `HOME` means there is no `~/.tapectl` to find, so the pointer
+    /// applies — and with no pointer the old refusal stands.
+    #[test]
+    fn an_unset_home_uses_the_pointer_or_is_refused_as_before() {
+        let fx = Pointer::new();
+        let r = resolve_from(None, None, None, None, Some(&fx.good())).unwrap();
+        assert_eq!(r.paths.home, fx.svc());
+        let err = resolve_from(None, None, None, None, Some(&fx.absent(1000)))
+            .expect_err("no HOME and no pointer must still refuse");
+        assert!(err.to_string().contains("HOME is not set"), "{err}");
+        let root = resolve_from(None, None, None, None, Some(&fx.file("/x", 0)))
+            .expect_err("root with no HOME refuses too: the pointer is off");
+        assert!(root.to_string().contains("HOME is not set"), "{root}");
+    }
+
+    /// `TAPECTL_HOME_POINTER` is read in `resolve`, here as a pure function.
+    #[test]
+    fn the_pointer_location_defaults_and_is_overridable() {
+        assert_eq!(DEFAULT_HOME_POINTER, "/etc/tapectl/home");
+        assert_eq!(
+            pointer_path_from_env(None),
+            PathBuf::from("/etc/tapectl/home")
+        );
+        assert_eq!(
+            pointer_path_from_env(Some(OsStr::new(""))),
+            PathBuf::from("/etc/tapectl/home"),
+            "an empty variable is an unexpanded one: the default"
+        );
+        assert_eq!(
+            pointer_path_from_env(Some(OsStr::new("/tmp/x/home"))),
+            PathBuf::from("/tmp/x/home")
+        );
     }
 
     // ---- peek_logging_config ----
