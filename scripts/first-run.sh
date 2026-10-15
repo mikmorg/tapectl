@@ -1260,8 +1260,14 @@ A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops 
 
 `tapectl host check` measures this (load, free memory, memory and I/O pressure, contender processes and units) and runs just before the WRITE confirmation below; you can run it yourself any time.
 EOF
-  run as_svc mt -f "$DEVICE" status || true
-  if as_svc mt -f "$DEVICE" status 2>/dev/null | grep DR_OPEN >/dev/null; then die "no cartridge loaded in $DEVICE"; fi
+  # Issue #428: tapectl's own read-only look at the drive (one O_NONBLOCK MTIOCGET,
+  # the chip and the catalog's record of that cartridge; never moves the tape).
+  run tc drive status --device "$DEVICE" || true
+  CART_STATE="$(tc drive status --device "$DEVICE" --json 2>/dev/null | python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["tape_node"]["cartridge"] or "")
+except Exception: pass')"
+  [ "$CART_STATE" = "empty" ] && die "no cartridge loaded in $DEVICE"
+  [ "$CART_STATE" = "loaded" ] || note "drive status could not confirm a loaded cartridge (${CART_STATE:-no answer}); volume init refuses an empty drive on its own"
   ask LABEL "volume label" "${LABEL:-L6-0001}"
   # Issue #414: re-entering this step after an interrupted run must pick up
   # where that run stopped, not die. What $LABEL already is in the catalog

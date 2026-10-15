@@ -1874,6 +1874,24 @@ resume` and `staging clean` (with or without `--force`) refuse a volume or
 stage set whose session is live, and `--force` does not override that: the
 running command is a fact, not a risk judgement.
 
+#### What is in the drive right now
+
+`tapectl drive status` shows what is in the drive right now (issue #428):
+
+```bash
+tapectl drive status            # the only configured drive
+tapectl drive status --json
+```
+
+It reads the st driver's status (`MTIOCGET`) through a non-blocking open, then the
+drive's identity and, with a ready cartridge, the cartridge chip, then the catalog's
+cartridge and volumes for that chip serial. It never moves the tape, takes no lock and
+writes nothing: no contact, no journal. A drive held by a tapectl command, or open in
+another process, is reported with the holder's pid and command and is sent no SCSI
+command, so it is safe to run during a write. It exits 0 whenever the probe ran (an
+empty drive is an answer) and 2 when the tape node cannot be read or no drive is
+configured; `--json` still prints the report.
+
 #### The daily drive poll
 
 Between a write and the next verify a drive can go months unwatched, and the
