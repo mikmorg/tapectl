@@ -434,6 +434,20 @@ fn identify(
         | ContactOutcome::AlreadySealed { .. } => {
             report.medium = MediumKind::Tapectl;
         }
+        // Issue #460. File 0 parsed, so this is a tapectl tape, and the
+        // typed label File 0 carries is still the consent word. What cannot
+        // be told is whether it is SEALED: said, not guessed. The catalog
+        // cross-check below (a volume this catalog still counts is refused,
+        // naming `volume retire`) is what gates the erase, exactly as it
+        // does for a tape whose seal reads.
+        ContactOutcome::SealUnreadable { position, error } => {
+            report.medium = MediumKind::Tapectl;
+            report.detail = Some(format!(
+                "the seal marker could not be read at tape position {position} ({error}), and \
+                 the tape is not shown to end before it: whether this volume is SEALED is not \
+                 known. Erasing it destroys it either way"
+            ));
+        }
     }
     if let File0Read::Bytes(bytes) = &file0_read {
         if report.medium == MediumKind::Tapectl {
@@ -805,7 +819,12 @@ fn erase_in_contact(
         ContactOutcome::EmptyFileZero => Some(MediumKind::Empty),
         ContactOutcome::FileZeroUnreadable { .. } => Some(MediumKind::Unreadable),
         ContactOutcome::IdentityMismatch { found: None } => Some(MediumKind::Foreign),
-        _ => Some(MediumKind::Tapectl),
+        // Still reads as a tapectl tape after the erase: `verify_after`
+        // refuses all of these as "File 0 still reads as recorded data".
+        ContactOutcome::IdentityMismatch { found: Some(_) }
+        | ContactOutcome::Matches
+        | ContactOutcome::AlreadySealed { .. }
+        | ContactOutcome::SealUnreadable { .. } => Some(MediumKind::Tapectl),
     };
     report.medium_after = medium_after;
     report.chip_serial_after = after_det.mam.serial.clone();
@@ -1364,6 +1383,33 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM cartridges"), 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM events"), 0);
         assert_eq!(contact(&conn).0, "cartridge erase");
+    }
+
+    /// Issue #460: a tape whose seal will not read is still identified as
+    /// the tapectl tape File 0 says it is -- the label is still the consent
+    /// word -- and the report says plainly that whether it is sealed is not
+    /// known, instead of showing it as unsealed (or as sealed with a time it
+    /// never read).
+    #[test]
+    fn a_tape_whose_seal_will_not_read_is_identified_and_says_so() {
+        let conn = crate::db::open_memory().unwrap();
+        let fake = sealed_tape("L6-0001");
+        fake.state().unreadable = vec![5];
+        let report = run(
+            &conn,
+            &fake,
+            opts(EraseMode::Short, None, true),
+            &[Some(SERIAL)],
+        )
+        .expect("a dry run succeeds");
+        assert_eq!(report.medium, MediumKind::Tapectl);
+        assert_eq!(report.confirm_label.as_deref(), Some("L6-0001"));
+        assert!(report.sealed.is_none(), "no seal was read");
+        let detail = report.detail.as_deref().expect("said, not guessed");
+        assert!(
+            detail.contains("seal marker could not be read") && detail.contains("not known"),
+            "{detail}"
+        );
     }
 
     /// The consent is the label the tape carries: a different one refuses

@@ -642,6 +642,23 @@ pub trait Store {
         Ok(false)
     }
 
+    /// Whether the medium's own status says it ended at or before the start
+    /// of tape file `position`: END OF DATA, with fewer files recorded than
+    /// `position` needs (issue #460). Asked only right AFTER a read of
+    /// `position` failed, to tell "there is no file there" from "there is
+    /// one and the drive could not read it" -- st fails a read with the
+    /// same EIO for both, and a seal marker that is merely unreadable is not
+    /// an absent one (ADR-0003 fails closed).
+    ///
+    /// `Ok(false)` is "no evidence", never "there is a file": the default,
+    /// for a store that cannot tell, so the caller treats the failure as an
+    /// unreadable file. Moves nothing; the answer is the state the failed
+    /// read left.
+    fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+        let _ = position;
+        Ok(false)
+    }
+
     /// Erase the medium (`cartridge erase`, ADR-0012 2026-10-12 items 51
     /// and 52). Moves the head; the next read repositions as usual.
     ///
@@ -1867,6 +1884,20 @@ impl Store for TapeStore {
             }
         }
     }
+
+    /// st's own status after the failed read: `GMT_EOD` (the space or read
+    /// ran into BLANK CHECK) with the head in a file numbered at or below
+    /// `position`. A count st has lost (`-1`), a head past `position`, or a
+    /// failure that was not END OF DATA (a medium error, a block-size
+    /// mismatch, a transport error) is no evidence -- the same facts
+    /// [`Self::reposition_at_most`] acts on. `file_number == position` is
+    /// the read that met END OF DATA inside the file it was asked for: a
+    /// file with no filemark after it is no complete file, and a write
+    /// session that died inside its own seal leaves exactly that.
+    fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+        let st = self.dev.position()?;
+        Ok(st.at_eod && u32::try_from(st.file_number).is_ok_and(|m| m <= position))
+    }
     /// Short: the trait's filemark at BOT. Long: rewind, the st long erase,
     /// rewind. The cursor is `Unknown` after either, so the next read
     /// rewinds.
@@ -2009,6 +2040,11 @@ impl Store for MemStore {
         Ok(self.files.is_empty())
     }
 
+    /// No file recorded at `position` (the only way `read_file` fails).
+    fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+        Ok(position as usize >= self.files.len())
+    }
+
     /// Short: the trait's filemark at BOT (one empty file). Long: nothing
     /// recorded at all.
     fn erase(&mut self, mode: EraseMode) -> Result<()> {
@@ -2117,6 +2153,81 @@ mod tests {
         assert!(fake.state().files.is_empty());
         assert!(fake.ops().contains(&Op::Erase(0)), "erased from BOT");
         assert!(store.blank_at_bot().unwrap());
+    }
+
+    /// Issue #460: after a read failed, `eod_at_or_before` tells a file the
+    /// tape does not have from one it has and could not read. MemStore: no
+    /// file recorded is the only way a read fails. TapeStore: st's own
+    /// END-OF-DATA status, at or before the file asked for.
+    #[test]
+    fn eod_at_or_before_tells_an_absent_file_from_an_unreadable_one() {
+        use crate::tape::fake::FakeTape;
+        let mut mem = MemStore::new(4096);
+        for _ in 0..3 {
+            mem.execute(&mut Cursor::new(vec![1u8; 4096]), 4096, false)
+                .unwrap();
+        }
+        assert!(!mem.eod_at_or_before(2).unwrap(), "file 2 is recorded");
+        assert!(mem.eod_at_or_before(3).unwrap(), "the tape ends at 3");
+        assert!(mem.eod_at_or_before(9).unwrap());
+
+        let tape = |files: usize| {
+            FakeTape::with_files((0..files).map(|i| vec![i as u8 + 1; 4096]).collect(), 4096)
+        };
+        // Past the end: the space fails at END OF DATA, with fewer files
+        // recorded than asked for.
+        let fake = tape(3);
+        let mut store = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        assert!(store.read_file_head(7, 1, &mut io::sink()).is_err());
+        assert!(store.eod_at_or_before(7).unwrap());
+        // Exactly at the end the read does not fail; but a read that met
+        // END OF DATA inside the file asked for (head numbered at it) is
+        // that file not being a complete one.
+        assert!(store.eod_at_or_before(3).unwrap(), "head at file 3, EOD");
+        assert!(
+            !store.eod_at_or_before(2).unwrap(),
+            "head already past file 2 at EOD says nothing about file 2"
+        );
+
+        // A file that is there and will not read: not END OF DATA.
+        let fake = tape(8);
+        fake.state().unreadable = vec![7];
+        let mut store = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        assert!(store.read_file_head(7, 1, &mut io::sink()).is_err());
+        assert!(!store.eod_at_or_before(7).unwrap());
+
+        // ... or that fails part-way through.
+        let fake = tape(8);
+        fake.state().fail_reads_at = vec![7];
+        let mut store = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        let _ = store.read_file(7, &mut io::sink());
+        assert!(!store.eod_at_or_before(7).unwrap());
+
+        // A drive that cannot report its position gives no answer at all,
+        // which the caller reads as no evidence.
+        let fake = tape(3);
+        let mut store = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        assert!(store.read_file_head(7, 1, &mut io::sink()).is_err());
+        fake.state().position_fails = true;
+        assert!(store.eod_at_or_before(7).is_err());
+
+        // The default (a store that cannot tell) is "no evidence".
+        struct Plain(MemStore);
+        impl Store for Plain {
+            fn capacity(&mut self) -> Result<CapacityReport> {
+                self.0.capacity()
+            }
+            fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+                self.0.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.0.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.0.reposition_for_resume(file_index)
+            }
+        }
+        assert!(!Plain(MemStore::new(4096)).eod_at_or_before(5).unwrap());
     }
 
     /// A store that cannot long-erase says so rather than pretending.

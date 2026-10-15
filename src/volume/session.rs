@@ -577,8 +577,10 @@ pub enum ContactOutcome {
     /// the session to be resumed again.
     FileZeroUnreadable { error: String },
     /// File 0 parsed and its identity matches `expected_label`/`expected_uuid`,
-    /// and (when a seal position was given) nothing parseable was found
-    /// there either — safe to continue.
+    /// and nothing parseable was found at the seal positions (File 0's own
+    /// pointer and, when given, the caller's) -- each either read and not a
+    /// seal marker, or positively past the end of data (issue #460) — safe
+    /// to continue.
     Matches,
     /// File 0 parsed but disagrees with the expected identity, or was
     /// readable yet failed to parse at all (ambiguous is treated as a
@@ -598,6 +600,17 @@ pub enum ContactOutcome {
     /// holds a SEALED volume (ADR-0003 — sealed volumes are immutable,
     /// there is no append).
     AlreadySealed { seal_position: u32 },
+    /// A seal position could not be read, and the medium does not show that
+    /// it ends before that position (issue #460). A failed read is "no seal"
+    /// only on positive evidence that there is no file there
+    /// ([`Store::eod_at_or_before`]); anything else may be a SEALED volume
+    /// the drive cannot read just now, so no caller treats it as absent:
+    /// the fresh-write path refuses, `--force` included (the same
+    /// ADR-0003 reasoning as [`Self::AlreadySealed`]); resume re-enters
+    /// confirm if the seal is RECORDED and otherwise refuses, writing
+    /// nothing. `position` is where it was read: File 0's own seal
+    /// pointer, or the caller's.
+    SealUnreadable { position: u32, error: String },
 }
 
 /// The one check both [`InterruptedSession::resume_checking`] and the
@@ -627,6 +640,16 @@ pub enum ContactOutcome {
 /// exactly the front/tail damage asymmetry `volume-format-v2.md` §4 designs
 /// for), but not if File 0 was readable and already mismatched (no need —
 /// that already refuses).
+///
+/// A seal position that cannot be READ is not an absent seal (issue #460).
+/// "No seal here" needs positive evidence -- the file was read and is not a
+/// seal marker, or the medium itself shows it ends before the position
+/// ([`Store::eod_at_or_before`]), or it is blank at BOT. A read that fails
+/// any other way is [`ContactOutcome::SealUnreadable`], returned before the
+/// identity is weighed: the tape may carry a sealed volume the drive cannot
+/// read just now, and nothing about a read that did not succeed is a
+/// finding about the medium. (ADR-0012's 2026-09-21 "deliberate and correct
+/// for a fresh write" conflation held only where the tape is blank there.)
 pub fn check_tape_contact(
     store: &mut dyn Store,
     expected_label: &str,
@@ -651,30 +674,88 @@ pub(crate) struct ContactFacts {
     identity: Option<format::IdThunkIdentity>,
     /// File 0's own `[layout] seal_marker` pointer, when it parsed.
     seal_pointer: Option<i64>,
-    /// Every seal position probed: the bytes read there, or `None` if the
-    /// read failed. Each position is read at most once per contact.
-    seal_reads: HashMap<u32, Option<Vec<u8>>>,
+    /// Every seal position probed, and what the probe found there. Each
+    /// position is read at most once per contact.
+    seal_reads: HashMap<u32, SealRead>,
+}
+
+/// What reading one seal position found (issue #460).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SealRead {
+    /// A file was read there: its bytes, which may or may not parse as a
+    /// seal marker.
+    Bytes(Vec<u8>),
+    /// No seal marker can be there: the file is oversized (issue #400, not
+    /// one of ours), or the read failed and the medium itself shows it ends
+    /// before the position ([`Store::eod_at_or_before`]) -- or is blank at
+    /// BOT, which is the same fact for every position.
+    Absent,
+    /// The read failed and nothing shows the medium ends before the
+    /// position: there may be a seal marker the drive cannot read. NOT
+    /// absent -- the one distinction ADR-0003 needs from a failed read.
+    Unreadable(String),
+}
+
+/// [`ContactFacts::probe_seal`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SealProbe {
+    /// The position holds a parsing seal marker.
+    Parses,
+    /// It does not hold one, and positively so.
+    Absent,
+    /// It could not be read, and the tape is not shown to end before it.
+    Unreadable(String),
 }
 
 impl ContactFacts {
-    /// Whether `position` holds a parsing seal marker — reading it only the
-    /// first time it is asked about (issue #403: resume used to read the
-    /// same seal position up to three times, each a long locate).
-    fn probe_seal(&mut self, store: &mut dyn Store, position: u32) -> bool {
+    /// What `position` holds -- reading it only the first time it is asked
+    /// about (issue #403: resume used to read the same seal position up to
+    /// three times, each a long locate).
+    ///
+    /// A failed read is [`SealProbe::Absent`] only on positive evidence
+    /// (issue #460): the medium is blank at BOT (`medium_blank`, already
+    /// proved by the caller), or reports END OF DATA at or before the
+    /// position. Any other failure is [`SealProbe::Unreadable`]; before
+    /// #460 every failure read as "no seal", which is right for a blank
+    /// tape (its positions do not read) and wrong for a sealed one whose
+    /// seal does not.
+    fn probe_seal(
+        &mut self,
+        store: &mut dyn Store,
+        position: u32,
+        medium_blank: bool,
+    ) -> SealProbe {
         let read = self.seal_reads.entry(position).or_insert_with(|| {
             // Bounded (issue #400): an oversized file is no seal marker.
             match crate::store::read_small(store, position) {
-                Ok(crate::store::SmallRead::Bytes(bytes)) => Some(bytes),
-                Ok(crate::store::SmallRead::Oversized) | Err(_) => None,
+                Ok(crate::store::SmallRead::Bytes(bytes)) => SealRead::Bytes(bytes),
+                Ok(crate::store::SmallRead::Oversized) => SealRead::Absent,
+                Err(e) => {
+                    if medium_blank || store.eod_at_or_before(position).unwrap_or(false) {
+                        SealRead::Absent
+                    } else {
+                        SealRead::Unreadable(e.to_string())
+                    }
+                }
             }
         });
-        read.as_deref()
-            .is_some_and(|bytes| format::parse_seal_marker(&String::from_utf8_lossy(bytes)).is_ok())
+        match read {
+            SealRead::Bytes(bytes)
+                if format::parse_seal_marker(&String::from_utf8_lossy(bytes)).is_ok() =>
+            {
+                SealProbe::Parses
+            }
+            SealRead::Bytes(_) | SealRead::Absent => SealProbe::Absent,
+            SealRead::Unreadable(error) => SealProbe::Unreadable(error.clone()),
+        }
     }
 
     /// The bytes this contact read at `position`, if it read them.
     pub(crate) fn seal_bytes(&self, position: u32) -> Option<Vec<u8>> {
-        self.seal_reads.get(&position).cloned().flatten()
+        match self.seal_reads.get(&position) {
+            Some(SealRead::Bytes(bytes)) => Some(bytes.clone()),
+            Some(SealRead::Absent | SealRead::Unreadable(_)) | None => None,
+        }
     }
 
     /// File 0's bytes, when this contact read them (not oversized).
@@ -736,10 +817,27 @@ pub(crate) fn contact_report(
             // medium first, so File 0 is gone or unparseable long before here.
             if let Ok(pointers) = format::parse_id_thunk_layout_pointers(&text) {
                 facts.seal_pointer = Some(i64::from(pointers.seal_marker));
-                if pointers.seal_marker >= 0 && facts.probe_seal(store, pointers.seal_marker as u32)
-                {
-                    let seal_position = pointers.seal_marker as u32;
-                    return (ContactOutcome::AlreadySealed { seal_position }, facts);
+                if pointers.seal_marker >= 0 {
+                    let position = pointers.seal_marker as u32;
+                    // File 0 read, so the tape is not blank at BOT.
+                    match facts.probe_seal(store, position, false) {
+                        SealProbe::Parses => {
+                            return (
+                                ContactOutcome::AlreadySealed {
+                                    seal_position: position,
+                                },
+                                facts,
+                            );
+                        }
+                        // Issue #460, before the identity is weighed: a
+                        // foreign File 0 whose seal does not read is not a
+                        // plain mismatch `--force` may overwrite, and a
+                        // matching one is not `Matches`.
+                        SealProbe::Unreadable(error) => {
+                            return (ContactOutcome::SealUnreadable { position, error }, facts);
+                        }
+                        SealProbe::Absent => {}
+                    }
                 }
             }
 
@@ -781,13 +879,25 @@ pub(crate) fn contact_report(
     // The caller's position — not read again when it is the tape's own
     // pointer, probed just above (issue #403).
     if let Some(seal_pos) = seal_position {
-        if facts.probe_seal(store, seal_pos) {
-            return (
-                ContactOutcome::AlreadySealed {
-                    seal_position: seal_pos,
-                },
-                facts,
-            );
+        match facts.probe_seal(store, seal_pos, blank) {
+            SealProbe::Parses => {
+                return (
+                    ContactOutcome::AlreadySealed {
+                        seal_position: seal_pos,
+                    },
+                    facts,
+                );
+            }
+            SealProbe::Unreadable(error) => {
+                return (
+                    ContactOutcome::SealUnreadable {
+                        position: seal_pos,
+                        error,
+                    },
+                    facts,
+                );
+            }
+            SealProbe::Absent => {}
         }
     }
 
@@ -856,9 +966,12 @@ fn resume_reconfirm_eligible(
 /// (migration 018), ADR-0012's 2026-09-21 correction "the seal is RECORDED,
 /// not inferred" (issue #277).
 ///
-/// `sealed_at` is set exactly once, at the single production `seal()` call
-/// site (`write::finish_session`, immediately after `ready.seal(store)`
-/// returns `Ok`), and is never cleared afterward by any confirm outcome —
+/// `sealed_at` is set at the single production `seal()` call site
+/// (`write::finish_session`, immediately after `ready.seal(store)` returns
+/// `Ok`) -- and, for a process that died in the window after that, by the
+/// resume that finds its tape sealed ([`record_seal_found_at_resume`], issue
+/// #460) -- write-once either way, and is never cleared afterward by any
+/// confirm outcome —
 /// not even an `Inconclusive` confirm's `mark_writes(..., "interrupted")`
 /// (`SealedPending::confirm`). That is what makes its mere presence settle
 /// what `ContactFacts::probe_seal` cannot: whether an unreadable seal position
@@ -874,6 +987,35 @@ fn seal_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
         |r| r.get(0),
     )?;
     Ok(sealed_at.is_some())
+}
+
+/// Record that this volume's seal exists, from a resume that found it on the
+/// tape and is about to re-enter `confirm` (issue #460): `sealed_at`, write-
+/// once like `finish_session`'s own write of it (`COALESCE`), from the seal
+/// marker's own time in the catalog's form, else now.
+///
+/// `finish_session` records it the moment `seal()` returns; a process that
+/// died after the marker was on the tape and before that write left it NULL,
+/// and a first resume re-confirms without ever setting it. Only the
+/// `AlreadySealed` arm that passed [`resume_reconfirm_eligible`] calls this --
+/// a tape that merely looks sealed (a foreign one, a position that disagrees)
+/// is quarantined and must not stamp this volume's row.
+fn record_seal_found_at_resume(
+    conn: &Connection,
+    volume_id: i64,
+    seal_bytes: Option<&[u8]>,
+) -> Result<()> {
+    let sealed_at = seal_bytes
+        .and_then(|b| format::parse_seal_marker(&String::from_utf8_lossy(b)).ok())
+        .and_then(|seal| format::catalog_timestamp(&seal.sealed_at));
+    busy::retry(BusyPolicy::DEFAULT, "the seal", || {
+        Ok(conn.execute(
+            "UPDATE volumes SET sealed_at = COALESCE(sealed_at, COALESCE(?2, datetime('now')))
+             WHERE id = ?1",
+            params![volume_id, sealed_at],
+        )?)
+    })?;
+    Ok(())
 }
 
 // ── a full readback continues an interrupted one (#410) ──
@@ -1742,6 +1884,46 @@ impl InterruptedSession {
                     self.built.layout.label, self.built.layout.label
                 )));
             }
+            ContactOutcome::SealUnreadable { position, error } => {
+                // Issue #460. A seal that cannot be read is not a seal that
+                // is absent: the tape does not end before it, so it may be
+                // this session's own `seal()` -- or a sealed volume that is
+                // not this session's at all.
+                //
+                // RECORDED: the same answer `Blank` and `Matches` always
+                // gave a seal that did not read (those are how an
+                // unreadable seal reached this point before): confirm reads
+                // and never writes, and reads the seal first, so a seal that
+                // is still unreadable is found at one read.
+                if seal_recorded(conn, self.volume_id)? {
+                    return Ok(ResumeOutcome::Confirming(SealedPending {
+                        built: self.built,
+                        volume_id: self.volume_id,
+                        write_ids: self.write_ids,
+                        seal_order: ReadOrder::SealFirst,
+                        seal_bytes,
+                    }));
+                }
+                // NOT recorded: whether `seal()` already ran is exactly what
+                // this read cannot tell. Resuming would reposition and seal
+                // again, over a tape that may already be sealed (ADR-0003),
+                // and a read that failed is no finding about the medium, so
+                // neither the rewrite nor a quarantine: refuse, change
+                // nothing, and let the operator run the resume again once
+                // the drive reads.
+                return Err(TapectlError::Other(format!(
+                    "volume resume: the seal marker could not be read at tape position \
+                     {position} ({error}), and the medium does not show that the tape ends \
+                     before it. The catalog has not recorded that this volume was sealed, so \
+                     tapectl cannot tell whether the seal was written; writing now could \
+                     overwrite a sealed volume, and --force cannot override this. Nothing was \
+                     written; the session stays `interrupted`. Check the drive (clean it, \
+                     reseat the cartridge) and that the right cartridge is loaded, then run \
+                     `tapectl volume resume {}` again. If the drive reads other tapes, \
+                     `tapectl volume verify {}` on this cartridge says what it holds.",
+                    self.built.layout.label, self.built.layout.label
+                )));
+            }
             contact @ (ContactOutcome::IdentityMismatch { .. } | ContactOutcome::EmptyFileZero) => {
                 // Issue #327: an empty File 0 at resume is divergence too —
                 // this session wrote a real ID thunk there. It quarantines
@@ -1787,6 +1969,12 @@ impl InterruptedSession {
                     &self.built.layout.volume_uuid,
                     seal_position,
                 ) {
+                    // Issue #460: this tape IS this session's sealed tape, so
+                    // the fact `finish_session` records where `seal()`
+                    // returns is recorded here too -- by a process that died
+                    // between the two it never was, and a later resume that
+                    // cannot read the seal would be told it is still owed.
+                    record_seal_found_at_resume(conn, self.volume_id, seal_bytes.as_deref())?;
                     return Ok(ResumeOutcome::Confirming(SealedPending {
                         built: self.built,
                         volume_id: self.volume_id,
@@ -5869,6 +6057,300 @@ mod tests {
         assert_eq!(volume_status, "sealed");
     }
 
+    // ── issue #460: an unreadable seal is not "no seal" ──
+
+    /// A `Store` over a `MemStore` whose read at ONE position fails as a
+    /// drive fails a read it cannot complete -- not as a tape fails one
+    /// past its end. `execute` and `reposition_for_resume` panic, as in
+    /// [`NoWriteStore`]: a resume that reaches either has decided to write
+    /// to a tape whose seal it could not read.
+    struct SealReadFails {
+        inner: MemStore,
+        position: u32,
+    }
+
+    impl Store for SealReadFails {
+        fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+            self.inner.capacity()
+        }
+        fn execute(&mut self, _src: &mut dyn std::io::Read, _len: u64, _sync: bool) -> Result<u64> {
+            panic!("issue #460: a resume that cannot read the seal must not write");
+        }
+        fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+            if position == self.position {
+                return Err(TapectlError::TapeIo(
+                    "read: Input/output error (os error 5)".to_string(),
+                ));
+            }
+            self.inner.read_file(position, sink)
+        }
+        fn reposition_for_resume(&mut self, _file_index: u32) -> Result<()> {
+            panic!("issue #460: a resume that cannot read the seal must not reposition");
+        }
+    }
+
+    /// What [`interrupted_after_seal`] leaves: the session, its tape and the
+    /// directories the session's files live in (which must outlive it).
+    struct AfterSeal {
+        conn: Connection,
+        keys: KeyAvailability,
+        interrupted: InterruptedSession,
+        volume_id: i64,
+        store: MemStore,
+        seal_pos: u32,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    /// An interrupted session whose tape holds a real seal marker (the
+    /// session's own `seal()` ran) and whose `sealed_at` is recorded only
+    /// when `record_sealed_at`: `false` is the window between `seal()`
+    /// returning and `finish_session` writing it (issue #460).
+    fn interrupted_after_seal(f: Fixture, record_sealed_at: bool) -> AfterSeal {
+        let mut inner = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut inner)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let ready = match planned
+            .execute_checking(&f.conn, &mut inner, || false)
+            .unwrap()
+        {
+            ExecuteOutcome::Ready(r) => r,
+            _ => panic!("expected Ready on a happy-path MemStore run"),
+        };
+        let seal_pos = ready
+            .built
+            .layout
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+            .expect("layout has a seal marker")
+            .position as u32;
+        let sealed_pending = ready.seal(&mut inner).expect("seal should succeed");
+        if record_sealed_at {
+            f.conn
+                .execute(
+                    "UPDATE volumes SET sealed_at = datetime('now') WHERE id = ?1",
+                    params![f.volume_id],
+                )
+                .unwrap();
+        }
+        mark_writes(&f.conn, &sealed_pending.write_ids, "interrupted").unwrap();
+        assert_eq!(
+            inner.files.len() as u32 - 1,
+            seal_pos,
+            "fixture premise: the seal marker is the last file, and it is on the tape"
+        );
+        let interrupted = InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .expect("resumable");
+        AfterSeal {
+            conn: f.conn,
+            keys: f.keys,
+            interrupted,
+            volume_id: f.volume_id,
+            store: inner,
+            seal_pos,
+            _dirs: (f._slices_dir, f._session_dir),
+        }
+    }
+
+    fn volume_sealed_at(conn: &Connection, volume_id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT sealed_at FROM volumes WHERE id = ?1",
+            params![volume_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Issue #460, the hole ADR-0012's 2026-09-21 amendment left: the
+    /// process died after `seal()` returned and before `sealed_at` was
+    /// written, so the catalog says the seal is owed; the tape holds it, and
+    /// the drive cannot read it now. "The read failed" is not "there is no
+    /// seal" -- the tape does not end before that position -- so resume
+    /// refuses, writes nothing and leaves the session as it was. Before the
+    /// fix this was `Matches`, then `reposition_for_resume` and a second
+    /// `seal()` over a sealed tape (`SealReadFails` panics there).
+    #[test]
+    fn resume_refuses_when_the_seal_does_not_read_and_is_not_recorded() {
+        let AfterSeal {
+            conn,
+            keys,
+            interrupted,
+            volume_id,
+            store: inner,
+            seal_pos,
+            _dirs,
+        } = interrupted_after_seal(make_fixture(), false);
+        let mut store = SealReadFails {
+            inner,
+            position: seal_pos,
+        };
+
+        let err =
+            match interrupted.resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+            {
+                Err(e) => e,
+                Ok(_) => panic!("a seal that cannot be read must stop the resume"),
+            };
+        let msg = err.to_string();
+        assert!(msg.contains("seal marker could not be read"), "{msg}");
+        assert!(msg.contains("tapectl volume verify"), "{msg}");
+
+        let write_status: String = conn
+            .query_row(
+                "SELECT status FROM writes WHERE volume_id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_status, "interrupted", "the session stays resumable");
+        assert!(
+            volume_sealed_at(&conn, volume_id).is_none(),
+            "nothing was learned about the seal"
+        );
+    }
+
+    /// The control that keeps today's behaviour for a RECORDED seal: the
+    /// same unreadable seal, `sealed_at` set. The seal is owed to no one;
+    /// resume re-enters confirm (which reads the seal first and finds it
+    /// unreadable itself), writing and repositioning nothing.
+    #[test]
+    fn resume_re_enters_confirm_when_the_seal_does_not_read_and_is_recorded() {
+        let AfterSeal {
+            conn,
+            keys,
+            interrupted,
+            store: inner,
+            seal_pos,
+            _dirs,
+            ..
+        } = interrupted_after_seal(make_fixture(), true);
+        let mut store = SealReadFails {
+            inner,
+            position: seal_pos,
+        };
+        match interrupted
+            .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+            .expect("a recorded seal re-enters confirm")
+        {
+            ResumeOutcome::Confirming(_) => {}
+            ResumeOutcome::Ready(_) => panic!("expected Confirming, got Ready"),
+            ResumeOutcome::Quarantined(q) => {
+                panic!("expected Confirming, got Quarantined: {:?}", q.reason)
+            }
+            ResumeOutcome::Interrupted(_) => panic!("expected Confirming, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Confirming, got Aborted: {}", a.reason),
+        }
+    }
+
+    /// Issue #460, the second half: a resume that re-confirms a tape it
+    /// finds sealed must RECORD the seal, as `finish_session` does at the
+    /// one place `seal()` returns. Otherwise a first resume re-confirms and
+    /// leaves `sealed_at` NULL, and a second resume that cannot read the
+    /// seal is told it is still owed. The time recorded is the seal
+    /// marker's own, in the catalog's form.
+    #[test]
+    fn a_resume_that_re_confirms_a_sealed_tape_records_when_it_was_sealed() {
+        let AfterSeal {
+            conn,
+            keys,
+            interrupted,
+            volume_id,
+            mut store,
+            seal_pos,
+            _dirs,
+        } = interrupted_after_seal(make_fixture(), false);
+        let on_tape = {
+            let bytes = &store.files[seal_pos as usize];
+            format::parse_seal_marker(&String::from_utf8_lossy(bytes))
+                .expect("the seal on the tape parses")
+                .sealed_at
+        };
+        let expected = format::catalog_timestamp(&on_tape).expect("RFC 3339");
+        assert!(volume_sealed_at(&conn, volume_id).is_none());
+
+        match interrupted
+            .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+            .expect("a sealed tape of this session re-enters confirm")
+        {
+            ResumeOutcome::Confirming(_) => {}
+            ResumeOutcome::Ready(_) => panic!("expected Confirming, got Ready"),
+            ResumeOutcome::Quarantined(q) => {
+                panic!("expected Confirming, got Quarantined: {:?}", q.reason)
+            }
+            ResumeOutcome::Interrupted(_) => panic!("expected Confirming, got Interrupted"),
+            ResumeOutcome::Aborted(a) => panic!("expected Confirming, got Aborted: {}", a.reason),
+        }
+
+        assert_eq!(
+            volume_sealed_at(&conn, volume_id).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    /// The write-once half: a `sealed_at` already recorded is never moved
+    /// (the same `COALESCE` `finish_session` uses).
+    #[test]
+    fn a_resume_that_re_confirms_never_moves_a_recorded_sealed_at() {
+        let AfterSeal {
+            conn,
+            keys,
+            interrupted,
+            volume_id,
+            mut store,
+            _dirs,
+            ..
+        } = interrupted_after_seal(make_fixture(), false);
+        conn.execute(
+            "UPDATE volumes SET sealed_at = '2020-01-02 03:04:05' WHERE id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        match interrupted
+            .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+            .expect("re-enters confirm")
+        {
+            ResumeOutcome::Confirming(_) => {}
+            _ => panic!("expected Confirming"),
+        }
+        assert_eq!(
+            volume_sealed_at(&conn, volume_id).as_deref(),
+            Some("2020-01-02 03:04:05")
+        );
+    }
+
+    /// A foreign sealed tape must not stamp OUR row: the quarantine path
+    /// (identity or position disagreement) records no `sealed_at`.
+    #[test]
+    fn a_quarantined_resume_does_not_record_a_sealed_at() {
+        let AfterSeal {
+            conn,
+            keys,
+            interrupted,
+            volume_id,
+            mut store,
+            _dirs,
+            ..
+        } = interrupted_after_seal(make_fixture(), false);
+        // The same sealed tape, but File 0 now names another volume.
+        let renamed = String::from_utf8_lossy(&store.files[0])
+            .replace("SESSTEST", "OTHERVOL")
+            .into_bytes();
+        assert_eq!(renamed.len(), store.files[0].len());
+        store.files[0] = renamed;
+        match interrupted
+            .resume_checking(&conn, &keys, SliceCheck::Size, &mut store, || false)
+            .expect("quarantines")
+        {
+            ResumeOutcome::Quarantined(_) => {}
+            _ => panic!("expected Quarantined"),
+        }
+        assert!(volume_sealed_at(&conn, volume_id).is_none());
+    }
+
     /// The tape a session left, on the in-memory tape that has the st
     /// driver's open semantics, write-protected and opened `mode` — what
     /// `volume resume` gets from `TapeStore::open_as` on a sealed tape
@@ -6385,6 +6867,113 @@ mod tests {
         let mut store = MemStore::new(BS as usize);
         let outcome = check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(5));
         assert_eq!(outcome, ContactOutcome::Blank);
+    }
+
+    // --- issue #460: a seal position that will not read ------------------
+
+    /// A `MemStore` whose read at `bad` fails (a drive error, not the end
+    /// of the tape), the way [`SealReadFails`] does -- but only reads are
+    /// refused; nothing here ever writes.
+    fn unreadable_at(mut store: MemStore, bad: u32) -> impl Store {
+        struct Bad(MemStore, u32);
+        impl Store for Bad {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.0.capacity()
+            }
+            fn execute(&mut self, s: &mut dyn std::io::Read, l: u64, y: bool) -> Result<u64> {
+                self.0.execute(s, l, y)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                if position == self.1 {
+                    return Err(TapectlError::TapeIo("read: Input/output error".to_string()));
+                }
+                self.0.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, n: u32) -> Result<()> {
+                self.0.reposition_for_resume(n)
+            }
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.0.blank_at_bot()
+            }
+            fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+                self.0.eod_at_or_before(position)
+            }
+        }
+        store.syncs.resize(store.files.len(), false);
+        Bad(store, bad)
+    }
+
+    #[test]
+    fn check_tape_contact_an_unreadable_seal_pointer_is_its_own_finding() {
+        // File 0 matches, its pointer is 5, and file 5 is there but does
+        // not read: neither `Matches` nor `AlreadySealed`.
+        let mut mem = MemStore::new(BS as usize);
+        put_file(
+            &mut mem,
+            0,
+            contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 6),
+        );
+        put_file(&mut mem, 5, vec![0u8; BS as usize]);
+        let mut store = unreadable_at(mem, 5);
+        for seal_position in [None, Some(5), Some(7)] {
+            match check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, seal_position) {
+                ContactOutcome::SealUnreadable { position, error } => {
+                    assert_eq!(position, 5, "{seal_position:?}");
+                    assert!(error.contains("Input/output error"), "{error}");
+                }
+                other => panic!("{seal_position:?}: expected SealUnreadable, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn check_tape_contact_an_unreadable_seal_pointer_wins_over_a_foreign_identity() {
+        // The foreign File 0 would be an `IdentityMismatch`, which --force
+        // overrides; its seal not reading must not be that.
+        let mut mem = MemStore::new(BS as usize);
+        put_file(
+            &mut mem,
+            0,
+            contact_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 6),
+        );
+        put_file(&mut mem, 5, vec![0u8; BS as usize]);
+        let mut store = unreadable_at(mem, 5);
+        assert_eq!(
+            check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None),
+            ContactOutcome::SealUnreadable {
+                position: 5,
+                error: "tape I/O error: read: Input/output error".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn check_tape_contact_an_unreadable_caller_position_is_its_own_finding() {
+        // The pointer (7) is past the end of what is recorded -- absent --
+        // and the caller's own position (3) is there and will not read.
+        let mut mem = MemStore::new(BS as usize);
+        put_file(
+            &mut mem,
+            0,
+            contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 8),
+        );
+        put_file(&mut mem, 3, vec![0u8; BS as usize]);
+        let mut store = unreadable_at(mem, 3);
+        match check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(3)) {
+            ContactOutcome::SealUnreadable { position, .. } => assert_eq!(position, 3),
+            other => panic!("expected SealUnreadable, got {other:?}"),
+        }
+        // Past the end of what is recorded it is still no seal at all.
+        let mut mem = MemStore::new(BS as usize);
+        put_file(
+            &mut mem,
+            0,
+            contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 8),
+        );
+        assert_eq!(
+            check_tape_contact(&mut mem, CONTACT_LABEL, CONTACT_UUID, Some(3)),
+            ContactOutcome::Matches
+        );
     }
 
     // --- issue #113: the beginning-of-tape park hook ---------------------

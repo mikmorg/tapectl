@@ -4161,6 +4161,26 @@ fn decide_fresh_write_contact_on(
              yourself and run `tapectl cartridge mark-erased` before writing to it again. \
              {NEVER_DEGAUSS}"
         ))),
+        // Issue #460: a seal position that would not read, on a tape the
+        // medium does not show ends before it. Not absent, so not consent:
+        // the tape may carry a sealed volume the drive cannot read just now.
+        // No `allow_overwrite` is consulted -- like `AlreadySealed`, no flag
+        // reaches it. The wording shares none of the phrases the other four
+        // refusals carry, nor the ADR citation `scripts/first-run.sh` routes
+        // its sealed branch by: this one is not a tape to erase on sight.
+        ContactOutcome::SealUnreadable { position, error } => Err(TapectlError::Other(format!(
+            "refusing to write volume \"{label}\" (uuid {volume_uuid}): the seal marker could \
+                 not be read at tape position {position} ({error}), and the medium does not show \
+                 that the tape ends before it. A seal that cannot be read is not a seal that is \
+                 absent: the loaded cartridge may carry a finished (sealed) volume that the drive \
+                 cannot read just now, and a sealed volume is immutable — tapectl will not \
+                 write over it, and --force cannot override this. Nothing was written. Check the \
+                 drive (clean it, reseat the cartridge), then run `tapectl volume verify` on the \
+                 volume this cartridge holds (`tapectl volume identify --device <dev>` shows what \
+                 is loaded) and run the command again. If the tape really is damaged, retire its \
+                 volume first, then `tapectl cartridge erase` reads it, asks for its label and \
+                 erases it. {NEVER_DEGAUSS}"
+        ))),
         ContactOutcome::IdentityMismatch { found } => {
             let found_desc = describe_file0_identity(found.as_ref());
             if allow_overwrite {
@@ -13257,6 +13277,158 @@ mod tests {
         );
     }
 
+    // -- issue #460: an unreadable seal is not "no seal" ------------------
+    //
+    // The tape is the st driver's, in memory (`FakeTape` under the real
+    // `TapeStore`): a seal position that does not read can be told apart from
+    // one the tape simply does not reach, which `MemStore` cannot do.
+
+    mod unreadable_seal {
+        use super::*;
+        use crate::store::TapeStore;
+        use crate::tape::fake::FakeTape;
+
+        /// File 0 is `thunk`, then `held - 1` more files (a filemark each,
+        /// which is all a seal-position probe sees of them).
+        fn tape(thunk: Vec<u8>, held: usize) -> FakeTape {
+            let mut files = vec![thunk];
+            files.resize(held, Vec::new());
+            FakeTape::with_files(files, FW_BS as usize)
+        }
+
+        fn store(fake: &FakeTape) -> TapeStore {
+            TapeStore::from_ops(fake.boxed(), 0).unwrap()
+        }
+
+        fn check(
+            fake: &FakeTape,
+            seal_position: Option<u32>,
+            force: bool,
+        ) -> std::result::Result<(), String> {
+            check_fresh_write_contact(&mut store(fake), FW_LABEL, FW_UUID, seal_position, force)
+                .map_err(|e| e.to_string())
+        }
+
+        /// What the operator reads, and what `scripts/first-run.sh` routes
+        /// `volume init` refusals by: none of the four existing refusals'
+        /// phrases, nor the ADR citation its sealed branch matches.
+        fn assert_unreadable_seal_refusal(msg: &str, position: u32) {
+            assert!(msg.contains("seal marker could not be read"), "{msg}");
+            assert!(msg.contains(&format!("tape position {position}")), "{msg}");
+            assert!(msg.contains("tapectl volume verify"), "{msg}");
+            assert!(msg.contains("--force cannot override"), "{msg}");
+            for other in [
+                "already carries a SEALED volume",
+                "not provably blank",
+                "identifies a DIFFERENT volume",
+                "File 0 is EMPTY",
+                "ADR-0003",
+            ] {
+                assert!(!msg.contains(other), "must not route as `{other}`: {msg}");
+            }
+        }
+
+        /// A: the catalog was restored from a backup taken between `volume
+        /// init` and `volume write` (the #360 situation), so its guards pass.
+        /// File 0 on the tape is the write's final File 0 -- label and uuid
+        /// match, seal pointer 7 -- and the drive cannot read file 7. Before
+        /// the fix this was `Matches` and `volume write` went on to write
+        /// over the tape.
+        #[test]
+        fn a_matching_file_zero_whose_seal_will_not_read_refuses_even_with_force() {
+            let fake = tape(fw_id_thunk_bytes(FW_LABEL, FW_UUID, 8), 8);
+            fake.state().unreadable = vec![7];
+            for seal_position in [Some(7), Some(5), None] {
+                for force in [false, true] {
+                    let msg = check(&fake, seal_position, force)
+                        .expect_err(&format!("{seal_position:?} force={force}"));
+                    assert_unreadable_seal_refusal(&msg, 7);
+                }
+            }
+        }
+
+        /// B: `volume init --force` on a tape holding another volume whose
+        /// seal does not read. That is not a plain identity mismatch the
+        /// flag may override: the other volume may be sealed.
+        #[test]
+        fn a_foreign_file_zero_whose_seal_will_not_read_refuses_even_with_force() {
+            let fake = tape(
+                fw_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 6),
+                6,
+            );
+            fake.state().unreadable = vec![5];
+            for force in [false, true] {
+                let msg = check(&fake, None, force).expect_err(&format!("force={force}"));
+                assert_unreadable_seal_refusal(&msg, 5);
+                assert!(!msg.contains("WRONGVOL"), "{msg}");
+            }
+        }
+
+        /// Positive controls: absence is still absence wherever the tape
+        /// itself shows it ends before the position.
+        #[test]
+        fn a_seal_the_tape_does_not_reach_is_still_no_seal() {
+            // `volume write` right after `volume init`: File 0 alone, its
+            // provisional pointer far past the end of data.
+            let fake = tape(fw_id_thunk_bytes(FW_LABEL, FW_UUID, 8), 1);
+            assert_eq!(check(&fake, Some(7), false), Ok(()));
+            assert_eq!(check(&fake, None, false), Ok(()));
+
+            // Interrupted after execute, before the seal: files 0..=6 are
+            // there and the end of data is exactly at the seal's position.
+            let fake = tape(fw_id_thunk_bytes(FW_LABEL, FW_UUID, 8), 7);
+            assert_eq!(check(&fake, Some(7), false), Ok(()));
+
+            // Interrupted earlier still.
+            let fake = tape(fw_id_thunk_bytes(FW_LABEL, FW_UUID, 8), 3);
+            assert_eq!(check(&fake, Some(7), false), Ok(()));
+
+            // A blank tape.
+            let fake = FakeTape::with_files(Vec::new(), FW_BS as usize);
+            assert_eq!(check(&fake, Some(7), false), Ok(()));
+            assert_eq!(check(&fake, None, false), Ok(()));
+        }
+
+        /// No evidence is not evidence: a drive that cannot say where its
+        /// head is cannot show that the tape ends before the seal, so the
+        /// failed read stays an unreadable seal.
+        #[test]
+        fn a_tape_that_cannot_report_its_position_gives_no_evidence_of_its_end() {
+            let fake = tape(fw_id_thunk_bytes(FW_LABEL, FW_UUID, 8), 3);
+            fake.state().position_fails = true;
+            let msg = check(&fake, Some(7), true).expect_err("no evidence, no absence");
+            assert_unreadable_seal_refusal(&msg, 7);
+        }
+
+        /// A foreign File 0 whose pointer lies past the end of data is the
+        /// plain mismatch it always was: refused, `--force` the way past.
+        #[test]
+        fn a_foreign_file_zero_with_no_seal_on_the_tape_is_the_plain_mismatch() {
+            let fake = tape(
+                fw_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 6),
+                2,
+            );
+            let msg = check(&fake, None, false).expect_err("a mismatch refuses");
+            assert!(msg.contains("DIFFERENT volume"), "{msg}");
+            assert_eq!(check(&fake, None, true), Ok(()), "--force overrides it");
+        }
+
+        /// A seal that reads and parses is `AlreadySealed`, as before, and
+        /// no flag reaches it.
+        #[test]
+        fn a_seal_that_reads_is_still_already_sealed() {
+            let mut seal = layout::generate_seal_marker(FW_LABEL, 6, "deadbeef", &[]).into_bytes();
+            seal.resize(FW_BS as usize, 0);
+            let fake = tape(fw_id_thunk_bytes(FW_LABEL, FW_UUID, 6), 6);
+            fake.state().files[5] = seal;
+            for force in [false, true] {
+                let msg = check(&fake, Some(5), force).expect_err("sealed");
+                assert!(msg.contains("ADR-0003"), "{msg}");
+                assert!(!msg.contains("seal marker could not be read"), "{msg}");
+            }
+        }
+    }
+
     #[test]
     fn check_fresh_write_contact_default_is_no_override_not_reachable_by_accident() {
         // The zero-argument, no-flag CLI invocation must refuse — the
@@ -19059,7 +19231,10 @@ mod tests {
             )
             .expect("--force overrides the unproven EMPTY File 0 as it always did");
             let d = created_details(&conn, "BP-FORCED");
-            assert!(d["blank_proof"].is_null(), "no proof was what allowed it: {d}");
+            assert!(
+                d["blank_proof"].is_null(),
+                "no proof was what allowed it: {d}"
+            );
         }
 
         /// Unproven stays refused: the same EMPTY tape, no erase on record.
