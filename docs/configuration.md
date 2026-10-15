@@ -298,16 +298,15 @@ The retire gate uses the same resolved policy. [`volume retire`](cli/volume.md#t
 [`volume compact-finish`](cli/volume.md#tapectl-volume-compact-finish) (so also step 3
 of `volume compact`) refuse outright when a live version would be left with no copy,
 and no flag gets past that. When a version would keep some copies but fewer than its
-resolved `min_copies`, or copies at fewer places than its `required_locations`
-names, that is a Tier-2 shortfall. For a tape-only unit the copy number is multiplied
-by `[compaction] tape_only_safety_multiplier` (ADR-0012, 2026-10-12), and its fact
-ends `(tape-only Nx)`: `below its policy of 4 (tape-only 2x)`. The number of places is
-not multiplied. The command lists it and
-asks on a terminal.
-`--yes` confirms in advance (`--force` too, for `cartridge retire` and the compact
-commands), and a non-interactive run without it refuses. This gate counts places
-only: copies at any two places satisfy two required locations, even when neither
-place is one the archive set names.
+resolved `min_copies`, or would keep no copy at one of its `required_locations`
+(judged by name, as `audit` does), or, for a tape-only unit, would span fewer places
+than `[defaults] min_locations`, that is a Tier-2 shortfall (#463). For a tape-only
+unit the copy number is multiplied by `[compaction] tape_only_safety_multiplier`
+(ADR-0012, 2026-10-12), and so is the number of copies each required location must
+keep; those facts end `(tape-only Nx)`: `below its policy of 4 (tape-only 2x)`. The
+number of places is not multiplied. The command lists the shortfalls and asks on a
+terminal. `--yes` confirms in advance (`--force` too, for `cartridge retire` and the
+compact commands), and a non-interactive run without it refuses.
 
 ### `[[backends.lto]]`
 
