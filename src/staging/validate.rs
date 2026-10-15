@@ -1837,10 +1837,20 @@ mod tests {
         let mut ahead = ReadAhead::new(READ_AHEAD_BYTES);
         ahead.behind = Some(DropBehindBoth::new(tmp.path().to_path_buf(), plan, WINDOW));
         let page = crate::dar::page_size() as u64;
-        let gone_below = |at: u64| {
-            let map = crate::dar::resident_map(&big);
+        // Below the cut nothing may stay; past it, nothing that was resident
+        // before the drop may have gone. Judged against the map taken just
+        // before each drop, not "all resident": a busy host (a CI runner) may
+        // evict some of the warmed pages on its own, which is not the drop's
+        // doing.
+        let resident = || crate::dar::resident_map(&big);
+        let gone_below = |at: u64, before: &[bool]| {
+            let map = resident();
             let cut = (at / page) as usize;
-            map[..cut].iter().all(|r| !r) && map[cut..].iter().all(|r| *r)
+            map[..cut].iter().all(|r| !r)
+                && map[cut..]
+                    .iter()
+                    .zip(&before[cut..])
+                    .all(|(now, was)| *now || !*was)
         };
 
         // The hasher at 3 MiB, dar at 2.5 MiB: the first 2.5 MiB go.
@@ -1848,21 +1858,36 @@ mod tests {
         ahead
             .dar_rchar
             .store((5 << 19) + DAR_READ_SLACK, Ordering::Release);
+        let before = resident();
+        if before.iter().filter(|r| **r).count() * 2 <= before.len() {
+            eprintln!(
+                "SKIP: the host evicted most of the warmed file before the drop; nothing to judge"
+            );
+            return;
+        }
         ahead.drop_passed();
         assert!(
-            gone_below(5 << 19),
+            gone_below(5 << 19, &before),
             "what both passed goes, nothing past it"
         );
         // Half a window further: nothing more yet.
         ahead
             .dar_rchar
             .store((3 << 20) + DAR_READ_SLACK, Ordering::Release);
+        let before = resident();
         ahead.drop_passed();
-        assert!(gone_below(5 << 19), "less than a window more: it waits");
+        assert!(
+            gone_below(5 << 19, &before),
+            "less than a window more: it waits"
+        );
         // The end of the stage: everything read goes.
         ahead.hashed.store(SIZE as u64, Ordering::Release);
+        let before = resident();
         ahead.drop_everything_read();
-        assert!(gone_below(SIZE as u64), "the stage is over: all of it goes");
+        assert!(
+            gone_below(SIZE as u64, &before),
+            "the stage is over: all of it goes"
+        );
     }
 
     /// The hasher beside dar ([`ConcurrentHash`]) drops whatever is left of
