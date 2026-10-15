@@ -374,7 +374,10 @@ tape_raise_setup() {
   if [ -z "$TAPE_NICE" ]; then note "TAPE_NICE is empty: the tape commands run at normal priority"; return 0; fi
   if [ "$SVC_MODE" != 1 ]; then note "tapectl runs as you (--no-service-user): there is no root-then-drop path, so the tape commands run at normal priority"; return 0; fi
   [ -z "$TAPE_IONICE" ] || read -r -a io <<<"ionice $TAPE_IONICE"
-  probe=(sudo -n nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} true)
+  # The probe is the whole chain on `true` (nice, ionice, runuser, the drop to
+  # the service user), so a runuser that sudo's PATH cannot find, or a nice value
+  # root may not set, is found here and not in the middle of a write.
+  probe=(sudo -n nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} runuser -u "$SVC_USER" -- true)
   if ! "${probe[@]}" >/dev/null 2>&1; then
     if [ "$AUTO" = 1 ]; then
       note "tape commands run at NORMAL priority: raising it needs root's sudo, which asks for a password, and --auto has no one to ask"

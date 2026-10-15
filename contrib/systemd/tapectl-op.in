@@ -64,11 +64,14 @@ if [ "$tape" = 1 ] && [ -n "$TAPE_NICE" ]; then
   # password (or its timestamp is fresh), ask for the password when there is a
   # terminal to ask on, and otherwise run at normal priority rather than fail
   # over a nicety, saying so.
+  # The probe is the whole chain on `true`: nice, ionice, runuser and the drop
+  # to the service user, so a runuser that sudo's PATH cannot find (or a nice
+  # value root may not set) falls back here instead of failing the command.
   raised() {
     if [ -n "$TAPE_IONICE" ]; then
-      sudo -n nice -n "$TAPE_NICE" ionice $TAPE_IONICE true
+      sudo -n nice -n "$TAPE_NICE" ionice $TAPE_IONICE runuser -u "$SVC_USER" -- true
     else
-      sudo -n nice -n "$TAPE_NICE" true
+      sudo -n nice -n "$TAPE_NICE" runuser -u "$SVC_USER" -- true
     fi
   }
   ready=0
