@@ -260,11 +260,20 @@ assert_prio() {
     python3 - "$RUN/prio-$name.tsv" "$TAPE_NICE_RUN" "$WANT_IO" "$BASE_NICE" "$BASE_IO" "$@" <<'PY'
 import sys
 tsv, want_nice, want_io, base_nice, base_io, *required = sys.argv[1:]
-TAPE = {"volume write", "volume resume", "volume verify", "cartridge erase"}
+# The tape commands first-run.sh's `tc` raises (is_tape_command), as the words
+# tapectl_prio.words() reports them.
+TAPE = {
+    "volume": {"write", "resume", "verify", "compact-write", "compact", "read-slices", "compact-read"},
+    "restore": {"unit", "file", "volume", "raw-volume"},
+    "cartridge": {"erase"}, "collection": {"run"}, "drive": {"poll"},
+}
+def is_tape(cmd):
+    first, _, second = cmd.partition(" ")
+    return first == "quick-archive" or second in TAPE.get(first, ())
 rows = [l.rstrip("\n").split("\t") for l in open(tsv) if l.strip()]
 bad, tape, non = [], {}, {}
 for pid, cmd, nice, io in rows:
-    if cmd in TAPE:
+    if is_tape(cmd):
         tape.setdefault(cmd, []).append((nice, io))
         if nice != want_nice or io != want_io:
             bad.append(f"NOT RAISED: pid {pid} '{cmd}' ran at nice {nice}, '{io}' (want {want_nice}, '{want_io}')")

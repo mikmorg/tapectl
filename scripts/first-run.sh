@@ -309,7 +309,7 @@ run_capture_json_err() {
 run_nolog() { printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $* (output NOT logged)"; "$@"; }
 TAPE_RAISE=0   # set by tape_raise_setup (step 13) once it has found that raising works
 tc() {
-  if [ "$TAPE_RAISE" = 1 ] && is_tape_command "$@"; then tc_raised "$@"; return; fi
+  if [ "$TAPE_RAISE" = 1 ] && is_tape_command "$@" && tape_raise_holds; then tc_raised "$@"; return; fi
   if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi
 }
 # is_tape_command ARGS...: does this tapectl command stream the drive? The same
@@ -352,6 +352,27 @@ tc_raised() {
   [ -z "$HOME_DIR" ] || home=(--home "$HOME_DIR")
   sudo nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} runuser -u "$SVC_USER" -- "$TAPECTL" ${home[@]+"${home[@]}"} "$@"
 }
+# tape_probe: the whole raise chain on `true` (nice, ionice, runuser, the drop to
+# the service user), without ever prompting: a runuser that sudo's PATH cannot
+# find, or a nice value root may not set, is found here and not in the middle of
+# a write.
+tape_probe() {
+  local io=()
+  [ -z "$TAPE_IONICE" ] || read -r -a io <<<"ionice $TAPE_IONICE"
+  sudo -n nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} runuser -u "$SVC_USER" -- true >/dev/null 2>&1
+}
+# tape_raise_holds: asked before EVERY raised command, because the sudo ticket
+# tape_raise_setup found can lapse (the keepalive dies, someone runs `sudo -k`,
+# the host's timeout is 0). A bare `sudo nice ...` would then prompt for a
+# password nobody answers, and sudo would fail the command after its timeout
+# with an error that never touched the tape — after a days-long write. So when
+# the chain no longer works, say so once and run the command at normal priority.
+tape_raise_holds() {
+  tape_probe && return 0
+  note "sudo's ticket for the raise has lapsed: this tape command runs at NORMAL priority" >&2
+  TAPE_RAISE=0
+  return 1
+}
 # tape_raise_setup: decide, once per run of step 13, whether tc can raise.
 # Raising needs ROOT's sudo, which is not the sudo this script otherwise uses:
 # home2's sudoers rule (home2-prep.sh part 8) lets the operator run commands AS
@@ -369,22 +390,16 @@ tape_raise_stop() {
   TAPE_KEEPALIVE_PID=""
 }
 tape_raise_setup() {
-  local io=() probe=()
   TAPE_RAISE=0
   if [ -z "$TAPE_NICE" ]; then note "TAPE_NICE is empty: the tape commands run at normal priority"; return 0; fi
   if [ "$SVC_MODE" != 1 ]; then note "tapectl runs as you (--no-service-user): there is no root-then-drop path, so the tape commands run at normal priority"; return 0; fi
-  [ -z "$TAPE_IONICE" ] || read -r -a io <<<"ionice $TAPE_IONICE"
-  # The probe is the whole chain on `true` (nice, ionice, runuser, the drop to
-  # the service user), so a runuser that sudo's PATH cannot find, or a nice value
-  # root may not set, is found here and not in the middle of a write.
-  probe=(sudo -n nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} runuser -u "$SVC_USER" -- true)
-  if ! "${probe[@]}" >/dev/null 2>&1; then
+  if ! tape_probe; then
     if [ "$AUTO" = 1 ]; then
       note "tape commands run at NORMAL priority: \`sudo -n nice ... runuser\` did not work here (root's sudo asks for a password, or nice/runuser is unavailable) and --auto has no one to ask"
       return 0
     fi
     note "raising the tape commands' priority needs root's sudo (it asks for YOUR password, once; the ticket is kept warm for this step)"
-    if ! sudo -v || ! "${probe[@]}" >/dev/null 2>&1; then
+    if ! sudo -v || ! tape_probe; then
       note "root's sudo is not available to you here"
       confirm "Run the tape commands at NORMAL priority instead?" || die "stopped — fix sudo, or pass --tape-nice '' to never raise, then re-run scripts/first-run.sh --from 13"
       return 0
