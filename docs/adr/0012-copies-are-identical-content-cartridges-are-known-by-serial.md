@@ -1464,3 +1464,10 @@ Decided by the coordinator from existing rulings, recorded so they are not re-op
     staging is kept and each short unit is named. `--keep-staging` opts out (first-run step 13
     passes it and runs `staging clean` after its full verify). A failed release is a warning
     (item 33). `staging clean` is unchanged.
+64. **`drive eject` and `drive cleaned`'s edges** (#429, #430, decided by the coordinator): an
+    empty drive ejects nothing and exits 0 with no record; a cartridge in a drive that is not
+    ready is refused (exit 2); a tape node held by a tapectl command or open in another process
+    is refused with exit 75 and nothing sent; a failed unload leaves a `failed` contact and no
+    event. A cleaning is one `cleaned` event on the drive (`field = 'cleaning_cartridge'`), no
+    contact; `drive cleaned` exits 1 when the cleaning cartridge is at or past its rated uses.
+    TapeAlert 22 and 23 name the cleaning cartridge, not the drive, as what to replace.

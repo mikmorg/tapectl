@@ -1209,7 +1209,7 @@ elif confirm "Run the first-year rehearsal on a TEST cartridge now?"; then
     ok "rehearsal green"
     # B14: step 13 checks for this marker (per binary) before the first write.
     mkdir -p "$(dirname "$LOG")"; printf '%s %s %s\n' "$(date -u +%FT%TZ)" "$TEST_BARCODE" "$("$TAPECTL" --version 2>/dev/null)" > "$(dirname "$LOG")/rehearsal-ok-$(sha256sum "$TAPECTL" | cut -c1-16)"
-    note "Eject the test cartridge (mt -f $DEVICE offline) and load the production one before step 13."
+    note "Eject the test cartridge ($( [ "$SVC_MODE" = 1 ] && printf 'sudo -u %s -H ' "$SVC_USER" )tapectl drive eject --device $DEVICE) and load the production one before step 13."
   fi
 else note "skipped"; fi
 }
@@ -1690,7 +1690,7 @@ OP_CMD="${SUDO_PREFIX}tapectl"; [ "$WRAPPER_INSTALLED" = 1 ] && OP_CMD="tapectl-
 cat <<EOF
    • Every tapectl command from now on: ${OP_CMD} <command>$( [ "$WRAPPER_INSTALLED" = 1 ] || printf '   (alias it)' ). Its home: $EFFECTIVE_HOME
    • A restore destination must be writable by ${SVC_USER}; new unit trees need the same ACL grant as step 11.
-   • Eject with: ${SUDO_PREFIX}mt -f ${DEVICE:-<device>} offline. Write the label on the cartridge.
+   • Eject with: ${OP_CMD} drive eject --device ${DEVICE:-<device>} (it tells the catalog; a write or verify in progress refuses it). Write the label on the cartridge.
      Then tell the catalog what the sticker says (ADR-0012 — the serial stays its identity):
      ${SUDO_PREFIX}tapectl cartridge relabel ${CART_BOUND:-<medium-serial>} <the-barcode-you-wrote>
    • Second copy, other location: the staged slices are still on disk, so load a fresh cartridge,

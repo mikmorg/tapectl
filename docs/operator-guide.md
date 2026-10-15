@@ -1898,6 +1898,47 @@ command, so it is safe to run during a write. It exits 0 whenever the probe ran 
 empty drive is an answer) and 2 when the tape node cannot be read or no drive is
 configured; `--json` still prints the report.
 
+#### Ejecting the cartridge
+
+`tapectl drive eject` unloads the cartridge and tells the catalog it left (issue #429):
+
+```bash
+tapectl drive eject                # the only configured drive
+tapectl drive eject --dry-run      # check and say what it would eject; send nothing
+```
+
+It reads the cartridge chip's serial, rewinds and unloads (what `mt offline` sends), and
+records one `drive eject` contact naming the cartridge and the drive, and one `ejected`
+event on the cartridge (on the drive if the chip is not registered). It changes nothing
+else: the cartridge's volumes stay bound to it, because an eject is not a displacement
+(ADR-0012, 2026-10-15 item 61), and its place stays what `cartridge move` last said; the
+output names the command for where it is going. It refuses while any tapectl command holds
+the drive or a volume (a write, a verify, a restore, a poll): exit 75, naming the holder's
+pid and command, nothing sent to the drive. Once it has the drive it holds the drive lock
+until it exits. An empty drive is not an error (exit 0, nothing recorded); a cartridge in a
+drive that is not ready is refused (exit 2). It needs a configured backend; without one
+`mt -f <device> offline` still works and the catalog is not told.
+
+#### Cleaning the drive
+
+tapectl drives no changer, so cleaning is you inserting the cleaning cartridge when the
+drive asks (`drive status` shows it; `drive poll` and `audit` print the cleaning TapeAlert
+as "clean the drive"). `tapectl drive cleaned` writes down that it happened (ADR-0012,
+2026-10-15 item 60):
+
+```bash
+tapectl drive cleaning-cartridge add CLNU01   # once per cleaning cartridge; rated for 50 uses (--rated-uses N)
+tapectl drive cleaned --cartridge CLNU01      # after each cleaning
+tapectl drive cleaned                         # the cartridge in the drive, if its chip names a registered one
+```
+
+Each cleaning is one `cleaned` event on the drive, naming the cartridge. Each cleaning
+cartridge's uses and each drive's last cleaning are counted from those events, and
+`tapectl report health` shows them once a cleaning cartridge is registered or a cleaning
+recorded. A cartridge within 5 uses of its rating is flagged NEAR ITS RATED LIFE; at or past
+it, SPENT, and `drive cleaned` exits 1: a spent cartridge does not clean, so replace it. The
+drive says so too: TapeAlert 22 reads "replace the cleaning cartridge".
+
 #### The daily drive poll
 
 Between a write and the next verify a drive can go months unwatched, and the
@@ -1948,7 +1989,8 @@ hardware fact, not a policy finding, and this is the check that exists to go
 red. Ping it through its own healthchecks.io-style check, separate from the
 audit's: set `TAPECTL_DRIVE_HEALTHCHECK_URL` in `tapectl-drive-poll.service`
 (`/start` before, bare URL on 0, `/fail` on 1, 2 and anything else but 75; the
-poll's output is the ping's body, so the check's log names the flags). The
+poll's output is the ping's body, so the check's log names the flags; a cleaning
+flag (TapeAlert 20-23) is printed as the action it asks for, and is still exit 1). The
 audit sees the same alerts from the catalog: `tape_alert` warns (exit 1) for
 each live volume whose cartridge raised one not before the volume's last
 passed full verify started, and names the flags; the remedy is `tapectl volume verify
