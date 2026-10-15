@@ -189,8 +189,9 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 /// "The write target."
 ///
 /// `catalog rebuild --from-volume` can attach a rebuilt row's contents to
-/// a pre-existing `initialized` row — `rebuild::ensure_write` always
-/// inserts its `writes` row as `status = 'completed'` — without ever
+/// a pre-existing `initialized` row — `rebuild::ensure_write` inserts its
+/// `writes` row as `status = 'completed'` when the tape's seal marker was
+/// read (a tape without one gets `'aborted'`, #458) — without ever
 /// moving that row off `initialized`: #158 deliberately never overwrites
 /// an existing row's status, on the grounds that overwriting an
 /// operator's `quarantined` finding would destroy a fact a failed
@@ -217,7 +218,8 @@ pub fn is_write_target(status: &str, condition: &str) -> bool {
 /// they carry no signal beyond `writes` here. `write_positions` reaches a
 /// volume only through `writes.id` (it has no `volume_id` of its own), and
 /// `stage_slices` has no `volume_id` at all; `rebuild::ensure_write`
-/// inserts its `completed` `writes` row in the very same transaction as
+/// inserts its `writes` row (`completed` for a sealed tape, `aborted`
+/// otherwise, #458) in the very same transaction as
 /// any slice/position row it attaches (`rebuild.rs`'s `insert_all`), so a
 /// `writes` row is never absent while a slice attributable to this volume
 /// is present. Joining either table would duplicate a fact this query

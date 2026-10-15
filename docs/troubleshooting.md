@@ -2352,7 +2352,18 @@ A key matched the envelope (age got past its header) but the payload would
 not decrypt, or the envelope's bytes do not match the front index. That is
 damage, not a wrong key: another key will not help. The operator envelope has
 a backup copy on every tape, which an operator or escrow key opens
-(`--find-envelope` tries it); otherwise use another copy of the volume.
+(`--find-envelope` tries it); otherwise use another copy of the volume. Since 1.1.0
+every tenant envelope has a backup too.
+
+`catalog rebuild` treats a pair that is unreadable in both copies by kind (#451).
+The operator envelope's pair lost: the rebuild refuses (it names every unit and
+carries catalog.db). A tenant envelope's pair lost on a tape whose catalog.db
+names each unit's owner (written after 2026-09-11): the rebuild goes on, warns
+naming the envelope and its copies' positions, and records every unit (`--json`:
+`unreadable_tenant_envelopes`). On an older tape, or one with no catalog.db, the
+tenant envelopes are the only record of ownership, so the rebuild refuses; use
+another copy of the volume. In every case RESTORE.sh (tape file 2) with the
+owner's key or the escrow key restores what still opens.
 
 ### RESTORE.sh: `this tape is layout_version N`
 
@@ -2412,6 +2423,37 @@ serial the drive reported, learnt onto that cartridge (the `note: cartridge
 ... learnt <serial>` line says so). Verify the tape (`tapectl volume verify <label>`), which
 checks the tape against its own front index; if it passes, the catalog's rows
 are the ones in doubt.
+
+### `catalog rebuild`: `NO VALID SEAL MARKER`
+
+```text
+  warning: volume "<label>" has NO VALID SEAL MARKER: <why>
+    recorded as an unsealed volume: status "initialized", its writes "aborted" and its slice positions "pending" ...
+```
+
+The rebuild reads the seal marker before it says a tape is sealed (ADR-0012,
+#458). The seal must read at File 0's `seal_marker` position, parse, name this
+volume, and bind the front index beside it. Without one the tape is an
+interrupted or aborted write: its envelopes and front index are laid down before
+its slices, so the catalog can describe slices that were never written. The rows
+are recorded as the catalog records any aborted write (`initialized`, writes
+`aborted`, positions `pending`), so the data is findable and nothing counts it as
+a copy in `audit` or `report copies`. A full `volume verify` cannot seal it.
+Three ways out:
+
+- write over it: `tapectl volume write <label>` starts again at the beginning of
+  the same tape;
+- reuse the cartridge another way: `tapectl volume retire <label>` (no copy is
+  lost; it prompts for nothing), then `tapectl cartridge erase`;
+- read what it holds: RESTORE.sh at tape file 2 with a tenant key or the escrow
+  key.
+
+Do not `volume verify` it first: a verify records its failures against those
+positions, and `volume write` will not delete positions that hold results. A seal
+marker that requires a feature this tapectl does not know is not "unsealed": the
+rebuild refuses it, by name, and the tape is read with a newer tapectl or its own
+RESTORE.sh. `--json` carries `seal_valid`, `unsealed_reason` and
+`recorded_as_unsealed`.
 
 ---
 
