@@ -760,7 +760,7 @@ mod tests {
         )
         .unwrap();
         let unit_id = conn.last_insert_rowid();
-        let mut volume = |label: &str| -> i64 {
+        let volume = |label: &str| -> i64 {
             conn.execute(
                 "INSERT INTO volumes (label, backend_type, backend_name, media_type,
                                       capacity_bytes, status)
