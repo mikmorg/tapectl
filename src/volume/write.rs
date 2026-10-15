@@ -4498,8 +4498,9 @@ pub fn volume_verify(
 /// read once, on that store — the read `verify_contacted` makes at contact
 /// in any case, handed to it rather than made twice ([`loaded::Peeked`]; a
 /// second read would be a rewind, which `volume::cost_budget` pins). A tape
-/// this catalog does not know is refused naming what File 0 says, before
-/// any contact opens. The volume's session lock is taken once the volume is
+/// this catalog does not know is refused naming what File 0 says — as a
+/// recorded `failed` contact, since the drive was opened and File 0 read
+/// (issue #442). The volume's session lock is taken once the volume is
 /// known, so after the File 0 read rather than before the drive opens as
 /// with a label; the st driver's own exclusive open is what kept a second
 /// process off the drive until then.
@@ -4536,8 +4537,18 @@ pub(crate) fn volume_verify_loaded(
 
 /// [`volume_verify_loaded`] minus the tape device, for a `MemStore` or a
 /// `FakeTape`-backed store: find the volume File 0 names, announce it, take
-/// its session lock, and verify it through [`volume_verify_with_store`] on
-/// a store that already holds the File 0 it read.
+/// its session lock, and verify it on a store that already holds the File 0
+/// it read.
+///
+/// **The contact opens first** (issue #442), before File 0 is read, as a
+/// labelled verify's does: the drive is open, so any refusal from here on —
+/// a tape the catalog does not know, a volume with a session live — is a
+/// contact, closed `failed` with its reason through the same
+/// [`close_verify_contact`] a failed verify uses. It cannot name a volume
+/// yet; the volume is attached once the catalog has resolved it by uuid
+/// ([`ContactGuard::record_volume`](contact::ContactGuard::record_volume)).
+/// Exactly one contact either way: the verify that follows is
+/// [`verify_contacted`] on this guard, not a second `site.open`.
 pub(crate) fn verify_loaded_with_store(
     conn: &Connection,
     store: &mut dyn Store,
@@ -4545,20 +4556,52 @@ pub(crate) fn verify_loaded_with_store(
     tier: Tier,
     site: ContactSite<'_>,
 ) -> Result<(loaded::LoadedVolume, VerifyReport)> {
-    let (found, mut peeked) = loaded::identify(conn, store)?;
+    let phase = progress::phase("contact-open", None);
+    let guard = site.open(conn, None);
+    phase.done();
+    let (found, mut peeked) = match loaded::identify(conn, store) {
+        Ok(identified) => identified,
+        Err(e) => return refuse_verify_contact(conn, guard, &site, None, tier, e),
+    };
+    guard.record_volume(found.volume_id);
+    let volume = Some((found.volume_id, found.label.as_str()));
     loaded::announce("verifying", &found);
     // Issue #376: the verify is a session on this volume, as with a label.
-    let _volume_lock = crate::staging::lock::acquire_volume(conn, found.volume_id, &found.label)?;
-    let report = volume_verify_with_store(
+    let _volume_lock =
+        match crate::staging::lock::acquire_volume(conn, found.volume_id, &found.label) {
+            Ok(lock) => lock,
+            Err(e) => return refuse_verify_contact(conn, guard, &site, volume, tier, e),
+        };
+    let mut r = verify_contacted(
         conn,
         &mut peeked,
         &found.label,
         found.volume_id,
         block_size,
         tier,
-        site,
-    )?;
-    Ok((found, report))
+        site.medium_serial(),
+    );
+    close_verify_contact(conn, guard, &site, volume, tier, &mut r);
+    Ok((found, r?))
+}
+
+/// Close a verify contact whose work never began: `e` is why. The refusal
+/// goes out unchanged, after the contact is closed `failed` and swept like
+/// any other.
+fn refuse_verify_contact<T>(
+    conn: &Connection,
+    guard: contact::ContactGuard<'_>,
+    site: &ContactSite<'_>,
+    volume: Option<(i64, &str)>,
+    tier: Tier,
+    e: TapectlError,
+) -> Result<T> {
+    let mut r = Err(e);
+    close_verify_contact(conn, guard, site, volume, tier, &mut r);
+    match r {
+        Err(e) => Err(e),
+        Ok(_) => unreachable!("closing a refusal leaves it a refusal"),
+    }
 }
 
 /// [`volume_verify`] minus the tape device: everything from the front-index
@@ -4594,7 +4637,6 @@ pub(crate) fn volume_verify_with_store(
     let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, Some(volume_id));
     phase.done();
-    let contact_id = guard.id();
     let mut r = verify_contacted(
         conn,
         store,
@@ -4604,6 +4646,33 @@ pub(crate) fn volume_verify_with_store(
         tier,
         site.medium_serial(),
     );
+    close_verify_contact(conn, guard, &site, Some((volume_id, label)), tier, &mut r);
+    r
+}
+
+/// Everything a verify contact does once its work has ended, on EVERY
+/// outcome: close the contact, take the one post-command sweep, record the
+/// read-error rate and the phase timings. `r` is the verify's result, left
+/// in place (with `contact_id` and `drive_health_note` filled in when it is
+/// an `Ok`).
+///
+/// Split out of [`volume_verify_with_store`] for issue #442: a verify that
+/// names no volume ([`verify_loaded_with_store`]) opens its contact before
+/// it knows which volume the loaded tape is, and a refusal after the drive
+/// was opened — a tape the catalog does not know, a lock held — has to
+/// close that contact through exactly this, or the sweep and the closing
+/// would be written twice. `volume` is `None` for a contact that never
+/// resolved one; it then records no phase timings against a volume (as
+/// `restore raw-volume`, which names none, records none).
+fn close_verify_contact(
+    conn: &Connection,
+    guard: contact::ContactGuard<'_>,
+    site: &ContactSite<'_>,
+    volume: Option<(i64, &str)>,
+    tier: Tier,
+    r: &mut Result<VerifyReport>,
+) {
+    let contact_id = guard.id();
     // NOT `finish_result` (issue #296). A verify that found mismatches
     // returns `Ok(report)` with `report.failed > 0` — the non-zero exit is
     // `verify_exit_code`'s job, one layer up — and `finish_result` would
@@ -4611,7 +4680,7 @@ pub(crate) fn volume_verify_with_store(
     // "the 2031 operator holding a tape with two uncorrected read errors";
     // a contact that found errors and recorded `ok` is precisely the
     // confident wrong answer that migration's own prose objects to.
-    match &r {
+    match &*r {
         Ok(report) if report.failed > 0 => guard.finish(
             contact::OUTCOME_FAILED,
             Some(&format!(
@@ -4624,7 +4693,7 @@ pub(crate) fn volume_verify_with_store(
     }
     // Carried out on the report (issue #296): the guard is gone after this,
     // and the operator reads it back from `volume verify --json`.
-    if let Ok(report) = &mut r {
+    if let Ok(report) = r.as_mut() {
         report.contact_id = contact_id;
     }
 
@@ -4647,7 +4716,7 @@ pub(crate) fn volume_verify_with_store(
         Ok(bk) => collect_and_record_health(
             conn,
             bk,
-            Some(volume_id),
+            volume.map(|(id, _)| id),
             contact_id,
             r.as_ref().ok().and_then(|report| report.session_id),
             health::Reading::Verify,
@@ -4659,7 +4728,7 @@ pub(crate) fn volume_verify_with_store(
         ),
         Err(unattributed) => {
             warn!("{unattributed}");
-            if let Ok(report) = &mut r {
+            if let Ok(report) = r.as_mut() {
                 report.drive_health_note = Some(format!(
                     "no [[backends.lto]] entry configured for device {}; drive health \
                      (sg_logs) was not collected. The verification above is unaffected.",
@@ -4679,10 +4748,13 @@ pub(crate) fn volume_verify_with_store(
     // real rise. #421's figure is "the delta over the readback", and a
     // quick verify has none.
     if tier == Tier::Integrity {
-        if let Ok(VerifyReport {
-            session_id: Some(session_id),
-            ..
-        }) = &r
+        if let (
+            Ok(VerifyReport {
+                session_id: Some(session_id),
+                ..
+            }),
+            Some((volume_id, label)),
+        ) = (&*r, volume)
         {
             crate::tape::read_errors::record_for_verify(
                 conn,
@@ -4695,12 +4767,17 @@ pub(crate) fn volume_verify_with_store(
         }
     }
     // Issue #386: this verify's phases, on every outcome.
-    phase_timings::record_drained(
-        conn,
-        "volume verify",
-        phase_timings::Subject::Volume(volume_id),
-    );
-    r
+    match volume {
+        Some((volume_id, _)) => phase_timings::record_drained(
+            conn,
+            "volume verify",
+            phase_timings::Subject::Volume(volume_id),
+        ),
+        // No volume to record them against: they are in the session log.
+        None => {
+            let _ = progress::drain();
+        }
+    }
 }
 
 /// [`volume_verify_with_store`] minus the contact bookkeeping — the verify
@@ -7437,6 +7514,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sessions, 1, "recorded against the volume File 0 named");
+        // ONE contact, however many places might have opened one: the
+        // success path of a no-label verify opens exactly the contact a
+        // labelled one does, and names the volume File 0 identified
+        // (issue #442).
+        let contacts = contact_rows(&conn);
+        assert_eq!(
+            contacts,
+            vec![(
+                "volume verify".to_string(),
+                Some(volume_id),
+                Some("ok".to_string()),
+                None
+            )]
+        );
 
         // The labelled verify of the same tape, for comparison.
         let (conn2, volume_id2, fake2) = loaded_fixture("LV-ONE");
@@ -7489,8 +7580,27 @@ mod tests {
         assert_eq!(reads, 2, "{:?}", fake.ops());
     }
 
+    /// The contacts of the catalog: `(operation, volume_id, outcome, detail)`
+    /// for each row, oldest first.
+    #[allow(clippy::type_complexity)]
+    fn contact_rows(
+        conn: &Connection,
+    ) -> Vec<(String, Option<i64>, Option<String>, Option<String>)> {
+        conn.prepare(
+            "SELECT operation, volume_id, outcome, detail FROM cartridge_contacts ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
     /// A tape the catalog does not know is refused, naming what File 0
-    /// says, before any contact opens: no session, no contact row.
+    /// says: no session, and ONE contact, recorded `failed` with the reason
+    /// (issue #442) — the drive was opened and File 0 read, which is what a
+    /// contact is, exactly as when a label was typed and the tape was wrong.
+    /// The contact names no volume: the catalog has none for this tape.
     #[test]
     fn a_verify_with_no_label_refuses_a_tape_the_catalog_does_not_know() {
         let (conn, _, fake) = loaded_fixture("LV-KNOWN");
@@ -7518,11 +7628,26 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(rows("verification_sessions"), 0);
-        assert_eq!(
-            rows("cartridge_contacts"),
-            0,
-            "no contact: nothing was verified"
+        let contacts = contact_rows(&conn);
+        assert_eq!(contacts.len(), 1, "one contact: {contacts:?}");
+        let (operation, volume_id, outcome, detail) = &contacts[0];
+        assert_eq!(operation, "volume verify");
+        assert_eq!(*volume_id, None, "the catalog has no volume for this tape");
+        assert_eq!(outcome.as_deref(), Some("failed"));
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|d| d.contains("no volume with that uuid")),
+            "the reason is recorded: {detail:?}"
         );
+        let closed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM cartridge_contacts WHERE closed_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(closed, 1, "closed, not left to read as a crash");
         // Verify's contract maps every error to "inconclusive".
         assert_eq!(
             crate::error::ErrorContract::Verify.exit_code(&anyhow::Error::msg(err)),
@@ -7551,6 +7676,19 @@ mod tests {
         .to_string();
 
         assert!(err.contains("does not identify a volume"), "{err}");
+        // The drive was opened and File 0 read: a contact, `failed`, with
+        // the reason (issue #442).
+        let contacts = contact_rows(&conn);
+        assert_eq!(contacts.len(), 1, "{contacts:?}");
+        assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+        assert!(
+            contacts[0]
+                .3
+                .as_deref()
+                .is_some_and(|d| d.contains("does not identify a volume")),
+            "{:?}",
+            contacts[0]
+        );
     }
 
     /// A label that IS given is checked against File 0 exactly as before:
@@ -8740,7 +8878,11 @@ mod tests {
             ("fn volume_write_contacted", "contact.id(),"),
             ("fn volume_resume_contacted", "contact.id(),"),
             ("fn volume_resume_adopt_lost_contacted", "contact.id(),"),
-            ("pub(crate) fn volume_verify_with_store(", "contact_id,"),
+            // Issue #442: the closing and the sweep live in ONE function,
+            // `close_verify_contact`, which both the labelled seam and the
+            // no-label seam (and its refusals) end in — so a verify contact
+            // is swept exactly once however it ended.
+            ("fn close_verify_contact(", "contact_id,"),
             // Issue #339: init sweeps too, in the function that holds the
             // guard — not in `volume_init_in_contact`, which the `?`s leave.
             ("fn volume_init_contacted", "contact.id(),"),

@@ -449,7 +449,7 @@ pub fn restore_file_from_loaded(
 /// The loaded-tape restore, minus the drive: read File 0 ONCE off `store`,
 /// find the volume in the catalog, then run the checks a named volume runs
 /// before the tape ([`plan_before_tape`]) and restore through
-/// [`restore_unit_from_store`] on a store that already holds that File 0 —
+/// [`restore_unit_in_contact`] on a store that already holds that File 0 —
 /// its contact check finds it where it looks and reads nothing again.
 ///
 /// The order a named volume has — every catalog refusal before the drive
@@ -457,6 +457,16 @@ pub fn restore_file_from_loaded(
 /// volume, and the tape is what names it. So the drive is open and File 0
 /// read first, then the same refusals, and still no slice is read, no
 /// scratch directory made and no key loaded before them.
+///
+/// **The contact opens first** (issue #442), before File 0 is read, and the
+/// volume is attached to it once the catalog has resolved it by uuid. The
+/// drive is open from the first step, so a refusal at any later one — a tape
+/// the catalog does not know, a destination that is not empty — is a contact
+/// closed `failed` with its reason ([`refuse_loaded_contact`]), as a named
+/// volume's wrong tape is; and the restore that follows is the SAME contact
+/// ([`restore_unit_in_contact`]), not a second one. A refusal writes no
+/// `restores` row: the restore never began, as a named volume's refusals
+/// before the drive write none.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn restore_unit_from_loaded_store(
     conn: &Connection,
@@ -469,9 +479,18 @@ pub(crate) fn restore_unit_from_loaded_store(
     store: &mut dyn Store,
     site: ContactSite<'_>,
 ) -> Result<RestoreReport> {
-    let (found, mut peeked) = crate::volume::loaded::identify(conn, store)?;
+    let started_at = restore_record::now_sqlite();
+    let phase = progress::phase("contact-open", None);
+    let guard = site.open(conn, None);
+    phase.done();
+    let kind = target.kind();
+    let (found, mut peeked) = match crate::volume::loaded::identify(conn, store) {
+        Ok(identified) => identified,
+        Err(e) => return refuse_loaded_contact(conn, guard, &site, None, kind, e),
+    };
+    guard.record_volume(found.volume_id);
     crate::volume::loaded::announce("restoring from", &found);
-    let (selection, _plan) = plan_before_tape(
+    let (selection, _plan) = match plan_before_tape(
         conn,
         config,
         unit_name,
@@ -479,19 +498,59 @@ pub(crate) fn restore_unit_from_loaded_store(
         target,
         options,
         version,
-    )?;
-    restore_unit_from_store(
+    ) {
+        Ok(planned) => planned,
+        Err(e) => return refuse_loaded_contact(conn, guard, &site, Some(found.volume_id), kind, e),
+    };
+    restore_unit_in_contact(
         conn,
         paths,
         config,
+        guard,
+        Some(found.volume_id),
+        &started_at,
         unit_name,
         &found.label,
         selection.version,
         target,
         options,
         &mut peeked,
-        site,
+        &site,
     )
+}
+
+/// Close the contact of a no-label restore (issue #435) that was refused
+/// after its drive was opened and File 0 read (issue #442): `failed`, with
+/// the reason, and the one post-command reading every contact takes. The
+/// refusal goes out unchanged.
+///
+/// `volume_id` is the volume the catalog resolved, `None` when it resolved
+/// none (a tape it does not know). `kind` names the restore for its phase
+/// timings, which have no volume to be recorded against in that case.
+fn refuse_loaded_contact<T>(
+    conn: &Connection,
+    guard: contact::ContactGuard<'_>,
+    site: &ContactSite<'_>,
+    volume_id: Option<i64>,
+    kind: &str,
+    e: TapectlError,
+) -> Result<T> {
+    let contact_id = guard.id();
+    guard.finish(contact::OUTCOME_FAILED, Some(&e.to_string()));
+    let phase = progress::phase("health-sweep", None);
+    crate::volume::write::health_after_read_contact(conn, site, volume_id, contact_id);
+    phase.done();
+    match volume_id {
+        Some(id) => crate::db::phase_timings::record_drained(
+            conn,
+            &format!("restore {kind}"),
+            crate::db::phase_timings::Subject::Volume(id),
+        ),
+        None => {
+            let _ = progress::drain();
+        }
+    }
+    Err(e)
 }
 
 /// The restore's checks that need no tape (issue #406), in the order an
@@ -1060,6 +1119,43 @@ pub(crate) fn restore_unit_from_store(
     let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, volume_id);
     phase.done();
+    restore_unit_in_contact(
+        conn,
+        paths,
+        config,
+        guard,
+        volume_id,
+        &started_at,
+        unit_name,
+        volume_label,
+        version,
+        target,
+        options,
+        store,
+        &site,
+    )
+}
+
+/// [`restore_unit_from_store`] from the moment its contact is open: the
+/// restore itself, the `restores` row, the one post-command reading and the
+/// phase timings. Split out for issue #442 — the loaded-tape restore opens
+/// the same contact before it can know the volume, and ends in this.
+#[allow(clippy::too_many_arguments)]
+fn restore_unit_in_contact(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    guard: contact::ContactGuard<'_>,
+    volume_id: Option<i64>,
+    started_at: &str,
+    unit_name: &str,
+    volume_label: &str,
+    version: i64,
+    target: RestoreTarget<'_>,
+    options: &RestoreOptions,
+    store: &mut dyn Store,
+    site: &ContactSite<'_>,
+) -> Result<RestoreReport> {
     let contact_id = guard.id();
     let mut trace = RestoreTrace::default();
     let r = guard.finish_result(restore_unit_contacted(
@@ -1081,7 +1177,7 @@ pub(crate) fn restore_unit_from_store(
             contact_id,
             volume_id,
             volume_label,
-            started_at: &started_at,
+            started_at,
         },
         unit_name,
         version,
@@ -1090,11 +1186,12 @@ pub(crate) fn restore_unit_from_store(
         &trace,
     );
     // ONE post-command health reading for this contact (issue #320), on
-    // every outcome, naming the volume the contact names. This seam is the
-    // only place `restore unit` — and `restore file`, which reaches the
-    // drive through it — takes one, so a contact cannot get two.
+    // every outcome, naming the volume the contact names. This is the only
+    // place `restore unit` — and `restore file`, which reaches the drive
+    // through it — takes one for a contact that reached the restore, so a
+    // contact cannot get two.
     let phase = progress::phase("health-sweep", None);
-    crate::volume::write::health_after_read_contact(conn, &site, volume_id, contact_id);
+    crate::volume::write::health_after_read_contact(conn, site, volume_id, contact_id);
     phase.done();
     // Issue #386: this restore's phases, on every outcome.
     if let Some(id) = volume_id {
@@ -2161,7 +2258,11 @@ pub fn restore_units_from_loaded(
 /// [`restore_units_from_loaded`] minus the drive; the multi-unit twin of
 /// [`restore_unit_from_loaded_store`], with the same order: File 0 once, the
 /// volume found, then the whole set planned and checked
-/// ([`plan_units`]), then the one pass over the tape.
+/// ([`plan_units`]), then the one pass over the tape. And the same contact
+/// (issue #442): opened before File 0 is read, the volume attached once
+/// resolved, closed `failed` by [`refuse_loaded_contact`] on any refusal
+/// before the set is restored, and handed on to
+/// [`restore_units_in_contact`] when there is none.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn restore_units_from_loaded_store(
     conn: &Connection,
@@ -2174,25 +2275,42 @@ pub(crate) fn restore_units_from_loaded_store(
     store: &mut dyn Store,
     site: ContactSite<'_>,
 ) -> Result<UnitsReport> {
-    let (found, mut peeked) = crate::volume::loaded::identify(conn, store)?;
-    crate::volume::loaded::announce("restoring from", &found);
-    let names = if unit_names.is_empty() {
-        units_on_volume(conn, &found.label)?
-    } else {
-        unit_names.to_vec()
+    let phase = progress::phase("contact-open", None);
+    let guard = site.open(conn, None);
+    phase.done();
+    let (found, mut peeked) = match crate::volume::loaded::identify(conn, store) {
+        Ok(identified) => identified,
+        Err(e) => return refuse_loaded_contact(conn, guard, &site, None, "volume", e),
     };
-    let requests = unit_requests(&names, dest_root)?;
-    let planned = plan_units(conn, config, &found.label, &requests, options)?;
-    restore_units_from_store(
+    guard.record_volume(found.volume_id);
+    crate::volume::loaded::announce("restoring from", &found);
+    let planned = (|| {
+        let names = if unit_names.is_empty() {
+            units_on_volume(conn, &found.label)?
+        } else {
+            unit_names.to_vec()
+        };
+        let requests = unit_requests(&names, dest_root)?;
+        plan_units(conn, config, &found.label, &requests, options)
+    })();
+    let planned = match planned {
+        Ok(planned) => planned,
+        Err(e) => {
+            return refuse_loaded_contact(conn, guard, &site, Some(found.volume_id), "volume", e)
+        }
+    };
+    restore_units_in_contact(
         conn,
         paths,
         config,
+        guard,
+        Some(found.volume_id),
         &found.label,
         &planned,
         options,
         fail_fast,
         &mut peeked,
-        site,
+        &site,
     )
 }
 
@@ -2343,6 +2461,38 @@ fn restore_units_from_store(
     let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, volume_id);
     phase.done();
+    restore_units_in_contact(
+        conn,
+        paths,
+        config,
+        guard,
+        volume_id,
+        volume_label,
+        planned,
+        options,
+        fail_fast,
+        store,
+        &site,
+    )
+}
+
+/// [`restore_units_from_store`] from the moment its contact is open (issue
+/// #442): the one corroboration, each planned unit in turn, the contact's
+/// close, the one reading and the phase timings.
+#[allow(clippy::too_many_arguments)]
+fn restore_units_in_contact(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    guard: contact::ContactGuard<'_>,
+    volume_id: Option<i64>,
+    volume_label: &str,
+    planned: &[PlannedUnit],
+    options: &RestoreOptions,
+    fail_fast: bool,
+    store: &mut dyn Store,
+    site: &ContactSite<'_>,
+) -> Result<UnitsReport> {
     let contact_id = guard.id();
 
     let corroborated = corroborate_at_contact(conn, volume_label, store, site.medium_serial());
@@ -2398,7 +2548,7 @@ fn restore_units_from_store(
         detail.as_deref(),
     );
     let phase = progress::phase("health-sweep", None);
-    crate::volume::write::health_after_read_contact(conn, &site, volume_id, contact_id);
+    crate::volume::write::health_after_read_contact(conn, site, volume_id, contact_id);
     phase.done();
     if let Some(id) = volume_id {
         crate::db::phase_timings::record_drained(
@@ -3551,6 +3701,28 @@ mod tests {
         /// The uuid `tape_labelled` writes into File 0.
         const TAPE_UUID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
+        /// The contacts of the catalog, oldest first:
+        /// `(operation, volume_id, outcome, detail)`.
+        #[allow(clippy::type_complexity)]
+        fn contact_rows(
+            conn: &Connection,
+        ) -> Vec<(String, Option<i64>, Option<String>, Option<String>)> {
+            conn.prepare(
+                "SELECT operation, volume_id, outcome, detail FROM cartridge_contacts ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        }
+
+        /// The `detail` of the only contact.
+        fn contact_detail(conn: &Connection) -> Option<String> {
+            conn.query_row("SELECT detail FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap()
+        }
+
         /// [`seed`], the volume carrying the uuid the loaded tape's File 0
         /// has. Returns the volume's id.
         fn seed_loaded(conn: &Connection, label: &str, unit_name: &str) -> i64 {
@@ -3616,13 +3788,25 @@ mod tests {
                     "the loaded volume was found and its contact check passed: {err}"
                 );
             }
-            let contact_volume: Option<i64> = conn
-                .query_row("SELECT volume_id FROM cartridge_contacts", [], |r| r.get(0))
-                .unwrap();
             assert_eq!(
-                contact_volume,
-                Some(volume_id),
-                "the contact names the volume"
+                contact_rows(&conn),
+                vec![(
+                    "restore unit".to_string(),
+                    Some(volume_id),
+                    // The fixture has no key, so the restore fails past the
+                    // contact check; what matters here is that it got there
+                    // on ONE contact (issue #442), not a second one opened
+                    // after the first.
+                    Some("failed".to_string()),
+                    contact_detail(&conn)
+                )],
+                "one contact, naming the volume"
+            );
+            assert!(
+                !contact_detail(&conn)
+                    .unwrap_or_default()
+                    .contains("no volume with that uuid"),
+                "the contact failed on the key load, not on finding the volume"
             );
 
             // The same restore with the label typed, on a fresh copy of the
@@ -3657,7 +3841,8 @@ mod tests {
 
         /// A tape this catalog does not know is refused, naming what File 0
         /// says, before the catalog's refusals, any scratch directory, any
-        /// key — and before a contact opens.
+        /// key. The drive was opened and File 0 read, so it is ONE contact,
+        /// `failed`, with the reason and no volume (issue #442).
         #[test]
         fn restore_with_no_from_refuses_a_tape_the_catalog_does_not_know() {
             let conn = crate::db::open_memory().unwrap();
@@ -3690,11 +3875,137 @@ mod tests {
                 "{err}"
             );
             assert!(err.contains("no volume with that uuid"), "{err}");
-            let contacts: i64 = conn
-                .query_row("SELECT COUNT(*) FROM cartridge_contacts", [], |r| r.get(0))
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "one contact: {contacts:?}");
+            let (operation, volume_id, outcome, detail) = &contacts[0];
+            assert_eq!(operation, "restore unit");
+            assert_eq!(*volume_id, None, "the catalog has no volume for this tape");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            assert!(
+                detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("no volume with that uuid")),
+                "the reason is recorded: {detail:?}"
+            );
+            let closed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM cartridge_contacts WHERE closed_at IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
                 .unwrap();
-            assert_eq!(contacts, 0, "nothing was restored: no contact");
+            assert_eq!(closed, 1, "closed, not left to read as a crash");
+            let restores: i64 = conn
+                .query_row("SELECT COUNT(*) FROM restores", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(restores, 0, "no restore began, so no restores row");
             assert!(!dest.path().join(".tapectl-restore-tmp").exists());
+        }
+
+        /// A refusal of the checks a named volume makes before the tape
+        /// (`plan_before_tape`) comes AFTER File 0 here, with the drive
+        /// open: one contact, `failed`, with the reason, naming the volume
+        /// the catalog resolved (issue #442). Nothing is restored and no
+        /// `restores` row is written, as for a named volume's refusal.
+        #[test]
+        fn restore_with_no_from_records_a_plan_refusal_as_a_failed_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            let volume_id = seed_loaded(&conn, "RL-PLAN", "rl-unit");
+            let tape = tape_labelled("RL-PLAN");
+            let home = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(home.path().to_path_buf());
+            // A destination that is not empty: refused before any slice is read.
+            let dest = TempDir::new().unwrap();
+            fs::write(dest.path().join("already-here"), b"x").unwrap();
+            let dest_dir = dest.path().to_string_lossy().into_owned();
+            let (fake, mut store) = on_fake_tape(&tape);
+
+            let err = restore_unit_from_loaded_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                "rl-unit",
+                RestoreTarget::Unit {
+                    dest_dir: &dest_dir,
+                },
+                &RestoreOptions::default(),
+                None,
+                &mut store,
+                site(Operation::RestoreUnit),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("it is not empty"), "{err}");
+
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "one contact: {contacts:?}");
+            let (operation, contact_volume, outcome, detail) = &contacts[0];
+            assert_eq!(operation, "restore unit");
+            assert_eq!(*contact_volume, Some(volume_id), "the volume File 0 named");
+            assert_eq!(outcome.as_deref(), Some("failed"));
+            assert!(
+                detail
+                    .as_deref()
+                    .is_some_and(|d| d.contains("it is not empty")),
+                "the reason is recorded: {detail:?}"
+            );
+            let restores: i64 = conn
+                .query_row("SELECT COUNT(*) FROM restores", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(restores, 0, "the restore never began");
+            assert!(
+                fake.ops().contains(&crate::tape::fake::Op::ReadHead(0)),
+                "positive control: the drive was in use (File 0 was read)"
+            );
+            assert!(
+                !fake
+                    .ops()
+                    .iter()
+                    .any(|o| matches!(o, crate::tape::fake::Op::Read(_))),
+                "and no slice was read: {:?}",
+                fake.ops()
+            );
+        }
+
+        /// The same for a unit the catalog does not have on the volume.
+        #[test]
+        fn restore_with_no_from_records_an_unknown_unit_as_a_failed_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            let volume_id = seed_loaded(&conn, "RL-NOUNIT", "rl-unit");
+            let tape = tape_labelled("RL-NOUNIT");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+            let dest_dir = dest.path().join("out").to_string_lossy().into_owned();
+            let (_fake, mut store) = on_fake_tape(&tape);
+
+            let err = restore_unit_from_loaded_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                "no-such-unit",
+                RestoreTarget::Unit {
+                    dest_dir: &dest_dir,
+                },
+                &RestoreOptions::default(),
+                None,
+                &mut store,
+                site(Operation::RestoreUnit),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("no-such-unit"), "{err}");
+
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert_eq!(contacts[0].1, Some(volume_id));
+            assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+            assert!(
+                contacts[0]
+                    .3
+                    .as_deref()
+                    .is_some_and(|d| d.contains("no-such-unit")),
+                "{contacts:?}"
+            );
         }
 
         /// `restore volume` with no label: the units are listed from the
@@ -3737,6 +4048,10 @@ mod tests {
             let (operation, outcome) = only_contact(&conn);
             assert_eq!(operation, "restore volume");
             assert!(outcome.is_some());
+            // ONE contact for the whole run, naming the volume (issue #442).
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert!(contacts[0].1.is_some(), "{contacts:?}");
         }
 
         /// The same for a volume named by a tape that is another volume's:
@@ -3766,6 +4081,61 @@ mod tests {
             assert!(err.contains("RL-STRANGER"), "{err}");
             assert!(err.contains("no volume with that uuid"), "{err}");
             assert!(!dest.path().join("out").exists());
+            // The drive was opened and File 0 read: one `failed` contact
+            // with the reason, naming no volume (issue #442).
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert_eq!(contacts[0].0, "restore volume");
+            assert_eq!(contacts[0].1, None);
+            assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+            assert!(
+                contacts[0]
+                    .3
+                    .as_deref()
+                    .is_some_and(|d| d.contains("no volume with that uuid")),
+                "{contacts:?}"
+            );
+        }
+
+        /// `restore volume` with no label, asked for a unit the catalog does
+        /// not have on the volume: refused by the set's planning, after
+        /// File 0 — one `failed` contact naming the volume (issue #442).
+        #[test]
+        fn restore_volume_with_no_label_records_a_plan_refusal_as_a_failed_contact() {
+            let conn = crate::db::open_memory().unwrap();
+            let volume_id = seed_loaded(&conn, "RL-SETPLAN", "rl-unit");
+            let tape = tape_labelled("RL-SETPLAN");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+            let (_fake, mut store) = on_fake_tape(&tape);
+
+            let err = restore_units_from_loaded_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                &["no-such-unit".to_string()],
+                &dest.path().join("out").to_string_lossy(),
+                &RestoreOptions::default(),
+                false,
+                &mut store,
+                site(Operation::RestoreVolume),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("no-such-unit"), "{err}");
+
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert_eq!(contacts[0].0, "restore volume");
+            assert_eq!(contacts[0].1, Some(volume_id));
+            assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+            assert!(
+                contacts[0]
+                    .3
+                    .as_deref()
+                    .is_some_and(|d| d.contains("no-such-unit")),
+                "{contacts:?}"
+            );
         }
 
         // ── issue #296: the contact ROW ──
@@ -4412,7 +4782,14 @@ mod tests {
             );
             let drive = body("fn restore_through_drive(");
             assert_eq!(drive.matches("restore_unit_from_store(").count(), 1);
-            let seam = body("pub(crate) fn restore_unit_from_store(");
+            // Issue #442: the seam opens the contact and ends in ONE tail,
+            // `restore_unit_in_contact`, which the no-label restore ends in
+            // too; the tail takes the reading.
+            let seam = body("fn restore_unit_in_contact(");
+            let opener = body("pub(crate) fn restore_unit_from_store(");
+            assert_eq!(opener.matches(".open(conn").count(), 1);
+            assert_eq!(opener.matches("restore_unit_in_contact(").count(), 1);
+            assert!(!opener.contains("health_after_read_contact("));
             for (name, b) in [
                 ("restore_file", file),
                 ("restore_unit", unit),
@@ -4433,22 +4810,49 @@ mod tests {
             assert_eq!(
                 seam.matches("health_after_read_contact(").count(),
                 1,
-                "the seam that opens the contact takes its one reading"
+                "the tail of the seam that opens the contact takes its one reading"
             );
             // Issue #398: a multi-unit restore is ONE contact, so its seam
             // takes ONE reading for the whole set — never one per unit.
-            let units = body("fn restore_units_from_store(");
+            let units = body("fn restore_units_in_contact(");
             assert_eq!(units.matches("health_after_read_contact(").count(), 1);
-            assert_eq!(units.matches(".open(conn").count(), 1);
+            let units_opener = body("fn restore_units_from_store(");
+            assert_eq!(units_opener.matches(".open(conn").count(), 1);
+            assert_eq!(units_opener.matches("restore_units_in_contact(").count(), 1);
+            assert!(!units_opener.contains("health_after_read_contact("));
             assert!(
-                !units.contains("restore_unit_from_store("),
+                !units.contains("restore_unit_from_store(")
+                    && !units.contains("restore_unit_in_contact("),
                 "the set must not take a contact per unit"
             );
+            // Issue #442: a no-label restore opens its contact before it can
+            // know the volume, so it has its own two openers (unit, set) and
+            // ONE closer for the refusals that come before a tail; a contact
+            // ends in a tail or in the closer, never both.
+            for (opener, tail) in [
+                (
+                    "pub(crate) fn restore_unit_from_loaded_store(",
+                    "restore_unit_in_contact(",
+                ),
+                (
+                    "pub(crate) fn restore_units_from_loaded_store(",
+                    "restore_units_in_contact(",
+                ),
+            ] {
+                let b = body(opener);
+                assert_eq!(b.matches(".open(conn").count(), 1, "{opener}");
+                assert_eq!(b.matches(tail).count(), 1, "{opener}");
+                assert!(!b.contains("health_after_read_contact("), "{opener}");
+                assert!(b.contains("refuse_loaded_contact("), "{opener}");
+            }
+            let closer = body("fn refuse_loaded_contact<T>(");
+            assert_eq!(closer.matches("health_after_read_contact(").count(), 1);
             assert_eq!(
                 prod.matches("health_after_read_contact(").count(),
-                3,
-                "restore.rs takes readings in exactly three seams: restore unit's, the \
-                 multi-unit restore's and raw-volume's"
+                4,
+                "restore.rs takes readings in exactly four places: restore unit's tail, the \
+                 multi-unit restore's tail, raw-volume's, and the refusal of a no-label \
+                 restore's contact"
             );
         }
 

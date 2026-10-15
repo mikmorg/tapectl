@@ -838,6 +838,35 @@ impl<'a> ContactGuard<'a> {
         }
     }
 
+    /// Attach the volume this contact turned out to be about, once the
+    /// command has found it (issue #442).
+    ///
+    /// A read that names no volume (`volume verify`, `restore unit|file|volume`
+    /// with no label, issue #435) learns which one the loaded tape is only from
+    /// File 0, so its contact has to open BEFORE that read — or a refusal after
+    /// the drive was opened would leave no contact at all — and cannot name a
+    /// volume yet. Which drive, which cartridge, which volume are facts about
+    /// the contact however late they are learned (as
+    /// [`record_drive_for`] says of the drive), and `finish` never touches
+    /// this column.
+    ///
+    /// Call it only with a volume the CATALOG resolved (`loaded::resolve`, by
+    /// uuid), never with what File 0 merely claims: `volume identify`
+    /// deliberately records NULL for that reason, and a tape the catalog does
+    /// not know has no volume to attach. Best-effort, like every contact
+    /// write.
+    pub fn record_volume(&self, volume_id: i64) {
+        let Some(id) = self.id else {
+            return;
+        };
+        if let Err(e) = self.conn.execute(
+            "UPDATE cartridge_contacts SET volume_id = ?2 WHERE id = ?1",
+            params![id, volume_id],
+        ) {
+            warn!(err = %e, contact_id = id, "cartridge_contacts volume update failed");
+        }
+    }
+
     /// Attach the drive this contact talked to (ADR-0013 §1), once
     /// `drive_identity::upsert` has produced a row for it.
     ///
@@ -1730,6 +1759,42 @@ pub(crate) mod tests {
             "a row carrying both an identity and a reason for having none is a \
              contradiction the schema cannot resolve"
         );
+    }
+
+    /// A contact that opened before its volume was known (issue #442) gets
+    /// the volume once the command has found it, and closing it leaves the
+    /// volume where it was put.
+    #[test]
+    fn record_volume_attaches_the_volume_found_after_the_contact_opened() {
+        let conn = crate::db::open_memory().unwrap();
+        let config = Config::default();
+        conn.execute(
+            "INSERT INTO volumes (label, uuid, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('RV-1', 'uuid-rv-1', 'lto', 'p', 10485760, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        let guard = ContactGuard::open(
+            &conn,
+            &config,
+            Operation::VolumeVerify,
+            "/dev/null",
+            None,
+            Medium::NoBackend,
+        );
+        assert_eq!(
+            only_row(&conn).1,
+            None,
+            "precondition: opened with no volume"
+        );
+
+        guard.record_volume(volume_id);
+        guard.finish(OUTCOME_FAILED, Some("refused after File 0"));
+
+        let row = only_row(&conn);
+        assert_eq!(row.1, Some(volume_id));
+        assert_eq!(row.9.as_deref(), Some(OUTCOME_FAILED));
     }
 
     #[test]
