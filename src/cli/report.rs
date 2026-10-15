@@ -5436,4 +5436,323 @@ Read error counter page  [0x3]
         assert_eq!(by("C-FLAT")["rising"], serde_json::Value::Null);
         assert_eq!(by("C-FLAT")["points"][0]["uncorrected"], 0);
     }
+
+    /// Issue #439: the feed ratio `volume write` records as an event is shown
+    /// by `volume info` and `report health`. Rows are seeded with the
+    /// writer's own serializer (`Assessment::details_json`), so these are
+    /// drift checks against `tape::feed_ratio`, not against this reader's
+    /// assumptions.
+    mod feed_ratio_report {
+        use super::*;
+        use crate::db::events;
+        use crate::tape::feed_ratio::{
+            Assessment, FeedRatio, Suppression, EVENT_ACTION, EVENT_FIELD,
+        };
+
+        const GB: u64 = 1_000_000_000;
+
+        fn volume(conn: &Connection, label: &str) -> i64 {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [label],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        }
+
+        /// Record a write's ratio as `assess_and_record` does, then stamp
+        /// the event's time (the column's default is now, second-resolution).
+        fn record(
+            conn: &Connection,
+            vid: i64,
+            label: &str,
+            native_mb: u64,
+            suppressed: Option<Suppression>,
+            at: &str,
+        ) {
+            let a = Assessment {
+                ratio: FeedRatio::new(native_mb, GB).unwrap(),
+                suppressed,
+            };
+            let id = events::log_event(
+                conn,
+                "volume",
+                vid,
+                Some(label),
+                EVENT_ACTION,
+                Some(EVENT_FIELD),
+                None,
+                Some(&format!("{:.4}", a.ratio.ratio())),
+                Some(&a.details_json(7)),
+                None,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE events SET timestamp = ?1 WHERE id = ?2",
+                rusqlite::params![at, id],
+            )
+            .unwrap();
+        }
+
+        fn seeded() -> Connection {
+            let conn = crate::db::open_memory().unwrap();
+            let ok = volume(&conn, "V-OK");
+            let bad = volume(&conn, "V-BAD");
+            let virt = volume(&conn, "V-VIRT");
+            let _none = volume(&conn, "V-NONE");
+            // 1_004 MB native for 1 GB sent: 1.004. 1_505 MB: 1.505.
+            record(&conn, ok, "V-OK", 1_004, None, "2026-10-14 09:00:00");
+            record(&conn, bad, "V-BAD", 1_505, None, "2026-10-14 10:00:00");
+            // A virtual drive: 16x, warning suppressed.
+            record(
+                &conn,
+                virt,
+                "V-VIRT",
+                16_000,
+                Some(Suppression::CapacityOverride),
+                "2026-10-14 11:00:00",
+            );
+            conn
+        }
+
+        #[test]
+        fn the_reader_gives_each_write_its_ratio_verdict_and_reason() {
+            let conn = seeded();
+            let rows = feed_ratio_rows(&conn, None).unwrap();
+            let by = |l: &str| rows.iter().find(|r| r.volume == l).unwrap();
+            assert_eq!(rows.len(), 3, "V-NONE recorded none: {rows:?}");
+            // Newest first.
+            assert_eq!(
+                rows.iter().map(|r| r.volume.as_str()).collect::<Vec<_>>(),
+                ["V-VIRT", "V-BAD", "V-OK"]
+            );
+
+            let ok = by("V-OK");
+            assert_eq!(ok.ratio, 1.004);
+            assert_eq!(ok.threshold, 1.05);
+            assert_eq!(ok.verdict, FeedVerdict::Streamed);
+            assert_eq!(ok.at, "2026-10-14 09:00:00");
+            assert_eq!(ok.native_bop_to_eod_mb, Some(1_004));
+            assert_eq!(ok.data_bytes, Some(GB));
+            assert_eq!(ok.suppressed, None);
+
+            let bad = by("V-BAD");
+            assert_eq!(bad.ratio, 1.505);
+            assert_eq!(bad.verdict, FeedVerdict::AboveThreshold);
+
+            // Above the threshold and warned-about by nobody: shown, never
+            // called a starved drive.
+            let virt = by("V-VIRT");
+            assert_eq!(virt.verdict, FeedVerdict::AboveThresholdSuppressed);
+            assert_eq!(virt.suppressed.as_deref(), Some("capacity_override"));
+        }
+
+        #[test]
+        fn the_reader_narrows_to_one_label() {
+            let conn = seeded();
+            let rows = feed_ratio_rows(&conn, Some("V-BAD")).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].volume, "V-BAD");
+            assert!(feed_ratio_rows(&conn, Some("V-NONE")).unwrap().is_empty());
+            assert!(feed_ratio_rows(&conn, Some("NOSUCH")).unwrap().is_empty());
+        }
+
+        /// A suppressed row that is not above the threshold is simply
+        /// streamed; and a row is judged by the threshold IT carries, not by
+        /// the constant in force now (the writer records it so history is
+        /// not rewritten).
+        #[test]
+        fn a_row_is_judged_by_its_own_threshold_and_suppression_only_matters_above_it() {
+            let conn = crate::db::open_memory().unwrap();
+            let a = volume(&conn, "V-A");
+            let b = volume(&conn, "V-B");
+            record(
+                &conn,
+                a,
+                "V-A",
+                1_000,
+                Some(Suppression::CapacityOverride),
+                "2026-10-14 09:00:00",
+            );
+            // 1.2 is above today's 1.05 but was judged against 1.5.
+            events::log_event(
+                &conn,
+                "volume",
+                b,
+                Some("V-B"),
+                EVENT_ACTION,
+                Some(EVENT_FIELD),
+                None,
+                Some("1.2000"),
+                Some(r#"{"ratio":1.2,"threshold":1.5,"warned":false}"#),
+                None,
+            )
+            .unwrap();
+            let rows = feed_ratio_rows(&conn, None).unwrap();
+            let by = |l: &str| rows.iter().find(|r| r.volume == l).unwrap();
+            assert_eq!(by("V-A").verdict, FeedVerdict::Streamed);
+            assert_eq!(by("V-A").suppressed.as_deref(), Some("capacity_override"));
+            assert_eq!(by("V-B").verdict, FeedVerdict::Streamed);
+            assert_eq!(by("V-B").threshold, 1.5);
+            assert!(by("V-B").verdict_text().contains("within 1.50"));
+        }
+
+        /// Only `write_feed_ratio` events of a VOLUME are read: the sibling
+        /// capacity event, another entity's event with the same id, and a row
+        /// with no ratio in it are not feed ratios. (Positive control: the
+        /// seeded volume's own row is still returned.)
+        #[test]
+        fn the_reader_reads_only_volume_feed_ratio_events_with_a_ratio_in_them() {
+            let conn = crate::db::open_memory().unwrap();
+            let v = volume(&conn, "V-ONE");
+            let none = volume(&conn, "V-TWO");
+            record(&conn, v, "V-ONE", 1_000, None, "2026-10-14 09:00:00");
+            crate::tape::feed_ratio::record_capacity_used(
+                &conn,
+                None,
+                v,
+                "V-ONE",
+                GB,
+                2_500_000_000_000,
+                0.97,
+            );
+            // Same action and id, wrong entity type.
+            events::log_event(
+                &conn,
+                "cartridge",
+                none,
+                Some("C"),
+                EVENT_ACTION,
+                Some(EVENT_FIELD),
+                None,
+                Some("9.0000"),
+                None,
+                None,
+            )
+            .unwrap();
+            // A volume's row with nothing readable in it.
+            events::log_event(
+                &conn,
+                "volume",
+                none,
+                Some("V-TWO"),
+                EVENT_ACTION,
+                Some(EVENT_FIELD),
+                None,
+                Some("not a number"),
+                Some("{"),
+                None,
+            )
+            .unwrap();
+            let rows = feed_ratio_rows(&conn, None).unwrap();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].volume, "V-ONE");
+            assert_eq!(rows[0].ratio, 1.0);
+        }
+
+        #[test]
+        fn report_health_lists_uneven_feeds_first_and_names_the_threshold() {
+            let conn = seeded();
+            let block = feed_ratio_block(&feed_ratio_rows(&conn, None).unwrap());
+            assert_eq!(block.len(), 4, "{block:#?}");
+            assert!(block[0].starts_with("Write feed ratio"), "{block:#?}");
+            // The starved write leads and is the only flagged one, although
+            // the virtual drive's is newer and larger.
+            assert!(
+                block[1].starts_with("  !! V-BAD: 1.5050 (above 1.05: the drive was fed unevenly"),
+                "{block:#?}"
+            );
+            assert!(
+                block[1].contains("A quiet host while the tape runs"),
+                "{block:#?}"
+            );
+            assert!(block[1].ends_with(", 2026-10-14 10:00:00"), "{block:#?}");
+            assert!(
+                block[2].starts_with("     V-VIRT: 16.0000 (above 1.05, not judged: warning suppressed (capacity_override)"),
+                "{block:#?}"
+            );
+            assert!(
+                block[3].starts_with("     V-OK: 1.0040 (streamed, within 1.05)"),
+                "{block:#?}"
+            );
+            assert_eq!(block.iter().filter(|l| l.contains("!!")).count(), 1);
+            assert!(
+                feed_ratio_block(&[]).is_empty(),
+                "nothing recorded, no block"
+            );
+        }
+
+        #[test]
+        fn report_health_json_carries_the_feed_ratios_and_honours_volume() {
+            let conn = seeded();
+            let empty = crate::db::open_memory().unwrap();
+            let none = report_health_json(&empty, &[], 2.0, None).unwrap();
+            assert_eq!(none["feed_ratios"], serde_json::json!([]));
+
+            let v = report_health_json(&conn, &[], 2.0, None).unwrap();
+            let rows = v["feed_ratios"].as_array().expect("an array");
+            assert_eq!(rows.len(), 3, "{v}");
+            assert_eq!(
+                rows[1],
+                serde_json::json!({
+                    "volume": "V-BAD",
+                    "at": "2026-10-14 10:00:00",
+                    "ratio": 1.505,
+                    "threshold": 1.05,
+                    "verdict": "above_threshold",
+                    "suppressed": null,
+                    "native_bop_to_eod_mb": 1505,
+                    "data_bytes": GB,
+                })
+            );
+            assert_eq!(rows[0]["verdict"], "above_threshold_suppressed");
+            assert_eq!(rows[0]["suppressed"], "capacity_override");
+            assert_eq!(rows[2]["verdict"], "streamed");
+            // Every existing key is still there.
+            for k in ["readings", "read_error_trends", "tape_alerts_raised"] {
+                assert!(v.get(k).is_some(), "{k} in {v}");
+            }
+
+            let one = report_health_json(&conn, &[], 2.0, Some("V-OK")).unwrap();
+            assert_eq!(one["feed_ratios"].as_array().unwrap().len(), 1);
+            assert_eq!(one["feed_ratios"][0]["volume"], "V-OK");
+        }
+
+        #[test]
+        fn volume_info_lines_one_per_write_and_say_when_a_written_volume_has_none() {
+            let conn = seeded();
+            let bad = feed_ratio_rows(&conn, Some("V-BAD")).unwrap();
+            let text = render_feed_ratio_lines(&bad, true);
+            assert_eq!(text.lines().count(), 1, "{text}");
+            assert!(
+                text.starts_with("  Feed ratio:  1.5050 (above 1.05: the drive was fed unevenly"),
+                "{text}"
+            );
+            assert!(text.ends_with(", recorded 2026-10-14 10:00:00\n"), "{text}");
+            let ok = feed_ratio_rows(&conn, Some("V-OK")).unwrap();
+            assert_eq!(
+                render_feed_ratio_lines(&ok, true),
+                "  Feed ratio:  1.0040 (streamed, within 1.05), recorded 2026-10-14 09:00:00\n"
+            );
+
+            // A second write continues under the label.
+            let mut two = ok.clone();
+            two.extend(bad);
+            let text = render_feed_ratio_lines(&two, true);
+            let lines: Vec<&str> = text.lines().collect();
+            assert!(lines[0].starts_with("  Feed ratio:  1.0040"), "{text}");
+            assert!(lines[1].starts_with("               1.5050"), "{text}");
+
+            // Written, nothing recorded: said. Never written: nothing to say.
+            let said = render_feed_ratio_lines(&[], true);
+            assert!(
+                said.starts_with("  Feed ratio:  not recorded") && said.contains("page 0x0c"),
+                "{said}"
+            );
+            assert_eq!(render_feed_ratio_lines(&[], false), "");
+            assert!(!said.to_lowercase().contains("receipt"), "{said}");
+        }
+    }
 }

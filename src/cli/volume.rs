@@ -4378,6 +4378,61 @@ mod tests {
             assert_eq!(info.deposits[0].location, "glacier");
         }
 
+        /// Issue #439: the dossier carries this volume's recorded feed
+        /// ratios (and only its own), in `--json` too; a volume with none
+        /// carries an empty list.
+        #[test]
+        fn info_carries_the_volumes_feed_ratios() {
+            use crate::tape::feed_ratio::{Assessment, FeedRatio, EVENT_ACTION, EVENT_FIELD};
+            let conn = crate::db::open_memory().unwrap();
+            for l in ["L6-FR", "L6-OTHER"] {
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                    [l],
+                )
+                .unwrap();
+                let id = conn.last_insert_rowid();
+                let a = Assessment {
+                    ratio: FeedRatio::new(1_505, 1_000_000_000).unwrap(),
+                    suppressed: None,
+                };
+                crate::db::events::log_event(
+                    &conn,
+                    "volume",
+                    id,
+                    Some(l),
+                    EVENT_ACTION,
+                    Some(EVENT_FIELD),
+                    None,
+                    Some("1.5050"),
+                    Some(&a.details_json(1)),
+                    None,
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES ('L6-NONE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [],
+            )
+            .unwrap();
+
+            let info = volume_info(&conn, "L6-FR", false).unwrap();
+            assert_eq!(info.feed_ratios.len(), 1, "{:?}", info.feed_ratios);
+            assert_eq!(info.feed_ratios[0].volume, "L6-FR");
+            let v = serde_json::to_value(&info).unwrap();
+            assert_eq!(v["feed_ratios"][0]["verdict"], "above_threshold");
+            assert_eq!(v["feed_ratios"][0]["ratio"], 1.505);
+            let none = volume_info(&conn, "L6-NONE", false).unwrap();
+            assert_eq!(
+                serde_json::to_value(&none).unwrap()["feed_ratios"],
+                serde_json::json!([])
+            );
+        }
+
         /// Issue #305: the seal time is printed, and its absence named.
         #[test]
         fn info_prints_the_seal_time_or_says_none_was_recorded() {
