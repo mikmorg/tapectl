@@ -1654,14 +1654,18 @@ step_erase_then_init_no_force() {
     mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase || { echo "mt erase failed"; return 1; }
     for h in p c d; do
         mkdir -p "$w/$h/staging"
-        "$BIN" --home "$w/$h" init --operator "gate-$h" --no-escrow >/dev/null 2>&1 \
+        # P stages and writes, which needs an escrow recipient (ADR-0005): a
+        # throwaway one, its secret going only to this run's log.
+        local escrow="--no-escrow"; [ "$h" = p ] && escrow=""
+        # shellcheck disable=SC2086 # empty or one word, by construction
+        "$BIN" --home "$w/$h" init --operator "gate-$h" $escrow >/dev/null 2>&1 \
             && "$BIN" --home "$w/$h" backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 >/dev/null 2>&1 \
             && "$BIN" --home "$w/$h" config set staging.directory "$w/$h/staging" >/dev/null 2>&1 \
             || { echo "home $h: init/backend add/config set failed"; return 1; }
     done
     "$BIN" --home "$w/p" volume init EP-0001 --device "$TAPE_DEV" >"$w/p-init.out" 2>&1 \
         && "$BIN" --home "$w/p" quick-archive "$w/src/u1" --tenant gate-p --volume EP-0001 --device "$TAPE_DEV" --yes >"$w/p-write.out" 2>&1 \
-        || { echo "home P could not write and seal EP-0001:"; tail -20 "$w"/p-*.out; return 1; }
+        || { echo "home P could not write and seal EP-0001:"; tail -n 20 "$w/p-init.out" "$w/p-write.out"; return 1; }
     # The dry run names what is on the tape; its JSON carries the consent word.
     out="$("$BIN" --home "$w/c" cartridge erase --device "$TAPE_DEV" --dry-run --json 2>"$w/c-dry.err")"; rc=$?
     [ "$rc" = 0 ] || { echo "dry run exit $rc"; cat "$w/c-dry.err"; return 1; }

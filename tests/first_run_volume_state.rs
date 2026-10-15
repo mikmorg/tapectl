@@ -292,10 +292,10 @@ fn an_aborted_session_with_its_seal_recorded_is_sent_to_verify_then_resume() {
         "{other}"
     );
     let verify_at = other
-        .find("tapectl volume verify $LABEL --device $DEVICE --full")
+        .find("$OP_CMD volume verify $LABEL --device $DEVICE --full")
         .expect("names the full verify");
     let resume_at = other
-        .find("tapectl volume resume $LABEL --device $DEVICE")
+        .find("$OP_CMD volume resume $LABEL --device $DEVICE")
         .expect("then the resume");
     assert!(verify_at < resume_at, "verify first: {other}");
 }
@@ -353,7 +353,8 @@ fn a_planned_session_is_cleared_and_written_under_a_new_label() {
         .and_then(|s| s.split(";;").next())
         .expect("step 13 has a `planned` branch");
     assert!(
-        planned.contains("tapectl volume abort $LABEL"),
+        // `$OP_CMD`: the command an operator can run in service-user mode (#469).
+        planned.contains("$OP_CMD volume abort $LABEL"),
         "the branch names the abort: {planned}"
     );
     assert!(

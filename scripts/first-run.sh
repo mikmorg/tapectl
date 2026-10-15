@@ -219,7 +219,10 @@ if [ -t 1 ]; then B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'; Y=$'\e[33m'; G=$'\e[32m'; 
 # this script prints (#469): in service-user mode the catalog is the service
 # user's (0600), so a bare `tapectl` from your own account is refused. Step 14
 # switches its summary to tapectl-op once the wrapper is installed.
-SUDO_PREFIX="$( [ "$SVC_MODE" = 1 ] && printf 'sudo -u %s -H ' "$SVC_USER" )"
+# Not `$( [ ... ] && printf ... )`: under `set -e` that substitution's
+# failure (no service user) would end the script with no word said.
+SUDO_PREFIX=""
+if [ "$SVC_MODE" = 1 ]; then SUDO_PREFIX="sudo -u $SVC_USER -H "; fi
 OP_CMD="${SUDO_PREFIX}tapectl"
 # as_svc: THE privilege seam. Every tapectl invocation and every read/write of
 # tapectl-owned state (the 0700 home, the 0600 config) goes through it; the

@@ -35,6 +35,30 @@ fn joined_string_continuations(src: &str) -> String {
     out
 }
 
+/// Each refusal `volume init`/`volume write` can return at the tape contact:
+/// the string literals in `write.rs` that begin "refusing to write volume",
+/// cut at their closing quote. Test code that merely mentions a phrase (an
+/// assertion, a fixture) is not a refusal and is not counted.
+fn refusal_literals(joined: &str) -> Vec<String> {
+    let opener = "\"refusing to write volume";
+    let mut out = Vec::new();
+    let mut rest = joined;
+    while let Some(at) = rest.find(opener) {
+        let body = &rest[at + 1..];
+        let mut end = body.len();
+        let bytes = body.as_bytes();
+        for i in 0..bytes.len() {
+            if bytes[i] == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+                end = i;
+                break;
+            }
+        }
+        out.push(body[..end].to_string());
+        rest = &body[end..];
+    }
+    out
+}
+
 /// (phrase, the step-13 branch it selects)
 const ROUTED: &[(&str, &str)] = &[
     ("already carries a SEALED volume", "cartridge erase"),
@@ -62,14 +86,20 @@ fn every_phrase_step_13_routes_on_is_in_a_volume_init_refusal() {
         "found {} routing line(s) in step 13; expected the SEALED, --force and device_sg ones",
         script.lines().count()
     );
-    let refusals = joined_string_continuations(&read("src/volume/write.rs"));
+    let refusals = refusal_literals(&joined_string_continuations(&read("src/volume/write.rs")));
+    assert!(
+        refusals.len() >= 5,
+        "found {} refusal literal(s) in write.rs; expected the SEALED, mismatch, EMPTY and \
+         two unreadable-File-0 ones at least, so the extraction is not looking where it should",
+        refusals.len()
+    );
     for (phrase, branch) in ROUTED {
         assert!(
             script.contains(phrase),
             "first-run.sh no longer routes on {phrase:?} ({branch}): update ROUTED with the script"
         );
         assert!(
-            refusals.contains(phrase),
+            refusals.iter().any(|r| r.contains(phrase)),
             "no refusal in src/volume/write.rs says {phrase:?}, so first-run.sh step 13 can never \
              take {branch} for it: reword the refusal back, or change the script and this test together"
         );
@@ -81,9 +111,12 @@ fn every_phrase_step_13_routes_on_is_in_a_volume_init_refusal() {
 /// ADR-0003 too, are not routed there (#446).
 #[test]
 fn only_the_sealed_refusal_routes_to_cartridge_erase() {
-    let refusals = joined_string_continuations(&read("src/volume/write.rs"));
+    let refusals = refusal_literals(&joined_string_continuations(&read("src/volume/write.rs")));
     assert_eq!(
-        refusals.matches("already carries a SEALED volume").count(),
+        refusals
+            .iter()
+            .filter(|r| r.contains("already carries a SEALED volume"))
+            .count(),
         1,
         "the cartridge-erase phrase must name one refusal only"
     );
@@ -98,10 +131,10 @@ fn only_the_sealed_refusal_routes_to_cartridge_erase() {
 /// override, or the script would offer a flag that changes nothing.
 #[test]
 fn no_force_phrase_appears_in_a_refusal_force_cannot_override() {
-    let refusals = joined_string_continuations(&read("src/volume/write.rs"));
-    let unforceable: Vec<&str> = refusals
-        .lines()
-        .filter(|l| l.contains("--force cannot override"))
+    let refusals = refusal_literals(&joined_string_continuations(&read("src/volume/write.rs")));
+    let unforceable: Vec<&String> = refusals
+        .iter()
+        .filter(|r| r.contains("--force cannot override"))
         .collect();
     // Positive control: the SEALED refusal and the unreadable-File-0-on-a-
     // live-cartridge refusal both say it, so an empty search proves nothing.
