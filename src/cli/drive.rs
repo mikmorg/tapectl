@@ -2628,30 +2628,38 @@ mod tests {
         assert_eq!(r.cartridge.as_ref().unwrap().barcode, "CART01L6");
 
         // The contact: one, closed ok, naming the cartridge and the drive.
-        let contacts: Vec<(i64, String, Option<String>, Option<i64>, Option<i64>)> = env
+        #[derive(Debug)]
+        struct Contact {
+            id: i64,
+            operation: String,
+            outcome: Option<String>,
+            cartridge_id: Option<i64>,
+            drive_id: Option<i64>,
+        }
+        let contacts: Vec<Contact> = env
             .conn
             .prepare(
                 "SELECT id, operation, outcome, cartridge_id, drive_id FROM cartridge_contacts",
             )
             .unwrap()
             .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
+                Ok(Contact {
+                    id: row.get(0)?,
+                    operation: row.get(1)?,
+                    outcome: row.get(2)?,
+                    cartridge_id: row.get(3)?,
+                    drive_id: row.get(4)?,
+                })
             })
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(contacts.len(), 1, "{contacts:?}");
-        assert_eq!(contacts[0].1, "drive eject");
-        assert_eq!(contacts[0].2.as_deref(), Some("ok"));
-        assert_eq!(contacts[0].3, Some(cart));
-        assert!(contacts[0].4.is_some(), "the drive is named");
-        assert_eq!(r.contact_id, Some(contacts[0].0));
+        assert_eq!(contacts[0].operation, "drive eject");
+        assert_eq!(contacts[0].outcome.as_deref(), Some("ok"));
+        assert_eq!(contacts[0].cartridge_id, Some(cart));
+        assert!(contacts[0].drive_id.is_some(), "the drive is named");
+        assert_eq!(r.contact_id, Some(contacts[0].id));
 
         // The event: one, on the cartridge, carrying the contact.
         let events: Vec<(String, i64, String, String)> = env
@@ -2670,7 +2678,7 @@ mod tests {
             ("cartridge", cart, "ejected")
         );
         let details: serde_json::Value = serde_json::from_str(&events[0].3).unwrap();
-        assert_eq!(details["contact_id"], contacts[0].0);
+        assert_eq!(details["contact_id"], contacts[0].id);
         assert_eq!(details["chip_serial"], "EW7VWMVKF6");
         assert_eq!(details["drive_serial"], "HUJ808A5L4");
         assert!(r.event_id.is_some());
