@@ -11,9 +11,11 @@
 //!
 //! Three pieces, one per question:
 //!
-//! - [`resolve`]: File 0's uuid -> the catalog's volume, or a refusal naming
-//!   what File 0 says. The uuid decides, never the label: a label can be
-//!   reused after a retire, the uuid cannot.
+//! - [`locate`], [`resolve`] and [`account`]: File 0's uuid -> what the
+//!   catalog makes of it (one lookup), read as the catalog's volume or a
+//!   refusal naming what File 0 says ([`resolve`]), or as `volume identify`'s
+//!   note and contradiction ([`account`]). The uuid decides, never the label:
+//!   a label can be reused after a retire, the uuid cannot.
 //! - [`identify`] and [`Peeked`]: the READ half. The File 0 read is made once
 //!   and its bytes handed to the store, so the first read of File 0 that the
 //!   path makes afterwards (`corroborate_volume`'s, which every read contact
