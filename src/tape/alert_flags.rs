@@ -132,6 +132,20 @@ pub fn class_of(code: u16) -> AlertClass {
         .unwrap_or(AlertClass::Other)
 }
 
+/// What a raised CLEANING flag asks of the operator, as an action — `None`
+/// for every other flag. The one text every surface that prints a raised
+/// cleaning flag takes it from (`drive poll`, `audit`'s `tape_alert`
+/// finding; `report health` prints [`AlertClass::verdict`] itself), so a
+/// cleaning flag reads "clean the drive" rather than only naming itself
+/// (issue #430) and the words are never written a second time.
+///
+/// It is the class's verdict, not one text per flag: the table does not
+/// tell "cleaning required" (20) from "expired cleaning media" (22), where
+/// the cartridge, not the drive, is what to replace.
+pub fn cleaning_action(code: u16) -> Option<&'static str> {
+    (class_of(code) == AlertClass::Cleaning).then(|| AlertClass::Cleaning.verdict())
+}
+
 /// SSC-3's name for a classified flag; `None` for the rest (the decode's own
 /// name is used for those).
 pub fn ssc3_name(code: u16) -> Option<&'static str> {
@@ -298,5 +312,25 @@ mod tests {
         );
         assert!(AlertClass::Medium.verdict().contains("THE CARTRIDGE"));
         assert!(AlertClass::Drive.verdict().contains("THE DRIVE"));
+    }
+
+    /// #430: exactly the cleaning flags carry an action, and it is the
+    /// class's own verdict. Over all 64 flags, so a flag reclassified into or
+    /// out of Cleaning moves this with it.
+    #[test]
+    fn only_the_cleaning_flags_have_a_cleaning_action() {
+        for code in 1u16..=64 {
+            let action = cleaning_action(code);
+            if (0x14..=0x17).contains(&code) {
+                assert_eq!(class_of(code), AlertClass::Cleaning, "flag {code:#04x}");
+                assert_eq!(action, Some(AlertClass::Cleaning.verdict()), "flag {code}");
+            } else {
+                assert_eq!(action, None, "flag {code:#04x} is not a cleaning flag");
+            }
+        }
+        assert!(
+            cleaning_action(0x14).is_some_and(|a| a.starts_with("clean the drive")),
+            "it reads as an action"
+        );
     }
 }

@@ -58,6 +58,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::config::{Config, LtoBackendConfig};
 use crate::db::busy::{self, BusyPolicy};
 use crate::error::{Result, TapectlError};
+use crate::tape::alert_flags;
 use crate::tape::contact::{ContactSite, Medium, Operation, OUTCOME_FAILED, OUTCOME_OK};
 use crate::tape::drive_identity::{self, DriveIdentity};
 use crate::tape::health::{self, Reading};
@@ -124,15 +125,31 @@ impl PollReport {
     }
 
     /// The reasons, one line each, for [`PollReport::drive_reported_problem`].
+    ///
+    /// A raised CLEANING flag (TapeAlert 20-23) reads as the action it asks
+    /// for — one line each, `<n> <name> => clean the drive: …`, the words
+    /// from [`alert_flags::cleaning_action`] (issue #430) — and every other
+    /// flag keeps its one `TapeAlert raised: <n> <name>, …` line. Which
+    /// flags are problems is not touched: a cleaning flag is still one, and
+    /// still the poll's exit 1.
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if !self.raised_alerts.is_empty() {
-            out.push(format!(
-                "TapeAlert raised: {}",
-                self.raised_alerts.join(", ")
-            ));
-        } else if let Some(n @ 1..) = self.tape_alerts {
-            out.push(format!("{n} TapeAlert flag(s) raised"));
+        let mut named: Vec<&str> = Vec::new();
+        let mut cleaning: Vec<String> = Vec::new();
+        for entry in &self.raised_alerts {
+            match cleaning_action_of(entry) {
+                Some(action) => cleaning.push(format!("TapeAlert raised: {entry} => {action}")),
+                None => named.push(entry),
+            }
+        }
+        if !named.is_empty() {
+            out.push(format!("TapeAlert raised: {}", named.join(", ")));
+        }
+        out.append(&mut cleaning);
+        if self.raised_alerts.is_empty() {
+            if let Some(n @ 1..) = self.tape_alerts {
+                out.push(format!("{n} TapeAlert flag(s) raised"));
+            }
         }
         if let Some(n @ 1..) = self.uncorrected {
             out.push(format!(
@@ -141,6 +158,14 @@ impl PollReport {
         }
         out
     }
+}
+
+/// What a raised-alert entry, `<number> <name>` as [`raised_tape_alerts`]
+/// writes it, asks of the operator when it is a cleaning flag. `None` for
+/// every other flag, and for an entry that does not start with a flag number.
+fn cleaning_action_of(entry: &str) -> Option<&'static str> {
+    let (number, _) = entry.split_once(' ')?;
+    alert_flags::cleaning_action(number.parse().ok()?)
 }
 
 /// The TapeAlert flags a decoded page 0x2E raised, `<number> <name>`, in
@@ -632,7 +657,14 @@ mod tests {
         assert!(report.drive_reported_problem());
         assert_eq!(
             report.problems(),
-            vec!["TapeAlert raised: 4 Media, 20 Cleaning required".to_string()]
+            vec![
+                "TapeAlert raised: 4 Media".to_string(),
+                format!(
+                    "TapeAlert raised: 20 Cleaning required => {}",
+                    CLEAN_THE_DRIVE
+                ),
+            ],
+            "the medium flag keeps its line; the cleaning flag reads as its action"
         );
         let journalled: i64 = conn
             .query_row(
@@ -660,6 +692,105 @@ mod tests {
         assert!(report.raised_alerts.is_empty());
         assert!(report.drive_reported_problem());
         assert_eq!(report.problems().len(), 1, "{:?}", report.problems());
+    }
+
+    /// `alert_flags`' action for a cleaning flag, verbatim — the words this
+    /// test module expects a poll to print, written once.
+    const CLEAN_THE_DRIVE: &str = "clean the drive: nothing is wrong with the data";
+
+    /// Issue #430: a raised cleaning flag reads as the action it asks for,
+    /// is still a problem, and is still exit 1 — the display moved, the
+    /// verdict did not.
+    #[test]
+    fn a_cleaning_flag_reads_as_an_action_and_is_still_exit_1() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut src = FixtureSource::default();
+        src.text.insert(
+            0x2e,
+            fixture_decode(0x2e).replace("  Cleaning required: 0", "  Cleaning required: 1"),
+        );
+        let report = run(&conn, src, mam(None));
+        assert_eq!(
+            crate::cli::drive::exit_code(&report).unwrap(),
+            crate::cli::drive::EXIT_DRIVE_REPORTED_PROBLEM,
+            "a cleaning flag is a problem for the wrapper: exit 1, as before"
+        );
+        assert_eq!(report.raised_alerts, vec!["20 Cleaning required"]);
+        assert!(report.drive_reported_problem());
+        assert_eq!(
+            report.problems(),
+            vec![format!(
+                "TapeAlert raised: 20 Cleaning required => {CLEAN_THE_DRIVE}"
+            )],
+            "the flag, then what to do about it; no bare 'TapeAlert raised: 20 …' line"
+        );
+        // Positive control for the "reads as an action" claim: the words are
+        // alert_flags' own, not this module's.
+        assert_eq!(
+            alert_flags::cleaning_action(20),
+            Some(CLEAN_THE_DRIVE),
+            "the expected text is alert_flags' cleaning verdict"
+        );
+    }
+
+    /// All four cleaning flags (20-23) are actions; a medium flag beside
+    /// them keeps the one line it always had, ahead of them.
+    #[test]
+    fn every_cleaning_flag_is_an_action_and_others_keep_their_line() {
+        let report = PollReport {
+            raised_alerts: vec![
+                "4 Media".into(),
+                "20 Cleaning required".into(),
+                "21 Cleaning requested".into(),
+                "22 Expired cleaning media".into(),
+                "23 Invalid cleaning tape".into(),
+                "36 Drive temperature".into(),
+            ],
+            tape_alerts: Some(6),
+            ..PollReport::default()
+        };
+        let mut want = vec!["TapeAlert raised: 4 Media, 36 Drive temperature".to_string()];
+        want.extend(
+            [
+                "20 Cleaning required",
+                "21 Cleaning requested",
+                "22 Expired cleaning media",
+                "23 Invalid cleaning tape",
+            ]
+            .map(|f| format!("TapeAlert raised: {f} => {CLEAN_THE_DRIVE}")),
+        );
+        assert_eq!(report.problems(), want);
+    }
+
+    /// A flag that is not a cleaning flag reads exactly as before #430, with
+    /// no action attached: the medium flag by name and number, the drive
+    /// flag, a flag count with no names, and an entry with no number.
+    #[test]
+    fn a_non_cleaning_flag_reads_as_it_always_did() {
+        let one = |alerts: &[&str], count: Option<i64>| PollReport {
+            raised_alerts: alerts.iter().map(|a| a.to_string()).collect(),
+            tape_alerts: count,
+            ..PollReport::default()
+        };
+        assert_eq!(
+            one(&["4 Media"], Some(1)).problems(),
+            vec!["TapeAlert raised: 4 Media".to_string()]
+        );
+        assert_eq!(
+            one(&["36 Drive temperature", "5 Read failure"], Some(2)).problems(),
+            vec!["TapeAlert raised: 36 Drive temperature, 5 Read failure".to_string()]
+        );
+        assert_eq!(
+            one(&[], Some(3)).problems(),
+            vec!["3 TapeAlert flag(s) raised".to_string()],
+            "a count with no named flag is still only a count"
+        );
+        assert_eq!(
+            one(&["Cleaning required"], Some(1)).problems(),
+            vec!["TapeAlert raised: Cleaning required".to_string()],
+            "an entry that carries no flag number is not classified by its name"
+        );
+        assert!(one(&[], Some(0)).problems().is_empty(), "clean is clean");
     }
 
     /// A poll's exit code as the CLI computes it, and the source it read
