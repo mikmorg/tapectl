@@ -33,9 +33,18 @@ pub(crate) struct PlannedFile {
 #[derive(Debug)]
 pub(crate) struct SourcePlan {
     files: Vec<PlannedFile>,
+    /// Regular files on disk that the snapshot does not list (NEW, warned
+    /// about by [`plan`]): dar will archive them, the hasher will not read
+    /// them, and [`CatalogueCheck`] must not call them unexplained.
+    unrecorded: Vec<String>,
 }
 
 impl SourcePlan {
+    /// The NEW regular files [`plan`] warned about — see [`CatalogueCheck`].
+    pub(crate) fn unrecorded_regular(&self) -> &[String] {
+        &self.unrecorded
+    }
+
     /// The bytes [`hash_files`] will read.
     pub(crate) fn total_bytes(&self) -> u64 {
         self.files
@@ -48,7 +57,8 @@ impl SourcePlan {
 /// Check the source against the snapshot's file list by metadata alone, and
 /// list the regular files to hash in the order dar will read them (issue
 /// #364). This is what still refuses before dar starts: a manifest file
-/// gone from disk (MISSING) or at another size (DIRTY). Content — BITROT,
+/// gone from disk (MISSING), at another size (DIRTY), or excluded since the
+/// snapshot (issue #464). Content — BITROT,
 /// and a file changing while staging reads it — is checked by
 /// [`hash_files`] and [`recheck`], while dar runs.
 ///
@@ -57,8 +67,9 @@ impl SourcePlan {
 /// `staging::walk_directory` walks the same way with the same exclude
 /// patterns, so the hasher reads each file just before or just after dar
 /// does, and the second read comes from the page cache. A manifest file the
-/// patterns exclude since the snapshot is still hashed (it is in the
-/// snapshot), at the end; dar skips it.
+/// patterns exclude since the snapshot is refused (issue #464): the snapshot
+/// lists a file dar will skip, so the catalogue would record as archived
+/// what the tape does not hold. `snapshot create` is the remedy.
 ///
 /// Also diffs the on-disk file set against the manifest for NEW files (issue
 /// #32/H6): a file dar will archive that the catalog has never seen is a
@@ -113,12 +124,17 @@ pub(crate) fn plan(
     // check below, and the hashing order.
     let (_, _, disk_entries) = super::walk_directory(source_path, global_excludes)?;
     let manifest_paths: HashSet<&str> = all_entries.iter().map(|(p, ..)| p.as_str()).collect();
-    let mut new_files: Vec<&str> = disk_entries
+    let mut new_entries: Vec<_> = disk_entries
         .iter()
         .filter(|e| !e.is_dir && !is_dotfile(&e.path) && !manifest_paths.contains(e.path.as_str()))
-        .map(|e| e.path.as_str())
         .collect();
-    new_files.sort_unstable();
+    new_entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    let new_files: Vec<&str> = new_entries.iter().map(|e| e.path.as_str()).collect();
+    let unrecorded: Vec<String> = new_entries
+        .iter()
+        .filter(|e| e.file_type == "regular")
+        .map(|e| e.path.clone())
+        .collect();
     if !new_files.is_empty() {
         // WARN, not error — deliberately weaker than BITROT/MISSING/DIRTY.
         //
@@ -167,22 +183,54 @@ pub(crate) fn plan(
             });
         }
     }
-    // What the walk did not find, in manifest order: MISSING, or excluded
-    // since the snapshot (still hashed; dar skips it).
+    // What the walk did not find, in manifest order: MISSING (refused here),
+    // or on disk but excluded since the snapshot. The stage-time patterns
+    // (`global_excludes` and the dotfile's `[excludes]`) are the ones dar
+    // gets as `-X`/`-P` masks; the manifest's are the snapshot-time ones. Such
+    // a file would be hashed and baselined while dar skips it, and `files`
+    // and the on-tape `catalog.db` would say the version holds a file the
+    // tape does not (issue #464). The snapshot no longer describes what will
+    // be archived: refuse, and a new snapshot is the remedy.
+    let mut excluded_since: Vec<&str> = Vec::new();
     for (path, _, _, kind) in &all_entries {
         if *kind != FileKind::Regular {
             continue;
         }
-        if let Some((size, baseline)) = regular.remove(path.as_str()) {
+        if let Some((size, _)) = regular.remove(path.as_str()) {
             check_source_size(&base.join(path), path, size)?;
-            files.push(PlannedFile {
-                rel_path: path.clone(),
-                expected_size: size,
-                baseline: baseline.cloned(),
-            });
+            excluded_since.push(path);
         }
     }
-    Ok(SourcePlan { files })
+    if !excluded_since.is_empty() {
+        return Err(TapectlError::Other(format!(
+            "the snapshot lists {} the unit's exclude patterns now exclude: {}. dar would skip \
+             them, but the catalogue would record them as archived. The snapshot no longer \
+             describes what would be archived: take a new snapshot (`tapectl snapshot create \
+             <unit>`) and stage that, or remove the exclude.",
+            count_of_files(excluded_since.len()),
+            named_files(&excluded_since),
+        )));
+    }
+    Ok(SourcePlan { files, unrecorded })
+}
+
+/// `1 file`, `3 files`.
+fn count_of_files(n: usize) -> String {
+    format!("{n} file{}", if n == 1 { "" } else { "s" })
+}
+
+/// How many file names a refusal spells out before summarising the rest.
+const NAMED_FILES: usize = 10;
+
+/// The first [`NAMED_FILES`] of `paths`, comma-separated, and a count of the
+/// rest.
+fn named_files<S: AsRef<str>>(paths: &[S]) -> String {
+    let shown: Vec<&str> = paths.iter().take(NAMED_FILES).map(AsRef::as_ref).collect();
+    let mut text = shown.join(", ");
+    if paths.len() > NAMED_FILES {
+        text.push_str(&format!(" and {} more", paths.len() - NAMED_FILES));
+    }
+    text
 }
 
 /// What a file's metadata said when it was hashed — what [`recheck`]
@@ -233,6 +281,103 @@ impl Hashed {
             .iter()
             .map(|f| (f.rel_path.clone(), f.sha256.clone()))
             .collect()
+    }
+}
+
+/// How many unexplained catalogue entries a [`CatalogueCheck`] keeps to name.
+const UNEXPLAINED_KEPT: usize = 1000;
+
+/// The proof that dar archived what the stage hashed (issue #464; research
+/// note rule 6, "dar's catalogue lists exactly the file set the hasher
+/// hashed"): the regular files in the catalogue dar produced, against the
+/// regular files [`hash_files`] read.
+///
+/// The stage records a sha256 for every hashed file, and `files` and the
+/// on-tape `catalog.db` are built from them. A hashed file dar did not
+/// archive would be catalogued as held by a tape that does not hold it. The
+/// two walks (tapectl's, which decides what is hashed, and dar's `-X`/`-P`
+/// masks) agree on every pattern but a directory pattern with a wildcard
+/// in its name, where dar's `*` spans `/` (`staging::exclude`), so the
+/// agreement is checked here and not assumed.
+///
+/// Two differences refuse:
+///
+/// - **hashed, not archived**: the divergence above, or a file dar skipped
+///   for any other reason. The data-integrity case: the catalogue claims
+///   what the tape lacks.
+/// - **archived, not hashed, and not NEW**: a file nothing explained. NEW
+///   files (on disk, absent from the snapshot) are dar's to archive and the
+///   catalogue's not to know — [`plan`] warns about them, a warning rather
+///   than a refusal by design (§2.13) — so they are expected here; this
+///   catches the file that appeared after [`plan`] walked, or that tapectl's
+///   walk excludes and dar does not.
+///
+/// Fed one catalogue entry at a time ([`CatalogueCheck::saw`]), so a unit of
+/// a million files costs a set of borrowed paths, not a copy of the listing.
+pub(crate) struct CatalogueCheck<'a> {
+    /// Hashed files the catalogue has not listed yet.
+    unseen: std::collections::HashSet<&'a str>,
+    unrecorded: std::collections::HashSet<&'a str>,
+    unexplained: Vec<String>,
+    unexplained_total: usize,
+}
+
+impl<'a> CatalogueCheck<'a> {
+    /// `unrecorded` is [`SourcePlan::unrecorded_regular`].
+    pub(crate) fn new(hashed: &'a Hashed, unrecorded: &'a [String]) -> Self {
+        Self {
+            unseen: hashed.files.iter().map(|f| f.rel_path.as_str()).collect(),
+            unrecorded: unrecorded.iter().map(String::as_str).collect(),
+            unexplained: Vec::new(),
+            unexplained_total: 0,
+        }
+    }
+
+    /// The catalogue lists the regular file `path`.
+    pub(crate) fn saw(&mut self, path: &str) {
+        if self.unseen.remove(path) || self.unrecorded.contains(path) {
+            return;
+        }
+        self.unexplained_total += 1;
+        if self.unexplained.len() < UNEXPLAINED_KEPT {
+            self.unexplained.push(path.to_string());
+        }
+    }
+
+    /// The catalogue has been listed to its end: refuse on any difference.
+    pub(crate) fn finish(self) -> Result<()> {
+        let mut missing: Vec<&str> = self.unseen.into_iter().collect();
+        if missing.is_empty() && self.unexplained_total == 0 {
+            return Ok(());
+        }
+        missing.sort_unstable();
+        let mut unexplained = self.unexplained;
+        unexplained.sort_unstable();
+        let mut text = String::from(
+            "dar's catalogue does not list the files the stage hashed, so the stage set is \
+             not marked staged. Nothing was staged.",
+        );
+        if !missing.is_empty() {
+            text.push_str(&format!(
+                " dar did not archive {} that were hashed: {}. The catalogue would record \
+                 them as archived and the tape would not hold them. dar and tapectl match the \
+                 unit's exclude patterns differently here (dar's `*` spans `/` in a directory \
+                 pattern such as `a*b/`): use a pattern without a wildcard inside a directory \
+                 name.",
+                count_of_files(missing.len()),
+                named_files(&missing),
+            ));
+        }
+        if self.unexplained_total > 0 {
+            text.push_str(&format!(
+                " dar archived {} that the snapshot does not list and `stage create` did not \
+                 see as new: {}. A file appeared while staging, or dar archives what \
+                 tapectl's walk excludes; stage again once the source is quiet.",
+                count_of_files(self.unexplained_total),
+                named_files(&unexplained),
+            ));
+        }
+        Err(TapectlError::Other(text))
     }
 }
 
@@ -1351,6 +1496,93 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::io::Write;
     use tempfile::TempDir;
+
+    // --- The catalogue check (issue #464) ---------------------------------
+
+    fn hashed_of(paths: &[&str]) -> Hashed {
+        Hashed {
+            files: paths
+                .iter()
+                .map(|p| HashedFile {
+                    rel_path: (*p).to_string(),
+                    sha256: "0".repeat(64),
+                    seen: Seen {
+                        dev: 0,
+                        ino: 0,
+                        size: 0,
+                        mtime_ns: 0,
+                        ctime_ns: 0,
+                    },
+                    started_ns: 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn check(hashed: &[&str], new: &[&str], listed: &[&str]) -> Result<()> {
+        let hashed = hashed_of(hashed);
+        let new: Vec<String> = new.iter().map(|p| p.to_string()).collect();
+        let mut check = CatalogueCheck::new(&hashed, &new);
+        for p in listed {
+            check.saw(p);
+        }
+        check.finish()
+    }
+
+    #[test]
+    fn a_catalogue_that_lists_exactly_the_hashed_files_passes() {
+        check(&["a", "d/b"], &[], &["d/b", "a"]).expect("same set, any order");
+        check(&[], &[], &[]).expect("a unit of no regular files");
+    }
+
+    /// The positive control for the issue: a hashed file dar did not archive
+    /// is refused, by name.
+    #[test]
+    fn a_hashed_file_the_catalogue_lacks_is_refused_by_name() {
+        let err = check(&["a", "d/b", "pruned/c"], &[], &["a", "d/b"])
+            .expect_err("planted: hashed, not archived");
+        let msg = err.to_string();
+        assert!(msg.contains("pruned/c"), "{msg}");
+        assert!(msg.contains("dar did not archive 1 file"), "{msg}");
+        assert!(
+            !msg.contains("d/b"),
+            "only the missing file is named: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_file_the_catalogue_lists_that_nothing_explains_is_refused() {
+        let err =
+            check(&["a"], &[], &["a", "appeared.txt"]).expect_err("planted: archived, unknown");
+        let msg = err.to_string();
+        assert!(msg.contains("appeared.txt"), "{msg}");
+        assert!(msg.contains("does not list"), "{msg}");
+        assert!(!msg.contains("dar did not archive"), "{msg}");
+    }
+
+    /// NEW files are dar's to archive: a warning at `plan`, never a refusal.
+    #[test]
+    fn a_new_file_dar_archived_or_did_not_is_expected() {
+        check(&["a"], &["new.txt"], &["a", "new.txt"]).expect("NEW and archived");
+        check(&["a"], &["new.txt"], &["a"]).expect("NEW and gone before dar read it");
+        let err = check(&["a", "b"], &["new.txt"], &["new.txt"]).expect_err("both hashed missing");
+        assert!(err.to_string().contains("a, b"), "{err}");
+    }
+
+    #[test]
+    fn many_unexplained_entries_are_counted_and_the_naming_is_capped() {
+        let hashed = hashed_of(&[]);
+        let mut check = CatalogueCheck::new(&hashed, &[]);
+        for i in 0..(UNEXPLAINED_KEPT + 50) {
+            check.saw(&format!("f{i}"));
+        }
+        let msg = check.finish().unwrap_err().to_string();
+        assert!(
+            msg.contains(&format!("{} files", UNEXPLAINED_KEPT + 50)),
+            "{msg}"
+        );
+        assert!(msg.contains("and 990 more"), "{msg}");
+    }
 
     /// `files` is `(path, size_bytes, sha256_baseline)` — the third element
     /// seeds `files.sha256` as it would stand after

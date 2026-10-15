@@ -245,6 +245,14 @@ const STOP_POLL_MS: i32 = 100;
 /// stop. Not `ErrorKind::Interrupted`, which readers retry.
 pub const STOPPED: &str = "stopped by a signal while reading dar's archive";
 
+impl DarOutput {
+    /// A dar's standard output, read with the same stop check as the
+    /// archive's ([`super::list`] reads a catalogue listing through it).
+    pub(crate) fn over(inner: ChildStdout) -> Self {
+        Self { inner }
+    }
+}
+
 impl Read for DarOutput {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {

@@ -799,6 +799,7 @@ fn stage_create_inner(
     // (issue #364). Stopped and joined on every way out.
     // `[staging] hash_threads` files at once (issue #366), handed out in dar's
     // read order and recorded in it.
+    let unrecorded = plan.unrecorded_regular().to_vec();
     let hashing = validate::ConcurrentHash::spawn(
         PathBuf::from(&snapshot.source_path),
         plan,
@@ -963,6 +964,15 @@ fn stage_create_inner(
     secure_catalog_files(&catalog_dir);
     // ...and nor did it sync it (issue #409).
     sync_catalogue(&catalog_base)?;
+    // Issue #464: the catalogue lists every file that was hashed (and
+    // nothing unexplained) — checked before the set can be marked staged, so
+    // `files` and the on-tape `catalog.db` never record a file dar skipped.
+    // dar's listing is read from a pipe and kept in memory only.
+    let mut listed = validate::CatalogueCheck::new(&hashed, &unrecorded);
+    dar::list::regular_files(&config.dar.binary, &catalog_base, &mut |path| {
+        listed.saw(path)
+    })?;
+    listed.finish()?;
     busy::retry(BusyPolicy::DEFAULT, "the stage set's catalogue", || {
         Ok(conn.execute(
             "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
@@ -4560,6 +4570,125 @@ mod tests {
             "a directory inside a pruned subtree is not recorded, as dar -D does not store it"
         );
         assert_eq!(recorded(".cache/cached-top.bin"), 0);
+    }
+
+    /// Rewrite the unit dotfile's `[excludes]` after the snapshot was taken:
+    /// what an operator does between `snapshot create` and `stage create`.
+    /// A dotfile edit mints no version (ADR-0012 2026-10-07 item 24).
+    fn set_dotfile_excludes(src: &Path, patterns: &[&str]) {
+        let dotfile_path = src.join(".tapectl-unit.toml");
+        let mut df = crate::unit::dotfile::read_dotfile(&dotfile_path).unwrap();
+        df.exclude_patterns = patterns.iter().map(|p| p.to_string()).collect();
+        crate::unit::dotfile::write_dotfile(&dotfile_path, &df).unwrap();
+    }
+
+    /// Issue #464: a file the snapshot listed and the stage now excludes was
+    /// hashed (`backfill_checksums` recorded its sha256) while dar skipped it,
+    /// so `files` and the on-tape `catalog.db` said the version held a file
+    /// the tape did not. The stage is refused before dar starts, naming the
+    /// file, and the remedy is a new snapshot, which then stages. A literal
+    /// name and a `*.ext` pattern are the two shapes the issue names.
+    #[test]
+    fn a_file_the_stage_now_excludes_but_the_snapshot_lists_refuses_the_stage() {
+        for (file, pattern) in [("secret.txt", "secret.txt"), ("note.ext", "*.ext")] {
+            let tmp = TempDir::new().unwrap();
+            let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+            fs::write(src.join("keep.dat"), b"kept content").unwrap();
+            fs::write(src.join(file), b"listed by the snapshot").unwrap();
+
+            let first = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, first, Some(file)),
+                1,
+                "{file}: positive control: the snapshot lists it"
+            );
+            set_dotfile_excludes(&src, &[pattern]);
+
+            let err = stage_create(&conn, &paths, &config, first, false)
+                .expect_err("a stage of a snapshot that no longer matches the excludes");
+            let msg = err.to_string();
+            assert!(msg.contains(file), "{pattern}: names the file: {msg}");
+            assert!(
+                msg.contains("snapshot create"),
+                "{pattern}: names the remedy: {msg}"
+            );
+            assert_eq!(
+                crate::db::files::fixture::sha256(&conn, first, file),
+                None,
+                "{pattern}: a refused stage baselines nothing for the file"
+            );
+            let staged: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM stage_sets WHERE snapshot_id = ?1 AND status = 'staged'",
+                    params![first],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(staged, 0, "{pattern}: nothing was staged");
+
+            // The remedy: a snapshot under the current excludes stages.
+            let second = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+            assert_ne!(
+                second, first,
+                "{pattern}: the removed file minted a version"
+            );
+            assert_eq!(
+                crate::db::files::fixture::count(&conn, second, Some(file)),
+                0,
+                "{pattern}: the new snapshot does not list it"
+            );
+            stage_create(&conn, &paths, &config, second, false)
+                .unwrap_or_else(|e| panic!("{pattern}: the fresh snapshot stages: {e}"));
+        }
+    }
+
+    /// Issue #464: the tapectl walk matches a directory pattern one path
+    /// component at a time; dar matches its `-P` mask against the whole
+    /// relative path, and dar's `*` spans `/` (`staging::exclude`'s module
+    /// doc). With `x*z/`, dar prunes `xdir/sub/z` while the walk still
+    /// records and hashes the files in it. The pre-dar check cannot see that
+    /// (the walk finds the file); the comparison of the hashed files with
+    /// the catalogue dar produced does, and refuses before the set is
+    /// `staged`.
+    #[test]
+    fn a_file_dar_prunes_but_the_walk_records_is_refused_after_dar() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("keep.txt"), b"kept content").unwrap();
+        fs::create_dir_all(src.join("xdir/sub/z")).unwrap();
+        fs::write(src.join("xdir/sub/z/inside.txt"), b"dar will prune this").unwrap();
+
+        let snap = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        set_dotfile_excludes(&src, &["x*z/"]);
+
+        let err = stage_create(&conn, &paths, &config, snap, false)
+            .expect_err("dar skipped a file the stage hashed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("xdir/sub/z/inside.txt"),
+            "names the file: {msg}"
+        );
+        assert!(msg.contains("dar"), "says dar did not archive it: {msg}");
+        let staged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM stage_sets WHERE snapshot_id = ?1 AND status = 'staged'",
+                params![snap],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(staged, 0, "the set never reached staged");
+        assert!(
+            fs::read_dir(&config.staging.directory)
+                .unwrap()
+                .next()
+                .is_none(),
+            "a refused stage leaves nothing under staging"
+        );
+
+        // The control: the same unit with an exclude both sides read the
+        // same way stages, and its catalogue lists what it archived.
+        set_dotfile_excludes(&src, &[]);
+        stage_create(&conn, &paths, &config, snap, false).expect("no exclude stages");
     }
 
     #[test]
