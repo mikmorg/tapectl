@@ -108,7 +108,7 @@ any flag still wins. Beyond the flags' own values (`DEVICE`, `OPERATOR`,
 | `ADOPT_KEYS_FROM` (`--adopt-keys-from`) | 7, 11 | a directory of `<name>.key` age identity files: `init` adopts `<operator>.key` (`--operator-key`) and each `TENANTS` entry still to be created adopts `<tenant>.key` (`tenant add --adopt-key`) instead of minting keys, each previewed with `--dry-run` first. A missing or unreadable file stops the step before anything is created. The copy-out is in [keys-and-recovery.md](keys-and-recovery.md#f-keeping-existing-keys-on-a-fresh-home) |
 | `COLLECTIONS=("name\|root\|tenant\|depth" …)` | 11 | granted by ACL, written as `[[collections]]`, then `collection sync` |
 | `CONTENDER_UNITS=(…)` | 13 | the systemd units `host check` treats as contenders; unset means the dev VM's homorg timers |
-| `TAPE_NICE` (`--tape-nice`), `TAPE_IONICE` (`--tape-ionice`) | 13, 14 | the priority the tape commands (`volume write`, `resume`, `verify`, `cartridge erase`) run at: default `-10` and `-c2 -n0` (best-effort, level 0), raised as root and then dropped to the service user (#432, ADR-0012 2026-10-15 item 58). Step 14 hands the same values to `install-systemd.sh`. An empty `TAPE_NICE` never raises. Root's `sudo` is needed for it: [the wrapper](#7-the-timers-and-the-operator-wrapper) says what happens without |
+| `TAPE_NICE` (`--tape-nice`), `TAPE_IONICE` (`--tape-ionice`) | 13, 14 | the priority the tape commands run at: default `-10` and `-c2 -n0` (best-effort, level 0) (#432, ADR-0012 2026-10-15 item 58). Step 13 raises `first-run.sh`'s own shell once with `sudo renice` and `sudo ionice`, and the write, resume and verify it starts inherit that; step 14 hands the same values to `install-systemd.sh` for [`tapectl-op` and the drive-poll unit](#7-the-timers-and-the-operator-wrapper). An empty `TAPE_NICE` never raises |
 
 **home2** (the production host, ADR-0012's 2026-09-28 amendment) has a one-time
 preparation first, dry-run by default:
@@ -131,12 +131,17 @@ Every `tapectl` call in `first-run.sh` outside the step-12 rehearsal goes throug
 follows a days-long write would otherwise wait at a prompt until sudo gives up.
 
 That rule does not cover the one thing that needs root: raising the tape
-commands' priority (`TAPE_NICE`, above). Step 13 therefore asks for *your* sudo
-password once, before its first tape command, and keeps the sudo ticket warm
-until step 13 ends, so the verify after a days-long write finds it still valid.
-Each tape command re-checks it first; under `--auto`, if sudo refuses, or if the
-ticket has lapsed, that command runs at normal priority and the step says so.
-The priority helps the drive's feed and is never a reason to fail a write.
+commands' priority (`TAPE_NICE`, above). Nice and ionice are inherited across
+`fork`, `exec` and `sudo -u`, so step 13 asks for root's `sudo` **once**, at its
+start, to raise `first-run.sh`'s own shell (`sudo renice`, `sudo ionice`: one
+password prompt, or `sudo -n` under `--auto`); every command it starts after
+that, the write, the resume branch and the post-write verify included, runs at
+that priority without asking root again. No sudo ticket is kept alive. The
+raise also covers step 13's other commands and step 14, and it cannot be undone
+by the script. Step 12's rehearsal and everything before step 13 stay at normal
+priority. If sudo refuses, the step says so once and the run continues at
+normal priority: the priority helps the drive's feed and is never a reason to
+fail a write.
 
 
 ---

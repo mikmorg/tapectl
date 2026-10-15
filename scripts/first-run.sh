@@ -74,9 +74,10 @@ LOCATIONS=()           # step 10: "name|description" — the first is the shelf 
 TENANTS=()             # step 11: "name|description" — non-operator tenants to create
 COLLECTIONS=()         # step 11: "name|root|tenant|unit_depth" — [[collections]] to configure and sync
 OPS_GROUP=""           # step 7: a group that may read the session logs (`tapectl status`), e.g. tapectl-ops (issue #393); empty = none
-TAPE_NICE=-10          # step 13: nice value for the tape commands (volume write, resume, verify, cartridge erase) and
-                       # step 14: what the installer bakes into tapectl-op and the drive-poll unit (issue #432). Raised as
-                       # root, then dropped to the service user (ADR-0012 2026-10-15 item 58). Empty = never raise.
+TAPE_NICE=-10          # step 13: the nice value this run raises ITSELF to, once, with sudo renice, so the tape commands
+                       # it starts inherit it (issue #432; see tape_raise_setup). Step 14 bakes the same value into
+                       # tapectl-op and the drive-poll unit, which raise a tape command as root and then drop to the
+                       # service user (ADR-0012 2026-10-15 item 58). Empty = never raise.
 TAPE_IONICE="-c2 -n0"  # the ionice arguments that go with it (best-effort, level 0). Empty = no I/O priority change.
 ESCROW_PUBLIC_KEY=""   # step 7: the ORIGINAL escrow public key (age1…, or a .pub path) for init to adopt instead of
                        # minting one — a rebuilt or fresh home that keeps the Heir Kit (ADR-0005, #139). Empty = ask
@@ -131,13 +132,13 @@ Options:
   --work-dir DIR    build lock and step-12 rehearsal workspace (default /scratch if it exists,
                     else ~/.cache/tapectl)
   --staging DIR     default for staging.directory in step 7
-  --tape-nice N     nice value for the tape commands, raised as root and then dropped to the service user
-                    (default -10; empty = never raise; also step 14's tapectl-op and drive-poll unit)
+  --tape-nice N     nice value step 13 raises this run to (one sudo renice; the tape commands inherit it) and
+                    step 14 gives tapectl-op and the drive-poll unit (default -10; empty = never raise)
   --tape-ionice ARGS  ionice arguments for them (default '-c2 -n0'; empty = no I/O priority change)
   --adopt-keys-from DIR
                     steps 7 and 11 adopt DIR/<name>.key (an age identity file) as the operator's and
                     each profile tenant's key instead of minting one (docs/keys-and-recovery.md)
-  --erase-label L   step 13: when `volume init` refuses a tape holding a SEALED volume, `cartridge erase`
+  --erase-label L   step 13: when \`volume init\` refuses a tape holding a SEALED volume, \`cartridge erase\`
                     it under --auto only if L is the label its File 0 carries (ERASE_LABEL in a profile)
   --escrow-public-key KEY
                     step 7 adopts KEY (age1… or a .pub path) as the escrow identity instead of
@@ -307,110 +308,49 @@ run_capture_json_err() {
 }
 # run_nolog: for the one command whose output must never be written to disk
 run_nolog() { printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $* (output NOT logged)"; "$@"; }
-TAPE_RAISE=0   # set by tape_raise_setup (step 13) once it has found that raising works
-tc() {
-  if [ "$TAPE_RAISE" = 1 ] && is_tape_command "$@" && tape_raise_holds; then tc_raised "$@"; return; fi
-  if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi
-}
-# is_tape_command ARGS...: does this tapectl command stream the drive? The same
-# rule as tapectl-op's (contrib/systemd/tapectl-op.in): the first two words that
-# are not options decide, --home and --config skipping their value, so a label
-# that equals a subcommand's name ("volume info write") cannot misfire.
-is_tape_command() {
-  local a skip=0 n=0 first="" second=""
-  for a in "$@"; do
-    if [ "$skip" = 1 ]; then skip=0; continue; fi
-    case "$a" in
-      --config | --home) skip=1 ;;
-      -*) ;;
-      *) n=$((n + 1)); if [ "$n" = 1 ]; then first=$a; else second=$a; break; fi ;;
-    esac
-  done
-  case "$first" in
-    volume) case "$second" in write | resume | verify | compact-write | compact | read-slices | compact-read) return 0 ;; esac ;;
-    restore) case "$second" in unit | file | volume | raw-volume) return 0 ;; esac ;;
-    cartridge) [ "$second" = erase ] && return 0 ;;
-    collection) [ "$second" = run ] && return 0 ;;
-    drive) [ "$second" = poll ] && return 0 ;;
-    quick-archive) return 0 ;;
-  esac
-  return 1
-}
-# tc_raised: `tc` for a command that streams the drive (volume write / resume /
-# verify, cartridge erase, ...). The drive wants an even feed and a busy host
-# starves it (#426: a write used 1.505 bytes of tape per data byte); a process
-# cannot raise its own priority, so ADR-0012 2026-10-15 item 58 raises it as
-# root and then drops to the service user:
-#   sudo nice -n N ionice ARGS runuser -u USER -- tapectl [--home H] ...
-# runuser sets HOME, USER, LOGNAME and the service user's groups, as
-# `sudo -u USER -H` does. `tc` calls this only once tape_raise_setup (step 13)
-# has found that raising works; until then, and whenever it cannot, every
-# command goes through the plain as_svc path, exactly as before.
-tc_raised() {
-  local io=() home=()
-  [ -z "$TAPE_IONICE" ] || read -r -a io <<<"ionice $TAPE_IONICE"
-  [ -z "$HOME_DIR" ] || home=(--home "$HOME_DIR")
-  sudo nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} runuser -u "$SVC_USER" -- "$TAPECTL" ${home[@]+"${home[@]}"} "$@"
-}
-# tape_probe: the whole raise chain on `true` (nice, ionice, runuser, the drop to
-# the service user), without ever prompting: a runuser that sudo's PATH cannot
-# find, or a nice value root may not set, is found here and not in the middle of
-# a write.
-tape_probe() {
-  local io=()
-  [ -z "$TAPE_IONICE" ] || read -r -a io <<<"ionice $TAPE_IONICE"
-  sudo -n nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} runuser -u "$SVC_USER" -- true >/dev/null 2>&1
-}
-# tape_raise_holds: asked before EVERY raised command, because the sudo ticket
-# tape_raise_setup found can lapse (the keepalive dies, someone runs `sudo -k`,
-# the host's timeout is 0). A bare `sudo nice ...` would then prompt for a
-# password nobody answers, and sudo would fail the command after its timeout
-# with an error that never touched the tape — after a days-long write. So when
-# the chain no longer works, say so once and run the command at normal priority.
-tape_raise_holds() {
-  tape_probe && return 0
-  note "sudo's ticket for the raise has lapsed: this tape command runs at NORMAL priority" >&2
-  TAPE_RAISE=0
-  return 1
-}
-# tape_raise_setup: decide, once per run of step 13, whether tc can raise.
-# Raising needs ROOT's sudo, which is not the sudo this script otherwise uses:
-# home2's sudoers rule (home2-prep.sh part 8) lets the operator run commands AS
-# the service user without a password, and root-level sudo still asks. So:
-# probe with `sudo -n`; if that needs a password and a person is here, ask once
-# (`sudo -v`) and keep the ticket warm while step 13 runs, because the verify
-# that follows a days-long write would otherwise sit at a prompt nobody answers;
-# under --auto, or when sudo refuses, run at normal priority and SAY so. The
-# priority is an aid to the feed, never a reason to fail a write.
-TAPE_KEEPALIVE_PID=""
-tape_raise_stop() {
-  [ -n "$TAPE_KEEPALIVE_PID" ] || return 0
-  pkill -P "$TAPE_KEEPALIVE_PID" 2>/dev/null || true
-  kill "$TAPE_KEEPALIVE_PID" 2>/dev/null || true
-  TAPE_KEEPALIVE_PID=""
+tc() { if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi; }
+# tape_raise_setup (step 13): raise THIS shell's CPU and I/O priority, once.
+# The drive wants an even feed and a busy host starves it (#426: a write used
+# 1.505 bytes of tape per data byte), so the tape commands of step 13 (volume
+# write, resume, verify, cartridge erase) should outrank other work on the host.
+# A process cannot raise its own priority without root, but nice and ionice
+# are inherited across fork, exec and `sudo -u` (checked on home2, 2026-10-14):
+# so the one root step is renicing the script's own shell, here, while a person
+# is present, and every `tc ...` after it inherits the priority without root
+# being asked again. No sudo ticket is kept alive, and none is needed later.
+#   - It covers the resume branch and the post-write verify, because they are
+#     children of this shell.
+#   - It also covers the non-tape commands of step 13 (snapshot, stage, audit,
+#     the kit) and step 14, and it cannot be undone: an unprivileged process
+#     cannot lower its priority back. That is accepted.
+#   - Step 12's rehearsal runs before this and stays at normal priority, and
+#     nothing earlier is raised.
+#   - tapectl-op and the drive-poll unit do not use this; they raise only the
+#     tape commands, as root and then dropped to the service user
+#     (contrib/systemd/tapectl-op.in, ADR-0012 2026-10-15 item 58).
+# It asks for root's sudo (one password prompt through the normal `sudo`; under
+# --auto, `sudo -n`, which asks nobody). If sudo refuses, it says so once and the
+# run continues at normal priority: the priority aids the feed, it is never a
+# reason to fail a write.
+tape_priority() { # print "<nice> <ionice>" of this shell
+  printf '%s %s' "$(ps -o ni= -p $$ | tr -d ' ')" "$(ionice -p $$ 2>/dev/null | tr -d '\n')"
 }
 tape_raise_setup() {
-  TAPE_RAISE=0
+  local sudo_opt=() io=() before failed=0
   if [ -z "$TAPE_NICE" ]; then note "TAPE_NICE is empty: the tape commands run at normal priority"; return 0; fi
-  if [ "$SVC_MODE" != 1 ]; then note "tapectl runs as you (--no-service-user): there is no root-then-drop path, so the tape commands run at normal priority"; return 0; fi
-  if ! tape_probe; then
-    if [ "$AUTO" = 1 ]; then
-      note "tape commands run at NORMAL priority: \`sudo -n nice ... runuser\` did not work here (root's sudo asks for a password, or nice/runuser is unavailable) and --auto has no one to ask"
-      return 0
-    fi
-    note "raising the tape commands' priority needs root's sudo (it asks for YOUR password, once; the ticket is kept warm for this step)"
-    if ! sudo -v || ! tape_probe; then
-      note "root's sudo is not available to you here"
-      confirm "Run the tape commands at NORMAL priority instead?" || die "stopped — fix sudo, or pass --tape-nice '' to never raise, then re-run scripts/first-run.sh --from 13"
-      return 0
-    fi
+  [ "$AUTO" != 1 ] || sudo_opt=(-n)
+  [ -z "$TAPE_IONICE" ] || read -r -a io <<<"$TAPE_IONICE"
+  before="$(tape_priority)"
+  [ "$AUTO" = 1 ] || note "raising the tape commands' priority needs root's sudo: it may ask for YOUR password, once"
+  sudo ${sudo_opt[@]+"${sudo_opt[@]}"} renice -n "$TAPE_NICE" -p $$ >/dev/null 2>&1 || failed=1
+  if [ "$failed" = 0 ] && [ "${#io[@]}" -gt 0 ]; then
+    sudo ${sudo_opt[@]+"${sudo_opt[@]}"} ionice "${io[@]}" -p $$ >/dev/null 2>&1 || failed=1
   fi
-  TAPE_RAISE=1
-  # Quits with this script (the kill -0), and sooner if the ticket is gone.
-  ( while kill -0 "$$" 2>/dev/null; do sleep 60; sudo -n -v 2>/dev/null || exit 0; done ) >/dev/null 2>&1 &
-  TAPE_KEEPALIVE_PID=$!
-  trap tape_raise_stop EXIT
-  ok "tape commands run at nice $TAPE_NICE${TAPE_IONICE:+, ionice $TAPE_IONICE}, raised as root and dropped to $SVC_USER (ADR-0012 2026-10-15 item 58)"
+  if [ "$failed" = 0 ]; then
+    ok "this run, and so every tape command in it, is now at nice $TAPE_NICE${TAPE_IONICE:+, ionice $TAPE_IONICE} (was: $before; now: $(tape_priority))"
+  else
+    note "root's sudo refused to raise this run's priority$( [ "$AUTO" = 1 ] && printf ' (--auto has no one to ask for a password)' ); the tape commands run at: $(tape_priority) (was: $before)"
+  fi
 }
 # derive_nodes: NST/NSTN (the canonical st node) and SG (the sg node the
 # kernel binds to it) from $DEVICE. Step 6 computes these; every later step
@@ -1316,7 +1256,7 @@ except Exception: pass' 2>/dev/null || true)"
   fi
   tape_lock
   explain <<'EOF'
-A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write and the verify below each read every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. The host's known contenders are the units listed below (CONTENDER_UNITS in its profile); on the dev VM they were the homorg runner's timers, and the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step. To help, the tape commands of this step (write, resume, verify, erase) run at raised CPU and I/O priority, raised as root and dropped to the service user (TAPE_NICE and TAPE_IONICE in the profile; ADR-0012 2026-10-15 item 58); that outranks other work on the host, it does not replace the quiet.
+A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write and the verify below each read every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. The host's known contenders are the units listed below (CONTENDER_UNITS in its profile); on the dev VM they were the homorg runner's timers, and the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step. To help, this step raises its own CPU and I/O priority once (sudo renice and ionice: one password prompt; TAPE_NICE and TAPE_IONICE in the profile; ADR-0012 2026-10-15 item 58), so the tape commands it starts run at that priority; that outranks other work on the host, it does not replace the quiet.
 
 `tapectl host check` measures this (load, free memory, memory and I/O pressure, contender processes and units) and runs just before the WRITE confirmation below; you can run it yourself any time.
 EOF
@@ -1716,7 +1656,6 @@ EOF
   run tc key escrow-kit --out "$KIT_OUT" && note "Reprint $KIT_OUT/COVER.txt — the catalog inside it now knows this tape."
   kit_finish "$KIT_OUT"
 fi
-tape_raise_stop   # the ticket was kept warm for the tape commands above; step 14 is not one
 }
 
 # ================================================================ step 14

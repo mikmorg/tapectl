@@ -921,10 +921,11 @@ without editing the config; `first-run.sh` step 13 does exactly that for the
 host profile's `CONTENDER_UNITS` before its WRITE confirmation.
 
 The tape commands also run at a higher priority than the work they compete with
-(#432): the wrapper `tapectl-op` and `first-run.sh` step 13 raise them to
-`nice -10` and best-effort I/O level 0 — as root, then dropped to the service
-user — and `tapectl-drive-poll.service` sets the same with `Nice=` and
-`IOSchedulingClass=`. That outranks other processes *on this host*; it does not
+(#432): to `nice -10` and best-effort I/O level 0. The wrapper `tapectl-op`
+raises a tape command as root and then drops to the service user;
+`first-run.sh` step 13 raises its own shell once (`sudo renice`), and the
+commands it starts inherit that; `tapectl-drive-poll.service` sets the same
+with `Nice=` and `IOSchedulingClass=`. That outranks other processes *on this host*; it does not
 replace the quiet, and it cannot help against a guest or another host sharing
 the CPUs or the disks. To see what a running write got, find its process
 (`pgrep -x tapectl`) and read `ps -o pid,ni -p <pid>` and `ionice -p <pid>`. On
