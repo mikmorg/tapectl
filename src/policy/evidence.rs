@@ -76,6 +76,18 @@ pub struct CoverageEvidence {
 /// parameter (`Some` excludes the volume being retired/consumed by
 /// identity; `None` excludes nothing).
 ///
+/// `current_only` scopes the rows to the unit's CURRENT snapshots
+/// (`snapshots.status = 'current'`, the scope `copy_count_expr` counts in),
+/// leaving out a volume that holds only a version the operator has released
+/// (`reclaimable`/`purged`). It is what keeps the Tier-1 line true when read
+/// alone (issue #463): "rests on 3 copies; weakest is A" must not count or
+/// name a volume whose only claim is a version nobody is relying on. The
+/// two callers differ on purpose, as they do on `only_eligible`:
+/// [`remaining_coverage_evidence`] asks what coverage the unit's live
+/// versions still have, while [`per_volume_verification`] feeds `catalog
+/// locate`, which shows every volume that physically holds anything of the
+/// unit, a released version included.
+///
 /// `outcome = 'passed'` and `verify_type = 'full'` live in the `LEFT
 /// JOIN`'s `ON` clause, not a `WHERE` — a `WHERE` filter on a LEFT-JOINed
 /// column would silently turn
@@ -86,6 +98,7 @@ fn tape_rows(
     conn: &Connection,
     unit_id: i64,
     only_eligible: bool,
+    current_only: bool,
     exclude_volume_id: Option<i64>,
 ) -> Result<Vec<CoverageEvidence>> {
     let exclude_clause = match exclude_volume_id {
@@ -97,6 +110,11 @@ fn tape_rows(
     } else {
         String::new()
     };
+    let current_clause = if current_only {
+        "AND s.status = 'current'"
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT v.label, MAX({dated}) as last_verified
          FROM writes w
@@ -107,6 +125,7 @@ fn tape_rows(
                 ON vs.volume_id = v.id AND vs.outcome = 'passed'
                AND vs.verify_type = 'full'
          WHERE s.unit_id = ?1 AND w.status = 'completed'
+           {current_clause}
            {exclude_clause}
            {eligible_clause}
          GROUP BY v.id, v.label
@@ -157,7 +176,7 @@ fn tape_rows(
 /// never be folded into a verification age here, so this function does not
 /// query them.
 pub fn per_volume_verification(conn: &Connection, unit_id: i64) -> Result<Vec<CoverageEvidence>> {
-    tape_rows(conn, unit_id, false, None)
+    tape_rows(conn, unit_id, false, false, None)
 }
 
 /// The column a FULL readback's freshness is judged by, for the
@@ -237,6 +256,15 @@ pub fn sealed_without_full_verify(conn: &Connection, label: Option<&str>) -> Res
 /// - the volume being excluded, when present, is excluded by identity
 ///   (`w.volume_id != ?`), matching `retire_impacts`.
 ///
+/// **Current versions only (issue #463).** Both halves — the tape rows and
+/// the deposits — are scoped to the unit's `'current'` snapshots, so the
+/// line they feed (`cli::consent::confirm` prints it alone) never counts or
+/// names a volume whose only claim on the unit is a version the operator
+/// released. What it does NOT do is take the count per version, the minimum,
+/// as `copy_count_expr` does: a row is a volume or a deposit, so a unit with
+/// several current versions (the ordinary state until older ones are
+/// released) reads the union of the volumes carrying any of them.
+///
 /// The eligibility gate and the query shape itself now live in the shared
 /// [`tape_rows`] helper (issue #196 added a second caller,
 /// [`per_volume_verification`], that needs the same LEFT JOIN shape
@@ -247,7 +275,7 @@ pub fn remaining_coverage_evidence(
     unit_id: i64,
     exclude_volume_id: Option<i64>,
 ) -> Result<Vec<CoverageEvidence>> {
-    let mut rows: Vec<CoverageEvidence> = tape_rows(conn, unit_id, true, exclude_volume_id)?;
+    let mut rows: Vec<CoverageEvidence> = tape_rows(conn, unit_id, true, true, exclude_volume_id)?;
 
     // ADR-0006 warehouse deposits (issue #73). A separate query rather than
     // a UNION with the query above: the two halves select different
@@ -271,7 +299,8 @@ pub fn remaining_coverage_evidence(
              FROM writes w
              JOIN stage_sets ss ON ss.id = w.stage_set_id
              JOIN snapshots s ON s.id = ss.snapshot_id
-             WHERE s.unit_id = ?1 AND w.status = 'completed' {deposit_exclude}
+             WHERE s.unit_id = ?1 AND w.status = 'completed'
+               AND s.status = 'current' {deposit_exclude}
          )
          ORDER BY v.label, l.name",
         crate::policy::coverage::eligible("v")
@@ -711,6 +740,144 @@ mod tests {
         .unwrap();
 
         (conn, unit_id, v1_id, v2_id)
+    }
+
+    /// Fixture for issue #463: unit `unit1` with v1 (`reclaimable`) written
+    /// to volumes `A` and `B`, and v2 (`current`) written to `C`. Returns
+    /// (conn, unit_id, id of A, id of B, id of C).
+    fn setup_released_and_current_versions() -> (Connection, i64, i64, i64, i64) {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('op', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        let tid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'unit1', ?1, 'mtime_size', 1, 'active')",
+            params![tid],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        let mut volume = |label: &str| -> i64 {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'primary', 'LTO-6', 2500000000000, 'sealed')",
+                params![label],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let (a, b, c) = (volume("A"), volume("B"), volume("C"));
+        for (version, status, volumes) in [(1, "reclaimable", vec![a, b]), (2, "current", vec![c])]
+        {
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                 VALUES (?1, ?2, 'full', ?3, '/tmp/u1')",
+                params![unit_id, version, status],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                 VALUES (?1, 'staged', 104857600)",
+                params![snap_id],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            for vol in volumes {
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     VALUES (?1, ?2, ?3, 'completed')",
+                    params![ss_id, snap_id, vol],
+                )
+                .unwrap();
+            }
+        }
+        (conn, unit_id, a, b, c)
+    }
+
+    fn labels(rows: &[CoverageEvidence]) -> Vec<&str> {
+        rows.iter().map(|e| e.volume_label.as_str()).collect()
+    }
+
+    /// Issue #463: the Tier-1 line is printed alone at the moment consent is
+    /// asked, so it must not count or name a volume that holds only a
+    /// RELEASED version. v1 is reclaimable on A and B; v2 is current on C:
+    /// the unit's live coverage rests on C and nothing else.
+    #[test]
+    fn remaining_coverage_ignores_a_volume_holding_only_a_released_version() {
+        let (conn, unit_id, _a, _b, _c) = setup_released_and_current_versions();
+        let rows = remaining_coverage_evidence(&conn, unit_id, None).unwrap();
+        assert_eq!(labels(&rows), ["C"], "{rows:?}");
+        let line = describe("unit1", &rows, now()).unwrap();
+        assert_eq!(
+            line,
+            "coverage for unit \"unit1\" rests on C, never verified"
+        );
+    }
+
+    /// The same filter reaches the warehouse half: a deposit of a volume that
+    /// holds only a released version is not coverage either.
+    #[test]
+    fn remaining_coverage_ignores_a_deposit_of_a_released_only_volume() {
+        let (conn, unit_id, a, _b, c) = setup_released_and_current_versions();
+        conn.execute(
+            "INSERT INTO locations (name, kind) VALUES ('glacier', 'warehouse')",
+            [],
+        )
+        .unwrap();
+        let loc = conn.last_insert_rowid();
+        for vol in [a, c] {
+            conn.execute(
+                "INSERT INTO volume_deposits (volume_id, location_id, deposited_at, receipt)
+                 VALUES (?1, ?2, '2026-01-02 00:00:00', 'r')",
+                params![vol, loc],
+            )
+            .unwrap();
+        }
+        let rows = remaining_coverage_evidence(&conn, unit_id, None).unwrap();
+        let deposits: Vec<&str> = rows
+            .iter()
+            .filter(|e| e.kind == EvidenceKind::WarehouseDeposit)
+            .map(|e| e.volume_label.as_str())
+            .collect();
+        assert_eq!(deposits, ["C"], "A's deposit backs only a released version");
+        assert_eq!(rows.len(), 2, "C's tape and C's deposit: {rows:?}");
+    }
+
+    /// Positive control: a volume that holds a released version AND a current
+    /// one still counts (through the current one), and excluding the only
+    /// volume with a current claim leaves nothing to rest on.
+    #[test]
+    fn a_volume_with_a_current_claim_still_counts_and_exclusion_still_works() {
+        let (conn, unit_id, _a, b, c) = setup_released_and_current_versions();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT ss.id, s.id, ?2, 'completed'
+             FROM snapshots s JOIN stage_sets ss ON ss.snapshot_id = s.id
+             WHERE s.unit_id = ?1 AND s.version = 2",
+            params![unit_id, b],
+        )
+        .unwrap();
+        let rows = remaining_coverage_evidence(&conn, unit_id, None).unwrap();
+        assert_eq!(labels(&rows), ["B", "C"], "{rows:?}");
+        let rows = remaining_coverage_evidence(&conn, unit_id, Some(c)).unwrap();
+        assert_eq!(labels(&rows), ["B"], "{rows:?}");
+        let rows = remaining_coverage_evidence(&conn, unit_id, Some(b)).unwrap();
+        assert_eq!(labels(&rows), ["C"], "{rows:?}");
+    }
+
+    /// `catalog locate` is the other reader of `tape_rows`, and it shows
+    /// every volume that physically holds anything of the unit — a released
+    /// version included. The filter above must not leak into it.
+    #[test]
+    fn per_volume_verification_still_lists_the_released_versions_volumes() {
+        let (conn, unit_id, _a, _b, _c) = setup_released_and_current_versions();
+        let rows = per_volume_verification(&conn, unit_id).unwrap();
+        assert_eq!(labels(&rows), ["A", "B", "C"], "{rows:?}");
     }
 
     /// ADR-0012 2026-10-07 item 30: the Tier-1 evidence dates a full
