@@ -5775,6 +5775,9 @@ mod tests {
                  recorded — that is a write-path operation against an already-sealed tape"
             );
         }
+        fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+            self.0.eod_at_or_before(position)
+        }
     }
 
     /// THE headline regression for issue #277. Builds exactly the scenario
@@ -7777,6 +7780,9 @@ mod tests {
         }
         fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
             self.inner.reposition_for_resume(file_index)
+        }
+        fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+            self.inner.eod_at_or_before(position)
         }
     }
 

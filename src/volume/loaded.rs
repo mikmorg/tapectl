@@ -355,6 +355,10 @@ impl Store for Peeked<'_> {
         self.inner.blank_at_bot()
     }
 
+    fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+        self.inner.eod_at_or_before(position)
+    }
+
     fn erase(&mut self, mode: EraseMode) -> Result<()> {
         self.inner.erase(mode)
     }

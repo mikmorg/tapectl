@@ -4055,7 +4055,8 @@ pub(crate) const NEVER_DEGAUSS: &str = "Never degauss or bulk-erase an LTO cartr
 /// lifecycle does not (yet) wire into the write path at all: a foreign or
 /// stale identity at File 0 that the operator has physically verified is
 /// safe to overwrite. It can defeat `IdentityMismatch`. It can NEVER defeat
-/// `AlreadySealed` — ADR-0003 makes a sealed volume's immutability absolute,
+/// `AlreadySealed` or `SealUnreadable` (issue #460: a seal that will not
+/// read may be a sealed volume) — ADR-0003 makes a sealed volume's immutability absolute,
 /// and the sanctioned way past a sealed cartridge is to erase it in the
 /// drive first ([`ERASE_IN_THE_DRIVE`], then `cartridge mark-erased`): a long
 /// erase turns its File 0 blank (`ContactOutcome::Blank`) on the next
@@ -13325,6 +13326,38 @@ mod tests {
                 "ADR-0003",
             ] {
                 assert!(!msg.contains(other), "must not route as `{other}`: {msg}");
+            }
+        }
+
+        /// The decision itself: no flag, no live-volume list and no blank
+        /// proof turns an unreadable seal into consent.
+        #[test]
+        fn the_decision_on_an_unreadable_seal_consults_no_flag_and_no_proof() {
+            let outcome = ContactOutcome::SealUnreadable {
+                position: 7,
+                error: "read: Input/output error (os error 5)".into(),
+            };
+            let chip = binding::BlankProof::Chip {
+                serial: "SER-1".into(),
+                life_written_mib: 0,
+            };
+            let erase = binding::BlankProof::VerifiedErase {
+                barcode: "SER-1".into(),
+                mode: "short".into(),
+                erased_at: "2026-10-15 00:00:00".into(),
+                erase_contact_id: 7,
+                life_written_mib: None,
+            };
+            for force in [false, true] {
+                for live in [Vec::new(), vec!["L6-LIVE".to_string()]] {
+                    for proof in [None, Some(&chip), Some(&erase)] {
+                        let err = decide_fresh_write_contact_on(
+                            &outcome, FW_LABEL, FW_UUID, force, &live, proof,
+                        )
+                        .expect_err("an unreadable seal is never consent");
+                        assert_unreadable_seal_refusal(&err.to_string(), 7);
+                    }
+                }
             }
         }
 
