@@ -405,6 +405,120 @@ pub fn hold_drive_for_contact(conn: &Connection, device_tape: &str) {
     }
 }
 
+/// How `device_tape`'s drive lock stands, for a reader that must not take it
+/// (`drive status`, issue #428).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveLockState {
+    /// Nobody holds it: no tapectl command is in contact with the drive.
+    Free,
+    /// A tapectl command holds it (from its contact until its exit).
+    Held,
+    /// The lockfile could not be opened or tested, so nothing is known.
+    Unknown(String),
+}
+
+/// Test `device_tape`'s drive lock WITHOUT keeping it: a non-blocking
+/// `flock` taken and released at once, the probe [`is_crashed`] and
+/// [`volume_session_live`] make for their locks. Unlike [`drive_lock_held`]
+/// (which counts a lockfile it cannot open as held, the conservative answer
+/// for a sweep) an unopenable lockfile is [`DriveLockState::Unknown`], so a
+/// reader can say it does not know instead of reporting a hold it never saw.
+///
+/// A hold taken by THIS process's registry ([`try_hold_drive`]) conflicts
+/// with the probe's own descriptor and reads as [`DriveLockState::Held`],
+/// which is true.
+pub fn drive_lock_state(db_file: &Path, device_tape: &str) -> DriveLockState {
+    let path = drive_lock_path(db_file, device_tape);
+    let (_, file) = match open_drive_lockfile(&path) {
+        Ok(opened) => opened,
+        Err(e) => return DriveLockState::Unknown(e.to_string()),
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(flock) => {
+            drop(flock);
+            DriveLockState::Free
+        }
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => DriveLockState::Held,
+        Err((_, errno)) => DriveLockState::Unknown(format!("flock {}: {errno}", path.display())),
+    }
+}
+
+/// The ids of the volumes with a live session lock right now: every
+/// `locks/volume-<id>.lock` beside the catalog `conn` is attached to that
+/// another process holds ([`volume_session_live`]). Only lockfiles that
+/// already exist are looked at, so asking creates none. An in-memory catalog
+/// has no lockfiles and no other process.
+pub fn live_volume_sessions(conn: &Connection) -> Vec<i64> {
+    let Some(db_file) = db_file_of(conn) else {
+        return Vec::new();
+    };
+    let dir = db_file.parent().unwrap_or_else(|| Path::new(".")).join("locks");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<i64> = entries
+        .filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            name.strip_prefix("volume-")?
+                .strip_suffix(".lock")?
+                .parse::<i64>()
+                .ok()
+        })
+        .filter(|id| volume_session_live(conn, *id))
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The pids of the processes holding an `flock` on `lockfile`, from the
+/// kernel's `/proc/locks`. An `flock` has no owner API, so this is the only
+/// way to put a pid to "held"; it is best-effort and says so by returning
+/// nothing: `/proc/locks` unreadable, the file gone, the holder in a PID
+/// namespace this one cannot name (the kernel shows pid 0 then).
+pub fn lock_holder_pids(lockfile: &Path) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::metadata(lockfile) else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string("/proc/locks") else {
+        return Vec::new();
+    };
+    let dev = meta.dev();
+    parse_proc_locks(
+        &text,
+        nix::sys::stat::major(dev),
+        nix::sys::stat::minor(dev),
+        meta.ino(),
+    )
+}
+
+/// The pids of the `flock` holders of file `ino` on device `major:minor` in
+/// `/proc/locks` text — one lock per line,
+/// `1: FLOCK  ADVISORY  WRITE 1661 fd:10:2883617 0 EOF`, the device in hex and
+/// the inode in decimal. A waiter's line (`1: -> FLOCK …`) is not a holder.
+fn parse_proc_locks(text: &str, major: u64, minor: u64, ino: u64) -> Vec<u32> {
+    let mut pids: Vec<u32> = text
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.contains(&"->") {
+                return None;
+            }
+            let at = f.iter().position(|w| *w == "FLOCK")?;
+            // FLOCK ADVISORY <READ|WRITE> <pid> <maj:min:ino> <start> <end>
+            let pid: u32 = f.get(at + 3)?.parse().ok()?;
+            let mut dev = f.get(at + 4)?.split(':');
+            let lock_major = u64::from_str_radix(dev.next()?, 16).ok()?;
+            let lock_minor = u64::from_str_radix(dev.next()?, 16).ok()?;
+            let lock_ino: u64 = dev.next()?.parse().ok()?;
+            (pid > 0 && (lock_major, lock_minor, lock_ino) == (major, minor, ino)).then_some(pid)
+        })
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 /// Whether some process OTHER than this one's registry holds
 /// `device_tape`'s drive lock — a probe that leaves nothing held. The test
 /// seam for "a contact holds the drive"; production asks through
@@ -470,6 +584,83 @@ mod tests {
             "a second take in this process is the same hold, not a self-conflict"
         );
         assert!(drive_lock_held(&db_file, "/x/nst9"), "and it stays held");
+    }
+
+    /// Issue #428: `drive status` reads the drive lock without keeping it.
+    #[test]
+    fn the_drive_lock_state_is_read_and_left_free() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_file = tmp.path().join("tapectl.db");
+        assert_eq!(
+            drive_lock_state(&db_file, "/x/nst4"),
+            DriveLockState::Free,
+            "positive control: nobody holds it"
+        );
+        // The probe kept nothing: another taker gets it.
+        let (_, file) = open_drive_lockfile(&drive_lock_path(&db_file, "/x/nst4")).unwrap();
+        let other = Flock::lock(file, FlockArg::LockExclusiveNonblock)
+            .expect("the probe released its lock");
+        assert_eq!(drive_lock_state(&db_file, "/x/nst4"), DriveLockState::Held);
+        drop(other);
+        assert_eq!(drive_lock_state(&db_file, "/x/nst4"), DriveLockState::Free);
+    }
+
+    #[test]
+    fn a_lockfile_that_cannot_be_opened_is_unknown_not_held() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // `locks` is a FILE, so the lockfile's directory cannot be made.
+        std::fs::write(tmp.path().join("locks"), b"").unwrap();
+        let db_file = tmp.path().join("tapectl.db");
+        assert!(matches!(
+            drive_lock_state(&db_file, "/x/nst4"),
+            DriveLockState::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn proc_locks_names_the_holder_of_one_inode_and_not_a_waiter() {
+        let text = "\
+1: POSIX  ADVISORY  READ 3638 fd:10:17566478 128 128
+2: FLOCK  ADVISORY  WRITE 1661 fd:10:2883617 0 EOF
+3: FLOCK  ADVISORY  WRITE 1662 fd:10:2883616 0 EOF
+3: -> FLOCK  ADVISORY  WRITE 1700 fd:10:2883617 0 EOF
+4: FLOCK  ADVISORY  WRITE 1661 fd:11:2883617 0 EOF
+5: FLOCK  ADVISORY  WRITE 0 fd:10:2883617 0 EOF
+";
+        assert_eq!(parse_proc_locks(text, 0xfd, 0x10, 2883617), vec![1661]);
+        assert_eq!(parse_proc_locks(text, 0xfd, 0x10, 2883616), vec![1662]);
+        assert!(parse_proc_locks(text, 0xfd, 0x10, 99).is_empty());
+        assert!(parse_proc_locks("", 0xfd, 0x10, 2883617).is_empty());
+    }
+
+    /// The real `/proc/locks`, against a lock this very process holds: its
+    /// own pid. A pid-namespace sandbox that hides it would show pid 0 and
+    /// fail here, which is the honest signal that the lookup is blind.
+    #[test]
+    fn the_holder_of_a_real_flock_is_found_in_proc_locks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_file = tmp.path().join("tapectl.db");
+        let path = drive_lock_path(&db_file, "/x/nst6");
+        assert!(lock_holder_pids(&path).is_empty(), "no lockfile, no holder");
+        let (_, file) = open_drive_lockfile(&path).unwrap();
+        assert!(lock_holder_pids(&path).is_empty(), "an unheld file");
+        let _held = Flock::lock(file, FlockArg::LockExclusiveNonblock).unwrap();
+        assert_eq!(lock_holder_pids(&path), vec![std::process::id()]);
+    }
+
+    #[test]
+    fn live_volume_sessions_lists_only_held_volume_locks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_file = tmp.path().join("tapectl.db");
+        let conn = Connection::open(&db_file).unwrap();
+        assert!(live_volume_sessions(&conn).is_empty(), "no locks directory");
+        // Volume 5's session is live; 6's lockfile is left over from a
+        // finished one; a stage lock is not a volume's.
+        let (_, held) = open_drive_lockfile(&volume_lock_path(&db_file, 5)).unwrap();
+        let _live = Flock::lock(held, FlockArg::LockExclusiveNonblock).unwrap();
+        open_drive_lockfile(&volume_lock_path(&db_file, 6)).unwrap();
+        open_drive_lockfile(&lock_path(&db_file, 5)).unwrap();
+        assert_eq!(live_volume_sessions(&conn), vec![5]);
     }
 
     #[test]
