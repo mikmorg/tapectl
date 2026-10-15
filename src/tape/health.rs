@@ -341,6 +341,12 @@ pub enum Reading {
     /// BOT, or the whole medium erased — and a reading taken after a long
     /// erase is the cartridge's one full pass end to end.
     Erase,
+    /// A `drive eject` (issue #466; ADR-0013, 2026-09-23 evening: every
+    /// contact takes one post-command sweep): its own kind, because it
+    /// drove the tape one way only — an unload — and a reading taken
+    /// straight after it is the drive with the cartridge gone, which no
+    /// other kind can say.
+    Eject,
 }
 
 impl Reading {
@@ -354,6 +360,7 @@ impl Reading {
         Reading::Init,
         Reading::Poll,
         Reading::Erase,
+        Reading::Eject,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -365,6 +372,7 @@ impl Reading {
             Reading::Init => "init",
             Reading::Poll => "poll",
             Reading::Erase => "erase",
+            Reading::Eject => "eject",
         }
     }
 }
@@ -1312,7 +1320,7 @@ Read error counter page  [0x3]
         let names: Vec<&str> = Reading::ALL.iter().map(|r| r.as_str()).collect();
         assert_eq!(
             names,
-            vec!["write", "resume", "verify", "restore", "init", "poll", "erase"],
+            vec!["write", "resume", "verify", "restore", "init", "poll", "erase", "eject"],
             "health_logs.operation is what KIND of reading a row is — a \
              different vocabulary from cartridge_contacts.operation, which is \
              the command verbatim"
@@ -1353,10 +1361,22 @@ Read error counter page  [0x3]
             erase_prod.len() < erase_full.len(),
             "positive control: erase.rs's test module was separated from its production half"
         );
+        // The fourth: cli/drive.rs, `drive eject`'s one sweep (issue #466),
+        // cut the same way.
+        let drive_full = source_of("cli/drive.rs");
+        let drive_prod = match drive_full.find("#[cfg(test)]\nmod tests") {
+            Some(i) => &drive_full[..i],
+            None => &drive_full[..],
+        };
+        assert!(
+            drive_prod.len() < drive_full.len(),
+            "positive control: drive.rs's test module was separated from its production half"
+        );
         let corpus: String = prod
             .lines()
             .chain(poll_prod.lines())
             .chain(erase_prod.lines())
+            .chain(drive_prod.lines())
             .filter(|l| !l.trim_start().starts_with("//"))
             .map(|l| format!("{l}\n"))
             .collect();
@@ -1376,7 +1396,7 @@ Read error counter page  [0x3]
             let variant = format!("Reading::{reading:?}");
             assert!(
                 crate::tape::contact::tests::contains_identifier(&corpus, &variant),
-                "{variant} has no PRODUCTION writer in src/volume/write.rs, src/tape/poll.rs or src/volume/erase.rs — a vocabulary \
+                "{variant} has no PRODUCTION writer in src/volume/write.rs, src/tape/poll.rs, src/volume/erase.rs or src/cli/drive.rs — a vocabulary \
                  value with no writer is exactly the `read`/`clean` defect \
                  ADR-0013 §4 names, and it is a FINDING, not a row to add"
             );

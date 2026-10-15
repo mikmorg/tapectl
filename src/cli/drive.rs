@@ -1354,6 +1354,9 @@ pub struct EjectProbe<'a> {
     /// The unload. `None`, the production value, is [`ioctl::offline`].
     pub unload: Option<&'a mut dyn FnMut() -> std::io::Result<()>>,
     pub sysfs_root: Option<&'a Path>,
+    /// The post-command sweep's log pages. `None`, the production value,
+    /// reads them through the backend's sg node with `sg_logs`.
+    pub log_source: Option<&'a std::cell::RefCell<dyn crate::tape::log_pages::LogSource + 'a>>,
 }
 
 /// Eject the cartridge from the drive `backend` names, and record that it
@@ -1381,6 +1384,11 @@ pub struct EjectProbe<'a> {
 /// 5. The contact opens, the cartridge is unloaded, the contact closes
 ///    (`ok`, or `failed` with the error), and only a good unload writes the
 ///    event.
+/// 6. The contact's one post-command sweep (ADR-0013, 2026-09-23 evening:
+///    every contact takes one, no exceptions), through the sg node, on both
+///    outcomes. A failed unload is the sweep that matters most, and the
+///    flags an unload raises (TapeAlert 16, 0x38) belong to this contact,
+///    not to whichever one reads the drive next.
 ///
 /// It never touches `cartridge_volumes` (ADR-0012 2026-10-15 item 61):
 /// migration 020 reserves `unmounted_at` for displacement, and coverage reads
@@ -1581,6 +1589,22 @@ pub fn eject(
             );
         }
     }
+    // 6. The sweep, after the close and on either outcome (the drive lock is
+    //    still held, so no poll reads these pages first). Best-effort:
+    //    nothing in it can change the eject's result.
+    crate::volume::write::collect_health_best_effort(
+        conn,
+        config,
+        device,
+        None,
+        report.contact_id,
+        crate::tape::health::Reading::Eject,
+        Operation::DriveEject,
+        crate::volume::write::HealthProbe {
+            log_source: probe.log_source,
+            identity: probe.identity.as_ref(),
+        },
+    );
     Ok(report)
 }
 
@@ -2548,6 +2572,7 @@ mod tests {
                 holders: None,
                 unload: Some(&mut unload),
                 sysfs_root: Some(env.sysfs.path()),
+                log_source: None,
             },
         )
         .expect("the lock is obtainable under a temp home")
@@ -2711,6 +2736,187 @@ mod tests {
         );
     }
 
+    /// An eject with the backend in the config, so its post-command sweep
+    /// has a drive to read, against the fixture log source. Returns the
+    /// report and the source (for its read counts).
+    fn run_swept_eject(
+        env: &mut EjectEnv,
+        unload_result: std::io::Result<()>,
+    ) -> (EjectReport, crate::tape::log_pages::tests::FixtureSource) {
+        env.config.backends.lto = vec![lto6_backend()];
+        let source =
+            std::cell::RefCell::new(crate::tape::log_pages::tests::FixtureSource::default());
+        let mut unload_result = Some(unload_result);
+        let mut unload = || unload_result.take().unwrap_or(Ok(()));
+        let report = eject(
+            &env.conn,
+            &env.paths,
+            &env.config,
+            &lto6_backend(),
+            false,
+            EjectProbe {
+                node: loaded(),
+                mam: chip(),
+                identity: Some(hp_drive()),
+                holders: None,
+                unload: Some(&mut unload),
+                sysfs_root: Some(env.sysfs.path()),
+                log_source: Some(&source),
+            },
+        )
+        .expect("the lock is obtainable under a temp home");
+        let seen = std::mem::take(&mut *source.borrow_mut());
+        (report, seen)
+    }
+
+    /// ADR-0013 (2026-09-23 evening): every contact takes one post-command
+    /// sweep, none excepted (issue #466). An eject's lands on its own
+    /// contact, once per page, and a FAILED unload is swept too — the
+    /// flags an unload raises are this contact's, not the next one's.
+    #[test]
+    fn an_eject_takes_its_contacts_one_sweep_whether_or_not_the_unload_worked() {
+        for (unload, outcome, contact_outcome) in [
+            (Ok(()), EjectOutcome::Ejected, "ok"),
+            (
+                Err(std::io::Error::from_raw_os_error(nix::libc::EIO)),
+                EjectOutcome::UnloadFailed,
+                "failed",
+            ),
+        ] {
+            let mut env = eject_env();
+            let (r, seen) = run_swept_eject(&mut env, unload);
+            assert_eq!(r.outcome, outcome, "{}", r.message);
+            let contact = r
+                .contact_id
+                .expect("an eject that reached the drive has a contact");
+
+            crate::tape::log_pages::tests::assert_each_page_read_once(&seen.reads);
+            assert_eq!(
+                seen.reads.len(),
+                crate::tape::log_pages::tests::LISTED.len(),
+                "the whole sweep, not a part of it"
+            );
+            let journalled: (i64, i64) = env
+                .conn
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(contact_id = ?1 AND trigger = 'drive eject'), 0)
+                       FROM log_page_journal",
+                    [contact],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                journalled,
+                (
+                    crate::tape::log_pages::tests::LISTED.len() as i64,
+                    crate::tape::log_pages::tests::LISTED.len() as i64
+                ),
+                "every page is journalled against the eject's own contact"
+            );
+            let reading: (String, Option<i64>) = env
+                .conn
+                .query_row("SELECT operation, contact_id FROM health_logs", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(reading, ("eject".to_string(), Some(contact)));
+            let closed: Option<String> = env
+                .conn
+                .query_row(
+                    "SELECT outcome FROM cartridge_contacts WHERE id = ?1",
+                    [contact],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(closed.as_deref(), Some(contact_outcome));
+        }
+    }
+
+    /// An eject that never reached the drive has no contact, so no sweep:
+    /// nothing read, nothing journalled.
+    #[test]
+    fn a_refused_or_empty_eject_takes_no_sweep() {
+        let mut env = eject_env();
+        env.config.backends.lto = vec![lto6_backend()];
+        let source =
+            std::cell::RefCell::new(crate::tape::log_pages::tests::FixtureSource::default());
+        let mut unload = || Ok(());
+        let r = eject(
+            &env.conn,
+            &env.paths,
+            &env.config,
+            &lto6_backend(),
+            false,
+            EjectProbe {
+                node: Some(node(GMT_DR_OPEN | GMT_ONLINE)),
+                mam: chip(),
+                identity: Some(hp_drive()),
+                holders: None,
+                unload: Some(&mut unload),
+                sysfs_root: Some(env.sysfs.path()),
+                log_source: Some(&source),
+            },
+        )
+        .unwrap();
+        assert_eq!(r.outcome, EjectOutcome::NoCartridge);
+        assert!(source.borrow().reads.is_empty(), "no page was read");
+        assert_eq!(eject_rows(&env.conn), 0);
+    }
+
+    /// The sweep is wired once, AFTER both outcomes' contact close and
+    /// outside the match that separates them (so neither can skip it), and
+    /// it names the contact. Pinned on the source because production reads
+    /// the pages with `sg_logs`; the tests above prove the behaviour with a
+    /// fixture source.
+    #[test]
+    fn the_eject_sweep_is_one_call_after_the_unload_match_and_names_the_contact() {
+        const SRC: &str = include_str!("drive.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            prod.len() < SRC.len(),
+            "positive control: the production half was separated from the tests"
+        );
+        let f = "pub fn eject(";
+        let start = prod.find(f).expect("positive control: eject exists");
+        let end = prod[start..].find("\n}\n").unwrap() + start;
+        let body = &prod[start..end];
+        assert!(
+            !body[f.len()..].contains("\npub fn "),
+            "body extraction overran into another function"
+        );
+        assert_eq!(
+            body.matches("collect_health_best_effort(").count(),
+            1,
+            "one sweep per contact, in one place"
+        );
+        let sweep = body.find("collect_health_best_effort(").unwrap();
+        let unload_match = body
+            .find("match unloaded {")
+            .expect("positive control: the unload match");
+        let match_end = body[unload_match..]
+            .find("\n    }\n")
+            .expect("the match closes at the function's indent")
+            + unload_match;
+        assert!(
+            sweep > match_end,
+            "the sweep follows the unload match, so a failed unload is swept too"
+        );
+        let call = &body[sweep..];
+        assert!(
+            call[..call.find(");").unwrap()].contains("report.contact_id"),
+            "the sweep names the eject's own contact"
+        );
+        assert!(
+            call.contains("Operation::DriveEject") && call.contains("Reading::Eject"),
+            "and the eject's own trigger and reading kind"
+        );
+        assert!(
+            body.matches("guard.finish(").count() == 2
+                && sweep > body.rfind("guard.finish(").unwrap(),
+            "positive control: both closes come before the sweep"
+        );
+    }
+
     /// A failed unload is a failed contact and nothing else: no event, the
     /// binding as it was, and exit 2.
     #[test]
@@ -2854,6 +3060,7 @@ mod tests {
                 holders: None,
                 unload: Some(&mut unload),
                 sysfs_root: Some(env.sysfs.path()),
+                log_source: None,
             },
         )
         .unwrap();
