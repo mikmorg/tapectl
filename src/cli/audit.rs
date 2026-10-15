@@ -227,6 +227,23 @@ const CHECKS: &[Check] = &[
         },
     },
     Check {
+        // Issue #425: the other half of `unit mark-tape-only`'s location
+        // gate. `location_presence` is the NAMES an archive set requires and
+        // returns early without any; this is `[defaults] min_locations`, a
+        // count of distinct places that applies to every tape-only unit, set
+        // or not, and not multiplied (ADR-0012 2026-10-12 item 46) — the
+        // sibling of `copy_count` for places. The row runs for every status
+        // like its siblings; `policy::coverage::location_floor` is the one
+        // place that says only a `tape_only` unit has a floor, so the rule
+        // is not stated twice.
+        name: "location_count",
+        scope: Scope::PerUnit {
+            statuses: ACTIVE_TAPE_ONLY_MISSING,
+            needs_policy: false,
+            run: check_location_count,
+        },
+    },
+    Check {
         name: "verify_age",
         scope: Scope::PerUnit {
             statuses: ACTIVE_TAPE_ONLY_MISSING,
@@ -847,6 +864,40 @@ fn check_location_presence(
                 resolved.required_locations.join(", "),
             ),
             action: additional_copy_action(ctx.conn, unit, &extra)?,
+        });
+    }
+    Ok(f)
+}
+
+// Check the distinct-place count (issue #425, ADR-0012 2026-10-12 items 46
+// and 47). A tape-only unit's current version must sit in at least `[defaults]
+// min_locations` different places, as set: the tape-only multiplier raises
+// copy floors, never this one. The predicate is `policy::coverage`'s, shared
+// with `unit mark-tape-only`'s location gate and `snapshot mark-reclaimable`'s
+// superseding-version gate, so the three cannot disagree. A VIOLATION, as
+// `copy_count` is: the same failure for places — a unit whose source is gone
+// and whose every copy shares one fire, flood or theft. `needs_policy` is
+// false: the floor is not a layer of the resolved policy.
+fn check_location_count(
+    ctx: &Ctx<'_>,
+    unit: &Unit,
+    _policy: Option<&ResolvedPolicy>,
+) -> Result<Findings> {
+    let mut f = Findings::default();
+    if let Some(short) = policy::coverage::short_of_location_floor(
+        ctx.conn,
+        ctx.config,
+        policy::coverage::NamedScope::Unit(unit.id),
+        &unit.status,
+    )? {
+        // A new copy, shelved elsewhere: always available, and the remedy
+        // every other coverage shortfall names.
+        let extra = " && tapectl volume move <OTHER-LABEL> --to <OTHER-LOCATION>";
+        f.violations.push(AuditFinding {
+            unit: unit.name.clone(),
+            check: "location_count".into(),
+            message: format!("has {}", short.describe()),
+            action: additional_copy_action(ctx.conn, unit, extra)?,
         });
     }
     Ok(f)
@@ -3958,6 +4009,166 @@ mod tests {
         }
     }
 
+    /// Issue #425 (ADR-0012 2026-10-12 items 46 and 47): `[defaults]
+    /// min_locations` was read only by `unit mark-tape-only`, so a tape-only
+    /// unit met "two places" at the moment it was marked and never again. The
+    /// `location_count` check holds it to the same floor afterwards, through
+    /// the one predicate in `policy::coverage`, as set: the tape-only
+    /// multiplier raises copy floors, never this one.
+    mod location_count_floor {
+        use super::*;
+        use crate::policy::coverage::tests::{add_tape_copy_at, setup_unit_with_deposit};
+
+        /// `photos` as [`setup_unit_with_deposit`] builds it (a tape at
+        /// `home`, a deposit at `glacier`: 2 copies in 2 places) with the
+        /// deposit moved to `home` and two more tapes there: 4 copies in 1
+        /// place. At the defaults (`min_copies` 2, 2x) the copy floor of a
+        /// tape-only unit is 4, so only the place floor can be short.
+        fn four_copies_in_one_place(status: &str) -> Connection {
+            let (conn, _unit_id, _vol) = setup_unit_with_deposit(status);
+            conn.execute(
+                "UPDATE volume_deposits
+                 SET location_id = (SELECT id FROM locations WHERE name = 'home')",
+                [],
+            )
+            .unwrap();
+            add_tape_copy_at(&conn, "L6-0004", "home");
+            add_tape_copy_at(&conn, "L6-0005", "home");
+            conn
+        }
+
+        /// Move the deposit back to `glacier`: 4 copies in 2 places.
+        fn spread_to_two_places(conn: &Connection) {
+            conn.execute(
+                "UPDATE volume_deposits
+                 SET location_id = (SELECT id FROM locations WHERE name = 'glacier')",
+                [],
+            )
+            .unwrap();
+        }
+
+        fn violations_of(conn: &Connection, config: &Config, check: &str) -> Vec<AuditFinding> {
+            let (violations, _warnings) = collect_findings(conn, config, Some("photos")).unwrap();
+            violations
+                .into_iter()
+                .filter(|f| f.check == check)
+                .collect()
+        }
+
+        /// The issue's acceptance test, at the DEFAULTS: 4 copies in 1 place
+        /// is a `location_count` violation (and only that: 4 meets the
+        /// copy floor of 2 x 2); 4 copies in 2 places is clean.
+        #[test]
+        fn four_copies_in_one_place_is_a_violation_and_in_two_is_clean() {
+            let conn = four_copies_in_one_place("tape_only");
+            let config = Config::default();
+            assert_eq!(config.defaults.min_locations, 2);
+
+            let found = violations_of(&conn, &config, "location_count");
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(
+                found[0].message,
+                "has copies in 1 location(s), needs 2 ([defaults] min_locations)"
+            );
+            assert!(
+                !found[0].message.contains("tape-only"),
+                "the place floor is not multiplied, so its message carries no multiplier: {}",
+                found[0].message
+            );
+            assert!(
+                violations_of(&conn, &config, "copy_count").is_empty(),
+                "4 copies meets 2 x 2: the place floor is the only thing short"
+            );
+
+            spread_to_two_places(&conn);
+            let (violations, _warnings) = collect_findings(&conn, &config, Some("photos")).unwrap();
+            assert!(
+                violations
+                    .iter()
+                    .all(|f| f.check != "location_count" && f.check != "copy_count"),
+                "4 copies in 2 places meets a tape-only unit's floors at the defaults: \
+                 {violations:?}"
+            );
+        }
+
+        /// Item 46: the multiplier is not applied to the place count. At 3x
+        /// (not 2, so a literal cannot pass) the unit is short of 6 copies
+        /// but its 2 places still meet the floor of 2, and the finding for
+        /// one place says 2, not 6.
+        #[test]
+        fn the_multiplier_never_raises_the_place_floor() {
+            let conn = four_copies_in_one_place("tape_only");
+            let mut config = Config::default();
+            config.compaction.tape_only_safety_multiplier = 3;
+            let found = violations_of(&conn, &config, "location_count");
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(
+                found[0].message,
+                "has copies in 1 location(s), needs 2 ([defaults] min_locations)"
+            );
+
+            spread_to_two_places(&conn);
+            assert!(
+                violations_of(&conn, &config, "location_count").is_empty(),
+                "2 places meets min_locations 2 at any multiplier"
+            );
+            assert_eq!(
+                violations_of(&conn, &config, "copy_count").len(),
+                1,
+                "positive control: the copy floor DID take the 3x"
+            );
+        }
+
+        /// The floor is a tape-only floor: an active unit still has its
+        /// source on disk, and `unit mark-tape-only` is where the places are
+        /// asked for. The same catalog, active, is clean.
+        #[test]
+        fn an_active_unit_is_not_held_to_the_place_floor() {
+            let conn = four_copies_in_one_place("active");
+            let config = Config::default();
+            assert!(violations_of(&conn, &config, "location_count").is_empty());
+
+            // Positive control: marking it tape-only starts the check.
+            conn.execute("UPDATE units SET status = 'tape_only'", [])
+                .unwrap();
+            assert_eq!(violations_of(&conn, &config, "location_count").len(), 1);
+        }
+
+        /// `min_locations` is the knob: at 1 a single place meets it, at 3 two
+        /// places are short, and the finding names the configured number.
+        #[test]
+        fn the_floor_is_the_configured_min_locations() {
+            let conn = four_copies_in_one_place("tape_only");
+            let mut config = Config::default();
+            config.defaults.min_locations = 1;
+            assert!(violations_of(&conn, &config, "location_count").is_empty());
+
+            spread_to_two_places(&conn);
+            config.defaults.min_locations = 3;
+            let found = violations_of(&conn, &config, "location_count");
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(
+                found[0].message,
+                "has copies in 2 location(s), needs 3 ([defaults] min_locations)"
+            );
+        }
+
+        /// Its remedy is the one every coverage shortfall's is: another
+        /// copy, shelved elsewhere (`additional_copy_action`).
+        #[test]
+        fn the_remedy_writes_a_copy_and_shelves_it_elsewhere() {
+            let conn = four_copies_in_one_place("tape_only");
+            let found = violations_of(&conn, &Config::default(), "location_count");
+            assert!(
+                found[0]
+                    .action
+                    .ends_with("tapectl volume move <OTHER-LABEL> --to <OTHER-LOCATION>"),
+                "{}",
+                found[0].action
+            );
+        }
+    }
+
     /// ADR-0012 2026-10-06 items 1 and 24: `verify_age` dates a unit's
     /// evidence from FULL readbacks only. A quick confirm or quick verify
     /// reads File 0, the front index and the seal — none of the unit's
@@ -4321,7 +4532,7 @@ mod tests {
     mod checks_table {
         use super::*;
 
-        /// The 17 distinct `check` name literals this file's findings can
+        /// The 18 distinct `check` name literals this file's findings can
         /// carry (grep-verified against every `check: "..."` / `check ==
         /// "..."` in this file, non-test code). Every `CHECKS` row name
         /// must be one of these, and every one of these must be covered by
@@ -4331,6 +4542,7 @@ mod tests {
             "copy_count",
             "warehouse_copies",
             "location_presence",
+            "location_count",
             "verify_age",
             "escrow_coverage",
             "no_archive",
@@ -4359,13 +4571,13 @@ mod tests {
                 "duplicate name in CHECKS: {names:?}"
             );
 
-            // 9 per-unit checks + 6 archive-wide checks. `policy_unresolvable`
+            // 10 per-unit checks + 6 archive-wide checks. `policy_unresolvable`
             // is not one of them (see below), and `escrow_kit_missing`/
             // `escrow_kit_stale` share one row.
             assert_eq!(
                 names.len(),
-                15,
-                "expected 9 per-unit + 6 archive-wide CHECKS rows, got: {names:?}"
+                16,
+                "expected 10 per-unit + 6 archive-wide CHECKS rows, got: {names:?}"
             );
 
             for &known in KNOWN_CHECK_NAMES {
@@ -4421,7 +4633,7 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(saw_per_unit, 9, "expected 9 PerUnit rows in CHECKS");
+            assert_eq!(saw_per_unit, 10, "expected 10 PerUnit rows in CHECKS");
         }
 
         /// Issue #105 / ADR-behaviour: a unit whose policy will not resolve
