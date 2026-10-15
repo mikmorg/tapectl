@@ -56,18 +56,21 @@ pub enum DriveCommands {
     /// Reads, and records nothing: the st driver's own status for the tape
     /// node (`MTIOCGET`, through a read-only `O_NONBLOCK` open, the open
     /// `mt status` makes) — empty or loaded, ready, the write-protect tab,
-    /// the position st holds, a cleaning request — then, when a cartridge is
-    /// loaded and ready, the drive's identity and the cartridge chip's MAM
-    /// (INQUIRY and READ ATTRIBUTE through the SCSI generic node), and the
-    /// catalog's record of that chip serial: the cartridge it names (barcode,
-    /// status, location) and the volumes it holds, or "unknown to this
-    /// catalog". Also names any tapectl command holding the drive or a
-    /// volume right now, with its pid and command where they can be learned.
+    /// the position st holds, a cleaning request. Whenever the node answers
+    /// it also reads the drive's identity (sysfs; an INQUIRY through the
+    /// SCSI generic node only if sysfs has no serial). Only when a cartridge
+    /// is loaded and ready does it read the cartridge chip's MAM (READ
+    /// ATTRIBUTE through the SCSI generic node), and then the catalog's
+    /// record of that chip serial: the cartridge it names (barcode, status,
+    /// location) and the volumes it holds, or "unknown to this catalog".
+    /// Also names any tapectl command holding the drive or a volume right
+    /// now, with its pid and command where they can be learned.
     ///
     /// It never moves the tape: no rewind, no read of File 0, no space, no
-    /// load or eject, no MTSETBLK. It takes no lock and writes nothing to the
-    /// catalog — no contact, no log page, no journal row — so it is safe to
-    /// run while a write is in progress: a drive held by another tapectl
+    /// load or eject, no MTSETBLK; a rewinding node (`/dev/stN`, whose close
+    /// rewinds) is refused unopened. It takes no lock and writes nothing to
+    /// the catalog — no contact, no log page, no journal row — so it is safe
+    /// to run while a write is in progress: a drive held by another tapectl
     /// command, or whose tape node another process has open, is reported as
     /// such and gets no SCSI command at all. (Like `mt status`, its
     /// MTIOCGET clears the st driver's recovered-error count; the count it
@@ -77,8 +80,8 @@ pub enum DriveCommands {
     /// drive and a cartridge the catalog does not know are all answers. Exit
     /// 2: the tape node could not be read (no such drive, no permission) or
     /// no drive is configured; with `--json` the report is still printed,
-    /// with the reason in it. There is no exit 1 (it gives no health verdict;
-    /// `drive poll` does) and no exit 75 (it never waits for the catalog).
+    /// with the reason in it. There is no exit 1: it gives no health verdict
+    /// (`drive poll` does).
     ///
     /// With `--json` the whole of stdout is one JSON object; warnings go to
     /// stderr.
@@ -503,7 +506,7 @@ pub fn status(
         report.tape_node.probe = NodeProbe::SkippedDriveHeld;
         report.notes.push(
             "a tapectl command holds this drive: its tape node was not opened and nothing was \
-             sent to it. The catalog's record is below."
+             sent to it. The catalog's record, if it has one, is below."
                 .into(),
         );
     } else {
