@@ -2,11 +2,11 @@
 .el .ds Aq '
 .TH tapectl-drive 1  "tapectl-drive " 
 .SH NAME
-tapectl\-drive \- The drive itself: what is in it now (`drive status`), its health on a schedule (`drive poll`)
+tapectl\-drive \- The drive itself: what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`)
 .SH SYNOPSIS
 \fBtapectl drive\fR [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fIsubcommands\fR>
 .SH DESCRIPTION
-The drive itself: what is in it now (`drive status`), its health on a schedule (`drive poll`)
+The drive itself: what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`)
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -43,6 +43,15 @@ Read the drive\*(Aqs health pages (and the cartridge chip, when one is loaded) a
 .TP
 tapectl\-drive\-status(1)
 Show what is in the drive right now, without touching it or the tape
+.TP
+tapectl\-drive\-eject(1)
+Unload the cartridge from the drive, and tell the catalog it left
+.TP
+tapectl\-drive\-cleaned(1)
+Record that the drive was cleaned — a record, not an action
+.TP
+tapectl\-drive\-cleaning\-cartridge(1)
+Register the cleaning cartridges you use, so their uses are counted
 .TP
 tapectl\-drive\-help(1)
 Print this message or the help of the given subcommand(s)

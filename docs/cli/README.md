@@ -127,7 +127,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`report dirty`](report.md#tapectl-report-dirty) | Units with changes since last snapshot |
 | &nbsp;&nbsp;[`report pending`](report.md#tapectl-report-pending) | Staged data pending write |
 | &nbsp;&nbsp;[`report verify-status`](report.md#tapectl-report-verify-status) | Verification recency |
-| &nbsp;&nbsp;[`report health`](report.md#tapectl-report-health) | Drive error trends |
+| &nbsp;&nbsp;[`report health`](report.md#tapectl-report-health) | Drive error trends, and drive cleanings |
 | &nbsp;&nbsp;[`report cartridge-health`](report.md#tapectl-report-cartridge-health) | Every cartridge's health, worst first, and why |
 | &nbsp;&nbsp;[`report capacity`](report.md#tapectl-report-capacity) | Volume capacity utilization |
 | &nbsp;&nbsp;[`report age`](report.md#tapectl-report-age) | Snapshot age distribution |
@@ -144,9 +144,12 @@ Accepted by every command, before or after the subcommand.
 | [`quick-archive`](quick-archive.md) | Quick archive: create + stage + write in one flow |
 | [`backend`](backend.md) | Tape drive backends |
 | &nbsp;&nbsp;[`backend add`](backend.md#tapectl-backend-add) | Add an LTO tape drive to the config |
-| [`drive`](drive.md) | The drive itself: what is in it now (`drive status`), its health on a schedule (`drive poll`) |
+| [`drive`](drive.md) | The drive itself: what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`) |
 | &nbsp;&nbsp;[`drive poll`](drive.md#tapectl-drive-poll) | Read the drive's health pages (and the cartridge chip, when one is loaded) and record them — read-only, through the SCSI generic node only |
 | &nbsp;&nbsp;[`drive status`](drive.md#tapectl-drive-status) | Show what is in the drive right now, without touching it or the tape |
+| &nbsp;&nbsp;[`drive eject`](drive.md#tapectl-drive-eject) | Unload the cartridge from the drive, and tell the catalog it left |
+| &nbsp;&nbsp;[`drive cleaned`](drive.md#tapectl-drive-cleaned) | Record that the drive was cleaned — a record, not an action |
+| &nbsp;&nbsp;[`drive cleaning-cartridge`](drive.md#tapectl-drive-cleaning-cartridge) | Register the cleaning cartridges you use, so their uses are counted |
 | [`db`](db.md) | Database operations |
 | &nbsp;&nbsp;[`db backup`](db.md#tapectl-db-backup) | Back up the database, and optionally the private key directory |
 | &nbsp;&nbsp;[`db fsck`](db.md#tapectl-db-fsck) | Check database integrity |

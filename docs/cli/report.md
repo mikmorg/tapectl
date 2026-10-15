@@ -19,7 +19,7 @@ tapectl report [OPTIONS] <COMMAND>
 - [`dirty`](#tapectl-report-dirty) — Units with changes since last snapshot
 - [`pending`](#tapectl-report-pending) — Staged data pending write
 - [`verify-status`](#tapectl-report-verify-status) — Verification recency
-- [`health`](#tapectl-report-health) — Drive error trends
+- [`health`](#tapectl-report-health) — Drive error trends, and drive cleanings
 - [`cartridge-health`](#tapectl-report-cartridge-health) — Every cartridge's health, worst first, and why
 - [`capacity`](#tapectl-report-capacity) — Volume capacity utilization
 - [`age`](#tapectl-report-age) — Snapshot age distribution
@@ -101,7 +101,7 @@ tapectl report verify-status [OPTIONS]
 
 ### tapectl report health
 
-Drive error trends
+Drive error trends, and drive cleanings
 
 ```text
 tapectl report health [OPTIONS]

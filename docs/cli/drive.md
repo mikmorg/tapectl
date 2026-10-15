@@ -4,7 +4,7 @@
 
 [All commands](README.md)
 
-The drive itself: what is in it now (`drive status`), its health on a schedule (`drive poll`)
+The drive itself: what is in it now (`drive status`), eject it (`drive eject`), its health on a schedule (`drive poll`), its cleanings (`drive cleaned`)
 
 ```text
 tapectl drive [OPTIONS] <COMMAND>
@@ -14,6 +14,9 @@ tapectl drive [OPTIONS] <COMMAND>
 
 - [`poll`](#tapectl-drive-poll) — Read the drive's health pages (and the cartridge chip, when one is loaded) and record them — read-only, through the SCSI generic node only
 - [`status`](#tapectl-drive-status) — Show what is in the drive right now, without touching it or the tape
+- [`eject`](#tapectl-drive-eject) — Unload the cartridge from the drive, and tell the catalog it left
+- [`cleaned`](#tapectl-drive-cleaned) — Record that the drive was cleaned — a record, not an action
+- [`cleaning-cartridge`](#tapectl-drive-cleaning-cartridge) — Register the cleaning cartridges you use, so their uses are counted
 
 ### tapectl drive poll
 
@@ -50,4 +53,79 @@ tapectl drive status [OPTIONS]
 **Options**
 
 - `--device <DEVICE>` — The drive to look at, by its tape node path as configured (`[[backends.lto]].device_tape`; a by-id link). Defaults to the only configured drive. A path no backend claims is looked at too, without the cartridge chip unless the kernel binds a SCSI generic node to it
+
+### tapectl drive eject
+
+Unload the cartridge from the drive, and tell the catalog it left
+
+Reads the cartridge chip's serial (READ ATTRIBUTE through the SCSI generic node; no motion), then rewinds and unloads the cartridge (`MTOFFL`, what `mt offline` sends) — and records it: one contact (`drive eject`) naming the cartridge and the drive, and one `ejected` event on the cartridge (on the drive when the chip is not registered). It changes nothing else: the cartridge's volumes stay bound to it (an ejected cartridge is on a shelf, not displaced), and its place stays what `cartridge move` last said. When the cartridge is going somewhere else, the output names the command.
+
+Refuses while any tapectl command holds the drive or a volume (a write, a verify, a restore, a poll): exit 75, naming the holder's pid and command, with nothing sent to the drive and nothing recorded. There is no `--force`. Once it has the drive it holds the drive's lock until it exits, so no command can start a tape operation mid-eject. The tape node being open in a process that is not tapectl is refused the same way (exit 75).
+
+Strict, like every command that moves a cartridge: the drive must be a configured backend (`tapectl backend add`), whose SCSI generic node is checked to be the same drive as its tape node. On a machine with no backend, `mt -f <device> offline` still works; the catalog is not told.
+
+Exit 0: unloaded and recorded, or nothing to do because the drive was already empty (no contact, no event: no cartridge was in the drive). Exit 75: refused, a tapectl command or another process has the drive. Exit 2: not unloaded — the tape node could not be read, a cartridge is present and the drive is not ready (loading, or faulted), or the unload failed (the contact is recorded as failed; there is no event). A catalog that cannot record the event after a good unload is a warning, not a failure.
+
+`--dry-run` does everything up to the unload: it checks for a holder, reads the node and the chip, and reports what it would eject; it takes no lock, sends no unload and records nothing. With `--json` the whole of stdout is one JSON object.
+
+```text
+tapectl drive eject [OPTIONS]
+```
+
+**Options**
+
+- `--device <DEVICE>` — The drive to eject from, by its tape node path as configured (`[[backends.lto]].device_tape`; a by-id link). Defaults to the only configured drive
+
+### tapectl drive cleaned
+
+Record that the drive was cleaned — a record, not an action
+
+tapectl drives no changer and never loads a cartridge, so cleaning is you inserting a cleaning cartridge when the drive asks for one (`drive status` shows "asks to be CLEANED"; `drive poll` reports the cleaning TapeAlert flag). This command writes down that it happened: one `cleaned` event on the drive, and, when a registered cleaning cartridge did it, one use of that cartridge. `report health` shows each drive's last cleaning and each cleaning cartridge's recorded uses against its rated life.
+
+Which cleaning cartridge: `--cartridge SERIAL`, or, without it, the one in the drive if its chip names a registered cleaning cartridge (read through the SCSI generic node; nothing moves, and nothing is sent while a tapectl command holds the drive). With neither, the cleaning is recorded against the drive alone and no cartridge's use is counted. Register a cleaning cartridge first with `drive cleaning-cartridge add`.
+
+Exit 0: recorded. Exit 1: recorded, and the cleaning cartridge is at or past its rated life (a spent cartridge does not clean; replace it). A cartridge near its rated life is a warning with exit 0. Exit 2: not recorded — the drive gave no serial to record against, or the named cartridge is not registered.
+
+`--dry-run` reports what would be recorded and records nothing. With `--json` the whole of stdout is one JSON object.
+
+```text
+tapectl drive cleaned [OPTIONS]
+```
+
+**Options**
+
+- `--cartridge <CARTRIDGE>` — The cleaning cartridge used, by the serial it was registered under (`drive cleaning-cartridge add`)
+- `--device <DEVICE>` — The drive that was cleaned, by its tape node path as configured (`[[backends.lto]].device_tape`; a by-id link). Defaults to the only configured drive
+
+### tapectl drive cleaning-cartridge
+
+Register the cleaning cartridges you use, so their uses are counted
+
+```text
+tapectl drive cleaning-cartridge [OPTIONS] <COMMAND>
+```
+
+**Subcommands**
+
+- [`add`](#tapectl-drive-cleaning-cartridge-add) — Register a cleaning cartridge
+
+#### tapectl drive cleaning-cartridge add
+
+Register a cleaning cartridge
+
+SERIAL is the serial the cartridge's chip reports (`drive status` shows it while the cartridge is loaded) or, when its chip cannot be read, any label that tells it apart; `drive cleaned --cartridge` names it the same way. LTO Ultrium universal cleaning cartridges are rated for 50 cleanings, which is the default; `--rated-uses` says otherwise for a cartridge that carries another rating. A serial can be registered once.
+
+`--dry-run` reports what would be registered and registers nothing.
+
+```text
+tapectl drive cleaning-cartridge add [OPTIONS] <SERIAL>
+```
+
+**Arguments**
+
+- `<SERIAL>` — The cleaning cartridge's serial
+
+**Options**
+
+- `--rated-uses <RATED_USES>` *(default: `50`)* — How many cleanings the cartridge is rated for
 

@@ -1,0 +1,52 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-drive-cleaned 1  "tapectl-drive-cleaned " 
+.SH NAME
+tapectl\-drive\-cleaned \- Record that the drive was cleaned — a record, not an action
+.SH SYNOPSIS
+\fBtapectl drive cleaned\fR [\fB\-\-cartridge\fR] [\fB\-\-json\fR] [\fB\-\-device\fR] [\fB\-\-dry\-run\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+.SH DESCRIPTION
+Record that the drive was cleaned — a record, not an action
+.PP
+tapectl drives no changer and never loads a cartridge, so cleaning is you inserting a cleaning cartridge when the drive asks for one (`drive status` shows "asks to be CLEANED"; `drive poll` reports the cleaning TapeAlert flag). This command writes down that it happened: one `cleaned` event on the drive, and, when a registered cleaning cartridge did it, one use of that cartridge. `report health` shows each drive\*(Aqs last cleaning and each cleaning cartridge\*(Aqs recorded uses against its rated life.
+.PP
+Which cleaning cartridge: `\-\-cartridge SERIAL`, or, without it, the one in the drive if its chip names a registered cleaning cartridge (read through the SCSI generic node; nothing moves, and nothing is sent while a tapectl command holds the drive). With neither, the cleaning is recorded against the drive alone and no cartridge\*(Aqs use is counted. Register a cleaning cartridge first with `drive cleaning\-cartridge add`.
+.PP
+Exit 0: recorded. Exit 1: recorded, and the cleaning cartridge is at or past its rated life (a spent cartridge does not clean; replace it). A cartridge near its rated life is a warning with exit 0. Exit 2: not recorded — the drive gave no serial to record against, or the named cartridge is not registered.
+.PP
+`\-\-dry\-run` reports what would be recorded and records nothing. With `\-\-json` the whole of stdout is one JSON object.
+.SH OPTIONS
+.TP
+\fB\-\-cartridge\fR \fI<CARTRIDGE>\fR
+The cleaning cartridge used, by the serial it was registered under (`drive cleaning\-cartridge add`)
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+The drive that was cleaned, by its tape node path as configured (`[[backends.lto]].device_tape`; a by\-id link). Defaults to the only configured drive
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
