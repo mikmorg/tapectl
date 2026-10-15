@@ -31,6 +31,17 @@
 //! one read of a page per contact, so there is no before-the-readback
 //! reading to subtract.
 //!
+//! **That scope is an assumption, so it is checked** (issue #467; ADR-0012
+//! 2026-10-07 item 6 left "the drive clears page 0x03 at load" to be
+//! confirmed on home2). Each recorded point carries the verify's OWN byte
+//! count (`verify_bytes`) beside the page's `bytes_processed`, and is marked
+//! `scope_unknown` when the page counted more than [`SCOPE_FACTOR`] times
+//! what the verify read: the page then covers reads this verify did not make
+//! (an earlier restore in the same load, or a drive that does not clear at
+//! load), and a rate over it is not this verify's. A scope-unknown point is
+//! shown, marked, and never judged ([`CartridgeTrend::rising`] skips it).
+//! Item 6's check is now a query over the events' details.
+//!
 //! **What is flagged.** No health formula (ADR-0012 items 11-12: thresholds
 //! come from home2's data). One provisional, configurable factor
 //! (`[health] read_error_rise_factor`, default [`DEFAULT_RISE_FACTOR`]): a
@@ -74,6 +85,37 @@ pub const RISE_FLOOR_PER_GIB: f64 = 1.0;
 pub const OUT_OF_SERVICE_CARTRIDGE: &[&str] = &["retired_permanent", "pending_erase"];
 
 const GIB: f64 = (1u64 << 30) as f64;
+
+/// A page 0x03 that counted more than this many times the bytes the verify
+/// itself read is of unknown scope (issue #467): it includes reads the verify
+/// did not make. Twice, because the verify also reads the metadata files
+/// (File 0, the front index, the envelopes) that its slice bytes leave out —
+/// a few MB against a slice total of gigabytes.
+pub const SCOPE_FACTOR: i64 = 2;
+
+/// What the verify read, as far as the catalog knows it: the volume's
+/// slice bytes (`volumes.bytes_written`, tape-padded — a full readback reads
+/// every slice). `None` when it is not recorded: a rebuilt volume leaves it
+/// 0 on purpose, and a rate cannot be called out of scope against nothing.
+///
+/// Derived here, from the session's volume, because the caller
+/// (`volume::write`) passes the session and the volume and not a byte count.
+fn verify_bytes(conn: &Connection, volume_id: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT bytes_written FROM volumes WHERE id = ?1",
+        [volume_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .filter(|b| *b > 0)
+}
+
+/// Whether the page counted far more than the verify read.
+pub fn scope_unknown(page_bytes: i64, verify_bytes: Option<i64>) -> bool {
+    verify_bytes.is_some_and(|v| page_bytes > v.saturating_mul(SCOPE_FACTOR))
+}
 
 /// Page 0x03's counters, as one verify's sweep read them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -185,6 +227,7 @@ pub fn record_for_verify(
         .ok()
         .flatten()
         .unwrap_or((None, None));
+    let verify_bytes = verify_bytes(conn, volume_id);
     let details = serde_json::json!({
         "session_id": session_id,
         "tier": match tier {
@@ -195,6 +238,8 @@ pub fn record_for_verify(
         "cartridge_id": cartridge_id,
         "drive_serial": drive_serial,
         "bytes_processed": errors.bytes_processed,
+        "verify_bytes": verify_bytes,
+        "scope_unknown": scope_unknown(errors.bytes_processed, verify_bytes),
         "corrected": errors.corrected(),
         "corrected_no_delay": errors.corrected_no_delay,
         "corrected_with_delay": errors.corrected_with_delay,
@@ -237,6 +282,10 @@ pub struct TrendPoint {
     pub corrected: i64,
     pub uncorrected: i64,
     pub corrected_per_gib: Option<f64>,
+    /// The page counted far more than the verify read ([`scope_unknown`]):
+    /// the rate is shown, marked, and never judged. `false` for a point
+    /// recorded before the verify's own count was kept.
+    pub scope_unknown: bool,
 }
 
 /// One cartridge's verifies, oldest first.
@@ -262,8 +311,17 @@ impl CartridgeTrend {
     /// of 0 rising to anything above 0 is a rise past any factor, so the
     /// floor is what keeps a first non-zero reading after zero from being an
     /// alarm.
+    ///
+    /// Points of unknown scope ([`TrendPoint::scope_unknown`]) are skipped:
+    /// their page counted reads the verify did not make, so a rate over them
+    /// is no sample of this cartridge's verify.
     pub fn rising(&self, factor: f64) -> Option<Rise> {
-        let mut rated = self.points.iter().filter_map(|p| p.corrected_per_gib).rev();
+        let mut rated = self
+            .points
+            .iter()
+            .filter(|p| !p.scope_unknown)
+            .filter_map(|p| p.corrected_per_gib)
+            .rev();
         let newest = rated.next()?;
         let previous = rated.next()?;
         (newest > previous * factor && newest > RISE_FLOOR_PER_GIB)
@@ -277,7 +335,7 @@ impl CartridgeTrend {
             .iter()
             .map(|p| {
                 p.corrected_per_gib
-                    .map(|r| format!("{r:.3}"))
+                    .map(|r| format!("{r:.3}{}", if p.scope_unknown { "?" } else { "" }))
                     .unwrap_or_else(|| "-".into())
             })
             .collect();
@@ -286,8 +344,13 @@ impl CartridgeTrend {
             .iter()
             .map(|p| p.uncorrected.to_string())
             .collect();
+        let marked = if self.points.iter().any(|p| p.scope_unknown) {
+            "; ? = the page counted more than twice what the verify read, so it is not compared"
+        } else {
+            ""
+        };
         format!(
-            "{} corrected/GiB over {} verif{} (uncorrected {})",
+            "{} corrected/GiB over {} verif{} (uncorrected {}{marked})",
             rates.join(" -> "),
             self.points.len(),
             if self.points.len() == 1 { "y" } else { "ies" },
@@ -355,6 +418,7 @@ pub fn trends(conn: &Connection) -> Result<Vec<CartridgeTrend>> {
             corrected: d["corrected"].as_i64().unwrap_or(0),
             uncorrected: d["uncorrected"].as_i64().unwrap_or(0),
             corrected_per_gib: d["corrected_per_gib"].as_f64(),
+            scope_unknown: d["scope_unknown"].as_bool().unwrap_or(false),
             volume: volume.clone(),
         };
         let key = barcode.unwrap_or_else(|| format!("volume:{volume}"));
@@ -512,6 +576,7 @@ pub(crate) mod tests {
                     corrected: 0,
                     uncorrected: 0,
                     corrected_per_gib: *r,
+                    scope_unknown: false,
                 })
                 .collect(),
         }
@@ -560,6 +625,86 @@ pub(crate) mod tests {
             trend(&[Some(1.0), Some(2.1), None]).render(),
             "1.000 -> 2.100 -> - corrected/GiB over 3 verifies (uncorrected 0, 0, 0)"
         );
+    }
+
+    #[test]
+    fn scope_is_unknown_past_twice_what_the_verify_read() {
+        assert!(!scope_unknown(2_000, Some(1_000)), "twice is within");
+        assert!(scope_unknown(2_001, Some(1_000)), "past twice is out");
+        assert!(
+            !scope_unknown(500, Some(1_000)),
+            "less is the drive clearing"
+        );
+        assert!(
+            !scope_unknown(1 << 40, None),
+            "no recorded byte count, no falsifier: unknown is not 'unknown scope'"
+        );
+    }
+
+    /// Issue #467: the verify's own byte count is recorded beside the page's,
+    /// and a point whose page counted far more than the verify read is
+    /// marked, shown with a `?`, and never judged — here a 9/GiB reading
+    /// over a page that covered four times the verify would be a rise past
+    /// any factor if compared. The same sequence with the page matching the
+    /// verify IS a rise (the positive control).
+    #[test]
+    fn a_point_of_unknown_scope_is_recorded_marked_and_not_compared() {
+        let gib = 1i64 << 30;
+        for (third_bytes_written, flagged) in [(gib, false), (gib / 4, true)] {
+            let conn = crate::db::open_memory().unwrap();
+            seed_verifies(&conn, "C-S", &[1, 1]);
+            let (cart, vol): (i64, i64) = conn
+                .query_row(
+                    "SELECT c.id, v.id FROM cartridges c, volumes v
+                      WHERE c.barcode = 'C-S' AND v.label = 'V-C-S'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            // The first two were recorded before this volume's byte count
+            // was set: nothing to call them out of scope against.
+            conn.execute(
+                "UPDATE volumes SET bytes_written = ?1 WHERE id = ?2",
+                params![third_bytes_written, vol],
+            )
+            .unwrap();
+            seed_one_verify(&conn, Some(cart), vol, 9, Tier::Integrity);
+
+            let details: Vec<serde_json::Value> = conn
+                .prepare("SELECT details FROM events WHERE action = ?1 ORDER BY id")
+                .unwrap()
+                .query_map([EVENT_ACTION], |r| {
+                    Ok(serde_json::from_str(&r.get::<_, String>(0)?).unwrap())
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(details.len(), 3);
+            assert_eq!(details[2]["bytes_processed"], gib);
+            assert_eq!(details[2]["verify_bytes"], third_bytes_written);
+            assert_eq!(details[2]["scope_unknown"], flagged);
+            assert_eq!(details[0]["verify_bytes"], serde_json::Value::Null);
+            assert_eq!(details[0]["scope_unknown"], false);
+
+            let t = trends(&conn).unwrap();
+            assert_eq!(t[0].points[2].scope_unknown, flagged);
+            if flagged {
+                assert_eq!(
+                    t[0].rising(DEFAULT_RISE_FACTOR),
+                    None,
+                    "the unknown-scope reading is skipped, leaving 1.0 -> 1.0"
+                );
+                let line = t[0].render();
+                assert!(line.contains("9.000?"), "{line}");
+                assert!(line.contains("not compared"), "{line}");
+            } else {
+                assert!(
+                    t[0].rising(DEFAULT_RISE_FACTOR).is_some(),
+                    "positive control: the same readings in scope are a rise"
+                );
+                assert!(!t[0].render().contains('?'));
+            }
+        }
     }
 
     fn trend_keys(conn: &Connection) -> Vec<String> {
