@@ -16,12 +16,12 @@
 //! unit-tested; the mhvtl e2e suite is what actually drives a device, and
 //! this workspace's guardrails forbid touching tape devices from here).
 
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 
 use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
-use crate::policy::coverage::{copy_count_expr, CoverageQuery};
 use crate::staging::clean::CleanReport;
+pub use crate::staging::release::CopyProgress;
 
 use super::selector::Batch;
 
@@ -53,16 +53,6 @@ impl RunConfirm {
     }
 }
 
-/// One batch unit's copy count against its own resolved `min_copies`,
-/// computed AFTER this call's write(s) landed. Only populated when release
-/// did NOT happen (see [`BatchExecutionReport::cleaned`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopyProgress {
-    pub unit_name: String,
-    pub copies: i64,
-    pub min_copies: i64,
-}
-
 /// Outcome of executing one batch.
 #[derive(Debug)]
 pub struct BatchExecutionReport {
@@ -76,7 +66,7 @@ pub struct BatchExecutionReport {
     pub copies_written: usize,
     /// `Some` when staging was released this call (every unit in the batch
     /// now meets its own resolved `min_copies`); `None` when it was
-    /// deliberately retained — see [`under_copied_units`].
+    /// deliberately retained — see [`crate::staging::release`].
     pub cleaned: Option<CleanReport>,
     /// Non-empty exactly when `cleaned` is `None`: which units are still
     /// short, and by how much.
@@ -114,8 +104,8 @@ pub struct BatchExecutionReport {
 /// Release (the last step) calls the existing GC guard
 /// (`staging::clean::clean_staging`, non-force) — but **only when every unit
 /// in this batch already has enough eligible copies to satisfy its own
-/// resolved `min_copies`** ([`under_copied_units`]). This gate did not
-/// exist before issue #229 and its absence was a real defect, not a
+/// resolved `min_copies`** ([`crate::staging::release::release_if_covered`]).
+/// This gate did not exist before issue #229 and its absence was a real defect, not a
 /// theoretical one: `copy_labels` is now always exactly one label (`collection
 /// run` refuses more, `docs/adr/0012-...md`'s 2026-09-17 amendment), so this
 /// function writes ONE copy and returns. `clean_staging`'s non-force guard
@@ -137,7 +127,7 @@ pub struct BatchExecutionReport {
 /// WHOLE database the instant this batch's own gate passed — including a
 /// different batch's unit that is still below its own `min_copies`. A
 /// still-short batch retains ALL of its own staging (not merely the short
-/// units'), by design — see [`under_copied_units`].
+/// units'), by design — see [`crate::staging::release`].
 ///
 /// The gate-and-release decision itself lives in [`release_if_covered`]
 /// (extracted from this function, issue #284): `volume_write` above has no
@@ -352,94 +342,24 @@ fn release_after_copies(
 /// device-bound write loop ahead of it — `volume::write::volume_write` has
 /// no store injection (see its own doc comment) and so cannot complete
 /// without a real tape drive, which this workspace's guardrails forbid.
-/// Before this extraction, a regression test for the #248 scoping below
-/// hand-copied this tail instead of calling it — meaning a revert of the
-/// scope back to `CleanScope::Whole` would have gone undetected, since the
-/// test exercised its own copy of the logic, not this one. This is now the
-/// only copy.
+/// Before this extraction, a regression test for the #248 scoping hand-copied
+/// this tail instead of calling it, so a revert of the scope back to
+/// `CleanScope::Whole` would have gone undetected.
 ///
-/// Releases the batch's staging only when this batch's copy just sealed is
-/// enough: every unit in it must now meet its own resolved `min_copies`
-/// (issue #229's second half — see [`execute_batch`]'s doc comment and
-/// [`under_copied_units`] for why `clean_staging`'s own guard cannot tell
-/// this on its own).
-///
-/// Issue #248: `clean_staging`'s own eligibility SQL has no batch/unit
-/// predicate at all — passing `CleanScope::Whole` here (as the CLI's
-/// `staging clean` still does) would release EVERY eligible `'staged'`
-/// stage_set in the database the moment this batch's gate above passed,
-/// including a different batch's unit that is still below its own
-/// min_copies. `CleanScope::Units(&this_batch_unit_ids)` narrows the
-/// release to exactly this batch, matching the gate it sits behind — the
-/// batch's blast radius stays equal to its own scope, per this module's
-/// doc comment.
+/// The rule itself — release only when every unit now meets its own resolved
+/// `min_copies`, scoped to exactly those units (issues #229, #248) — lives in
+/// [`crate::staging::release::release_if_covered`] since issue #440, shared
+/// with `volume write` and `volume resume`; this only names the batch's units
+/// for it, in `batch.units` order. [`execute_batch`]'s doc comment says why
+/// the gate cannot be `clean_staging`'s own guard.
 fn release_if_covered(
     conn: &Connection,
     config: &Config,
     batch: &Batch,
 ) -> Result<(Option<CleanReport>, Vec<CopyProgress>)> {
-    let under_copied = under_copied_units(conn, config, batch)?;
-    let cleaned = if under_copied.is_empty() {
-        let unit_ids = batch_unit_ids(conn, batch)?;
-        Some(crate::staging::clean::clean_staging(
-            conn,
-            config,
-            false,
-            crate::staging::clean::CleanScope::Units(&unit_ids),
-        )?)
-    } else {
-        None
-    };
-    Ok((cleaned, under_copied))
-}
-
-/// Which of this batch's units still have fewer eligible copies than their
-/// own resolved `min_copies`, computed AFTER the write loop above landed.
-///
-/// Routed through `policy::coverage::copy_count_expr` — the declared sole
-/// owner of "how many copies does this unit have" (issue #96's derivation-
-/// discipline rule) — with the exact same call shape
-/// `collection::status::status_for_collection` already uses for its
-/// `under_copied` count, so the two surfaces cannot silently disagree about
-/// what "under-copied" means. `CoverageQuery::current_unit` compares the
-/// unit's CURRENT snapshot(s) against eligible (`sealed`) volumes; the write
-/// loop above promotes the snapshot this batch just wrote to `'current'` and
-/// its volume to `'sealed'` at seal/confirm time (`volume::session`), so a
-/// unit whose one-and-only copy this call just wrote is correctly counted
-/// here, not missed.
-fn under_copied_units(
-    conn: &Connection,
-    config: &Config,
-    batch: &Batch,
-) -> Result<Vec<CopyProgress>> {
-    let mut under = Vec::new();
-    for u in &batch.units {
-        let unit = crate::db::queries::get_unit_by_name(conn, &u.name)?.ok_or_else(|| {
-            TapectlError::Other(format!(
-                "execute_batch: unit \"{}\" is missing from the catalog right after its \
-                 own batch wrote it — the catalog is inconsistent",
-                u.name
-            ))
-        })?;
-        let resolved = crate::policy::resolve(conn, config, &unit)?;
-        let sql = format!(
-            "SELECT {}",
-            copy_count_expr(&CoverageQuery::current_unit("?1"))
-        );
-        let copies: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
-        // The floor `staging clean`'s retention gate also asks: the one
-        // tape-only rule (ADR-0012 2026-10-12 item 43).
-        let min_copies =
-            crate::policy::coverage::copy_floor(config, resolved.min_copies, &unit.status);
-        if copies < min_copies {
-            under.push(CopyProgress {
-                unit_name: u.name.clone(),
-                copies,
-                min_copies,
-            });
-        }
-    }
-    Ok(under)
+    let unit_ids = batch_unit_ids(conn, batch)?;
+    let outcome = crate::staging::release::release_if_covered(conn, config, &unit_ids)?;
+    Ok((outcome.cleaned, outcome.under_copied))
 }
 
 /// This batch's own unit ids, in `batch.units` order — the `CleanScope::
@@ -449,11 +369,9 @@ fn under_copied_units(
 ///
 /// This is a lookup, not a decision: it says which stage_sets
 /// `clean_staging` is allowed to consider, never whether any of them may
-/// actually be released — that call is [`under_copied_units`], made
-/// separately, immediately before this one runs (see `execute_batch`'s own
-/// call site). Keeping the two as distinct calls, rather than folding unit
-/// ids into `CopyProgress`, avoids growing that already-public,
-/// CLI-displayed struct with a field only this internal wiring needs.
+/// actually be released — that call is
+/// [`crate::staging::release::under_copied_units`], made on the same ids
+/// by [`release_if_covered`] immediately before the release.
 fn batch_unit_ids(conn: &Connection, batch: &Batch) -> Result<Vec<i64>> {
     let mut ids = Vec::with_capacity(batch.units.len());
     for u in &batch.units {
@@ -473,6 +391,18 @@ fn batch_unit_ids(conn: &Connection, batch: &Batch) -> Result<Vec<i64>> {
 mod tests {
     use super::*;
     use crate::collection::selector::PendingUnit;
+
+    /// The batch's units judged against their own `min_copies` — the shared
+    /// derivation ([`crate::staging::release::under_copied_units`]) over the
+    /// batch's unit ids, which is what `release_if_covered` asks.
+    fn under_copied_units(
+        conn: &Connection,
+        config: &Config,
+        batch: &Batch,
+    ) -> Result<Vec<CopyProgress>> {
+        let unit_ids = batch_unit_ids(conn, batch)?;
+        crate::staging::release::under_copied_units(conn, config, &unit_ids)
+    }
 
     /// ADR-0012 2026-10-07 item 33: a catalog error releasing staging after
     /// the copies are sealed comes back as a warning naming the step and
@@ -1054,7 +984,12 @@ mod tests {
         // that calls `release_if_covered`.
         assert!(
             body.contains("release_after_copies(")
-                && SRC.contains("    match release_if_covered(conn, config, batch) {"),
+                && SRC.contains("    match release_if_covered(conn, config, batch) {")
+                // Issue #440: and that one is the shared rule `volume write`
+                // and `volume resume` use, not a copy of it.
+                && SRC.contains(
+                    "crate::staging::release::release_if_covered(conn, config, &unit_ids)?"
+                ),
             "execute_batch no longer delegates its release step to release_if_covered \
              -- the #248 scope decision must live in exactly one place (issue #284)"
         );

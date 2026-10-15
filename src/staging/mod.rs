@@ -4,6 +4,7 @@ pub mod exclude;
 mod files;
 pub mod jobs;
 pub mod lock;
+pub mod release;
 #[cfg(test)]
 mod plaintext_audit;
 pub mod validate;
