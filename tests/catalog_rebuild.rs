@@ -182,6 +182,24 @@ fn link_and_special(unit_name: &str) -> Vec<db::files::FileEntry> {
 }
 
 thread_local! {
+    /// When set, the fixture's first tenant (`alpha` in [`UNITS`]) is named
+    /// this, and the operator's own tenant row is named `opadmin`: a catalog
+    /// whose operator is not called `operator`, with a REAL tenant that is
+    /// (issue #459 item 2).
+    static ALPHA_TENANT_NAME: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`build_sealed_volume_with`], with `alpha` named `operator` — the name
+/// the operator envelope's manifest carries as its placeholder tenant.
+fn build_sealed_volume_with_a_tenant_named_operator(catalog_db: CatalogDb) -> SealedVolume {
+    ALPHA_TENANT_NAME.with(|n| n.set(Some("operator")));
+    let vol = build_sealed_volume_with(catalog_db);
+    ALPHA_TENANT_NAME.with(|n| n.set(None));
+    vol
+}
+
+thread_local! {
     /// SQL [`build_sealed_volume_editing_catalog_db`] runs against the
     /// `catalog.db` before it goes into the operator envelope: a stand-in for
     /// a value an older tapectl wrote that today's catalog cannot hold.
@@ -293,8 +311,14 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
     let db_dir = tempfile::tempdir().unwrap();
     let conn = db::open(&db_dir.path().join("src.db")).unwrap();
 
-    let operator = insert_tenant_keyed(&conn, "operator", true, copy_keypair(&keys.operator));
-    let alpha = insert_tenant_keyed(&conn, "alpha", false, copy_keypair(&keys.alpha));
+    let alpha_name = ALPHA_TENANT_NAME.with(|n| n.get()).unwrap_or("alpha");
+    let operator_name = if alpha_name == "operator" {
+        "opadmin"
+    } else {
+        "operator"
+    };
+    let operator = insert_tenant_keyed(&conn, operator_name, true, copy_keypair(&keys.operator));
+    let alpha = insert_tenant_keyed(&conn, alpha_name, false, copy_keypair(&keys.alpha));
     let bravo = insert_tenant_keyed(&conn, "bravo", false, copy_keypair(&keys.bravo));
 
     conn.execute(
@@ -4378,4 +4402,94 @@ fn an_unsealed_tape_under_an_initialized_row_attaches_aborted_writes() {
     for (unit_name, _, _) in UNITS {
         assert_eq!(copies(&conn, unit_name), 0, "{unit_name}");
     }
+}
+
+// ── Issue #459 item 2: the operator envelope is found by what it is ──────
+//
+// The operator envelope's manifest files every unit under the placeholder
+// tenant "operator". A real tenant may be named that too (`validate_tenant_
+// name` accepts it; `operator_name_for_init` falls back to it), and tenant
+// envelopes come first on the tape, so identifying the operator envelope by
+// the manifest's tenant string picked that tenant's envelope and silently
+// dropped every other tenant's units.
+
+/// The front-index positions of the envelopes, in tape order, by kind.
+fn envelope_kinds(vol: &SealedVolume) -> Vec<String> {
+    let fi = String::from_utf8_lossy(&vol.store.files[3]).into_owned();
+    tapectl::volume::format::parse_front_index(&fi)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.type_label)
+        .filter(|l| l.contains("envelope"))
+        .collect()
+}
+
+fn tenant_of_unit(conn: &rusqlite::Connection, unit_name: &str) -> String {
+    conn.query_row(
+        "SELECT t.name FROM units u JOIN tenants t ON t.id = u.tenant_id WHERE u.name = ?1",
+        rusqlite::params![unit_name],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_tenant_named_operator_does_not_pass_for_the_operator_envelope() {
+    let mut vol = build_sealed_volume_with_a_tenant_named_operator(CatalogDb::New);
+    let kinds = envelope_kinds(&vol);
+    let first_tenant = kinds.iter().position(|k| k == "tenant_envelope").unwrap();
+    let operator = kinds.iter().position(|k| k == "operator_envelope").unwrap();
+    assert!(
+        first_tenant < operator,
+        "premise: a tenant envelope sorts before the operator's: {kinds:?}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert_eq!(
+        report.units,
+        UNITS.len(),
+        "every tenant's units are rebuilt, not just the one named `operator`"
+    );
+    assert!(
+        report.had_catalog_db,
+        "the catalog.db rides in the real operator envelope, not the tenant's"
+    );
+    for (unit_name, _, _) in UNITS {
+        assert_eq!(copies(&conn, unit_name), 1, "{unit_name}");
+    }
+    assert_eq!(tenant_of_unit(&conn, "photos/2019"), "operator");
+    assert_eq!(tenant_of_unit(&conn, "ledgers/fy24"), "bravo");
+}
+
+/// The same, where ownership can only come from the tenant envelopes (a
+/// catalog.db from before the 2026-09-11 ownership table): the real tenant
+/// named `operator` is still a tenant, and its units are filed under it.
+#[test]
+fn a_tenant_named_operator_still_owns_its_units_when_ownership_comes_from_envelopes() {
+    let mut vol = build_sealed_volume_with_a_tenant_named_operator(CatalogDb::Old);
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert!(
+        !report.tenants_from_catalog_db,
+        "premise: the catalog.db carries no ownership"
+    );
+    assert_eq!(report.units, UNITS.len());
+    assert!(
+        report.units_without_tenant_envelope.is_empty(),
+        "the tenant named `operator` has an envelope that names its units: {:?}",
+        report.units_without_tenant_envelope
+    );
+    assert_eq!(tenant_of_unit(&conn, "photos/2019"), "operator");
+    assert_eq!(tenant_of_unit(&conn, "photos/2020"), "operator");
+    assert_eq!(tenant_of_unit(&conn, "ledgers/fy24"), "bravo");
 }

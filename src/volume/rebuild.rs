@@ -607,16 +607,13 @@ fn rebuild_contacted(
         format::SealVerdict::Unsealed(why) => Some(why.clone()),
         _ => None,
     };
-    let operator = opened
-        .iter()
-        .find(|e| e.manifest.is_operator())
-        .ok_or_else(|| {
-            TapectlError::Other(
-                "no operator envelope could be opened on this tape — \
+    let operator = opened.iter().find(|e| e.is_operator()).ok_or_else(|| {
+        TapectlError::Other(
+            "no operator envelope could be opened on this tape — \
                  a rebuild needs the complete unit list it carries"
-                    .to_string(),
-            )
-        })?;
+                .to_string(),
+        )
+    })?;
 
     let mut report = RebuildReport {
         label: ident.label.clone(),
@@ -888,7 +885,10 @@ fn tenant_key_refusal_message() -> String {
          A tenant key restores that tenant's own data without a catalog at \
          all: run RESTORE.sh from tape file 2 —\n\n    \
          tapectl restore raw-volume --device DEV --to DIR --only restore_sh\n    \
-         bash DIR/{restore_sh} --restore --unit UNIT --key KEYFILE --to DIR\n\n\
+         bash DIR/{restore_sh} --restore --unit UNIT --key KEYFILE --to NEWDIR\n\n\
+         NEWDIR is a different directory from DIR: DIR now holds the dumped \
+         script, and RESTORE.sh refuses a --to that is not empty before it \
+         reads the tape. NEWDIR may be empty or not exist yet.\n\n\
          or, with no tapectl, as the tape's own guide (file 1) says:\n\n    \
          mt -f DEV rewind && mt -f DEV fsf 2\n    \
          dd if=DEV bs=512k | tr -d '\\0' > RESTORE.sh\n\n\
@@ -1002,7 +1002,7 @@ fn open_all_envelopes(
         return Err(TapectlError::Other(msg));
     }
 
-    if operator_refused && !out.iter().any(|e| e.manifest.is_operator()) {
+    if operator_refused && !out.iter().any(|e| e.is_operator()) {
         return Err(TapectlError::Other(tenant_key_refusal_message()));
     }
 
@@ -1020,7 +1020,9 @@ fn open_all_envelopes(
 fn tenant_index(opened: &[OpenedEnvelope], supplement: &Supplement) -> HashMap<String, String> {
     let mut map = supplement.tenant_of.clone();
     for env in opened {
-        if env.manifest.is_operator() {
+        // By the envelope's kind, not its manifest's tenant string (#459): a
+        // real tenant named `operator` owns its units like any other.
+        if env.is_operator() {
             continue;
         }
         for unit in &env.manifest.units {
@@ -2798,6 +2800,48 @@ mod tests {
             crate::volume::raw::RAW_TYPES.contains(&label),
             "--only accepts the label the recipe names"
         );
+    }
+
+    /// Issue #459 item 1: the recipe's second command restored into the
+    /// directory its first had dumped RESTORE.sh into, and RESTORE.sh's
+    /// `check_destination` (#405) refuses a `--to` that is not empty before
+    /// it reads the tape — so the heir's recipe failed at its second step.
+    /// The two commands are parsed out of the message, so rewording it cannot
+    /// quietly bring the collision back.
+    #[test]
+    fn the_tenant_key_recipe_restores_into_a_different_directory_than_it_dumped_into() {
+        let msg = super::tenant_key_refusal_message();
+        let line = |starts: &str| -> String {
+            msg.lines()
+                .map(str::trim)
+                .find(|l| l.starts_with(starts))
+                .unwrap_or_else(|| panic!("no `{starts}` command in: {msg}"))
+                .to_string()
+        };
+        let arg_after = |cmd: &str, flag: &str| -> String {
+            let mut words = cmd.split_whitespace();
+            words
+                .find(|w| *w == flag)
+                .unwrap_or_else(|| panic!("{cmd}: no {flag}"));
+            words
+                .next()
+                .unwrap_or_else(|| panic!("{cmd}: {flag} has no value"))
+                .to_string()
+        };
+        let dump = line("tapectl restore raw-volume");
+        let restore = line("bash ");
+        let dumped_into = arg_after(&dump, "--to");
+        let restored_into = arg_after(&restore, "--to");
+        assert_ne!(
+            dumped_into, restored_into,
+            "RESTORE.sh refuses a non-empty --to; the script sits in the dump directory:\n{msg}"
+        );
+        // The script the second command runs lives in the first's directory,
+        // so the destination is not the directory that holds it.
+        let script = restore.split_whitespace().nth(1).unwrap();
+        let script_dir = std::path::Path::new(script).parent().unwrap();
+        assert_eq!(script_dir, std::path::Path::new(&dumped_into));
+        assert_ne!(std::path::Path::new(&restored_into), script_dir);
     }
 
     #[test]

@@ -87,12 +87,6 @@ struct ManifestDoc {
 }
 
 impl Manifest {
-    /// True for the operator envelope and its backup, which carry every
-    /// unit on the volume under the placeholder tenant `"operator"`.
-    pub fn is_operator(&self) -> bool {
-        self.tenant == "operator"
-    }
-
     /// Render as the on-tape `MANIFEST.toml` bytes.
     ///
     /// Hand-formatted, not `toml::to_string`: a generic TOML serializer
@@ -253,20 +247,5 @@ mod tests {
         let parsed = Manifest::from_toml(&m.to_toml()).unwrap();
         assert_eq!(parsed, m);
         assert!(parsed.units.is_empty());
-    }
-
-    /// (d) The operator envelope and its backup are recognised by the
-    /// placeholder tenant `"operator"`; anything else is not.
-    #[test]
-    fn is_operator_checks_the_placeholder_tenant() {
-        let mut m = Manifest {
-            volume: "VOL001".to_string(),
-            tenant: "alpha".to_string(),
-            created_at: "2026-09-11T00:00:00+00:00".to_string(),
-            units: vec![],
-        };
-        assert!(!m.is_operator());
-        m.tenant = "operator".to_string();
-        assert!(m.is_operator());
     }
 }

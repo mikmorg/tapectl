@@ -394,8 +394,31 @@ fn location_rows_to_json(rows: &[LocationRow]) -> serde_json::Value {
     serde_json::to_value(rows).unwrap()
 }
 
+/// The directory `catalog rebuild` decrypts the envelopes into (issue #459
+/// item 3): a fresh 0700 directory under `<home>/tmp`, removed when the
+/// returned value drops — on success, on every error and on a panic.
+///
+/// What lands there is plaintext: each envelope's `MANIFEST.toml` (unit
+/// names) and the operator's `catalog.db`, which lists every tenant's file
+/// paths and names. It used to be a `tapectl-rebuild-<pid>` directory in the
+/// system temp directory, a world-listable `/tmp` whose directory and files
+/// were made at the umask; ADR-0012 2026-10-06 item 6 keeps file names on
+/// the encrypted home device, and the write path already builds its own
+/// `catalog.db` the same way ([`crate::staging::home_work_dir`]).
+///
+/// `tempfile` makes the directory at the umask, so it is set to 0700 here
+/// too (best-effort, as the parent's is): the files inside are created at
+/// the umask by the envelope reader, and the directory is what keeps them
+/// from anyone else.
+fn rebuild_scratch(paths: &crate::config::TapectlPaths) -> Result<tempfile::TempDir> {
+    let work = crate::staging::home_work_dir(paths, ".rebuild-")?;
+    crate::config::secure_path(work.path(), 0o700);
+    Ok(work)
+}
+
 pub fn run(
     conn: &Connection,
+    paths: &crate::config::TapectlPaths,
     config: &crate::config::Config,
     command: &CatalogCommands,
     json_output: bool,
@@ -576,8 +599,11 @@ pub fn run(
                 crate::tape::contact::Operation::CatalogRebuild,
             );
             reads.check_read_contact(config, &device)?;
-            let scratch =
-                std::env::temp_dir().join(format!("tapectl-rebuild-{}", std::process::id()));
+            // Removed when `work` drops, on every path out, success or
+            // failure, exactly as `RestoreScratch` does for decrypted slices
+            // (#102): it holds decrypted MANIFEST/catalog.db copies.
+            let work = rebuild_scratch(paths)?;
+            let scratch = work.path().to_path_buf();
             let report = crate::volume::rebuild::rebuild_from_volume(
                 conn,
                 config,
@@ -590,10 +616,7 @@ pub fn run(
                 &scratch,
                 &reads,
             );
-            // The scratch dir holds decrypted MANIFEST/catalog.db copies —
-            // remove it on every path out, success or failure, exactly as
-            // `RestoreScratch` does for decrypted slices (#102).
-            let _ = std::fs::remove_dir_all(&scratch);
+            drop(work);
             let report = report?;
 
             if json_output {
@@ -1228,6 +1251,45 @@ fn displacements_json(report: &crate::volume::rebuild::RebuildReport) -> serde_j
 
 #[cfg(test)]
 mod tests {
+    /// Issue #459 item 3: the rebuild's decrypted scratch is a 0700 directory
+    /// under `<home>/tmp`, which is itself 0700 and gone when the work ends.
+    #[test]
+    fn the_rebuild_scratch_is_a_private_directory_under_the_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::TapectlPaths::new(tmp.path().join(".tapectl"));
+        let work = super::rebuild_scratch(&paths).unwrap();
+
+        let home_tmp = paths.home.join("tmp");
+        assert_eq!(work.path().parent(), Some(home_tmp.as_path()));
+        assert_eq!(mode(work.path()), 0o700, "decrypted file names live here");
+        assert_eq!(mode(&home_tmp), 0o700);
+        let path = work.path().to_path_buf();
+        drop(work);
+        assert!(!path.exists(), "removed when the rebuild ends");
+    }
+
+    /// ... and the rebuild arm uses it: a source pin, because the arm needs a
+    /// drive to run. The old spelling is the pin's negative control.
+    #[test]
+    fn the_rebuild_arm_takes_its_scratch_from_the_home_not_the_system_temp_directory() {
+        const SRC: &str = include_str!("catalog.rs");
+        let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(
+            prod.len() < SRC.len(),
+            "positive control: production half separated"
+        );
+        assert!(
+            prod.contains("rebuild_scratch(paths)?"),
+            "the arm calls the helper"
+        );
+        assert!(
+            !prod.contains("temp_dir()"),
+            "a decrypted catalog.db goes under <home>/tmp, never the system temp directory"
+        );
+    }
+
     /// Issue #458: a tape with no valid seal is said to be unsealed and not a
     /// copy, with what to do with the cartridge; a sealed one says nothing.
     /// The advice that applies to a lost write the catalog can adopt

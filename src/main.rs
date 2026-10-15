@@ -564,7 +564,7 @@ fn run(
             cli::restore::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Catalog { ref command } => {
-            cli::catalog::run(&conn, &cfg, command, cli.json, cli.dry_run)?;
+            cli::catalog::run(&conn, &paths, &cfg, command, cli.json, cli.dry_run)?;
         }
         Commands::Location { ref command } => {
             cli::location::run(&conn, command, cli.json, cli.dry_run)?;

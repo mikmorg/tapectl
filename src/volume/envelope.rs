@@ -42,6 +42,10 @@ pub struct ManifestHeader {
     /// Tenant name — the real tenant for a tenant envelope, and the literal
     /// `"operator"` for the operator envelope and its backup, which list
     /// every unit across all tenants rather than belonging to one.
+    ///
+    /// **Not a test of which envelope this is** (issue #459): a real tenant
+    /// may be named `operator` too. The operator envelope is the one the
+    /// front index types `operator_envelope` ([`OpenedEnvelope::is_operator`]).
     pub tenant: String,
     pub created_at: String,
 }
@@ -55,14 +59,6 @@ pub struct ManifestHeader {
 pub struct EnvelopeManifest {
     pub manifest: ManifestHeader,
     pub units: Vec<ManifestUnit>,
-}
-
-impl EnvelopeManifest {
-    /// True for the operator envelope and its backup, which carry every
-    /// unit on the volume under the placeholder tenant `"operator"`.
-    pub fn is_operator(&self) -> bool {
-        self.manifest.tenant == "operator"
-    }
 }
 
 /// Parse an envelope `MANIFEST.toml`.
@@ -91,6 +87,26 @@ pub struct OpenedEnvelope {
     /// The operator envelope's `catalog.db` (issue #83), extracted to disk.
     /// `None` for tenant envelopes, which never carry it.
     pub catalog_db: Option<PathBuf>,
+}
+
+impl OpenedEnvelope {
+    /// True for the operator envelope and its backup, which carry every unit
+    /// on the volume under the placeholder tenant `"operator"`.
+    ///
+    /// Decided by the front-index entry type this envelope was opened as
+    /// (`operator_envelope`, `operator_envelope_backup`), never by the
+    /// manifest's tenant string (issue #459): a real tenant may be named
+    /// `operator` (`validate_tenant_name` accepts it, and `operator_name_for_init`
+    /// falls back to it), and tenant envelopes come first on the tape.
+    pub fn is_operator(&self) -> bool {
+        matches!(
+            crate::volume::layout_model::ZoneKind::from_type_label(&self.type_label),
+            Some(
+                crate::volume::layout_model::ZoneKind::OperatorEnvelope
+                    | crate::volume::layout_model::ZoneKind::OperatorEnvelopeBackup
+            )
+        )
+    }
 }
 
 /// Why an envelope could not be opened.
@@ -280,7 +296,6 @@ mod tests {
         let m = parse_manifest(&generated_manifest("alpha")).unwrap();
         assert_eq!(m.manifest.volume, "VOL001");
         assert_eq!(m.manifest.tenant, "alpha");
-        assert!(!m.is_operator());
         assert_eq!(m.units.len(), 1);
         let u = &m.units[0];
         assert_eq!(u.name, "photos/2019");
@@ -293,11 +308,25 @@ mod tests {
         assert_eq!(u.slices[0].sha256_plain, "aa".repeat(32));
     }
 
+    /// Issue #459: the operator envelope is the one the FRONT INDEX types
+    /// `operator_envelope` (or its backup), whatever its manifest's tenant
+    /// string; a tenant envelope is never it, even for a tenant that is
+    /// literally named `operator`.
     #[test]
-    fn the_operator_envelope_is_recognised_by_its_placeholder_tenant() {
-        assert!(parse_manifest(&generated_manifest("operator"))
-            .unwrap()
-            .is_operator());
+    fn the_operator_envelope_is_recognised_by_its_front_index_type_not_its_tenant() {
+        let opened = |type_label: &str, tenant: &str| OpenedEnvelope {
+            position: 4,
+            type_label: type_label.to_string(),
+            manifest: parse_manifest(&generated_manifest(tenant)).unwrap(),
+            catalog_db: None,
+        };
+        assert!(opened("operator_envelope", "operator").is_operator());
+        assert!(opened("operator_envelope_backup", "operator").is_operator());
+        // Whatever the placeholder says, the entry type decides.
+        assert!(opened("operator_envelope", "alpha").is_operator());
+        assert!(!opened("tenant_envelope", "operator").is_operator());
+        assert!(!opened("tenant_envelope_backup", "operator").is_operator());
+        assert!(!opened("tenant_envelope", "alpha").is_operator());
     }
 
     /// Tapes written before #134 carry `layout_version = 1` in `[manifest]`.
