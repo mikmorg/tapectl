@@ -1,0 +1,8 @@
+# Issue #437: the binary falls back to the system home pointer (/etc/tapectl/home)
+# when an account has no ~/.tapectl of its own. Every test that spawns the binary
+# isolates with HOME=<tmp>, which on a host that HAS a pointer (home2 after first-run
+# step 7) would resolve to the service home. Pointing the variable at a path that does
+# not exist switches the pointer off for everything cargo runs; tests/home_pointer.rs
+# sets it per child where it exercises the pointer, and pins that this is in force.
+[env]
+TAPECTL_HOME_POINTER = "/nonexistent/tapectl-home-pointer"

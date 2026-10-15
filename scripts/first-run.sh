@@ -911,7 +911,9 @@ EOF
       note "loaded medium is LTO-$mnum — a fact about that cartridge, not this drive (ADR-0010); the drive stays $DGEN"
     fi
   fi
-  run tc backend add --name "$BNAME" --device-tape "$DEVICE" --device-sg "$SG" --generation "$DGEN"
+  # Issue #431: no device_sg line -- tapectl derives the sg node from device_tape
+  # through sysfs every time the config loads, so an /dev/sgN renumbering never matters.
+  run tc backend add --name "$BNAME" --device-tape "$DEVICE" --generation "$DGEN"
   run tc config check || true
 fi
 }
@@ -1440,9 +1442,13 @@ EOF
       # binds to device_tape (numbering moved since step 8). A config fact,
       # not a consent question -- --force would fail identically.
       explain <<'EOF'
-volume init refused before touching the tape: the drive's two device nodes in config.toml no longer name the same drive (/dev/sgN numbering moved, usually after a reboot). The refusal above names the sg node the kernel binds to the tape node. Edit [[backends.lto]] in config.toml so device_sg is that node (`tapectl config show` prints it; `tapectl config check` confirms the fix), then re-run with --from 13.
+volume init refused before touching the tape: the drive's two device nodes in config.toml no longer name the same drive (/dev/sgN numbering moved, usually after a reboot). The refusal above names the sg node the kernel binds to the tape node. Remove the device_sg line from [[backends.lto]] in config.toml and tapectl derives it from device_tape (issue #431), or set device_sg to that node (`tapectl config show` prints it; `tapectl config check` confirms the fix), then re-run with --from 13.
 EOF
       die "volume init refused: device_sg does not belong to device_tape — fix the [[backends.lto]] entry, then re-run scripts/first-run.sh --from 13"
+    elif grep -q "device_sg is not set" "$INIT_OUT"; then
+      # Issue #431: no device_sg line and none derivable from device_tape (the
+      # drive is not attached, or device_tape is not a /dev/nstN tape node).
+      die "volume init refused: no sg node can be derived from device_tape $DEVICE — attach the drive (lsscsi -g), or set device_sg in [[backends.lto]], then re-run scripts/first-run.sh --from 13"
     elif grep -q "ADR-0003" "$INIT_OUT"; then
       # The SEALED case (issue #223): --force does not reach it, so it is never
       # offered. What does is `cartridge erase` (ADR-0012 2026-10-12 items

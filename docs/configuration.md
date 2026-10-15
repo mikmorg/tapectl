@@ -199,7 +199,7 @@ tapectl config remove defaults.slice_size
 - **`config add`** adds a table to a list of tables, as `field=value` pairs, or values
   to a list such as `global_excludes`. The new table's `name` must not already be
   taken, because names are how entries are picked. A drive added as
-  `config add backends.lto name=… device_tape=… device_sg=… generation=…` gets the
+  `config add backends.lto name=… device_tape=… generation=…` gets the
   checks [`backend add`](cli/backend.md#tapectl-backend-add) makes, and `backend add`
   writes through the same editor.
 - **`config remove`** removes a key, so its default applies, or one entry of a list
@@ -329,7 +329,7 @@ tapectl config check
 |---|---|---|---|
 | `name` | string | *required* | Your name for the drive. Must be unique among the blocks. |
 | `device_tape` | path | *required* | The non-rewinding tape device. **Use the `/dev/tape/by-id/…-nst` path**, because `/dev/nstN` numbers can change after a reboot. Two blocks that resolve to the same device make the config invalid. |
-| `device_sg` | path | *required* | The SCSI generic node of the **same** drive (find it with `lsscsi -g`). It is used to read the cartridge memory chip (serial, generation) and the drive's health log pages. A write refuses if this node is provably a different drive from `device_tape`. |
+| `device_sg` | path | derived from `device_tape` | The SCSI generic node of the **same** drive. It is used to read the cartridge memory chip (serial, generation) and the drive's health log pages. When the line is absent, tapectl derives it from `device_tape` (the node the kernel binds to that tape node, read from sysfs) every time the config loads, so a `/dev/sgN` renumbering never matters (issue #431). Set it only to override; a write refuses a configured node that is provably a different drive from `device_tape`. Absent and not derivable (the drive is not attached, or `device_tape` is not a tape node) is refused by name where a drive is needed, and `config check` warns. `device_sg = ""` is refused. To go back to deriving: `tapectl config remove 'backends.lto[NAME].device_sg'`. |
 | `generation` | string | *required* | The generation the drive natively writes, such as `"LTO-6"` or `"LTO-8"`. `LTO-5`, `L5` and `lto5` are all accepted. `"LTO-7-M8"` is refused here: it is a cartridge format, and the drive that writes it declares `LTO-8`. |
 | `capacity_override` | size (**decimal**) | unset | **Virtual drives only** (mhvtl, test harnesses). It overrides the capacity for every cartridge this drive touches. A real drive gets its capacity from the loaded cartridge's detected generation, so leave this unset. `config check` warns whenever it is set. |
 | `fill_ceiling` | float | `0.97` | The **fill ceiling**: the fraction of a cartridge's capacity a write may fill, above 0 and at most 1. The pre-write capacity check of every write refuses a layout above it and says by how much; planning sizes tapes with it. `--fill-ceiling` on `volume write`, `volume plan`, `collection plan` and `collection run` overrides it for one command (`0.99` or `99%`). It was called `usable_capacity_factor` (default `0.92`) until issue #391; a config that still uses that name is refused, naming the new key. Each completed write records the capacity it used (a `write_capacity_used` event in `report events`), so the ceiling can be tuned from what writes really take. |
@@ -337,7 +337,7 @@ tapectl config check
 
 Which commands read which keys:
 
-- **Every drive command** reads `device_tape` and `device_sg`. Write paths
+- **Every drive command** reads `device_tape` (and `device_sg`, derived from it unless set). Write paths
   ([`volume init`](cli/volume.md#tapectl-volume-init), `volume write`,
   `volume resume`, `volume compact-write`, `volume compact`, `collection run`,
   [`quick-archive`](cli/quick-archive.md)) and the planners

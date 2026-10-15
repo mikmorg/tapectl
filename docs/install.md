@@ -149,7 +149,7 @@ binary (`TAPECTL_BIN`), so what it proves is what step 13 uses.
 | 5 service user | system account **`tapectl`**, home `/var/lib/tapectl`, shell `/usr/sbin/nologin`, comment "tapectl archival service" | — | `id tapectl` |
 | 6 the drive | `tapectl` added to the group owning `/dev/nst*` and `/dev/sg*` (usually `tape`) via `usermod -aG` | — | `sudo -u tapectl -H mt -f <by-id> status` |
 | 7 the home | **`/var/lib/tapectl/.tapectl/`** (§4), the escrow identity (secret printed once), the operator tenant and its keys (`init --operator <name>`: run as a system account such as the service user, `init` refuses to guess the operator name from the account); the staging directory (asked; the proposal is `--staging`/`STAGING_DIR` when set, else the directory `config.toml` names if the service user can write it — `<home>/staging` after a fresh `init` — else `/scratch/tapectl-staging` when `/scratch` exists), written into `[staging] directory`, created with `sudo mkdir -p` when missing and offered a `chown tapectl` when the service user cannot write it. With `OPS_GROUP` in the profile: that group (`groupadd --system`), the service user and you added to it, and `[ops] group` in `config.toml` (issue #393: members run `tapectl status` without sudo; step 7 writes the pointer `/etc/tapectl/home`, root 0644, naming the home, issue #437) | home 0700 `tapectl` (0710, group `OPS_GROUP`, with an ops group; `logs/` 2750); staging `tapectl` | `sudo -u tapectl -H tapectl config check`, `db fsck` |
-| 8 backend | a `[[backends.lto]]` table appended to `config.toml`: `device_tape` (by-id), `device_sg`, `generation` (from the drive's INQUIRY product id, never from the loaded cartridge — ADR-0010) | in `config.toml` | `tapectl config show` |
+| 8 backend | a `[[backends.lto]]` table appended to `config.toml`: `device_tape` (by-id), `generation` (from the drive's INQUIRY product id, never from the loaded cartridge — ADR-0010) | in `config.toml` | `tapectl config show` |
 | 9 heir kit | `~/heir-kit/` (**yours**; `--kit-out` moves it): `COVER.txt`, `escrow-kit.html`, `catalog.db.age` | you, 0700 | print `COVER.txt`, hand-write the secret on it, seal, two failure domains |
 | 10 location | a `locations` row (e.g. `home-rack`) | in the catalog | `tapectl location list` |
 | 11 tenants, units | tenant rows and keys under `keys/`; per unit: a POSIX ACL grant (`setfacl -R -m u:tapectl:rX` on the tree, the same as a default ACL so new files inherit it, `rwX` on the top directory only, `x` on each ancestor) and a **`.tapectl-unit.toml`** dotfile in the unit's top directory | files keep their owner and mode | `getfacl <dir>`, `tapectl unit list` |
@@ -333,10 +333,12 @@ importing or rebuilding anything into it. `docs/operator-guide.md`,
 
 **Step 8** finds the existing backend and only cross-checks it: if the
 config's `device_tape` is not the drive you chose in step 6, it says so and
-leaves the edit to you (there is no `backend edit`). `device_sg` is the node
-most likely to have moved on a rebuilt host; `config check` warns about a
-tape/sg pairing that names two different drives, and `volume write` refuses
-it. Fix `[[backends.lto]] device_sg` by hand, then `config check`.
+leaves the edit to you (there is no `backend edit`). `device_sg` is derived
+from `device_tape` whenever the config has no `device_sg` line (issue #431), so a
+renumbering never matters. Only an explicit `device_sg` can go stale: `config check`
+warns about a tape/sg pairing that names two different drives, and `volume write`
+refuses it. The fix is to remove the line (`tapectl config remove
+'backends.lto[NAME].device_sg'`), then `config check`.
 
 **Step 11** finds a `.tapectl-unit.toml` already in a directory and adopts it
 instead of re-creating it — the dotfile carries the unit's uuid — by adding
@@ -609,7 +611,7 @@ archive. Wipe the medium when the move is done.
 state under `~/.local/state/tapectl/` (the rehearsal marker is proof about one
 binary on one host — earn it again), the systemd units (re-render them for the
 new host), the ACLs (per filesystem; step 11 re-grants), the `tape` group
-membership (step 6), and `device_sg` (re-derived; §6).
+membership (step 6), and `device_sg` (derived; nothing to copy).
 
 **On the new host**:
 
@@ -623,7 +625,7 @@ membership (step 6), and `device_sg` (re-derived; §6).
    ```
 3. `scripts/first-run.sh --from 6` — the drive by serial; step 7 finds the
    home initialised and probes the config (§6); step 8 cross-checks the
-   backend — fix `device_sg` if it moved; step 9 asks before regenerating the
+   backend; step 9 asks before regenerating the
    kit; step 11 re-grants the ACLs and adopts the dotfiles; step 12 rehearses
    this host's binary; step 14 installs the timers with `--backup-dir` on the
    new host's second disk.

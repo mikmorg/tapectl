@@ -203,3 +203,16 @@ fn as_root_the_pointer_is_ignored() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(host.own_home().join("tapectl.db").exists());
 }
+
+/// `.cargo/config.toml` switches the system home pointer off for every test binary,
+/// so a HOME-isolated test can never resolve to a real service home on a host that has
+/// `/etc/tapectl/home` (issue #437). If this fails, the suite is no longer isolated.
+#[test]
+fn the_suite_runs_with_the_system_pointer_switched_off() {
+    let p = std::env::var_os("TAPECTL_HOME_POINTER")
+        .expect("TAPECTL_HOME_POINTER is unset: .cargo/config.toml [env] is not in force");
+    assert!(
+        !std::path::Path::new(&p).exists(),
+        "TAPECTL_HOME_POINTER names {p:?}, which exists: the suite could read a real home"
+    );
+}

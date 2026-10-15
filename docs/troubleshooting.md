@@ -552,11 +552,13 @@ a proven mismatch:
 error: configuration error: refusing to resolve an LTO backend for a write: backend "<name>": device_sg =
 <configured> is not the drive device_tape = <device> names — the kernel binds that tape node to <bound>. Its
 cartridge chip (MAM) and log pages would be read from a different device (/dev/sgN numbering moves across
-reboots). Set device_sg = "<bound>" in this [[backends.lto]] entry.
+reboots). Set device_sg = "<bound>" in this [[backends.lto]] entry, or remove the device_sg line and tapectl
+derives it from device_tape.
 ```
 
-The message names the correct node. Edit `device_sg` in that
-`[[backends.lto]]` entry to match, then check the config:
+The message names the correct node. The simplest fix is to delete the `device_sg`
+line: tapectl then derives it from `device_tape` on every load (issue #431). Or set
+it to the node the refusal named, then check the config:
 
 ```toml
 [[backends.lto]]
@@ -570,6 +572,21 @@ generation = "LTO-6"
 tapectl config check
 lsscsi -g        # optional cross-check: the tape line's last column is its sg node
 ```
+
+### `device_sg` is not set and cannot be derived
+
+With no `device_sg` line, tapectl derives the node from `device_tape`. Where the
+kernel names no node for it, a drive command refuses by name:
+
+```text
+backend "<name>": device_sg is not set and cannot be derived from device_tape = <path> — …
+```
+
+The rest of the message says why: the path does not exist on this machine (is the
+drive attached?), or sysfs does not name exactly one SCSI generic node for it (is
+`device_tape` a `/dev/nstN` tape node?). Attach the drive, or set
+`device_sg = "/dev/sgN"` in the `[[backends.lto]]` entry (`lsscsi -g` lists it), then
+run `tapectl config check`.
 
 On a read path the same mismatch only produces a warning. The read goes ahead
 as if no backend matched, so it records no cartridge chip, log pages or drive.

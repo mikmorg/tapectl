@@ -180,7 +180,7 @@ binary = "/usr/bin/dar"    # Path to dar binary
 [[backends.lto]]
 name = "lto-primary"
 device_tape = "/dev/tape/by-id/scsi-XXXXXXXX-nst"   # by-id: /dev/nstN moves across reboots
-device_sg = "/dev/sg1"      # also moves; tapectl re-checks that it names the same drive
+# device_sg = "/dev/sg1"    # optional: derived from device_tape when absent (#431)
 generation = "LTO-6"        # what the DRIVE is, not what you feed it
 # capacity_override = "2400M"   # virtual drives and test harnesses only
 
