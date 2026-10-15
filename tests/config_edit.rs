@@ -724,3 +724,45 @@ fn set_of_defaults_verify_interval_days_takes_a_day_count_and_refuses_zero() {
         &["config", "set", "defaults.verify_interval_days", "0"],
     );
 }
+
+/// Issue #453: `config set` refuses a copy floor below 1 and a place floor
+/// below 0, at the defaults level and on an archive set, by name, with the
+/// file untouched; the smallest legitimate values go through.
+#[test]
+fn set_of_a_copy_floor_below_one_or_a_place_floor_below_zero_is_refused() {
+    let home = home();
+    let out = refused(home.path(), &["config", "set", "defaults.min_copies", "0"]);
+    assert!(out.contains("defaults.min_copies = 0"), "{out}");
+    assert!(out.contains(">= 1"), "{out}");
+    // `--` so that clap reads -1 as the value, not as a flag.
+    let out = refused(
+        home.path(),
+        &["config", "set", "--", "defaults.min_locations", "-1"],
+    );
+    assert!(out.contains("defaults.min_locations = -1"), "{out}");
+    assert!(out.contains(">= 0"), "{out}");
+
+    ok(home.path(), &["config", "add", "archive_sets", "name=cold"]);
+    let out = refused(
+        home.path(),
+        &["config", "set", "archive_sets[cold].min_copies", "0"],
+    );
+    assert!(
+        out.contains("archive_sets[0] (\"cold\").min_copies = 0"),
+        "{out}"
+    );
+
+    ok(home.path(), &["config", "set", "defaults.min_copies", "1"]);
+    ok(
+        home.path(),
+        &["config", "set", "defaults.min_locations", "0"],
+    );
+    ok(
+        home.path(),
+        &["config", "set", "archive_sets[cold].min_copies", "1"],
+    );
+    let after = read(home.path());
+    assert!(after.contains("min_copies = 1\n"), "{after}");
+    assert!(after.contains("min_locations = 0\n"), "{after}");
+    config_check_passes(home.path());
+}

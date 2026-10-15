@@ -1456,6 +1456,34 @@ impl Config {
                 }
             }
         }
+        // Issue #453: the copy and place floors. `min_copies` below 1 and
+        // `min_locations` below 0 make the comparisons that enforce them
+        // vacuous.
+        if let Err(e) = validate_min_copies(i64::from(self.defaults.min_copies)) {
+            problems.push(format!(
+                "{}: defaults.min_copies = {} {e}",
+                path.display(),
+                self.defaults.min_copies
+            ));
+        }
+        if let Err(e) = validate_min_locations(i64::from(self.defaults.min_locations)) {
+            problems.push(format!(
+                "{}: defaults.min_locations = {} {e}",
+                path.display(),
+                self.defaults.min_locations
+            ));
+        }
+        for (i, as_cfg) in self.archive_sets.iter().enumerate() {
+            if let Some(copies) = as_cfg.min_copies {
+                if let Err(e) = validate_min_copies(i64::from(copies)) {
+                    problems.push(format!(
+                        "{}: archive_sets[{i}] (\"{}\").min_copies = {copies} {e}",
+                        path.display(),
+                        as_cfg.name
+                    ));
+                }
+            }
+        }
         // Issue #421: a rise factor below 1 flags a falling rate, and NaN
         // flags nothing; both are switches, not thresholds.
         let factor = self.health().read_error_rise_factor;
@@ -1960,6 +1988,46 @@ pub fn validate_verify_interval_days(days: i64) -> std::result::Result<(), Strin
              `volume verify` before `audit` calls it overdue, and the oldest an \
              interrupted full readback may be and still be continued; at 0 or below \
              every copy is always overdue and no readback is ever continued)"
+                .to_string(),
+        )
+    }
+}
+
+/// A `min_copies` (issue #453): at least one. The copy requirement is
+/// compared as `copies < min_copies`, so 0 or below is satisfied by a unit
+/// with no copy at all: `audit`'s `copy_count` goes vacuous, the staging
+/// release (#440) frees a unit's slices at once, and the retire family loses
+/// the below-policy fact it asks consent for (ADR-0008 Tier 2). The error is
+/// the reason only; each caller names the key (`[defaults]`'s or
+/// `[[archive_sets]]`'s `min_copies`, or `--min-copies`) and the value.
+///
+/// Like [`validate_verify_interval_days`], only new values are refused:
+/// config load, `config check`/`set`, and `archive-set create`/`edit`/`sync`.
+/// A catalog row already holding one keeps working.
+pub fn validate_min_copies(copies: i64) -> std::result::Result<(), String> {
+    if copies >= 1 {
+        Ok(())
+    } else {
+        Err(
+            "must be >= 1 (how many Copies each Version of a unit needs; at 0 or below a \
+             unit with no copy at all meets it, so `audit`'s copy_count goes silent, \
+             staging is released at once, and the retire family finds nothing below policy)"
+                .to_string(),
+        )
+    }
+}
+
+/// A `[defaults] min_locations` (issue #453): zero or more. 0 is a real
+/// choice (no distinct-place floor); below it the comparison is vacuous in
+/// a way no operator meant. The error is the reason only; the caller names
+/// the key and the value.
+pub fn validate_min_locations(locations: i64) -> std::result::Result<(), String> {
+    if locations >= 0 {
+        Ok(())
+    } else {
+        Err(
+            "must be >= 0 (how many distinct locations a tape-only unit's copies must span; \
+             0 asks for no spread, and a negative count means nothing)"
                 .to_string(),
         )
     }
@@ -3979,6 +4047,85 @@ mod tests {
         // Round trip: a set value is written back.
         let again = toml::to_string_pretty(&cfg).unwrap();
         assert!(again.contains("verify_interval_days = 365"), "{again}");
+    }
+
+    /// Issue #453 (the #452 review, catalog lens 8): a `min_copies` below 1
+    /// is met by a unit with no copy at all (`audit`'s copy_count goes
+    /// vacuous, the #440 release frees staging at once, the Tier-2 copy fact
+    /// disappears), and a `min_locations` below 0 means nothing. Config
+    /// load refuses each by name — `[defaults]` and an archive set's — and
+    /// `config check`'s lenient path lists them all. 1 and 0 respectively
+    /// are the smallest legitimate values and load.
+    #[test]
+    fn config_load_refuses_a_copy_floor_below_one_and_a_place_floor_below_zero() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        let refused = |body: &str, names: &str| {
+            std::fs::write(&path, body).unwrap();
+            let msg = Config::load(&path).unwrap_err().to_string();
+            assert!(msg.contains(names), "{names}: {msg}");
+            let report = crate::policy::lenient_config::check(body, &path);
+            assert!(!report.valid, "{body}");
+            assert!(
+                report.problems.iter().any(|p| p.contains(names)),
+                "{names}: {:?}",
+                report.problems
+            );
+            msg
+        };
+
+        for copies in [0, -1] {
+            let msg = refused(
+                &format!("[defaults]\nmin_copies = {copies}\n"),
+                &format!("defaults.min_copies = {copies}"),
+            );
+            assert!(msg.contains(">= 1"), "{msg}");
+        }
+        let msg = refused(
+            "[defaults]\nmin_locations = -1\n",
+            "defaults.min_locations = -1",
+        );
+        assert!(msg.contains(">= 0"), "{msg}");
+        for copies in [0, -3] {
+            let msg = refused(
+                &format!(
+                    "[[archive_sets]]\nname = \"warm\"\nmin_copies = 2\n\n\
+                     [[archive_sets]]\nname = \"cold\"\nmin_copies = {copies}\n"
+                ),
+                &format!("archive_sets[1] (\"cold\").min_copies = {copies}"),
+            );
+            assert!(msg.contains(">= 1"), "{msg}");
+        }
+
+        // Every problem is listed, not just the first.
+        let body = "[defaults]\nmin_copies = 0\nmin_locations = -2\n\n\
+                    [[archive_sets]]\nname = \"cold\"\nmin_copies = 0\n";
+        let report = crate::policy::lenient_config::check(body, &path);
+        for key in [
+            "defaults.min_copies = 0",
+            "defaults.min_locations = -2",
+            "archive_sets[0] (\"cold\").min_copies = 0",
+        ] {
+            assert!(
+                report.problems.iter().any(|p| p.contains(key)),
+                "{key}: {:?}",
+                report.problems
+            );
+        }
+
+        // Positive controls: the smallest legitimate values load, and 0
+        // places is a real choice (no spread asked for).
+        std::fs::write(
+            &path,
+            "[defaults]\nmin_copies = 1\nmin_locations = 0\n\n\
+             [[archive_sets]]\nname = \"cold\"\nmin_copies = 1\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("1 copy and 0 places are legitimate floors");
+        assert_eq!(cfg.defaults.min_copies, 1);
+        assert_eq!(cfg.defaults.min_locations, 0);
+        assert_eq!(cfg.archive_sets[0].min_copies, Some(1));
     }
 
     // ---- issue #222: two [[backends.lto]] entries on one drive ----

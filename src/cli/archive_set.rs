@@ -312,6 +312,13 @@ impl PolicyWrite {
             // at unit-write time with a raw SQLite error.
             crate::config::validate_checksum_mode(m).map_err(TapectlError::Other)?;
         }
+        // Issue #453: a copy requirement below 1 is met by a unit with no
+        // copy at all. A stored row below it keeps working; only a new value
+        // is refused.
+        if let Some(copies) = args.min_copies {
+            crate::config::validate_min_copies(copies)
+                .map_err(|e| TapectlError::Other(format!("--min-copies {copies} {e}")))?;
+        }
         // Issue #422: a stored row below one day keeps working; only a new
         // value is refused.
         if let Some(days) = args.verify_interval_days {
@@ -350,8 +357,13 @@ impl PolicyWrite {
     /// only for the keys present; a value set by `edit` for a key the table
     /// omits is left alone). `sync` validates compression and checksum mode
     /// for every table before calling this; `slice_size` is parsed and
-    /// `verify_interval_days` bounded (issue #422) here.
+    /// `verify_interval_days` bounded (issue #422) and `min_copies` bounded
+    /// (issue #453) here.
     fn from_config(as_cfg: &crate::config::ArchiveSetConfig) -> Result<Self> {
+        if let Some(copies) = as_cfg.min_copies {
+            crate::config::validate_min_copies(i64::from(copies))
+                .map_err(|e| TapectlError::Other(format!("min_copies = {copies} {e}")))?;
+        }
         if let Some(days) = as_cfg.verify_interval_days {
             crate::config::validate_verify_interval_days(i64::from(days))
                 .map_err(|e| TapectlError::Other(format!("verify_interval_days = {days} {e}")))?;
@@ -2190,5 +2202,180 @@ fi
         run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
         assert_eq!(column_i64(&conn, "cold", "min_copies"), Some(4));
         assert_eq!(column_i64(&conn, "cold", "verify_interval_days"), Some(0));
+    }
+
+    // ---- issue #453: min_copies below 1 is refused ----
+
+    /// Issue #453: a copy requirement below 1 is met by a unit with no copy
+    /// at all. `create` refuses it by the flag's name, in a dry run as in a
+    /// real one (#241), and writes nothing; 1 is the smallest requirement
+    /// and is stored.
+    #[test]
+    fn create_refuses_a_min_copies_below_one() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        for copies in [0, -1, i64::MIN] {
+            for dry_run in [true, false] {
+                let err = run(
+                    &conn,
+                    &config,
+                    &create_cmd("cold", Some(copies), None),
+                    false,
+                    dry_run,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    err.contains("--min-copies"),
+                    "must name the flag ({copies}, dry run {dry_run}): {err}"
+                );
+                assert!(
+                    err.contains(&copies.to_string()),
+                    "must name the value: {err}"
+                );
+                assert!(err.contains(">= 1"), "must name the bound: {err}");
+            }
+        }
+        assert_eq!(set_count(&conn), 0, "a refused create must write nothing");
+        assert_eq!(all_events(&conn), 0);
+
+        run(
+            &conn,
+            &config,
+            &create_cmd("cold", Some(1), None),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(column_i64(&conn, "cold", "min_copies"), Some(1));
+    }
+
+    /// Issue #453, the `edit` half: refused by the flag's name before any
+    /// column is written or logged; the stored `min_copies` is left as it
+    /// was, and so is a column named beside it.
+    #[test]
+    fn edit_refuses_a_min_copies_below_one() {
+        let conn = fresh_conn();
+        let config = Config::default();
+        run(
+            &conn,
+            &config,
+            &create_cmd("cold", Some(3), None),
+            false,
+            false,
+        )
+        .unwrap();
+        let events_before = all_events(&conn);
+
+        for copies in [0, -2] {
+            for dry_run in [true, false] {
+                let edit = ArchiveSetCommands::Edit {
+                    name: "cold".to_string(),
+                    policy: PolicyArgs {
+                        min_copies: Some(copies),
+                        verify_interval_days: Some(90),
+                        ..PolicyArgs::default()
+                    },
+                };
+                let err = run(&conn, &config, &edit, false, dry_run)
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("--min-copies"), "{err}");
+                assert!(err.contains(&copies.to_string()), "{err}");
+            }
+        }
+        assert_eq!(column_i64(&conn, "cold", "min_copies"), Some(3));
+        assert_eq!(
+            column_i64(&conn, "cold", "verify_interval_days"),
+            None,
+            "a refused edit writes none of its columns"
+        );
+        assert_eq!(all_events(&conn), events_before);
+
+        let edit = ArchiveSetCommands::Edit {
+            name: "cold".to_string(),
+            policy: PolicyArgs {
+                min_copies: Some(1),
+                ..PolicyArgs::default()
+            },
+        };
+        run(&conn, &config, &edit, false, false).unwrap();
+        assert_eq!(column_i64(&conn, "cold", "min_copies"), Some(1));
+    }
+
+    /// Issue #453, the config-driven path: an `[[archive_sets]]` table's
+    /// `min_copies` below 1 is refused by `sync`, naming the set and the
+    /// TOML key (not the CLI flag), before any row is written — the valid
+    /// set listed first included. `Config::load` refuses such a file
+    /// already; `sync` checks again because it can be handed a `Config`
+    /// that was never loaded from a file (as in #422).
+    #[test]
+    fn sync_refuses_a_min_copies_below_one() {
+        let conn = fresh_conn();
+        let mut config = Config::default();
+        let mut first = set_config("aaa");
+        first.min_copies = Some(2);
+        config.archive_sets.push(first);
+        config.archive_sets.push(set_config("cold"));
+
+        for copies in [0, -1] {
+            config.archive_sets[1].min_copies = Some(copies);
+            let err = run(&conn, &config, &ArchiveSetCommands::Sync, false, false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("archive set \"cold\""),
+                "must name the set: {err}"
+            );
+            assert!(
+                err.contains("min_copies") && !err.contains("--min-copies"),
+                "must name the TOML key, not the CLI flag: {err}"
+            );
+            assert!(err.contains(&copies.to_string()), "{err}");
+            assert_eq!(set_count(&conn), 0, "a refused sync must write nothing");
+        }
+
+        config.archive_sets[1].min_copies = Some(1);
+        run(&conn, &config, &ArchiveSetCommands::Sync, false, false).unwrap();
+        assert_eq!(column_i64(&conn, "cold", "min_copies"), Some(1));
+        assert_eq!(column_i64(&conn, "aaa", "min_copies"), Some(2));
+    }
+
+    /// Issue #453: as with the interval (#422), only new values are
+    /// refused. A row already holding `min_copies = 0` keeps working: an
+    /// `edit` of another column succeeds and `list` and `info` read it.
+    #[test]
+    fn an_existing_row_with_min_copies_zero_keeps_working() {
+        let conn = fresh_conn();
+        conn.execute(
+            "INSERT INTO archive_sets (name, min_copies) VALUES ('cold', 0)",
+            [],
+        )
+        .unwrap();
+        let config = Config::default();
+        run(
+            &conn,
+            &config,
+            &ArchiveSetCommands::Edit {
+                name: "cold".to_string(),
+                policy: with_verify_days(30),
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(column_i64(&conn, "cold", "min_copies"), Some(0));
+        assert_eq!(column_i64(&conn, "cold", "verify_interval_days"), Some(30));
+        run(&conn, &config, &ArchiveSetCommands::List, false, false).unwrap();
+        run(
+            &conn,
+            &config,
+            &ArchiveSetCommands::Info {
+                name: "cold".to_string(),
+            },
+            false,
+            false,
+        )
+        .unwrap();
     }
 }
