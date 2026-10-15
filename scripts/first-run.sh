@@ -924,7 +924,7 @@ if as_svc grep -q '^\[\[backends.lto\]\]' "$CFG" 2>/dev/null; then
   derive_nodes
   CFG_TAPE="$(as_svc sed -n 's/^device_tape *= *"\(.*\)"/\1/p' "$CFG" | head -1)"
   if [ -n "$CFG_TAPE" ] && [ "$(readlink -f "$CFG_TAPE" 2>/dev/null)" != "$NST" ]; then
-    note "config's device_tape ($CFG_TAPE) is not the drive you chose ($DEVICE -> $NST); there is no backend edit — fix config.toml by hand, or re-run step 6 with the configured drive"
+    note "config's device_tape ($CFG_TAPE) is not the drive you chose ($DEVICE -> $NST); fix it with \`$OP_CMD config set 'backends.lto[NAME].device_tape' $DEVICE\` (NAME is the block's name), or re-run step 6 with the configured drive"
   fi
   run tc config check || note "config check reported something — read it (an sg/tape pairing warning here becomes a refusal at the write)"
 else
@@ -961,7 +961,7 @@ EOF
 
   # Default chain: --generation, else the product id, else NOTHING. There is
   # deliberately no literal fallback: a wrong generation here is written into
-  # config.toml permanently and there is no `backend edit`.
+  # config.toml and refuses every write until `config set` corrects it.
   if [ -n "${DGEN:-}" ]; then
     :
   elif [ -n "$DRIVE_GEN" ]; then
