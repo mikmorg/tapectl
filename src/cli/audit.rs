@@ -4525,6 +4525,60 @@ mod tests {
         assert!(live_msg.contains("4 Media"), "{live_msg}");
     }
 
+    /// Issue #430: a raised "Cleaning required" on a live volume's
+    /// cartridge is a WARNING, as every TapeAlert is — never a violation —
+    /// and its message names the action (`clean the drive`) beside the flag.
+    /// The fix column is still `volume verify`: a passed full readback is
+    /// what answers an alert, whichever flag it was.
+    #[test]
+    fn audit_warns_of_a_cleaning_alert_and_names_the_action() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, \
+             capacity_bytes, status, observed_condition)
+             VALUES ('C-LIVE', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', 'ok')",
+            [],
+        )
+        .unwrap();
+        let volume_id = conn.last_insert_rowid();
+        // Flag n is the page's n-th flag line; flag 20 is "Cleaning required".
+        let mut raw_log = String::from("=== page 0x2e ===\n");
+        for n in 1..=63 {
+            let name = if n == 20 {
+                "Cleaning required".to_string()
+            } else {
+                format!("Flag {n}")
+            };
+            raw_log.push_str(&format!("  {name}: {}\n", u8::from(n == 20)));
+        }
+        conn.execute(
+            "INSERT INTO health_logs (volume_id, operation, tape_alerts, raw_log, logged_at)
+             VALUES (?1, 'verify', 1, ?2, '2026-10-01 10:00:00')",
+            params![volume_id, raw_log],
+        )
+        .unwrap();
+
+        let (violations, warnings) = collect_findings(&conn, &Config::default(), None).unwrap();
+        assert!(
+            violations.iter().all(|f| f.check != "tape_alert"),
+            "a cleaning alert is a warning, never a violation: {violations:?}"
+        );
+        let found: Vec<&AuditFinding> = warnings
+            .iter()
+            .filter(|f| f.check == "tape_alert")
+            .collect();
+        assert_eq!(found.len(), 1, "{warnings:?}");
+        assert_eq!(found[0].unit, "volume:C-LIVE");
+        assert_eq!(found[0].action, "tapectl volume verify C-LIVE");
+        assert!(
+            found[0].message.contains(
+                "20 Cleaning required => clean the drive: nothing is wrong with the data"
+            ),
+            "{}",
+            found[0].message
+        );
+    }
+
     /// Issue #138 / C4 architecture review: `CHECKS` is now the scope table
     /// that used to be a comment above `collect_findings`. These tests pin
     /// the table's shape and the runner's use of it, independent of any
