@@ -120,3 +120,43 @@ fn a_held_drive_is_skipped_with_75_and_a_free_one_is_polled() {
         vec![("drive poll".to_string(), Some("failed".to_string()))]
     );
 }
+
+/// Issue #431: a drive configured with no `device_sg` whose tape node the
+/// kernel cannot bind (here, a path that does not exist) is refused BY NAME
+/// when something needs the sg node — not read through an empty path, not
+/// guessed. The poll reads and records nothing.
+#[test]
+fn a_poll_of_a_drive_with_no_derivable_sg_node_refuses_by_name() {
+    let home = TempDir::new().unwrap();
+    ok(&run(home.path(), &["init"]), "init");
+    ok(
+        &run(
+            home.path(),
+            &[
+                "backend",
+                "add",
+                "--name",
+                "lto0",
+                "--device-tape",
+                TAPE,
+                "--generation",
+                "LTO-6",
+            ],
+        ),
+        "backend add without --device-sg",
+    );
+
+    let out = run(home.path(), &["drive", "poll"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("lto0"), "names the backend: {stderr}");
+    assert!(
+        stderr.contains("device_sg is not set") && stderr.contains("cannot be derived"),
+        "says why: {stderr}"
+    );
+    assert!(stderr.contains("Set device_sg"), "says how to fix it: {stderr}");
+    assert!(
+        contacts(home.path()).is_empty(),
+        "a refused poll records no contact"
+    );
+}

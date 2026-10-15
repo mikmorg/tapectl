@@ -160,7 +160,9 @@ t = re.sub(r'(?m)^binary *=.*$', 'binary = "/usr/bin/dar"', t, count=1)
 t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "1M"', t, count=1)
 t = re.sub(r'(?m)^directory *=.*$', f'directory = "{run}/staging"', t, count=1)
 t = re.sub(r'(?m)^device_tape *=.*$', f'device_tape = "{tape}"', t)
-t = re.sub(r'(?m)^device_sg *=.*$', f'device_sg = "{sg}"', t)
+# device_sg is deliberately NOT written (issue #431): the gate proves the sg node
+# is derived from device_tape. `sg` stays on the argv for its callers.
+_ = sg
 # Must match an UNCOMMENTED table header: `tapectl init` writes a commented
 # [[backends.lto]] example (#124b), and a substring test sees that and wrongly
 # concludes a backend is already configured — leaving the gate with no drive.
@@ -171,7 +173,6 @@ if not re.search(r"(?m)^\[\[backends\.lto\]\]", t):
 [[backends.lto]]
 name = "gate-mhvtl"
 device_tape = "{tape}"
-device_sg = "{sg}"
 generation = "LTO-8"
 # 2 748 779 069 440 = 2.5 TiB exactly, written as a bare byte count on
 # purpose (issue #200). This string used to be "2.5T", parsed BINARY by

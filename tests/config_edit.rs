@@ -440,6 +440,83 @@ fn backend_add_still_writes_a_table_that_loads() {
     assert!(read(home.path()).contains("enospc_buffer = \"64M\""));
 }
 
+/// Issue #431: `device_sg` is optional. A drive added with only its tape
+/// node (by `backend add` or `config add`) is written without the key, the
+/// file loads, and `config check` — which stays advisory, exit 0 — names
+/// what it could not derive rather than printing an empty node. The tape
+/// node is a path that cannot exist here, so nothing real is derived.
+#[test]
+fn a_backend_without_device_sg_loads_and_config_check_names_what_it_lacks() {
+    let home = home();
+    ok(
+        home.path(),
+        &[
+            "backend",
+            "add",
+            "--name",
+            "drive-a",
+            "--device-tape",
+            "/dev/tapectl-config-edit-nonexistent-a",
+            "--generation",
+            "LTO-6",
+        ],
+    );
+    ok(
+        home.path(),
+        &[
+            "config",
+            "add",
+            "backends.lto",
+            "name=drive-b",
+            "device_tape=/dev/tapectl-config-edit-nonexistent-b",
+            "generation=LTO-6",
+        ],
+    );
+    let after = read(home.path());
+    assert!(
+        !after.lines().any(|l| l.starts_with("device_sg")),
+        "no device_sg line is written when none is given:\n{after}"
+    );
+
+    let human = String::from_utf8_lossy(&ok(home.path(), &["config", "check"]).stdout).to_string();
+    assert!(human.contains("config: valid"), "{human}");
+    for name in ["drive-a", "drive-b"] {
+        assert!(
+            human.contains(&format!("backend \"{name}\": device_sg is not set")),
+            "{name}: {human}"
+        );
+    }
+    assert!(human.contains("cannot be derived"), "{human}");
+
+    let json: serde_json::Value = serde_json::from_slice(
+        &ok(home.path(), &["config", "check", "--json"]).stdout,
+    )
+    .unwrap();
+    let devices = json["tape_devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2, "{json}");
+    for d in devices {
+        assert_eq!(d["device_sg"], "", "{d}");
+        assert_eq!(d["device_sg_derived"], false, "{d}");
+        assert!(
+            d["device_sg_pairing_problem"]
+                .as_str()
+                .is_some_and(|p| p.contains("device_sg is not set")),
+            "{d}"
+        );
+    }
+
+    // An explicit empty value is not a way to spell "absent".
+    refused(
+        home.path(),
+        &[
+            "config",
+            "set",
+            "backends.lto[drive-a].device_sg",
+            "",
+        ],
+    );
+}
+
 /// The stub an older `init` wrote (`lto = []` under `[backends]`) is the
 /// shape that made `backend add` fail once; a table added over it must load.
 #[test]

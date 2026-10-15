@@ -1251,6 +1251,9 @@ import sys
 
 cfg, staging, tape, sg, single, generation, mhvtl = sys.argv[1:8]
 _ = single  # kept for signature stability; copy policy is handled in audit_passes()
+# device_sg is deliberately NOT written (issue #431): the suite proves the sg node
+# is derived from device_tape. `sg` stays on the argv for its callers.
+_ = sg
 t = open(cfg).read()
 t = re.sub(r'(?m)^binary *=.*$', 'binary = "dar"', t, count=1)
 t = re.sub(r'(?m)^slice_size *=.*$', 'slice_size = "1M"', t, count=1)
@@ -1273,7 +1276,6 @@ if not re.search(r"(?m)^\[\[backends\.lto\]\]", t):
 [[backends.lto]]
 name = "lifecycle"
 device_tape = "{tape}"
-device_sg = "{sg}"
 generation = "{generation}"
 {override}fill_ceiling = 0.95
 enospc_buffer = "2G"
