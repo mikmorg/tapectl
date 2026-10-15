@@ -1737,7 +1737,12 @@ mod tests {
     /// Two files of `size` bytes, written and warm, planned in dar's order.
     fn two_warm_files(
         size: usize,
-    ) -> (TempDir, std::sync::Arc<SourcePlan>, std::path::PathBuf, std::path::PathBuf) {
+    ) -> (
+        TempDir,
+        std::sync::Arc<SourcePlan>,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
         let tmp = TempDir::new().unwrap();
         for name in ["a.bin", "b.bin"] {
             crate::dar::write_warm(&tmp.path().join(name), size);
@@ -1768,7 +1773,10 @@ mod tests {
         let ahead = ReadAhead::new(READ_AHEAD_BYTES).dropping_behind(base.clone(), plan.clone());
         ahead.hashed.store(total, Ordering::Release);
         ahead.drop_passed();
-        assert!(cached(&first) && cached(&second), "dar has read nothing: both stay");
+        assert!(
+            cached(&first) && cached(&second),
+            "dar has read nothing: both stay"
+        );
         ahead
             .dar_rchar
             .store(SIZE as u64 + DAR_READ_SLACK / 2, Ordering::Release);
@@ -1798,7 +1806,10 @@ mod tests {
         ahead.hashed.store(SIZE as u64, Ordering::Release);
         ahead.drop_passed();
         assert!(!cached(&first), "both are past the first file: it goes");
-        assert!(cached(&second), "the hasher is not past the second: it stays");
+        assert!(
+            cached(&second),
+            "the hasher is not past the second: it stays"
+        );
 
         // dar done: the hasher's place alone decides.
         ahead.dar_finished();
@@ -1821,7 +1832,8 @@ mod tests {
             return;
         }
         let (conn, sid) = setup_conn_with_snapshot(&[("big.bin", SIZE as i64, None)]);
-        let plan = std::sync::Arc::new(plan(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap());
+        let plan =
+            std::sync::Arc::new(plan(&conn, sid, tmp.path().to_str().unwrap(), &[]).unwrap());
         let mut ahead = ReadAhead::new(READ_AHEAD_BYTES);
         ahead.behind = Some(DropBehindBoth::new(tmp.path().to_path_buf(), plan, WINDOW));
         let page = crate::dar::page_size() as u64;
@@ -1837,7 +1849,10 @@ mod tests {
             .dar_rchar
             .store((5 << 19) + DAR_READ_SLACK, Ordering::Release);
         ahead.drop_passed();
-        assert!(gone_below(5 << 19), "what both passed goes, nothing past it");
+        assert!(
+            gone_below(5 << 19),
+            "what both passed goes, nothing past it"
+        );
         // Half a window further: nothing more yet.
         ahead
             .dar_rchar

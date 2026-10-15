@@ -182,15 +182,17 @@ pub fn spawn_archive(params: &DarCreateParams) -> Result<DarStream> {
         // domain, with EPERM. dar runs without the filter then, as it did
         // before issue #441: the filter is never a reason not to stage.
         Err(e)
-            if e.raw_os_error() == Some(nix::libc::EPERM)
-                && super::fadvise_filter_available() =>
+            if e.raw_os_error() == Some(nix::libc::EPERM) && super::fadvise_filter_available() =>
         {
             tracing::warn!(
                 error = %e,
                 "dar could not start under no_new_privs; running it without the \
                  fadvise filter, so it may read the source from disk twice (issue #441)"
             );
-            spawn(&mut with_create_args(super::command(params.dar_binary), params))
+            spawn(&mut with_create_args(
+                super::command(params.dar_binary),
+                params,
+            ))
         }
         spawned => spawned,
     }
