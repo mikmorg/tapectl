@@ -404,12 +404,35 @@ step_phase_a() {
 check install_and_rehearsal step_phase_a
 must install_and_rehearsal
 check nothing_raised_before_step_13 assert_base A 3600
-# The rehearsal leaves a sealed volume of its own throwaway catalog on the
-# cartridge; init refuses that (ADR-0003). Erase it IN THE DRIVE, as the gate's
-# resume arms do, so step 13 starts from a blank tape.
-step_blank_tape() {
-    eval "$("$REPO/scripts/mhvtl-device.sh" --tape "$DEVICE" --ensure-media)" \
-        && mt -f "$DEVICE" rewind && mt -f "$DEVICE" erase && mt -f "$DEVICE" rewind
+# #469: step 13's erase branch, driven for real. The rehearsal leaves a SEALED
+# volume of its own throwaway catalog on the cartridge; `volume init` refuses it
+# (ADR-0003) and step 13 offers `cartridge erase`, which under --auto runs only
+# when --erase-label names the label File 0 carries. A wrong word is refused
+# with the tape untouched (here); phase B passes the right one, erases, inits
+# with no --force (the verified-erase proof, #444) and writes. Until #469 this
+# harness blanked the tape with `mt erase` first, so no harness ever ran the
+# branch the production fresh start takes.
+file0_label() { # the label File 0 carries, read with mt and dd alone
+    mt -f "$DEVICE" rewind >/dev/null 2>&1 || return 1
+    dd if="$DEVICE" bs=512k count=1 2>/dev/null | tr -d '\0' | sed -n 's/^label = "\(.*\)"$/\1/p' | head -1
+}
+REHEARSAL_LABEL=""
+step_rehearsal_tape_sealed() {
+    eval "$("$REPO/scripts/mhvtl-device.sh" --tape "$DEVICE" --ensure-media)" || return 1
+    REHEARSAL_LABEL="$(file0_label)"
+    [ -n "$REHEARSAL_LABEL" ] || { echo "File 0 names no label: the rehearsal left no volume for step 13 to erase"; return 1; }
+    echo "the rehearsal's volume on the cartridge: $REHEARSAL_LABEL"
+}
+step_wrong_erase_label() {
+    local rc
+    first_run --from 13 --to 13 --erase-label "NOT-$REHEARSAL_LABEL" </dev/null >"$RUN/phase-A2.out" 2>&1; rc=$?
+    [ "$rc" -ne 0 ] || { echo "a wrong --erase-label did not stop step 13"; return 1; }
+    grep -F "does not match the tape in the drive" "$RUN/phase-A2.out" >/dev/null \
+        || { echo "step 13 did not refuse the wrong word by name:"; tail -20 "$RUN/phase-A2.out"; return 1; }
+    [ "$(file0_label)" = "$REHEARSAL_LABEL" ] \
+        || { echo "File 0 changed although step 13 was refused before erasing"; return 1; }
+    [ "$(sql "SELECT COUNT(*) FROM volumes WHERE label = ?" "$LABEL")" = 0 ] \
+        || { echo "the refused run left a volume row for $LABEL"; return 1; }
 }
 # #393: after step 7, the operator reads `status` with the ops group alone
 # (no sudo to the service user), and step 7 said it checked that itself.
@@ -432,15 +455,17 @@ step_ops_group_status() {
     fi
 }
 check ops_group_status step_ops_group_status
-check blank_tape step_blank_tape
-must blank_tape
+check rehearsal_tape_sealed step_rehearsal_tape_sealed
+must rehearsal_tape_sealed
+check wrong_erase_label_refused step_wrong_erase_label
+must wrong_erase_label_refused
 
 # ---------- phase B: the write, cut short ----------
-echo "fr414: phase B — first-run.sh --from 13, $SIG once the write is part-way; output $RUN/phase-B.out"
+echo "fr414: phase B — first-run.sh --from 13 --erase-label <the rehearsal's label>: erase, init with no --force, $SIG once the write is part-way; output $RUN/phase-B.out"
 step_phase_b() {
     local fr_pid poll_rc fr_rc
     sampler_start B
-    first_run --from 13 --to 13 </dev/null >"$RUN/phase-B.out" 2>&1 &
+    first_run --from 13 --to 13 --erase-label "$REHEARSAL_LABEL" </dev/null >"$RUN/phase-B.out" 2>&1 &
     fr_pid=$!
     # The poller runs as the service user so it can read the 0700 catalog and
     # signal the tapectl process (same uid) the moment the state is right.
@@ -514,8 +539,23 @@ PY
     grep "write did not seal" "$RUN/phase-B.out" >/dev/null \
         || { echo "phase-B.out does not show step 13 dying at the write"; tail -30 "$RUN/phase-B.out"; return 1; }
 }
+# #469 / #444: the write above began on a tape step 13 erased itself.
+step_erased_then_inited_without_force() {
+    local proof
+    grep -F "the tape is erased, read back and recorded" "$RUN/phase-B.out" >/dev/null \
+        || { echo "phase-B.out shows no cartridge erase"; return 1; }
+    if grep -E 'volume init .*--force' "$RUN/phase-B.out" >/dev/null; then
+        echo "step 13 forced volume init after the erase"; return 1
+    fi
+    proof="$(sql "SELECT json_extract(e.details, '\$.blank_proof.kind') FROM events e
+                  JOIN volumes v ON v.id = e.entity_id
+                  WHERE e.entity_type = 'volume' AND e.action = 'created' AND v.label = ?" "$LABEL")"
+    [ "$proof" = verified_erase ] \
+        || { echo "volume $LABEL was created with blank proof '${proof:-none}', want verified_erase"; return 1; }
+}
 check write_cut_short step_phase_b
 must write_cut_short
+check erased_then_inited_without_force step_erased_then_inited_without_force
 check priority_phase_b assert_prio B "volume write"
 check raise_notice_phase_b assert_raised_notice "$RUN/phase-B.out"
 # The positive control: the catalog must show the session cut short. A KILL
