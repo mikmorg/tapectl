@@ -1668,6 +1668,19 @@ step_rust_motions() {
 }
 check rust_motions      step_rust_motions
 
+# Issue #416 item 9: a 2 GiB write and full confirm through the real write
+# session into a MemStore, timed against this machine's own sha256 (so a loaded
+# box does not fail it; an order-of-magnitude slowdown does). It holds in a
+# debug build (measured 2026-10-15: 1.09x of two hash passes, ceiling 3x, ~80 s,
+# 2 GiB of memory), so the gate needs no release build. No tape.
+step_perf_write_2g() {
+    flock -w 1200 -E 99 /scratch/tapectl-build.lock \
+        env TAPECTL_PERF_TESTS=1 \
+        cargo test --test performance perf_a_2gib_write_and_full_confirm_through_a_store \
+            -- --ignored --nocapture
+}
+check perf_write_2g     step_perf_write_2g
+
 # ---------- verdict: compare against the EXPECTED_FAIL manifest ----------
 echo
 echo "== gate verdict =="
