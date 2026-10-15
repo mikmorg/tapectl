@@ -65,6 +65,7 @@ use rusqlite::types::Value;
 use rusqlite::{params, Connection};
 use tracing::warn;
 
+use crate::db::busy::{self, BusyPolicy};
 use crate::error::Result;
 use crate::tape::health::HealthCounters;
 
@@ -650,6 +651,13 @@ pub fn insert(conn: &Connection, row: &JournalRow) -> rusqlite::Result<i64> {
 /// Journal every capture of a sweep, in the order read, best-effort: a
 /// refused INSERT warns and is skipped. Bookkeeping must never become a new
 /// way for a tape command to fail. Returns the ids written.
+///
+/// Each INSERT waits out a busy catalog ([`BusyPolicy::DEFAULT`], issue
+/// #466): a command's sweep lands after its work, and a stage finalization
+/// elsewhere can hold the write lock for minutes (154 s measured, #372).
+/// Page 0x2E exists only in memory at this point (ADR-0013: a read-to-clear
+/// page is read once and journalled verbatim), so a plain INSERT that gave up
+/// after `busy_timeout` lost the reading for good.
 pub fn record_sweep(
     conn: &Connection,
     contact_id: Option<i64>,
@@ -657,20 +665,109 @@ pub fn record_sweep(
     device_tape: Option<&str>,
     sweep: &Sweep,
 ) -> Vec<i64> {
+    record_sweep_with_policy(
+        BusyPolicy::DEFAULT,
+        conn,
+        contact_id,
+        trigger,
+        device_tape,
+        sweep,
+    )
+}
+
+/// [`record_sweep`] under `policy` — the seam a test shrinks and the form
+/// `record_sweep` calls with the production policy. A row that still cannot
+/// be written when the policy runs out is reported on stderr and in the
+/// session log by [`lost_capture_line`] if it is page 0x2E, and never fails
+/// the command.
+pub fn record_sweep_with_policy(
+    policy: BusyPolicy,
+    conn: &Connection,
+    contact_id: Option<i64>,
+    trigger: &str,
+    device_tape: Option<&str>,
+    sweep: &Sweep,
+) -> Vec<i64> {
+    record_sweep_reporting(
+        policy,
+        conn,
+        contact_id,
+        trigger,
+        device_tape,
+        sweep,
+        &mut |line| {
+            crate::progress::stderr_println(line);
+            crate::progress::log(line);
+        },
+    )
+}
+
+/// The page whose bytes are the only copy of the reading: SSC-3 describes
+/// TapeAlert as cleared when read (ADR-0013, "Two hazards").
+const READ_TO_CLEAR_PAGE: u8 = 0x2e;
+
+/// [`record_sweep_with_policy`] with the "could not be journalled" sink
+/// injected. The budget is the SWEEP's, not each row's: once it is spent the
+/// remaining captures get one attempt each (a `busy_timeout` wait), so a
+/// wedged lock holder costs a sweep of thirteen pages seconds, not hours.
+fn record_sweep_reporting(
+    policy: BusyPolicy,
+    conn: &Connection,
+    contact_id: Option<i64>,
+    trigger: &str,
+    device_tape: Option<&str>,
+    sweep: &Sweep,
+    lost: &mut dyn FnMut(&str),
+) -> Vec<i64> {
+    let started = std::time::Instant::now();
     let mut ids = Vec::with_capacity(sweep.captures.len());
     for capture in &sweep.captures {
         let row = JournalRow::from_capture(contact_id, trigger, device_tape, capture);
-        match insert(conn, &row) {
+        let left = BusyPolicy {
+            budget: policy.budget.saturating_sub(started.elapsed()),
+            ..policy
+        };
+        match busy::retry(left, "a log page's journal row", || Ok(insert(conn, &row)?)) {
             Ok(id) => ids.push(id),
-            Err(e) => warn!(
-                err = %e,
-                page = format!("0x{:02x}", capture.page_code),
-                trigger,
-                "log_page_journal insert failed"
-            ),
+            Err(e) => {
+                warn!(
+                    err = %e,
+                    page = format!("0x{:02x}", capture.page_code),
+                    trigger,
+                    "log_page_journal insert failed"
+                );
+                if capture.page_code == READ_TO_CLEAR_PAGE {
+                    if let Some(line) = lost_capture_line(capture, trigger, &e.to_string()) {
+                        lost(&line);
+                    }
+                }
+            }
         }
     }
     ids
+}
+
+/// What the operator is told when page 0x2E's journal row could not be
+/// written: the reading's bytes in hex, so it can still be put back by hand
+/// (`INSERT INTO log_page_journal`) — the drive will not say it twice. `None`
+/// for a read that failed or returned no bytes: it has nothing to preserve,
+/// and its page can be read again.
+fn lost_capture_line(capture: &PageCapture, trigger: &str, why: &str) -> Option<String> {
+    let raw = capture
+        .raw
+        .as_deref()
+        .filter(|r| capture.ok() && !r.is_empty())?;
+    let hex: Vec<String> = raw.iter().map(|b| format!("{b:02x}")).collect();
+    Some(format!(
+        "warning: the catalog could not record page 0x{:02x} read from {} at {} during \
+         \"{trigger}\" ({why}). It may be cleared by being read, so its bytes are kept \
+         here instead ({} bytes, hex): {}",
+        capture.page_code,
+        capture.device_sg,
+        capture.captured_at,
+        raw.len(),
+        hex.join(" ")
+    ))
 }
 
 // ── Reading it back: parse it later ──────────────────────────────────────
@@ -2102,6 +2199,198 @@ pub(crate) mod tests {
         assert_eq!(
             record_sweep(&conn, Some(contact), "volume write", None, &s).len(),
             LISTED.len()
+        );
+    }
+
+    // ── a busy catalog (issue #466) ──
+
+    /// A file-backed catalog whose connection gives up on a lock after 20 ms,
+    /// so any wait longer than that is the retry policy's, never SQLite's own
+    /// `busy_timeout`.
+    pub(crate) fn file_catalog() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("tapectl.db")).unwrap();
+        conn.busy_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        (dir, conn)
+    }
+
+    /// Another connection takes the catalog's write lock NOW (before this
+    /// returns) and gives it back `hold` later, from its own thread. Join the
+    /// handle when the test is done with the lock.
+    pub(crate) fn hold_write_lock(
+        dir: &tempfile::TempDir,
+        hold: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let holder = crate::db::open(&dir.path().join("tapectl.db")).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            holder.execute_batch("ROLLBACK").unwrap();
+        })
+    }
+
+    fn journal_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM log_page_journal", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A command's sweep lands after its work, and a writer elsewhere (a stage
+    /// finalization held the lock 154 s, #372) can still hold the catalog:
+    /// the sweep waits for the lock rather than give up after `busy_timeout`
+    /// and lose page 0x2E, which exists only in memory.
+    #[test]
+    fn a_busy_catalog_is_waited_out_and_every_capture_is_journalled() {
+        let s = sweep(&mut FixtureSource::default());
+        let (dir, conn) = file_catalog();
+        let contact = open_contact(&conn);
+        let release = hold_write_lock(&dir, std::time::Duration::from_millis(400));
+        let ids = record_sweep(&conn, Some(contact), "volume write", None, &s);
+        release.join().unwrap();
+        assert_eq!(
+            ids.len(),
+            LISTED.len(),
+            "every capture is journalled once the lock frees"
+        );
+        assert_eq!(journal_rows(&conn), LISTED.len() as i64);
+    }
+
+    /// A policy that gives up fast, for a lock that never frees in a test.
+    fn quick_policy() -> BusyPolicy {
+        BusyPolicy {
+            budget: std::time::Duration::from_millis(150),
+            first_pause: std::time::Duration::from_millis(10),
+            max_pause: std::time::Duration::from_millis(20),
+        }
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Past the bound the command still does not fail, and page 0x2E — the
+    /// one reading that may exist nowhere else — is put in front of the
+    /// operator in hex. Only that page: the rest can be read again.
+    #[test]
+    fn a_lock_held_past_the_bound_reports_the_0x2e_bytes_and_fails_nothing() {
+        let s = sweep(&mut FixtureSource::default());
+        let (dir, conn) = file_catalog();
+        let contact = open_contact(&conn);
+        // Held for longer than the whole sweep can take if its budget is the
+        // SWEEP's (150 ms, then a quick attempt per page: well under a
+        // second) but shorter than thirteen full budgets would be: a policy
+        // applied per row would outlast the lock and journal the late pages.
+        let release = hold_write_lock(&dir, std::time::Duration::from_secs(1));
+        let mut lines = Vec::new();
+        let ids = record_sweep_reporting(
+            quick_policy(),
+            &conn,
+            Some(contact),
+            "volume write",
+            None,
+            &s,
+            &mut |l| lines.push(l.to_string()),
+        );
+        release.join().unwrap();
+        assert!(
+            ids.is_empty(),
+            "nothing could be written while the lock was held: {ids:?}"
+        );
+        assert_eq!(journal_rows(&conn), 0);
+        assert_eq!(lines.len(), 1, "one line, for page 0x2E only: {lines:?}");
+        let want = hex_of(
+            fixture_pages()
+                .iter()
+                .find(|(p, _, _)| *p == 0x2e)
+                .unwrap()
+                .1,
+        );
+        assert!(
+            lines[0].contains(&want),
+            "the whole page, in hex: {lines:?}"
+        );
+        assert!(lines[0].contains("page 0x2e"), "{lines:?}");
+        assert!(lines[0].contains("volume write"), "{lines:?}");
+
+        // Positive control: with the lock free the same sweep journals all
+        // thirteen and reports nothing.
+        let mut lines = Vec::new();
+        let ids = record_sweep_reporting(
+            quick_policy(),
+            &conn,
+            Some(contact),
+            "volume write",
+            None,
+            &s,
+            &mut |l| lines.push(l.to_string()),
+        );
+        assert_eq!(ids.len(), LISTED.len());
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// A failed read has no bytes to preserve, so a lost row for it says
+    /// nothing; and the sink production uses writes the session log.
+    #[test]
+    fn the_production_sink_writes_the_session_log() {
+        let s = sweep(&mut FixtureSource::default());
+        let (dir, conn) = file_catalog();
+        let contact = open_contact(&conn);
+        let logs = tempfile::tempdir().unwrap();
+        let release = hold_write_lock(&dir, std::time::Duration::from_secs(1));
+        let path;
+        {
+            let session = crate::progress::start_session(
+                Some(logs.path()),
+                "volume write L6-0001",
+                crate::progress::Display::Off,
+                false,
+            );
+            path = session.log_path().unwrap().to_path_buf();
+            record_sweep_with_policy(
+                quick_policy(),
+                &conn,
+                Some(contact),
+                "volume write",
+                None,
+                &s,
+            );
+        }
+        release.join().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let want = hex_of(
+            fixture_pages()
+                .iter()
+                .find(|(p, _, _)| *p == 0x2e)
+                .unwrap()
+                .1,
+        );
+        assert!(
+            text.contains(&want),
+            "the session log keeps the bytes: {text}"
+        );
+
+        let mut failed = FixtureSource::default();
+        failed.fail.insert(0x2e);
+        let s = sweep(&mut failed);
+        let mut lines = Vec::new();
+        let release = hold_write_lock(&dir, std::time::Duration::from_secs(1));
+        record_sweep_reporting(
+            quick_policy(),
+            &conn,
+            Some(contact),
+            "volume write",
+            None,
+            &s,
+            &mut |l| lines.push(l.to_string()),
+        );
+        release.join().unwrap();
+        assert!(
+            lines.is_empty(),
+            "a failed read has no bytes to keep: {lines:?}"
         );
     }
 

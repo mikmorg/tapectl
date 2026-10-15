@@ -90,6 +90,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tracing::warn;
 
 use crate::config::{Config, LtoBackendConfig};
+use crate::db::busy::{self, BusyPolicy};
 use crate::error::Result;
 use crate::tape::drive_identity::{self, DriveIdentity};
 use crate::tape::log_pages::LogSource;
@@ -760,7 +761,19 @@ impl<'a> ContactGuard<'a> {
     /// contact with a `closed_at` always has one when its node publishes
     /// `stats/` — and a contact dropped without `finish` has none, for the
     /// same reason it has no outcome.
-    pub fn finish(mut self, outcome: &str, detail: Option<&str>) {
+    ///
+    /// The closing UPDATE waits out a busy catalog ([`BusyPolicy::DEFAULT`],
+    /// issue #466): one that gave up left `closed_at` NULL, and a NULL
+    /// `closed_at` reads exactly like a crash. The two kernel-counter
+    /// captures before it are written once, as before — they are readings of
+    /// the instant, and a lock that outlasts `busy_timeout` there warns.
+    pub fn finish(self, outcome: &str, detail: Option<&str>) {
+        self.finish_with_policy(BusyPolicy::DEFAULT, outcome, detail);
+    }
+
+    /// [`finish`](ContactGuard::finish) under `policy` — the seam a test
+    /// shrinks.
+    pub fn finish_with_policy(mut self, policy: BusyPolicy, outcome: &str, detail: Option<&str>) {
         self.finished = true;
         // Issue #344: the MTIOCGET readings the device noted under this
         // contact, journalled verbatim.
@@ -781,12 +794,14 @@ impl<'a> ContactGuard<'a> {
         let Some(id) = self.id else {
             return;
         };
-        if let Err(e) = self.conn.execute(
-            "UPDATE cartridge_contacts
-                SET closed_at = datetime('now'), outcome = ?2, detail = ?3
-              WHERE id = ?1",
-            params![id, outcome, detail],
-        ) {
+        if let Err(e) = busy::retry(policy, "the contact's close", || {
+            Ok(self.conn.execute(
+                "UPDATE cartridge_contacts
+                    SET closed_at = datetime('now'), outcome = ?2, detail = ?3
+                  WHERE id = ?1",
+                params![id, outcome, detail],
+            )?)
+        }) {
             warn!(err = %e, contact_id = id, "cartridge_contacts close failed");
         }
     }
@@ -1429,6 +1444,67 @@ pub(crate) mod tests {
             .query_row("SELECT detail FROM cartridge_contacts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(detail.as_deref(), Some("2 slices mismatched"));
+    }
+
+    /// `finish`'s UPDATE waits out a busy catalog (issue #466): a refusal
+    /// there left `closed_at` NULL, which reads exactly like a crash.
+    #[test]
+    fn finish_waits_out_a_busy_catalog_instead_of_reading_as_a_crash() {
+        use crate::tape::log_pages::tests::{file_catalog, hold_write_lock};
+        let (dir, conn) = file_catalog();
+        let config = config_with_backend();
+        let mam = mam_with_serial(None, Some(7));
+        let guard = ContactGuard::open(
+            &conn,
+            &config,
+            Operation::VolumeWrite,
+            "/dev/null",
+            None,
+            Medium::Observed {
+                backend: &backend(),
+                mam: &mam,
+            },
+        );
+        let release = hold_write_lock(&dir, std::time::Duration::from_millis(400));
+        guard.finish(OUTCOME_OK, None);
+        release.join().unwrap();
+        let row = only_row(&conn);
+        assert!(row.8.is_some(), "closed_at is set once the lock frees");
+        assert_eq!(row.9.as_deref(), Some(OUTCOME_OK));
+    }
+
+    /// Past the bound a refused close warns and the command goes on: the
+    /// contact stays open (`closed_at` NULL), as a crash leaves it, but
+    /// nothing fails.
+    #[test]
+    fn finish_past_the_bound_gives_up_without_failing() {
+        use crate::tape::log_pages::tests::{file_catalog, hold_write_lock};
+        let (dir, conn) = file_catalog();
+        let config = config_with_backend();
+        let mam = mam_with_serial(None, Some(7));
+        let guard = ContactGuard::open(
+            &conn,
+            &config,
+            Operation::VolumeWrite,
+            "/dev/null",
+            None,
+            Medium::Observed {
+                backend: &backend(),
+                mam: &mam,
+            },
+        );
+        let release = hold_write_lock(&dir, std::time::Duration::from_millis(600));
+        guard.finish_with_policy(
+            BusyPolicy {
+                budget: std::time::Duration::from_millis(100),
+                first_pause: std::time::Duration::from_millis(10),
+                max_pause: std::time::Duration::from_millis(20),
+            },
+            OUTCOME_OK,
+            None,
+        );
+        release.join().unwrap();
+        assert_eq!(only_row(&conn).8, None, "the close was given up on");
     }
 
     /// The crash case, asserted directly rather than left untested because

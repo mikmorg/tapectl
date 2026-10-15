@@ -366,17 +366,18 @@ fn record(
     }
     let collected = sweep.health(header);
     if let Some((counters, raw)) = &collected {
-        if let Err(e) = busy::retry(policy, "a drive poll's health reading", || {
-            health::record(
-                conn,
-                None,
-                Some(contact_id),
-                None,
-                Reading::Poll,
-                counters,
-                raw,
-            )
-        }) {
+        // The policy is the poll's own (injectable), applied once: not
+        // `health::record`, whose default budget would nest inside it.
+        if let Err(e) = health::record_with_policy(
+            policy,
+            conn,
+            None,
+            Some(contact_id),
+            None,
+            Reading::Poll,
+            counters,
+            raw,
+        ) {
             unrecorded.push(format!("the reading's health_logs row ({e})"));
         }
         identity.backfill_from_sg_logs_header(raw);

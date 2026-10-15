@@ -29,6 +29,7 @@
 //! health` surfaces and labels both so a summary never claims a cleaner
 //! picture than the drive is reporting.
 
+use crate::db::busy::{self, BusyPolicy};
 use crate::error::Result;
 use rusqlite::{params, Connection};
 
@@ -399,7 +400,54 @@ impl Reading {
 /// §7 requires every row to record its observer — "parse it later" needs to
 /// know which build wrote the parsed columns beside the raw text, or a parser
 /// bug fixed in a later version is indistinguishable from a hardware change.
+///
+/// The INSERT waits out a busy catalog ([`BusyPolicy::DEFAULT`], issue
+/// #466) as the journal rows written beside it do: a command's reading
+/// lands after its work, when another writer may hold the catalog for
+/// minutes. Past the policy it is [`crate::error::TapectlError::CatalogBusy`],
+/// which every caller treats as a warning, never as a failed command.
 pub fn record(
+    conn: &Connection,
+    volume_id: Option<i64>,
+    contact_id: Option<i64>,
+    session_id: Option<i64>,
+    operation: Reading,
+    counters: &HealthCounters,
+    raw_log: &str,
+) -> Result<()> {
+    record_with_policy(
+        BusyPolicy::DEFAULT,
+        conn,
+        volume_id,
+        contact_id,
+        session_id,
+        operation,
+        counters,
+        raw_log,
+    )
+}
+
+/// [`record`] under `policy` — the form `drive poll` calls with its own
+/// (injectable) policy, so the wait is bounded once, not nested.
+#[allow(clippy::too_many_arguments)]
+pub fn record_with_policy(
+    policy: BusyPolicy,
+    conn: &Connection,
+    volume_id: Option<i64>,
+    contact_id: Option<i64>,
+    session_id: Option<i64>,
+    operation: Reading,
+    counters: &HealthCounters,
+    raw_log: &str,
+) -> Result<()> {
+    busy::retry(policy, "a health reading", || {
+        insert_reading(
+            conn, volume_id, contact_id, session_id, operation, counters, raw_log,
+        )
+    })
+}
+
+fn insert_reading(
     conn: &Connection,
     volume_id: Option<i64>,
     contact_id: Option<i64>,
@@ -849,6 +897,30 @@ Read error counter page  [0x3]
         assert_eq!(c.total_bytes_processed, None);
         assert_eq!(c.total_rewritten, None, "0x02 only");
         assert_eq!(c.total_retries, Some(0), "0x03 only, and 0x03 was read");
+    }
+
+    /// The reading's `health_logs` row waits out a busy catalog as the
+    /// journal rows beside it do (issue #466), instead of being warned away.
+    #[test]
+    fn record_waits_out_a_busy_catalog() {
+        use crate::tape::log_pages::tests::{file_catalog, hold_write_lock};
+        let (dir, conn) = file_catalog();
+        let release = hold_write_lock(&dir, std::time::Duration::from_millis(400));
+        let r = record(
+            &conn,
+            None,
+            None,
+            None,
+            Reading::Write,
+            &HealthCounters::default(),
+            "raw",
+        );
+        release.join().unwrap();
+        r.expect("the lock frees within the retry policy");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM health_logs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]
