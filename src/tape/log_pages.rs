@@ -2230,6 +2230,62 @@ pub(crate) mod tests {
         })
     }
 
+    /// The write lock, held by another connection until [`HeldLock::release`]
+    /// — no clock decides when it frees, so a test that needs it held for
+    /// the whole of a call cannot flake on a loaded machine.
+    pub(crate) struct HeldLock {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HeldLock {
+        /// Give the lock back and wait until it is.
+        pub(crate) fn release(mut self) {
+            drop(self.release.take());
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    impl Drop for HeldLock {
+        /// A test that panics with the lock held still lets it go (the
+        /// holder thread sees the channel close).
+        fn drop(&mut self) {
+            drop(self.release.take());
+        }
+    }
+
+    /// [`hold_write_lock`] with no timer: the lock is taken now (before this
+    /// returns) and kept until the test calls [`HeldLock::release`].
+    pub(crate) fn hold_write_lock_until_released(dir: &tempfile::TempDir) -> HeldLock {
+        let holder = crate::db::open(&dir.path().join("tapectl.db")).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // Returns when the sender is dropped (`release`, or a panic).
+            let _ = held.recv();
+            holder.execute_batch("ROLLBACK").unwrap();
+        });
+        HeldLock {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    thread_local! {
+        /// How many times THIS thread's connection was refused the write
+        /// lock since it was last reset (see [`refuse_and_count`]).
+        static REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A busy handler that counts the attempt and refuses at once, so a test
+    /// can count the retry policy's attempts instead of timing its waits.
+    /// SQLite calls it once per refused attempt (this one never waits, so it
+    /// is never called twice for one).
+    fn refuse_and_count(_prior_calls: i32) -> bool {
+        REFUSED.with(|n| n.set(n.get() + 1));
+        false
+    }
+
     fn journal_rows(conn: &Connection) -> i64 {
         conn.query_row("SELECT COUNT(*) FROM log_page_journal", [], |r| r.get(0))
             .unwrap()
@@ -2275,19 +2331,32 @@ pub(crate) mod tests {
     /// Past the bound the command still does not fail, and page 0x2E — the
     /// one reading that may exist nowhere else — is put in front of the
     /// operator in hex. Only that page: the rest can be read again.
+    ///
+    /// And the budget is the SWEEP's, not each row's. Counted, not timed: the
+    /// lock is held until the sweep has returned, every refused attempt is
+    /// counted (the connection's busy handler refuses at once), and the
+    /// sweep's attempts have a HARD upper bound — the first row makes at
+    /// most `budget / pause + 1` (every sleep lasts at least its pause), and
+    /// each of the other twelve exactly one, its share being spent. A
+    /// per-row budget would make about thirteen times the first row's, eight
+    /// or so times the bound here; the bound cannot be exceeded by the
+    /// right code on any machine, however loaded.
     #[test]
     fn a_lock_held_past_the_bound_reports_the_0x2e_bytes_and_fails_nothing() {
         let s = sweep(&mut FixtureSource::default());
         let (dir, conn) = file_catalog();
         let contact = open_contact(&conn);
-        // Held for longer than the whole sweep can take if its budget is the
-        // SWEEP's (150 ms, then a quick attempt per page: well under a
-        // second) but shorter than thirteen full budgets would be: a policy
-        // applied per row would outlast the lock and journal the late pages.
-        let release = hold_write_lock(&dir, std::time::Duration::from_secs(1));
+        conn.busy_handler(Some(refuse_and_count)).unwrap();
+        let policy = BusyPolicy {
+            budget: std::time::Duration::from_millis(200),
+            first_pause: std::time::Duration::from_millis(10),
+            max_pause: std::time::Duration::from_millis(10),
+        };
+        let held = hold_write_lock_until_released(&dir);
+        REFUSED.with(|n| n.set(0));
         let mut lines = Vec::new();
         let ids = record_sweep_reporting(
-            quick_policy(),
+            policy,
             &conn,
             Some(contact),
             "volume write",
@@ -2295,12 +2364,29 @@ pub(crate) mod tests {
             &s,
             &mut |l| lines.push(l.to_string()),
         );
-        release.join().unwrap();
+        let attempts = REFUSED.with(|n| n.get());
+        held.release();
+
         assert!(
             ids.is_empty(),
             "nothing could be written while the lock was held: {ids:?}"
         );
         assert_eq!(journal_rows(&conn), 0);
+        let first_row_at_most =
+            (policy.budget.as_millis() / policy.first_pause.as_millis()) as usize + 1;
+        let bound = first_row_at_most + (LISTED.len() - 1);
+        assert!(
+            attempts >= LISTED.len(),
+            "every capture was tried at least once: {attempts}"
+        );
+        assert!(
+            attempts <= bound,
+            "the budget is the sweep's: {attempts} attempts, at most {bound} \
+             ({first_row_at_most} for the first row, one for each of the other {}); a \
+             per-row budget makes about {}",
+            LISTED.len() - 1,
+            LISTED.len() * first_row_at_most
+        );
         assert_eq!(lines.len(), 1, "one line, for page 0x2E only: {lines:?}");
         let want = hex_of(
             fixture_pages()
@@ -2340,7 +2426,8 @@ pub(crate) mod tests {
         let (dir, conn) = file_catalog();
         let contact = open_contact(&conn);
         let logs = tempfile::tempdir().unwrap();
-        let release = hold_write_lock(&dir, std::time::Duration::from_secs(1));
+        // Held until the sweep has returned: no clock decides what it lost.
+        let held = hold_write_lock_until_released(&dir);
         let path;
         {
             let session = crate::progress::start_session(
@@ -2359,7 +2446,12 @@ pub(crate) mod tests {
                 &s,
             );
         }
-        release.join().unwrap();
+        held.release();
+        assert_eq!(
+            journal_rows(&conn),
+            0,
+            "positive control: the lock was held for the whole sweep"
+        );
         let text = std::fs::read_to_string(&path).unwrap();
         let want = hex_of(
             fixture_pages()
@@ -2377,8 +2469,8 @@ pub(crate) mod tests {
         failed.fail.insert(0x2e);
         let s = sweep(&mut failed);
         let mut lines = Vec::new();
-        let release = hold_write_lock(&dir, std::time::Duration::from_secs(1));
-        record_sweep_reporting(
+        let held = hold_write_lock_until_released(&dir);
+        let ids = record_sweep_reporting(
             quick_policy(),
             &conn,
             Some(contact),
@@ -2387,7 +2479,11 @@ pub(crate) mod tests {
             &s,
             &mut |l| lines.push(l.to_string()),
         );
-        release.join().unwrap();
+        held.release();
+        assert!(
+            ids.is_empty(),
+            "positive control: the lock held, so the failed read's row WAS lost"
+        );
         assert!(
             lines.is_empty(),
             "a failed read has no bytes to keep: {lines:?}"
