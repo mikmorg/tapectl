@@ -2062,8 +2062,18 @@ tapectl cannot resolve on its own, not a risk to accept.
 
 Variants of the same fact: `wrong tape: volume "<label>" is uuid <a> in this
 catalog, but the loaded cartridge's File 0 carries uuid <b> under the same
-label` (a label reused after a retire), and `wrong cartridge: …` when the chip
-serial disagrees. `volume identify` shows what is loaded, and needs no key:
+label` (a label reused after a retire), `wrong tape: the loaded tape's File 0
+names volume "<on tape>", but this catalog knows that uuid (<uuid>) as
+"<label>"` (the catalog knows the tape under another label), and `wrong
+cartridge: …` when the chip serial disagrees. `volume verify` and `restore`
+with no label find the volume from File 0's uuid and refuse the same way; a
+refusal after the drive was opened is recorded as a `failed` contact, as a
+labelled one is. `volume identify` shows what is loaded, and needs no key. It
+prints File 0, then a `catalog:` line on stderr (`this tape is volume "<label>"
+(status <status>)`, or `no volume with that uuid` for a tape this catalog has
+never seen) and exits 0. When the tape contradicts the catalog, including the
+wrong-tape cases above, it prints a `warning: this tape contradicts the
+catalog.` block and exits 2:
 
 ```bash
 tapectl volume identify
