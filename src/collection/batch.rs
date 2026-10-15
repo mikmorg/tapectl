@@ -955,6 +955,69 @@ mod tests {
         );
     }
 
+    /// Issue #440, the pin taken BEFORE the release rule was lifted out of
+    /// this module: the batch's release is all-or-nothing. Two units in one
+    /// batch, `alpha` covered (2/2) and `beta` short (1/2): NEITHER is
+    /// released and only `beta` is named. Stage once, write N times (§11) —
+    /// a copy two that finds only `beta` staged would not carry the same
+    /// content as copy one.
+    #[test]
+    fn a_batch_with_one_short_unit_releases_none_of_its_units() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        let dir_guard = tempfile::tempdir().unwrap();
+        let config = config_with_staging_dir(dir_guard.path(), 2);
+        let (_, alpha_file) = seed_unit_with_n_completed_copies_and_staged_file(
+            &conn,
+            tenant_id,
+            dir_guard.path(),
+            "testlib/alpha",
+            2,
+        );
+        let (_, beta_file) = seed_unit_with_n_completed_copies_and_staged_file(
+            &conn,
+            tenant_id,
+            dir_guard.path(),
+            "testlib/beta",
+            1,
+        );
+        let batch = Batch {
+            units: vec![
+                PendingUnit {
+                    name: "testlib/alpha".into(),
+                    size_bytes: 10,
+                },
+                PendingUnit {
+                    name: "testlib/beta".into(),
+                    size_bytes: 10,
+                },
+            ],
+            total_bytes: 20,
+            padded_bytes: 20,
+        };
+
+        let (cleaned, under_copied) = release_if_covered(&conn, &config, &batch).unwrap();
+        assert!(cleaned.is_none(), "one short unit keeps the whole batch");
+        assert_eq!(under_copied.len(), 1, "{under_copied:?}");
+        assert_eq!(
+            (
+                under_copied[0].unit_name.as_str(),
+                under_copied[0].copies,
+                under_copied[0].min_copies
+            ),
+            ("testlib/beta", 1, 2)
+        );
+        assert!(
+            alpha_file.exists() && beta_file.exists(),
+            "neither unit's staged bytes are released while any unit of the batch is short"
+        );
+    }
+
     /// Issue #284, P2: what the three [`release_if_covered`] tests above
     /// cannot prove — that [`execute_batch`] still actually calls
     /// `release_if_covered` for its release step, rather than an unscoped
