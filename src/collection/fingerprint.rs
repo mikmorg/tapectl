@@ -158,6 +158,12 @@ fn walk_fingerprint(unit_path: &Path, global_excludes: &[String]) -> Result<Vec<
         if crate::staging::exclude::is_excluded(path, &exclude_compiled) {
             continue;
         }
+        // Lossy on purpose (issue #465): `staging::walk_directory` refuses a
+        // name that is not UTF-8 at `snapshot create`, so such a unit never
+        // has a snapshot to be compared with and stays pending, and the
+        // refusal reaches the operator from the snapshot, naming the path.
+        // An `Err` from here would be reported by
+        // `pending_units_for_collection` as a refused dotfile, which it is not.
         let rel = path
             .strip_prefix(unit_path)
             .unwrap_or(path)

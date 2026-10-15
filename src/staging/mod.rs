@@ -2384,14 +2384,9 @@ fn walk_directory(
         });
     for entry in walker {
         let entry = entry.map_err(|e| TapectlError::Other(e.to_string()))?;
-        let rel_path = entry
-            .path()
-            .strip_prefix(base)
-            .unwrap_or(entry.path())
-            .to_string_lossy()
-            .to_string();
+        let rel = entry.path().strip_prefix(base).unwrap_or(entry.path());
 
-        if rel_path.is_empty() {
+        if rel.as_os_str().is_empty() {
             continue; // skip root
         }
 
@@ -2410,6 +2405,21 @@ fn walk_directory(
         if !is_dir && exclude::is_excluded(entry.path(), &exclude_compiled) {
             continue;
         }
+        // Issue #465: names are recorded as UTF-8 text, and one that is not
+        // used to be stored lossily — every stage of the unit then failed as
+        // "source file missing", and two names that collapsed to the same
+        // text collided on the paths index. Refused here, once, naming the
+        // path (`{:?}` escapes the bytes that are not UTF-8). Checked after
+        // the exclusion above: a name dar will not archive is not recorded
+        // and not a reason to refuse. A symlink's target is not a name tapectl
+        // looks up, and stays lossy.
+        let Some(rel_path) = rel.to_str().map(str::to_string) else {
+            return Err(TapectlError::Other(format!(
+                "cannot record the file name {rel:?} under {path}: it is not valid UTF-8, \
+                 and tapectl records and looks up names as text. Rename it (for example \
+                 with `convmv -f latin1 -t utf8`), or move it out of the unit"
+            )));
+        };
         // lstat's own size for the entry — for a symlink this is the length
         // of the *target path string*, not any real content size. Kept
         // as-is (not zeroed for a symlink/special below): it's what
@@ -4570,6 +4580,54 @@ mod tests {
             "a directory inside a pruned subtree is not recorded, as dar -D does not store it"
         );
         assert_eq!(recorded(".cache/cached-top.bin"), 0);
+    }
+
+    /// Issue #465 item 4: a file name that is not UTF-8 was stored lossily
+    /// (`to_string_lossy`), so every stage of the unit was refused as "source
+    /// file missing" and two names that collapsed to the same text collided
+    /// on the paths index. `snapshot create` refuses it instead, naming the
+    /// path with the bytes that are not UTF-8 escaped. A name inside an
+    /// excluded subtree is not archived, so it is not refused.
+    #[test]
+    fn snapshot_create_refuses_a_file_name_that_is_not_utf8_naming_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+        for (dir, shown) in [("", "caf\\xE9.txt"), ("sub", "sub/caf\\xE9.txt")] {
+            let tmp = TempDir::new().unwrap();
+            let (conn, _paths, _config, src) = setup_unit_with_excludes(&tmp, vec![]);
+            fs::write(src.join("keep.txt"), b"kept").unwrap();
+            fs::create_dir_all(src.join(dir)).unwrap();
+            fs::write(src.join(dir).join(latin1), b"latin one").unwrap();
+
+            let err = snapshot_create(&conn, "unit1", &Config::default())
+                .expect_err("a name that is not UTF-8 cannot be recorded");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(shown),
+                "{dir:?}: names the path, escaped: {msg}"
+            );
+            assert!(msg.contains("UTF-8"), "{dir:?}: says why: {msg}");
+            let snapshots: i64 = conn
+                .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(snapshots, 0, "{dir:?}: nothing was recorded");
+        }
+
+        // Positive control for the exception: the same name under an
+        // excluded directory is neither archived nor recorded, so it is not
+        // a reason to refuse.
+        let tmp = TempDir::new().unwrap();
+        let (conn, _paths, _config, src) =
+            setup_unit_with_excludes(&tmp, vec![".cache/".to_string()]);
+        fs::write(src.join("keep.txt"), b"kept").unwrap();
+        fs::create_dir_all(src.join(".cache")).unwrap();
+        fs::write(src.join(".cache").join(latin1), b"cache").unwrap();
+        let snap = snapshot_create(&conn, "unit1", &Config::default())
+            .expect("an excluded name is not a reason to refuse");
+        assert_eq!(
+            crate::db::files::fixture::count(&conn, snap, Some("keep.txt")),
+            1
+        );
     }
 
     /// Rewrite the unit dotfile's `[excludes]` after the snapshot was taken:
