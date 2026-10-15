@@ -689,9 +689,11 @@ tapectl volume verify L6-0001 --device "$TAPE"
 staging, never the plaintext archive: dar writes its archive to standard
 output, and tapectl cuts and encrypts it in memory. At its peak staging holds
 the unit's slices, about the unit's size. The source is read once: each file
-is hashed within 1 GiB of dar reading it, so the second read comes from the
-page cache. `[staging] hash_threads` files are hashed at once (1 by default,
-never more than the cores) when they fit in that 1 GiB, as many small files do;
+is hashed within 128 MiB of dar reading it, so the second read comes from the
+page cache (dar's own page-cache eviction is switched off while it archives, and
+tapectl drops the source's pages itself once both have read them, issue #441).
+`[staging] hash_threads` files are hashed at once (1 by default,
+never more than the cores) when they fit in that 128 MiB, as many small files do;
 more threads can speed a unit of many small files, and on a single spinning
 disk they may instead read slower.
 
