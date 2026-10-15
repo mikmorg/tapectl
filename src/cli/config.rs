@@ -593,10 +593,7 @@ fn print_human(
         }
     }
     for check in tape_device_checks {
-        println!(
-            "{}",
-            crate::policy::depth_check::describe_tape_device(check)
-        );
+        println!("{}", describe_device_check(check));
         if let Some((_, node)) = sg_derived
             .iter()
             .find(|(name, _)| *name == check.backend_name)
@@ -706,6 +703,29 @@ pub(crate) fn describe_ops(
     lines
 }
 
+/// `config check`'s line for one backend's device nodes: the library's
+/// ([`crate::policy::depth_check::describe_tape_device`]), except for a drive
+/// that is simply not attached (issue #447).
+///
+/// A backend with no `device_sg` whose tape node is not there cannot have
+/// had one derived — [`crate::tape::drive_identity::sg_pairing_problem`]
+/// says so, and rightly refuses a write through it — but that is the normal
+/// state of a drive that is unplugged, and `describe_tape_device` words any
+/// pairing problem as "warning: … volume write refuses this backend", which
+/// is a sentence about a MISCONFIGURED drive. It is a note here, as it was
+/// before 1.1.0 made the empty `device_sg` a pairing problem. The exit code
+/// and the `--json` report (which still carries the problem) are unchanged;
+/// with the node present and `device_sg` still underivable it stays the
+/// warning it is.
+pub(crate) fn describe_device_check(check: &crate::policy::depth_check::TapeDeviceCheck) -> String {
+    match &check.pairing_problem {
+        Some(problem) if check.device_sg.is_empty() && !check.device_tape_exists => {
+            format!("note: {problem} — normal if the drive isn't attached")
+        }
+        _ => crate::policy::depth_check::describe_tape_device(check),
+    }
+}
+
 /// `config check`'s one line on the quiet-host limits in force (ADR-0012,
 /// 2026-09-24 amendment, item 7) — where they come from, then each value,
 /// so the operator can see what `volume write`'s pre-flight will ask about
@@ -781,6 +801,55 @@ mod tests {
         );
         // A file that is not TOML names none rather than guessing.
         assert!(derived_sg_nodes("not [toml", &cfg).is_empty());
+    }
+
+    /// Issue #447: a drive that is simply not attached (no tape node, so no
+    /// `device_sg` could be derived) is a note, not "warning: … volume write
+    /// refuses this backend". Through the production scan, not a hand-built
+    /// check; the node-present, still-underivable case is the control that
+    /// keeps its warning, and a proven wrong pairing is untouched.
+    #[test]
+    fn config_check_calls_a_detached_drive_a_note_and_a_broken_one_a_warning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let present = tmp.path().join("nst-present");
+        std::fs::File::create(&present).unwrap();
+        let config_for = |tape: &str| {
+            toml::from_str::<crate::config::Config>(&format!(
+                "[[backends.lto]]\nname = \"drive\"\ndevice_tape = \"{tape}\"\n\
+                 generation = \"LTO-6\"\n"
+            ))
+            .unwrap()
+        };
+        let line_for = |cfg: &crate::config::Config| {
+            let checks = crate::policy::depth_check::scan_tape_devices(cfg);
+            assert_eq!(checks.len(), 1);
+            assert!(
+                checks[0].pairing_problem.is_some(),
+                "the scan still reports the problem (the JSON and the write refusal keep it)"
+            );
+            describe_device_check(&checks[0])
+        };
+
+        let detached = line_for(&config_for(
+            tmp.path().join("nst-not-attached").to_str().unwrap(),
+        ));
+        assert!(detached.starts_with("note: "), "{detached}");
+        assert!(detached.contains("isn't attached"), "{detached}");
+        assert!(
+            detached.contains("device_sg is not set"),
+            "it still says what is missing: {detached}"
+        );
+        assert!(!detached.contains("warning"), "{detached}");
+        assert!(!detached.contains("volume write refuses"), "{detached}");
+
+        // The node is there and the kernel cannot name its sg node: that is
+        // a problem the operator has to fix, and it stays a warning.
+        let broken = line_for(&config_for(present.to_str().unwrap()));
+        assert!(broken.starts_with("warning: "), "{broken}");
+        assert!(
+            broken.contains("volume write refuses this backend"),
+            "{broken}"
+        );
     }
 
     #[test]
