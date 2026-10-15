@@ -3520,6 +3520,21 @@ fn check_backup_destination(dest: &Path, include_keys: bool) -> Result<()> {
     Ok(())
 }
 
+/// Create `path` empty with mode 0600 when it does not exist, so SQLite
+/// opens an inode that was never readable by anyone else (and gives its
+/// journal the same mode). An existing file is left exactly as it is — the
+/// caller tightens it afterwards — and a failure is ignored: SQLite's own
+/// open reports an unwritable destination, by name.
+fn precreate_private_file(path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path);
+}
+
 /// What a real `db backup` copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackupReport {
@@ -3588,11 +3603,20 @@ pub fn db_backup(
     }
 
     let src_conn = rusqlite::Connection::open(&paths.db_file)?;
+    // Issue #459 item 4: the backup is the whole catalog — every tenant's
+    // unit names and paths — so it is private like the live one (`db::open`
+    // makes the live file 0600). A new file is created 0600 FROM THE FIRST
+    // byte rather than at the process umask and tightened afterwards, and an
+    // existing destination is tightened below. Best effort throughout, as
+    // `secure_path` is: the destination may be removable or foreign-owned
+    // media that cannot be chmod'ed, and that is no reason to fail a backup.
+    precreate_private_file(Path::new(dest));
     let mut dst_conn = rusqlite::Connection::open(dest)?;
 
     copy_database_in_one_step(&src_conn, &mut dst_conn)?;
     // Closed before it is measured, so the size is the finished file's.
     drop(dst_conn);
+    crate::config::secure_path(Path::new(dest), 0o600);
     let db_bytes = fs::metadata(dest)?.len();
 
     // Issue #40: unconditionally copying every private key to an arbitrary
@@ -9283,6 +9307,53 @@ mod tests {
             assert!(
                 found_key_file,
                 "fixture should have produced at least one .age.key file to check"
+            );
+        }
+
+        /// Issue #459 item 4: `db backup --to X` wrote X at the process umask
+        /// (0644 under the usual 022) — the whole catalog, readable by every
+        /// local user — and only the scheduled wrapper chmod'ed it. An
+        /// EXISTING destination at a looser mode is the deterministic form
+        /// (the test never touches the process-wide umask): SQLite reuses
+        /// the inode, so before the fix it stayed 0644.
+        #[test]
+        fn the_backup_file_is_0600_even_over_a_world_readable_destination() {
+            let (_tmp, paths) = temp_home_with_a_key();
+            let dest_tmp = TempDir::new().unwrap();
+            let dest = dest_tmp.path().join("backup.db");
+            fs::write(&dest, b"").unwrap();
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
+
+            db_backup(&paths, dest.to_str().unwrap(), false, false, false)
+                .unwrap()
+                .expect("a real backup");
+
+            assert_eq!(mode_of(&dest), 0o600, "the catalog copy must be private");
+            drop(crate::db::open(&dest).unwrap());
+        }
+
+        /// ...and a NEW destination is private too, with the private-key
+        /// directory beside it 0700 (it already was: `copy_dir_all`).
+        #[test]
+        fn a_new_backup_file_is_0600_and_so_is_its_key_directory_0700() {
+            let (_tmp, paths) = temp_home_with_a_key();
+            let dest_tmp = TempDir::new().unwrap();
+            let dest = dest_tmp.path().join("fresh.db");
+            assert!(!dest.exists());
+
+            db_backup(&paths, dest.to_str().unwrap(), true, false, false)
+                .unwrap()
+                .expect("a real backup");
+
+            assert_eq!(mode_of(&dest), 0o600);
+            assert_eq!(mode_of(&dest.with_extension("keys")), 0o700);
+            let siblings: Vec<String> = fs::read_dir(dest_tmp.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !siblings.iter().any(|n| n.ends_with("-journal")),
+                "no journal sidecar is left behind: {siblings:?}"
             );
         }
 
