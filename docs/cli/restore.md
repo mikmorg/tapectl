@@ -22,13 +22,13 @@ tapectl restore [OPTIONS] <COMMAND>
 Restore a unit from a volume
 
 ```text
-tapectl restore unit [OPTIONS] --unit <UNIT> --from <FROM> --to <TO>
+tapectl restore unit [OPTIONS] --unit <UNIT> --to <TO>
 ```
 
 **Options**
 
 - `--unit <UNIT>` *(required)* — Unit name
-- `--from <FROM>` *(required)* — Volume label
+- `--from <FROM>` — Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with --dry-run, which opens no drive (issue #435)
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--scratch <DIR>` — Where the restore's scratch directory is made (removed when the restore ends); defaults to inside --to, never the system temp directory. A unit whose isolated catalogue from `stage create` is on disk streams its slices into dar and puts only named pipes there; otherwise (a rebuilt catalog, dar older than 2.7.9) every decrypted slice waits there, as large as the unit
@@ -44,12 +44,12 @@ Restore several units from one volume in one pass over the tape
 The disaster-recovery path: the drive is opened and rewound once and the units are read in the order they lie on the tape, each into its own directory, `DIR/<unit name>`. Each unit's newest version on the volume is restored (use `restore unit --version` for an older one). One unit's failure does not stop the others (unless --fail-fast); the command fails if any unit was not restored
 
 ```text
-tapectl restore volume [OPTIONS] --to <DIR> <LABEL>
+tapectl restore volume [OPTIONS] --to <DIR> [LABEL]
 ```
 
 **Arguments**
 
-- `<LABEL>` — Volume label
+- `[LABEL]` — Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with --dry-run, which opens no drive (issue #435)
 
 **Options**
 
@@ -68,14 +68,14 @@ tapectl restore volume [OPTIONS] --to <DIR> <LABEL>
 Restore a single file from a unit
 
 ```text
-tapectl restore file [OPTIONS] --file <FILE> --unit <UNIT> --from <FROM> --to <TO>
+tapectl restore file [OPTIONS] --file <FILE> --unit <UNIT> --to <TO>
 ```
 
 **Options**
 
 - `--file <FILE>` *(required)* — File path within the unit, relative to its root, as `catalog ls` prints it. Checked against the catalog's file list for the version before the tape is touched; a directory is refused
 - `--unit <UNIT>` *(required)* — Unit name
-- `--from <FROM>` *(required)* — Volume label
+- `--from <FROM>` — Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says (issue #435)
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--scratch <DIR>` — Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside --to, never the system temp directory. With the unit's isolated catalogue from `stage create` on disk only the slices holding the file (and the last) are read; otherwise every slice

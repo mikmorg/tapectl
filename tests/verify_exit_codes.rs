@@ -116,6 +116,32 @@ fn a_verify_whose_drive_cannot_be_opened_exits_3_and_touches_nothing() {
     );
 }
 
+/// Issue #435: a verify with no label reaches for the drive like any other
+/// and, when it cannot, exits 3 and leaves the catalog as it was — the same
+/// "no verdict" a named volume's verify gives.
+#[test]
+fn a_verify_with_no_label_whose_drive_cannot_be_opened_exits_3() {
+    let home = initialised_home();
+    let out = tapectl(home.path(), &["volume", "verify", "--device", NO_DRIVE]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("tape I/O error"), "stderr: {stderr}");
+    assert_eq!(out.status.code(), Some(3), "stderr: {stderr}");
+
+    // The loaded-tape form accepts every flag the named form does.
+    let out = tapectl(
+        home.path(),
+        &[
+            "volume", "verify", "--quick", "--device", NO_DRIVE, "--json",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `--dry-run` is refused (issue #241) — no verdict, so 3 as well; still
 /// non-zero, which is all `tests/dry_run_contract.rs` asks.
 #[test]
@@ -153,10 +179,11 @@ fn a_refused_dry_run_verify_exits_3() {
 fn a_verify_command_line_that_does_not_parse_exits_3() {
     let home = TempDir::new().unwrap();
     for (args, says) in [
-        (
-            &["volume", "verify"][..],
-            "required arguments were not provided",
-        ),
+        // Issue #435: a verify with no label is a command now (it verifies
+        // the loaded tape), so a missing label is not a parse failure. A
+        // flag it does not have, and a conflict between two it does, still
+        // are — with no label to hide behind.
+        (&["volume", "verify", "--bogus"][..], "unexpected argument"),
         (
             &["volume", "verify", "L6-X", "--bogus"][..],
             "unexpected argument",
@@ -173,7 +200,10 @@ fn a_verify_command_line_that_does_not_parse_exits_3() {
             &["volume", "verify", "L6-X", "L6-Y"][..],
             "unexpected argument",
         ),
-        (&["--json", "volume", "verify"][..], "required arguments"),
+        (
+            &["--json", "volume", "verify", "--full", "--quick"][..],
+            "cannot be used with",
+        ),
         (
             &["--home", "/nonexistent/h", "volume", "verify", "--bogus"][..],
             "unexpected argument",

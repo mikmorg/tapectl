@@ -603,9 +603,15 @@ pub fn progress_session_name(command: &Commands) -> Option<String> {
         } => format!("collection run {collection}"),
         Commands::Volume { command } => match command {
             V::Init { label, .. } => format!("volume init {label}"),
-            V::Write { label, .. } => format!("volume write {label}"),
-            V::Resume { label, .. } => format!("volume resume {label}"),
-            V::Verify { label, .. } => format!("volume verify {label}"),
+            V::Write { label, .. } => {
+                format!("volume write {}", label.as_deref().unwrap_or("loaded"))
+            }
+            V::Resume { label, .. } => {
+                format!("volume resume {}", label.as_deref().unwrap_or("loaded"))
+            }
+            V::Verify { label, .. } => {
+                format!("volume verify {}", label.as_deref().unwrap_or("loaded"))
+            }
             V::ReadSlices { from, .. } => format!("volume read-slices {from}"),
             V::CompactRead { label, .. } => format!("volume compact-read {label}"),
             V::CompactWrite { destination, .. } => {
@@ -619,7 +625,9 @@ pub fn progress_session_name(command: &Commands) -> Option<String> {
             R::Unit { dry_run: true, .. } => return None,
             R::Unit { unit, .. } => format!("restore unit {unit}"),
             R::Volume { dry_run: true, .. } => return None,
-            R::Volume { label, .. } => format!("restore volume {label}"),
+            R::Volume { label, .. } => {
+                format!("restore volume {}", label.as_deref().unwrap_or("loaded"))
+            }
             R::File { unit, .. } => format!("restore file {unit}"),
             R::RawVolume { .. } => "restore raw-volume".to_string(),
         },

@@ -227,33 +227,14 @@ fn restore_through_drive(
     version: Option<i64>,
     dry_run: bool,
 ) -> Result<RestoreReport> {
-    let unit = queries::get_unit_by_name(conn, unit_name)?
-        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
-
-    // Validated here as well as in `restore_unit_from_store`, so a dry run —
-    // which never reaches the store half — still refuses a unit whose tenant
-    // has gone.
-    queries::get_tenant_by_id(conn, unit.tenant_id)?
-        .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
-
-    // Exactly one snapshot version's slices on this volume (issue #315) —
-    // resolved before the drive is touched, so a `--version` the volume does
-    // not carry is refused with no tape I/O, and a dry run counts only the
-    // selected version's slices.
-    let selection = select_write_positions(conn, unit_name, volume_label, version)?;
-
-    // Issue #406: everything that can be refused without the tape is refused
-    // here, before the first contact — a typo in `--file`, a destination
-    // that is not empty, a leftover scratch directory, a disk too small.
-    // Each of these used to surface only after every slice was read (~5 h
-    // for a large unit), or never. A dry run takes the same checks, so a
-    // dry run that says "would restore" means it.
-    let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
-    // Issue #411: stream or spool, and which slices — decided here, so the
-    // space check asks for what this restore will actually write.
-    let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
-    preflight(
-        conn, unit_name, &selection, &plan, target, &scratch, options,
+    let (selection, plan) = plan_before_tape(
+        conn,
+        config,
+        unit_name,
+        volume_label,
+        target,
+        options,
+        version,
     )?;
 
     if dry_run {
@@ -304,6 +285,212 @@ fn restore_through_drive(
             Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
         )
         .with_mam_reads(&reads),
+    )
+}
+
+/// Everything a `restore unit` / `restore file` settles from the catalog
+/// before the tape is read: the unit and its tenant, the one snapshot
+/// version's slices on the volume, the stream-or-spool plan and the
+/// preflight that may refuse. [`restore_through_drive`] runs it before the
+/// drive opens; the loaded-tape path ([`restore_unit_from_loaded_store`])
+/// cannot know the volume until it has read File 0, so it runs the same
+/// code right after.
+fn plan_before_tape(
+    conn: &Connection,
+    config: &Config,
+    unit_name: &str,
+    volume_label: &str,
+    target: RestoreTarget<'_>,
+    options: &RestoreOptions,
+    version: Option<i64>,
+) -> Result<(RestoreSelection, RestorePlan)> {
+    let unit = queries::get_unit_by_name(conn, unit_name)?
+        .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
+
+    // Validated here as well as in `restore_unit_from_store`, so a dry run —
+    // which never reaches the store half — still refuses a unit whose tenant
+    // has gone.
+    queries::get_tenant_by_id(conn, unit.tenant_id)?
+        .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
+
+    // Exactly one snapshot version's slices on this volume (issue #315) —
+    // resolved before the drive is touched, so a `--version` the volume does
+    // not carry is refused with no tape I/O, and a dry run counts only the
+    // selected version's slices.
+    let selection = select_write_positions(conn, unit_name, volume_label, version)?;
+
+    // Issue #406: everything that can be refused without the tape is refused
+    // here, before the first contact — a typo in `--file`, a destination
+    // that is not empty, a leftover scratch directory, a disk too small.
+    // Each of these used to surface only after every slice was read (~5 h
+    // for a large unit), or never. A dry run takes the same checks, so a
+    // dry run that says "would restore" means it.
+    let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
+    // Issue #411: stream or spool, and which slices — decided here, so the
+    // space check asks for what this restore will actually write.
+    let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
+    preflight(
+        conn, unit_name, &selection, &plan, target, &scratch, options,
+    )?;
+    Ok((selection, plan))
+}
+
+/// Open the drive for a restore that names no volume (issue #435) and hand
+/// `body` the store and the contact site: the same four steps, in the same
+/// order, as [`restore_through_drive`] and [`restore_units`] take for a
+/// named volume — the no-medium check first, both MAM reads held for the
+/// contact, then the read-only store. One function so `restore unit`,
+/// `restore file` and `restore volume` cannot open the drive three ways.
+fn with_loaded_drive<R>(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+    block_size: usize,
+    operation: Operation,
+    body: impl FnOnce(&mut dyn Store, ContactSite<'_>) -> Result<R>,
+) -> Result<R> {
+    let reads = MamReads::new(conn, operation);
+    reads.check_read_contact(config, device)?;
+    let observed = crate::volume::binding::loaded_medium(config, device, &reads);
+    let phase = progress::phase("drive-open", None);
+    let mut store = TapeStore::open_read(device, block_size)?;
+    phase.done();
+    body(
+        &mut store,
+        ContactSite::new(
+            config,
+            operation,
+            device,
+            Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+        )
+        .with_mam_reads(&reads),
+    )
+}
+
+/// [`restore_unit`] for the tape that is loaded, named by no `--from` (issue
+/// #435): File 0 identifies the volume. Never a dry run — a preview that
+/// opens no drive cannot know the volume — so the CLI refuses that before
+/// it gets here.
+#[allow(clippy::too_many_arguments)]
+pub fn restore_unit_from_loaded(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    dest_dir: &str,
+    device: &str,
+    block_size: usize,
+    version: Option<i64>,
+    options: &RestoreOptions,
+) -> Result<RestoreReport> {
+    with_loaded_drive(
+        conn,
+        config,
+        device,
+        block_size,
+        Operation::RestoreUnit,
+        |store, site| {
+            restore_unit_from_loaded_store(
+                conn,
+                paths,
+                config,
+                unit_name,
+                RestoreTarget::Unit { dest_dir },
+                options,
+                version,
+                store,
+                site,
+            )
+        },
+    )
+}
+
+/// [`restore_file`] for the tape that is loaded; see
+/// [`restore_unit_from_loaded`]. Returns the report so the caller can name
+/// the volume that was chosen.
+#[allow(clippy::too_many_arguments)]
+pub fn restore_file_from_loaded(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    file_path: &str,
+    dest_dir: &str,
+    device: &str,
+    block_size: usize,
+    version: Option<i64>,
+    options: &RestoreOptions,
+) -> Result<RestoreReport> {
+    with_loaded_drive(
+        conn,
+        config,
+        device,
+        block_size,
+        Operation::RestoreUnit,
+        |store, site| {
+            restore_unit_from_loaded_store(
+                conn,
+                paths,
+                config,
+                unit_name,
+                RestoreTarget::File {
+                    file_path,
+                    dest_dir,
+                },
+                options,
+                version,
+                store,
+                site,
+            )
+        },
+    )
+}
+
+/// The loaded-tape restore, minus the drive: read File 0 ONCE off `store`,
+/// find the volume in the catalog, then run the checks a named volume runs
+/// before the tape ([`plan_before_tape`]) and restore through
+/// [`restore_unit_from_store`] on a store that already holds that File 0 —
+/// its contact check finds it where it looks and reads nothing again.
+///
+/// The order a named volume has — every catalog refusal before the drive
+/// opens (#406) — cannot hold here: the catalog questions are about a
+/// volume, and the tape is what names it. So the drive is open and File 0
+/// read first, then the same refusals, and still no slice is read, no
+/// scratch directory made and no key loaded before them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restore_unit_from_loaded_store(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    target: RestoreTarget<'_>,
+    options: &RestoreOptions,
+    version: Option<i64>,
+    store: &mut dyn Store,
+    site: ContactSite<'_>,
+) -> Result<RestoreReport> {
+    let (found, mut peeked) = crate::volume::loaded::identify(conn, store)?;
+    crate::volume::loaded::announce("restoring from", &found);
+    let (selection, _plan) = plan_before_tape(
+        conn,
+        config,
+        unit_name,
+        &found.label,
+        target,
+        options,
+        version,
+    )?;
+    restore_unit_from_store(
+        conn,
+        paths,
+        config,
+        unit_name,
+        &found.label,
+        selection.version,
+        target,
+        options,
+        &mut peeked,
+        site,
     )
 }
 
@@ -1921,6 +2108,94 @@ pub fn restore_units(
     )
 }
 
+/// The [`UnitRequest`]s for `names`, each restored to `<dest_root>/<name>`
+/// — `restore volume`'s layout. The name becomes a path under `dest_root`,
+/// so it is held to the unit-name rules (no `..`, no leading `/`) even for
+/// a row a rebuilt catalog brought in from tape.
+pub fn unit_requests(names: &[String], dest_root: &str) -> Result<Vec<UnitRequest>> {
+    names
+        .iter()
+        .map(|name| {
+            crate::naming::validate_unit_name(name)?;
+            Ok(UnitRequest {
+                unit: name.clone(),
+                version: None,
+                dest_dir: Path::new(dest_root)
+                    .join(name)
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+        })
+        .collect()
+}
+
+/// [`restore_units`] for the tape that is loaded, named by no label (issue
+/// #435). `unit_names` empty restores every unit with written slices on the
+/// volume File 0 names. Never a dry run, as [`restore_unit_from_loaded`].
+#[allow(clippy::too_many_arguments)]
+pub fn restore_units_from_loaded(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_names: &[String],
+    dest_root: &str,
+    options: &RestoreOptions,
+    fail_fast: bool,
+    device: &str,
+    block_size: usize,
+) -> Result<UnitsReport> {
+    with_loaded_drive(
+        conn,
+        config,
+        device,
+        block_size,
+        Operation::RestoreVolume,
+        |store, site| {
+            restore_units_from_loaded_store(
+                conn, paths, config, unit_names, dest_root, options, fail_fast, store, site,
+            )
+        },
+    )
+}
+
+/// [`restore_units_from_loaded`] minus the drive; the multi-unit twin of
+/// [`restore_unit_from_loaded_store`], with the same order: File 0 once, the
+/// volume found, then the whole set planned and checked
+/// ([`plan_units`]), then the one pass over the tape.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restore_units_from_loaded_store(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_names: &[String],
+    dest_root: &str,
+    options: &RestoreOptions,
+    fail_fast: bool,
+    store: &mut dyn Store,
+    site: ContactSite<'_>,
+) -> Result<UnitsReport> {
+    let (found, mut peeked) = crate::volume::loaded::identify(conn, store)?;
+    crate::volume::loaded::announce("restoring from", &found);
+    let names = if unit_names.is_empty() {
+        units_on_volume(conn, &found.label)?
+    } else {
+        unit_names.to_vec()
+    };
+    let requests = unit_requests(&names, dest_root)?;
+    let planned = plan_units(conn, config, &found.label, &requests, options)?;
+    restore_units_from_store(
+        conn,
+        paths,
+        config,
+        &found.label,
+        &planned,
+        options,
+        fail_fast,
+        &mut peeked,
+        site,
+    )
+}
+
 /// One unit of a set, planned before the tape ([`plan_units`]).
 struct PlannedUnit {
     unit: String,
@@ -3269,6 +3544,228 @@ mod tests {
                 !err.contains("wrong tape"),
                 "the contact check must have passed; got: {err}"
             );
+        }
+
+        // ── issue #435: restore names no volume; the loaded tape does ──
+
+        /// The uuid `tape_labelled` writes into File 0.
+        const TAPE_UUID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+        /// [`seed`], the volume carrying the uuid the loaded tape's File 0
+        /// has. Returns the volume's id.
+        fn seed_loaded(conn: &Connection, label: &str, unit_name: &str) -> i64 {
+            seed(conn, label, unit_name);
+            conn.execute(
+                "UPDATE volumes SET uuid = ?1 WHERE label = ?2",
+                params![TAPE_UUID, label],
+            )
+            .unwrap();
+            conn.query_row(
+                "SELECT id FROM volumes WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+
+        /// A `TapeStore` over a `FakeTape` holding `tape`'s files, so every
+        /// head motion is recorded.
+        fn on_fake_tape(tape: &MemStore) -> (crate::tape::fake::FakeTape, TapeStore) {
+            let fake = crate::tape::fake::FakeTape::with_files(tape.files.clone(), 4096);
+            let store = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+            (fake, store)
+        }
+
+        /// No `--from`: the volume File 0 names is the one restored from —
+        /// the restore gets past its contact check on it (and fails later,
+        /// on the key load these fixtures do not have), records its contact
+        /// against that volume, and moves the head exactly as the same
+        /// restore with the label typed does: File 0 is read once.
+        #[test]
+        fn restore_with_no_from_restores_from_the_volume_file0_names() {
+            let conn = crate::db::open_memory().unwrap();
+            let volume_id = seed_loaded(&conn, "RL-ONE", "rl-unit");
+            let tape = tape_labelled("RL-ONE");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+            let dest_dir = dest.path().to_string_lossy().into_owned();
+            let (fake, mut store) = on_fake_tape(&tape);
+
+            let err = restore_unit_from_loaded_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                "rl-unit",
+                RestoreTarget::Unit {
+                    dest_dir: &dest_dir,
+                },
+                &RestoreOptions::default(),
+                None,
+                &mut store,
+                site(Operation::RestoreUnit),
+            )
+            .unwrap_err()
+            .to_string();
+            for refusal in [
+                "wrong tape",
+                "does not identify",
+                "no volume with that uuid",
+            ] {
+                assert!(
+                    !err.contains(refusal),
+                    "the loaded volume was found and its contact check passed: {err}"
+                );
+            }
+            let contact_volume: Option<i64> = conn
+                .query_row("SELECT volume_id FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                contact_volume,
+                Some(volume_id),
+                "the contact names the volume"
+            );
+
+            // The same restore with the label typed, on a fresh copy of the
+            // same tape: identical head motion.
+            let conn2 = crate::db::open_memory().unwrap();
+            seed_loaded(&conn2, "RL-ONE", "rl-unit");
+            let (fake2, mut store2) = on_fake_tape(&tape);
+            let _ = restore_unit_from_store(
+                &conn2,
+                &paths,
+                &Config::default(),
+                "rl-unit",
+                "RL-ONE",
+                1,
+                RestoreTarget::Unit {
+                    dest_dir: &dest_dir,
+                },
+                &RestoreOptions::default(),
+                &mut store2,
+                site(Operation::RestoreUnit),
+            );
+            assert_eq!(
+                fake.ops(),
+                fake2.ops(),
+                "no `--from` costs the same head motion as naming the volume"
+            );
+            assert!(
+                fake.ops().contains(&crate::tape::fake::Op::ReadHead(0)),
+                "positive control: File 0 was read"
+            );
+        }
+
+        /// A tape this catalog does not know is refused, naming what File 0
+        /// says, before the catalog's refusals, any scratch directory, any
+        /// key — and before a contact opens.
+        #[test]
+        fn restore_with_no_from_refuses_a_tape_the_catalog_does_not_know() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn, "RL-KNOWN", "rl-unit");
+            conn.execute("UPDATE volumes SET uuid = 'some-other-uuid'", [])
+                .unwrap();
+            let mut store = tape_labelled("RL-LOADED");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+            let dest_dir = dest.path().to_string_lossy().into_owned();
+
+            let err = restore_unit_from_loaded_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                "rl-unit",
+                RestoreTarget::Unit {
+                    dest_dir: &dest_dir,
+                },
+                &RestoreOptions::default(),
+                None,
+                &mut store,
+                site(Operation::RestoreUnit),
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(
+                err.contains("\"RL-LOADED\"") && err.contains(TAPE_UUID),
+                "{err}"
+            );
+            assert!(err.contains("no volume with that uuid"), "{err}");
+            let contacts: i64 = conn
+                .query_row("SELECT COUNT(*) FROM cartridge_contacts", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(contacts, 0, "nothing was restored: no contact");
+            assert!(!dest.path().join(".tapectl-restore-tmp").exists());
+        }
+
+        /// `restore volume` with no label: the units are listed from the
+        /// volume File 0 names, planned and restored from it; the report
+        /// names it.
+        #[test]
+        fn restore_volume_with_no_label_restores_the_units_of_the_loaded_volume() {
+            let conn = crate::db::open_memory().unwrap();
+            seed_loaded(&conn, "RL-MANY", "rl-unit");
+            let tape = tape_labelled("RL-MANY");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+            let (_fake, mut store) = on_fake_tape(&tape);
+            let to = dest.path().join("out");
+
+            let report = restore_units_from_loaded_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                &[],
+                &to.to_string_lossy(),
+                &RestoreOptions::default(),
+                false,
+                &mut store,
+                site(Operation::RestoreVolume),
+            )
+            .expect("the contact check passes; each unit's own failure is its outcome");
+
+            assert_eq!(report.volume_label, "RL-MANY");
+            assert_eq!(
+                report
+                    .units
+                    .iter()
+                    .map(|u| u.unit_name.as_str())
+                    .collect::<Vec<_>>(),
+                ["rl-unit"],
+                "every unit written to the loaded volume"
+            );
+            assert!(report.units[0].attempted);
+            let (operation, outcome) = only_contact(&conn);
+            assert_eq!(operation, "restore volume");
+            assert!(outcome.is_some());
+        }
+
+        /// The same for a volume named by a tape that is another volume's:
+        /// refused, nothing planned past the volume lookup.
+        #[test]
+        fn restore_volume_with_no_label_refuses_a_tape_the_catalog_does_not_know() {
+            let conn = crate::db::open_memory().unwrap();
+            seed(&conn, "RL-OTHER", "rl-unit");
+            let mut store = tape_labelled("RL-STRANGER");
+            let dest = TempDir::new().unwrap();
+            let paths = TapectlPaths::new(dest.path().to_path_buf());
+
+            let err = restore_units_from_loaded_store(
+                &conn,
+                &paths,
+                &Config::default(),
+                &[],
+                &dest.path().join("out").to_string_lossy(),
+                &RestoreOptions::default(),
+                false,
+                &mut store,
+                site(Operation::RestoreVolume),
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(err.contains("RL-STRANGER"), "{err}");
+            assert!(err.contains("no volume with that uuid"), "{err}");
+            assert!(!dest.path().join("out").exists());
         }
 
         // ── issue #296: the contact ROW ──
@@ -5884,7 +6381,7 @@ mod tests {
             /// `restore volume <label> --to <to> [--unit …]`.
             fn volume(label: &str, to: &Path, units: &[&str]) -> RestoreCommands {
                 RestoreCommands::Volume {
-                    label: label.to_string(),
+                    label: Some(label.to_string()),
                     to: to.to_string_lossy().into_owned(),
                     units: units.iter().map(|u| u.to_string()).collect(),
                     device: Some(DEVICE.to_string()),
@@ -6162,7 +6659,7 @@ mod tests {
                 let m = multi("RU-SP", "sp-unit", &tree, "150k", true);
                 let unit = |to: &Path| RestoreCommands::Unit {
                     unit: "sp-unit".into(),
-                    from: "RU-SP".into(),
+                    from: Some("RU-SP".into()),
                     to: to.to_string_lossy().into_owned(),
                     device: Some(DEVICE.into()),
                     version: None,

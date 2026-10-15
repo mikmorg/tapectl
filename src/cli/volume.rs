@@ -91,8 +91,21 @@ pub enum VolumeCommands {
     /// tape, a slice that changed): write the label again. 6 = the medium
     /// was proven bad and the volume quarantined. 75 = the catalog was busy.
     Write {
-        /// Volume label
-        label: String,
+        /// Volume label. A write names its volume: the label ties the data
+        /// to the volume `volume init` consented to (ADR-0003). Give it, or
+        /// give `--loaded` instead
+        #[arg(required_unless_present = "loaded")]
+        label: Option<String>,
+        /// Write the loaded tape without naming it: File 0 is read (a
+        /// `volume identify` contact) and the tape is written only when it
+        /// is one of this catalog's volumes, `initialized` and with nothing
+        /// written to it; the volume chosen is printed. Any other state, or
+        /// a tape this catalog does not know, is refused naming it. The
+        /// write that follows takes its usual File 0 consent check on its
+        /// own handle. Cannot be combined with a label or `--init` (issue
+        /// #435)
+        #[arg(long, conflicts_with = "label")]
+        loaded: bool,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
         #[arg(long)]
@@ -110,7 +123,7 @@ pub enum VolumeCommands {
         /// nothing and exits 2. Only `--force` is taken from `volume init`'s
         /// flags; when a cartridge needs `--generation` or `--cartridge`,
         /// run `volume init` yourself first. ADR-0012 2026-10-15 item 59.
-        #[arg(long)]
+        #[arg(long, requires = "label", conflicts_with = "loaded")]
         init: bool,
         /// Move the volume, with its cartridge, to this location once it is
         /// sealed and confirmed (`volume move <label> --to LOCATION`). The
@@ -204,8 +217,18 @@ pub enum VolumeCommands {
     /// quarantined, 75 catalog busy). A resume refused before it changed
     /// the session exits 2 and leaves the session as it was.
     Resume {
-        /// Volume label
-        label: String,
+        /// Volume label. Give it, or give `--loaded` instead
+        #[arg(required_unless_present = "loaded")]
+        label: Option<String>,
+        /// Resume the loaded tape without naming it: File 0 is read (a
+        /// `volume identify` contact) and the tape is resumed only when it
+        /// is one of this catalog's volumes with an interrupted write
+        /// session, a re-confirmable aborted one, or a write the catalog
+        /// lost; the volume chosen is printed. Any other state, or a tape
+        /// this catalog does not know, is refused naming it. Cannot be
+        /// combined with a label (issue #435)
+        #[arg(long, conflicts_with = "label")]
+        loaded: bool,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
         #[arg(long)]
@@ -283,8 +306,13 @@ pub enum VolumeCommands {
     /// command line); the volume is untouched — check the drive and verify
     /// again.
     Verify {
-        /// Volume label
-        label: String,
+        /// Volume label. Without it the loaded tape names itself: File 0
+        /// is read (the read a verify makes at contact anyway) and the
+        /// volume is found in this catalog by its uuid; the one chosen is
+        /// printed. A label that is given is checked against File 0 as
+        /// ever. A tape this catalog does not know is refused, naming what
+        /// File 0 says (issue #435)
+        label: Option<String>,
         /// Tape device (by-id path). Defaults to the only configured drive;
         /// required when more than one is configured.
         #[arg(long)]
@@ -860,6 +888,106 @@ fn print_staging_release(label: &str, release: &StagingRelease) {
     }
 }
 
+/// `volume identify`'s drive work, shared with `--loaded`: the no-medium
+/// check, the MAM read, the read-only store, and the corroborated File 0
+/// read, recorded as the `volume identify` contact it is. One definition so
+/// the drive steps (and the guards that count them) stay one.
+fn identify_loaded_tape(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+) -> Result<write::Identified> {
+    // Issue #166: refuse before the store is opened if this drive cannot
+    // read the loaded medium. Proceeds silently with no configured backend
+    // (ADR-0010's DR-path leniency).
+    let reads = crate::tape::mam_journal::MamReads::new(conn, Operation::VolumeIdentify);
+    reads.check_read_contact(config, device)?;
+    // Before the store open: reading the MAM opens the device read-only and
+    // drops the fd, and the st driver refuses a second concurrent open.
+    let observed = crate::volume::binding::loaded_medium(config, device, &reads);
+    let mut store = TapeStore::open_read(device, DEFAULT_BLOCK_SIZE)?;
+    // Corroborated (ADR-0012, issue #193) where there is a catalog row to
+    // compare against; the bare `volume_identify` stays the DB-less File 0
+    // reader the heir path mirrors.
+    write::volume_identify_corroborated(
+        conn,
+        &mut store,
+        ContactSite::new(
+            config,
+            Operation::VolumeIdentify,
+            device,
+            Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+        )
+        .with_mam_reads(&reads),
+    )
+}
+
+/// What a `--loaded` write command works on.
+#[derive(Clone, Copy)]
+enum LoadedFor {
+    /// `volume write --loaded`: an initialized volume nothing is written to.
+    Write,
+    /// `volume resume --loaded`: a volume `volume resume` would pick up.
+    Resume,
+}
+
+/// `--loaded` (issue #435): which volume of this catalog the loaded tape is,
+/// and whether it is in the state this command works on. A `volume
+/// identify` contact reads File 0; the volume is found by uuid; a state the
+/// command does not work on is refused naming it. The label comes back, and
+/// the command goes on exactly as if it had been typed — including the
+/// write's own File 0 consent check on its own handle, which a tape swapped
+/// in since this read fails (ADR-0003).
+///
+/// This is the one place a write-family command reads the tape before its
+/// own contact, and the reason it is a recorded `volume identify` contact
+/// rather than a private peek: it is that command, run for this purpose. A
+/// tape the catalog contradicts (`Identified::contradiction`) is not chosen.
+fn resolve_loaded_for(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+    wants: LoadedFor,
+) -> Result<String> {
+    use crate::volume::loaded;
+    let id = identify_loaded_tape(conn, config, device)?;
+    if let Some(why) = id.contradiction {
+        return Err(TapectlError::Other(format!(
+            "--loaded does not choose a tape the catalog contradicts. {why}"
+        )));
+    }
+    let file0 = crate::volume::binding::file0_facts_from_text(&id.text);
+    let volume = loaded::resolve(conn, &file0)?;
+    let doing = match wants {
+        LoadedFor::Write => {
+            loaded::require_writable(conn, &volume)?;
+            "writing"
+        }
+        LoadedFor::Resume => {
+            loaded::require_resumable(conn, &volume)?;
+            "resuming"
+        }
+    };
+    loaded::announce(doing, &volume);
+    Ok(volume.label)
+}
+
+/// `volume identify`'s note on what this catalog makes of the tape it just
+/// printed, for stderr: `None` when File 0 names no uuid (nothing to look
+/// up). A tape the catalog does not know is reported as such, not an error
+/// (issue #435).
+fn identify_catalog_note(conn: &Connection, file0_text: &str) -> Option<String> {
+    let file0 = crate::volume::binding::file0_facts_from_text(file0_text);
+    file0.uuid.as_ref()?;
+    Some(match crate::volume::loaded::resolve(conn, &file0) {
+        Ok(v) => format!(
+            "catalog: this tape is volume \"{}\" (status {})",
+            v.label, v.status
+        ),
+        Err(e) => format!("catalog: {e}"),
+    })
+}
+
 /// What `--move-to` did once a copy was sealed and confirmed (issue #438).
 #[derive(Debug)]
 enum MoveAfterWrite {
@@ -1032,6 +1160,8 @@ impl WriteSteps for DriveWriteSteps<'_> {
 /// What the operator asked of one `volume write`.
 struct WriteRequest<'a> {
     label: &'a str,
+    /// The label came from the loaded tape (`--loaded`), not the command line.
+    loaded: bool,
     init: bool,
     force: bool,
     move_to: Option<&'a str>,
@@ -1041,6 +1171,8 @@ struct WriteRequest<'a> {
 /// What one `volume write` did, once the volume was sealed and confirmed.
 #[derive(Debug)]
 struct WriteDone {
+    /// The volume was chosen from the loaded tape (`--loaded`).
+    loaded: bool,
     /// The volume id `--init` created, when it ran.
     initialized: Option<i64>,
     release: StagingRelease,
@@ -1093,6 +1225,7 @@ fn write_and_follow(
     let release = release_staging_after_write(conn, config, req.label, req.keep_staging);
     let moved = move_after_write(conn, req.label, req.move_to);
     Ok(WriteDone {
+        loaded: req.loaded,
         initialized,
         release,
         moved,
@@ -1101,7 +1234,8 @@ fn write_and_follow(
 
 /// `volume write --json`: the keys it always had, plus the staging release's
 /// (issue #440) and — all additive — `initialized`, `moved_to`,
-/// `move_warning`, `moved_cartridge` and `volumes_moved` (issue #438). Always
+/// `move_warning`, `moved_cartridge` and `volumes_moved` (issue #438), and
+/// `loaded` (issue #435). Always
 /// present, so a scripted consumer never branches on whether a key exists:
 /// `moved_to` and `move_warning` are null unless `--move-to` moved or failed.
 fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
@@ -1110,6 +1244,7 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
             "label": label,
             "status": "completed",
             "initialized": done.initialized.is_some(),
+            "loaded": done.loaded,
         }),
         &done.release,
     );
@@ -1196,6 +1331,7 @@ pub fn run(
 
         VolumeCommands::Write {
             label,
+            loaded,
             device,
             force,
             init,
@@ -1225,6 +1361,23 @@ pub fn run(
                 check_move_destination(conn, to)?;
             }
             let device = write_device(config, device.as_deref())?;
+            // Issue #435: `--loaded` names the volume from the loaded tape's
+            // File 0 — resolved here, before the write's own contact, and
+            // refused unless the volume is one a write works on. `label` is
+            // then the volume it chose, and the write goes on as typed.
+            let from_loaded;
+            let label: &str = match (label.as_deref(), *loaded) {
+                (Some(label), false) => label,
+                (None, true) => {
+                    from_loaded = resolve_loaded_for(conn, config, &device, LoadedFor::Write)?;
+                    &from_loaded
+                }
+                _ => {
+                    return Err(TapectlError::Other(
+                        "volume write takes a label or --loaded, not both and not neither".into(),
+                    ))
+                }
+            };
             // Issue #391: `--fill-ceiling` for this write only.
             let config = &config.with_fill_ceiling(*fill_ceiling);
             let steps = DriveWriteSteps {
@@ -1243,6 +1396,7 @@ pub fn run(
                 &steps,
                 &WriteRequest {
                     label,
+                    loaded: *loaded,
                     init: *init,
                     force: *force,
                     move_to: move_to.as_deref(),
@@ -1260,6 +1414,7 @@ pub fn run(
 
         VolumeCommands::Resume {
             label,
+            loaded,
             device,
             prewrite_hash,
             full_confirm,
@@ -1277,6 +1432,22 @@ pub fn run(
                 ));
             }
             let device = write_device(config, device.as_deref())?;
+            // Issue #435: as for `volume write`, `--loaded` takes the
+            // volume's name from the loaded tape's File 0, refusing unless
+            // the volume is one `volume resume` would pick up.
+            let from_loaded;
+            let label: &str = match (label.as_deref(), *loaded) {
+                (Some(label), false) => label,
+                (None, true) => {
+                    from_loaded = resolve_loaded_for(conn, config, &device, LoadedFor::Resume)?;
+                    &from_loaded
+                }
+                _ => {
+                    return Err(TapectlError::Other(
+                        "volume resume takes a label or --loaded, not both and not neither".into(),
+                    ))
+                }
+            };
             write::volume_resume(
                 conn,
                 paths,
@@ -1294,7 +1465,12 @@ pub fn run(
                 println!(
                     "{}",
                     staging_release_json(
-                        serde_json::json!({"label": label, "status": "completed", "resumed": true}),
+                        serde_json::json!({
+                            "label": label,
+                            "status": "completed",
+                            "resumed": true,
+                            "loaded": loaded,
+                        }),
                         &release
                     )
                 );
@@ -1376,8 +1552,34 @@ pub fn run(
             };
             let tier_name = if *quick { "quick" } else { "full" };
             let device = read_device(config, device.as_deref())?;
-            let report =
-                write::volume_verify(conn, config, label, &device, DEFAULT_BLOCK_SIZE, tier)?;
+            // Issue #435: no label verifies the loaded tape, found by what
+            // its File 0 says; `loaded` is then true and `label` is the
+            // volume it chose. With a label this is `volume verify` as it
+            // always was.
+            let (label, loaded, report) = match label {
+                Some(label) => {
+                    let report = write::volume_verify(
+                        conn,
+                        config,
+                        label,
+                        &device,
+                        DEFAULT_BLOCK_SIZE,
+                        tier,
+                    )?;
+                    (label.clone(), false, report)
+                }
+                None => {
+                    let (found, report) = write::volume_verify_loaded(
+                        conn,
+                        config,
+                        &device,
+                        DEFAULT_BLOCK_SIZE,
+                        tier,
+                    )?;
+                    (found.label, true, report)
+                }
+            };
+            let label = &label;
             // Issue #280: read ONCE, before either output branch, so the
             // human message and its `--json` twin can never derive "does
             // this volume count as a copy" two different ways.
@@ -1442,6 +1644,9 @@ pub fn run(
                     "{}",
                     serde_json::json!({
                         "label": label,
+                        // Issue #435, additive: whether the volume was found
+                        // from the loaded tape's File 0 (no label given).
+                        "loaded": loaded,
                         "tier": tier_name,
                         "checked": report.checked,
                         "passed": report.passed,
@@ -1629,34 +1834,18 @@ pub fn run(
 
         VolumeCommands::Identify { device } => {
             let device = read_device(config, device.as_deref())?;
-            // Issue #166: refuse before the store is opened if this drive
-            // cannot read the loaded medium. Proceeds silently with no
-            // configured backend (ADR-0010's DR-path leniency).
-            let reads = crate::tape::mam_journal::MamReads::new(conn, Operation::VolumeIdentify);
-            reads.check_read_contact(config, &device)?;
-            // Before the store open: reading the MAM opens the device
-            // read-only and drops the fd, and the st driver refuses a second
-            // concurrent open.
-            let observed = crate::volume::binding::loaded_medium(config, &device, &reads);
-            let mut store = TapeStore::open_read(&device, DEFAULT_BLOCK_SIZE)?;
-            // Corroborated (ADR-0012, issue #193) where there is a catalog
-            // row to compare against; the bare `volume_identify` stays the
-            // DB-less File 0 reader the heir path mirrors.
-            let id = write::volume_identify_corroborated(
-                conn,
-                &mut store,
-                ContactSite::new(
-                    config,
-                    Operation::VolumeIdentify,
-                    &device,
-                    Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
-                )
-                .with_mam_reads(&reads),
-            )?;
+            let id = identify_loaded_tape(conn, config, &device)?;
             // The tape's own account FIRST, always — see `Identified`. A
             // contradiction is reported after it and through the exit code,
             // never by withholding the answer the operator asked for.
             println!("{}", id.text);
+            // Issue #435: a tape this catalog does not know is reported as
+            // such. On stderr, so stdout stays File 0 for anything parsing it.
+            if id.contradiction.is_none() {
+                if let Some(note) = identify_catalog_note(conn, &id.text) {
+                    eprintln!("{note}");
+                }
+            }
             if let Some(why) = id.contradiction {
                 eprintln!("\nwarning: this tape contradicts the catalog.\n{why}");
                 return Err(TapectlError::Other(
@@ -3679,7 +3868,8 @@ mod tests {
             let tmp = tempfile::TempDir::new().unwrap();
             let paths = TapectlPaths::new(tmp.path().join("home"));
             let cmd = VolumeCommands::Write {
-                label: s.volumes[1].clone(),
+                label: Some(s.volumes[1].clone()),
+                loaded: false,
                 device: Some("/nonexistent/tapectl-release-nst".into()),
                 force: false,
                 init: false,
@@ -3719,7 +3909,8 @@ mod tests {
             let paths = TapectlPaths::new(tmp.path().join("home"));
             for cmd in [
                 VolumeCommands::Write {
-                    label: s.volumes[1].clone(),
+                    label: Some(s.volumes[1].clone()),
+                    loaded: false,
                     device: None,
                     force: false,
                     init: false,
@@ -3731,7 +3922,8 @@ mod tests {
                     keep_staging: false,
                 },
                 VolumeCommands::Resume {
-                    label: s.volumes[1].clone(),
+                    label: Some(s.volumes[1].clone()),
+                    loaded: false,
                     device: None,
                     prewrite_hash: false,
                     full_confirm: false,
@@ -3764,14 +3956,19 @@ mod tests {
             // `volume write`: the arm hands the whole sequence to
             // `write_and_follow`, which is where the order is pinned.
             let start = run_body.find("VolumeCommands::Write {\n").unwrap();
-            let arm = &run_body[start..start + run_body[start..].find("VolumeCommands::Resume {\n").unwrap()];
+            let arm = &run_body[start
+                ..start
+                    + run_body[start..]
+                        .find("VolumeCommands::Resume {\n")
+                        .unwrap()];
             assert_eq!(
                 arm.matches("write_and_follow(").count(),
                 1,
                 "the Write arm runs its steps through write_and_follow"
             );
             assert!(
-                !arm.contains("release_staging_after_write(") && !arm.contains(" move_after_write("),
+                !arm.contains("release_staging_after_write(")
+                    && !arm.contains(" move_after_write("),
                 "the arm itself releases and moves nothing: write_and_follow does, after the write"
             );
             let seq_start = SRC.find("fn write_and_follow(").unwrap();
@@ -3808,30 +4005,26 @@ mod tests {
             );
 
             // `volume resume`.
-            for (arm, next, write_call) in [(
-                "VolumeCommands::Resume {\n",
-                "VolumeCommands::Abort {",
-                "write::volume_resume(",
-            )] {
-                let start = run_body.find(arm).unwrap();
-                let body = &run_body[start..start + run_body[start..].find(next).unwrap()];
-                let call = body
-                    .find(write_call)
-                    .unwrap_or_else(|| panic!("{arm}: no write"));
-                let question = call + body[call..].find(")?;").expect("the write's own `?`");
-                let release = body
-                    .find("release_staging_after_write(conn, config, label, *keep_staging)")
-                    .unwrap_or_else(|| panic!("{arm}: no release honouring --keep-staging"));
-                assert!(
-                    release > question,
-                    "{arm}: the release must come after the write's `?`, not before it"
-                );
-                assert_eq!(
-                    body.matches("release_staging_after_write(").count(),
-                    1,
-                    "{arm}: one release call"
-                );
-            }
+            let arm = "VolumeCommands::Resume {\n";
+            let start = run_body.find(arm).unwrap();
+            let body = &run_body
+                [start..start + run_body[start..].find("VolumeCommands::Abort {").unwrap()];
+            let call = body
+                .find("write::volume_resume(")
+                .unwrap_or_else(|| panic!("{arm}: no write"));
+            let question = call + body[call..].find(")?;").expect("the write's own `?`");
+            let release = body
+                .find("release_staging_after_write(conn, config, label, *keep_staging)")
+                .unwrap_or_else(|| panic!("{arm}: no release honouring --keep-staging"));
+            assert!(
+                release > question,
+                "{arm}: the release must come after the write's `?`, not before it"
+            );
+            assert_eq!(
+                body.matches("release_staging_after_write(").count(),
+                1,
+                "{arm}: one release call"
+            );
             // And nowhere else in the library: `collection run`, `quick-archive`
             // and `volume compact*` reach `volume_write` directly and have
             // their own release step, so a release inside it would double up.
@@ -3882,7 +4075,9 @@ mod tests {
 
         impl WriteSteps for FakeSteps<'_> {
             fn init(&self, label: &str, force: bool) -> Result<i64> {
-                self.log.borrow_mut().push(format!("init {label} force={force}"));
+                self.log
+                    .borrow_mut()
+                    .push(format!("init {label} force={force}"));
                 if self.fail == Fail::Init {
                     return Err(TapectlError::Other(
                         "volume init refused: the loaded cartridge's File 0 identifies a \
@@ -3901,13 +4096,18 @@ mod tests {
             }
 
             fn write(&self, label: &str, force: bool) -> Result<()> {
-                self.log.borrow_mut().push(format!("write {label} force={force}"));
+                self.log
+                    .borrow_mut()
+                    .push(format!("write {label} force={force}"));
                 if self.fail == Fail::Write {
                     return Err(TapectlError::WriteInterrupted("the tape stopped".into()));
                 }
                 add_write(self.conn, self.staged, label, "initialized", "completed");
                 self.conn
-                    .execute("UPDATE volumes SET status = 'sealed' WHERE label = ?1", [label])
+                    .execute(
+                        "UPDATE volumes SET status = 'sealed' WHERE label = ?1",
+                        [label],
+                    )
                     .unwrap();
                 Ok(())
             }
@@ -3918,8 +4118,11 @@ mod tests {
         }
 
         fn add_shelf(conn: &Connection, name: &str) -> i64 {
-            conn.execute("INSERT INTO locations (name, kind) VALUES (?1, 'shelf')", [name])
-                .unwrap();
+            conn.execute(
+                "INSERT INTO locations (name, kind) VALUES (?1, 'shelf')",
+                [name],
+            )
+            .unwrap();
             conn.last_insert_rowid()
         }
 
@@ -3935,6 +4138,7 @@ mod tests {
         fn request<'a>(init: bool, force: bool, move_to: Option<&'a str>) -> WriteRequest<'a> {
             WriteRequest {
                 label: NEW,
+                loaded: false,
                 init,
                 force,
                 move_to,
@@ -3959,9 +4163,13 @@ mod tests {
                 log: RefCell::default(),
             };
 
-            let done =
-                write_and_follow(&conn, &config, &steps, &request(true, true, Some("offsite")))
-                    .unwrap();
+            let done = write_and_follow(
+                &conn,
+                &config,
+                &steps,
+                &request(true, true, Some("offsite")),
+            )
+            .unwrap();
 
             // `--force` went to the init only.
             assert_eq!(
@@ -4015,7 +4223,8 @@ mod tests {
                 log: RefCell::default(),
             };
 
-            let done = write_and_follow(&conn, &config, &steps, &request(false, true, None)).unwrap();
+            let done =
+                write_and_follow(&conn, &config, &steps, &request(false, true, None)).unwrap();
 
             // Positive control for the force test below: with no `--init`,
             // `--force` still reaches the write.
@@ -4046,13 +4255,26 @@ mod tests {
                 log: RefCell::default(),
             };
 
-            let err = write_and_follow(&conn, &config, &steps, &request(true, false, Some("offsite")))
-                .unwrap_err();
+            let err = write_and_follow(
+                &conn,
+                &config,
+                &steps,
+                &request(true, false, Some("offsite")),
+            )
+            .unwrap_err();
 
             assert!(err.to_string().contains("DIFFERENT volume"), "{err}");
-            assert_eq!(steps.log(), ["init V-NEW force=false"], "the write never ran");
+            assert_eq!(
+                steps.log(),
+                ["init V-NEW force=false"],
+                "the write never ran"
+            );
             let rows: i64 = conn
-                .query_row("SELECT COUNT(*) FROM volumes WHERE label = ?1", [NEW], |r| r.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM volumes WHERE label = ?1",
+                    [NEW],
+                    |r| r.get(0),
+                )
                 .unwrap();
             assert_eq!(rows, 0, "no volume row: nothing was initialised");
             assert!(s.file.exists(), "nothing was released");
@@ -4078,16 +4300,28 @@ mod tests {
                 log: RefCell::default(),
             };
 
-            let err = write_and_follow(&conn, &config, &steps, &request(true, false, Some("offsite")))
-                .unwrap_err();
+            let err = write_and_follow(
+                &conn,
+                &config,
+                &steps,
+                &request(true, false, Some("offsite")),
+            )
+            .unwrap_err();
 
             assert_eq!(
                 steps.log(),
                 ["init V-NEW force=false", "write V-NEW force=false"]
             );
-            assert_eq!(location_of(&conn, NEW), None, "an unsealed volume is not moved");
+            assert_eq!(
+                location_of(&conn, NEW),
+                None,
+                "an unsealed volume is not moved"
+            );
             assert!(s.file.exists(), "nothing was released");
-            assert_eq!(WriteOutcome::of(&anyhow::Error::from(err)), Some(WriteOutcome::Interrupted));
+            assert_eq!(
+                WriteOutcome::of(&anyhow::Error::from(err)),
+                Some(WriteOutcome::Interrupted)
+            );
 
             // Control: the same request with a write that seals DOES move.
             let conn = crate::db::open_memory().unwrap();
@@ -4100,7 +4334,13 @@ mod tests {
                 fail: Fail::Nothing,
                 log: RefCell::default(),
             };
-            write_and_follow(&conn, &config, &steps, &request(true, false, Some("offsite"))).unwrap();
+            write_and_follow(
+                &conn,
+                &config,
+                &steps,
+                &request(true, false, Some("offsite")),
+            )
+            .unwrap();
             assert_eq!(location_of(&conn, NEW), Some(offsite));
         }
 
@@ -4124,8 +4364,9 @@ mod tests {
                 log: RefCell::default(),
             };
 
-            let done = write_and_follow(&conn, &config, &steps, &request(true, false, Some("gone")))
-                .expect("a move that fails after the seal does not fail the write");
+            let done =
+                write_and_follow(&conn, &config, &steps, &request(true, false, Some("gone")))
+                    .expect("a move that fails after the seal does not fail the write");
 
             let MoveAfterWrite::Failed { to, warning } = &done.moved else {
                 panic!("the move failed: {:?}", done.moved);
@@ -4144,7 +4385,9 @@ mod tests {
             );
             assert_eq!(location_of(&conn, NEW), None);
             let sealed: String = conn
-                .query_row("SELECT status FROM volumes WHERE label = ?1", [NEW], |r| r.get(0))
+                .query_row("SELECT status FROM volumes WHERE label = ?1", [NEW], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert_eq!(sealed, "sealed", "the copy stands");
             assert!(
@@ -4172,12 +4415,16 @@ mod tests {
             check_move_destination(&conn, "offsite").unwrap();
             check_move_destination(&conn, " offsite ").unwrap();
 
-            let err = check_move_destination(&conn, "ofsite").unwrap_err().to_string();
+            let err = check_move_destination(&conn, "ofsite")
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("\"ofsite\" not found"), "{err}");
             assert!(err.contains("known locations: glacier, offsite"), "{err}");
             assert!(err.contains("Nothing was written"), "{err}");
 
-            let err = check_move_destination(&conn, "glacier").unwrap_err().to_string();
+            let err = check_move_destination(&conn, "glacier")
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("warehouse location"), "{err}");
             assert!(err.contains("Nothing was written"), "{err}");
         }
@@ -4213,7 +4460,7 @@ mod tests {
             else {
                 panic!("a write");
             };
-            assert_eq!(label, "L6-0003");
+            assert_eq!(label.as_deref(), Some("L6-0003"));
             assert!(init && full_confirm && force);
             assert_eq!(move_to.as_deref(), Some("offsite"));
 
@@ -4239,7 +4486,8 @@ mod tests {
 
         fn write_cmd(label: &str, init: bool, move_to: Option<&str>) -> VolumeCommands {
             VolumeCommands::Write {
-                label: label.into(),
+                label: Some(label.into()),
+                loaded: false,
                 device: Some("/nonexistent/tapectl-438-nst".into()),
                 force: false,
                 init,
@@ -4312,7 +4560,10 @@ mod tests {
             .expect_err("unknown location");
 
             let text = err.to_string();
-            assert!(text.contains("--move-to location \"nowhere\" not found"), "{text}");
+            assert!(
+                text.contains("--move-to location \"nowhere\" not found"),
+                "{text}"
+            );
             assert_eq!(exit_code(err), crate::error::EXIT_ERROR);
         }
 
@@ -4340,8 +4591,204 @@ mod tests {
             )
             .expect_err("a sealed volume is not a write target");
 
-            assert!(matches!(err, TapectlError::VolumeNotWriteTarget { .. }), "{err:?}");
+            assert!(
+                matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+                "{err:?}"
+            );
             assert_eq!(location_of(&conn, &s.volumes[1]), None);
+        }
+    }
+
+    /// Issue #435: the loaded tape as a volume reference — the flag surface
+    /// of `volume verify`, `write` and `resume`, `volume identify`'s note on
+    /// what the catalog makes of the tape, and the `--loaded` arm's first act.
+    mod loaded_tape {
+        use super::*;
+        use clap::Parser;
+
+        fn try_parse(args: &[&str]) -> std::result::Result<VolumeCommands, clap::Error> {
+            let mut argv = vec!["tapectl", "volume"];
+            argv.extend_from_slice(args);
+            crate::cli::Cli::try_parse_from(argv).map(|cli| match cli.command {
+                crate::cli::Commands::Volume { command } => command,
+                other => panic!("not a volume command: {other:?}"),
+            })
+        }
+
+        #[test]
+        fn verify_takes_a_label_or_none() {
+            let VolumeCommands::Verify { label, .. } = try_parse(&["verify", "L6-0002"]).unwrap()
+            else {
+                panic!("a verify");
+            };
+            assert_eq!(label.as_deref(), Some("L6-0002"));
+            let VolumeCommands::Verify { label, quick, .. } =
+                try_parse(&["verify", "--quick"]).unwrap()
+            else {
+                panic!("a verify");
+            };
+            assert!(label.is_none() && quick, "the loaded tape, quick");
+        }
+
+        /// A write or a resume names its volume, or says `--loaded`: one
+        /// answer to the question, never two and never none.
+        #[test]
+        fn write_and_resume_take_a_label_or_loaded_never_both_or_neither() {
+            let fields = |cmd: VolumeCommands| match cmd {
+                VolumeCommands::Write { label, loaded, .. }
+                | VolumeCommands::Resume { label, loaded, .. } => (label, loaded),
+                other => panic!("not a write or a resume: {other:?}"),
+            };
+            for cmd in ["write", "resume"] {
+                let (label, loaded) = fields(try_parse(&[cmd, "--loaded"]).unwrap());
+                assert!(label.is_none() && loaded, "{cmd} --loaded");
+                let (label, loaded) = fields(try_parse(&[cmd, "L6-0003"]).unwrap());
+                assert_eq!((label.as_deref(), loaded), (Some("L6-0003"), false));
+
+                let both = try_parse(&[cmd, "L6-0003", "--loaded"]).unwrap_err();
+                assert_eq!(
+                    both.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{cmd}"
+                );
+                let neither = try_parse(&[cmd]).unwrap_err();
+                assert_eq!(
+                    neither.kind(),
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    "{cmd}"
+                );
+            }
+        }
+
+        /// `--init` initialises a volume it NAMES: with no label there is
+        /// nothing to initialise as, and `--loaded` is the other answer.
+        #[test]
+        fn init_needs_the_label_and_excludes_loaded() {
+            assert!(try_parse(&["write", "L6-0003", "--init"]).is_ok());
+            let err = try_parse(&["write", "--loaded", "--init"]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{err}"
+            );
+            let err = try_parse(&["write", "--init"]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{err}"
+            );
+        }
+
+        fn file0_text(label: &str, uuid: &str) -> String {
+            crate::volume::layout::generate_id_thunk_v2(&crate::volume::layout::IdThunkV2Params {
+                label,
+                uuid,
+                media_type: "LTO-6",
+                tapectl_version: "0.0.0-test",
+                nominal_capacity: 2_500_000_000_000,
+                mam_capacity: 2_400_000_000_000,
+                total_files: 6,
+                mam_manufacturer: "TESTCO",
+                mam_serial: "",
+                mam_length: 846,
+                mam_loads: 1,
+                created_at: "2026-10-15T00:00:00Z",
+                cartridge_identity_source: None,
+            })
+        }
+
+        /// `volume identify` says what the catalog makes of the tape, on
+        /// stderr: the volume and its status, or that the catalog does not
+        /// have it — reported, not an error. A File 0 with no uuid has
+        /// nothing to look up and no note.
+        #[test]
+        fn identify_reports_whether_the_catalog_knows_the_tape() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, uuid, backend_type, backend_name, capacity_bytes, status)
+                 VALUES ('L6-0002', 'uuid-known', 'lto', 'p', 10485760, 'sealed')",
+                [],
+            )
+            .unwrap();
+
+            let note = identify_catalog_note(&conn, &file0_text("L6-0002", "uuid-known")).unwrap();
+            assert_eq!(
+                note,
+                "catalog: this tape is volume \"L6-0002\" (status sealed)"
+            );
+
+            let note =
+                identify_catalog_note(&conn, &file0_text("L6-0009", "uuid-unknown")).unwrap();
+            assert!(note.starts_with("catalog: "), "{note}");
+            assert!(
+                note.contains("\"L6-0009\" (uuid uuid-unknown)")
+                    && note.contains("no volume with that uuid"),
+                "{note}"
+            );
+
+            assert_eq!(identify_catalog_note(&conn, "not a tapectl tape\n"), None);
+        }
+
+        /// The `--loaded` arm's first act is to read the tape, through the
+        /// drive `volume identify` uses: with none to read it stops there,
+        /// before the write — an error from the read (not the "takes a label"
+        /// refusal), and nothing recorded.
+        #[test]
+        fn loaded_write_and_resume_read_the_tape_before_anything_else() {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = Config::default();
+            config.backends.lto.push(crate::config::LtoBackendConfig {
+                name: "lto0".into(),
+                device_tape: "/nonexistent/tapectl-435-nst".into(),
+                device_sg: "/nonexistent/tapectl-435-sg".into(),
+                generation: "LTO-6".into(),
+                capacity_override: None,
+                fill_ceiling: 1.0,
+                enospc_buffer: "0".into(),
+            });
+            let paths = TapectlPaths::new(dir.path().join("home"));
+            let device = Some("/nonexistent/tapectl-435-nst".to_string());
+            for cmd in [
+                VolumeCommands::Write {
+                    label: None,
+                    loaded: true,
+                    device: device.clone(),
+                    force: false,
+                    init: false,
+                    move_to: None,
+                    allow_missing_escrow: false,
+                    prewrite_hash: false,
+                    fill_ceiling: None,
+                    full_confirm: false,
+                    keep_staging: false,
+                },
+                VolumeCommands::Resume {
+                    label: None,
+                    loaded: true,
+                    device: device.clone(),
+                    prewrite_hash: false,
+                    full_confirm: false,
+                    keep_staging: false,
+                },
+            ] {
+                let err = run(&conn, &paths, &config, &cmd, false, true, false)
+                    .expect_err("no tape to read");
+                let text = err.to_string();
+                assert!(!text.contains("takes a label or --loaded"), "{text}");
+                assert!(
+                    !text.contains("volume not found"),
+                    "the write was not reached: {text}"
+                );
+                assert_eq!(
+                    crate::error::ErrorContract::Write.exit_code(&anyhow::Error::from(err)),
+                    crate::error::EXIT_ERROR
+                );
+            }
+            let n: i64 = conn
+                .query_row("SELECT COUNT(*) FROM writes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0);
         }
     }
 
@@ -5117,7 +5564,7 @@ mod tests {
     #[test]
     fn a_verify_that_errors_exits_inconclusive_and_nothing_else_changes() {
         let verify = VolumeCommands::Verify {
-            label: "L".into(),
+            label: Some("L".into()),
             device: None,
             full: false,
             quick: false,
@@ -5145,7 +5592,8 @@ mod tests {
     fn the_volume_writes_take_the_write_family_contract() {
         for write in [
             VolumeCommands::Write {
-                label: "L".into(),
+                label: Some("L".into()),
+                loaded: false,
                 device: None,
                 force: false,
                 init: false,
@@ -5157,7 +5605,8 @@ mod tests {
                 keep_staging: false,
             },
             VolumeCommands::Resume {
-                label: "L".into(),
+                label: Some("L".into()),
+                loaded: false,
                 device: None,
                 prewrite_hash: false,
                 full_confirm: false,

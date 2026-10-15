@@ -15,9 +15,14 @@ pub enum RestoreCommands {
         /// Unit name
         #[arg(long)]
         unit: String,
-        /// Volume label
+        /// Volume label. Without it the loaded tape names itself: File 0 is
+        /// read and the volume is found in this catalog by its uuid, and
+        /// the one chosen is printed. A label that is given is checked
+        /// against File 0 as ever. A tape this catalog does not know is
+        /// refused, naming what File 0 says. Not with --dry-run, which
+        /// opens no drive (issue #435)
         #[arg(long)]
-        from: String,
+        from: Option<String>,
         /// Destination directory
         #[arg(long)]
         to: String,
@@ -71,8 +76,13 @@ pub enum RestoreCommands {
     /// One unit's failure does not stop the others (unless --fail-fast);
     /// the command fails if any unit was not restored
     Volume {
-        /// Volume label
-        label: String,
+        /// Volume label. Without it the loaded tape names itself: File 0 is
+        /// read and the volume is found in this catalog by its uuid, and
+        /// the one chosen is printed. A label that is given is checked
+        /// against File 0 as ever. A tape this catalog does not know is
+        /// refused, naming what File 0 says. Not with --dry-run, which
+        /// opens no drive (issue #435)
+        label: Option<String>,
         /// Destination directory: each unit is restored into `DIR/<unit
         /// name>`, which must be empty or new
         #[arg(long, value_name = "DIR")]
@@ -123,9 +133,13 @@ pub enum RestoreCommands {
         /// Unit name
         #[arg(long)]
         unit: String,
-        /// Volume label
+        /// Volume label. Without it the loaded tape names itself: File 0 is
+        /// read and the volume is found in this catalog by its uuid, and
+        /// the one chosen is printed. A label that is given is checked
+        /// against File 0 as ever. A tape this catalog does not know is
+        /// refused, naming what File 0 says (issue #435)
         #[arg(long)]
-        from: String,
+        from: Option<String>,
         /// Destination directory
         #[arg(long)]
         to: String,
@@ -215,6 +229,11 @@ pub fn run(
             spool,
             dry_run,
         } => {
+            // Issue #435: no `--from` restores from the loaded tape, which
+            // File 0 names. A dry run opens no drive, so it cannot.
+            if from.is_none() && *dry_run {
+                return Err(no_volume_dry_run("restore unit"));
+            }
             let device = crate::cli::read_device(config, device.as_deref())?;
             let options = volume::restore::RestoreOptions {
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
@@ -222,19 +241,32 @@ pub fn run(
                 no_space_check: *no_space_check,
                 spool: *spool,
             };
-            let report = volume::restore::restore_unit(
-                conn,
-                paths,
-                config,
-                unit,
-                from,
-                to,
-                &device,
-                DEFAULT_BLOCK_SIZE,
-                *version,
-                *dry_run,
-                &options,
-            )?;
+            let report = match from {
+                Some(from) => volume::restore::restore_unit(
+                    conn,
+                    paths,
+                    config,
+                    unit,
+                    from,
+                    to,
+                    &device,
+                    DEFAULT_BLOCK_SIZE,
+                    *version,
+                    *dry_run,
+                    &options,
+                )?,
+                None => volume::restore::restore_unit_from_loaded(
+                    conn,
+                    paths,
+                    config,
+                    unit,
+                    to,
+                    &device,
+                    DEFAULT_BLOCK_SIZE,
+                    *version,
+                    &options,
+                )?,
+            };
 
             if json_output {
                 println!(
@@ -302,19 +334,41 @@ pub fn run(
                 // `restore file` always spools the slices it reads.
                 spool: false,
             };
-            volume::restore::restore_file(
-                conn,
-                paths,
-                config,
-                unit,
-                file,
-                from,
-                to,
-                &device,
-                DEFAULT_BLOCK_SIZE,
-                *version,
-                &options,
-            )?;
+            // Issue #435: no `--from` restores from the loaded tape; the
+            // volume is then the one File 0 named.
+            let from: String = match from {
+                Some(from) => {
+                    volume::restore::restore_file(
+                        conn,
+                        paths,
+                        config,
+                        unit,
+                        file,
+                        from,
+                        to,
+                        &device,
+                        DEFAULT_BLOCK_SIZE,
+                        *version,
+                        &options,
+                    )?;
+                    from.clone()
+                }
+                None => {
+                    volume::restore::restore_file_from_loaded(
+                        conn,
+                        paths,
+                        config,
+                        unit,
+                        file,
+                        to,
+                        &device,
+                        DEFAULT_BLOCK_SIZE,
+                        *version,
+                        &options,
+                    )?
+                    .volume_label
+                }
+            };
 
             if json_output {
                 println!(
@@ -338,47 +392,55 @@ pub fn run(
             fail_fast,
             dry_run,
         } => {
-            let names = if units.is_empty() {
-                volume::restore::units_on_volume(conn, label)?
-            } else {
-                units.clone()
-            };
-            let requests = names
-                .iter()
-                .map(|name| {
-                    // The name becomes a path under --to: hold it to the
-                    // unit-name rules (no `..`, no leading `/`) even for a
-                    // row a rebuilt catalog brought in from tape.
-                    crate::naming::validate_unit_name(name)?;
-                    Ok(volume::restore::UnitRequest {
-                        unit: name.clone(),
-                        version: None,
-                        dest_dir: std::path::Path::new(to)
-                            .join(name)
-                            .to_string_lossy()
-                            .into_owned(),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let device = crate::cli::read_device(config, device.as_deref())?;
+            // Issue #435: no label restores from the loaded tape, which File
+            // 0 names; the units are then listed from that volume once it is
+            // known. A dry run opens no drive, so it cannot.
+            if label.is_none() && *dry_run {
+                return Err(no_volume_dry_run("restore volume"));
+            }
             let options = volume::restore::RestoreOptions {
                 scratch: scratch.as_ref().map(std::path::PathBuf::from),
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
                 spool: *spool,
             };
-            let report = volume::restore::restore_units(
-                conn,
-                paths,
-                config,
-                label,
-                &requests,
-                &options,
-                *fail_fast,
-                &device,
-                DEFAULT_BLOCK_SIZE,
-                *dry_run,
-            )?;
+            let report = match label {
+                Some(label) => {
+                    let names = if units.is_empty() {
+                        volume::restore::units_on_volume(conn, label)?
+                    } else {
+                        units.clone()
+                    };
+                    let requests = volume::restore::unit_requests(&names, to)?;
+                    let device = crate::cli::read_device(config, device.as_deref())?;
+                    volume::restore::restore_units(
+                        conn,
+                        paths,
+                        config,
+                        label,
+                        &requests,
+                        &options,
+                        *fail_fast,
+                        &device,
+                        DEFAULT_BLOCK_SIZE,
+                        *dry_run,
+                    )?
+                }
+                None => {
+                    let device = crate::cli::read_device(config, device.as_deref())?;
+                    volume::restore::restore_units_from_loaded(
+                        conn,
+                        paths,
+                        config,
+                        units,
+                        to,
+                        &options,
+                        *fail_fast,
+                        &device,
+                        DEFAULT_BLOCK_SIZE,
+                    )?
+                }
+            };
 
             if json_output {
                 println!("{}", units_report_json(&report));
@@ -521,6 +583,18 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+/// The refusal for `--dry-run` with no volume named (issue #435): a dry run
+/// opens no drive, and without a label the volume is whatever File 0 on the
+/// loaded tape says.
+fn no_volume_dry_run(command: &str) -> TapectlError {
+    crate::cli::refuse_dry_run(
+        command,
+        "with no volume named the tape that is loaded names it, which means reading its \
+         File 0, and a dry run opens no drive. Name the volume (--from for restore unit, the \
+         label for restore volume) to preview.",
+    )
 }
 
 /// `restore volume`'s report, one line per unit in the order the units lie

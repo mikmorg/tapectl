@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-verify \- Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing)
 .SH SYNOPSIS
-\fBtapectl volume verify\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-full\fR] [\fB\-\-quick\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume verify\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-full\fR] [\fB\-\-quick\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
 .SH DESCRIPTION
 Verify volume contents via the keyless chain walk (seal \-> front index \-> content). Default tier is `\-\-full` (integrity: hashes every content file); `\-\-quick` opts down to navigable (seal binding + front index self\-consistency only, no per\-file content hashing).
 .PP
@@ -52,5 +52,5 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
-<\fILABEL\fR>
-Volume label
+[\fILABEL\fR]
+Volume label. Without it the loaded tape names itself: File 0 is read (the read a verify makes at contact anyway) and the volume is found in this catalog by its uuid; the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says (issue #435)

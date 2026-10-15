@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-resume \- Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them
 .SH SYNOPSIS
-\fBtapectl volume resume\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-full\-confirm\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-keep\-staging\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume resume\fR [\fB\-\-json\fR] [\fB\-\-loaded\fR] [\fB\-\-device\fR] [\fB\-\-dry\-run\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-full\-confirm\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-keep\-staging\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
 .SH DESCRIPTION
 Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them.
 .PP
@@ -23,11 +23,14 @@ Once the resumed volume is sealed and confirmed, staging is released or kept exa
 Exit status: `volume write`\*(Aqs (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A resume refused before it changed the session exits 2 and leaves the session as it was.
 .SH OPTIONS
 .TP
-\fB\-\-device\fR \fI<DEVICE>\fR
-Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
-.TP
 \fB\-\-json\fR
 Output in JSON format
+.TP
+\fB\-\-loaded\fR
+Resume the loaded tape without naming it: File 0 is read (a `volume identify` contact) and the tape is resumed only when it is one of this catalog\*(Aqs volumes with an interrupted write session, a re\-confirmable aborted one, or a write the catalog lost; the volume chosen is printed. Any other state, or a tape this catalog does not know, is refused naming it. Cannot be combined with a label (issue #435)
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
 .TP
 \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
@@ -35,17 +38,17 @@ Show what would be done without making changes. Commands that cannot preview ref
 \fB\-\-prewrite\-hash\fR
 See `volume write \-\-prewrite\-hash`: the revalidation full\-hashes every staged slice instead of size\-checking it. The session\*(Aqs frozen generated files are re\-hashed either way
 .TP
-\fB\-\-full\-confirm\fR
-See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`
-.TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
 .TP
-\fB\-\-keep\-staging\fR
-See `volume write \-\-keep\-staging`: the staged slices stay even when this resume completes the last copy the policy asks for
+\fB\-\-full\-confirm\fR
+See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-\-keep\-staging\fR
+See `volume write \-\-keep\-staging`: the staged slices stay even when this resume completes the last copy the policy asks for
 .TP
 \fB\-y\fR, \fB\-\-yes\fR
 Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
@@ -63,5 +66,5 @@ Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless 
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
-<\fILABEL\fR>
-Volume label
+[\fILABEL\fR]
+Volume label. Give it, or give `\-\-loaded` instead

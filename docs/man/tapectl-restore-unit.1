@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-unit \- Restore a unit from a volume
 .SH SYNOPSIS
-\fBtapectl restore unit\fR [\fB\-\-json\fR] <\fB\-\-unit\fR> <\fB\-\-from\fR> <\fB\-\-to\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-version\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-scratch\fR] [\fB\-\-home\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-spool\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl restore unit\fR [\fB\-\-json\fR] <\fB\-\-unit\fR> [\fB\-\-from\fR] <\fB\-\-to\fR> [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-version\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-scratch\fR] [\fB\-\-home\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-spool\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Restore a unit from a volume
 .SH OPTIONS
@@ -16,7 +16,7 @@ Output in JSON format
 Unit name
 .TP
 \fB\-\-from\fR \fI<FROM>\fR
-Volume label
+Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with \-\-dry\-run, which opens no drive (issue #435)
 .TP
 \fB\-\-to\fR \fI<TO>\fR
 Destination directory

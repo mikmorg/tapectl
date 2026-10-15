@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-volume \- Restore several units from one volume in one pass over the tape
 .SH SYNOPSIS
-\fBtapectl restore volume\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-unit\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-home\fR] [\fB\-\-spool\fR] [\fB\-\-fail\-fast\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl restore volume\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-unit\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-home\fR] [\fB\-\-spool\fR] [\fB\-\-fail\-fast\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
 .SH DESCRIPTION
 Restore several units from one volume in one pass over the tape
 .PP
@@ -63,5 +63,5 @@ Show what would be restored, unit by unit in tape order, without opening the dri
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)
 .TP
-<\fILABEL\fR>
-Volume label
+[\fILABEL\fR]
+Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with \-\-dry\-run, which opens no drive (issue #435)

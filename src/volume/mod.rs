@@ -9,6 +9,7 @@ pub mod figures;
 pub mod format;
 pub mod layout;
 pub mod layout_model;
+pub(crate) mod loaded;
 pub mod manifest;
 pub mod raw;
 pub mod rebuild;

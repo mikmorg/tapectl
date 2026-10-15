@@ -78,6 +78,10 @@ fn each_write_command_refused_before_the_tape_moved_exits_2() {
             NO_DRIVE,
         ][..],
         &["volume", "resume", "NOSUCH", "--device", NO_DRIVE][..],
+        // Issue #435: `--loaded` names the volume from the tape, which here
+        // does not exist — refused before anything is written.
+        &["volume", "write", "--loaded", "--device", NO_DRIVE][..],
+        &["volume", "resume", "--loaded", "--device", NO_DRIVE][..],
         &[
             "volume",
             "compact-write",
@@ -126,6 +130,12 @@ fn a_write_command_line_that_does_not_parse_exits_2() {
     let home = TempDir::new().unwrap();
     for args in [
         &["volume", "write"][..],
+        &["volume", "resume"][..],
+        // Issue #435: a label and `--loaded` are two answers to one question;
+        // `--init` needs the label it initialises.
+        &["volume", "write", "L", "--loaded"][..],
+        &["volume", "resume", "L", "--loaded"][..],
+        &["volume", "write", "--loaded", "--init"][..],
         &["volume", "resume", "L", "--fill-ceiling", "99%"][..],
         &["volume", "compact-write"][..],
         &["collection", "run", "--bogus"][..],

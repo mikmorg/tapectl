@@ -265,6 +265,10 @@ fn written() -> Written {
 enum Path {
     VerifyFull,
     VerifyQuick,
+    /// `volume verify` with no label (#435): the same two verifies, the
+    /// volume found from the File 0 they read at contact in any case.
+    VerifyLoadedFull,
+    VerifyLoadedQuick,
     Rebuild,
     Raw,
     Envelope,
@@ -274,9 +278,11 @@ enum Path {
     Binding,
 }
 
-const PATHS: [Path; 9] = [
+const PATHS: [Path; 11] = [
     Path::VerifyFull,
     Path::VerifyQuick,
+    Path::VerifyLoadedFull,
+    Path::VerifyLoadedQuick,
     Path::Rebuild,
     Path::Raw,
     Path::Envelope,
@@ -384,6 +390,23 @@ impl Written {
                 .unwrap();
                 assert!(r.mismatches.is_empty(), "{:?}", r.mismatches);
             }
+            Path::VerifyLoadedFull | Path::VerifyLoadedQuick => {
+                let tier = if path == Path::VerifyLoadedFull {
+                    Tier::Integrity
+                } else {
+                    Tier::Navigable
+                };
+                let (found, r) = crate::volume::write::verify_loaded_with_store(
+                    &self.conn,
+                    &mut store,
+                    BS as usize,
+                    tier,
+                    self.site(Operation::VolumeVerify),
+                )
+                .unwrap();
+                assert_eq!(found.label, LABEL);
+                assert!(r.mismatches.is_empty(), "{:?}", r.mismatches);
+            }
             Path::Rebuild => {
                 let fresh = db::open_memory().unwrap();
                 let identity: age::x25519::Identity = self.operator_secret.parse().unwrap();
@@ -486,11 +509,11 @@ fn budget(path: Path) -> (f64, usize) {
     match path {
         // File 0 and File 3 for the contact, then seal first (§2.5: a tape
         // nothing has just seen): out to the seal, one rewind, one pass.
-        Path::VerifyFull => (3.05, 1),
+        Path::VerifyFull | Path::VerifyLoadedFull => (3.05, 1),
         // File 3 first, then a space out to the seal (#397). The rewind is
         // the contact's head read of File 3 being read again whole — a few
         // files from BOT, so nearly free in travel, but counted.
-        Path::VerifyQuick => (1.05, 1),
+        Path::VerifyQuick | Path::VerifyLoadedQuick => (1.05, 1),
         // File 0, File 3 and the operator envelope, all before the slices
         // (format §1), then one locate out to the seal marker for its
         // `sealed_at` (#305: without it a sealed tape is dated to the
@@ -619,7 +642,12 @@ fn the_pre_1_0_5_rewind_per_read_breaks_every_multi_file_budget() {
     for (path, cost) in &costs {
         if matches!(
             path,
-            Path::VerifyFull | Path::Raw | Path::ReadSlices | Path::CompactRead | Path::Resume
+            Path::VerifyFull
+                | Path::VerifyLoadedFull
+                | Path::Raw
+                | Path::ReadSlices
+                | Path::CompactRead
+                | Path::Resume
         ) {
             assert!(
                 cost.lengths > 10.0,

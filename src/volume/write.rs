@@ -30,6 +30,7 @@ use super::layout;
 use super::layout_model::{
     CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, SliceCheck, ZoneKind,
 };
+use super::loaded;
 use super::session::{
     self, check_tape_contact, AbortedAdoption, ConfirmOutcome, ContactOutcome, QuarantineReason,
     ResumeAdmission, ResumeOutcome,
@@ -4489,6 +4490,77 @@ pub fn volume_verify(
     )
 }
 
+/// [`volume_verify`] for the tape that is loaded, named by no label (issue
+/// #435): File 0 identifies the volume, and this finds it in the catalog by
+/// uuid. Returns the volume it found with the report.
+///
+/// The drive is opened exactly as [`volume_verify`] opens it, and File 0 is
+/// read once, on that store — the read `verify_contacted` makes at contact
+/// in any case, handed to it rather than made twice ([`loaded::Peeked`]; a
+/// second read would be a rewind, which `volume::cost_budget` pins). A tape
+/// this catalog does not know is refused naming what File 0 says, before
+/// any contact opens. The volume's session lock is taken once the volume is
+/// known, so after the File 0 read rather than before the drive opens as
+/// with a label; the st driver's own exclusive open is what kept a second
+/// process off the drive until then.
+pub(crate) fn volume_verify_loaded(
+    conn: &Connection,
+    config: &Config,
+    device: &str,
+    block_size: usize,
+    tier: Tier,
+) -> Result<(loaded::LoadedVolume, VerifyReport)> {
+    // The holder, the MAM read and the store open are `volume_verify`'s own,
+    // in its order: the no-medium check first, so an empty drive is refused
+    // before the first touch of it.
+    let reads = MamReads::new(conn, Operation::VolumeVerify);
+    reads.check_read_contact(config, device)?;
+    let observed = binding::loaded_medium(config, device, &reads);
+    let phase = progress::phase("drive-open", None);
+    let mut store = TapeStore::open_read(device, block_size)?;
+    phase.done();
+    verify_loaded_with_store(
+        conn,
+        &mut store,
+        block_size,
+        tier,
+        ContactSite::new(
+            config,
+            Operation::VolumeVerify,
+            device,
+            Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+        )
+        .with_mam_reads(&reads),
+    )
+}
+
+/// [`volume_verify_loaded`] minus the tape device, for a `MemStore` or a
+/// `FakeTape`-backed store: find the volume File 0 names, announce it, take
+/// its session lock, and verify it through [`volume_verify_with_store`] on
+/// a store that already holds the File 0 it read.
+pub(crate) fn verify_loaded_with_store(
+    conn: &Connection,
+    store: &mut dyn Store,
+    block_size: usize,
+    tier: Tier,
+    site: ContactSite<'_>,
+) -> Result<(loaded::LoadedVolume, VerifyReport)> {
+    let (found, mut peeked) = loaded::identify(conn, store)?;
+    loaded::announce("verifying", &found);
+    // Issue #376: the verify is a session on this volume, as with a label.
+    let _volume_lock = crate::staging::lock::acquire_volume(conn, found.volume_id, &found.label)?;
+    let report = volume_verify_with_store(
+        conn,
+        &mut peeked,
+        &found.label,
+        found.volume_id,
+        block_size,
+        tier,
+        site,
+    )?;
+    Ok((found, report))
+}
+
 /// [`volume_verify`] minus the tape device: everything from the front-index
 /// read through the `verification_sessions` / `verification_results` rows,
 /// and the one post-command sweep.
@@ -7301,6 +7373,223 @@ mod tests {
             assert_eq!(report.failed, 0, "{tier:?}: {:?}", report.mismatches);
             assert_eq!(verified(), vec![want], "after a passing {tier:?} verify");
         }
+    }
+
+    // ── issue #435: `volume verify` names no volume; the loaded tape does ──
+
+    /// A catalog with one volume `label` carrying the uuid every
+    /// `mem_store_v2_tape` writes into File 0, and that tape on a
+    /// `FakeTape` (so every head motion is recorded).
+    fn loaded_fixture(label: &str) -> (Connection, i64, crate::tape::fake::FakeTape) {
+        let conn = crate::db::open_memory().unwrap();
+        let good = b"intact slice bytes, repeated a few times. ".repeat(4);
+        seed_one_slice_fixture(&conn, label, "lv-unit", 4, &good, "completed", "staged");
+        conn.execute(
+            "UPDATE volumes SET uuid = ?1 WHERE label = ?2",
+            params![MEM_TAPE_UUID, label],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row(
+                "SELECT id FROM volumes WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mem = mem_store_v2_tape(label, &good, &good);
+        let fake = crate::tape::fake::FakeTape::with_files(mem.files.clone(), 4096);
+        (conn, volume_id, fake)
+    }
+
+    fn fake_store(fake: &crate::tape::fake::FakeTape) -> crate::store::TapeStore {
+        crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap()
+    }
+
+    /// No label: the volume File 0 names is verified and the verification is
+    /// recorded against IT — and the command costs what the same verify with
+    /// the label typed costs, exactly: the same head motions, so File 0 is
+    /// read once, not once to find the volume and again to check it.
+    #[test]
+    fn a_verify_with_no_label_verifies_the_volume_file0_names_at_the_cost_of_one_file0_read() {
+        use crate::tape::fake::Op;
+        let (conn, volume_id, fake) = loaded_fixture("LV-ONE");
+        let mut store = fake_store(&fake);
+
+        let (found, report) = verify_loaded_with_store(
+            &conn,
+            &mut store,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap();
+
+        assert_eq!(
+            (found.label.as_str(), found.volume_id),
+            ("LV-ONE", volume_id)
+        );
+        assert_eq!(report.failed, 0, "{:?}", report.mismatches);
+        let sessions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM verification_sessions WHERE volume_id = ?1",
+                params![volume_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions, 1, "recorded against the volume File 0 named");
+
+        // The labelled verify of the same tape, for comparison.
+        let (conn2, volume_id2, fake2) = loaded_fixture("LV-ONE");
+        let mut store2 = fake_store(&fake2);
+        volume_verify_with_store(
+            &conn2,
+            &mut store2,
+            "LV-ONE",
+            volume_id2,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap();
+        let file0 = |ops: &[Op]| ops.iter().filter(|o| **o == Op::ReadHead(0)).count();
+        assert_eq!(
+            file0(&fake2.ops()),
+            1,
+            "positive control: a verify reads File 0 once"
+        );
+        assert_eq!(
+            fake.ops(),
+            fake2.ops(),
+            "the loaded verify moves the head exactly as the labelled one does"
+        );
+        assert_eq!(fake.moving_rewinds(), fake2.moving_rewinds());
+    }
+
+    /// The control that gives the test above its teeth: finding the volume
+    /// by a read of its own, and then verifying the way a labelled verify
+    /// does, reads File 0 twice. That is the cost `Peeked` removes.
+    #[test]
+    fn finding_the_volume_by_a_separate_read_would_read_file0_twice() {
+        use crate::tape::fake::Op;
+        let (conn, volume_id, fake) = loaded_fixture("LV-TWO");
+        let mut store = fake_store(&fake);
+        let file0 = binding::read_file0_facts(&mut store);
+        assert_eq!(file0.uuid.as_deref(), Some(MEM_TAPE_UUID));
+        volume_verify_with_store(
+            &conn,
+            &mut store,
+            "LV-TWO",
+            volume_id,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap();
+        let reads = fake.ops().iter().filter(|o| **o == Op::ReadHead(0)).count();
+        assert_eq!(reads, 2, "{:?}", fake.ops());
+    }
+
+    /// A tape the catalog does not know is refused, naming what File 0
+    /// says, before any contact opens: no session, no contact row.
+    #[test]
+    fn a_verify_with_no_label_refuses_a_tape_the_catalog_does_not_know() {
+        let (conn, _, fake) = loaded_fixture("LV-KNOWN");
+        conn.execute("UPDATE volumes SET uuid = 'some-other-uuid'", [])
+            .unwrap();
+        let mut store = fake_store(&fake);
+
+        let err = verify_loaded_with_store(
+            &conn,
+            &mut store,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains(MEM_TAPE_UUID),
+            "names the uuid File 0 carries: {err}"
+        );
+        assert!(err.contains("no volume with that uuid"), "{err}");
+        let rows = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(rows("verification_sessions"), 0);
+        assert_eq!(
+            rows("cartridge_contacts"),
+            0,
+            "no contact: nothing was verified"
+        );
+        // Verify's contract maps every error to "inconclusive".
+        assert_eq!(
+            crate::error::ErrorContract::Verify.exit_code(&anyhow::Error::msg(err)),
+            crate::error::EXIT_VERIFY_INCONCLUSIVE
+        );
+    }
+
+    /// A blank or foreign File 0 identifies nothing: refused, not guessed.
+    #[test]
+    fn a_verify_with_no_label_refuses_a_file0_that_identifies_no_volume() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut store = MemStore::new(4096);
+        let junk = b"not a tapectl tape\n".to_vec();
+        store
+            .execute(&mut Cursor::new(junk.clone()), junk.len() as u64, false)
+            .unwrap();
+
+        let err = verify_loaded_with_store(
+            &conn,
+            &mut store,
+            4096,
+            Tier::Navigable,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("does not identify a volume"), "{err}");
+    }
+
+    /// A label that IS given is checked against File 0 exactly as before:
+    /// the loaded tape is another volume's, and the verify is refused,
+    /// naming both.
+    #[test]
+    fn a_label_that_disagrees_with_file0_is_still_refused() {
+        let (conn, _, fake) = loaded_fixture("LV-ON-TAPE");
+        // Another volume of the catalog, with a uuid of its own.
+        conn.execute(
+            "INSERT INTO volumes (label, uuid, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('LV-TYPED', 'a-different-uuid', 'lto', 'p', 10485760, 'sealed')",
+            [],
+        )
+        .unwrap();
+        let typed_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = 'LV-TYPED'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut store = fake_store(&fake);
+
+        let err = volume_verify_with_store(
+            &conn,
+            &mut store,
+            "LV-TYPED",
+            typed_id,
+            4096,
+            Tier::Integrity,
+            site(Operation::VolumeVerify),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("wrong tape"), "{err}");
+        assert!(
+            err.contains("LV-TYPED") && err.contains("LV-ON-TAPE"),
+            "{err}"
+        );
     }
 
     // ── issue #423: a passing full verify records a sealed copy's figures ──
@@ -15271,13 +15560,15 @@ mod tests {
                 with_reads += src.matches("with_mam_reads(").count();
             }
             assert_eq!(
-                checks, 9,
+                checks, 11,
                 "verify, restore unit, restore of several units (#398), catalog rebuild, \
-                 restore raw-volume, identify, read-slices, compact-read, compact"
+                 restore raw-volume, identify, read-slices, compact-read, compact — and the \
+                 two that name no volume (#435): verify of the loaded tape and the one drive \
+                 helper behind restore unit, file and volume of the loaded tape"
             );
             assert_eq!(
-                with_reads, 9,
-                "each of the nine hands its holder to its contact"
+                with_reads, 11,
+                "each of the eleven hands its holder to its contact"
             );
         }
 
@@ -15466,9 +15757,11 @@ mod tests {
             // Positive control on the walk: it found every read path the
             // count test names, in the files they live in.
             assert_eq!(
-                reads, 9,
+                reads, 11,
                 "verify, restore unit, restore of several units (#398), catalog rebuild, \
-                 restore raw-volume, identify, read-slices, compact-read, compact — found in \
+                 restore raw-volume, identify, read-slices, compact-read, compact — and the \
+                 two that name no volume (#435): verify of the loaded tape and the one drive \
+                 helper behind restore unit, file and volume of the loaded tape — found in \
                  {files:?}"
             );
             assert_eq!(
