@@ -13,8 +13,8 @@ use crate::error::Result;
 /// stage_sets the eligibility rule inside `clean_staging` gets to look at,
 /// not whether any of them may actually be released — that stays entirely
 /// with the caller (`cli::staging::run`'s min_copies gate;
-/// `collection::batch::execute_batch`'s own `under_copied_units` gate),
-/// exactly as ADR-0012's #244 amendment requires ("`clean_staging` stays
+/// `staging::release::release_if_covered`, the gate `collection run`,
+/// `volume write` and `volume resume` share), exactly as ADR-0012's #244 amendment requires ("`clean_staging` stays
 /// policy-free; the gate goes in the CLI caller").
 #[derive(Debug, Clone, Copy)]
 pub enum CleanScope<'a> {
@@ -282,8 +282,8 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
 /// still decided entirely by the eligibility rule above (`force`, `writes`
 /// status) plus whatever gate the caller ran before ever calling this
 /// function (`cli::staging::run`'s min_copies split since issue #262:
-/// release covered units, retain under-copied ones; `collection::batch::
-/// execute_batch`'s own `under_copied_units`) — `clean_staging` itself
+/// release covered units, retain under-copied ones; `staging::release::
+/// release_if_covered` for a batch or a write) — `clean_staging` itself
 /// stays exactly as policy-free as ADR-0012's #244 amendment requires.
 /// `CleanScope::Whole` reproduces this function's original, unscoped
 /// behaviour verbatim (`tapectl staging clean`'s archive-wide sweep when

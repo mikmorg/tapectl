@@ -4,11 +4,13 @@
 .SH NAME
 tapectl\-volume\-write \- Write staged data to volume
 .SH SYNOPSIS
-\fBtapectl volume write\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume write\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-full\-confirm\fR] [\fB\-\-home\fR] [\fB\-\-keep\-staging\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Write staged data to volume
 .PP
 Refuses any volume not left `initialized` by `volume init` — a sealed, retired, erased or quarantined volume is not a write target (ADR\-0012); no flag overrides it.
+.PP
+Once the volume is sealed and confirmed, staging is released if every unit written has reached its resolved `min_copies` (ADR\-0012, 2026\-10\-07 item 2: after a quick confirm too); otherwise it is kept and the output names each unit that is still short. A release that fails is a warning and the exit status stays 0. `\-\-keep\-staging` never releases; `staging clean` does it later.
 .PP
 Exit status, shared by every command that writes a tape: 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re\-enters the confirm. 4 = interrupted part\-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
 .SH OPTIONS
@@ -55,6 +57,9 @@ After sealing, read every file back and hash it against the front index (tri\-la
 tapectl home directory: database, keys, catalogs, stage\-reports, logs.
 
 Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-\-keep\-staging\fR
+Keep the staged slices after the write seals and confirms, even when every unit written has reached its resolved `min_copies`. Without this flag the staging is released then; release it later with `tapectl staging clean`
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

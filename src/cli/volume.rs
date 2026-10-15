@@ -65,7 +65,7 @@ pub enum VolumeCommands {
     ///
     /// Once the volume is sealed and confirmed, staging is released if every
     /// unit written has reached its resolved `min_copies` (ADR-0012,
-    /// 2026-10-06 item 2: after a quick confirm too); otherwise it is kept
+    /// 2026-10-07 item 2: after a quick confirm too); otherwise it is kept
     /// and the output names each unit that is still short. A release that
     /// fails is a warning and the exit status stays 0. `--keep-staging`
     /// never releases; `staging clean` does it later.
@@ -727,7 +727,10 @@ fn release_staging_after_write(
 /// exists: `staging_released`, `stage_sets_released`, `bytes_freed`,
 /// `under_copied` (empty unless a unit kept the staging), `keep_staging`
 /// and `release_warning` (null unless the release failed).
-fn staging_release_json(mut base: serde_json::Value, release: &StagingRelease) -> serde_json::Value {
+fn staging_release_json(
+    mut base: serde_json::Value,
+    release: &StagingRelease,
+) -> serde_json::Value {
     let (released, sets, bytes) = match release {
         StagingRelease::Released(c) => (true, c.sets_cleaned, c.bytes_freed),
         _ => (false, 0, 0),
@@ -3209,6 +3212,271 @@ fn staged_plan_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #440: what `volume write` and `volume resume` do about staging
+    /// once the copy is sealed and confirmed. The write itself needs a tape
+    /// drive, so these drive the release step on a catalog that looks as it
+    /// does right after one (the seam `collection::batch::release_if_covered`
+    /// uses for the same reason), and pin the wiring around it by source.
+    mod staging_release_after_write {
+        use super::*;
+        use crate::staging::release::fixtures::*;
+        use crate::staging::release::CopyProgress;
+
+        /// `alpha` v1, `copies` completed writes, staged on disk; the first
+        /// copy's volume label is the one "just written".
+        fn written(copies: i64) -> (Connection, tempfile::TempDir, Staged) {
+            let conn = crate::db::open_memory().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+            let s = staged_version(&conn, alpha, 1, "current", dir.path(), copies);
+            (conn, dir, s)
+        }
+
+        /// Released at the floor: the write that brought the unit to its
+        /// second copy frees the staging, and says how much.
+        #[test]
+        fn released_when_the_write_brings_every_unit_to_min_copies() {
+            let (conn, dir, s) = written(2);
+            let config = config(dir.path(), 2);
+
+            let release = release_staging_after_write(&conn, &config, &s.volumes[1], false);
+
+            match &release {
+                StagingRelease::Released(r) => {
+                    assert_eq!(r.sets_cleaned, 1);
+                    assert!(r.bytes_freed > 0);
+                }
+                other => panic!("expected a release at the floor: {other:?}"),
+            }
+            assert!(!s.file.exists());
+            assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
+            let json = staging_release_json(serde_json::json!({"label": "x"}), &release);
+            assert_eq!(json["staging_released"], true);
+            assert_eq!(json["stage_sets_released"], 1);
+            assert_eq!(json["under_copied"], serde_json::json!([]));
+            assert_eq!(json["keep_staging"], false);
+            assert!(json["release_warning"].is_null());
+        }
+
+        /// Kept below it, naming the unit and the shortfall in the words the
+        /// operator reads; the same facts are in `--json`.
+        #[test]
+        fn kept_below_min_copies_with_the_reason() {
+            let (conn, dir, s) = written(1);
+            let config = config(dir.path(), 2);
+
+            let release = release_staging_after_write(&conn, &config, &s.volumes[0], false);
+
+            let StagingRelease::Retained(units) = &release else {
+                panic!("one copy of two must keep the staging: {release:?}");
+            };
+            assert_eq!(
+                units.iter().map(CopyProgress::describe).collect::<Vec<_>>(),
+                ["unit testlib/alpha has 1 copy, needs 2"]
+            );
+            assert!(s.file.exists(), "the next copy reuses these bytes");
+            assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
+            let json = staging_release_json(serde_json::json!({"label": "x"}), &release);
+            assert_eq!(json["staging_released"], false);
+            assert_eq!(
+                json["under_copied"],
+                serde_json::json!([{"unit": "testlib/alpha", "copies": 1, "min_copies": 2}])
+            );
+        }
+
+        /// `--keep-staging`: covered, and kept anyway. The positive control
+        /// is the same catalog released without the flag.
+        #[test]
+        fn keep_staging_opts_out_even_when_every_unit_is_covered() {
+            let (conn, dir, s) = written(2);
+            let config = config(dir.path(), 2);
+
+            let release = release_staging_after_write(&conn, &config, &s.volumes[1], true);
+
+            assert!(matches!(release, StagingRelease::Kept), "{release:?}");
+            assert!(s.file.exists(), "--keep-staging releases nothing");
+            assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
+            let json = staging_release_json(serde_json::json!({"label": "x"}), &release);
+            assert_eq!(json["keep_staging"], true);
+            assert_eq!(json["staging_released"], false);
+
+            // Positive control: without the flag this catalog DOES release.
+            let again = release_staging_after_write(&conn, &config, &s.volumes[1], false);
+            assert!(matches!(again, StagingRelease::Released(_)), "{again:?}");
+            assert!(!s.file.exists());
+        }
+
+        /// A release that errors after the copy stands is a warning: the
+        /// step and the command that finishes it are named, nothing is
+        /// released, and nothing here can change the write's exit status.
+        #[test]
+        fn a_failed_release_is_a_warning_naming_staging_clean() {
+            let (conn, dir, s) = written(2);
+            let config = config(dir.path(), 2);
+            // The catalog fails the release's own reads, after the gate.
+            conn.execute_batch("DROP TABLE stage_slices").unwrap();
+
+            let release = release_staging_after_write(&conn, &config, &s.volumes[1], false);
+
+            let StagingRelease::Failed(warning) = &release else {
+                panic!("a catalog error must be reported, not raised: {release:?}");
+            };
+            assert!(
+                warning.starts_with(
+                    "warning: volume \"V-u1-v1-1\" is sealed and confirmed and counts as a \
+                     copy, but releasing staging did not finish: "
+                ),
+                "{warning}"
+            );
+            assert!(
+                warning.ends_with("To finish it: tapectl staging clean"),
+                "{warning}"
+            );
+            let json = staging_release_json(serde_json::json!({"label": "x"}), &release);
+            assert_eq!(json["staging_released"], false);
+            assert_eq!(json["release_warning"], serde_json::json!(warning));
+        }
+
+        /// A failed or unconfirmed write never reaches the release: the
+        /// command returns before it. Driven for real where the write can be
+        /// refused without a drive (a sealed volume is no write target), with
+        /// a catalog whose staging WOULD release — the control follows.
+        #[test]
+        fn a_write_that_does_not_complete_releases_nothing() {
+            let (conn, dir, s) = written(2);
+            let config = {
+                let mut c = config(dir.path(), 2);
+                c.backends.lto.push(crate::config::LtoBackendConfig {
+                    name: "lto0".into(),
+                    device_tape: "/nonexistent/tapectl-release-nst".into(),
+                    device_sg: "/nonexistent/tapectl-release-sg".into(),
+                    generation: "LTO-6".into(),
+                    capacity_override: None,
+                    fill_ceiling: 1.0,
+                    enospc_buffer: "0".into(),
+                });
+                c
+            };
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let cmd = VolumeCommands::Write {
+                label: s.volumes[1].clone(),
+                device: Some("/nonexistent/tapectl-release-nst".into()),
+                force: false,
+                allow_missing_escrow: false,
+                prewrite_hash: false,
+                fill_ceiling: None,
+                full_confirm: false,
+                keep_staging: false,
+            };
+
+            let err = run(&conn, &paths, &config, &cmd, false, true, false)
+                .expect_err("a sealed volume is not a write target");
+            assert!(
+                matches!(err, TapectlError::VolumeNotWriteTarget { .. }),
+                "the write itself was reached and refused: {err:?}"
+            );
+            assert!(s.file.exists(), "a refused write released nothing");
+            assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
+
+            // Control: the catalog is releasable, so the file survived
+            // because the write failed, not because nothing could be freed.
+            let release = release_staging_after_write(&conn, &config, &s.volumes[1], false);
+            assert!(
+                matches!(release, StagingRelease::Released(_)),
+                "{release:?}"
+            );
+        }
+
+        /// `--dry-run` refuses `volume write` and `volume resume` outright
+        /// (issue #241), before any release can be considered.
+        #[test]
+        fn dry_run_releases_nothing() {
+            let (conn, dir, s) = written(2);
+            let config = config(dir.path(), 2);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            for cmd in [
+                VolumeCommands::Write {
+                    label: s.volumes[1].clone(),
+                    device: None,
+                    force: false,
+                    allow_missing_escrow: false,
+                    prewrite_hash: false,
+                    fill_ceiling: None,
+                    full_confirm: false,
+                    keep_staging: false,
+                },
+                VolumeCommands::Resume {
+                    label: s.volumes[1].clone(),
+                    device: None,
+                    prewrite_hash: false,
+                    full_confirm: false,
+                    keep_staging: false,
+                },
+            ] {
+                let err = run(&conn, &paths, &config, &cmd, false, true, true)
+                    .expect_err("--dry-run is refused");
+                assert!(
+                    err.to_string().contains("--dry-run is not supported"),
+                    "{err}"
+                );
+            }
+            assert!(s.file.exists());
+            assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
+        }
+
+        /// The wiring, by source (the house pattern for what cannot be
+        /// driven without a drive): in both arms the release is the statement
+        /// AFTER the write's own `?` — every failed, aborted, interrupted or
+        /// inconclusive outcome returns at that `?` — and `--keep-staging`
+        /// reaches it.
+        #[test]
+        fn both_arms_release_only_after_the_write_returns_ok() {
+            const SRC: &str = include_str!("volume.rs");
+            let run_body = &SRC[SRC.find("pub fn run(").unwrap()..];
+            for (arm, next, write_call) in [
+                (
+                    "VolumeCommands::Write {\n",
+                    "VolumeCommands::Resume {\n",
+                    "write::volume_write(",
+                ),
+                (
+                    "VolumeCommands::Resume {\n",
+                    "VolumeCommands::Abort {",
+                    "write::volume_resume(",
+                ),
+            ] {
+                let start = run_body.find(arm).unwrap();
+                let body = &run_body[start..start + run_body[start..].find(next).unwrap()];
+                let call = body
+                    .find(write_call)
+                    .unwrap_or_else(|| panic!("{arm}: no write"));
+                let question = call + body[call..].find(")?;").expect("the write's own `?`");
+                let release = body
+                    .find("release_staging_after_write(conn, config, label, *keep_staging)")
+                    .unwrap_or_else(|| panic!("{arm}: no release honouring --keep-staging"));
+                assert!(
+                    release > question,
+                    "{arm}: the release must come after the write's `?`, not before it"
+                );
+                assert_eq!(
+                    body.matches("release_staging_after_write(").count(),
+                    1,
+                    "{arm}: one release call"
+                );
+            }
+            // And nowhere else in the library: `collection run`, `quick-archive`
+            // and `volume compact*` reach `volume_write` directly and have
+            // their own release step, so a release inside it would double up.
+            let write_rs = include_str!("../volume/write.rs");
+            assert!(
+                !write_rs.contains("staging::release"),
+                "volume::write must not release staging itself"
+            );
+        }
+    }
 
     /// ADR-0012 2026-10-07 item 33 and the ruling on its question 2:
     /// `volume compact`'s step 3 refused for CONSENT after step 2 sealed and

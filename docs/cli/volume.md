@@ -59,6 +59,8 @@ Write staged data to volume
 
 Refuses any volume not left `initialized` by `volume init` — a sealed, retired, erased or quarantined volume is not a write target (ADR-0012); no flag overrides it.
 
+Once the volume is sealed and confirmed, staging is released if every unit written has reached its resolved `min_copies` (ADR-0012, 2026-10-07 item 2: after a quick confirm too); otherwise it is kept and the output names each unit that is still short. A release that fails is a warning and the exit status stays 0. `--keep-staging` never releases; `staging clean` does it later.
+
 Exit status, shared by every command that writes a tape: 0 = sealed and confirmed. 2 = an error with the medium untouched: nothing was written (or a usage error). 3 = the confirm was inconclusive: the tape is sealed, `volume resume` re-enters the confirm. 4 = interrupted part-way: `volume resume` continues. 5 = aborted (end of tape, a slice that changed): write the label again. 6 = the medium was proven bad and the volume quarantined. 75 = the catalog was busy.
 
 ```text
@@ -77,6 +79,7 @@ tapectl volume write [OPTIONS] <LABEL>
 - `--prewrite-hash` — Full-hash every staged slice from disk before the tape moves (tri-layer L1). Off by default (ADR-0012, 2026-09-30): the write then checks each slice exists at its recorded size, and a slice that rotted in staging is caught while streaming (clean abort, tape left unsealed). This costs one extra full read of the batch
 - `--fill-ceiling <FILL_CEILING>` — Fill this volume to at most this fraction of its capacity, for this write only: `0.99` or `99%`. Overrides the drive's `fill_ceiling` (default 97%, ADR-0012). The pre-write check refuses a layout above the ceiling and names by how much
 - `--full-confirm` — After sealing, read every file back and hash it against the front index (tri-layer L3, hours on a full cartridge). Off by default (ADR-0012, 2026-10-06): the confirm then reads the front index and the seal marker, and a passing one seals the volume with no full readback recorded — `audit` and `report verify-status` name it until `volume verify` runs one
+- `--keep-staging` — Keep the staged slices after the write seals and confirms, even when every unit written has reached its resolved `min_copies`. Without this flag the staging is released then; release it later with `tapectl staging clean`
 
 ### tapectl volume resume
 
@@ -91,6 +94,8 @@ An ABORTED session is adopted and re-confirmed the same way (never written, neve
 A write the CATALOG lost (it was restored from a backup taken after `volume init` and before the write) is adopted as sealed, reading only, once `catalog rebuild --from-volume` has attached it and a passing full verify is recorded after that rebuild — and only when File 0's uuid is this volume's, a seal marker binds the front index, and every slice hash in the front index is the one this catalog recorded when it staged that slice (ADR-0012, 2026-09-29 later).
 
 Refuses any volume whose CATALOG status is not `initialized` — a volume recorded sealed, retired or erased, or whose condition is quarantined, is not a write target (ADR-0012); no flag overrides it. That is a different question from whether the loaded TAPE carries a seal marker, which is what the re-confirm path above is about.
+
+Once the resumed volume is sealed and confirmed, staging is released or kept exactly as `volume write` does it (`--keep-staging` opts out).
 
 Exit status: `volume write`'s (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A resume refused before it changed the session exits 2 and leaves the session as it was.
 
@@ -107,6 +112,7 @@ tapectl volume resume [OPTIONS] <LABEL>
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 - `--prewrite-hash` — See `volume write --prewrite-hash`: the revalidation full-hashes every staged slice instead of size-checking it. The session's frozen generated files are re-hashed either way
 - `--full-confirm` — See `volume write --full-confirm`: the confirm this resume runs (or re-enters) reads every file back. A full readback that was interrupted CONTINUES: the files it already read back clean are not read again, as long as the front index on the tape is the one they were checked against. Without this flag the resume runs the quick confirm and the readback is left to `volume verify`
+- `--keep-staging` — See `volume write --keep-staging`: the staged slices stay even when this resume completes the last copy the policy asks for
 
 ### tapectl volume abort
 

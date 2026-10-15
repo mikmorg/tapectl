@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-volume\-resume \- Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them
 .SH SYNOPSIS
-\fBtapectl volume resume\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-full\-confirm\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
+\fBtapectl volume resume\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-full\-confirm\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-keep\-staging\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Resume an interrupted write session. Reload the SAME cartridge first: the session continues from its frozen staging files rather than rebuilding them.
 .PP
@@ -17,6 +17,8 @@ An ABORTED session is adopted and re\-confirmed the same way (never written, nev
 A write the CATALOG lost (it was restored from a backup taken after `volume init` and before the write) is adopted as sealed, reading only, once `catalog rebuild \-\-from\-volume` has attached it and a passing full verify is recorded after that rebuild — and only when File 0\*(Aqs uuid is this volume\*(Aqs, a seal marker binds the front index, and every slice hash in the front index is the one this catalog recorded when it staged that slice (ADR\-0012, 2026\-09\-29 later).
 .PP
 Refuses any volume whose CATALOG status is not `initialized` — a volume recorded sealed, retired or erased, or whose condition is quarantined, is not a write target (ADR\-0012); no flag overrides it. That is a different question from whether the loaded TAPE carries a seal marker, which is what the re\-confirm path above is about.
+.PP
+Once the resumed volume is sealed and confirmed, staging is released or kept exactly as `volume write` does it (`\-\-keep\-staging` opts out).
 .PP
 Exit status: `volume write`\*(Aqs (0 sealed and confirmed, 2 nothing written, 3 confirm inconclusive, 4 interrupted, 5 aborted, 6 quarantined, 75 catalog busy). A resume refused before it changed the session exits 2 and leaves the session as it was.
 .SH OPTIONS
@@ -38,6 +40,9 @@ See `volume write \-\-full\-confirm`: the confirm this resume runs (or re\-enter
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
+.TP
+\fB\-\-keep\-staging\fR
+See `volume write \-\-keep\-staging`: the staged slices stay even when this resume completes the last copy the policy asks for
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/

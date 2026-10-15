@@ -7,7 +7,7 @@
 //! callers share it: `collection run`'s batch (via
 //! `collection::batch::release_if_covered`) and `volume write` / `volume
 //! resume` (via `cli::volume`), each right after a copy is sealed AND
-//! confirmed (ADR-0012 2026-10-06/07, items 2 and 33: staging is released
+//! confirmed (ADR-0012 2026-10-07, items 2 and 33: staging is released
 //! after a quick confirm too, and a failed release is a warning, never a
 //! failed write).
 //!
@@ -196,7 +196,6 @@ pub(crate) mod fixtures {
 
     /// One staged version of a unit, as the catalog and the disk hold it.
     pub(crate) struct Staged {
-        pub unit_id: i64,
         pub stage_set_id: i64,
         pub snapshot_id: i64,
         pub file: PathBuf,
@@ -272,7 +271,6 @@ pub(crate) mod fixtures {
         )
         .unwrap();
         let mut staged = Staged {
-            unit_id,
             stage_set_id,
             snapshot_id,
             file,
@@ -302,14 +300,21 @@ pub(crate) mod fixtures {
         )
         .unwrap();
         let volume_id: i64 = conn
-            .query_row("SELECT id FROM volumes WHERE label = ?1", params![label], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT id FROM volumes WHERE label = ?1",
+                params![label],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status) \
              VALUES (?1, ?2, ?3, ?4)",
-            params![staged.stage_set_id, staged.snapshot_id, volume_id, write_status],
+            params![
+                staged.stage_set_id,
+                staged.snapshot_id,
+                volume_id,
+                write_status
+            ],
         )
         .unwrap();
     }
