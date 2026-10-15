@@ -11,6 +11,12 @@
 //! `tapectl drive eject` — unload the cartridge, with the catalog told (issue
 //! #429; ADR-0012 2026-10-15 item 61). The one drive command that moves a
 //! cartridge, so the one that refuses first. See [`eject`].
+//!
+//! `tapectl drive cleaned` and `tapectl drive cleaning-cartridge add` — the
+//! record of drive cleanings (issue #430; ADR-0012 2026-10-15 item 60). A
+//! cleaning is something the operator does with their hands; these commands
+//! only remember it. The registry, the events and the counts derived from
+//! them are `tape::cleaning`; see [`cleaned`].
 
 use clap::Subcommand;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -147,6 +153,79 @@ pub enum DriveCommands {
         #[arg(long)]
         device: Option<String>,
     },
+
+    /// Record that the drive was cleaned — a record, not an action
+    ///
+    /// tapectl drives no changer and never loads a cartridge, so cleaning is
+    /// you inserting a cleaning cartridge when the drive asks for one
+    /// (`drive status` shows "asks to be CLEANED"; `drive poll` reports the
+    /// cleaning TapeAlert flag). This command writes down that it happened:
+    /// one `cleaned` event on the drive, and, when a registered cleaning
+    /// cartridge did it, one use of that cartridge. `report health` shows
+    /// each drive's last cleaning and each cleaning cartridge's recorded uses
+    /// against its rated life.
+    ///
+    /// Which cleaning cartridge: `--cartridge SERIAL`, or, without it, the
+    /// one in the drive if its chip names a registered cleaning cartridge
+    /// (read through the SCSI generic node; nothing moves, and nothing is
+    /// sent while a tapectl command holds the drive). With neither, the
+    /// cleaning is recorded against the drive alone and no cartridge's use is
+    /// counted. Register a cleaning cartridge first with `drive
+    /// cleaning-cartridge add`.
+    ///
+    /// Exit 0: recorded. Exit 1: recorded, and the cleaning cartridge is at
+    /// or past its rated life (a spent cartridge does not clean; replace it).
+    /// A cartridge near its rated life is a warning with exit 0. Exit 2: not
+    /// recorded — the drive gave no serial to record against, or the named
+    /// cartridge is not registered.
+    ///
+    /// `--dry-run` reports what would be recorded and records nothing. With
+    /// `--json` the whole of stdout is one JSON object.
+    Cleaned {
+        /// The cleaning cartridge used, by the serial it was registered
+        /// under (`drive cleaning-cartridge add`).
+        #[arg(long)]
+        cartridge: Option<String>,
+
+        /// The drive that was cleaned, by its tape node path as configured
+        /// (`[[backends.lto]].device_tape`; a by-id link). Defaults to the
+        /// only configured drive.
+        #[arg(long)]
+        device: Option<String>,
+    },
+
+    /// Register the cleaning cartridges you use, so their uses are counted
+    CleaningCartridge {
+        #[command(subcommand)]
+        command: CleaningCartridgeCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CleaningCartridgeCommands {
+    /// Register a cleaning cartridge
+    ///
+    /// SERIAL is the serial the cartridge's chip reports (`drive status`
+    /// shows it while the cartridge is loaded) or, when its chip cannot be
+    /// read, any label that tells it apart; `drive cleaned --cartridge`
+    /// names it the same way. LTO Ultrium universal cleaning cartridges are
+    /// rated for 50 cleanings, which is the default; `--rated-uses` says
+    /// otherwise for a cartridge that carries another rating. A serial can be
+    /// registered once.
+    ///
+    /// `--dry-run` reports what would be registered and registers nothing.
+    Add {
+        /// The cleaning cartridge's serial.
+        serial: String,
+
+        /// How many cleanings the cartridge is rated for.
+        #[arg(
+            long,
+            default_value_t = crate::tape::cleaning::DEFAULT_RATED_USES,
+            value_parser = clap::value_parser!(i64).range(1..)
+        )]
+        rated_uses: i64,
+    },
 }
 
 /// Exit 1: the reading was recorded and the drive reported a problem.
@@ -195,7 +274,14 @@ pub fn run(
             }
             let conn = crate::db::open(&paths.db_file)?;
             let report = poll::poll(&conn, config, backend, Probe::default())?;
-            render(&report, json_output);
+            // A cleaning cartridge loaded for its cleaning is a cartridge
+            // the catalog knows, not an unregistered data cartridge (the
+            // poll's own contact, which cannot know it, says the latter).
+            let cleaning = report
+                .medium_serial
+                .as_deref()
+                .and_then(|s| crate::tape::cleaning::standing(&conn, s).ok().flatten());
+            render(&report, cleaning.as_ref(), json_output);
             exit_code(&report)
         }
         // Read-only, so `--dry-run` has nothing to preview and is accepted
@@ -239,6 +325,34 @@ pub fn run(
             render_eject(&report, json_output);
             Ok(eject_exit_code(&report))
         }
+        // Honours `--dry-run`. STRICT for the same reason `eject` is: the
+        // record names the drive by the identity read through `device_sg`.
+        DriveCommands::Cleaned { cartridge, device } => {
+            let backend = crate::config::resolve_lto_backend(config, device.as_deref())?;
+            let conn = crate::db::open(&paths.db_file)?;
+            let report = cleaned(
+                &conn,
+                paths,
+                backend,
+                cartridge.as_deref(),
+                dry_run,
+                CleanedProbe::default(),
+            )?;
+            render_cleaned(&report, json_output);
+            Ok(cleaned_exit_code(&report))
+        }
+        DriveCommands::CleaningCartridge {
+            command: CleaningCartridgeCommands::Add { serial, rated_uses },
+        } => {
+            let conn = crate::db::open(&paths.db_file)?;
+            let report = add_cleaning_cartridge(&conn, serial, *rated_uses, dry_run)?;
+            if json_output {
+                println!("{}", serde_json::to_string(&report).unwrap_or_default());
+            } else {
+                println!("{}", report.message);
+            }
+            Ok(EXIT_SUCCESS)
+        }
     }
 }
 
@@ -270,7 +384,11 @@ pub fn exit_code(report: &PollReport) -> Result<i32> {
     })
 }
 
-fn render(report: &PollReport, json_output: bool) {
+fn render(
+    report: &PollReport,
+    cleaning: Option<&crate::tape::cleaning::Standing>,
+    json_output: bool,
+) {
     if json_output {
         let mut v = serde_json::to_value(report).unwrap_or_default();
         if let Some(obj) = v.as_object_mut() {
@@ -279,6 +397,10 @@ fn render(report: &PollReport, json_output: bool) {
                 report.drive_reported_problem().into(),
             );
             obj.insert("problems".into(), report.problems().into());
+            obj.insert(
+                "cleaning_cartridge".into(),
+                cleaning.map(|c| c.serial.clone()).into(),
+            );
         }
         println!("{v}");
         return;
@@ -296,6 +418,15 @@ fn render(report: &PollReport, json_output: bool) {
     );
     match (&report.medium_serial, &report.cartridge) {
         (None, _) => println!("  no cartridge answered (an empty drive): a drive-only reading"),
+        (Some(_), None) if cleaning.is_some() => {
+            if let Some(c) = cleaning {
+                println!(
+                    "  cleaning cartridge {} is loaded (the drive is cleaning itself): a \
+                     drive-only reading",
+                    c.serial
+                )
+            }
+        }
         (Some(serial), None) => {
             println!("  cartridge {serial} is loaded and is not registered: a drive-only reading")
         }
@@ -442,10 +573,14 @@ pub struct LastContactFacts {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct CatalogFacts {
-    /// The chip was read and no cartridge in the catalog has its serial.
-    /// `None` when no chip serial was read, which says nothing either way.
+    /// The chip was read and neither a cartridge nor a cleaning cartridge in
+    /// the catalog has its serial. `None` when no chip serial was read,
+    /// which says nothing either way.
     pub unknown_cartridge: Option<bool>,
     pub cartridge: Option<CartridgeFacts>,
+    /// The chip names a registered cleaning cartridge (`drive
+    /// cleaning-cartridge add`), with its recorded uses.
+    pub cleaning_cartridge: Option<crate::tape::cleaning::Standing>,
     pub last_contact_on_device: Option<LastContactFacts>,
 }
 
@@ -653,7 +788,12 @@ pub fn status(
         .filter(|s| !s.is_empty());
     if let Some(serial) = &chip_serial {
         report.catalog.cartridge = cartridge_facts(conn, serial);
-        report.catalog.unknown_cartridge = Some(report.catalog.cartridge.is_none());
+        // A registered cleaning cartridge is known to the catalog, not an
+        // unknown data cartridge (issue #430).
+        report.catalog.cleaning_cartridge =
+            crate::tape::cleaning::standing(conn, serial).ok().flatten();
+        report.catalog.unknown_cartridge =
+            Some(report.catalog.cartridge.is_none() && report.catalog.cleaning_cartridge.is_none());
     }
     report.catalog.last_contact_on_device =
         last_contact_on_device(conn, device, report.drive.serial.as_deref());
@@ -1033,7 +1173,11 @@ pub fn status_text(report: &StatusReport) -> String {
                 );
             }
             if n.cleaning_requested == Some(true) {
-                let _ = writeln!(out, "  cleaning:  the drive asks to be CLEANED");
+                let _ = writeln!(
+                    out,
+                    "  cleaning:  the drive asks to be CLEANED (insert a cleaning cartridge, \
+                     then record it with `tapectl drive cleaned`)"
+                );
             }
             if let Some(e) = n.recovered_errors.filter(|e| *e > 0) {
                 let _ = writeln!(
@@ -1107,6 +1251,15 @@ pub fn status_text(report: &StatusReport) -> String {
             }
             for v in &cart.volumes {
                 let _ = writeln!(out, "             volume {} ({})", v.label, v.status);
+            }
+        }
+        (None, _) if c.cleaning_cartridge.is_some() => {
+            if let Some(clean) = &c.cleaning_cartridge {
+                let _ = writeln!(
+                    out,
+                    "  catalog:   a cleaning cartridge, not a data cartridge: {}",
+                    clean.line()
+                );
             }
         }
         (None, Some(true)) => {
@@ -1527,6 +1680,282 @@ pub fn eject_text(report: &EjectReport) -> String {
     }
     for w in &report.warnings {
         let _ = writeln!(out, "  warning: {w}");
+    }
+    out
+}
+
+// ── `drive cleaned` and `drive cleaning-cartridge add` (issue #430) ───────
+
+/// What `tapectl drive cleaning-cartridge add` did.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AddedCleaningCartridge {
+    pub serial: String,
+    pub rated_uses: i64,
+    pub dry_run: bool,
+    pub registered: bool,
+    pub message: String,
+}
+
+/// Register a cleaning cartridge (`--dry-run`: say what would be registered).
+/// Refuses a serial already registered either way.
+pub fn add_cleaning_cartridge(
+    conn: &Connection,
+    serial: &str,
+    rated_uses: i64,
+    dry_run: bool,
+) -> Result<AddedCleaningCartridge> {
+    let serial = serial.trim();
+    if dry_run {
+        if let Some(existing) = crate::tape::cleaning::find(conn, serial)? {
+            return Err(TapectlError::Other(format!(
+                "cleaning cartridge {serial} is already registered (rated for {} uses, since {})",
+                existing.rated_uses, existing.registered_at
+            )));
+        }
+        return Ok(AddedCleaningCartridge {
+            serial: serial.to_string(),
+            rated_uses,
+            dry_run,
+            registered: false,
+            message: format!(
+                "dry run: would register cleaning cartridge {serial}, rated for {rated_uses} \
+                 uses. Nothing was registered."
+            ),
+        });
+    }
+    let c = crate::tape::cleaning::register(conn, serial, rated_uses)?;
+    Ok(AddedCleaningCartridge {
+        serial: c.serial.clone(),
+        rated_uses: c.rated_uses,
+        dry_run,
+        registered: true,
+        message: format!(
+            "registered cleaning cartridge {} (rated for {} uses). Record each cleaning with \
+             `tapectl drive cleaned --cartridge {}`; `tapectl report health` shows its uses.",
+            c.serial, c.rated_uses, c.serial
+        ),
+    })
+}
+
+/// What `tapectl drive cleaned` recorded and found.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CleanedReport {
+    pub device: String,
+    pub backend: String,
+    pub dry_run: bool,
+    /// The drive the cleaning is recorded against.
+    pub drive_serial: String,
+    /// The cleaning cartridge that did it, with its uses INCLUDING this one
+    /// (a dry run: as they stand, this one not yet counted).
+    pub cleaning_cartridge: Option<crate::tape::cleaning::Standing>,
+    /// How the cartridge was identified: `flag` (`--cartridge`) or `chip`
+    /// (read from the drive).
+    pub identified_by: Option<String>,
+    /// The `cleaned` event; `None` for a dry run.
+    pub event_id: Option<i64>,
+    /// What a reader should know that no field says.
+    pub notes: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Where `drive cleaned`'s hardware and process answers come from.
+#[derive(Default)]
+pub struct CleanedProbe {
+    pub identity: Option<DriveIdentity>,
+    pub mam: Option<MamRead>,
+    pub drive_lock: Option<DriveLockState>,
+}
+
+/// Record a cleaning of the drive `backend` names.
+///
+/// A RECORD: it sends the drive nothing but the identity read every contact
+/// makes (sysfs, and an INQUIRY only if sysfs has no serial) and, when no
+/// `--cartridge` was named and no tapectl command holds the drive, one READ
+/// ATTRIBUTE to see whether the cartridge in it is a registered cleaning
+/// cartridge. It opens no tape node and moves nothing, and writes no
+/// contact: a contact is a time a data cartridge was in a drive.
+///
+/// The cleaning is an event on the drive ([`crate::tape::cleaning::record`]),
+/// so the drive must have a serial: a cleaning that cannot name its drive
+/// could not be told from another drive's afterwards, and is refused rather
+/// than recorded against nothing.
+pub fn cleaned(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    backend: &LtoBackendConfig,
+    cartridge: Option<&str>,
+    dry_run: bool,
+    probe: CleanedProbe,
+) -> Result<CleanedReport> {
+    use crate::tape::cleaning;
+    let device = backend.device_tape.as_str();
+    // The named cartridge first: it is a catalog question, and an operator who
+    // typed a serial the catalog does not have wants to hear so whatever the
+    // drive is doing.
+    let named: Option<cleaning::CleaningCartridge> =
+        match cartridge.map(str::trim).filter(|c| !c.is_empty()) {
+            Some(serial) => Some(cleaning::find(conn, serial)?.ok_or_else(|| {
+                TapectlError::Other(format!(
+                    "no cleaning cartridge {serial} is registered; register it first with \
+                     `tapectl drive cleaning-cartridge add {serial}` (rated for {} uses \
+                     unless --rated-uses says otherwise). Nothing was recorded",
+                    cleaning::DEFAULT_RATED_USES
+                ))
+            })?),
+            None => None,
+        };
+    let identity = probe
+        .identity
+        .unwrap_or_else(|| drive_identity::read_identity(backend));
+    let Some(drive_serial) = identity.serial.clone().filter(|s| !s.is_empty()) else {
+        return Err(TapectlError::Other(format!(
+            "drive cleaned: the drive at {device} gave no serial, and a cleaning is recorded \
+             against the drive that was cleaned. Check that `device_sg` ({}) is this drive's \
+             SCSI generic node (`tapectl drive status`); nothing was recorded",
+            backend.device_sg
+        )));
+    };
+    let mut report = CleanedReport {
+        device: device.to_string(),
+        backend: backend.name.clone(),
+        dry_run,
+        drive_serial: drive_serial.clone(),
+        cleaning_cartridge: None,
+        identified_by: None,
+        event_id: None,
+        notes: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    // Which cleaning cartridge: the one named, else the one the drive holds.
+    let mut used = named;
+    if used.is_some() {
+        report.identified_by = Some("flag".into());
+    } else {
+        let lock_state = probe
+            .drive_lock
+            .unwrap_or_else(|| lock::drive_lock_state(&paths.db_file, device));
+        if lock_state == DriveLockState::Held {
+            report.notes.push(
+                "a tapectl command holds this drive, so the cartridge in it was not read; pass \
+                 --cartridge to count a cleaning cartridge's use"
+                    .into(),
+            );
+        } else {
+            let read = probe
+                .mam
+                .unwrap_or_else(|| mam::read_mam(&backend.device_sg));
+            if let Some(serial) = read.info.serial.as_deref().filter(|s| !s.is_empty()) {
+                match cleaning::find(conn, serial)? {
+                    Some(c) => {
+                        used = Some(c);
+                        report.identified_by = Some("chip".into());
+                    }
+                    None => report.notes.push(match cartridge_facts(conn, serial) {
+                        Some(c) => format!(
+                            "the cartridge in the drive is {}, a data cartridge, not a \
+                             cleaning cartridge",
+                            c.barcode
+                        ),
+                        None => format!(
+                            "the cartridge in the drive (chip serial {serial}) is not a \
+                             registered cleaning cartridge; to count its uses: tapectl drive \
+                             cleaning-cartridge add {serial}"
+                        ),
+                    }),
+                }
+            }
+        }
+    }
+    if used.is_none() {
+        report.notes.push(
+            "no cleaning cartridge was named or found in the drive: the cleaning is recorded \
+             against the drive only and no cartridge's use is counted (`--cartridge SERIAL`)"
+                .into(),
+        );
+    }
+
+    if dry_run {
+        report.cleaning_cartridge = match &used {
+            Some(c) => cleaning::standing(conn, &c.serial)?,
+            None => None,
+        };
+        return Ok(report);
+    }
+
+    let drive_id = drive_identity::upsert(conn, &identity)?.ok_or_else(|| {
+        TapectlError::Other(format!(
+            "drive cleaned: drive {drive_serial} could not be registered in the catalog"
+        ))
+    })?;
+    report.event_id = Some(cleaning::record(
+        conn,
+        drive_id,
+        &drive_serial,
+        device,
+        used.as_ref(),
+        report.identified_by.as_deref(),
+    )?);
+    if let Some(c) = &used {
+        report.cleaning_cartridge = cleaning::standing(conn, &c.serial)?;
+        if let Some(w) = report.cleaning_cartridge.as_ref().and_then(|s| s.warning()) {
+            report.warnings.push(w);
+        }
+    }
+    Ok(report)
+}
+
+/// 0 when recorded; 1 when the cleaning cartridge that did it is at or past
+/// its rated life (a spent cartridge does not clean).
+pub fn cleaned_exit_code(report: &CleanedReport) -> i32 {
+    match report.cleaning_cartridge.as_ref().map(|s| s.life) {
+        Some(crate::tape::cleaning::Life::Spent) => crate::error::EXIT_WARNING,
+        _ => EXIT_SUCCESS,
+    }
+}
+
+fn render_cleaned(report: &CleanedReport, json_output: bool) {
+    if json_output {
+        println!("{}", serde_json::to_string(report).unwrap_or_default());
+        return;
+    }
+    print!("{}", cleaned_text(report));
+}
+
+/// The human form of a recorded cleaning.
+pub fn cleaned_text(report: &CleanedReport) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} of drive {} ({})",
+        if report.dry_run {
+            "dry run: would record a cleaning"
+        } else {
+            "recorded a cleaning"
+        },
+        report.drive_serial,
+        report.device
+    );
+    if let Some(c) = &report.cleaning_cartridge {
+        let _ = writeln!(
+            out,
+            "  cleaning cartridge {}{}",
+            c.line(),
+            match report.identified_by.as_deref() {
+                Some("chip") => " (read from the drive)",
+                _ => "",
+            }
+        );
+    }
+    for n in &report.notes {
+        let _ = writeln!(out, "  note: {n}");
+    }
+    for w in &report.warnings {
+        let _ = writeln!(out, "  warning: {w}");
+    }
+    if report.dry_run {
+        let _ = writeln!(out, "  Nothing was recorded.");
     }
     out
 }
@@ -2565,5 +2994,310 @@ mod tests {
         }
         assert_eq!(v["outcome"], "ejected");
         assert_eq!(v["chip_serial"], "EW7VWMVKF6");
+    }
+
+    // ── `drive cleaned` (issue #430) ────────────────────────────────────────
+
+    fn cleaned_home() -> (tempfile::TempDir, TapectlPaths, Connection) {
+        let home = tempfile::TempDir::new().unwrap();
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        let conn = crate::db::open(&paths.db_file).unwrap();
+        (home, paths, conn)
+    }
+
+    fn do_cleaned(
+        conn: &Connection,
+        paths: &TapectlPaths,
+        cartridge: Option<&str>,
+        dry_run: bool,
+        mam: Option<MamRead>,
+        lock: DriveLockState,
+    ) -> Result<CleanedReport> {
+        cleaned(
+            conn,
+            paths,
+            &lto6_backend(),
+            cartridge,
+            dry_run,
+            CleanedProbe {
+                identity: Some(hp_drive()),
+                mam,
+                drive_lock: Some(lock),
+            },
+        )
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A named cleaning cartridge: one `cleaned` event on the drive naming it,
+    /// one use counted, no contact (a contact is a time a DATA cartridge was
+    /// in a drive), no cartridge or volume row touched. The third use of a
+    /// cartridge rated for 3 is spent: exit 1, and said.
+    #[test]
+    fn a_cleaning_is_an_event_and_a_counted_use_and_a_spent_cartridge_exits_1() {
+        let (_home, paths, conn) = cleaned_home();
+        let data = register_cartridge(&conn, "CART01L6", "SOMEDATASERIAL");
+        put_volume_on(&conn, data, "L6-0001", "sealed");
+        let bound_before = count(&conn, "cartridge_volumes");
+        crate::tape::cleaning::register(&conn, "CLNU01", 3).unwrap();
+
+        let r = do_cleaned(
+            &conn,
+            &paths,
+            Some("CLNU01"),
+            false,
+            None,
+            DriveLockState::Free,
+        )
+        .unwrap();
+        assert_eq!(r.drive_serial, "HUJ808A5L4");
+        assert_eq!(r.identified_by.as_deref(), Some("flag"));
+        let s = r.cleaning_cartridge.as_ref().unwrap();
+        assert_eq!((s.uses, s.remaining), (1, 2));
+        assert_eq!(cleaned_exit_code(&r), 0);
+        assert!(r.event_id.is_some());
+        let (entity, action, field, new_value): (String, String, String, String) = conn
+            .query_row(
+                "SELECT entity_type, action, field, new_value FROM events WHERE action = 'cleaned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                entity.as_str(),
+                action.as_str(),
+                field.as_str(),
+                new_value.as_str()
+            ),
+            ("drive", "cleaned", "cleaning_cartridge", "CLNU01")
+        );
+        assert_eq!(
+            count(&conn, "cartridge_contacts"),
+            0,
+            "a cleaning is no contact"
+        );
+        assert_eq!(count(&conn, "cartridge_volumes"), bound_before);
+
+        let r = do_cleaned(
+            &conn,
+            &paths,
+            Some("CLNU01"),
+            false,
+            None,
+            DriveLockState::Free,
+        )
+        .unwrap();
+        assert_eq!(r.cleaning_cartridge.as_ref().unwrap().remaining, 1);
+        assert!(
+            r.warnings[0].contains("near its rated life"),
+            "{:?}",
+            r.warnings
+        );
+        assert_eq!(
+            cleaned_exit_code(&r),
+            0,
+            "near its life is a warning, not an exit"
+        );
+
+        let r = do_cleaned(
+            &conn,
+            &paths,
+            Some("CLNU01"),
+            false,
+            None,
+            DriveLockState::Free,
+        )
+        .unwrap();
+        assert_eq!(cleaned_exit_code(&r), crate::error::EXIT_WARNING);
+        assert!(r.warnings[0].contains("replace it"), "{:?}", r.warnings);
+        assert!(cleaned_text(&r).contains("SPENT"), "{}", cleaned_text(&r));
+        assert_eq!(
+            crate::tape::cleaning::drive_cleanings(&conn).unwrap()[0].cleanings,
+            3
+        );
+    }
+
+    /// An unregistered cartridge is refused by name with the fix, before the
+    /// drive is asked anything; nothing is recorded, not even the drive.
+    #[test]
+    fn an_unregistered_cleaning_cartridge_is_refused_with_the_command_that_registers_it() {
+        let (_home, paths, conn) = cleaned_home();
+        let err = do_cleaned(
+            &conn,
+            &paths,
+            Some("CLNX"),
+            false,
+            None,
+            DriveLockState::Free,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("drive cleaning-cartridge add CLNX")
+                && err.contains("Nothing was recorded"),
+            "{err}"
+        );
+        assert_eq!(rows_written(&conn), 0);
+    }
+
+    /// With no flag, a registered cleaning cartridge in the drive is found by
+    /// its CHIP; an unregistered chip is a note naming the command, a data
+    /// cartridge's chip a note saying so; neither counts a use. A drive a
+    /// tapectl command holds is not read at all, even with a chip supplied.
+    #[test]
+    fn the_cartridge_in_the_drive_is_found_by_its_chip_and_a_held_drive_is_not_read() {
+        let (_home, paths, conn) = cleaned_home();
+        let chip = || Some(mam_read(Some(mam::tests_support::LTO6_SAMPLE)));
+
+        // Unregistered chip: a note, no use.
+        let r = do_cleaned(&conn, &paths, None, false, chip(), DriveLockState::Free).unwrap();
+        assert!(r.cleaning_cartridge.is_none() && r.identified_by.is_none());
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("drive cleaning-cartridge add EW7VWMVKF6")),
+            "{:?}",
+            r.notes
+        );
+        assert!(
+            r.event_id.is_some(),
+            "the cleaning is recorded against the drive alone"
+        );
+
+        // A data cartridge's chip.
+        register_cartridge(&conn, "CART01L6", "EW7VWMVKF6");
+        let r = do_cleaned(&conn, &paths, None, false, chip(), DriveLockState::Free).unwrap();
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("CART01L6, a data cartridge")),
+            "{:?}",
+            r.notes
+        );
+
+        // A registered cleaning cartridge's chip: found, counted.
+        crate::tape::cleaning::register(&conn, "EW7VWMVKF6", 50).unwrap();
+        let r = do_cleaned(&conn, &paths, None, false, chip(), DriveLockState::Free).unwrap();
+        assert_eq!(r.identified_by.as_deref(), Some("chip"));
+        assert_eq!(r.cleaning_cartridge.as_ref().unwrap().uses, 1);
+        assert!(
+            cleaned_text(&r).contains("read from the drive"),
+            "{}",
+            cleaned_text(&r)
+        );
+
+        // The same chip, a drive held: not read, so not found.
+        let r = do_cleaned(&conn, &paths, None, false, chip(), DriveLockState::Held).unwrap();
+        assert!(r.identified_by.is_none() && r.cleaning_cartridge.is_none());
+        assert!(
+            r.notes.iter().any(|n| n.contains("holds this drive")),
+            "{:?}",
+            r.notes
+        );
+    }
+
+    /// A drive that will not give a serial cannot be recorded against: refused,
+    /// nothing written. A dry run reports and writes nothing (not even the
+    /// drive row), and a spent cartridge is not an exit in a dry run it has
+    /// not yet been used for.
+    #[test]
+    fn a_drive_with_no_serial_is_refused_and_a_dry_run_writes_nothing() {
+        let (_home, paths, conn) = cleaned_home();
+        crate::tape::cleaning::register(&conn, "CLNU01", 50).unwrap();
+        // The registration wrote its own `created` event; compare against it.
+        let baseline = rows_written(&conn);
+        let err = cleaned(
+            &conn,
+            &paths,
+            &lto6_backend(),
+            Some("CLNU01"),
+            false,
+            CleanedProbe {
+                identity: Some(DriveIdentity::default()),
+                mam: None,
+                drive_lock: Some(DriveLockState::Free),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("gave no serial"), "{err}");
+        assert_eq!(rows_written(&conn), baseline);
+
+        let events_before = count(&conn, "events");
+        let r = do_cleaned(
+            &conn,
+            &paths,
+            Some("CLNU01"),
+            true,
+            None,
+            DriveLockState::Free,
+        )
+        .unwrap();
+        assert!(r.dry_run && r.event_id.is_none());
+        assert_eq!(
+            r.cleaning_cartridge.as_ref().unwrap().uses,
+            0,
+            "not yet counted"
+        );
+        assert_eq!(count(&conn, "events"), events_before);
+        assert_eq!(count(&conn, "drives"), 0, "a dry run registers no drive");
+        assert!(
+            cleaned_text(&r).contains("Nothing was recorded"),
+            "{}",
+            cleaned_text(&r)
+        );
+    }
+
+    /// `drive status` and `drive poll` call a loaded cleaning cartridge what
+    /// it is, not "unknown to this catalog" / "not registered".
+    #[test]
+    fn a_loaded_cleaning_cartridge_is_a_cleaning_cartridge_not_an_unknown_one() {
+        let conn = crate::db::open_memory().unwrap();
+        crate::tape::cleaning::register(&conn, "EW7VWMVKF6", 50).unwrap();
+        let r = look(
+            &conn,
+            node(GMT_BOT | GMT_ONLINE),
+            Some(mam_read(Some(mam::tests_support::LTO6_SAMPLE))),
+        );
+        let c = r.catalog.cleaning_cartridge.as_ref().expect("recognised");
+        assert_eq!((c.serial.as_str(), c.uses), ("EW7VWMVKF6", 0));
+        assert_eq!(r.catalog.unknown_cartridge, Some(false));
+        assert!(r.catalog.cartridge.is_none());
+        let text = status_text(&r);
+        assert!(text.contains("a cleaning cartridge"), "{text}");
+        assert!(!text.contains("unknown to this catalog"), "{text}");
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["catalog"]["cleaning_cartridge"]["serial"], "EW7VWMVKF6");
+
+        // Positive control: the same chip, not registered, is still unknown.
+        let conn = crate::db::open_memory().unwrap();
+        let r = look(
+            &conn,
+            node(GMT_BOT | GMT_ONLINE),
+            Some(mam_read(Some(mam::tests_support::LTO6_SAMPLE))),
+        );
+        assert_eq!(r.catalog.unknown_cartridge, Some(true));
+        assert!(r.catalog.cleaning_cartridge.is_none());
+    }
+
+    #[test]
+    fn registering_a_cleaning_cartridge_honours_dry_run_and_refuses_a_duplicate() {
+        let conn = crate::db::open_memory().unwrap();
+        let dry = add_cleaning_cartridge(&conn, "CLNU01", 50, true).unwrap();
+        assert!(dry.dry_run && !dry.registered && dry.message.starts_with("dry run:"));
+        assert!(crate::tape::cleaning::find(&conn, "CLNU01")
+            .unwrap()
+            .is_none());
+        let added = add_cleaning_cartridge(&conn, "CLNU01", 50, false).unwrap();
+        assert!(added.registered);
+        assert!(add_cleaning_cartridge(&conn, "CLNU01", 50, false).is_err());
+        assert!(
+            add_cleaning_cartridge(&conn, "CLNU01", 50, true).is_err(),
+            "a dry run refuses what the real run refuses"
+        );
     }
 }

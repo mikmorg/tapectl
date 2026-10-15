@@ -1,5 +1,6 @@
 pub mod alert_flags;
 pub mod cartridge_health;
+pub mod cleaning;
 pub mod contact;
 pub mod drive_identity;
 #[cfg(test)]

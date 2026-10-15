@@ -153,6 +153,12 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // #241's file scope), never fixed here, only moved out of `Excluded`.
     (&["db", "import"], Verdict::Honours),
     (&["db", "stats"], Verdict::ReadOnly),
+    // Issue #430: a cleaning is recorded as an event on the drive; `--dry-run`
+    // reports what it would record (the cartridge named or found in the
+    // drive) and records nothing, not even the drive's row. Proven in
+    // `cli::drive`'s unit tests and `tests/drive_cleaning_cli.rs`.
+    (&["drive", "cleaned"], Verdict::Honours),
+    (&["drive", "cleaning-cartridge", "add"], Verdict::Honours),
     // Issue #429: `--dry-run` checks for a holder, reads the node and the
     // chip and reports what it would eject; it takes no lock, unloads
     // nothing and records nothing. Proven in `tests/drive_eject_cli.rs` (a
