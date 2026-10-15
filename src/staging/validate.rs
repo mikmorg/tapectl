@@ -240,7 +240,13 @@ impl Hashed {
 /// #364): the two reads of a file must both find it in the page cache, so
 /// the source leaves its disk once. Well under the page cache of any host
 /// that stages.
-pub(crate) const READ_AHEAD_BYTES: u64 = 1 << 30;
+///
+/// 128 MiB, not the 1 GiB it was (issue #441): under memory pressure a
+/// larger lead outruns the page cache, and a page the hasher read is gone
+/// before dar reads it. With dar's own eviction off, two stages at once
+/// under `MemoryMax=1500M` read 1.78x the source from disk with a 512 MiB
+/// lead, 1.13x with 256 MiB and 1.00x with 128 MiB (vm-desk1, 2026-10-15).
+pub(crate) const READ_AHEAD_BYTES: u64 = 128 << 20;
 
 /// The hasher's and dar's read positions, shared between the hasher thread
 /// and the thread that consumes dar's archive, each holding the other to

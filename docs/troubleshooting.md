@@ -1113,7 +1113,7 @@ every file against its recorded baseline).
 ```
 
 A file that changes while staging reads it refuses the stage too. Each file is
-read once from disk: tapectl hashes it within 1 GiB of dar reading it, and
+read once from disk: tapectl hashes it within 128 MiB of dar reading it, and
 after dar has finished checks that every file still has the size and change
 time it had when it was hashed. A file that changed in between is refused:
 
