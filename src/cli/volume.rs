@@ -1093,7 +1093,7 @@ fn print_move_after_write(label: &str, moved: &MoveAfterWrite) {
 trait WriteSteps {
     /// What the write refuses from the catalog and the disk alone, asked
     /// before `--init` initialises anything (issue #445).
-    fn preflight(&self) -> Result<()>;
+    fn preflight(&self, label: &str) -> Result<()>;
     /// `volume init <label>`; returns the new volume's id.
     fn init(&self, label: &str, force: bool) -> Result<i64>;
     /// `volume write <label>`; `Ok` only when sealed and confirmed.
@@ -1113,8 +1113,8 @@ struct DriveWriteSteps<'a> {
 }
 
 impl WriteSteps for DriveWriteSteps<'_> {
-    fn preflight(&self) -> Result<()> {
-        write::write_catalog_preflight(self.conn)
+    fn preflight(&self, label: &str) -> Result<()> {
+        write::write_catalog_preflight(self.conn, label, self.allow_missing_escrow)
     }
 
     fn init(&self, label: &str, force: bool) -> Result<i64> {
@@ -1212,7 +1212,7 @@ fn write_and_follow(
 ) -> Result<WriteDone> {
     let initialized = if req.init {
         // Issue #445: before the cartridge is touched.
-        steps.preflight()?;
+        steps.preflight(req.label)?;
         let id = steps.init(req.label, req.force)?;
         // stderr, so `--json` keeps stdout to the one document. The write
         // below may stop; the operator is told what stands and how to go on.
@@ -4060,7 +4060,7 @@ mod tests {
                 .expect("the move is requested");
             assert!(init < call, "the init comes before the write");
             let preflight = seq
-                .find("steps.preflight()?")
+                .find("steps.preflight(req.label)?")
                 .expect("write_and_follow asks the write's catalog-only refusals");
             assert!(
                 preflight < init,
@@ -4166,10 +4166,10 @@ mod tests {
         }
 
         impl WriteSteps for FakeSteps<'_> {
-            fn preflight(&self) -> Result<()> {
+            fn preflight(&self, label: &str) -> Result<()> {
                 self.log.borrow_mut().push("preflight".to_string());
                 if self.fail == Fail::Unstaged {
-                    return crate::volume::write::write_catalog_preflight(self.conn);
+                    return crate::volume::write::write_catalog_preflight(self.conn, label, false);
                 }
                 Ok(())
             }

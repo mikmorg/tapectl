@@ -6089,23 +6089,57 @@ fn assemble_keys_for_units(
 /// item 59): `volume write --init` runs it BEFORE `volume init` writes File
 /// 0, binds the cartridge and creates the row, so a write that was going to
 /// refuse for a reason the catalog already knew — nothing staged (a first
-/// copy released its staging), a staged slice missing or short, a tenant
-/// without a key, no escrow recipient — refuses with the tape untouched and
-/// no volume row, instead of stranding an `initialized` one.
+/// copy released its staging), a staged slice missing or short, a tenant or
+/// the operator without a key, no escrow recipient, a staged set the escrow
+/// key cannot open — refuses with the tape untouched and no volume row,
+/// instead of stranding an `initialized` one.
 ///
-/// It runs the same two steps `volume write` runs, from the same functions
-/// ([`checked_staged_units`], [`assemble_keys_for_units`]). Two checks of the
-/// write are not here, each for its own reason: copy distinctness
+/// It runs the same steps `volume write` runs, from the same functions
+/// ([`checked_staged_units`], [`assemble_keys_for_units`], and the key half
+/// of the Layout's own pre-write `validate`, asked of an empty Layout so the
+/// verdicts and their words are the write's), with the same
+/// `--allow-missing-escrow` waiver. Two checks of the write are not here,
+/// each for its own reason: copy distinctness
 /// (`coverage::copy_distinctness`) compares the batch with a volume's
 /// cartridge and location, and this volume has neither until `volume init`
 /// binds it — its cartridge half only ever fires on an inconsistent catalog
 /// (init erased any copy on the cartridge), its location half is a warning;
-/// and the quiet-host question and the capacity gate need the contact, so
-/// they stay in the write.
-pub(crate) fn write_catalog_preflight(conn: &Connection) -> Result<()> {
+/// and the quiet-host question and the capacity gate need the contact (and
+/// the built Layout), so they stay in the write.
+pub(crate) fn write_catalog_preflight(
+    conn: &Connection,
+    label: &str,
+    allow_missing_escrow: bool,
+) -> Result<()> {
     let units = checked_staged_units(conn)?;
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
-    assemble_keys_for_units(conn, &units, &stage_set_ids)?;
+    let session = assemble_keys_for_units(conn, &units, &stage_set_ids)?;
+    // The write's `validate` also checks keys, escrow and per-set escrow
+    // receipts; those verdicts need no Layout, so an empty one carries them.
+    let keys_only = Layout {
+        label: label.to_string(),
+        volume_uuid: String::new(),
+        media_type: String::new(),
+        block_size: 1,
+        budget: CapacityBudget {
+            available_bytes: u64::MAX,
+            reserve_bytes: 0,
+        },
+        entries: Vec::new(),
+    };
+    if let Err(errs) = keys_only.validate(&session.keys, SliceCheck::Size) {
+        let (blocking, _waived) = blocking_validation_errors(errs, allow_missing_escrow);
+        if !blocking.is_empty() {
+            return Err(TapectlError::Other(format!(
+                "volume \"{label}\" failed pre-write validation: {}",
+                blocking
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -10440,7 +10474,9 @@ mod tests {
     #[test]
     fn the_init_preflight_refuses_what_the_catalog_alone_can_and_passes_otherwise() {
         let conn = crate::db::open_memory().unwrap();
-        let err = write_catalog_preflight(&conn).unwrap_err().to_string();
+        let err = write_catalog_preflight(&conn, "PF-1", false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no staged data to write"), "{err}");
 
         let (tenant_id, stage_set_id) = seed_escrow_check_fixture(&conn);
@@ -10454,7 +10490,27 @@ mod tests {
             params![stage_set_id, slice.to_string_lossy()],
         )
         .unwrap();
+        // No escrow registered at all: not waivable, and refused before any
+        // cartridge is touched.
+        for waived in [false, true] {
+            let err = write_catalog_preflight(&conn, "PF-1", waived)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("failed pre-write validation") && err.contains("escrow"),
+                "no escrow recipient registered (waived={waived}): {err}"
+            );
+        }
         let escrow_pk = register_escrow(&conn);
+        // A staged set encrypted without the registered escrow key: refused,
+        // and waived by --allow-missing-escrow exactly as the write waives it.
+        set_key_fingerprints(&conn, stage_set_id, Some("[]"));
+        let err = write_catalog_preflight(&conn, "PF-1", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed pre-write validation"), "{err}");
+        write_catalog_preflight(&conn, "PF-1", true)
+            .expect("--allow-missing-escrow waives a set the escrow key cannot open");
         set_key_fingerprints(
             &conn,
             stage_set_id,
@@ -10463,7 +10519,9 @@ mod tests {
 
         // A staged slice that is not on the disk.
         std::fs::remove_file(&slice).unwrap();
-        let err = write_catalog_preflight(&conn).unwrap_err().to_string();
+        let err = write_catalog_preflight(&conn, "PF-1", false)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("p.dar.age") || err.to_lowercase().contains("missing"),
             "the staged-slice check refused: {err}"
@@ -10476,7 +10534,9 @@ mod tests {
             params![tenant_id],
         )
         .unwrap();
-        let err = write_catalog_preflight(&conn).unwrap_err().to_string();
+        let err = write_catalog_preflight(&conn, "PF-1", false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("has no active key"), "{err}");
         conn.execute(
             "UPDATE encryption_keys SET is_active = 1 WHERE tenant_id = ?1",
@@ -10484,7 +10544,8 @@ mod tests {
         )
         .unwrap();
 
-        write_catalog_preflight(&conn).expect("with the batch, the files and the keys, it passes");
+        write_catalog_preflight(&conn, "PF-1", false)
+            .expect("with the batch, the files and the keys, it passes");
         let volumes: i64 = conn
             .query_row("SELECT COUNT(*) FROM volumes", [], |r| r.get(0))
             .unwrap();
