@@ -11,7 +11,7 @@
 //!
 //! | file | what it is |
 //! |---|---|
-//! | `COVER.txt` | The plain-text cover sheet. The artifact with the decades-scale claim: no browser, no tooling, readable with `cat`. Carries the escrow IDENTITY (the public half, in retypable Bech32) and a boxed hand-fill area for the escrow SECRET, which `tapectl init` printed once and nothing on this machine holds (ADR-0005, issue #341). The public half decrypts nothing; the sheet says so and tells the operator to write the secret in. |
+//! | `COVER.txt` | The plain-text cover sheet. The artifact with the decades-scale claim: no browser, no tooling, readable with `cat`. Carries the escrow IDENTITY (the public half, in retypable Bech32) and a boxed hand-fill area for the escrow SECRET, which `tapectl init` printed once and nothing on this machine holds (ADR-0005, issue #341). The public half decrypts nothing; the sheet says so and tells the operator to write the secret in. It also names the drives that read the sealed volumes' media generations ([`Generation::can_read`], issue #448), lists the places the catalog shelves them beside a hand-fill "Tapes are at" box, and gives RESTORE.sh's tool list. |
 //! | `escrow-kit.html` | The same content, self-contained, with the identity as an inline SVG QR and print styling. Exists so the ceremony is one keystroke, because ADR-0005 requires repeating it after every write session and a ceremony with friction is one that gets skipped. |
 //! | `catalog.db.age` | The **full** `tapectl.db`, age-encrypted to the escrow recipient. |
 //!
@@ -32,6 +32,7 @@ use rusqlite::Connection;
 
 use crate::db::{events, queries};
 use crate::error::{Result, TapectlError};
+use crate::media::Generation;
 
 /// What a generation produced, for the CLI to render.
 #[derive(Debug)]
@@ -85,11 +86,16 @@ pub fn generate(conn: &Connection, db_path: &Path, out_dir: &Path) -> Result<Kit
     let warehouse_deposits: i64 =
         conn.query_row("SELECT COUNT(*) FROM volume_deposits", [], |r| r.get(0))?;
 
+    let generations = sealed_generations(conn)?;
+    let places = sealed_places(conn)?;
+
     let facts = KitFacts {
         escrow_public_key: &escrow,
         sealed_volumes,
         catalog_bytes,
         warehouse_deposits,
+        generations: &generations,
+        places: &places,
     };
     fs::write(&cover_txt, render_cover_text(&facts))?;
     fs::write(&html, render_cover_html(&facts)?)?;
@@ -188,6 +194,281 @@ struct KitFacts<'a> {
     /// on a one-page emergency sheet costs attention that the reader may not
     /// have to spare.
     warehouse_deposits: i64,
+    /// The media generation of each sealed volume, grouped (#448): what the
+    /// reading drive must be able to read. Parsed from `volumes.media_type`.
+    generations: &'a [GenerationFact],
+    /// Where the catalog says the sealed volumes are (#448), grouped by
+    /// place, as a starting point for the hand-filled "Tapes are at" box.
+    places: &'a [PlaceFact],
+}
+
+/// A group of sealed volumes written on one media generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerationFact {
+    /// `Some` when `volumes.media_type` names an LTO generation
+    /// ([`Generation::parse`]); `None` for anything else.
+    generation: Option<Generation>,
+    /// The `media_type` as the catalog stores it, for the `None` case.
+    stored: String,
+    volumes: i64,
+}
+
+/// Sealed volumes the catalog shelves in one place (`None`: no place
+/// recorded). Each volume is its label and, when a cartridge is bound, the
+/// barcode on its sticker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlaceFact {
+    place: Option<String>,
+    volumes: Vec<(String, Option<String>)>,
+}
+
+/// Every drive generation, in release order. `Lto7M8` is a media format an
+/// LTO-8 drive writes, never a drive, so it is not here ([`Generation::can_read`]
+/// is false for it as a drive). `a_new_generation_must_be_considered_here`
+/// fails to compile when a variant is added.
+const DRIVE_GENERATIONS: [Generation; 10] = [
+    Generation::Lto1,
+    Generation::Lto2,
+    Generation::Lto3,
+    Generation::Lto4,
+    Generation::Lto5,
+    Generation::Lto6,
+    Generation::Lto7,
+    Generation::Lto8,
+    Generation::Lto9,
+    Generation::Lto10,
+];
+
+/// Position of `g` in release order, for sorting (`Generation` is
+/// deliberately not `Ord`).
+fn release_order(g: Generation) -> usize {
+    match g {
+        Generation::Lto1 => 1,
+        Generation::Lto2 => 2,
+        Generation::Lto3 => 3,
+        Generation::Lto4 => 4,
+        Generation::Lto5 => 5,
+        Generation::Lto6 => 6,
+        Generation::Lto7 => 7,
+        Generation::Lto7M8 => 8,
+        Generation::Lto8 => 9,
+        Generation::Lto9 => 10,
+        Generation::Lto10 => 11,
+    }
+}
+
+/// The media generations of the sealed volumes, grouped, in release order
+/// (anything [`Generation::parse`] does not know last, by stored text).
+/// `volumes.media_type` is the generation detected at `volume init` (ADR-0010).
+fn sealed_generations(conn: &Connection) -> Result<Vec<GenerationFact>> {
+    let mut stmt = conn.prepare(
+        "SELECT media_type, COUNT(*) FROM volumes
+          WHERE status = 'sealed' AND media_type IS NOT NULL AND media_type != ''
+          GROUP BY media_type",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut out: Vec<GenerationFact> = Vec::new();
+    for (stored, volumes) in rows {
+        let generation = Generation::parse(&stored);
+        // Two spellings of one generation ("LTO6", "LTO-6") are one group.
+        if let Some(g) = generation {
+            if let Some(existing) = out.iter_mut().find(|f| f.generation == Some(g)) {
+                existing.volumes += volumes;
+                continue;
+            }
+        }
+        out.push(GenerationFact {
+            generation,
+            stored,
+            volumes,
+        });
+    }
+    out.sort_by(|a, b| {
+        let key = |f: &GenerationFact| match f.generation {
+            Some(g) => (release_order(g), String::new()),
+            None => (usize::MAX, f.stored.clone()),
+        };
+        key(a).cmp(&key(b))
+    });
+    Ok(out)
+}
+
+/// The sealed volumes by the place the catalog shelves them, named places
+/// alphabetically and the volumes with no recorded place last.
+fn sealed_places(conn: &Connection) -> Result<Vec<PlaceFact>> {
+    let mut stmt = conn.prepare(
+        "SELECT l.name, v.label, c.barcode
+           FROM volumes v
+           LEFT JOIN locations l ON l.id = v.location_id
+           LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
+           LEFT JOIN cartridges c ON c.id = cv.cartridge_id
+          WHERE v.status = 'sealed'
+          ORDER BY l.name IS NULL, l.name, v.label",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut out: Vec<PlaceFact> = Vec::new();
+    for (place, label, barcode) in rows {
+        match out.last_mut() {
+            Some(last) if last.place == place => last.volumes.push((label, barcode)),
+            _ => out.push(PlaceFact {
+                place,
+                volumes: vec![(label, barcode)],
+            }),
+        }
+    }
+    Ok(out)
+}
+
+/// The drives that can read media of generation `media`, in release order
+/// ([`Generation::can_read`]).
+fn drives_that_read(media: Generation) -> Vec<Generation> {
+    DRIVE_GENERATIONS
+        .iter()
+        .copied()
+        .filter(|d| Generation::can_read(*d, media))
+        .collect()
+}
+
+/// "an LTO-6 or LTO-7 drive", "an LTO-5, LTO-6 or LTO-7 drive".
+fn drive_phrase(drives: &[Generation]) -> String {
+    let names: Vec<&str> = drives.iter().map(|g| g.as_str()).collect();
+    match names.as_slice() {
+        [] => "no current drive".to_string(),
+        [one] => format!("an {one} drive"),
+        [init @ .., last] => format!("an {} or {last} drive", init.join(", ")),
+    }
+}
+
+/// Lay `items` out after `lead` in lines of at most `width` columns, each
+/// continuation line indented `hang` spaces. An item is never split.
+fn wrap_items(lead: &str, items: &[String], hang: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut line = lead.to_string();
+    for (i, item) in items.iter().enumerate() {
+        let piece = if i + 1 < items.len() {
+            format!("{item},")
+        } else {
+            item.clone()
+        };
+        if line.chars().count() + 1 + piece.chars().count() > width {
+            out.push_str(&line);
+            out.push('\n');
+            line = format!("{}{piece}", " ".repeat(hang));
+        } else {
+            line.push(' ');
+            line.push_str(&piece);
+        }
+    }
+    out.push_str(&line);
+    out
+}
+
+/// The generations paragraph of WHAT TO DO FIRST item 2: which drives read
+/// the cartridges the catalog knew when the sheet was made (#448).
+fn generations_text(generations: &[GenerationFact]) -> String {
+    if generations.is_empty() {
+        return "\
+   The catalog lists no sealed cartridge, so this sheet cannot say
+   which drives read them. The cartridge's label names its
+   generation (LTO-6, LTO-7, ...): look up which drives read it in
+   the maker's compatibility table.
+"
+        .to_string();
+    }
+    let mut lines = String::from(
+        "   The tapes the catalog listed when this sheet was made, and
+   the drives that read them:
+
+",
+    );
+    for f in generations {
+        match f.generation {
+            Some(g) => {
+                lines.push_str(&format!(
+                    "     {} ({} volume(s)): {}\n",
+                    g.as_str(),
+                    f.volumes,
+                    drive_phrase(&drives_that_read(g)),
+                ));
+            }
+            None => {
+                lines.push_str(&format!(
+                    "     {} ({} volume(s)): not a generation this sheet knows;\n",
+                    f.stored, f.volumes
+                ));
+                lines.push_str("       look it up in the maker's compatibility table\n");
+            }
+        }
+    }
+    lines.push_str(
+        "
+   A NEWER drive often cannot read an OLDER cartridge: an LTO-8
+   drive reads only LTO-7, LTO-7 Type M and LTO-8, for example.
+",
+    );
+    lines
+}
+
+/// The "where the tapes are" section: the places the catalog knew, then a
+/// hand-fill box (#448). Cross-checked by `escrow_kit_stale`, which warns
+/// when a tape moves after the kit was made.
+fn places_text(places: &[PlaceFact]) -> String {
+    let mut known = String::new();
+    if places.is_empty() {
+        known.push_str("The catalog lists no sealed cartridge yet.\n");
+    } else {
+        known.push_str(
+            "The catalog knew these places when this sheet was made.
+Places change: cross out what is no longer true.
+
+",
+        );
+        for p in places {
+            let items: Vec<String> = p
+                .volumes
+                .iter()
+                .map(|(label, barcode)| match barcode {
+                    Some(b) => format!("{label} ({b})"),
+                    None => label.clone(),
+                })
+                .collect();
+            let lead = format!(
+                "    {}:",
+                p.place.as_deref().unwrap_or("(no place recorded)")
+            );
+            known.push_str(&wrap_items(&lead, &items, 8, 64));
+            known.push('\n');
+        }
+    }
+    format!(
+        "\
+WHERE THE TAPES ARE -- FILL THIS IN
+-----------------------------------
+{known}
+  +------------------------------------------------------------+
+  |                                                            |
+  |  Tapes are at:                                             |
+  |                                                            |
+  |  ______________________________________________________    |
+  |                                                            |
+  |  ______________________________________________________    |
+  |                                                            |
+  +------------------------------------------------------------+
+
+  Written by: ______________________  Date: ________
+
+"
+    )
 }
 
 /// The warehouse paragraph, present only when deposits exist.
@@ -255,11 +536,12 @@ cartridges (LTO). They hold a long-term backup of personal files:
 documents, photos, and similar. The tapes are encrypted. Opening
 them takes a SECRET that was shown exactly once, on the screen
 of the person who set this archive up, and was never stored on
-any computer. This sheet does two things:
+any computer. This sheet does three things:
 
   1. It names WHICH secret is needed: the escrow identity
      printed below. That printed value opens nothing by itself.
   2. It has a box for the secret to be written in BY HAND.
+  3. It has a box for WHERE THE TAPES ARE, to keep current.
 
 With the box filled in, this sheet is the key to the tapes. If
 the box is empty, look for the secret on another piece of paper
@@ -304,7 +586,7 @@ letters B, I and O and the digit 1 never occur.
 WITHOUT THE SECRET THIS SHEET OPENS NOTHING. The tapes are
 encrypted to it, and so is catalog.db.age in this envelope.
 
-HOW TO CHECK THE PAIR
+{places}HOW TO CHECK THE PAIR
 ---------------------
 Type the secret, alone, on one line of a file (say escrow.key)
 and run:
@@ -317,7 +599,8 @@ was miscopied (a wrong one is refused with \"invalid checksum\")
 or this is the secret of a different archive. The same file is
 what every recovery tool takes as its key:
 
-    ./RESTORE.sh --restore --key escrow.key --to ./out
+    ./RESTORE.sh --list --key escrow.key
+    ./RESTORE.sh --restore --key escrow.key --all --to ./out
     age -d -i escrow.key -o catalog.db catalog.db.age
     tapectl catalog rebuild --from-volume --device /dev/nst0 \\
         --key escrow.key
@@ -325,11 +608,24 @@ what every recovery tool takes as its key:
 (/dev/nst0 is only an example: list the drives on the machine you
 are using with `ls -l /dev/tape/by-id/` and use yours everywhere.)
 
-A restore needs free disk space of about twice the unit's size
-where --to points: the decrypted slices, then the files.
-RESTORE.sh measures this before it reads any slice, and
---scratch DIR puts the decrypted slices on another disk. Do not
-restore into /tmp, which is RAM on many systems.
+One key can open only PART of a tape: a tenant's key opens that
+tenant's envelope alone. The escrow key opens every envelope, so
+--all with the escrow key is the way to get everything: it
+restores every unit, each into its own folder under ./out.
+Without --all, RESTORE.sh uses the first envelope the key opens;
+if that lists one unit, only that unit is restored and nothing
+is said of the rest of the tape. --list first shows what the
+tape holds.
+
+A restore needs free disk space of about one unit's size where
+--to points (all of them together, with --all): RESTORE.sh
+streams each slice from the tape through age into dar, so only
+the restored files are written. It measures this before it
+reads any slice. Decrypted slices are kept on disk only for
+--path (one file or folder) and for a dar older than 2.7.9 (or
+than 2.7.21, for a unit with no catalogue); --scratch DIR puts
+those on another disk. Do not restore into /tmp, which is RAM
+on many systems.
 
 WHAT ELSE IS IN THIS ENVELOPE
 -----------------------------
@@ -344,16 +640,35 @@ WHAT TO DO FIRST
 1. Do NOT bulk-erase, degauss, or reformat the cartridges.
    They are readable for decades if left alone.
 
-2. You need an LTO tape drive of a matching generation. If you
-   do not have one, a data-recovery firm does. The tapes are
-   standard hardware; nothing about them is proprietary.
+2. You need an LTO tape drive that can READ these cartridges.
+{generations}
+   The drive connects by SAS (some models by Fibre Channel), so
+   the computer needs a matching host adapter (HBA) card; there
+   is no USB or SATA tape drive. If you do not have a drive, a
+   data-recovery firm does. The tapes are standard hardware;
+   nothing about them is proprietary.
 
 3. Every cartridge is SELF-DESCRIBING. Near the start of each
    tape there is a plain-text guide and a script named
    RESTORE.sh that can recover the contents using only common
-   tools (tar, age, dar). You do not need the tapectl program,
-   and you do not need this catalog file, to get the data back.
-   Both exist to make it easier, not to make it possible.
+   tools. You do not need the tapectl program, and you do not
+   need this catalog file, to get the data back. Both exist to
+   make it easier, not to make it possible.
+
+   RESTORE.sh checks for its tools before it reads the tape and
+   names any that is missing. It needs:
+     mt     package mt-st (it can set the tape's block size)
+     dd, head, truncate, tar, mkfifo, tee, sha256sum
+            standard on Linux (coreutils, tar)
+     age    age-encryption.org. The files are in the stable age v1
+            format, which the `age` program and `rage` both read.
+            RESTORE.sh runs a program named `age`: if you have
+            only rage, link it under that name.
+     dar    dar.linux.free.fr. 2.7.9 or later needs the least
+            disk space (see above).
+     gpg    package gnupg, only if your dar was built with GPG
+            support (Debian's and Ubuntu's is): that dar refuses
+            to start without it.
 
 4. If you do have tapectl, the first commands are:
 
@@ -370,14 +685,16 @@ WHAT TO DO FIRST
     not two shelves in one building.
   * Paper: a UL-350 rated safe. If stored together with tape,
     Class-125 (tape is far less heat-tolerant than paper).
-  * REFRESH after each writing session. The secret opens EVERY
-    tape ever written -- it is a recipient of all of them, old
-    and new. What goes stale is catalog.db.age in this envelope:
-    it lists only the volumes that existed when this kit was
-    made (see GENERATED). For a tape written later, rebuild the
-    catalog from that tape (tapectl catalog rebuild
-    --from-volume) or generate a fresh kit. Running
-    `tapectl audit` warns when this kit has fallen behind.
+  * REFRESH after each writing session, and when a tape moves
+    to another place. The secret opens EVERY tape ever written
+    -- it is a recipient of all of them, old and new. What goes
+    stale is catalog.db.age in this envelope, and the places
+    listed above: they show only the volumes and places that
+    existed when this kit was made (see GENERATED). For a tape
+    written later, rebuild the catalog from that tape (tapectl
+    catalog rebuild --from-volume) or generate a fresh kit.
+    Running `tapectl audit` warns when this kit has fallen
+    behind.
 
 GENERATED
 ---------
@@ -394,6 +711,8 @@ GENERATED
         bytes = f.catalog_bytes,
         sealed = f.sealed_volumes,
         warehouse = warehouse_section(f.warehouse_deposits),
+        generations = generations_text(f.generations),
+        places = places_text(f.places),
     )
 }
 
@@ -582,6 +901,8 @@ mod tests {
             sealed_volumes: 3,
             catalog_bytes: 4096,
             warehouse_deposits: 0,
+            generations: &[],
+            places: &[],
         };
         let txt = render_cover_text(&f);
         assert!(
@@ -618,6 +939,8 @@ mod tests {
             sealed_volumes: 3,
             catalog_bytes: 4096,
             warehouse_deposits: 0,
+            generations: &[],
+            places: &[],
         };
         let txt = render_cover_text(&f);
         for forbidden in [
@@ -652,6 +975,8 @@ mod tests {
             sealed_volumes: 0,
             catalog_bytes: 1,
             warehouse_deposits: 0,
+            generations: &[],
+            places: &[],
         };
         let txt = render_cover_text(&f);
         let start = txt
@@ -702,6 +1027,8 @@ mod tests {
             sealed_volumes: 2,
             catalog_bytes: 4096,
             warehouse_deposits: 2,
+            generations: &[],
+            places: &[],
         };
         let txt = render_cover_text(&f);
         assert!(
@@ -724,6 +1051,8 @@ mod tests {
             sealed_volumes: 2,
             catalog_bytes: 4096,
             warehouse_deposits: 0,
+            generations: &[],
+            places: &[],
         };
         let txt = render_cover_text(&f);
         assert!(
@@ -747,6 +1076,8 @@ mod tests {
             sealed_volumes: 3,
             catalog_bytes: 4096,
             warehouse_deposits: 0,
+            generations: &[],
+            places: &[],
         };
         let txt = render_cover_text(&f);
         let start = txt
@@ -793,6 +1124,360 @@ mod tests {
         }
     }
 
+    /// The sheet's one prose line for a collapsed-whitespace comparison: it
+    /// is wrapped at 64 columns, so a phrase can span a line break.
+    fn flat(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn facts_for<'a>(generations: &'a [GenerationFact], places: &'a [PlaceFact]) -> KitFacts<'a> {
+        KitFacts {
+            escrow_public_key: ESCROW,
+            sealed_volumes: 2,
+            catalog_bytes: 4096,
+            warehouse_deposits: 0,
+            generations,
+            places,
+        }
+    }
+
+    /// Issue #448 item 1: the only RESTORE.sh example on the sheet used to
+    /// restore with no `--all`. RESTORE.sh stops at the first envelope the key
+    /// opens, so on a tape with several tenants an heir following the sheet
+    /// could stop with one tenant's one unit. The example lists first, then
+    /// restores everything, and the sheet says why.
+    #[test]
+    fn the_example_lists_first_then_restores_everything_with_all() {
+        let txt = render_cover_text(&facts_for(&[], &[]));
+        let list = txt
+            .find("./RESTORE.sh --list --key escrow.key")
+            .expect("the example lists the tape first");
+        let all = txt
+            .find("./RESTORE.sh --restore --key escrow.key --all --to ./out")
+            .expect("the example restores everything with --all");
+        assert!(list < all, "--list comes before the restore");
+        assert!(
+            !txt.contains("--restore --key escrow.key --to ./out"),
+            "the bare restore example (no --all) is the defect"
+        );
+        let prose = flat(&txt);
+        for required in [
+            "One key can open only PART of a tape",
+            "a tenant's key opens that tenant's envelope alone",
+            "--all with the escrow key is the way to get everything",
+        ] {
+            assert!(prose.contains(required), "missing {required:?}");
+        }
+    }
+
+    /// Issue #448 item 3: the 1.1.0 restore streams (RESTORE.sh checks for
+    /// about one unit's size, not twice), and `--scratch` matters only for
+    /// `--path` and the old-dar fallback.
+    #[test]
+    fn the_disk_space_paragraph_is_the_streaming_restore_not_the_pre_1_1_0_one() {
+        let prose = flat(&render_cover_text(&facts_for(&[], &[])));
+        assert!(
+            !prose.contains("twice the unit"),
+            "the pre-1.1.0 'twice the unit's size' is gone"
+        );
+        for required in [
+            "about one unit's size",
+            "streams each slice from the tape through age into dar",
+            "only for --path (one file or folder) and for a dar older than 2.7.9",
+            "--scratch DIR puts those on another disk",
+        ] {
+            assert!(prose.contains(required), "missing {required:?}: {prose}");
+        }
+    }
+
+    /// Issue #448 item 4: one tool list, from RESTORE.sh's own prerequisite
+    /// loop. The test READS the loop out of the generated script, so a tool
+    /// added to it and not to the sheet fails here.
+    #[test]
+    fn the_tool_list_covers_every_tool_restore_sh_checks_for() {
+        let script = crate::volume::layout::generate_restore_script_v2("L6-0001", 3);
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("for tool in ") && l.ends_with("; do"))
+            .expect("RESTORE.sh has a prerequisite loop");
+        let tools: Vec<&str> = line
+            .trim_start_matches("for tool in ")
+            .trim_end_matches("; do")
+            .split_whitespace()
+            .collect();
+        assert!(
+            tools.len() >= 9 && tools.contains(&"mkfifo") && tools.contains(&"tee"),
+            "parsed the wrong line: {line:?}"
+        );
+        let txt = render_cover_text(&facts_for(&[], &[]));
+        for tool in &tools {
+            assert!(
+                txt.contains(tool),
+                "the cover sheet's tool list lacks {tool:?}, which RESTORE.sh requires"
+            );
+        }
+        let prose = flat(&txt);
+        for required in [
+            "mt package mt-st",
+            "stable age v1 format",
+            "`age` program and `rage` both read.",
+            "only if your dar was built with GPG support",
+        ] {
+            assert!(prose.contains(required), "missing {required:?}");
+        }
+        assert!(
+            !prose.contains("(tar, age, dar)"),
+            "the three-tool list was the drift"
+        );
+    }
+
+    /// Issue #448 item 2: "a matching generation" was wrong in the direction
+    /// that matters. An LTO-6 cartridge reads in an LTO-6 or LTO-7 drive and
+    /// in nothing newer; the sheet renders `Generation::can_read` for each
+    /// generation among the sealed volumes, and names the interface.
+    #[test]
+    fn an_lto6_volume_names_lto6_and_lto7_drives_and_the_interface() {
+        let conn = conn_with_escrow();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status)
+             VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed'),
+                    ('L6-0002', 'lto', 'lto0', 'LTO6', 2500000000000, 'sealed'),
+                    ('L6-GONE', 'lto', 'lto0', 'LTO-8', 12000000000000, 'retired')",
+            [],
+        )
+        .unwrap();
+        let tmp = TempDir::new().unwrap();
+        generate(&conn, Path::new("/nonexistent.db"), tmp.path()).unwrap();
+        let prose = flat(&fs::read_to_string(tmp.path().join("COVER.txt")).unwrap());
+
+        assert!(
+            prose.contains("LTO-6 (2 volume(s)): an LTO-6 or LTO-7 drive"),
+            "an LTO-6 cartridge reads in an LTO-6 or LTO-7 drive; two spellings are one \
+             group: {prose}"
+        );
+        assert!(
+            !prose.contains("LTO-8 ("),
+            "a retired volume's generation is not the kit's business: {prose}"
+        );
+        assert!(!prose.contains("matching generation"));
+        for required in [
+            "SAS",
+            "host adapter (HBA)",
+            "A NEWER drive often cannot read an OLDER cartridge",
+        ] {
+            assert!(prose.contains(required), "missing {required:?}");
+        }
+    }
+
+    /// The read-compatibility the sheet prints is `Generation::can_read`'s,
+    /// listed in release order, and an LTO-8 drive is named only for the
+    /// media it reads.
+    #[test]
+    fn drives_that_read_follow_the_compatibility_table() {
+        use Generation::*;
+        assert_eq!(drives_that_read(Lto6), [Lto6, Lto7]);
+        assert_eq!(drives_that_read(Lto5), [Lto5, Lto6, Lto7]);
+        assert_eq!(drives_that_read(Lto7), [Lto7, Lto8]);
+        assert_eq!(drives_that_read(Lto7M8), [Lto8]);
+        assert_eq!(drives_that_read(Lto8), [Lto8, Lto9]);
+        assert_eq!(drives_that_read(Lto10), [Lto10]);
+        assert_eq!(drive_phrase(&[Lto6, Lto7]), "an LTO-6 or LTO-7 drive");
+        assert_eq!(
+            drive_phrase(&[Lto5, Lto6, Lto7]),
+            "an LTO-5, LTO-6 or LTO-7 drive"
+        );
+        assert_eq!(drive_phrase(&[Lto8]), "an LTO-8 drive");
+    }
+
+    /// `DRIVE_GENERATIONS` lists every drive generation: a new `Generation`
+    /// variant makes this `match` fail to compile, which is the prompt to
+    /// decide whether it is a drive and extend the list.
+    #[test]
+    fn a_new_generation_must_be_considered_here() {
+        for g in [
+            Generation::Lto1,
+            Generation::Lto2,
+            Generation::Lto3,
+            Generation::Lto4,
+            Generation::Lto5,
+            Generation::Lto6,
+            Generation::Lto7,
+            Generation::Lto7M8,
+            Generation::Lto8,
+            Generation::Lto9,
+            Generation::Lto10,
+        ] {
+            let is_a_drive = match g {
+                Generation::Lto1
+                | Generation::Lto2
+                | Generation::Lto3
+                | Generation::Lto4
+                | Generation::Lto5
+                | Generation::Lto6
+                | Generation::Lto7
+                | Generation::Lto8
+                | Generation::Lto9
+                | Generation::Lto10 => true,
+                Generation::Lto7M8 => false,
+            };
+            assert_eq!(DRIVE_GENERATIONS.contains(&g), is_a_drive, "{g}");
+        }
+        let mut orders: Vec<usize> = DRIVE_GENERATIONS
+            .iter()
+            .copied()
+            .chain([Generation::Lto7M8])
+            .map(release_order)
+            .collect();
+        orders.sort_unstable();
+        orders.dedup();
+        assert_eq!(orders.len(), 11, "release_order is one-to-one");
+    }
+
+    /// With no sealed cartridge (or one whose generation this sheet cannot
+    /// read) the sheet says to look the generation up, never nothing.
+    #[test]
+    fn the_generation_line_falls_back_to_the_makers_table() {
+        let prose = flat(&render_cover_text(&facts_for(&[], &[])));
+        assert!(prose.contains("look up which drives read it in the maker's compatibility table"));
+        let odd = [GenerationFact {
+            generation: None,
+            stored: "DLT-IV".into(),
+            volumes: 1,
+        }];
+        let prose = flat(&render_cover_text(&facts_for(&odd, &[])));
+        assert!(prose.contains("DLT-IV (1 volume(s)): not a generation this sheet knows"));
+    }
+
+    /// Issue #448 item 5: "Tapes are at:" is a hand-fill box beside the
+    /// secret box, with the places the catalog knows printed above it as a
+    /// starting point; the box is as ragged-proof as the secret's.
+    #[test]
+    fn the_sheet_has_a_tapes_are_at_box_and_lists_the_places_the_catalog_knows() {
+        let places = [
+            PlaceFact {
+                place: Some("home-rack".into()),
+                volumes: vec![
+                    ("L6-0001".into(), Some("BC0001L6".into())),
+                    ("L6-0002".into(), None),
+                ],
+            },
+            PlaceFact {
+                place: None,
+                volumes: vec![("L6-0003".into(), Some("BC0003L6".into()))],
+            },
+        ];
+        let txt = render_cover_text(&facts_for(&[], &places));
+        assert!(txt.contains("WHERE THE TAPES ARE -- FILL THIS IN"));
+        assert!(
+            txt.contains("home-rack: L6-0001 (BC0001L6), L6-0002"),
+            "{txt}"
+        );
+        assert!(
+            txt.contains("(no place recorded): L6-0003 (BC0003L6)"),
+            "{txt}"
+        );
+        let start = txt.find("WHERE THE TAPES ARE").unwrap();
+        let end = start + txt[start..].find("Written by:").unwrap();
+        let section = &txt[start..end];
+        assert!(section.contains("Tapes are at:"));
+        let box_lines: Vec<&str> = section
+            .lines()
+            .filter(|l| l.trim_start().starts_with('|') || l.trim_start().starts_with('+'))
+            .collect();
+        assert!(box_lines.len() >= 5, "{box_lines:?}");
+        let widths: std::collections::BTreeSet<usize> =
+            box_lines.iter().map(|l| l.chars().count()).collect();
+        assert_eq!(widths.len(), 1, "ragged box: {box_lines:#?}");
+        assert!(
+            box_lines.iter().any(|l| l.contains("____")),
+            "the box has lines to write on"
+        );
+        // The secret's box is untouched by the second one.
+        let secret_at = txt.find("WRITE IT HERE").unwrap();
+        let tapes_heading = txt.find("WHERE THE TAPES ARE -- FILL THIS IN").unwrap();
+        assert!(
+            secret_at < tapes_heading,
+            "the secret box comes first, the tapes box beside it"
+        );
+        assert_eq!(txt.matches("WRITE IT HERE").count(), 1);
+    }
+
+    /// The places come from the catalog: sealed volumes, grouped by their
+    /// place, the cartridge's barcode beside the label, and a volume no
+    /// longer sealed is not listed.
+    #[test]
+    fn generate_prints_the_places_from_the_catalog() {
+        let conn = conn_with_escrow();
+        conn.execute_batch(
+            "INSERT INTO locations (name) VALUES ('home-rack'), ('offsite');
+             INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                 VALUES ('BC0001L6', 'LTO-6', 2500000000000, 'in_use'),
+                        ('BC0002L6', 'LTO-6', 2500000000000, 'in_use');
+             INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, location_id)
+                 VALUES ('L6-0001', 'lto', 'lto0', 'LTO-6', 1, 'sealed',
+                         (SELECT id FROM locations WHERE name = 'home-rack')),
+                        ('L6-0002', 'lto', 'lto0', 'LTO-6', 1, 'sealed',
+                         (SELECT id FROM locations WHERE name = 'offsite')),
+                        ('L6-0003', 'lto', 'lto0', 'LTO-6', 1, 'retired',
+                         (SELECT id FROM locations WHERE name = 'offsite'));
+             INSERT INTO cartridge_volumes (cartridge_id, volume_id)
+                 VALUES ((SELECT id FROM cartridges WHERE barcode = 'BC0001L6'),
+                         (SELECT id FROM volumes WHERE label = 'L6-0001')),
+                        ((SELECT id FROM cartridges WHERE barcode = 'BC0002L6'),
+                         (SELECT id FROM volumes WHERE label = 'L6-0002'));",
+        )
+        .unwrap();
+        let tmp = TempDir::new().unwrap();
+        generate(&conn, Path::new("/nonexistent.db"), tmp.path()).unwrap();
+        let txt = fs::read_to_string(tmp.path().join("COVER.txt")).unwrap();
+        assert!(txt.contains("home-rack: L6-0001 (BC0001L6)"), "{txt}");
+        assert!(txt.contains("offsite: L6-0002 (BC0002L6)"), "{txt}");
+        assert!(!txt.contains("L6-0003"), "a retired volume is not listed");
+        let html = fs::read_to_string(tmp.path().join("escrow-kit.html")).unwrap();
+        assert!(html.contains("home-rack: L6-0001 (BC0001L6)"));
+    }
+
+    /// Long lists wrap inside the sheet's 64 columns without splitting a
+    /// volume, and so does every line of the new generation and places
+    /// sections.
+    #[test]
+    fn a_long_place_list_wraps_within_the_sheets_columns() {
+        let volumes = (1..=14)
+            .map(|n| (format!("L6-{n:04}"), Some(format!("BC{n:04}L6"))))
+            .collect();
+        let places = [PlaceFact {
+            place: Some("offsite".into()),
+            volumes,
+        }];
+        let gens = [GenerationFact {
+            generation: Some(Generation::Lto5),
+            stored: "LTO-5".into(),
+            volumes: 14,
+        }];
+        let txt = render_cover_text(&facts_for(&gens, &places));
+        let section_start = txt.find("WHERE THE TAPES ARE -- FILL").unwrap();
+        let section_end = section_start + txt[section_start..].find("Written by:").unwrap();
+        let gens_start = txt.find("2. You need an LTO tape drive").unwrap();
+        let gens_end = gens_start + txt[gens_start..].find("3. Every cartridge").unwrap();
+        for part in [&txt[section_start..section_end], &txt[gens_start..gens_end]] {
+            for line in part.lines() {
+                assert!(
+                    line.chars().count() <= 64,
+                    "wider than the sheet's 64 columns: {line:?}"
+                );
+            }
+        }
+        let flat_places = flat(&txt);
+        for n in 1..=14 {
+            assert!(
+                flat_places.contains(&format!("L6-{n:04} (BC{n:04}L6)")),
+                "volume {n} was lost or split by the wrap"
+            );
+        }
+    }
+
     /// The page has to render with no network and no filesystem beyond
     /// itself — that is the entire point of printing it.
     #[test]
@@ -802,6 +1487,8 @@ mod tests {
             sealed_volumes: 0,
             catalog_bytes: 1,
             warehouse_deposits: 0,
+            generations: &[],
+            places: &[],
         };
         let html = render_cover_html(&f).unwrap();
         assert!(html.contains("<svg"), "the QR must be inlined as SVG");

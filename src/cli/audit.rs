@@ -1497,26 +1497,70 @@ fn escrow_kit_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
         |r| r.get(0),
     )?;
 
+    // Issue #448 item 5: the kit also lists WHERE the sealed volumes are
+    // (COVER.txt's places, and the locations inside catalog.db.age), so a
+    // `volume move` or `cartridge move` after the kit leaves it wrong with no
+    // sign. The movers (`cli::location::move_together`) write one `moved`
+    // event per volume and per cartridge, field `location`, in the same
+    // transaction as the move; a cartridge's event is attributed to the sealed
+    // volumes on it, and a volume moved by both counts once. Only volumes that
+    // count as copies matter: a retired or erased one is not on the sheet.
+    // Strictly newer than the kit's own event, as for a write.
+    let moved_count: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(DISTINCT vid) FROM (
+                 SELECT v.id AS vid
+                   FROM events e
+                   JOIN volumes v ON e.entity_type = 'volume' AND v.id = e.entity_id
+                  WHERE e.action = 'moved' AND e.field = 'location'
+                    AND e.timestamp > ?1 AND {elig}
+                 UNION ALL
+                 SELECT v.id
+                   FROM events e
+                   JOIN cartridge_volumes cv
+                     ON e.entity_type = 'cartridge' AND cv.cartridge_id = e.entity_id
+                   JOIN volumes v ON v.id = cv.volume_id
+                  WHERE e.action = 'moved' AND e.field = 'location'
+                    AND e.timestamp > ?1 AND {elig}
+             )",
+            elig = crate::policy::coverage::eligible("v")
+        ),
+        rusqlite::params![last_kit],
+        |r| r.get(0),
+    )?;
+
     // Issue #351: what goes stale is the kit's CATALOG, never its key. The
     // escrow identity is a recipient of every tape ever written (ADR-0005),
     // so the kit's secret opens these volumes too; only `catalog.db.age`, the
     // snapshot taken at generation time, does not list them. Saying the kit
     // "misses" new tapes tells an heir not to try the one key that works.
+    let mut reasons: Vec<String> = Vec::new();
     if stale_count > 0 {
-        return Ok(vec![AuditFinding {
-            unit: "archive".into(),
-            check: "escrow_kit_stale".into(),
-            message: format!(
-                "{stale_count} volume(s) were sealed after the last heir kit ({last_kit}): \
-                 the kit's escrow secret still opens them (it is a recipient of every tape), \
-                 but the kit's encrypted catalog (catalog.db.age) does not list them — \
-                 regenerate the kit, or rebuild the catalog from those tapes with \
-                 `tapectl catalog rebuild --from-volume`"
-            ),
-            action: "tapectl key escrow-kit --out <dir>".to_string(),
-        }]);
+        reasons.push(format!(
+            "{stale_count} volume(s) were sealed after the last heir kit ({last_kit}): \
+             the kit's escrow secret still opens them (it is a recipient of every tape), \
+             but the kit's encrypted catalog (catalog.db.age) does not list them — \
+             regenerate the kit, or rebuild the catalog from those tapes with \
+             `tapectl catalog rebuild --from-volume`"
+        ));
     }
-    Ok(Vec::new())
+    if moved_count > 0 {
+        reasons.push(format!(
+            "{moved_count} volume(s) were moved to another place after the last heir kit \
+             ({last_kit}): the cover sheet's list of places and the locations inside \
+             catalog.db.age still show the old ones — regenerate the kit, reprint \
+             COVER.txt and correct its \"Tapes are at\" box"
+        ));
+    }
+    if reasons.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![AuditFinding {
+        unit: "archive".into(),
+        check: "escrow_kit_stale".into(),
+        message: reasons.join("; and "),
+        action: "tapectl key escrow-kit --out <dir>".to_string(),
+    }])
 }
 
 /// A unit's current copy count for `audit`'s `copy_count` check.
@@ -2506,6 +2550,171 @@ mod tests {
                 "an undated completed write must warn, not be silently treated as covered"
             );
             assert_eq!(findings[0].check, "escrow_kit_stale");
+        }
+
+        // --- Heir Kit staleness: a tape that MOVED (issue #448 item 5) ----
+
+        /// A sealed, cartridge-bound volume `label` at `home`, written two
+        /// days ago, with an heir kit generated yesterday: the kit is current
+        /// until something happens after it. Locations `home` and `offsite`.
+        fn current_kit_with_a_bound_volume(conn: &Connection, unit_id: i64, label: &str) {
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO locations (name) VALUES ('home'), ('offsite');",
+            )
+            .unwrap();
+            seed_written_volume(conn, unit_id, label, "sealed", 1000, 900, 100);
+            conn.execute(
+                "UPDATE writes SET completed_at = datetime('now', '-2 day')
+                  WHERE volume_id = (SELECT id FROM volumes WHERE label = ?1)",
+                params![label],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                 VALUES (?1, 'LTO-6', 2500000000000, 'in_use')",
+                params![format!("BC-{label}")],
+            )
+            .unwrap();
+            let cart = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id)
+                 VALUES (?1, (SELECT id FROM volumes WHERE label = ?2))",
+                params![cart, label],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events (entity_type, entity_id, action, timestamp)
+                 VALUES ('system', 0, 'escrow_kit_generated', datetime('now', '-1 day'))",
+                [],
+            )
+            .unwrap();
+        }
+
+        /// Control for everything below: the same fixture with no move is
+        /// not stale, so a finding that follows a move is the move's.
+        #[test]
+        fn escrow_kit_check_is_silent_when_nothing_moved_since_the_kit() {
+            let (conn, unit_id) = setup();
+            current_kit_with_a_bound_volume(&conn, unit_id, "MOVE1");
+            assert!(escrow_kit_findings(&conn).unwrap().is_empty());
+        }
+
+        /// `volume move` after the kit: the sheet's places and catalog.db.age's
+        /// locations are wrong, and the check says so. The move is made by the
+        /// real mover, so the event the check reads is the one the mover
+        /// writes (a cartridge event and a volume event, one volume).
+        #[test]
+        fn escrow_kit_check_fires_when_a_volume_moved_after_the_kit() {
+            let (conn, unit_id) = setup();
+            current_kit_with_a_bound_volume(&conn, unit_id, "MOVE2");
+            crate::cli::location::move_volume(&conn, "MOVE2", "offsite", false).unwrap();
+
+            let findings = escrow_kit_findings(&conn).unwrap();
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(findings[0].check, "escrow_kit_stale");
+            assert!(
+                findings[0]
+                    .message
+                    .starts_with("1 volume(s) were moved to another place after the last heir kit"),
+                "one volume moved, counted once for its volume and cartridge events: {}",
+                findings[0].message
+            );
+            assert!(findings[0].message.contains("\"Tapes are at\" box"));
+            assert!(
+                !findings[0].message.contains("were sealed after"),
+                "nothing was sealed after the kit: {}",
+                findings[0].message
+            );
+            assert_eq!(findings[0].action, "tapectl key escrow-kit --out <dir>");
+        }
+
+        /// `cartridge move` writes a cartridge event; the check attributes it
+        /// to the sealed volumes on that cartridge.
+        #[test]
+        fn escrow_kit_check_fires_when_a_cartridge_moved_after_the_kit() {
+            let (conn, unit_id) = setup();
+            current_kit_with_a_bound_volume(&conn, unit_id, "MOVE3");
+            crate::cli::location::move_cartridge(&conn, "BC-MOVE3", "offsite", false).unwrap();
+            let findings = escrow_kit_findings(&conn).unwrap();
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(findings[0].message.starts_with("1 volume(s) were moved"));
+
+            // And on its own: a cartridge event with no volume event beside it.
+            conn.execute("DELETE FROM events WHERE entity_type = 'volume'", [])
+                .unwrap();
+            assert_eq!(
+                escrow_kit_findings(&conn).unwrap().len(),
+                1,
+                "the cartridge's own event is enough"
+            );
+        }
+
+        /// A move BEFORE the kit is on the sheet already.
+        #[test]
+        fn escrow_kit_check_ignores_a_move_older_than_the_kit() {
+            let (conn, unit_id) = setup();
+            current_kit_with_a_bound_volume(&conn, unit_id, "MOVE4");
+            crate::cli::location::move_volume(&conn, "MOVE4", "offsite", false).unwrap();
+            conn.execute(
+                "UPDATE events SET timestamp = datetime('now', '-3 day') WHERE action = 'moved'",
+                [],
+            )
+            .unwrap();
+            assert!(escrow_kit_findings(&conn).unwrap().is_empty());
+            // A kit generated later still covers it.
+            conn.execute(
+                "UPDATE events SET timestamp = datetime('now')  WHERE action = 'moved'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE events SET timestamp = datetime('now', '+1 day')
+                  WHERE action = 'escrow_kit_generated'",
+                [],
+            )
+            .unwrap();
+            assert!(escrow_kit_findings(&conn).unwrap().is_empty());
+        }
+
+        /// A volume that no longer counts as a copy is not on the sheet, so
+        /// moving it makes nothing stale.
+        #[test]
+        fn escrow_kit_check_ignores_a_move_of_a_retired_volume() {
+            let (conn, unit_id) = setup();
+            current_kit_with_a_bound_volume(&conn, unit_id, "KEPT");
+            current_kit_with_a_bound_volume(&conn, unit_id, "GONE");
+            conn.execute(
+                "UPDATE volumes SET status = 'retired' WHERE label = 'GONE'",
+                [],
+            )
+            .unwrap();
+            crate::cli::location::move_volume(&conn, "GONE", "offsite", false).unwrap();
+            assert!(escrow_kit_findings(&conn).unwrap().is_empty());
+        }
+
+        /// Sealed AND moved after the kit: one finding, both reasons, the
+        /// sealed-after text byte-for-byte what it is without a move.
+        #[test]
+        fn escrow_kit_check_names_both_a_new_tape_and_a_moved_one() {
+            let (conn, unit_id) = setup();
+            current_kit_with_a_bound_volume(&conn, unit_id, "OLD");
+            crate::cli::location::move_volume(&conn, "OLD", "offsite", false).unwrap();
+            seed_written_volume(&conn, unit_id, "NEWER", "sealed", 1000, 900, 100);
+            conn.execute(
+                "UPDATE writes SET completed_at = datetime('now')
+                  WHERE volume_id = (SELECT id FROM volumes WHERE label = 'NEWER')",
+                [],
+            )
+            .unwrap();
+
+            let findings = escrow_kit_findings(&conn).unwrap();
+            assert_eq!(findings.len(), 1, "one check, one finding: {findings:?}");
+            let message = &findings[0].message;
+            assert!(message.starts_with("1 volume(s) were sealed after the last heir kit"));
+            assert!(
+                message.contains("; and 1 volume(s) were moved to another place"),
+                "{message}"
+            );
         }
 
         /// A sealed volume above the threshold must NOT be flagged — proves
