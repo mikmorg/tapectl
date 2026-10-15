@@ -14,7 +14,9 @@
 //! - the drive's lifetime counters FOR THIS CARTRIDGE, page 0x17 (volume
 //!   statistics): write retries (the drive's rewrites), read retries,
 //!   unrecovered errors, beginning-of-medium passes;
-//! - the drive's TapeAlert page 0x2E.
+//! - the drive's TapeAlert page 0x2E: every medium flag raised by any
+//!   reading since the cartridge's last passed full readback, not only the
+//!   newest reading (issue #467).
 //!
 //! A WARNING is printed when the chip's TapeAlert flags are non-zero, when
 //! page 0x2E raised a medium flag (`Media`, `Media life`, `Nearing media
@@ -102,7 +104,10 @@ pub struct Wear {
     pub mam: Option<(Option<String>, MamInfo)>,
     /// Page 0x17 for this cartridge, and when it was captured.
     pub volume_stats: Option<(String, VolumeStatistics)>,
-    /// Page 0x2E's raised medium flags, and when it was captured.
+    /// Page 0x2E's raised medium flags, and when. Every flag ANY reading
+    /// since the cartridge's last passed full readback raised, in the order
+    /// first raised ([`medium_alerts_since_readback`]); `when` is the newest
+    /// reading that raised one, or — with none raised — the newest reading.
     pub tape_alerts: Option<(String, Vec<String>)>,
 }
 
@@ -116,10 +121,11 @@ impl Wear {
                 w.push(format!("the chip reports TapeAlert flags {flags:#x}"));
             }
         }
-        if let Some((_, alerts)) = &self.tape_alerts {
+        if let Some((when, alerts)) = &self.tape_alerts {
             if !alerts.is_empty() {
                 w.push(format!(
-                    "the drive raised TapeAlert {} (page 0x2E)",
+                    "the drive raised TapeAlert {} (page 0x2E), last at {when} — and no full \
+                     readback has passed since",
                     alerts.join(", ")
                 ));
             }
@@ -223,6 +229,66 @@ fn latest_page(conn: &Connection, cartridge_id: i64, page: u8) -> Result<Option<
         .optional()?)
 }
 
+/// The `started_at` of the newest PASSED FULL readback of any volume bound
+/// to this cartridge, or `None` when none has passed. A volume's later
+/// retirement or erasure does not unread the medium, so every binding counts.
+fn last_passed_readback(conn: &Connection, cartridge_id: i64) -> Result<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT MAX(vs.started_at)
+           FROM verification_sessions vs
+           JOIN cartridge_volumes cv ON cv.volume_id = vs.volume_id
+          WHERE cv.cartridge_id = ?1 AND vs.verify_type = 'full' AND vs.outcome = 'passed'",
+        [cartridge_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// The medium TapeAlert flags raised by ANY successful page 0x2E reading
+/// journalled through a contact with this cartridge since its last passed
+/// full readback (issue #467) — `policy::tape_alerts`' rule, which `audit`
+/// already applies: whether 0x2E clears on read is unsettled (ADR-0013), so
+/// a later clean reading proves nothing, and a passed full verify, which
+/// read every byte back, does. A reading before the readback started does
+/// not count; one in its first second may be its own, so it does.
+///
+/// `None` when the cartridge has no usable reading at all.
+fn medium_alerts_since_readback(
+    conn: &Connection,
+    cartridge_id: i64,
+) -> Result<Option<(String, Vec<String>)>> {
+    let since = last_passed_readback(conn, cartridge_id)?;
+    let mut stmt = conn.prepare(
+        "SELECT j.captured_at, j.decoded
+           FROM log_page_journal j
+           JOIN cartridge_contacts c ON c.id = j.contact_id
+          WHERE c.cartridge_id = ?1 AND j.page_code = 0x2e AND j.subpage_code = 0
+            AND j.ok = 1 AND j.decoded IS NOT NULL
+          ORDER BY j.id",
+    )?;
+    let readings = stmt
+        .query_map([cartridge_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let Some(newest) = readings.last().map(|(at, _)| at.clone()) else {
+        return Ok(None);
+    };
+    let mut raised: Vec<String> = Vec::new();
+    let mut raised_at: Option<String> = None;
+    for (at, decoded) in &readings {
+        if since.as_deref().is_some_and(|s| at.as_str() < s) {
+            continue;
+        }
+        for flag in raised_medium_alerts(decoded) {
+            if !raised.contains(&flag) {
+                raised.push(flag);
+            }
+            raised_at = Some(at.clone());
+        }
+    }
+    Ok(Some((raised_at.unwrap_or(newest), raised)))
+}
+
 /// The newest successful MAM capture of this cartridge, by either route
 /// the journal knows (its contacts, or its chip serial), re-parsed.
 fn latest_mam(
@@ -267,8 +333,7 @@ pub fn for_cartridge(
     };
     let volume_stats = latest_page(conn, cartridge_id, 0x17)?
         .map(|(when, text)| (when, parse_volume_statistics(&text)));
-    let tape_alerts = latest_page(conn, cartridge_id, 0x2e)?
-        .map(|(when, text)| (when, raised_medium_alerts(&text)));
+    let tape_alerts = medium_alerts_since_readback(conn, cartridge_id)?;
     Ok(Wear {
         mam,
         volume_stats,
@@ -513,6 +578,151 @@ mod tests {
         let other = for_cartridge(&conn, 2, None).unwrap();
         assert_eq!(other.warnings().len(), 1, "{:?}", other.warnings());
         assert!(other.mam.is_none());
+    }
+
+    /// Issue #467: a medium flag raised by ANY reading since the cartridge's
+    /// last passed full readback is shown — a later clean reading proves
+    /// nothing (whether 0x2E clears on read is unsettled, ADR-0013) — and a
+    /// passed FULL verify of a volume on the cartridge, which read every byte
+    /// back, is what retires it. `cartridge info` and the write pre-flight
+    /// both go through `for_cartridge`.
+    #[test]
+    fn a_medium_flag_stands_until_a_full_readback_passes() {
+        let conn = crate::db::open_memory().unwrap();
+        for (id, serial) in [(1, "EW7VWMVKF6"), (2, "OTHER")] {
+            conn.execute(
+                "INSERT INTO cartridges (id, barcode, media_type, nominal_capacity, serial_number)
+                 VALUES (?1, ?2, 'LTO-6', 2500000000000, ?2)",
+                params![id, serial],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cartridge_contacts (id, cartridge_id, operation, device)
+                 VALUES (?1, ?1, 'volume verify', '/dev/nst0')",
+                [id],
+            )
+            .unwrap();
+        }
+        let flagged =
+            |flag: &str| HP_0X2E.replace(&format!("  {flag}: 0"), &format!("  {flag}: 1"));
+        let reading = |contact: i64, at: &str, text: &str| {
+            conn.execute(
+                "INSERT INTO log_page_journal (captured_at, contact_id, device_sg, trigger,
+                    page_code, ok, tool_argv, decoded, tapectl_version)
+                 VALUES (?1, ?2, '/dev/sg0', 'volume verify', 46, 1, '[]', ?3, 't')",
+                params![at, contact, text],
+            )
+            .unwrap();
+        };
+        // The other cartridge only ever reads clean.
+        reading(2, "2026-10-01 09:00:00", HP_0X2E);
+
+        // Raised once, then clean twice: the newest reading alone says clean.
+        reading(1, "2026-10-02 09:00:00", &flagged("Nearing media life"));
+        reading(1, "2026-10-03 09:00:00", HP_0X2E);
+        reading(1, "2026-10-04 09:00:00", HP_0X2E);
+        assert!(
+            raised_medium_alerts(HP_0X2E).is_empty(),
+            "positive control: the newest reading is clean"
+        );
+        let wear = for_cartridge(&conn, 1, None).unwrap();
+        assert_eq!(
+            wear.tape_alerts,
+            Some((
+                "2026-10-02 09:00:00".to_string(),
+                vec!["Nearing media life".to_string()]
+            )),
+            "the flag stands, dated by the reading that raised it"
+        );
+        let text = wear.lines().join("\n");
+        assert!(
+            text.contains("TapeAlert Nearing media life (page 0x2E), last at 2026-10-02"),
+            "{text}"
+        );
+        // Another cartridge's readings are not mine, and its clean one is clean.
+        let other = for_cartridge(&conn, 2, None).unwrap();
+        assert_eq!(
+            other.tape_alerts,
+            Some(("2026-10-01 09:00:00".to_string(), vec![]))
+        );
+        assert!(other.warnings().is_empty());
+
+        // A second flag in another reading joins the first.
+        reading(1, "2026-10-05 09:00:00", &flagged("Media life"));
+        assert_eq!(
+            for_cartridge(&conn, 1, None).unwrap().tape_alerts,
+            Some((
+                "2026-10-05 09:00:00".to_string(),
+                vec!["Nearing media life".to_string(), "Media life".to_string()]
+            ))
+        );
+
+        // The write pre-flight shows it too, from a clean chip read.
+        conn.execute(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
+             VALUES (9, 'L6-0001', 'lto', 'p', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (1, 9)",
+            [],
+        )
+        .unwrap();
+        let chip = parse_mam(LTO6_SAMPLE);
+        assert!(preflight_lines(&conn, 9, &chip)
+            .join("\n")
+            .contains("WARNING: worn cartridge? the drive raised TapeAlert"));
+
+        // A quick verify, a failed one and a passed one of ANOTHER cartridge's
+        // volume read nothing back: the flags stand.
+        let session = |volume: i64, at: &str, kind: &str, outcome: &str| {
+            conn.execute(
+                "INSERT INTO verification_sessions (volume_id, started_at, verify_type, outcome)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![volume, at, kind, outcome],
+            )
+            .unwrap();
+        };
+        conn.execute(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
+             VALUES (10, 'L6-0002', 'lto', 'p', 2500000000000, 'sealed')",
+            [],
+        )
+        .unwrap();
+        session(9, "2026-10-06 09:00:00", "quick", "passed");
+        session(9, "2026-10-06 10:00:00", "full", "failed");
+        session(10, "2026-10-06 11:00:00", "full", "passed");
+        assert_eq!(
+            for_cartridge(&conn, 1, None)
+                .unwrap()
+                .tape_alerts
+                .unwrap()
+                .1
+                .len(),
+            2
+        );
+
+        // A passed full readback of a volume on the cartridge retires both
+        // flags: what was raised before it STARTED is answered.
+        session(9, "2026-10-06 12:00:00", "full", "passed");
+        let after = for_cartridge(&conn, 1, None).unwrap();
+        assert_eq!(
+            after.tape_alerts,
+            Some(("2026-10-05 09:00:00".to_string(), vec![])),
+            "no flag stands; the newest reading is the date"
+        );
+        assert!(after.warnings().is_empty());
+
+        // And a flag raised after it stands again.
+        reading(1, "2026-10-07 09:00:00", &flagged("Not data grade"));
+        assert_eq!(
+            for_cartridge(&conn, 1, None).unwrap().tape_alerts,
+            Some((
+                "2026-10-07 09:00:00".to_string(),
+                vec!["Not data grade".to_string()]
+            ))
+        );
     }
 
     /// `volume write`'s pre-flight block: the cartridge is found by the
