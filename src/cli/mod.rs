@@ -305,7 +305,7 @@ pub enum Commands {
         command: BackendCommands,
     },
 
-    /// The drive itself: read its health on a schedule (`drive poll`)
+    /// The drive itself: what is in it now (`drive status`), its health on a schedule (`drive poll`)
     Drive {
         #[command(subcommand)]
         command: drive::DriveCommands,

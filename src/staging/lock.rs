@@ -452,7 +452,10 @@ pub fn live_volume_sessions(conn: &Connection) -> Vec<i64> {
     let Some(db_file) = db_file_of(conn) else {
         return Vec::new();
     };
-    let dir = db_file.parent().unwrap_or_else(|| Path::new(".")).join("locks");
+    let dir = db_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("locks");
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };

@@ -157,6 +157,9 @@ const TABLE: &[(&[&str], Verdict)] = &[
     // preview would have to read the drive too. Refused before the backend
     // is resolved, so the refusal never reaches a device.
     (&["drive", "poll"], Verdict::Refuses { probe_args: &[] }),
+    // Issue #428: status reads the st driver's answer and the catalog and
+    // writes nothing anywhere (no contact, no journal row, no lock).
+    (&["drive", "status"], Verdict::ReadOnly),
     // export/import/init/quick-archive: top-level `Commands::*` arms in
     // `main.rs` that call `cli::operations::*`/`cmd_init` directly, never a
     // `cli::<mod>::run(...)` dispatch — fixed by issue #247, which extended

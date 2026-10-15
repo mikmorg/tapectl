@@ -532,8 +532,7 @@ impl TapeNodeStatus {
     /// The cartridge's write-protect tab, or `None` when no ready cartridge
     /// makes the bit mean anything (st leaves it stale on an empty drive).
     pub fn write_protected(&self) -> Option<bool> {
-        (self.cartridge() == CartridgeState::Loaded)
-            .then_some(self.raw.mt_gstat & GMT_WR_PROT != 0)
+        (self.cartridge() == CartridgeState::Loaded).then_some(self.raw.mt_gstat & GMT_WR_PROT != 0)
     }
 
     /// st's own file count, `None` where it has lost track (`-1`) or there
@@ -598,6 +597,16 @@ impl TapeNodeStatus {
 /// it held is in the answer ([`TapeNodeStatus::raw`]'s `mt_erreg`).
 pub fn status_nonblocking(device: &str) -> io::Result<TapeNodeStatus> {
     use std::os::unix::fs::OpenOptionsExt;
+    if node_rewinds_on_close(device) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{device} is a rewinding tape node (stN, not nstN): the st driver rewinds the \
+                 tape when it is closed, so status will not open it; name the non-rewinding \
+                 node (/dev/nstN, or the by-id link ending -nst)"
+            ),
+        ));
+    }
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NONBLOCK)
@@ -618,6 +627,33 @@ pub fn status_nonblocking(device: &str) -> io::Result<TapeNodeStatus> {
             mt_blkno: m.mt_blkno,
         },
     })
+}
+
+/// `SCSI_TAPE_MAJOR` (`<linux/major.h>`): the st driver's block of device
+/// numbers.
+const SCSI_TAPE_MAJOR: u64 = 9;
+
+/// Whether `device` is an st node that rewinds the tape when it is closed
+/// (`/dev/stN`, as opposed to `/dev/nstN`). Read from the device number the
+/// kernel assigned, so a by-id link and a renamed node are judged by what
+/// they are: bit 7 of an st minor is "no rewind" (`TAPE_REWIND` in `st.c`).
+/// Anything that is not an st character device — a path that does not exist,
+/// a test's regular file — answers `false`.
+fn node_rewinds_on_close(device: &str) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(meta) = std::fs::metadata(device) else {
+        return false;
+    };
+    meta.file_type().is_char_device()
+        && st_minor_rewinds(
+            nix::sys::stat::major(meta.rdev()),
+            nix::sys::stat::minor(meta.rdev()),
+        )
+}
+
+/// [`node_rewinds_on_close`] for a device number.
+fn st_minor_rewinds(major: u64, minor: u64) -> bool {
+    major == SCSI_TAPE_MAJOR && minor & 0x80 == 0
 }
 
 /// Extract the density code byte from `MTIOCGET`'s `mt_dsreg` register: the
@@ -765,6 +801,20 @@ mod density_tests {
             all.gstat_flags(),
             ["BOT", "EOT", "WR_PROT", "ONLINE", "DR_OPEN", "CLN"]
         );
+    }
+
+    /// A rewinding node is refused before it is opened: closing it would
+    /// rewind, and a status never moves tape.
+    #[test]
+    fn a_rewinding_st_node_is_recognised_by_its_device_number() {
+        assert!(st_minor_rewinds(9, 0), "/dev/st0");
+        assert!(st_minor_rewinds(9, 32), "/dev/st0l");
+        assert!(st_minor_rewinds(9, 3), "/dev/st3");
+        assert!(!st_minor_rewinds(9, 128), "/dev/nst0");
+        assert!(!st_minor_rewinds(9, 160), "/dev/nst0l");
+        assert!(!st_minor_rewinds(8, 0), "a disk is not a tape");
+        assert!(!node_rewinds_on_close("/nonexistent/tapectl/st0"));
+        assert!(!node_rewinds_on_close("/dev/null"), "not an st node");
     }
 
     #[test]
