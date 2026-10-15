@@ -26,7 +26,12 @@ pub enum VolumeCommands {
         /// DIFFERENT volume (e.g. a mislabeled or stale tape), or is EMPTY
         /// (a filemark at the beginning of the tape). Refused by
         /// default — loading the wrong cartridge would
-        /// otherwise silently overwrite it. Never overrides a cartridge
+        /// otherwise silently overwrite it. An EMPTY or unreadable File 0
+        /// needs no `--force` when the tape is PROVEN blank (ADR-0012
+        /// 2026-10-15 item 57): the chip's lifetime totals read 0 MiB
+        /// written, or this catalog's own `cartridge erase` verified it
+        /// blank and nothing has been written since; init prints which
+        /// proof it used. Never overrides a cartridge
         /// that is already SEALED (ADR-0003): retire its volume, erase the
         /// tape in the drive (`mt erase`, or `mt weof 1` at the start) and
         /// run `cartridge mark-erased` first for that case. Never degauss
