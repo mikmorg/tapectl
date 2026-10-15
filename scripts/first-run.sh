@@ -307,25 +307,52 @@ run_capture_json_err() {
 }
 # run_nolog: for the one command whose output must never be written to disk
 run_nolog() { printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $* (output NOT logged)"; "$@"; }
-tc() { if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi; }
-# tc_tape: `tc` for a command that streams the drive (volume write / resume /
-# verify, cartridge erase). The drive wants an even feed and a busy host
+TAPE_RAISE=0   # set by tape_raise_setup (step 13) once it has found that raising works
+tc() {
+  if [ "$TAPE_RAISE" = 1 ] && is_tape_command "$@"; then tc_raised "$@"; return; fi
+  if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi
+}
+# is_tape_command ARGS...: does this tapectl command stream the drive? The same
+# rule as tapectl-op's (contrib/systemd/tapectl-op.in): the first two words that
+# are not options decide, --home and --config skipping their value, so a label
+# that equals a subcommand's name ("volume info write") cannot misfire.
+is_tape_command() {
+  local a skip=0 n=0 first="" second=""
+  for a in "$@"; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$a" in
+      --config | --home) skip=1 ;;
+      -*) ;;
+      *) n=$((n + 1)); if [ "$n" = 1 ]; then first=$a; else second=$a; break; fi ;;
+    esac
+  done
+  case "$first" in
+    volume) case "$second" in write | resume | verify | compact-write | compact | read-slices | compact-read) return 0 ;; esac ;;
+    restore) case "$second" in unit | file | volume | raw-volume) return 0 ;; esac ;;
+    cartridge) [ "$second" = erase ] && return 0 ;;
+    collection) [ "$second" = run ] && return 0 ;;
+    drive) [ "$second" = poll ] && return 0 ;;
+    quick-archive) return 0 ;;
+  esac
+  return 1
+}
+# tc_raised: `tc` for a command that streams the drive (volume write / resume /
+# verify, cartridge erase, ...). The drive wants an even feed and a busy host
 # starves it (#426: a write used 1.505 bytes of tape per data byte); a process
 # cannot raise its own priority, so ADR-0012 2026-10-15 item 58 raises it as
 # root and then drops to the service user:
 #   sudo nice -n N ionice ARGS runuser -u USER -- tapectl [--home H] ...
 # runuser sets HOME, USER, LOGNAME and the service user's groups, as
-# `sudo -u USER -H` does. It raises only once tape_raise_setup (step 13) has
-# found that it can; until then, and whenever it cannot, this IS `tc`.
-TAPE_RAISE=0
-tc_tape() {
-  if [ "$TAPE_RAISE" != 1 ]; then tc "$@"; return; fi
+# `sudo -u USER -H` does. `tc` calls this only once tape_raise_setup (step 13)
+# has found that raising works; until then, and whenever it cannot, every
+# command goes through the plain as_svc path, exactly as before.
+tc_raised() {
   local io=() home=()
   [ -z "$TAPE_IONICE" ] || read -r -a io <<<"ionice $TAPE_IONICE"
   [ -z "$HOME_DIR" ] || home=(--home "$HOME_DIR")
   sudo nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} runuser -u "$SVC_USER" -- "$TAPECTL" ${home[@]+"${home[@]}"} "$@"
 }
-# tape_raise_setup: decide, once per run of step 13, whether tc_tape can raise.
+# tape_raise_setup: decide, once per run of step 13, whether tc can raise.
 # Raising needs ROOT's sudo, which is not the sudo this script otherwise uses:
 # home2's sudoers rule (home2-prep.sh part 8) lets the operator run commands AS
 # the service user without a password, and root-level sudo still asks. So:
@@ -1334,7 +1361,7 @@ THIS VOLUME HAS AN INTERRUPTED WRITE. A run of this step (or a `volume write` by
 EOF
       quiet_host_check
       confirm "Resume the interrupted write of $LABEL on the cartridge in $DEVICE?" || die "stopped before resuming — re-run scripts/first-run.sh --from 13 --label $LABEL when ready"
-      run tc_tape volume resume "$LABEL" --device "$DEVICE" || die "resume did not seal and confirm $LABEL — read the output; the catalog knows exactly why. Re-run scripts/first-run.sh --from 13 --label $LABEL once it is fixed"
+      run tc volume resume "$LABEL" --device "$DEVICE" || die "resume did not seal and confirm $LABEL — read the output; the catalog knows exactly why. Re-run scripts/first-run.sh --from 13 --label $LABEL once it is fixed"
       ;;
     live)
       die "volume $LABEL has a write session in progress RIGHT NOW (another process is writing it — tapectl turns a crashed session into an interrupted one whenever it opens the catalog). Find that process and let it finish; do not start a second writer"
@@ -1555,7 +1582,7 @@ EOF
         confirm_destructive "ERASE the tape in $DEVICE, which holds $ERASE_WORD (shown above)" "$ERASE_WORD" || die "stopped before erasing; nothing was erased"
       fi
       erc=0
-      run tc_tape cartridge erase --device "$DEVICE" --confirm-label "$ERASE_WORD" || erc=$?
+      run tc cartridge erase --device "$DEVICE" --confirm-label "$ERASE_WORD" || erc=$?
       [ "$erc" = 0 ] || die "cartridge erase exited $erc (2 refused, nothing written; 3 unverified; 4 failed part-way; 6 the read-back contradicts the erase): read its message above, then re-run scripts/first-run.sh --from 13"
       ok "the tape is erased, read back and recorded"
       # Continue: init again. The short erase leaves File 0 EMPTY, which init
@@ -1602,7 +1629,7 @@ EOF
   # A write that stops (a signal, a dropped session, an error mid-tape) is
   # picked up by re-running this step: it finds the interrupted session and
   # offers `volume resume` (issue #414).
-  run tc_tape volume write "$LABEL" --device "$DEVICE" --yes || die "write did not seal — read the output; the catalog knows exactly why. If it was interrupted, reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session"
+  run tc volume write "$LABEL" --device "$DEVICE" --yes || die "write did not seal — read the output; the catalog knows exactly why. If it was interrupted, reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session"
 fi
   # Issue #265: a failed verify has TWO outcomes and they need opposite
   # responses. ADR-0012's 2026-09-17 amendment: only a mismatch that PROVES the
@@ -1613,7 +1640,7 @@ fi
   # silently changed the catalog.
   VERIFY_JSON="$(dirname "$LOG")/volume-verify-$LABEL.json"
   VERIFY_ERR="$(dirname "$LOG")/volume-verify-$LABEL.err"
-  if run_capture_json_err "$VERIFY_JSON" "$VERIFY_ERR" tc_tape volume verify "$LABEL" --device "$DEVICE" --full --json; then
+  if run_capture_json_err "$VERIFY_JSON" "$VERIFY_ERR" tc volume verify "$LABEL" --device "$DEVICE" --full --json; then
     ok "$LABEL sealed and verified"
   else
     # The loaded tape is not this volume: verify corroborates the cartridge
