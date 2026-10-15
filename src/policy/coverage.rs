@@ -703,7 +703,8 @@ pub fn deposit_count_expr(q: &CoverageQuery) -> String {
 
 // ── Named required locations (issue #348; ADR-0012 2026-10-07 items 15, 34) ──
 
-/// Whose coverage [`short_required_locations`] judges.
+/// Whose coverage [`short_required_locations`] and
+/// [`short_of_location_floor`] judge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamedScope {
     /// A unit's CURRENT coverage, by unit id — `audit`'s
@@ -776,6 +777,125 @@ pub fn tape_only_note(config: &crate::config::Config, unit_status: &str) -> Stri
 /// items 15 and 34 — named locations take the multiplier everywhere).
 pub fn copies_per_named_location(config: &crate::config::Config, unit_status: &str) -> i64 {
     copy_floor(config, 1, unit_status)
+}
+
+// ── The distinct-place floor (ADR-0012 2026-10-12 items 46, 47; issue #425) ──
+
+/// **The** distinct-place floor: how many different places a unit's copies
+/// must span, for a unit whose status is (or, for `unit mark-tape-only`, is
+/// about to be) `unit_status` — `[defaults] min_locations` for `tape_only`,
+/// 0 (no floor) for every other status.
+///
+/// It is read from `[defaults]` and not from the unit's resolved policy
+/// because it is not a layer of that chain: `policy::resolve` carries
+/// `min_copies` and `required_locations`, and no dotfile or archive set can
+/// set a count of places (an archive set names places with
+/// `required_locations`). It is `config`, never an `i64`, so no caller can
+/// hand it a multiplied number: ADR-0012 2026-10-12 item 46 — the tape-only
+/// multiplier raises copy floors ([`copy_floor`],
+/// [`copies_per_named_location`]) and never a count of distinct places. At
+/// the defaults a tape-only unit needs 4 copies in 2 places, not 4 in 4.
+///
+/// It is a tape-only floor because the claim it guards is the one `unit
+/// mark-tape-only` makes — the source is going away, so the tape copies
+/// must not all sit in one fire, flood or theft. An active unit still has
+/// its source on disk, and a catalog that never ran `location add` has every
+/// volume at no place at all. A tape-only unit is held to the floor after the
+/// marking exactly as at it: `audit`'s `location_count`, `snapshot
+/// mark-reclaimable`/`report supersedable` ([`short_of_location_floor`]) and
+/// `unit mark-tape-only` ([`PlaceShortfall::judge`], since it shows the count
+/// whether or not it is short) all go through this floor and that one
+/// comparison.
+pub fn location_floor(config: &crate::config::Config, unit_status: &str) -> i64 {
+    if unit_status == "tape_only" {
+        i64::from(config.defaults.min_locations)
+    } else {
+        0
+    }
+}
+
+/// A scope whose copies sit in fewer distinct places than its
+/// [`location_floor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaceShortfall {
+    /// The distinct places the scope's copies span ([`location_count_expr`]:
+    /// the fewest any examined version has).
+    pub places: i64,
+    /// The floor it fell short of — as set, never multiplied.
+    pub floor: i64,
+}
+
+impl PlaceShortfall {
+    /// The comparison itself, and the only place it is made: `Some` when
+    /// `places` is under the [`location_floor`] for `unit_status`, `None`
+    /// when it meets it or the status has no floor.
+    pub fn judge(
+        config: &crate::config::Config,
+        unit_status: &str,
+        places: i64,
+    ) -> Option<PlaceShortfall> {
+        let floor = location_floor(config, unit_status);
+        (places < floor).then_some(PlaceShortfall { places, floor })
+    }
+
+    /// `"copies in 1 location(s), needs 2 ([defaults] min_locations)"`: the
+    /// words `audit`'s `location_count` and `snapshot mark-reclaimable` put
+    /// after their subject (`"has "`, `"superseding v2 has "`). It carries no
+    /// tape-only note: the floor is not multiplied.
+    pub fn describe(&self) -> String {
+        format!(
+            "copies in {} location(s), needs {} ([defaults] min_locations)",
+            self.places, self.floor
+        )
+    }
+}
+
+/// The distinct places `scope`'s copies span, by [`location_count_expr`]: a
+/// recorded warehouse deposit is a place (ADR-0006), a volume nobody has
+/// shelved is none, and only [`eligible`] volumes count (ADR-0004).
+/// [`NamedScope::Unit`] is the unit's CURRENT coverage — the fewest places
+/// any current version has, the per-version rule of issue #153.
+/// [`NamedScope::Snapshot`] is one version.
+pub fn places_held(conn: &Connection, scope: NamedScope) -> crate::error::Result<i64> {
+    let (q, id) = match scope {
+        NamedScope::Unit(id) => (CoverageQuery::current_unit("?1"), id),
+        NamedScope::Snapshot(id) => (
+            CoverageQuery {
+                scope: CoverageScope::Snapshot { id_expr: "?1" },
+                exclude_volume: None,
+            },
+            id,
+        ),
+    };
+    let sql = format!("SELECT {}", location_count_expr(&q));
+    Ok(conn.query_row(&sql, params![id], |row| row.get(0))?)
+}
+
+/// **The** distinct-place predicate: `Some` when `scope`'s copies sit in
+/// fewer distinct places ([`places_held`]) than the [`location_floor`] for
+/// `unit_status`, `None` when they meet it or the status has no floor (no
+/// statement is run then, so an active unit costs `audit` nothing).
+///
+/// `audit`'s `location_count` asks it of [`NamedScope::Unit`] — the unit's
+/// current coverage (`unit mark-tape-only` asks the same of the same scope,
+/// by [`places_held`] and [`PlaceShortfall::judge`], because it prints the
+/// count too). `snapshot mark-reclaimable` and `report supersedable` ask it
+/// of [`NamedScope::Snapshot`], the SUPERSEDING version, which must carry
+/// the unit once the released one is gone.
+pub fn short_of_location_floor(
+    conn: &Connection,
+    config: &crate::config::Config,
+    scope: NamedScope,
+    unit_status: &str,
+) -> crate::error::Result<Option<PlaceShortfall>> {
+    if location_floor(config, unit_status) <= 0 {
+        return Ok(None);
+    }
+    Ok(PlaceShortfall::judge(
+        config,
+        unit_status,
+        places_held(conn, scope)?,
+    ))
 }
 
 /// **The** named-location predicate: the names in `required` at which
@@ -3240,6 +3360,144 @@ pub(crate) mod tests {
         assert!(
             old.iter().any(|l| l.contains("idx_writes_status")),
             "the check must see the pre-027 plan: {old:#?}"
+        );
+    }
+
+    // ── the distinct-place floor (issue #425) ──
+
+    /// The floor belongs to a tape-only unit alone, is `[defaults]
+    /// min_locations` AS SET at any multiplier (not 2, so a literal cannot
+    /// pass: 3x), and is never handed to a caller as a number to multiply.
+    #[test]
+    fn the_place_floor_is_min_locations_as_set_for_a_tape_only_unit_alone() {
+        let mut config = crate::config::Config::default();
+        config.compaction.tape_only_safety_multiplier = 3;
+        for min_locations in [1, 2, 5] {
+            config.defaults.min_locations = min_locations;
+            assert_eq!(
+                location_floor(&config, "tape_only"),
+                i64::from(min_locations)
+            );
+            for other in ["active", "missing"] {
+                assert_eq!(location_floor(&config, other), 0, "{other}");
+            }
+        }
+        // Zero is "no floor", as it was for `unit mark-tape-only`.
+        config.defaults.min_locations = 0;
+        assert_eq!(location_floor(&config, "tape_only"), 0);
+    }
+
+    /// The fixture's unit holds 2 copies in 2 places (a tape at `home`, a
+    /// deposit at `glacier`): it meets the floor of 2, is short of 3, and
+    /// moving the deposit to `home` makes it 1 place. The `describe` words
+    /// are the ones `audit` and `snapshot mark-reclaimable` print.
+    #[test]
+    fn the_place_predicate_counts_distinct_places_including_deposits() {
+        let (conn, unit_id, _vol) = setup_unit_with_deposit("tape_only");
+        let mut config = crate::config::Config::default();
+        let ask = |conn: &Connection, config: &crate::config::Config, status: &str| {
+            short_of_location_floor(conn, config, NamedScope::Unit(unit_id), status).unwrap()
+        };
+        assert_eq!(places_held(&conn, NamedScope::Unit(unit_id)).unwrap(), 2);
+        assert_eq!(ask(&conn, &config, "tape_only"), None);
+
+        config.defaults.min_locations = 3;
+        let short = ask(&conn, &config, "tape_only").expect("2 places is short of 3");
+        assert_eq!(
+            short,
+            PlaceShortfall {
+                places: 2,
+                floor: 3
+            }
+        );
+        assert_eq!(
+            short.describe(),
+            "copies in 2 location(s), needs 3 ([defaults] min_locations)"
+        );
+        assert_eq!(ask(&conn, &config, "active"), None, "no floor, no question");
+
+        conn.execute(
+            "UPDATE volume_deposits
+             SET location_id = (SELECT id FROM locations WHERE name = 'home')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(places_held(&conn, NamedScope::Unit(unit_id)).unwrap(), 1);
+        config.defaults.min_locations = 2;
+        assert_eq!(
+            ask(&conn, &config, "tape_only"),
+            Some(PlaceShortfall {
+                places: 1,
+                floor: 2
+            })
+        );
+    }
+
+    /// The scopes are the two the callers need: a unit's CURRENT coverage is
+    /// the fewest places any current version has (issue #153), and one
+    /// snapshot is judged alone — `snapshot mark-reclaimable` asks it of the
+    /// version that supersedes, not of the one it releases.
+    #[test]
+    fn the_place_predicate_judges_a_unit_by_its_thinnest_version_and_a_snapshot_alone() {
+        let (conn, unit_id, _vol) = setup_unit_with_deposit("tape_only");
+        let config = crate::config::Config::default();
+        let v1: i64 = conn
+            .query_row("SELECT id FROM snapshots WHERE version = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // v2: current, written to one tape at `home` only (a different tape
+        // from v1's, whose deposit at `glacier` would otherwise follow it).
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                  capacity_bytes, status, location_id)
+             VALUES ('L6-0009', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                     (SELECT id FROM locations WHERE name = 'home'))",
+            [],
+        )
+        .unwrap();
+        let v2_tape = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 2, 'full', 'current', '/tmp/photos')",
+            params![unit_id],
+        )
+        .unwrap();
+        let v2 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size, num_slices)
+             VALUES (?1, 'staged', 104857600, 1)",
+            params![v2],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            params![conn.last_insert_rowid(), v2, v2_tape],
+        )
+        .unwrap();
+
+        let unit = short_of_location_floor(&conn, &config, NamedScope::Unit(unit_id), "tape_only")
+            .unwrap();
+        assert_eq!(
+            unit,
+            Some(PlaceShortfall {
+                places: 1,
+                floor: 2
+            }),
+            "the unit is as covered as v2, its thinnest current version"
+        );
+        assert_eq!(
+            short_of_location_floor(&conn, &config, NamedScope::Snapshot(v1), "tape_only").unwrap(),
+            None,
+            "v1 alone sits in 2 places"
+        );
+        assert_eq!(
+            short_of_location_floor(&conn, &config, NamedScope::Snapshot(v2), "tape_only").unwrap(),
+            Some(PlaceShortfall {
+                places: 1,
+                floor: 2
+            })
         );
     }
 }

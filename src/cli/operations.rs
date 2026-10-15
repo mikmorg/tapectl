@@ -2483,12 +2483,15 @@ pub fn unit_mark_tape_only(
     // multiplier in the copy fact.
     let tape_only_note = crate::policy::coverage::tape_only_note(config, "tape_only");
     let min_copies = crate::policy::coverage::copy_floor(config, policy.min_copies, "tape_only");
-    // The location-count floor has no per-unit or per-archive-set layer:
-    // it exists only in `[defaults]`, so it is read from there. The named
-    // `required_locations` below is the per-set location policy. It counts
-    // distinct places, which the multiplier never raises (item 46): at the
-    // defaults a tape-only unit needs 4 copies in 2 places, not 4 in 4.
-    let min_locations = i64::from(config.defaults.min_locations);
+    // The distinct-place floor has no per-unit or per-archive-set layer: it
+    // exists only in `[defaults]`, and `policy::coverage::location_floor`
+    // reads it from there, for the status the unit is about to have. The
+    // named `required_locations` below is the per-set location policy. The
+    // floor counts distinct places, which the multiplier never raises (item
+    // 46): at the defaults a tape-only unit needs 4 copies in 2 places, not
+    // 4 in 4. Issue #425: the predicate is the one `audit`'s `location_count`
+    // and `snapshot mark-reclaimable` ask too, so a tape-only unit is held to
+    // the floor after the marking exactly as at it.
 
     // Count copies and locations. ADR-0004: a write's own `status =
     // 'completed'` only proves the volume was sealed AT WRITE TIME —
@@ -2505,12 +2508,20 @@ pub fn unit_mark_tape_only(
     // other one. Copies are distinct volumes everywhere now.
     let unit_scope = crate::policy::coverage::CoverageQuery::current_unit("?1");
     let sql = format!(
-        "SELECT {}, {}",
-        crate::policy::coverage::copy_count_expr(&unit_scope),
-        crate::policy::coverage::location_count_expr(&unit_scope)
+        "SELECT {}",
+        crate::policy::coverage::copy_count_expr(&unit_scope)
     );
-    let (copy_count, location_count): (i64, i64) =
-        conn.query_row(&sql, params![unit.id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let copy_count: i64 = conn.query_row(&sql, params![unit.id], |row| row.get(0))?;
+    // The count is shown whatever the floor (`locations` below), so it is
+    // asked for itself and then judged by the one comparison
+    // `short_of_location_floor` makes — as `tape_only`, the status the unit
+    // is about to have.
+    let location_count = crate::policy::coverage::places_held(
+        conn,
+        crate::policy::coverage::NamedScope::Unit(unit.id),
+    )?;
+    let place_shortfall =
+        crate::policy::coverage::PlaceShortfall::judge(config, "tape_only", location_count);
 
     // Issue #348: `required_locations` checked BY NAME, through the one
     // predicate `audit`'s `location_presence` also uses — and, the unit
@@ -2611,10 +2622,10 @@ pub fn unit_mark_tape_only(
             facts.push(format!("  {}", t.describe()));
         }
     }
-    if location_count < min_locations {
+    if let Some(short) = place_shortfall {
         facts.push(format!(
-            "insufficient locations: {location_count} < {min_locations} required \
-             ([defaults] location floor)"
+            "insufficient locations: {} < {} required ([defaults] location floor)",
+            short.places, short.floor
         ));
     }
     if !missing_locations.is_empty() {
