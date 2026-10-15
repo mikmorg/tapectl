@@ -131,6 +131,55 @@ pub(crate) fn fadvise_filter_available() -> bool {
     })
 }
 
+/// The seccomp mode in the text of a `/proc/<pid>/status`: the number on its
+/// `Seccomp:` line — 0 none, 1 strict, 2 a filter is installed. `None` where
+/// there is no such line (a kernel built without seccomp).
+pub(crate) fn seccomp_mode(status: &str) -> Option<u8> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// The warning for a child of [`command_without_fadvise`] whose filter did
+/// not take, from its `/proc/<pid>/status` text; `None` if the filter is
+/// installed or the text does not say (issue #447).
+///
+/// The child's two `prctl` calls (`PR_SET_NO_NEW_PRIVS`, then
+/// `PR_SET_SECCOMP`) can fail — EACCES, ENOMEM — and the closure cannot
+/// report it: a failed `pre_exec` would stop dar from starting, which is
+/// worse than reading the source twice. The kernel records the outcome in
+/// the process's `Seccomp:` line instead, and seccomp mode survives `exec`.
+pub(crate) fn unfiltered_warning(pid: u32, status: &str) -> Option<String> {
+    match seccomp_mode(status) {
+        Some(2) | None => None,
+        Some(mode) => Some(format!(
+            "dar -c (pid {pid}) is running without the fadvise filter (Seccomp: {mode} in \
+             /proc/{pid}/status): dar will evict each source file from the page cache as it \
+             reads it, so stage create may read the source from disk twice"
+        )),
+    }
+}
+
+/// Check, right after `spawn()` returned, that dar's filter took, and warn
+/// (once per spawn) if it did not (issue #447). `Command::spawn` returns
+/// after the child's `exec` succeeded, so the child's `pre_exec` has run and
+/// the status is final; an unreadable status (dar already gone) says nothing.
+pub(crate) fn warn_unless_filtered(pid: u32) {
+    warn_unless_filtered_by(pid, |pid| {
+        std::fs::read_to_string(format!("/proc/{pid}/status")).ok()
+    });
+}
+
+/// [`warn_unless_filtered`] with the status text supplied, and the warning
+/// returned as well as logged: the seam the tests use in place of a kernel
+/// that refuses a child's `PR_SET_SECCOMP`.
+fn warn_unless_filtered_by(pid: u32, status: impl FnOnce(u32) -> Option<String>) -> Option<String> {
+    let warning = unfiltered_warning(pid, &status(pid)?)?;
+    tracing::warn!("{warning}");
+    Some(warning)
+}
+
 /// The seccomp filter of [`command_without_fadvise`].
 ///
 /// Installing it sets `PR_SET_NO_NEW_PRIVS` in the child first, which also
@@ -566,6 +615,63 @@ mod tests {
             .any(|(k, v)| k == "LC_ALL" && v == Some(OsStr::new("C"))),
             "the create command goes through the same constructor"
         );
+    }
+
+    /// Issue #447: the child's `prctl`s can fail without anything telling
+    /// tapectl; `/proc/<pid>/status` does. Mode 2 is a filter in place.
+    #[test]
+    fn a_child_whose_seccomp_filter_did_not_take_is_warned_about() {
+        let status = |mode: &str| {
+            format!("Name:\tdar\nState:\tS (sleeping)\nSeccomp:\t{mode}\nSeccomp_filters:\t0\n")
+        };
+        assert_eq!(seccomp_mode(&status("2")), Some(2));
+        assert_eq!(seccomp_mode(&status("0")), Some(0));
+        assert_eq!(seccomp_mode("Name:\tdar\n"), None);
+
+        // The filter refused in the child (the fake status text a kernel
+        // that failed PR_SET_SECCOMP would give): a warning naming the pid
+        // and the mode.
+        let warning = warn_unless_filtered_by(4242, |_| Some(status("0")))
+            .expect("Seccomp: 0 is a filter that did not take");
+        assert!(
+            warning.contains("4242") && warning.contains("Seccomp: 0"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("fadvise") && warning.contains("twice"),
+            "{warning}"
+        );
+        // Strict mode is not the filter either.
+        assert!(warn_unless_filtered_by(1, |_| Some(status("1"))).is_some());
+
+        // No warning where the filter is in place, where the status has no
+        // such line, or where it cannot be read.
+        assert_eq!(warn_unless_filtered_by(1, |_| Some(status("2"))), None);
+        assert_eq!(
+            warn_unless_filtered_by(1, |_| Some("Name:\tdar\n".into())),
+            None
+        );
+        assert_eq!(warn_unless_filtered_by(1, |_| None), None);
+    }
+
+    /// The seam's positive control against a real child: what the kernel
+    /// says of a process started by [`command_without_fadvise`] is mode 2,
+    /// and [`warn_unless_filtered`] reads it from `/proc` and stays quiet.
+    #[test]
+    fn a_real_child_of_the_fadvise_command_shows_the_filter_in_proc() {
+        if !fadvise_filter_available() {
+            eprintln!("SKIP: this kernel has no seccomp filters, so dar runs unfiltered");
+            return;
+        }
+        let mut child = command_without_fadvise("sleep").arg("30").spawn().unwrap();
+        let status = std::fs::read_to_string(format!("/proc/{}/status", child.id()));
+        let quiet = warn_unless_filtered_by(child.id(), |pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/status")).ok()
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(seccomp_mode(&status.unwrap()), Some(2));
+        assert_eq!(quiet, None);
     }
 
     /// Issue #465 item 7: the child's "my parent is gone" error is a bare

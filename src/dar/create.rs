@@ -181,24 +181,29 @@ pub fn spawn_archive(params: &DarCreateParams) -> Result<DarStream> {
             .stderr(Stdio::piped())
             .spawn()
     };
+    let mut filtered = super::fadvise_filter_available();
     let mut child = match spawn(&mut cmd) {
         // The filter needs no_new_privs, under which a security module
         // (SELinux, AppArmor) refuses an exec that would change dar's
         // domain, with EPERM. dar runs without the filter then, as it did
         // before issue #441: the filter is never a reason not to stage.
-        Err(e)
-            if e.raw_os_error() == Some(nix::libc::EPERM) && super::fadvise_filter_available() =>
-        {
+        Err(e) if e.raw_os_error() == Some(nix::libc::EPERM) && filtered => {
             tracing::warn!(
                 error = %e,
                 "dar could not start under no_new_privs; running it without the \
                  fadvise filter, so it may read the source from disk twice"
             );
+            filtered = false;
             spawn(&mut without_fadvise_filter(&cmd))
         }
         spawned => spawned,
     }
     .map_err(|e| TapectlError::Dar(format!("cannot run dar: {e}")))?;
+    // The child's own `prctl`s can fail unseen (issue #447): the kernel's
+    // record of its seccomp mode is the only report.
+    if filtered {
+        super::warn_unless_filtered(child.id());
+    }
     let stdout = child.stdout.take();
     let stderr = super::drain(child.stderr.take());
     Ok(DarStream {
