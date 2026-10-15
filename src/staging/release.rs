@@ -183,3 +183,337 @@ pub fn unit_ids_written_to(conn: &Connection, volume_label: &str) -> Result<Vec<
         .collect::<std::result::Result<Vec<i64>, _>>()?;
     Ok(ids)
 }
+
+/// Catalog fixtures for this module's tests and for the `volume write` /
+/// `volume resume` tests in `cli::volume`, which exercise the same rule.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::path::{Path, PathBuf};
+
+    use rusqlite::{params, Connection};
+
+    use crate::config::Config;
+
+    /// One staged version of a unit, as the catalog and the disk hold it.
+    pub(crate) struct Staged {
+        pub unit_id: i64,
+        pub stage_set_id: i64,
+        pub snapshot_id: i64,
+        pub file: PathBuf,
+        /// Labels of the `sealed` volumes carrying a completed write of it.
+        pub volumes: Vec<String>,
+    }
+
+    pub(crate) fn tenant(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// A config whose staging directory is `dir` and whose default
+    /// `min_copies` is `min_copies`.
+    pub(crate) fn config(dir: &Path, min_copies: i32) -> Config {
+        let mut config = Config {
+            staging: crate::config::StagingConfig {
+                directory: dir.to_string_lossy().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.defaults.min_copies = min_copies;
+        config
+    }
+
+    pub(crate) fn unit(conn: &Connection, tenant_id: i64, name: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status) \
+             VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+            params![name, tenant_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Version `version` of `unit_id`: a snapshot with status
+    /// `snapshot_status`, one `'staged'` stage set with a real slice file
+    /// under `dir`, and `copies` completed writes, each on its own `sealed`
+    /// volume.
+    pub(crate) fn staged_version(
+        conn: &Connection,
+        unit_id: i64,
+        version: i64,
+        snapshot_status: &str,
+        dir: &Path,
+        copies: i64,
+    ) -> Staged {
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size) \
+             VALUES (?1, ?2, ?3, '/tmp', 1, 10)",
+            params![unit_id, version, snapshot_status],
+        )
+        .unwrap();
+        let snapshot_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+            params![snapshot_id],
+        )
+        .unwrap();
+        let stage_set_id = conn.last_insert_rowid();
+        let file = dir.join(format!("u{unit_id}_v{version}_slice_1.age"));
+        std::fs::write(&file, b"staged slice bytes").unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 19, 19, 'deadbeef', 'deadbeef', ?2)",
+            params![stage_set_id, file.to_string_lossy()],
+        )
+        .unwrap();
+        let mut staged = Staged {
+            unit_id,
+            stage_set_id,
+            snapshot_id,
+            file,
+            volumes: Vec::new(),
+        };
+        for i in 0..copies {
+            let label = format!("V-u{unit_id}-v{version}-{i}");
+            add_write(conn, &staged, &label, "sealed", "completed");
+            staged.volumes.push(label);
+        }
+        staged
+    }
+
+    /// A `writes` row of `staged`'s stage set with status `write_status`, on
+    /// the volume `label` (created with `volume_status` if it is new).
+    pub(crate) fn add_write(
+        conn: &Connection,
+        staged: &Staged,
+        label: &str,
+        volume_status: &str,
+        write_status: &str,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO volumes (label, backend_type, backend_name, capacity_bytes, status) \
+             VALUES (?1, 'lto', 'p', 10485760, ?2)",
+            params![label, volume_status],
+        )
+        .unwrap();
+        let volume_id: i64 = conn
+            .query_row("SELECT id FROM volumes WHERE label = ?1", params![label], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![staged.stage_set_id, staged.snapshot_id, volume_id, write_status],
+        )
+        .unwrap();
+    }
+
+    pub(crate) fn stage_set_status(conn: &Connection, stage_set_id: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM stage_sets WHERE id = ?1",
+            params![stage_set_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
+    use crate::db;
+
+    /// Released at the floor: a unit with exactly its `min_copies` loses its
+    /// staged bytes and its stage set reads `cleaned`.
+    #[test]
+    fn staging_is_released_once_the_unit_meets_its_min_copies() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let s = staged_version(&conn, alpha, 1, "current", dir.path(), 2);
+
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+
+        assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
+        let cleaned = out.cleaned.expect("released at the floor");
+        assert_eq!(
+            (cleaned.sets_cleaned, cleaned.files_removed, cleaned.errors),
+            (1, 1, 0)
+        );
+        assert!(cleaned.bytes_freed > 0, "the bytes freed are reported");
+        assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
+        assert!(!s.file.exists());
+    }
+
+    /// Kept below the floor, with the reason the operator reads.
+    #[test]
+    fn staging_is_kept_below_min_copies_and_the_unit_is_named() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let s = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+
+        assert!(out.cleaned.is_none(), "one copy of two must not release");
+        assert_eq!(out.under_copied.len(), 1, "{:?}", out.under_copied);
+        assert_eq!(
+            out.under_copied[0].describe(),
+            "unit testlib/alpha has 1 copy, needs 2"
+        );
+        assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
+        assert!(s.file.exists(), "the next copy reuses these bytes");
+    }
+
+    /// Two units on one write, one short: the staging of NEITHER is released
+    /// and only the short one is named — stage once, write N times, so the
+    /// next copy finds the same content this one wrote.
+    #[test]
+    fn a_short_unit_keeps_the_staging_of_every_unit_judged_with_it() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        let t = tenant(&conn);
+        let alpha = unit(&conn, t, "testlib/alpha");
+        let beta = unit(&conn, t, "testlib/beta");
+        let a = staged_version(&conn, alpha, 1, "current", dir.path(), 2);
+        let b = staged_version(&conn, beta, 1, "current", dir.path(), 1);
+
+        let out = release_if_covered(&conn, &config, &[alpha, beta]).unwrap();
+
+        assert!(out.cleaned.is_none());
+        let named: Vec<_> = out.under_copied.iter().map(|p| p.describe()).collect();
+        assert_eq!(named, ["unit testlib/beta has 1 copy, needs 2"]);
+        assert!(
+            a.file.exists() && b.file.exists(),
+            "the covered unit's staging waits for the short one"
+        );
+    }
+
+    /// A unit is as covered as its least-covered live version (ADR-0012):
+    /// version 1 at two copies does not release anything while version 2,
+    /// just written, has one.
+    #[test]
+    fn a_unit_is_as_covered_as_its_least_covered_version() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let v1 = staged_version(&conn, alpha, 1, "current", dir.path(), 2);
+        let v2 = staged_version(&conn, alpha, 2, "current", dir.path(), 1);
+
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+
+        assert!(out.cleaned.is_none());
+        assert_eq!(out.under_copied[0].copies, 1);
+        assert!(v1.file.exists() && v2.file.exists());
+    }
+
+    /// The release cannot reach a set no write completed: a covered unit's
+    /// other version, staged and never written, stays staged on disk.
+    #[test]
+    fn a_never_written_set_is_never_released() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let written = staged_version(&conn, alpha, 1, "current", dir.path(), 2);
+        let unwritten = staged_version(&conn, alpha, 2, "staged", dir.path(), 0);
+
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+
+        assert!(out.under_copied.is_empty(), "v1 alone is current");
+        assert_eq!(out.cleaned.expect("released").sets_cleaned, 1);
+        assert_eq!(stage_set_status(&conn, written.stage_set_id), "cleaned");
+        assert_eq!(stage_set_status(&conn, unwritten.stage_set_id), "staged");
+        assert!(unwritten.file.exists());
+    }
+
+    /// Nor a set one of whose writes is not complete — a further copy still
+    /// planned or interrupted reads these bytes (`v2-open-questions.md`
+    /// §3.5) — even when the unit's copy count says it is covered.
+    #[test]
+    fn a_set_with_an_unfinished_write_elsewhere_is_never_released() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 2);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let s = staged_version(&conn, alpha, 1, "current", dir.path(), 2);
+        add_write(&conn, &s, "V-third", "initialized", "interrupted");
+
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+
+        assert!(out.under_copied.is_empty(), "two sealed copies: covered");
+        assert_eq!(out.cleaned.expect("the gate passed").sets_cleaned, 0);
+        assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
+        assert!(s.file.exists());
+    }
+
+    /// The floor is the one tape-only rule's: one copy meets `min_copies =
+    /// 1` for an active unit; a tape-only unit at 3x needs 3, and the
+    /// message says why the number is 3.
+    #[test]
+    fn the_floor_takes_the_tape_only_multiplier_and_says_so() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config(dir.path(), 1);
+        config.compaction.tape_only_safety_multiplier = 3;
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+
+        assert!(under_copied_units(&conn, &config, &[alpha])
+            .unwrap()
+            .is_empty());
+        conn.execute("UPDATE units SET status = 'tape_only'", [])
+            .unwrap();
+        let under = under_copied_units(&conn, &config, &[alpha]).unwrap();
+        assert_eq!(under.len(), 1);
+        assert_eq!(
+            under[0].describe(),
+            "unit testlib/alpha has 1 copy, needs 3 (tape-only 3x)"
+        );
+    }
+
+    #[test]
+    fn the_reason_is_plural_for_zero_copies() {
+        let p = CopyProgress {
+            unit_name: "u".into(),
+            copies: 0,
+            min_copies: 2,
+            floor_note: String::new(),
+        };
+        assert_eq!(p.describe(), "unit u has 0 copies, needs 2");
+    }
+
+    /// The units a volume was written for are those with a COMPLETED write
+    /// on it: not another volume's, not an interrupted one's.
+    #[test]
+    fn unit_ids_written_to_lists_only_completed_writes_on_that_volume() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let t = tenant(&conn);
+        let alpha = unit(&conn, t, "testlib/alpha");
+        let beta = unit(&conn, t, "testlib/beta");
+        let gamma = unit(&conn, t, "testlib/gamma");
+        let a = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
+        let b = staged_version(&conn, beta, 1, "current", dir.path(), 0);
+        let g = staged_version(&conn, gamma, 1, "current", dir.path(), 0);
+        add_write(&conn, &a, "V-ONE", "sealed", "completed");
+        add_write(&conn, &b, "V-ONE", "sealed", "completed");
+        add_write(&conn, &g, "V-ONE", "sealed", "interrupted");
+        add_write(&conn, &g, "V-TWO", "sealed", "completed");
+
+        assert_eq!(unit_ids_written_to(&conn, "V-ONE").unwrap(), [alpha, beta]);
+        assert_eq!(unit_ids_written_to(&conn, "V-TWO").unwrap(), [gamma]);
+        assert!(unit_ids_written_to(&conn, "V-NONE").unwrap().is_empty());
+    }
+}
