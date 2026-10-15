@@ -18,17 +18,17 @@ tapectl backend [OPTIONS] <COMMAND>
 
 Add an LTO tape drive to the config
 
-Writes a validated `[[backends.lto]]` block in place, so existing comments survive, through the editor `config add` uses; the file is checked before it is replaced, and a refusal leaves it untouched. Find your drive with `ls -l /dev/tape/by-id/`, and `lsscsi -g` for the sg node. Prefer the by-id paths: /dev/nstN numbering is not stable across reboots.
+Writes a validated `[[backends.lto]]` block in place, so existing comments survive, through the editor `config add` uses; the file is checked before it is replaced, and a refusal leaves it untouched. Find your drive with `ls -l /dev/tape/by-id/`. Prefer the by-id path: /dev/nstN numbering is not stable across reboots. The SCSI generic node (the sg node, used for the cartridge chip and the drive's health pages) is derived from the tape node at every use, so it need not be given; --device-sg overrides the derivation.
 
 ```text
-tapectl backend add [OPTIONS] --name <NAME> --device-tape <DEVICE_TAPE> --device-sg <DEVICE_SG> --generation <GENERATION>
+tapectl backend add [OPTIONS] --name <NAME> --device-tape <DEVICE_TAPE> --generation <GENERATION>
 ```
 
 **Options**
 
 - `--name <NAME>` *(required)* — Name for this drive, used to select it later. Letters, digits, dot, underscore and dash
 - `--device-tape <DEVICE_TAPE>` *(required)* — Tape device node, e.g. /dev/tape/by-id/scsi-XXXX-nst
-- `--device-sg <DEVICE_SG>` *(required)* — SCSI generic node used for health/MAM queries, e.g. /dev/sg1
+- `--device-sg <DEVICE_SG>` — SCSI generic node used for health/MAM queries, e.g. /dev/sg1. Optional: left out, tapectl derives it from --device-tape at use (the kernel names the pairing), so a /dev/sgN renumbering never matters. Given, it overrides the derivation, and a write still refuses a node the kernel proves is another drive's
 - `--generation <GENERATION>` *(required)* — Generation this drive natively writes, e.g. LTO-6 (ADR-0010: a drive declares only what it can write; the medium's actual generation is detected at `volume init`, not declared here)
 - `--capacity-override <CAPACITY_OVERRIDE>` — Capacity override — for virtual drives (mhvtl) and test harnesses only. A real drive's capacity follows the loaded cartridge's detected generation (ADR-0010); leave this unset. Decimal, as printed on the cartridge (K=10^3 ... T=10^12; ADR-0012) — not the binary unit `enospc_buffer` uses
 - `--enospc-buffer <ENOSPC_BUFFER>` — Headroom reserved before end-of-tape, e.g. 50M

@@ -4,11 +4,11 @@
 .SH NAME
 tapectl\-backend\-add \- Add an LTO tape drive to the config
 .SH SYNOPSIS
-\fBtapectl backend add\fR [\fB\-\-json\fR] <\fB\-\-name\fR> <\fB\-\-device\-tape\fR> [\fB\-\-dry\-run\fR] <\fB\-\-device\-sg\fR> [\fB\-v\fR|\fB\-\-verbose\fR] <\fB\-\-generation\fR> [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-capacity\-override\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-enospc\-buffer\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl backend add\fR [\fB\-\-json\fR] <\fB\-\-name\fR> <\fB\-\-device\-tape\fR> [\fB\-\-dry\-run\fR] [\fB\-\-device\-sg\fR] [\fB\-v\fR|\fB\-\-verbose\fR] <\fB\-\-generation\fR> [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-capacity\-override\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-enospc\-buffer\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Add an LTO tape drive to the config
 .PP
-Writes a validated `[[backends.lto]]` block in place, so existing comments survive, through the editor `config add` uses; the file is checked before it is replaced, and a refusal leaves it untouched. Find your drive with `ls \-l /dev/tape/by\-id/`, and `lsscsi \-g` for the sg node. Prefer the by\-id paths: /dev/nstN numbering is not stable across reboots.
+Writes a validated `[[backends.lto]]` block in place, so existing comments survive, through the editor `config add` uses; the file is checked before it is replaced, and a refusal leaves it untouched. Find your drive with `ls \-l /dev/tape/by\-id/`. Prefer the by\-id path: /dev/nstN numbering is not stable across reboots. The SCSI generic node (the sg node, used for the cartridge chip and the drive\*(Aqs health pages) is derived from the tape node at every use, so it need not be given; \-\-device\-sg overrides the derivation.
 .SH OPTIONS
 .TP
 \fB\-\-json\fR
@@ -24,7 +24,7 @@ Tape device node, e.g. /dev/tape/by\-id/scsi\-XXXX\-nst
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
 \fB\-\-device\-sg\fR \fI<DEVICE_SG>\fR
-SCSI generic node used for health/MAM queries, e.g. /dev/sg1
+SCSI generic node used for health/MAM queries, e.g. /dev/sg1. Optional: left out, tapectl derives it from \-\-device\-tape at use (the kernel names the pairing), so a /dev/sgN renumbering never matters. Given, it overrides the derivation, and a write still refuses a node the kernel proves is another drive\*(Aqs
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
