@@ -1746,6 +1746,10 @@ fn report_cartridge_health(conn: &Connection, config: &Config, json_output: bool
 /// trends joined it: the readings used to be the whole document, a bare
 /// array, which has no room for a second block. Like the text block, the
 /// trends cover every cartridge whatever `--volume` says.
+/// `feed_ratios` (issue #439, additive) is the text's feed-ratio block as
+/// data: every recorded write's [`FeedRatioRow`], newest first, narrowed by
+/// `volume_filter` (the text block puts the uneven feeds first; here the
+/// `verdict` says which they are).
 pub(crate) fn report_health_json(
     conn: &Connection,
     rows: &[HealthRow],
