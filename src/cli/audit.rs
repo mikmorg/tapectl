@@ -919,6 +919,13 @@ fn check_verify_age(
         // read, and must not refresh this clock. Dated by its START
         // (ADR-0012 2026-10-07 item 30): a continued readback's start is its
         // oldest checkpoint, when some of its files were last read.
+        //
+        // Only a readback of a volume that still counts as a copy of this
+        // unit (#454): `w.status = 'completed'` (the unit's bytes are on it)
+        // and `coverage::eligible` (not retired, erased or quarantined).
+        // Without them a fresh verify of a copy since retired kept the clock
+        // fresh while the only live copy went unread — the same gate
+        // `evidence::tape_rows(only_eligible: true)` applies.
         let last_verify: Option<String> = ctx
             .conn
             .query_row(
@@ -926,11 +933,14 @@ fn check_verify_age(
                     "SELECT MAX({dated})
                      FROM verification_sessions vs
                      JOIN writes w ON w.volume_id = vs.volume_id
+                     JOIN volumes v ON v.id = w.volume_id
                      JOIN stage_sets ss ON ss.id = w.stage_set_id
                      JOIN snapshots s ON s.id = ss.snapshot_id
                      WHERE s.unit_id = ?1 AND vs.outcome = 'passed'
-                       AND vs.verify_type = 'full'",
+                       AND vs.verify_type = 'full'
+                       AND w.status = 'completed' AND {eligible}",
                     dated = policy::evidence::full_readback_date("vs"),
+                    eligible = policy::coverage::eligible("v"),
                 ),
                 params![unit.id],
                 |row| row.get(0),
@@ -4497,6 +4507,92 @@ mod tests {
         fn a_recent_full_readback_is_fresh() {
             let conn = setup(&[("full", &days_ago(2)), ("quick", &days_ago(1))]);
             assert!(verify_age_messages(&conn).is_empty());
+        }
+
+        /// Add a second copy of the unit's one stage set on volume `label`
+        /// (status `status`, the unit's write `write_status`) with one passed
+        /// full readback `days` days old, started when it completed.
+        fn add_copy_verified(
+            conn: &Connection,
+            label: &str,
+            status: &str,
+            write_status: &str,
+            days: i64,
+        ) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, ?2)",
+                params![label, status],
+            )
+            .unwrap();
+            let vol_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 SELECT ss.id, ss.snapshot_id, ?1, ?2 FROM stage_sets ss",
+                params![vol_id, write_status],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO verification_sessions
+                     (volume_id, verify_type, outcome, started_at, completed_at)
+                 VALUES (?1, 'full', 'passed', ?2, ?2)",
+                params![vol_id, days_ago(days)],
+            )
+            .unwrap();
+        }
+
+        /// #454: the unit's clock is the newest full readback of a volume
+        /// that still counts as its copy. Positive control first: with the
+        /// second copy sealed, its fresh readback keeps the unit fresh.
+        #[test]
+        fn a_fresh_readback_of_another_live_copy_keeps_the_unit_fresh() {
+            let conn = setup(&[("full", &days_ago(100))]);
+            add_copy_verified(&conn, "V-OTHER", "sealed", "completed", 2);
+            assert!(verify_age_messages(&conn).is_empty());
+        }
+
+        /// #454: a fresh verify of a copy since retired, erased or
+        /// quarantined no longer satisfies the unit's clock — its only live
+        /// copy is 100 days stale, and the warning says so.
+        #[test]
+        fn a_fresh_readback_of_a_since_retired_copy_no_longer_satisfies_the_clock() {
+            let old = days_ago(100);
+            for status in ["retired", "erased"] {
+                let conn = setup(&[("full", &old)]);
+                add_copy_verified(&conn, "V-GONE", status, "completed", 2);
+                assert_eq!(
+                    verify_age_messages(&conn),
+                    [format!("not verified within 30 days (last: {old})")],
+                    "a {status} copy's fresh readback must not count"
+                );
+            }
+            // Quarantine is a medium's observed condition, not a status.
+            let conn = setup(&[("full", &old)]);
+            add_copy_verified(&conn, "V-BAD", "sealed", "completed", 2);
+            conn.execute(
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE label = 'V-BAD'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                verify_age_messages(&conn),
+                [format!("not verified within 30 days (last: {old})")],
+                "a volume with a bad observed condition is no copy"
+            );
+        }
+
+        /// #454: a readback of a volume whose write of this unit never
+        /// completed says nothing about this unit's bytes.
+        #[test]
+        fn a_fresh_readback_of_a_volume_with_no_completed_write_of_the_unit_does_not_count() {
+            let old = days_ago(100);
+            let conn = setup(&[("full", &old)]);
+            add_copy_verified(&conn, "V-ABORTED", "sealed", "aborted", 2);
+            assert_eq!(
+                verify_age_messages(&conn),
+                [format!("not verified within 30 days (last: {old})")]
+            );
         }
 
         /// ADR-0012 2026-10-07 item 30: a full readback is dated by its
