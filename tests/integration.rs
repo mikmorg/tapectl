@@ -3335,7 +3335,27 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
             [tid2],
         )
         .unwrap();
-    // Deliberately no snapshot/writes -- below the copy threshold.
+    let unit2_id = conn2.last_insert_rowid();
+    // A snapshot but deliberately no writes: archived, on no tape -- below
+    // the copy threshold. (Issue #462: this unit used to have no snapshot at
+    // all and reached Tier 2 only because it had no `current_path`, which
+    // let the never-archived refusal be skipped; a unit with no snapshot is
+    // Tier 3 whatever its directory, and is checked below.)
+    conn2
+        .execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (?1, 1, 'full', 'current', '/tmp/u2')",
+            [unit2_id],
+        )
+        .unwrap();
+    // Never snapshotted, and no `current_path` either.
+    conn2
+        .execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u3', 'unit3', ?1, 'mtime_size', 1, 'active')",
+            [tid2],
+        )
+        .unwrap();
     drop(conn2);
 
     let guard_output = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
@@ -3362,6 +3382,35 @@ fn test_unit_mark_tape_only_shows_coverage_evidence() {
         guard_stderr.contains("insufficient copies"),
         "guard wording must be unchanged: {guard_stderr}"
     );
+
+    // Issue #462, through the binary: a unit that was never snapshotted is
+    // refused at ADR-0008 Tier 3 although it has no source directory to
+    // walk, and neither `--yes` nor `--force` reaches the refusal.
+    for flag in ["--yes", "--force"] {
+        let tier3 = std::process::Command::new(env!("CARGO_BIN_EXE_tapectl"))
+            .args([
+                "--home",
+                home.to_str().unwrap(),
+                "--config",
+                config_path.to_str().unwrap(),
+                "unit",
+                "mark-tape-only",
+                "unit3",
+                flag,
+            ])
+            .output()
+            .expect("failed to run the tapectl binary");
+        assert!(
+            !tier3.status.success(),
+            "{flag} must not defeat the never-archived refusal"
+        );
+        let tier3_stderr = String::from_utf8_lossy(&tier3.stderr);
+        assert!(
+            tier3_stderr.contains("never been archived")
+                && tier3_stderr.contains("cannot be overridden"),
+            "{flag}: {tier3_stderr}"
+        );
+    }
 }
 
 /// ADR-0012 2026-10-12 items 43 and 46, through the binary at the DEFAULT
