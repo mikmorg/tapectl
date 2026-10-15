@@ -15088,15 +15088,22 @@ mod tests {
             for (file, src) in corpus {
                 let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
                 assert!(prod.len() < src.len(), "positive control: {file} split");
+                // The seams that own their `ContactSite` pass `&site`; the
+                // restore tails (issue #442) are handed it by reference.
                 total += prod
                     .matches("health_after_read_contact(conn, &site,")
-                    .count();
+                    .count()
+                    + prod
+                        .matches("health_after_read_contact(conn, site,")
+                        .count();
             }
             assert_eq!(
-                total, 7,
+                total, 8,
                 "seven read seams — restore unit, restore of several units (#398), restore \
                  raw-volume, catalog rebuild, volume identify, read-slices, compact-read — one \
-                 call each"
+                 call each, and an eighth: the closer of a no-label restore's contact refused \
+                 before it reached its seam (#442), which a contact never takes along with its \
+                 seam's"
             );
             let write = corpus[0].1.split("#[cfg(test)]\nmod tests").next().unwrap();
             for f in [
