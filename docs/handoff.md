@@ -254,8 +254,8 @@ is what reuses it, and step 13 offers it at that refusal:
 By hand, outside step 13, the same is:
 
 ```bash
-sudo -u tapectl -H tapectl cartridge erase --device /dev/tape/by-id/scsi-HUJ808A5L4-nst --dry-run
-sudo -u tapectl -H tapectl cartridge erase --device /dev/tape/by-id/scsi-HUJ808A5L4-nst   # type L6-0001
+sudo -u tapectl -H tapectl cartridge erase --dry-run
+sudo -u tapectl -H tapectl cartridge erase   # type L6-0001
 ```
 
 Step 13 snapshots and stages before init, so an erase that stops it loses nothing: re-run
@@ -274,10 +274,10 @@ same day:
 1. Leave staging alone (1.1.0's write does not release it; on 1.1.1 the write that
    completes the policy does, unless given `--keep-staging`). Load a second fresh cartridge,
    which must be a different cartridge from L6-0001.
-2. Run `tapectl-op volume init L6-0002 --device /dev/tape/by-id/scsi-HUJ808A5L4-nst`,
-   then `tapectl-op volume write L6-0002 --device … --keep-staging` (1.1.1 releases staging
+2. Run `tapectl-op volume init L6-0002`,
+   then `tapectl-op volume write L6-0002 --keep-staging` (1.1.1 releases staging
    after the copy that completes the policy otherwise), then `tapectl-op volume verify
-   L6-0002 --device … --full`.
+   L6-0002 --full`.
 3. Run `tapectl-op volume move L6-0002 --to offsite`. If step 14 has not installed the
    wrapper yet, use `sudo -u tapectl -H tapectl` in place of `tapectl-op`.
 4. `tapectl-op audit` should now find `keepsake` at two copies in two places (the

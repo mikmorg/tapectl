@@ -81,7 +81,7 @@ snapshot created: family/letters v1 (2 files, 224 B)
 $ tapectl stage create family/letters
 staged: family/letters (1 slices, 1.1 KiB dar, 1.8 KiB encrypted)
 
-$ tapectl volume write L8-0001 --device /dev/tape/by-id/scsi-XYZZY_A1-nst --yes
+$ tapectl volume write L8-0001 --yes
 about to write to volume "L8-0001":
   family/letters v1: 1 slices, 1.8 KiB
   family/photos/2019-italy v1: 1 slices, 1.1 MiB
@@ -378,7 +378,7 @@ the factory, and no drive can use it again.
   and uses the serial as a placeholder barcode:
 
   ```text
-  $ tapectl volume init L8-0001 --device /dev/tape/by-id/scsi-XYZZY_A1-nst
+  $ tapectl volume init L8-0001
   cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
   volume "L8-0001" initialized (id=1)
   ```

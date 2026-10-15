@@ -46,7 +46,7 @@ flowchart LR
 ## A taste
 
 ```bash
-TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst                 # your drive, by serial
+TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst                 # your drive, by serial: named once, in backend add
 
 tapectl init --operator mike                             # write the printed escrow secret on paper
 tapectl backend add --name lto6 --device-tape "$TAPE" --device-sg /dev/sg1 --generation LTO-6
@@ -55,12 +55,12 @@ tapectl unit init-bulk /media/family/photos --tenant family
 
 tapectl snapshot create family/photos/2019-italy         # fast: what is there
 tapectl stage create family/photos/2019-italy            # dar + sha256 + age, into staging
-tapectl volume init L6-0001 --device "$TAPE"             # reads the cartridge's chip
-tapectl volume write L6-0001 --device "$TAPE"            # plan, write, seal marker, confirm the ends
-tapectl volume verify L6-0001 --device "$TAPE" --full    # the first full read-back
+tapectl volume init L6-0001                              # reads the cartridge's chip
+tapectl volume write L6-0001                             # plan, write, seal marker, confirm the ends
+tapectl volume verify L6-0001 --full                     # the first full read-back
 
 tapectl audit --action-plan                              # "has 1 copies, needs 2" — and the fix
-tapectl restore unit --unit family/photos/2019-italy --from L6-0001 --to /tmp/restore --device "$TAPE"
+tapectl restore unit --unit family/photos/2019-italy --from L6-0001 --to /tmp/restore
 ```
 
 The [walkthrough](docs/walkthrough.md) runs a complete session like this — two tapes,

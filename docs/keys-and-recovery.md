@@ -527,7 +527,11 @@ tampering. The identity and the secret do not change. For each envelope:
 
 ## Recovery runbooks
 
-Every `--device` below is written as `"$TAPE"`. Find the drive by serial and set it
+Runbook A is the ordinary case: the catalog is intact and one drive is configured,
+so tapectl finds the drive and `--device` is left out
+([when it is needed](operator-guide.md#configure)). Runbooks B to F start from a
+machine that may have no config and no backend, where a read needs the drive
+named, so every `--device` there is written as `"$TAPE"`. Find the drive by serial and set it
 first. `/dev/nstN` numbers change between reboots on a host with more than one
 drive, and a wrong number reads a different tape.
 
@@ -558,9 +562,9 @@ The catalog knows which volume holds what. Find a copy, then restore from it:
 
 ```bash
 tapectl catalog locate family/letters
-tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE" --dry-run
-tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE"
-tapectl restore file --file 1998-letter-to-mum.txt --unit family/letters --from L8-0002 --to /tmp/restore --device "$TAPE"
+tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --dry-run
+tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit
+tapectl restore file --file 1998-letter-to-mum.txt --unit family/letters --from L8-0002 --to /tmp/restore
 ```
 
 ```text
@@ -575,7 +579,7 @@ once, front to back, and puts each unit in its own directory under `--to`
 on the volume:
 
 ```bash
-tapectl restore volume L8-0002 --to /tmp/restore --unit family/letters --unit family/photos --device "$TAPE"
+tapectl restore volume L8-0002 --to /tmp/restore --unit family/letters --unit family/photos
 ```
 
 `--version N` picks an older version. The default is the newest one on that

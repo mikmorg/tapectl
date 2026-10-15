@@ -20,7 +20,10 @@ A few conventions:
   example, one line per unit. Those breaks are shown as tapectl prints them.
   To find a message in a log, search for a short phrase from it, never for a
   whole wrapped line.
-- Examples name the drive by its stable by-id path. `/dev/nstN` numbers can
+- With one drive configured, tapectl finds it, so the tapectl examples leave
+  `--device` out ([when it is needed](operator-guide.md#configure)). Where a
+  command needs the drive named (`mt`, `fuser`, a host with several drives),
+  the example uses its stable by-id path, `$TAPE`. `/dev/nstN` numbers can
   change across reboots.
 
   ```bash
@@ -503,9 +506,8 @@ prints its plan first and then fails). Uncomment the example
 [`tapectl backend add`](cli/backend.md#tapectl-backend-add).
 
 That message appears only when you leave out `--device`. With `--device`,
-which every example on this page passes, tapectl instead reports that no
-backend has the path you named, and `configured: none` says there are no
-backends at all:
+tapectl instead reports that no backend has the path you named, and
+`configured: none` says there are no backends at all:
 
 ```text
 error: configuration error: no [[backends.lto]] entry has device_tape = <device> (configured: none)
@@ -603,7 +605,7 @@ follows the prefix:
 | `Permission denied (os error 13)` | your user (or the service user) is not in the device's group | `ls -l` the `nst` and `sg` nodes and add the user to their group (usually `tape`); log in again |
 | `Device or resource busy (os error 16)` | another process has the drive open | find it (`fuser -v "$TAPE"`) and wait for it |
 | `No medium found (os error 123)` or `Input/output error (os error 5)` | the drive never became ready: still loading, or a fault. An empty drive is caught before this, by name ([No cartridge loaded](#no-cartridge-loaded)) | wait for the drive to settle, reseat the cartridge, check `mt -f "$TAPE" status` |
-| `No such file or directory (os error 2)` | `--device` names a path that does not exist (a typo, or a by-id link for a drive that is not attached) | `ls -l /dev/tape/by-id/` and use the path it lists |
+| `No such file or directory (os error 2)` | `device_tape` (or the `--device` you passed) names a path that does not exist (a typo, or a by-id link for a drive that is not attached) | `ls -l /dev/tape/by-id/` and use the path it lists |
 | `Read-only file system (os error 30)` | the cartridge's write-protect tab is set, and the command writes: `volume init`, `volume write`, or a `volume resume` whose seal is not yet recorded | slide the tab, or use another cartridge. Commands that only read open the drive read-only and work with the tab set: `volume verify`, `restore`, `volume identify`, `catalog rebuild`, and a `volume resume` that only re-confirms a recorded seal |
 
 When the path cannot be opened at all, the error follows a logged warning,
@@ -1242,14 +1244,14 @@ tapectl writes without asking only to a cartridge it can prove is blank, or to
 one that is already its own. First find out what is actually loaded:
 
 ```bash
-tapectl volume identify --device "$TAPE"
+tapectl volume identify
 ```
 
 If this is the wrong tape, swap it. If you mean to overwrite it (a stale
 volume, a tape erased with `mt weof`), re-run with `--force`:
 
 ```bash
-tapectl volume init L6-0003 --device "$TAPE" --force
+tapectl volume init L6-0003 --force
 ```
 
 When the cartridge's chip serial matches a cartridge the catalog knows,
@@ -1332,8 +1334,8 @@ sealed tape of any label. If you really mean to reuse the cartridge:
    records it (the cartridge registered by its chip serial if the catalog did
    not know it, or its retired volume marked erased):
    ```bash
-   tapectl cartridge erase --device "$TAPE" --dry-run   # what it holds, and the label to confirm
-   tapectl cartridge erase --device "$TAPE"             # asks for that label
+   tapectl cartridge erase --dry-run   # what it holds, and the label to confirm
+   tapectl cartridge erase             # asks for that label
    ```
    Unattended, `--confirm-label <label>` gives the label instead; `--yes` does
    not. The default erase writes one filemark at the start of the tape and
@@ -1350,7 +1352,7 @@ sealed tape of any label. If you really mean to reuse the cartridge:
    mark-erased <barcode>`.
 3. Initialise it again:
    ```bash
-   tapectl volume init <new-label> --device "$TAPE"
+   tapectl volume init <new-label>
    ```
    After a long erase the tape is blank and `volume init` needs nothing more.
    After `tapectl cartridge erase`'s short erase `volume init` needs nothing more
@@ -1358,7 +1360,7 @@ sealed tape of any label. If you really mean to reuse the cartridge:
    (ADR-0012 item 57). Only a by-hand `mt weof 1`, which records nothing, still
    wants `--force` (see the previous entry):
    ```bash
-   tapectl volume init <new-label> --device "$TAPE"
+   tapectl volume init <new-label>
    ```
 
 ### The drive reports no medium serial: name the cartridge
@@ -1380,7 +1382,7 @@ have to say which cartridge this is:
 
 ```bash
 tapectl cartridge register --barcode L6-0003 --generation LTO-6
-tapectl volume init L6-0003 --device "$TAPE" --cartridge L6-0003
+tapectl volume init L6-0003 --cartridge L6-0003
 ```
 
 Related refusals:
@@ -1650,7 +1652,7 @@ An earlier write stopped part-way. A fresh write would not match what is
 already on the tape, so the session is resumed, never rewritten:
 
 ```bash
-tapectl volume resume L6-0003 --device "$TAPE"
+tapectl volume resume L6-0003
 ```
 
 `volume resume` explains itself when there is nothing it can pick up:
@@ -1774,7 +1776,7 @@ error` is the drive or the cartridge (clean the drive, reseat the cartridge).
 Fix the cause, keep the same cartridge loaded, and run:
 
 ```bash
-tapectl volume resume <label> --device "$TAPE"
+tapectl volume resume <label>
 ```
 
 Resume writes position `<n>` again from its start. If the tape turns out to
@@ -1813,7 +1815,7 @@ Re-stage it, then write the cartridge again from the beginning:
 ```bash
 tapectl staging clean --force --unit <unit> --version <n>
 tapectl stage create <unit> --version <n>
-tapectl volume write <label> --device "$TAPE"
+tapectl volume write <label>
 ```
 
 The volume is still `initialized`, so `volume write` starts over from the
@@ -1990,14 +1992,14 @@ missing copies. A volume that was already quarantined and fails again prints
 still reads, write it to a new cartridge, then retire the volume:
 
 ```bash
-tapectl volume read-slices --from L6-0001 --unit family/letters --device "$TAPE"
+tapectl volume read-slices --from L6-0001 --unit family/letters
 ```
 
 Then load a blank cartridge and write the salvaged slices to it:
 
 ```bash
-tapectl volume init L6-0009 --device "$TAPE"
-tapectl volume write L6-0009 --device "$TAPE"
+tapectl volume init L6-0009
+tapectl volume write L6-0009
 ```
 
 **Only read or transport errors: the volume is left alone. Exit 3.**
@@ -2064,7 +2066,7 @@ label` (a label reused after a retire), and `wrong cartridge: …` when the chip
 serial disagrees. `volume identify` shows what is loaded, and needs no key:
 
 ```bash
-tapectl volume identify --device "$TAPE"
+tapectl volume identify
 ```
 
 ### The destination is not empty

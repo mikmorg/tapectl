@@ -45,8 +45,10 @@ The data being archived:
 /media/work/invoices-2024/2024-001.txt
 ```
 
-Throughout, `TAPE` is your drive's non-rewinding device **by serial** — never
-`/dev/nst0`, whose number can change at every boot:
+`TAPE` is your drive's non-rewinding device **by serial** — never
+`/dev/nst0`, whose number can change at every boot. It is used once, to register
+the drive in step 2 (and again in step 14): with one drive registered, tapectl finds
+it from then on and no command here takes `--device`. Find yours:
 
 ```bash
 ls -l /dev/tape/by-id/                       # find yours; it ends in -nst
@@ -305,9 +307,9 @@ knows the cartridge from now on — a barcode sticker is optional and can be add
 later with [`cartridge relabel`](cli/cartridge.md#tapectl-cartridge-relabel)).
 
 ```bash
-tapectl volume init L8-0001 --device "$TAPE"
-tapectl volume write L8-0001 --device "$TAPE"
-tapectl volume verify L8-0001 --device "$TAPE" --full
+tapectl volume init L8-0001
+tapectl volume write L8-0001
+tapectl volume verify L8-0001 --full
 ```
 
 ```text
@@ -430,9 +432,9 @@ that already carries a volume label, and on a sealed tape `--force` does not cha
 that.
 
 ```bash
-tapectl volume init L8-0002 --device "$TAPE"
-tapectl volume write L8-0002 --device "$TAPE"
-tapectl volume verify L8-0002 --device "$TAPE" --full
+tapectl volume init L8-0002
+tapectl volume write L8-0002
+tapectl volume verify L8-0002 --full
 tapectl volume move L8-0002 --to offsite
 tapectl audit
 tapectl report copies
@@ -510,7 +512,7 @@ against it before reading anything, and refuses a different one. Here that is
 L8-0002. One file:
 
 ```bash
-tapectl restore file --file 1998-letter-to-mum.txt --unit family/letters --from L8-0002 --to /tmp/restore --device "$TAPE"
+tapectl restore file --file 1998-letter-to-mum.txt --unit family/letters --from L8-0002 --to /tmp/restore
 ```
 
 ```text
@@ -524,8 +526,8 @@ archived owners, so as yourself they come back owned by you.
 A whole unit (`--dry-run` first shows what would happen):
 
 ```bash
-tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE" --dry-run
-tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE"
+tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --dry-run
+tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit
 diff -r /media/family/letters /tmp/restore/unit && echo identical
 ```
 
@@ -612,7 +614,7 @@ from a tape with the escrow secret you wrote down:
 ```bash
 tapectl init --operator mike --escrow-public-key age130teljw9ws8rpmlf7w66penltdv4q59yf4xaqq9xjv45t8qmaqfqqrnmm7
 tapectl backend add --name lto8 --device-tape "$TAPE" --device-sg "$SG" --generation LTO-8
-tapectl catalog rebuild --from-volume --key escrow.key --device "$TAPE"
+tapectl catalog rebuild --from-volume --key escrow.key
 tapectl unit list
 ```
 

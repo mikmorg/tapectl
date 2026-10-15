@@ -22,10 +22,13 @@ documentation is [docs/README.md](README.md).
 > Commands are written `tapectl …`. An install made with
 > `scripts/first-run.sh` runs tapectl as a dedicated service user, `tapectl`,
 > so on such a machine type the same command as `tapectl-op …` (the installed
-> wrapper) or `sudo -u tapectl -H tapectl …`. Examples use
-> `TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst` for the drive; `ls -l /dev/tape/by-id/`
-> shows yours. `/dev/nstN` numbers are not stable across reboots, so never use
-> them in scripts.
+> wrapper) or `sudo -u tapectl -H tapectl …`. With one drive configured, tapectl
+> finds it, so the examples leave `--device` out ([when it is
+> needed](#configure)). Where a drive is named for `mt` or another tool, or in
+> [Disaster Recovery](#disaster-recovery), the examples write it as
+> `TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst`; `ls -l /dev/tape/by-id/` shows
+> yours. `/dev/nstN` numbers are not stable across reboots, so never use them
+> in scripts.
 
 ## Contents
 
@@ -221,9 +224,25 @@ staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
 ```
 
-With exactly one drive configured, every `--device` flag may be left out: it
-resolves to that drive. With more than one, `--device` is required on every
-command that touches a tape.
+**When `--device` is needed.** With exactly one `[[backends.lto]]` configured,
+every tapectl command that touches a tape finds the drive without `--device`,
+so the examples in this guide, and in the other pages, leave it out. Pass it,
+as the by-id path, when:
+
+- **more than one drive is configured.** Every command that touches a tape
+  then refuses without it (`multiple LTO backends configured … pass --device to
+  select one`).
+- **a read has no backend configured.** `volume identify`, `volume verify`,
+  `restore`, `catalog rebuild` and `volume read-slices` take any path you give
+  them with no `[[backends.lto]]` at all, so a rebuilt machine holding only keys
+  can read its tapes before `backend add`. That is the heir and disaster-recovery
+  path ([Disaster Recovery](#disaster-recovery) here, runbooks B to F in
+  [keys-and-recovery.md](keys-and-recovery.md#recovery-runbooks), and §8 of
+  [install.md](install.md)), and those pages name the drive every time. A write never runs without a backend.
+- **you run something other than tapectl.** `mt`, `dd`, `fuser` and the
+  `sg_*` tools always need their device, and so do the scripts in `scripts/` and
+  the test harnesses (`first-run.sh --device`, `lifecycle-suite.sh --device`),
+  which take their own flag.
 
 ### Working on a different archive
 
@@ -257,8 +276,6 @@ output shown is from a real session with four small units and a policy of two
 copies.
 
 ```bash
-TAPE=/dev/tape/by-id/scsi-<SERIAL>-nst
-
 # 0. Is the host quiet, and what changed?
 tapectl host check
 tapectl report dirty
@@ -272,14 +289,14 @@ tapectl volume plan --copies 2
 
 # 3. First copy: load a blank cartridge. One command initialises it, writes the
 #    volume, reads every file back, and moves it to the shelf once it is confirmed
-tapectl volume write L8-0001 --init --full-confirm --move-to home-rack --device "$TAPE"
+tapectl volume write L8-0001 --init --full-confirm --move-to home-rack
 
 # 4. Second copy: swap in another blank cartridge. This write completes the
 #    policy's copies, so it also releases the staged slices (after its full readback)
-tapectl volume write L8-0002 --init --full-confirm --move-to offsite --device "$TAPE"
+tapectl volume write L8-0002 --init --full-confirm --move-to offsite
 
 # (the long form still works: volume init, volume write, volume verify --full,
-#  volume move; `tapectl volume verify --device "$TAPE"` with no label verifies
+#  volume move; `tapectl volume verify` with no label verifies
 #  whichever volume is loaded)
 
 # 5. Check, release staging, refresh the Heir Kit, back up the catalog
@@ -309,11 +326,11 @@ volume write plan (2 copy/copies):
 total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
 estimated tapes: 1 (at the 97% fill ceiling)
 
-$ tapectl volume init L8-0001 --device "$TAPE"
+$ tapectl volume init L8-0001
 cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
 volume "L8-0001" initialized (id=1)
 
-$ tapectl volume write L8-0001 --device "$TAPE"
+$ tapectl volume write L8-0001
 about to write to volume "L8-0001":
   family/letters v1: 1 slices, 1.8 KiB
   family/photos/2019-italy v1: 1 slices, 1.1 MiB
@@ -323,7 +340,7 @@ about to write to volume "L8-0001":
 total: 4 slices, 1.7 MiB
 volume "L8-0001" write completed
 
-$ tapectl volume verify L8-0001 --device "$TAPE"
+$ tapectl volume verify L8-0001
 verify L8-0001 (full tier): 13 checked, 13 passed, 0 failed
 
 $ tapectl volume move L8-0001 --to home-rack
@@ -678,11 +695,11 @@ tapectl snapshot create tv/breaking-bad/s01
 tapectl stage create tv/breaking-bad/s01
 
 # Step 3: Write to tape (a blank or erased cartridge)
-tapectl volume init L6-0001 --device "$TAPE"
-tapectl volume write L6-0001 --device "$TAPE"
+tapectl volume init L6-0001
+tapectl volume write L6-0001
 
 # Step 4: Verify
-tapectl volume verify L6-0001 --device "$TAPE"
+tapectl volume verify L6-0001
 ```
 
 **Staging space.** `stage create` writes only a unit's encrypted slices to
@@ -987,45 +1004,43 @@ tapectl collection run --collection movies --batch 0 --label L8-0003 --policy-aw
 ### Restore
 
 `restore` takes everything as flags: `--unit`, the volume to read `--from`,
-and the destination `--to` (plus `--file` for a single file). `--device` may
-be left out when only one drive is configured.
+and the destination `--to` (plus `--file` for a single file).
 
 ```bash
 # Full unit
-tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE"
+tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit
 
 # Single file (path within the unit)
 tapectl restore file --file 1998-letter-to-mum.txt --unit family/letters \
-  --from L8-0002 --to /tmp/restore --device "$TAPE"
+  --from L8-0002 --to /tmp/restore
 
 # Dry run
-tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE" --dry-run
+tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --dry-run
 
 # A large unit whose slices are spooled: they wait on another disk
 tapectl restore unit --unit family/letters --from L8-0002 --to /srv/restore/letters \
-  --scratch /mnt/big --device "$TAPE"
+  --scratch /mnt/big
 
 # Into a directory that already holds an older copy, replacing what collides
 tapectl restore unit --unit family/letters --from L8-0002 --to /srv/restore/letters \
-  --overwrite --device "$TAPE"
+  --overwrite
 
 # Spool the slices to disk even though the unit could stream into dar
 tapectl restore unit --unit family/letters --from L8-0002 --to /srv/restore/letters \
-  --spool --device "$TAPE"
+  --spool
 
 # Every unit on a volume, in one pass over the tape, each into /srv/restore/<unit>
-tapectl restore volume L8-0002 --to /srv/restore --device "$TAPE"
+tapectl restore volume L8-0002 --to /srv/restore
 
 # Only some of them, still in one pass
-tapectl restore volume L8-0002 --to /srv/restore --unit family/letters --unit mike/notes \
-  --device "$TAPE"
+tapectl restore volume L8-0002 --to /srv/restore --unit family/letters --unit mike/notes
 ```
 
 ```text
-$ tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE" --dry-run
+$ tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --dry-run
 would restore "family/letters" v1 from L8-0002 (1 slices) to /tmp/restore/unit
 
-$ tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit --device "$TAPE"
+$ tapectl restore unit --unit family/letters --from L8-0002 --to /tmp/restore/unit
 2026-09-29T08:20:06.455931Z  WARN tapectl::dar::restore: restoring as a non-root user: restored files will be owned by the invoking user, not their archived owners
 restored "family/letters" v1 from L8-0002 (1 slices) to /tmp/restore/unit
 
@@ -1197,10 +1212,10 @@ layout.
 
 ```bash
 # Read slices from tape into staging (source cartridge loaded)
-tapectl volume read-slices --from L6-0001 --unit tv/breaking-bad/s01 --device "$TAPE"
+tapectl volume read-slices --from L6-0001 --unit tv/breaking-bad/s01
 # Swap in a blank cartridge, then write
-tapectl volume init L6-0002 --device "$TAPE"
-tapectl volume write L6-0002 --device "$TAPE"
+tapectl volume init L6-0002
+tapectl volume write L6-0002
 ```
 
 ### Mark Tape-Only
@@ -1528,7 +1543,7 @@ tape using only what is on the tape itself, verifies every file against the
 front index as it goes, and needs no database:
 
 ```bash
-tapectl restore raw-volume --device "$TAPE" --to /staging/MHVTLR3 \
+tapectl restore raw-volume --to /staging/MHVTLR3 \
   --from MHVTLR3
 ```
 
@@ -1950,7 +1965,7 @@ it only *reads*:
 
 ```bash
 tapectl drive poll                                     # the only configured drive
-tapectl drive poll --device /dev/tape/by-id/scsi-HUJ808A5L4-nst
+tapectl drive poll --device /dev/tape/by-id/scsi-HUJ808A5L4-nst   # several drives: name the one to poll
 ```
 
 It sends three kinds of command to the backend's `device_sg`, and nothing
@@ -2017,7 +2032,7 @@ no rotation for you — this is a human procedure driven by one report:
 
 ```bash
 tapectl report verify-status                     # verification recency, oldest first
-tapectl volume verify L6-0003 --device "$TAPE"   # --full is the default
+tapectl volume verify L6-0003                     # --full is the default
 ```
 
 The report lists every verification session, not one line per volume.
@@ -2295,16 +2310,16 @@ tapectl report compaction-candidates
 tapectl snapshot mark-reclaimable tv/breaking-bad/s01 --version 1
 
 # Three-step compaction, on one drive
-tapectl volume compact-read L6-0001 --device "$TAPE"          # source loaded
+tapectl volume compact-read L6-0001                           # source loaded
 # (swap in a blank cartridge)
-tapectl volume init L6-0010 --device "$TAPE"
-tapectl volume compact-write --destination L6-0010 --device "$TAPE"
+tapectl volume init L6-0010
+tapectl volume compact-write --destination L6-0010
 tapectl volume compact-finish L6-0001                         # retires the source
 
 # Or all three in one flow, at a terminal: initialise the destination first
-tapectl volume init L6-0010 --device "$TAPE"                  # destination loaded
+tapectl volume init L6-0010                                   # destination loaded
 # (swap in the source)
-tapectl volume compact L6-0001 --to L6-0010 --device "$TAPE"
+tapectl volume compact L6-0001 --to L6-0010
 ```
 
 A volume is a candidate when its live data falls below
@@ -2399,7 +2414,7 @@ itself.
 Load a new tape and initialise a volume on it. You register nothing first:
 
 ```bash
-tapectl volume init L8-0001 --device "$TAPE"
+tapectl volume init L8-0001
 ```
 
 `volume init` reads the chip, finds no cartridge registered under that serial,
@@ -2443,7 +2458,7 @@ Some drives — and some virtual libraries — report no medium serial at all. T
 tapectl cannot tell which cartridge is loaded, and it will not guess:
 
 ```bash
-tapectl volume init L6-0002 --device "$TAPE"
+tapectl volume init L6-0002
 # refused: this drive reports no medium serial, so tapectl cannot tell which
 # physical cartridge is loaded. Name it: ... --cartridge <barcode>
 ```
@@ -2456,7 +2471,7 @@ from a label somebody typed:
 
 ```bash
 tapectl cartridge register --barcode L6-0002 --generation LTO-6
-tapectl volume init L6-0002 --device "$TAPE" --cartridge L6-0002
+tapectl volume init L6-0002 --cartridge L6-0002
 ```
 
 One safeguard on this path: if the barcode you name is still carrying a live
@@ -2501,10 +2516,10 @@ hands. In order, it:
    retired.
 
 ```bash
-tapectl cartridge erase --device "$TAPE" --dry-run          # what is on it, and its label
-tapectl cartridge erase --device "$TAPE"                    # type the label when asked
-tapectl cartridge erase --device "$TAPE" --confirm-label L6-0001   # unattended
-tapectl cartridge erase --device "$TAPE" --long             # the whole medium, hours
+tapectl cartridge erase --dry-run                  # what is on it, and its label
+tapectl cartridge erase                            # type the label when asked
+tapectl cartridge erase --confirm-label L6-0001    # unattended
+tapectl cartridge erase --long                     # the whole medium, hours
 ```
 
 After either erase `volume init` needs no `--force`. After the default short erase
@@ -2528,7 +2543,7 @@ tapectl cartridge edit L6-0001 --generation LTO-5  # the registration was wrong 
 tapectl cartridge move L6-0001 --to offsite-vault   # the cartridge and every volume on it
 tapectl cartridge retire L6-0001            # worn out or too many errors: never write it again
 tapectl cartridge unretire L6-0001          # you were wrong about the medium; undo the retire
-tapectl cartridge erase --device "$TAPE"    # erase, verify and record (above)
+tapectl cartridge erase                     # erase, verify and record (above)
 tapectl cartridge mark-erased L6-0001       # after erasing it some other way (mt erase; never a degausser)
 tapectl cartridge relabel L6-0001 L6-0001-B  # the sticker changed; identity did not (later commands use the new barcode)
 ```

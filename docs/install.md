@@ -264,7 +264,7 @@ re-entry, and this list gives it for each:
     overrides, and the script offers it where it stands: type the label to
     overwrite the cartridge. Under `--auto` it stops instead, with `volume
     init refused under --auto; not forcing`. Check the tape with `tapectl
-    volume identify --device <by-id>`, then re-run `--from 13` without
+    volume identify`, then re-run `--from 13` without
     `--auto`;
   - no readable medium serial. An interactive run asks you to name the
     cartridge (the barcode on its sticker) and carries on. Under `--auto` it
