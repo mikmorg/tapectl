@@ -89,7 +89,7 @@ COLLECTIONS=(
 CONTENDER_UNITS=()
 
 # Issue #393: let mikmorg (and an agent helping) watch sessions without sudo —
-# `tapectl --home /srv/archive_meta/tapectl/.tapectl status`. The group reads
+# a plain `tapectl status` (the pointer /etc/tapectl/home, #437). The group reads
 # logs/ and nothing else in the home. Ruled for home2 (ADR-0012, 2026-10-07
 # amendment, item 18): on the 1.1.0 fresh start, step 7 creates the group, adds
 # tapectl and mikmorg to it, writes [ops] group, grants the group traverse (x

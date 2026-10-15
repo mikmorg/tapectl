@@ -567,7 +567,8 @@ The service user must be a member of the group itself: giving a directory a
 group (`chgrp`) is limited to one's own groups, and until it can, the home and
 `logs/` stay 0700 rather than open to whatever group they already have. A
 member then runs
-`tapectl --home <service user's home> status` (or sets `TAPECTL_HOME`): see
+`tapectl status` (the pointer `/etc/tapectl/home` names the home; `--home` and
+`TAPECTL_HOME` still override it): see
 [`status`](cli/status.md) and the operator guide's "Watching from another
 account". Logs written before the table was added stay 0600, and `status` names
 them unreadable. Removing the table takes the access back on the next command.

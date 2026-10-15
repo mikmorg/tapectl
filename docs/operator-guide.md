@@ -548,9 +548,13 @@ timings are kept in the catalog regardless.
 the session logs alone — it opens no catalog and no config:
 
 ```bash
-tapectl --home /srv/archive_meta/tapectl/.tapectl status            # what is running, and the last 5
-tapectl --home /srv/archive_meta/tapectl/.tapectl status --last 20 --json
+tapectl status                       # what is running, and the last 5
+tapectl status --last 20 --json
 ```
+
+The home comes from the pointer `/etc/tapectl/home` (written by first-run step 7 and
+`install-systemd.sh`) when the account has no `~/.tapectl` of its own; it is ignored as
+root, and `--home` or `TAPECTL_HOME` override it.
 
 ```text
 session logs: /srv/archive_meta/tapectl/.tapectl/logs

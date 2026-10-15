@@ -165,6 +165,9 @@ done
 # WRITE confirmation counts under --auto only when the word came from one), and
 # a private XDG_STATE_HOME so its log and the rehearsal marker are this run's.
 export XDG_STATE_HOME="$RUN/state"
+# #437: step 7 writes the home pointer here, never to this VM's /etc/tapectl/home
+# (which would redirect every HOME-isolated test on the box to this run's home).
+export TAPECTL_HOME_POINTER="$RUN/home-pointer"
 FR_LOG="$RUN/state/tapectl/first-run.log"
 first_run() { bash "$REPO/scripts/first-run.sh" --profile "$PROFILE" --auto --label "$LABEL" "$@"; }
 DB="$RUN/home/tapectl.db"
@@ -231,8 +234,14 @@ step_blank_tape() {
 # (no sudo to the service user), and step 7 said it checked that itself.
 step_ops_group_status() {
     local gid; gid="$(getent group "$OPS_GROUP" | cut -d: -f3)" || { echo "step 7 created no group $OPS_GROUP"; return 1; }
-    sudo setpriv --reuid="$(id -u)" --regid="$gid" --clear-groups "$TAPECTL" --home "$RUN/home" status \
-        || { echo "status as $USER with group $OPS_GROUP failed"; return 1; }
+    # #437: step 7 wrote the pointer to this run's file, naming this run's home,
+    # and the operator's plain `tapectl status` (no --home, no ~/.tapectl) finds it.
+    [ "$(cat "$TAPECTL_HOME_POINTER" 2>/dev/null)" = "$RUN/home" ] \
+        || { echo "step 7 wrote no pointer naming $RUN/home to $TAPECTL_HOME_POINTER"; return 1; }
+    [ ! -e /etc/tapectl/home ] || { echo "/etc/tapectl/home exists on this VM: the pointer escaped the run"; return 1; }
+    sudo setpriv --reuid="$(id -u)" --regid="$gid" --clear-groups \
+        env -u TAPECTL_HOME HOME="$RUN/no-such-home" TAPECTL_HOME_POINTER="$TAPECTL_HOME_POINTER" "$TAPECTL" status \
+        || { echo "plain status (via the pointer) as $USER with group $OPS_GROUP failed"; return 1; }
     # ok/note lines go to the terminal, not first-run.log: read phase A's output.
     grep -F "ops group $OPS_GROUP:" "$RUN/phase-A.out" | grep -F "checked as" >/dev/null \
         || { echo "step 7 did not report its own status check:"; grep -F "ops group" "$RUN/phase-A.out"; return 1; }

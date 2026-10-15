@@ -708,6 +708,10 @@ EOF
     INIT_ARGS+=(--operator-key "$ADOPT_FILE")
     run tc --dry-run "${INIT_ARGS[@]}" || die "init refuses $ADOPT_FILE (read the reason above) — nothing was created"
   fi
+  # Issue #437: a home pointer left from a deleted home names a directory that
+  # no longer exists, and init would refuse on it. It is rewritten in step 7.
+  _ptr="${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"
+  if [ -f "$_ptr" ] && ! sudo test -d "$(cat "$_ptr")"; then run sudo rm -f "$_ptr"; fi
   note "PAPER READY? The escrow secret appears exactly once, next."
   confirm "Run init now? (type y — Enter means no, nothing has been created)" || die "stopped before init: nothing was minted or written. Re-run with --from $STEP and answer y when the paper is ready"
   run_nolog tc "${INIT_ARGS[@]}"
@@ -776,7 +780,7 @@ fi
 # member too, so tapectl can give the home and logs/ the group itself.
 if [ -n "$OPS_GROUP" ] && [ "$SVC_MODE" = 1 ]; then
   explain <<EOF
-THE OPS GROUP. Live progress prints only on the terminal that started a command, and the session logs under $EFFECTIVE_HOME/logs/ belong to $SVC_USER (0700), so your own account cannot see whether a write is running, which phase it is in, or how the last one ended without sudo. With [ops] group = "$OPS_GROUP", every tapectl command run as $SVC_USER keeps the home at 0710 and logs/ at 2750 owned by $OPS_GROUP, and writes each session log 0640: members can run \`tapectl --home $EFFECTIVE_HOME status\` and read the logs, and open nothing else — every other entry of the home (the catalog, the keys, config.toml, …) is kept closed to the group. Group membership takes effect at the member's next login.
+THE OPS GROUP. Live progress prints only on the terminal that started a command, and the session logs under $EFFECTIVE_HOME/logs/ belong to $SVC_USER (0700), so your own account cannot see whether a write is running, which phase it is in, or how the last one ended without sudo. With [ops] group = "$OPS_GROUP", every tapectl command run as $SVC_USER keeps the home at 0710 and logs/ at 2750 owned by $OPS_GROUP, and writes each session log 0640: members can run a plain \`tapectl status\` (the pointer /etc/tapectl/home names the home) and read the logs, and open nothing else — every other entry of the home (the catalog, the keys, config.toml, …) is kept closed to the group. Group membership takes effect at the member's next login.
 EOF
   if ! getent group "$OPS_GROUP" >/dev/null; then
     confirm "Create group $OPS_GROUP?" && run sudo groupadd --system "$OPS_GROUP"
@@ -793,6 +797,13 @@ EOF
     # Any tapectl command run as the service user applies the modes; this one
     # also reports them.
     run tc config check || true
+    # Issue #437 / ADR-0012 2026-10-15 item 62: a pointer so members need no
+    # --home. tapectl ignores it as root and when the account has its own ~/.tapectl.
+    POINTER="${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"
+    run sudo install -d -m 0755 "$(dirname "$POINTER")"
+    printf '%s\n' "$EFFECTIVE_HOME" | sudo tee "$POINTER" >/dev/null
+    run sudo chmod 0644 "$POINTER"
+    ok "home pointer $POINTER -> $EFFECTIVE_HOME"
     # The home's 0710 is not enough on its own: every directory above it must
     # let the group through too. On home2 /srv/archive_meta is root 0750 with
     # traverse granted to the service user alone, so members got "permission
@@ -809,11 +820,15 @@ EOF
       fi
       p="$(dirname "$p")"
     done
+    # Checked without --home, as members will run it; sudo may leave HOME=/root,
+    # so HOME is pinned to the operator's own. If that account has its own
+    # ~/.tapectl, this exercises that home, not the pointer.
+    OP_HOME="$(getent passwd "$USER" | cut -d: -f6)"
     if sudo setpriv --reuid="$(id -u "$USER")" --regid="$(getent group "$OPS_GROUP" | cut -d: -f3)" --clear-groups \
-         "$TAPECTL" --home "$EFFECTIVE_HOME" status >/dev/null 2>&1; then
-      ok "ops group $OPS_GROUP: \`tapectl --home $EFFECTIVE_HOME status\` works for its members (checked as $USER with the group)"
+         env -u TAPECTL_HOME HOME="$OP_HOME" TAPECTL_HOME_POINTER="$POINTER" "$TAPECTL" status >/dev/null 2>&1; then
+      ok "ops group $OPS_GROUP: \`tapectl status\` works for its members (checked as $USER with the group)"
     else
-      note "could not run \`tapectl --home $EFFECTIVE_HOME status\` as $USER with group $OPS_GROUP from here — after your next login, run it once; a \"permission denied\" names the directory that still blocks the group"
+      note "could not run \`tapectl status\` as $USER with group $OPS_GROUP from here — after your next login, run it once; a \"permission denied\" names the directory that still blocks the group"
     fi
   else
     note "no group $OPS_GROUP — the session logs stay readable by $SVC_USER only"
