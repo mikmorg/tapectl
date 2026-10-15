@@ -104,6 +104,15 @@ fn slice_io_error(path: &Path, e: io::Error) -> TapectlError {
     staging_io_error("cannot write staged slice", path, e)
 }
 
+/// [`slice_io_error`]'s text as an `io::Error` of the same kind, for the
+/// `Write` impl, whose errors travel up as `io::Error` (the slicer's `?`
+/// makes them `TapectlError::Io`, which prints its text once). `StorageFull`
+/// stays `StorageFull`; the errno is in the text.
+fn slice_write_error(path: &Path, e: io::Error) -> io::Error {
+    let kind = e.kind();
+    io::Error::new(kind, slice_io_error(path, e).to_string())
+}
+
 /// sha256 on its own thread, fed copies of the bytes, so hashing the
 /// plaintext and the ciphertext runs beside encryption instead of after it
 /// (issue #364: one core used to do read, hash, encrypt and hash in turn).
@@ -254,7 +263,11 @@ impl Write for SliceWriter {
             .stream
             .as_mut()
             .ok_or_else(|| io::Error::other("slice already finished"))?;
-        let n = stream.write(buf)?;
+        // Past the 1 MiB buffer the disk filling up surfaces here, mid-slice
+        // (issue #465): name the slice, as `finish` does.
+        let n = stream
+            .write(buf)
+            .map_err(|e| slice_write_error(&self.path, e))?;
         if let Some(plain) = self.plain.as_mut() {
             plain.feed(&buf[..n]);
         }
@@ -264,7 +277,7 @@ impl Write for SliceWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         match self.stream.as_mut() {
-            Some(s) => s.flush(),
+            Some(s) => s.flush().map_err(|e| slice_write_error(&self.path, e)),
             None => Ok(()),
         }
     }
@@ -395,6 +408,49 @@ mod tests {
             "the cause, printed once: {msg}"
         );
         assert!(Path::new("/dev/full").exists(), "the device is untouched");
+    }
+
+    /// Issue #465 item 3: past the 1 MiB `BufWriter` the disk filling up
+    /// surfaces from `write` itself, in the middle of a slice, and that
+    /// error used to reach the operator bare — `No space left on device (os
+    /// error 28)`, naming no slice. It names the operation and the slice
+    /// once, like the one `finish` raises, and keeps its kind.
+    #[test]
+    fn a_full_staging_filesystem_mid_slice_names_the_slice_once() {
+        let Ok(full) = fs::OpenOptions::new().write(true).open("/dev/full") else {
+            eprintln!("skipping: no /dev/full");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("abc_v1_s1.1.dar.age");
+        let (_, recipients) = recipient();
+        let mut w =
+            SliceWriter::over(path.clone(), full, build_encryptor(&recipients).unwrap()).unwrap();
+        // Random-looking bytes: age does not compress, so 4 MiB in is more
+        // than the buffer holds whatever the framing adds.
+        let chunk: Vec<u8> = (0..65_536u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let mut failed = None;
+        for _ in 0..64 {
+            if let Err(e) = w.write_all(&chunk) {
+                failed = Some(e);
+                break;
+            }
+        }
+        let err = failed.expect("a write past the buffer reaches /dev/full and fails");
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull, "{err:?}");
+        let operator: TapectlError = err.into();
+        let msg = operator.to_string();
+        assert!(
+            msg.contains("cannot write staged slice") && msg.contains(&*path.to_string_lossy()),
+            "names the operation and the slice: {msg}"
+        );
+        assert_eq!(
+            msg.matches("No space left on device").count(),
+            1,
+            "the cause, printed once: {msg}"
+        );
     }
 
     /// The production source of `name`'s body in `file`'s non-test part.
