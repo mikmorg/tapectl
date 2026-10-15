@@ -2829,6 +2829,8 @@ fn report_health_json_carries_drive_and_cartridge_and_keeps_drive_only_readings(
         "read_error_rise_floor_per_gib": tapectl::tape::read_errors::RISE_FLOOR_PER_GIB,
         // Issue #303, additive: no TapeAlert was raised here.
         "tape_alerts_raised": [],
+        // Issue #439, additive: no write recorded a feed ratio here.
+        "feed_ratios": [],
     });
     assert_eq!(parsed, expected, "the whole --json document");
 }
@@ -3058,6 +3060,7 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
             "condition",
             "created_at",
             "deposits",
+            "feed_ratios",
             "first_write",
             "label",
             "largest_units",
@@ -3077,7 +3080,7 @@ fn quiet_silences_progress_and_volume_info_json_keeps_its_shape() {
             "writes",
         ],
         "volume info --json is unchanged by issue #386 (sealed_at was added after it, \
-         for first-run.sh step 13)"
+         for first-run.sh step 13; feed_ratios by issue #439)"
     );
 }
 

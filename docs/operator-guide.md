@@ -933,8 +933,10 @@ home2 the remaining lever, lowering the weight of the guest `vm-desk1`, is
 printed (never applied) by `contrib/hosts/home2-prep.sh`; it is a host decision.
 
 The write itself needs no supervision once it is streaming; the drive's
-counters afterwards (`report health`, which compares the tape the drive
-actually used against the bytes written) say whether the feed held.
+counters afterwards say whether the feed held: `tapectl volume info <label>`
+shows each write's feed ratio (native tape bytes per data byte sent, judged
+against 1.05), and `tapectl report health` lists every recorded write, the
+uneven feeds first.
 
 ### Check what's pending
 
