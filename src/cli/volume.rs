@@ -1848,6 +1848,30 @@ pub fn run(
             // `cartridge move` needed no second gate of its own. The dry
             // branch prints the outcome that WOULD have been written; the
             // real branch below is byte-for-byte what it always was.
+            //
+            // Issue #461: a real move waits on no live session of the volume
+            // it names. Refused without waiting (exit 75) when one holds the
+            // volume's lock; a dry run changes nothing and takes no lock. A
+            // label the catalog does not know is `move_volume`'s refusal.
+            let _volume_lock = if dry_run {
+                None
+            } else {
+                use rusqlite::OptionalExtension;
+                let id: Option<i64> = conn
+                    .query_row("SELECT id FROM volumes WHERE label = ?1", [label], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                match id {
+                    Some(id) => Some(crate::staging::lock::acquire_volume_to_change(
+                        conn,
+                        id,
+                        label,
+                        &format!("move volume \"{label}\" to \"{to}\""),
+                    )?),
+                    None => None,
+                }
+            };
             let outcome = crate::cli::location::move_volume(conn, label, to, dry_run)?;
             let others: Vec<&str> = outcome
                 .volumes

@@ -355,6 +355,23 @@ pub fn volume_retire(
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
+    // Issue #461: a live session on this volume (a write, a resume, a
+    // verify, a re-confirm) records the volume's status when it finishes, so
+    // retiring it underneath is refused, without waiting, before anything is
+    // read, asked or changed — a fact, ahead of consent. Held through the
+    // impact analysis, the floor, the prompt and the write, so they all see
+    // one volume. A dry run changes nothing and takes no lock.
+    let _volume_lock = if dry_run {
+        None
+    } else {
+        Some(crate::staging::lock::acquire_volume_to_change(
+            conn,
+            vol_id,
+            label,
+            &format!("retire volume \"{label}\""),
+        )?)
+    };
+
     let impacts = retire_impacts(conn, vol_id)?;
 
     let at_risk: Vec<String> = impacts
@@ -1286,6 +1303,25 @@ pub fn cartridge_retire(
     drop(stmt);
     let volume_labels: Vec<String> = mounted.iter().map(|(_, l, _)| l.clone()).collect();
 
+    // Issue #461: the volumes this retires with the cartridge, as `volume
+    // retire` guards one. A live session on any of them refuses, before
+    // anything is read or asked, and nothing is changed. A dry run takes none.
+    let _volume_locks = if dry_run {
+        Vec::new()
+    } else {
+        mounted
+            .iter()
+            .map(|(vol_id, vol_label, _)| {
+                crate::staging::lock::acquire_volume_to_change(
+                    conn,
+                    *vol_id,
+                    vol_label,
+                    &format!("retire cartridge \"{barcode}\" permanently"),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
     // One merged impact per unit across every volume on the cartridge.
     //
     // `bind_cartridge` closes every other open mount when it binds, so in
@@ -1750,6 +1786,24 @@ pub fn cartridge_mark_erased(
         .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let volume_labels: Vec<String> = mounted_volumes.iter().map(|(_, l)| l.clone()).collect();
+
+    // Issue #461: as `cartridge retire` — the volumes this records erased are
+    // guarded against a live session, which would seal one of them after.
+    let _volume_locks = if dry_run {
+        Vec::new()
+    } else {
+        mounted_volumes
+            .iter()
+            .map(|(vol_id, vol_label)| {
+                crate::staging::lock::acquire_volume_to_change(
+                    conn,
+                    *vol_id,
+                    vol_label,
+                    &format!("mark cartridge \"{barcode}\" erased"),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
 
     // ADR-0008 Tier-3 impact analysis (issue #289), computed unconditionally
     // and BEFORE the dry-run return -- same shape `cartridge_retire` builds.

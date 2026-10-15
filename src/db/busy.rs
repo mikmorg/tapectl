@@ -92,7 +92,11 @@ pub fn is_busy_error(e: &TapectlError) -> bool {
 pub fn is_catalog_busy(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         if let Some(e) = cause.downcast_ref::<TapectlError>() {
-            is_busy_error(e)
+            // Issue #461: a retire-family command refused because a live
+            // session holds the volume's lock is the same answer to the
+            // caller — nothing changed, retry later. NOT in
+            // [`is_busy_error`]: [`retry`] must never loop on it.
+            is_busy_error(e) || matches!(e, TapectlError::VolumeBusy { .. })
         } else if let Some(e) = cause.downcast_ref::<rusqlite::Error>() {
             is_busy(e)
         } else {

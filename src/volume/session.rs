@@ -1430,14 +1430,29 @@ impl PlannedSession {
         store: &mut dyn Store,
         mut is_interrupted: impl FnMut() -> bool,
     ) -> Result<ExecuteOutcome> {
-        for (write_id, _) in &self.write_ids {
-            conn.execute(
-                "UPDATE writes SET status = 'in_progress',
-                 started_at = COALESCE(started_at, datetime('now'))
-                 WHERE id = ?1",
-                params![write_id],
-            )?;
-        }
+        // Issue #461: ALL of this session's `writes` rows go `in_progress`, or
+        // none do. A `conn.execute` per row left a split session when the
+        // catalog went busy part-way: the flipped rows were swept to
+        // `interrupted` and adopted by a resume that then had no row for a
+        // slice (the `.expect("plan() populated slice_write_id…")` in
+        // `run_entries`), the rest stayed `planned` and invisible to it. One
+        // IMMEDIATE transaction, retried whole on a busy catalog (issue
+        // #377 rule 3): a dropped transaction rolls back, so each attempt
+        // starts clean, and a catalog still busy past the budget fails here,
+        // with every row `planned` and the tape untouched.
+        busy::retry(BusyPolicy::DEFAULT, "the write session's start", || {
+            let tx = busy::immediate_tx(conn)?;
+            for (write_id, _) in &self.write_ids {
+                tx.execute(
+                    "UPDATE writes SET status = 'in_progress',
+                     started_at = COALESCE(started_at, datetime('now'))
+                     WHERE id = ?1",
+                    params![write_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })?;
         run_entries(
             conn,
             store,
@@ -3451,6 +3466,148 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unwritten, 0, "every slice's cursor row must be recorded");
+    }
+
+    /// Issue #461: the `planned` -> `in_progress` flip waits out a busy
+    /// catalog. Another connection holds the write lock for eight times this
+    /// connection's busy_timeout, BEFORE `execute` begins; the flip used to
+    /// be a bare `conn.execute` per row and failed at the first.
+    #[test]
+    fn the_planned_flip_waits_out_a_busy_catalog() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("tapectl.db");
+        let f = make_fixture_on(db::open(&db_path).unwrap());
+        f.conn.pragma_update(None, "busy_timeout", 50).unwrap();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            c.execute_batch("COMMIT").unwrap();
+        });
+        ready_rx.recv().unwrap();
+
+        let outcome = planned
+            .execute(&f.conn, &mut store)
+            .expect("a busy catalog at the session's start must be waited out");
+        assert!(matches!(outcome, ExecuteOutcome::Ready(_)));
+        holder.join().unwrap();
+        let statuses: Vec<String> = f
+            .conn
+            .prepare("SELECT status FROM writes WHERE volume_id = ?1")
+            .unwrap()
+            .query_map(params![f.volume_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !statuses.is_empty() && statuses.iter().all(|s| s == "in_progress"),
+            "every row flipped: {statuses:?}"
+        );
+    }
+
+    /// Issue #461: a failure part-way through the flip leaves NO row flipped.
+    /// A second `writes` row is added to the plan by hand and a trigger fails
+    /// the UPDATE of that one, so the first row's UPDATE has already run when
+    /// the error comes. Per-row autocommit left the first `in_progress`
+    /// (swept to `interrupted` by the next open, and adopted by a resume that
+    /// had no row for the second one's slices); one transaction rolls it
+    /// back. The resume afterwards has nothing to adopt and does not panic.
+    ///
+    /// Negative control (run by hand, not committed): make the flip a
+    /// `conn.execute` per row again and the first assertion shows
+    /// `["in_progress", "planned"]`.
+    #[test]
+    fn a_failure_part_way_through_the_planned_flip_leaves_no_row_flipped() {
+        let f = make_fixture();
+        let mut store = MemStore::new(BS as usize);
+        let validated = f
+            .built
+            .into_validated(&f.keys, SliceCheck::Size, &mut store)
+            .unwrap();
+        let mut planned = validated.plan(&f.conn, f.volume_id, &f.units).unwrap();
+        let first_write_id = planned.write_ids[0].0;
+
+        // A second unit's write, planned on the same volume.
+        let unit_id: i64 = f
+            .conn
+            .query_row("SELECT id FROM units WHERE name = 'unit-alpha'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        f.conn
+            .execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, 2, 'staged', '/tmp/unit-alpha', 1, 32)",
+                params![unit_id],
+            )
+            .unwrap();
+        let snapshot_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snapshot_id],
+            )
+            .unwrap();
+        let stage_set_id = f.conn.last_insert_rowid();
+        f.conn
+            .execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'planned')",
+                params![stage_set_id, snapshot_id, f.volume_id],
+            )
+            .unwrap();
+        let second_write_id = f.conn.last_insert_rowid();
+        planned.write_ids.push((second_write_id, snapshot_id));
+        f.conn
+            .execute_batch(&format!(
+                "CREATE TEMP TRIGGER fail_the_second_flip BEFORE UPDATE OF status ON main.writes
+                 WHEN NEW.id = {second_write_id} AND NEW.status = 'in_progress'
+                 BEGIN SELECT RAISE(ABORT, 'injected failure on the second row'); END;"
+            ))
+            .unwrap();
+
+        let err = match planned.execute(&f.conn, &mut store) {
+            Err(e) => e,
+            Ok(_) => panic!("the flip's failure must fail the execute"),
+        };
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the injected failure is what stopped it: {err}"
+        );
+        let status_of = |id: i64| -> String {
+            f.conn
+                .query_row("SELECT status FROM writes WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            [status_of(first_write_id), status_of(second_write_id)],
+            ["planned", "planned"],
+            "all rows or none: the first row's flip rolled back with the second's failure"
+        );
+        assert!(
+            store.files.is_empty(),
+            "the failure came before any byte reached the tape"
+        );
+
+        // A resume afterwards finds nothing to adopt, and does not panic.
+        assert!(InterruptedSession::rehydrate(&f.conn, f.volume_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            resume_admission(&f.conn, f.volume_id).unwrap(),
+            ResumeAdmission::Nothing
+        );
     }
 
     /// Issue #417: execute reads every staged file through `DropBehind`,

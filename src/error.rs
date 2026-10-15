@@ -413,6 +413,32 @@ pub enum TapectlError {
     )]
     VolumeSessionLive { label: String },
 
+    /// Issue #461: a command that changes a volume's STATUS or place —
+    /// `volume retire`, `cartridge retire`, `cartridge mark-erased`,
+    /// `volume compact-finish`, `volume move` — found the volume's session
+    /// lock held by a live `volume init`, `write`, `resume` or `verify`
+    /// (`staging::lock::acquire_volume_to_change`). Nothing was changed. The
+    /// session reads the volume's status as it seals; changing it underneath
+    /// would be undone, or would undo the session. Unlike
+    /// [`Self::VolumeSessionLive`] this is a "try again later": it exits
+    /// [`EXIT_CATALOG_BUSY`] (75, through `db::busy::is_catalog_busy`), the
+    /// code every command already uses for "something else is running; the
+    /// state is untouched; retry". `holders` is empty or names the holding
+    /// process (` (held by pid N: `tapectl volume write L`)`).
+    #[error(
+        "volume \"{label}\" has a live session{holders}: refusing to {action}. Nothing was \
+         changed. A `volume init`, `write`, `resume` or `verify` is running on it right now \
+         (it holds the volume's lock) and records the volume's status when it finishes, so \
+         changing the volume under it would be undone or would undo it. `--force` and `--yes` \
+         do not apply. Run this command again once that one has finished; if it was killed, \
+         the kernel has already released its lock and this refusal will not recur."
+    )]
+    VolumeBusy {
+        label: String,
+        action: String,
+        holders: String,
+    },
+
     #[error("tape I/O error: {0}")]
     TapeIo(String),
 
@@ -783,6 +809,45 @@ mod tests {
             EXIT_ERROR,
             "only the write family reads the outcome"
         );
+    }
+
+    /// Issue #461: a retire-family command refused by a live session's
+    /// volume lock exits 75 under every contract that reaches it, and
+    /// `VolumeSessionLive` (a write, resume or verify meeting a live
+    /// session) keeps the exit it always had. [`crate::db::busy::retry`]
+    /// must never treat the refusal as a busy catalog to loop on.
+    #[test]
+    fn a_retire_family_refusal_by_a_live_session_exits_75_and_is_not_retried() {
+        let busy = || TapectlError::VolumeBusy {
+            label: "L6-0001".into(),
+            action: "retire volume \"L6-0001\"".into(),
+            holders: String::new(),
+        };
+        let live = || TapectlError::VolumeSessionLive {
+            label: "L6-0001".into(),
+        };
+        for contract in [
+            ErrorContract::Ordinary,
+            ErrorContract::Write,
+            ErrorContract::Erase,
+            ErrorContract::Audit,
+        ] {
+            assert_eq!(contract.exit_code(&anyhow::Error::from(busy())), 75);
+        }
+        assert_eq!(
+            ErrorContract::Ordinary.exit_code(&anyhow::Error::from(live())),
+            EXIT_ERROR,
+            "the session commands' own refusal is unchanged"
+        );
+        assert!(!crate::db::busy::is_busy_error(&busy()));
+        let mut calls = 0;
+        let err = crate::db::busy::retry(crate::db::busy::BusyPolicy::DEFAULT, "x", || {
+            calls += 1;
+            Err::<(), _>(busy())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1, "a live session is not waited out by retry");
+        assert!(matches!(err, TapectlError::VolumeBusy { .. }));
     }
 
     /// `collection run` reports the worst outcome among its copies:

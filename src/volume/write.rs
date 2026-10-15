@@ -559,6 +559,16 @@ fn volume_init_in_contact<'c>(
         ],
     )?;
     let volume_id = tx.last_insert_rowid();
+    // Issue #376, ordered by issue #461: the volume's session lock is taken
+    // HERE, once the row has an id and before anything else is recorded, and
+    // held to the end of this function — through the commit and File 0.
+    // Taken after the commit (as it was), a lock that could not be had left
+    // the row, the binding and a displaced volume marked `erased` behind with
+    // File 0 never written. Now the `?` drops `tx` and all of it rolls back.
+    // Nothing else can hold this id's lock yet (it was minted a line ago);
+    // holding it is what makes this session visible as live to every other
+    // process, from the moment the row can be seen.
+    let _volume_lock = crate::staging::lock::acquire_volume(conn, volume_id, label)?;
     let bound = binding::bind_cartridge(
         &tx,
         volume_id,
@@ -589,11 +599,6 @@ fn volume_init_in_contact<'c>(
         }
     }
     tx.commit()?;
-    // Issue #376: the volume's session lock, from the moment its row exists
-    // until File 0 is on tape and this function returns. Nothing else can
-    // hold it yet (the id was minted a line ago); holding it is what makes
-    // this session visible as live to every other process.
-    let _volume_lock = crate::staging::lock::acquire_volume(conn, volume_id, label)?;
 
     // AFTER the commit, and ONLY when the CHIP named the cartridge.
     // `cartridge_contacts` has no `identity_source` column, so a
@@ -5821,6 +5826,16 @@ pub fn compact_finish(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
+
+    // Issue #461: as `volume retire` — a live session on the source volume
+    // refuses this retirement, without waiting and before anything is
+    // checked or asked. Held to the end, through the consent prompt.
+    let _volume_lock = crate::staging::lock::acquire_volume_to_change(
+        conn,
+        vol_id,
+        label,
+        &format!("retire volume \"{label}\" (compact-finish)"),
+    )?;
 
     // Guard: verify all live slices exist on at least one other volume
     let mut stmt = conn.prepare(
@@ -16679,6 +16694,89 @@ mod tests {
             // And then the one sweep, attributed to it.
             assert_one_init_sweep(&conn, cid, Some(volume_id));
             assert_each_page_read_once(&src.borrow().reads);
+        }
+
+        /// Issue #461: `volume init` takes the volume's session lock before
+        /// the transaction that inserts the row commits (it used to take it
+        /// after). A lock that cannot be had now rolls the whole transaction
+        /// back: no `volumes` row, no cartridge binding (and so no
+        /// displacement of a volume already on the cartridge), and File 0
+        /// never written. The holder is a second connection's lock on the
+        /// id the row is about to get, which stands in for a lockfile that
+        /// cannot be taken.
+        ///
+        /// Negative control (run by hand, not committed): move the
+        /// `acquire_volume` line back below `tx.commit()` and the first
+        /// assertion on the `volumes` count fails with 1.
+        #[test]
+        fn an_init_whose_session_lock_cannot_be_taken_leaves_no_row_and_no_binding() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let db_path = tmp.path().join("tapectl.db");
+            let conn = crate::db::open(&db_path).unwrap();
+            let holder = crate::db::open(&db_path).unwrap();
+            let mut config = lto8_config(tmp.path());
+            config.backends.lto[0].generation = "LTO-6".into();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, status)
+                 VALUES ('LOCK-INIT-1', 'LTO-6', 2500000000000, 'available')",
+                [],
+            )
+            .unwrap();
+            let next_id: i64 = conn
+                .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM volumes", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let held = crate::staging::lock::acquire_volume(&holder, next_id, "ELSEWHERE").unwrap();
+
+            let init = |conn: &Connection, store: &mut crate::store::MemStore| {
+                let mut slot = ContactSlot::empty()
+                    .with_drive_identity(identity_with_serial(Some("XYZZY_A1")));
+                let r = volume_init_contacted(
+                    conn,
+                    &config,
+                    "LI-NEW",
+                    GENCHK_DEVICE,
+                    512 * 1024,
+                    false,
+                    None,
+                    Some("LOCK-INIT-1"),
+                    &mut slot,
+                    ContactStore::Injected(store),
+                );
+                slot.finish_result(r)
+            };
+
+            let mut store = crate::store::MemStore::new(512 * 1024);
+            let err = init(&conn, &mut store).unwrap_err();
+            assert!(
+                matches!(err, TapectlError::VolumeSessionLive { .. }),
+                "the held lock is what refused: {err}"
+            );
+            let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+            assert_eq!(
+                count("SELECT COUNT(*) FROM volumes"),
+                0,
+                "the refused init left no volumes row"
+            );
+            assert_eq!(
+                count("SELECT COUNT(*) FROM cartridge_volumes"),
+                0,
+                "and no cartridge binding"
+            );
+            assert_eq!(
+                count("SELECT COUNT(*) FROM events WHERE entity_type = 'volume'"),
+                0,
+                "and no `created` event"
+            );
+            assert!(store.files.is_empty(), "File 0 was never written");
+
+            // Positive control: the same init, the lock free, takes that id.
+            drop(held);
+            let mut store = crate::store::MemStore::new(512 * 1024);
+            let volume_id = init(&conn, &mut store).expect("a free lock does not refuse");
+            assert_eq!(volume_id, next_id);
+            assert_eq!(store.files.len(), 1, "File 0 was written");
         }
 
         /// Issue #339, the other outcome the contact can have: a refusal

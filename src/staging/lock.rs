@@ -231,6 +231,73 @@ pub fn acquire_volume(conn: &Connection, volume_id: i64, label: &str) -> Result<
     }
 }
 
+/// Take volume `volume_id`'s session lock for a command that CHANGES the
+/// volume's status or place (issue #461): `volume retire`, `cartridge
+/// retire`, `cartridge mark-erased`, `volume compact-finish`, `volume move`.
+/// Non-blocking, like [`acquire_volume`]; when a live session holds it, this
+/// refuses with [`TapectlError::VolumeBusy`] — which exits 75, "nothing was
+/// changed, run it again" — naming the holding process where the kernel
+/// will say who it is ([`lock_holder_pids`]). `action` finishes the
+/// sentence "refusing to …". Hold the result for as long as the command
+/// reads the volume's state and writes the change, so the two see one volume.
+pub fn acquire_volume_to_change(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    action: &str,
+) -> Result<VolumeLock> {
+    match acquire_volume(conn, volume_id, label) {
+        Err(TapectlError::VolumeSessionLive { .. }) => Err(TapectlError::VolumeBusy {
+            label: label.to_string(),
+            action: action.to_string(),
+            holders: volume_holders(conn, volume_id),
+        }),
+        other => other,
+    }
+}
+
+/// ` (held by pid N: `tapectl volume write L6-0001 …`)` for the process(es)
+/// holding `volume_id`'s lock, or an empty string when the kernel does not
+/// say (`/proc/locks` unreadable, a holder in another PID namespace). Best
+/// effort: this only decorates a refusal.
+fn volume_holders(conn: &Connection, volume_id: i64) -> String {
+    let Some(db_file) = db_file_of(conn) else {
+        return String::new();
+    };
+    let pids = lock_holder_pids(&volume_lock_path(&db_file, volume_id));
+    if pids.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = pids
+        .iter()
+        .map(|pid| match process_command_line(*pid) {
+            Some(cmd) => format!("pid {pid}: `{cmd}`"),
+            None => format!("pid {pid}"),
+        })
+        .collect();
+    format!(" (held by {})", named.join("; "))
+}
+
+/// `/proc/<pid>/cmdline` as one line, cut at 120 characters; `None` when the
+/// process is gone or unreadable.
+fn process_command_line(pid: u32) -> Option<String> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let line: String = String::from_utf8_lossy(&raw)
+        .split('\0')
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    Some(if line.chars().count() > 120 {
+        let cut: String = line.chars().take(120).collect();
+        format!("{cut}…")
+    } else {
+        line
+    })
+}
+
 /// Whether a session is live on `volume_id` right now: its lock is held by
 /// another process, or by another open file description in this one (issue
 /// #376). The same probe as [`is_crashed`], inverted, with the same
