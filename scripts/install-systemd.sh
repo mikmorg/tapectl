@@ -19,6 +19,10 @@
 #   <backup dir>                                 created, owned by the service
 #                                                user, mode 0700
 #   /usr/local/bin/tapectl-op                    `exec sudo -u <user> -H <tapectl> "$@"`
+#   /etc/tapectl/home                            the system home pointer: the
+#                                                tapectl home's path, root 0644, so
+#                                                an [ops] group member's plain
+#                                                `tapectl status` finds it (#437)
 #
 # The units under contrib/systemd/ are written for the default service user
 # (`tapectl`, home /var/lib/tapectl); this script rewrites User=, HOME=,
@@ -28,8 +32,8 @@
 #
 # What it never does: create the service user (scripts/first-run.sh step 5),
 # install the tapectl binary (step 3), touch a tape or a device node, or —
-# under --uninstall — remove the service user, its home, the binary or the
-# backups. docs/install.md "Uninstall" has those commands.
+# under --uninstall — remove the service user, its home, the binary, the
+# backups or the home pointer. docs/install.md "Uninstall" has those commands.
 #
 # scripts/first-run.sh step 14 calls this script; it can also be run alone.
 # Root work goes through sudo, so --dry-run needs no privilege at all.
@@ -49,12 +53,15 @@ UNINSTALL=0
 UNITDIR=/etc/systemd/system
 LIBDIR=/usr/local/lib/tapectl
 WRAPPER_PATH=/usr/local/bin/tapectl-op
+# The system home pointer (issue #437). The same variable the tapectl binary
+# reads to find it, so a dry run or a test can aim both at a scratch path.
+POINTER_PATH="${TAPECTL_HOME_POINTER:-/etc/tapectl/home}"
 UNITS=(tapectl-audit.service tapectl-audit.timer tapectl-backup.service tapectl-backup.timer tapectl-drive-poll.service tapectl-drive-poll.timer)
 TIMERS=(tapectl-audit.timer tapectl-backup.timer tapectl-drive-poll.timer)
 SCRIPTS=(tapectl-scheduled-audit.sh tapectl-scheduled-backup.sh tapectl-scheduled-drive-poll.sh)
 
 usage() {
-  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
   cat <<EOF
 
 Usage: scripts/install-systemd.sh [options]
@@ -133,8 +140,8 @@ if [ "$UNINSTALL" = 1 ]; then
   as_root systemctl daemon-reload
   as_root systemctl reset-failed 'tapectl-*' || true
   ok "units, wrappers and $WRAPPER_PATH removed"
-  note "left in place on purpose: the service user, its home, $BIN, and the backups in $BACKUP_DIR"
-  note "docs/install.md 'Uninstall' has the commands for those"
+  note "left in place on purpose: the service user, its home, $BIN, the backups in $BACKUP_DIR, and the home pointer $POINTER_PATH"
+  note "docs/install.md 'Uninstall' has the commands for those (remove the pointer when you delete the home it names)"
   exit 0
 fi
 
@@ -156,9 +163,12 @@ else
 fi
 [ -n "$SVC_HOME" ] || die "no home directory for $SVC_USER — pass --home"
 THOME="${TAPECTL_HOME_DIR:-$SVC_HOME/.tapectl}"
+# The pointer holds this path, and tapectl refuses a relative one.
+case "$THOME" in /*) ;; *) die "the tapectl home '$THOME' is not an absolute path — pass absolute --home / --tapectl-home" ;; esac
 for p in "$SVC_HOME" "$THOME" "$BACKUP_DIR" "$BIN"; do case "$p" in *[[:space:]]*) die "path '$p' contains whitespace, which systemd's Environment= and ReadWritePaths= would split" ;; esac; done
 if [ -x "$BIN" ]; then ok "binary: $BIN"; else note "$BIN is not there (or not executable) — the timers will fail until it is (first-run step 3 installs it)"; fi
 printf '   user %s, HOME %s, tapectl home %s\n' "$SVC_USER" "$SVC_HOME" "$THOME"
+printf '   home pointer: %s -> %s\n' "$POINTER_PATH" "$THOME"
 printf '   backups: %s, keep %s\n' "$BACKUP_DIR" "$KEEP"
 
 # --- the backup directory: outside the home, on a second disk
@@ -222,6 +232,20 @@ if [ "$WRAPPER" = 1 ]; then
 exec sudo -u $SVC_USER -H $BIN "\$@"
 EOF
   if same_as "$WRAPPER_PATH" "$TMP/tapectl-op"; then ok "$WRAPPER_PATH unchanged"; else as_root install -D -m 0755 "$TMP/tapectl-op" "$WRAPPER_PATH"; fi
+fi
+
+# --- the system home pointer (issue #437, ADR-0012 2026-10-15 item 62):
+# one absolute path, root-owned and world-readable, so an account without a
+# ~/.tapectl of its own (an [ops] group member) finds the service user's home
+# with a plain `tapectl status`. tapectl never reads it as root and never when
+# the account has its own ~/.tapectl; it is rewritten here only when it differs.
+printf '%s\n' "$THOME" > "$TMP/home-pointer"
+if same_as "$POINTER_PATH" "$TMP/home-pointer"; then
+  ok "$POINTER_PATH unchanged ($THOME)"
+else
+  if [ -f "$POINTER_PATH" ]; then note "$POINTER_PATH named $(head -n 1 "$POINTER_PATH" 2>/dev/null || echo '?') — replacing it with $THOME"; fi
+  as_root install -d -m 0755 "$(dirname "$POINTER_PATH")"
+  as_root install -m 0644 "$TMP/home-pointer" "$POINTER_PATH"
 fi
 
 # --- activate
