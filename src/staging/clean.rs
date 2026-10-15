@@ -691,7 +691,9 @@ pub struct CleanReport {
     pub lockfiles_reclaimed: usize,
     /// What a hard kill leaves in the tapectl home (issue #465): the
     /// catalogue directories of stage sets that never staged, and `<home>/tmp`
-    /// entries older than a day — see `reclaim_home_leftovers`.
+    /// entries older than a day — see `reclaim_home_leftovers` — and (issue
+    /// #474) the `clone-*`/`compact-*` directories a recovery read left in
+    /// staging, see `reclaim_recovery_read_dirs`.
     pub home_leftovers_reclaimed: usize,
     /// Stage sets NOT released because a live session holds the lock of a
     /// volume they are planned onto (issue #376), with those volumes'
@@ -766,6 +768,98 @@ pub fn reclaim_session_dirs_and_lockfiles(
     reclaim_session_dirs(conn, config, force, report)?;
     reclaim_lockfiles(conn, db_file, report)?;
     reclaim_home_leftovers(conn, db_file, report)?;
+    reclaim_recovery_read_dirs(conn, config, report)?;
+    Ok(())
+}
+
+/// How long a recovery read's directory under staging must have gone
+/// unchanged, by the newest change anywhere in it, before it is a leftover.
+/// `volume read-slices` and `volume compact-read` make theirs, then record
+/// each slice's path as it lands: for that window a live read holds a
+/// directory no set references, and a tape read of a full cartridge runs for
+/// hours. An hour is clear of the longest quiet stretch of a read that is
+/// still going (a rewind, a slow block), and a directory a read left behind
+/// is not in anyone's way for that long.
+const RECOVERY_READ_DIR_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Reclaim what a recovery read left in staging (issue #474): the
+/// `clone-<label>-<unit uuid>/` directory of `volume read-slices` and the
+/// `compact-<label>/` directory of `volume compact-read`, when no `staged`
+/// (or `staging`) set references a file in it and nothing in it has changed
+/// for [`RECOVERY_READ_DIR_MIN_AGE`].
+///
+/// Both commands now remove what they wrote when they fail or are
+/// interrupted; this is for what they could not — a hard kill — and for the
+/// ciphertext an older build stranded, whose `staging_path` sits on a set
+/// that stayed `cleaned`. `clean_staging` selects only `staged` and `failed`
+/// sets, so nothing else ever looked at those directories. A leftover's
+/// recorded paths are nulled before the directory goes, as `clean_staging`
+/// nulls before it unlinks.
+///
+/// A directory a `staged` set references is that set's staged data
+/// (`volume write` reads it) and is left whatever its age.
+fn reclaim_recovery_read_dirs(
+    conn: &Connection,
+    config: &Config,
+    report: &mut CleanReport,
+) -> Result<()> {
+    let Ok(entries) = fs::read_dir(&config.staging.directory) else {
+        return Ok(());
+    };
+    let candidates: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            (name.starts_with("clone-") || name.starts_with("compact-"))
+                && e.file_type().is_ok_and(|t| t.is_dir())
+        })
+        .map(|e| e.path())
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let recorded: Vec<(i64, PathBuf, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT sl.id, sl.staging_path, ss.status FROM stage_slices sl
+             JOIN stage_sets ss ON ss.id = sl.stage_set_id
+             WHERE sl.staging_path IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                    row.get(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    let now = std::time::SystemTime::now();
+    for dir in candidates {
+        let inside = |p: &PathBuf| p.starts_with(&dir);
+        if recorded
+            .iter()
+            .any(|(_, p, status)| inside(p) && matches!(status.as_str(), "staged" | "staging"))
+        {
+            continue;
+        }
+        let quiet = newest_change(&dir)
+            .and_then(|changed| now.duration_since(changed).ok())
+            .is_some_and(|age| age >= RECOVERY_READ_DIR_MIN_AGE);
+        if !quiet {
+            continue;
+        }
+        for (slice_id, _, _) in recorded.iter().filter(|(_, p, _)| inside(p)) {
+            conn.execute(
+                "UPDATE stage_slices SET staging_path = NULL WHERE id = ?1",
+                params![slice_id],
+            )?;
+        }
+        remove_leftover(&dir, report);
+    }
     Ok(())
 }
 
@@ -2454,6 +2548,106 @@ mod tests {
         assert_eq!(report.home_leftovers_reclaimed, 2);
         assert!(report.bytes_freed >= 2, "{}", report.bytes_freed);
         assert!(tmp.exists(), "`tmp` itself stays");
+    }
+
+    /// Issue #474 item 3: `volume read-slices` and `volume compact-read`
+    /// make `clone-*` / `compact-*` directories under staging, and
+    /// `clean_staging` selects only `staged` and `failed` sets, so what a
+    /// killed or older-build read left in one was never found. `staging
+    /// clean` removes such a directory when no `staged` set references a
+    /// file in it and it has been quiet for an hour: not a referenced one
+    /// (that is a set's staged data), not a young one (a read may be going
+    /// on), not a directory of another name.
+    #[test]
+    fn staging_clean_reaps_recovery_read_directories_nothing_staged_references() {
+        let conn = db::open_memory().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let db_file = home.path().join("tapectl.db");
+        let staging = tempfile::tempdir().unwrap();
+        let (set_staged, _path, _guard) = seed_stage_set_rows(&conn, "staged");
+        let snapshot_id: i64 = conn
+            .query_row(
+                "SELECT snapshot_id FROM stage_sets WHERE id = ?1",
+                [set_staged],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ago = |secs: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        let make = |name: &str, age_secs: u64| -> PathBuf {
+            let dir = staging.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("slice_1.dat");
+            std::fs::write(&file, b"ciphertext").unwrap();
+            for p in [&file, &dir] {
+                std::fs::File::open(p)
+                    .unwrap()
+                    .set_modified(ago(age_secs))
+                    .unwrap();
+            }
+            file
+        };
+        let (two_hours, minute) = (2 * 3600, 60);
+
+        // Referenced by a `staged` set: kept however old.
+        let referenced = make("clone-REF-uuid", two_hours);
+        conn.execute(
+            "UPDATE stage_slices SET staging_path = ?1 WHERE stage_set_id = ?2",
+            params![referenced.to_string_lossy(), set_staged],
+        )
+        .unwrap();
+        // Unreferenced and old: reaped, both kinds.
+        let old_clone = make("clone-OLD-uuid", two_hours);
+        let old_compact = make("compact-OLD", two_hours);
+        // Unreferenced but young: a read may be going on.
+        let young = make("clone-YOUNG-uuid", minute);
+        // Named like neither: not this reaper's.
+        let other = make("other-dir", two_hours);
+        // An older build's strand: its slice's path sits on a `cleaned` set.
+        let strand = make("clone-STRAND-uuid", two_hours);
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'cleaned', 524288)",
+            params![snapshot_id],
+        )
+        .unwrap();
+        let cleaned_set = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                        sha256_plain, sha256_encrypted, staging_path)
+             VALUES (?1, 1, 10, 10, 'aa', 'aa', ?2)",
+            params![cleaned_set, strand.to_string_lossy()],
+        )
+        .unwrap();
+
+        let mut report = CleanReport::default();
+        reclaim_session_dirs_and_lockfiles(
+            &conn,
+            &config_for(staging.path()),
+            &db_file,
+            false,
+            &mut report,
+        )
+        .unwrap();
+
+        assert!(referenced.exists(), "a staged set's data is kept");
+        assert!(
+            !old_clone.exists(),
+            "an unreferenced old clone dir is reaped"
+        );
+        assert!(!old_compact.exists(), "so is a compact dir");
+        assert!(young.exists(), "a young directory may be a live read's");
+        assert!(other.exists(), "only clone-* and compact-* are touched");
+        assert!(!strand.exists(), "a cleaned set's strand is reaped");
+        let nulled: Option<String> = conn
+            .query_row(
+                "SELECT staging_path FROM stage_slices WHERE stage_set_id = ?1",
+                [cleaned_set],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulled, None, "the stale path is nulled with the directory");
+        assert_eq!(report.home_leftovers_reclaimed, 3);
+        assert!(report.bytes_freed >= 30, "{}", report.bytes_freed);
+        assert_eq!(report.errors, 0);
     }
 
     /// A sibling stage_set's plaintext files must never be swept up by
