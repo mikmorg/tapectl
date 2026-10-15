@@ -1429,3 +1429,31 @@ Ruled by the CTO, 2026-10-13, on the measurements in `docs/runs/2026-10-12-1.1.0
     measured 1.0000). The profile's `CONTENDER_PROCESSES`, written by `first-run.sh` step 7.
 56. **`v1.1.0` is tagged** on master after the real-drive proof (2026-10-13).
 
+
+## Amendment, 2026-10-15: the 1.1.1 batch
+
+Ruled by the CTO, 2026-10-15, while planning 1.1.1 (a patch: no generated on-tape byte changes):
+
+57. **A blank cartridge needs no `--force` at `volume init` when its blankness is proven** (#434):
+    either the chip's lifetime totals read zero MiB written (a never-written cartridge, which has
+    no EOD and so cannot be read blank), or this catalog's own `cartridge erase` verified it blank
+    and no write contact followed. This narrows ADR-0003's fail-closed File 0 check by evidence;
+    every unproven tape still refuses as before.
+58. **Tape commands run at raised priority by raising it as root and then dropping to the service
+    user** (#432): `tapectl-op` runs `sudo nice -n -10 ionice -c2 -n0 runuser -u <svc> -- tapectl …`
+    using the operator's existing sudo; the systemd units set `Nice=` and `IOSchedulingClass=`
+    themselves. No limits.d grant and no new sudoers line.
+59. **`volume write --init --full-confirm --move-to <location>` makes a further copy in one
+    command** (#438). It reuses write's recorded full readback (`--full-confirm`) and write's exit
+    table; there is no `--full-verify` on `volume write`.
+60. **A cleaning cartridge is its own table** (#430): migration 036 adds `cleaning_cartridges`
+    (serial, registered, rated uses); each cleaning is an event and the use count is derived from
+    events. `cartridges` is not rebuilt.
+
+Decided by the coordinator from existing rulings, recorded so they are not re-opened:
+
+61. **`drive eject` never sets `cartridge_volumes.unmounted_at`** (#429): migration 020 reserves
+    that column for displacement, and coverage reads `unmounted_at IS NULL` as "bound". An eject
+    records a contact and an event only.
+62. **The ops-group home pointer (`/etc/tapectl/home`) is ignored when the effective uid is 0**
+    (#437), so root never acts on the service home and leaves root-owned files in it.
