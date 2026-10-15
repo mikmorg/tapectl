@@ -716,6 +716,15 @@ pub struct DefaultsConfig {
     /// the extra leg, so this is opt-in, per class, not fleet-wide.
     #[serde(default)]
     pub warehouse_copies: i64,
+    /// How many days a copy may go without a passing full `volume verify`
+    /// before `audit` calls it overdue (`verify_age`), as the bottom layer of
+    /// the policy chain: an `[[archive_sets]]` entry's `verify_interval_days`
+    /// overrides it, and a dotfile cannot set it. Unset by default in 1.1.2 —
+    /// `audit` then checks verification age only for units whose archive set
+    /// carries an interval (the code default of 365 is 1.2.0, issue #453).
+    /// At least 1 ([`validate_verify_interval_days`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_interval_days: Option<i64>,
 }
 
 fn default_slice_size() -> String {
@@ -768,6 +777,7 @@ impl Default for DefaultsConfig {
             min_copies: default_min_copies(),
             min_locations: default_min_locations(),
             warehouse_copies: 0,
+            verify_interval_days: None,
         }
     }
 }
@@ -1425,7 +1435,16 @@ impl Config {
                 ));
             }
         }
-        // Issue #422: an archive set's verify interval below one day.
+        // Issue #422: an archive set's verify interval below one day; issue
+        // #453: the same bound on `[defaults]`'s.
+        if let Some(days) = self.defaults.verify_interval_days {
+            if let Err(e) = validate_verify_interval_days(days) {
+                problems.push(format!(
+                    "{}: defaults.verify_interval_days = {days} {e}",
+                    path.display()
+                ));
+            }
+        }
         for (i, as_cfg) in self.archive_sets.iter().enumerate() {
             if let Some(days) = as_cfg.verify_interval_days {
                 if let Err(e) = validate_verify_interval_days(i64::from(days)) {
@@ -1918,13 +1937,16 @@ pub fn validate_checksum_mode(value: &str) -> std::result::Result<(), String> {
     validate_closed_set("checksum_mode", value, VALID_CHECKSUM_MODES)
 }
 
-/// An archive set's `verify_interval_days` (issue #422): at least one day.
-/// `audit`'s `verify_age` reads 0 or below as "always overdue", and the
-/// readback age gate (ADR-0012 2026-10-07 item 1) never continues an
-/// interrupted readback under it, so such a value is an off switch wearing
-/// an interval's clothes. The error is the reason only; each caller names
-/// the key the way its input spells it (`[[archive_sets]]`'s
+/// A `verify_interval_days` (issue #422): at least one day. `audit`'s
+/// `verify_age` reads 0 or below as "always overdue", and the readback age
+/// gate (ADR-0012 2026-10-07 item 1) never continues an interrupted
+/// readback under it, so such a value is an off switch wearing an
+/// interval's clothes. The error is the reason only; each caller names the
+/// key the way its input spells it (`[[archive_sets]]`'s or `[defaults]`'s
 /// `verify_interval_days`, or `--verify-interval-days`) and the value.
+///
+/// `[defaults] verify_interval_days` (issue #453) is held to the same bound
+/// at config load, `config check` and `config set`.
 ///
 /// Only new values are refused — `archive-set create`/`edit`/`sync` and
 /// config load. A catalog row already holding one keeps working: nothing
@@ -3908,6 +3930,55 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&path).expect("one day is a legitimate interval");
         assert_eq!(cfg.archive_sets[0].verify_interval_days, Some(1));
+    }
+
+    /// Issue #453 (ADR-0012 2026-10-15 later, item 66): `[defaults]
+    /// verify_interval_days` is optional (unset by default, and not written
+    /// by `init`), loads as a day count, and is refused below one day by
+    /// name — at load, in `config check`'s lenient path, and so in `config
+    /// set` (which validates through the same collector).
+    #[test]
+    fn config_load_refuses_a_defaults_verify_interval_below_one_day() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+
+        assert_eq!(Config::default().defaults.verify_interval_days, None);
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!written.contains("verify_interval_days"), "{written}");
+
+        for days in [0, -7] {
+            let body = format!("[defaults]\nverify_interval_days = {days}\n");
+            std::fs::write(&path, &body).unwrap();
+            let msg = Config::load(&path).unwrap_err().to_string();
+            assert!(
+                msg.contains(&format!("defaults.verify_interval_days = {days}")),
+                "{msg}"
+            );
+            assert!(msg.contains(">= 1"), "{msg}");
+
+            let report = crate::policy::lenient_config::check(&body, &path);
+            assert!(!report.valid);
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("defaults.verify_interval_days")),
+                "{:?}",
+                report.problems
+            );
+        }
+
+        std::fs::write(&path, "[defaults]\nverify_interval_days = 365\n").unwrap();
+        let cfg = Config::load(&path).expect("365 days is a legitimate interval");
+        assert_eq!(cfg.defaults.verify_interval_days, Some(365));
+        std::fs::write(&path, "[defaults]\nverify_interval_days = 1\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.verify_interval_days,
+            Some(1)
+        );
+        // Round trip: a set value is written back.
+        let again = toml::to_string_pretty(&cfg).unwrap();
+        assert!(again.contains("verify_interval_days = 365"), "{again}");
     }
 
     // ---- issue #222: two [[backends.lto]] entries on one drive ----

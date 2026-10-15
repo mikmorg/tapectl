@@ -277,6 +277,16 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
     // is not yet set up for it. Advisory, like the scans above.
     let ops_lines = describe_ops(paths, loaded.and_then(|cfg| cfg.ops.as_ref()));
 
+    // Issue #453: `[defaults] verify_interval_days` as the config in force
+    // has it (`null` while unset, and while the config did not parse well
+    // enough to say). `config show` prints the file, so a set value is there
+    // too; this is the one place `--json` states it outright.
+    let defaults_json = loaded.map(|cfg| {
+        serde_json::json!({
+            "verify_interval_days": cfg.defaults.verify_interval_days,
+        })
+    });
+
     if json_output {
         print_json(
             &report,
@@ -293,6 +303,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             &capacity_override_hits,
             host_check.as_ref(),
             &ops_lines,
+            defaults_json,
         );
     } else {
         print_human(
@@ -366,6 +377,7 @@ fn print_json(
     capacity_override_hits: &[&str],
     host_check: Option<&(bool, crate::config::HostCheckConfig)>,
     ops_lines: &[String],
+    defaults_json: Option<serde_json::Value>,
 ) {
     let shadowing_json: Vec<_> = shadowing_hits
         .iter()
@@ -509,6 +521,7 @@ fn print_json(
                 "warnings": crate::host_check::long_process_name_warnings(hc),
             })),
             "ops": ops_lines,
+            "defaults": defaults_json,
         })
     );
 }

@@ -48,6 +48,7 @@ const DEFAULTS_FIELDS: &[&str] = &[
     "min_copies",
     "min_locations",
     "warehouse_copies",
+    "verify_interval_days",
 ];
 
 /// Every unknown key in the `[defaults]` table of `toml_text`.
@@ -176,6 +177,22 @@ slice_size = \"10G\"
 min_copies = 5
 ";
         assert!(scan(text).is_empty(), "{:?}", scan(text));
+    }
+
+    /// An `Option` field that is `None` is not serialized, so the guard
+    /// below never sees it: `[defaults] verify_interval_days` (issue #453)
+    /// is pinned here with a value, written and scanned.
+    #[test]
+    fn a_serialized_config_with_the_optional_defaults_set_reports_nothing() {
+        let mut cfg = crate::config::Config::default();
+        cfg.defaults.verify_interval_days = Some(365);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("verify_interval_days = 365"), "{text}");
+        assert!(
+            scan(&text).is_empty(),
+            "DEFAULTS_FIELDS lacks an optional [defaults] key: {:?}",
+            scan(&text)
+        );
     }
 
     /// A serialized real config must be clean, or `config check` would warn

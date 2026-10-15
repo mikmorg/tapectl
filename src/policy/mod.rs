@@ -46,6 +46,10 @@ pub struct ResolvedPolicy {
 /// 2. Archive set (from DB via unit.archive_set_id)
 /// 3. System defaults (from config.toml)
 ///
+/// `verify_interval_days` is not a dotfile key, so for it the order is
+/// archive set, then `[defaults]` (which carries no value unless the
+/// operator set one, issue #453), then none.
+///
 /// Returns `Err` if the unit dotfile's own `[policy]` section (the only
 /// layer parsed at USE time, not at config load — see below) is not valid.
 /// `config.defaults.slice_size`/`compression`/`checksum_mode` and any
@@ -89,7 +93,10 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                 detail: format!("config.toml [defaults] slice_size is invalid: {e}"),
             }
         })?,
-        verify_interval_days: None,
+        // Level 3 (issue #453): `[defaults] verify_interval_days`, `None`
+        // unless the operator set one. An archive set's own value, below,
+        // replaces it; a dotfile cannot set the key at all.
+        verify_interval_days: defaults.verify_interval_days,
         preserve_xattrs: defaults.preserve_xattrs,
         preserve_acls: defaults.preserve_acls,
         preserve_fsa: defaults.preserve_fsa,
@@ -363,13 +370,15 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
 /// unit on it has one.
 ///
 /// The interval is a unit's policy and a volume holds many units, so the
-/// volume answers to the strictest of them. Only an archive set carries the
-/// key — it is not a dotfile key and `[defaults]` has none ([`resolve`]
-/// starts from `None` and only layer 2 sets it) — so this reads
+/// volume answers to the strictest of them. This reads the archive sets'
+/// intervals only — not a dotfile key (there is none), and not
+/// `[defaults] verify_interval_days` either, which [`resolve`] does apply
+/// (issue #453) but which this function has no `Config` to read: it reads
 /// `archive_sets` directly rather than resolving every unit (which would
-/// read every unit's dotfile, and fail a readback on a bad one). Every
-/// `writes` row counts, whatever its status: a write's own confirm runs
-/// while its rows are still `in_progress`.
+/// read every unit's dotfile, and fail a readback on a bad one). So the
+/// readback age gate bounds a continued readback by an archive set's
+/// interval alone. Every `writes` row counts, whatever its status: a
+/// write's own confirm runs while its rows are still `in_progress`.
 pub fn volume_verify_interval_days(conn: &Connection, volume_id: i64) -> Result<Option<i64>> {
     Ok(conn.query_row(
         "SELECT MIN(a.verify_interval_days)
@@ -447,6 +456,69 @@ mod tests {
         assert_eq!(p.checksum_mode, "sha256");
         assert_eq!(p.required_locations, vec!["home", "offsite"]);
         assert_eq!(p.verify_interval_days, Some(90));
+    }
+
+    /// Issue #453 (ADR-0012 2026-10-15 later, item 66): `verify_interval_days`
+    /// resolves archive set, then `[defaults]`, then none. A unit with no
+    /// archive set, or one whose set carries no interval, gets the defaults
+    /// value; a set's own interval wins over it; with neither there is none.
+    #[test]
+    fn resolve_verify_interval_is_archive_set_then_defaults_then_none() {
+        let conn = fresh_conn();
+        conn.execute(
+            "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('tight', 30)",
+            [],
+        )
+        .unwrap();
+        let tight = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO archive_sets (name, min_copies) VALUES ('silent', 3)",
+            [],
+        )
+        .unwrap();
+        let silent = conn.last_insert_rowid();
+
+        let mut config = Config::default();
+        // Neither: none.
+        for set in [None, Some(silent), Some(tight)] {
+            let p = resolve(&conn, &config, &make_unit(set, None)).unwrap();
+            let want = if set == Some(tight) { Some(30) } else { None };
+            assert_eq!(p.verify_interval_days, want, "no [defaults] interval");
+        }
+
+        config.defaults.verify_interval_days = Some(365);
+        // [defaults] applies where the set has none (or there is no set)...
+        for set in [None, Some(silent)] {
+            let p = resolve(&conn, &config, &make_unit(set, None)).unwrap();
+            assert_eq!(p.verify_interval_days, Some(365), "set {set:?}");
+        }
+        // ...and the set's own value wins over it, in either direction.
+        let p = resolve(&conn, &config, &make_unit(Some(tight), None)).unwrap();
+        assert_eq!(p.verify_interval_days, Some(30));
+        config.defaults.verify_interval_days = Some(7);
+        let p = resolve(&conn, &config, &make_unit(Some(tight), None)).unwrap();
+        assert_eq!(p.verify_interval_days, Some(30), "a looser set still wins");
+    }
+
+    /// Issue #453: the dotfile still cannot set `verify_interval_days` — its
+    /// `[policy]` table refuses the key by name (issue #211), with or
+    /// without a `[defaults]` value to defer to.
+    #[test]
+    fn resolve_rejects_verify_interval_days_in_a_dotfile_policy_table() {
+        let conn = fresh_conn();
+        let mut config = Config::default();
+        config.defaults.verify_interval_days = Some(365);
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".tapectl-unit.toml"),
+            "[policy]\nverify_interval_days = 30\n",
+        )
+        .unwrap();
+        let unit = make_unit(None, Some(tmp.path().to_str().unwrap().to_string()));
+        let err = resolve(&conn, &config, &unit)
+            .expect_err("a dotfile [policy] table must not carry verify_interval_days");
+        let msg = err.to_string();
+        assert!(msg.contains(".tapectl-unit.toml"), "{msg}");
     }
 
     #[test]

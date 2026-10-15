@@ -3437,3 +3437,65 @@ fn a_closed_stderr_pipe_does_not_panic() {
         "the not-initialized refusal must exit with its own code with stderr closed"
     );
 }
+
+/// Issue #453 (ADR-0012 2026-10-15 later, item 66): `audit`'s `verify_age`
+/// fires at the `[defaults] verify_interval_days` value for a unit with no
+/// archive set. Before the key is set the same catalog yields no
+/// `verify_age` finding at all (the control: the finding is the key's
+/// doing, not the fixture's), and the archive set's own interval, where a
+/// unit has one, still wins.
+#[test]
+fn audit_warns_verify_age_at_the_defaults_interval_with_no_archive_set() {
+    let home = TempDir::new().expect("tempdir");
+    let init = run_tapectl_noninteractive(home.path(), &["init"]);
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    seed_one_completed_copy_stage_set(home.path(), "PM453");
+
+    let verify_age = |home: &std::path::Path| -> Vec<serde_json::Value> {
+        let out = run_tapectl_noninteractive(home, &["--json", "audit"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!(
+                "audit --json is not one document: {e}\nstdout={stdout:?}\nstderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        parsed["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no findings array: {parsed}"))
+            .iter()
+            .filter(|f| f["check"] == "verify_age")
+            .cloned()
+            .collect()
+    };
+
+    assert!(
+        verify_age(home.path()).is_empty(),
+        "no archive set and no [defaults] interval: audit has nothing to say about verification age"
+    );
+
+    let set = run_tapectl_noninteractive(
+        home.path(),
+        &["config", "set", "defaults.verify_interval_days", "365"],
+    );
+    assert!(
+        set.status.success(),
+        "config set failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let found = verify_age(home.path());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["unit"], "unit-PM453");
+    assert_eq!(found[0]["severity"], "warning");
+    assert!(
+        found[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not verified within 365 days"),
+        "{found:?}"
+    );
+}

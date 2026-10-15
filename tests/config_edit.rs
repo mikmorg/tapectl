@@ -677,3 +677,50 @@ fn an_edit_under_an_unknown_key_already_in_the_file_is_refused() {
     ok(home.path(), &["config", "remove", "defaults.typo"]);
     config_check_passes(home.path());
 }
+
+/// Issue #453 (ADR-0012 2026-10-15 later, item 66): `[defaults]
+/// verify_interval_days` is a key `config set` writes (as an integer, with
+/// the comments kept), refuses at 0 by name with the file untouched, and
+/// `config check --json` prints it — `null` until it is set.
+#[test]
+fn set_of_defaults_verify_interval_days_takes_a_day_count_and_refuses_zero() {
+    let home = home();
+    let json_default = |home: &Path| -> serde_json::Value {
+        let out = ok(home, &["--json", "config", "check"]);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("config check --json is not one document: {e}"));
+        v["defaults"]["verify_interval_days"].clone()
+    };
+    assert_eq!(json_default(home.path()), serde_json::Value::Null);
+
+    let out = refused(
+        home.path(),
+        &["config", "set", "defaults.verify_interval_days", "0"],
+    );
+    assert!(out.contains("defaults.verify_interval_days = 0"), "{out}");
+    assert!(out.contains(">= 1"), "{out}");
+    // Not a day count at all.
+    refused(
+        home.path(),
+        &["config", "set", "defaults.verify_interval_days", "often"],
+    );
+
+    ok(
+        home.path(),
+        &["config", "set", "defaults.verify_interval_days", "365"],
+    );
+    let after = read(home.path());
+    assert!(after.contains("verify_interval_days = 365\n"), "{after}");
+    assert!(after.contains("# operator note: slices sized for the basement drive"));
+    config_check_passes(home.path());
+    assert_eq!(json_default(home.path()), serde_json::json!(365));
+    // `config show` prints the file, so the key is there too.
+    let shown = ok(home.path(), &["config", "show"]);
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("verify_interval_days = 365"));
+
+    // A set value cannot be walked back below one day either.
+    refused(
+        home.path(),
+        &["config", "set", "defaults.verify_interval_days", "0"],
+    );
+}
