@@ -400,9 +400,9 @@ config: INVALID
   - unknown key: logging.foo
 ```
 
-The fix is to edit the named line. There is no `backend edit` command;
-config.toml is the only place to change these settings. See
-[configuration.md](configuration.md).
+The fix is to edit the named line, by hand or with `tapectl config set` / `config
+remove` (which refuse an unknown key by name and validate before they write). There
+is no `backend edit` command. See [configuration.md](configuration.md).
 
 ### Config: a key an older version wrote
 
@@ -1412,8 +1412,8 @@ policy — --force does not override it. Load a <drive-gen>-writable cartridge, 
 can.
 
 If this drive is not really an <drive-gen>, `generation` in the [[backends.lto]] block named "<name>" (<device>)
-is wrong — edit config.toml (`tapectl config show` prints it; there is no `backend edit`, by decision:
-ADR-0012) and run `tapectl config check`.
+is wrong — correct it with `tapectl config set 'backends.lto[<name>].generation' LTO-N` (N is the drive's
+own generation; `tapectl config show` prints the file) and run `tapectl config check`.
 ```
 
 Up to LTO-7, a drive writes its own generation and the one before, and reads

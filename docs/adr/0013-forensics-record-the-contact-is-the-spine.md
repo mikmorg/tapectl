@@ -219,3 +219,23 @@ its reading is the baseline for that cartridge's life on that drive (page 0x17's
 count and lifetime megabytes are most useful *before* the first write). Cost: one 22-page
 sweep per init on the HP. Tracked as #339. The once-per-contact rule is unchanged.
 
+## Amendment, 2026-10-15 — the 1.1.2 batch's forensic changes (#466, #467)
+
+Decided by the coordinator from this ADR's own rules, recorded so they are not re-opened:
+
+- **A command's journal writes wait out a busy catalog** (#466): the post-command sweep's
+  inserts, the health row and the contact's close run under the bounded busy retry the
+  drive poll already used. The budget is the sweep's, not each row's. A read-to-clear page
+  0x2E that still cannot be written is printed whole, in hex, to stderr and the session
+  log: the reading must reach the operator somewhere, because it exists nowhere else.
+- **`drive eject` takes its contact's one post-command sweep**, after the unload attempt,
+  failed unloads included ("every contact takes one post-command sweep", the 2026-09-23
+  evening amendment, had no exception for it). New health reading kind: `eject`.
+- **`drive cleaned` journals its chip read** (new MAM hook `drive_cleaned`); `drive status`
+  stays a command that records nothing, and `cartridge journal`'s help says which commands
+  record.
+- **A read-error point records what the verify read** (`verify_bytes` in the event
+  details) and is marked `scope_unknown` when page 0x03 counted more than twice that, so
+  ADR-0012 2026-10-07 item 6's assumption (the page clears at load) is checked by every
+  reading; the rise judgement skips scope-unknown points.
+

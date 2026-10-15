@@ -348,7 +348,8 @@ importing or rebuilding anything into it. `docs/operator-guide.md`,
 
 **Step 8** finds the existing backend and only cross-checks it: if the
 config's `device_tape` is not the drive you chose in step 6, it says so and
-leaves the edit to you (there is no `backend edit`). `device_sg` is derived
+leaves the edit to you (`tapectl config set 'backends.lto[NAME].device_tape' <dev>`;
+there is no `backend edit`). `device_sg` is derived
 from `device_tape` whenever the config has no `device_sg` line (issue #431), so a
 renumbering never matters. Only an explicit `device_sg` can go stale: `config check`
 warns about a tape/sg pairing that names two different drives, and `volume write`

@@ -521,8 +521,8 @@ default.
 
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
-| `contender_units` | list of systemd unit names | `[]` | | Units that compete with a write while they are active. A timer counts as active while it is armed. List this host's own heavy jobs here. |
-| `contender_processes` | list of process names | `["cargo", "rustc", "docker", "Runner.Worker"]` | | Process names, as in `/proc/<pid>/comm`, which the kernel truncates to 15 characters. Their presence counts as competition. |
+| `contender_units` | list of systemd unit names | `[]` | | Units that compete with a write while they are active. A timer counts as active while it is armed. List this host's own heavy jobs here. A unit systemd does not know (a typo, a missing `.timer`) is reported as "could not be checked" (#467). |
+| `contender_processes` | list of process names | `["cargo", "rustc", "docker", "Runner.Worker"]` | | Process names, as in `/proc/<pid>/comm`, which the kernel truncates to 15 characters. Their presence counts as competition. A longer name is compared on its first 15 characters, and `config check` warns about it (#467). |
 | `max_load_per_cpu` | float | `1.0` | greater than 0 | Above this 1-minute load average per CPU, the host counts as loaded. |
 | `min_available_mb` | integer (MiB) | `2048` | `0` turns the check off | Below this much `MemAvailable`, the host counts as short of memory. |
 | `max_memory_pressure_pct` | float | `10.0` | greater than 0, at most 100 | The limit for `/proc/pressure/memory` `full avg60`. |
@@ -1052,7 +1052,8 @@ Everything after the first line is advice. It never changes the exit code, and
 report as one object, with fields such as `valid`, `problems`, `dar`, `staging`,
 `staging_space`, `tape_devices`, `shadowing_dotfiles`, `unknown_keys`,
 `decorative_keys` (keys that do nothing, such as `dirty_on_metadata_change = true`),
-`subsumed_policy_fields` (the `preserve_acls` notes), `host_check`, `ops` and more.
+`subsumed_policy_fields` (the `preserve_acls` notes), `host_check` (with `warnings`
+for contender names longer than 15 characters), `ops` and more.
 
 Other commands fail on an invalid config with the first problem only, and exit 2:
 

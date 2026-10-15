@@ -175,7 +175,8 @@ declare a media type or a capacity: the generation of each cartridge is
 detected from the medium at `volume init`, and that tape's capacity follows
 from it. `capacity_override` exists for virtual drives and test harnesses
 only. There is no `backend edit`; to change a backend, edit its
-`[[backends.lto]]` table and run `tapectl config check`.
+`[[backends.lto]]` table by hand or with `tapectl config set
+'backends.lto[NAME].<key>' <value>`, then run `tapectl config check`.
 
 A minimal hand-written config looks like this (every key, its default and what
 it does are in [configuration.md](configuration.md)):
@@ -849,7 +850,11 @@ block. There is no health score: until production data sets thresholds
 (ADR-0012, 2026-10-06 item 11) these are figures to read, and the only
 `WARNING: worn cartridge?` lines are things the hardware itself raised — TapeAlert
 flags on the chip, a medium TapeAlert from the drive (`Media`, `Media life`,
-`Nearing media life`, `Not data grade`), or an unrecovered error on page 0x17.
+`Nearing media life`, `Not data grade`) raised by any reading since the
+cartridge's last passed full readback (not only the newest reading: whether page
+0x2E clears on read is unsettled, so a later clean reading proves nothing; #467),
+or an unrecovered error on page 0x17. The medium-flag line ends "…(page 0x2E),
+last at <when> — and no full readback has passed since".
 A warning never stops the write. If you see one, write that batch to another
 cartridge and retire this one. A line saying `no reading recorded` means tapectl
 has no figure, not that the figure is good.
@@ -2020,7 +2025,12 @@ the volume on it.
 The TapeAlert page (0x2E) may clear as it is read, so the poll runs only when
 no tapectl command has the drive: it takes the drive lock without waiting, and
 when a command holds it, it reads nothing and exits 75. A poll can therefore
-never take the alerts a write's or a verify's own reading is owed. Nor does it
+never take the alerts a write's or a verify's own reading is owed, within one
+tapectl home: the lock is `<home>/locks/drive-<node>.lock`, so a command run
+against another home (a throwaway rehearsal home, `--home` elsewhere) holds a
+different lock, and the poll does not see it. Stop the poll's timer for such
+runs (`sudo systemctl stop tapectl-drive-poll.timer`), as handoff (f) does for
+the step-12 rehearsal. Nor does it
 read a page the catalog cannot record: it takes the catalog's write lock and
 records its contact before the first page, and reads nothing when it cannot (75
 for a catalog another command is writing, 2 for one that refuses writes); a
@@ -2655,8 +2665,8 @@ overrides it.
 identification — never from whatever cartridge happens to be loaded, which is a
 fact about that tape and not about the drive. If it is ever wrong (you moved
 the config to a different drive, or declared it by hand), the refusal above
-names the `[[backends.lto]]` block to fix: there is no `backend edit`, so edit
-`generation` in config.toml and run `tapectl config check`.
+names the `[[backends.lto]]` block to fix, and the command that corrects it:
+`tapectl config set 'backends.lto[NAME].generation' LTO-N`, then `tapectl config check`.
 
 ## Key Management
 
