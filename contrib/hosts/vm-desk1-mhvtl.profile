@@ -39,3 +39,7 @@ COLLECTIONS=(
   "keepsake|/scratch/fr-src/keepsake|family|1"
 )
 CONTENDER_UNITS=()
+# Tape commands at raised priority (#432), as home2 runs them (these are also
+# first-run.sh's defaults). The re-entry scenario asserts them on the live write.
+TAPE_NICE=-10
+TAPE_IONICE="-c2 -n0"

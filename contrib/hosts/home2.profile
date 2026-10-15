@@ -29,6 +29,19 @@ STAGING_JOBS=2
 # built-in list plus java — the minecraft server here, which on 2026-10-12 made
 # a write use 1.5x its native tape (#426). The whole list: it replaces the default.
 CONTENDER_PROCESSES=(cargo rustc docker Runner.Worker java)
+# Tape commands (volume write, resume, verify, cartridge erase; and tapectl-op's
+# and the drive-poll unit's, via step 14) run at raised CPU and I/O priority:
+# vm-desk1 (homorg's work) shares this host's CPUs and array, and a busy host
+# starves the drive's feed (#426, #432). Priority can only be raised by root, so
+# first-run.sh and tapectl-op raise it as root and then drop to tapectl
+# (ADR-0012, 2026-10-15, item 58) — which needs root's sudo, not just the
+# AS-tapectl rule of home2-prep.sh part 8: step 13 asks for your password once
+# and keeps the ticket warm. Empty TAPE_NICE = never raise. The host-side lever
+# (lowering vm-desk1's weight) is printed by home2-prep.sh and is the CTO's and
+# homorg's founder's call.
+TAPE_NICE=-10
+TAPE_IONICE="-c2 -n0"
+
 _local_profile="${TAPECTL_LOCAL_PROFILE:-$HOME/.config/tapectl/home2.local.profile}"
 # shellcheck source=/dev/null
 [ -f "$_local_profile" ] && . "$_local_profile"

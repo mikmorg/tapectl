@@ -74,6 +74,10 @@ LOCATIONS=()           # step 10: "name|description" — the first is the shelf 
 TENANTS=()             # step 11: "name|description" — non-operator tenants to create
 COLLECTIONS=()         # step 11: "name|root|tenant|unit_depth" — [[collections]] to configure and sync
 OPS_GROUP=""           # step 7: a group that may read the session logs (`tapectl status`), e.g. tapectl-ops (issue #393); empty = none
+TAPE_NICE=-10          # step 13: nice value for the tape commands (volume write, resume, verify, cartridge erase) and
+                       # step 14: what the installer bakes into tapectl-op and the drive-poll unit (issue #432). Raised as
+                       # root, then dropped to the service user (ADR-0012 2026-10-15 item 58). Empty = never raise.
+TAPE_IONICE="-c2 -n0"  # the ionice arguments that go with it (best-effort, level 0). Empty = no I/O priority change.
 ESCROW_PUBLIC_KEY=""   # step 7: the ORIGINAL escrow public key (age1…, or a .pub path) for init to adopt instead of
                        # minting one — a rebuilt or fresh home that keeps the Heir Kit (ADR-0005, #139). Empty = ask
                        # (or, under --auto, mint).
@@ -127,6 +131,9 @@ Options:
   --work-dir DIR    build lock and step-12 rehearsal workspace (default /scratch if it exists,
                     else ~/.cache/tapectl)
   --staging DIR     default for staging.directory in step 7
+  --tape-nice N     nice value for the tape commands, raised as root and then dropped to the service user
+                    (default -10; empty = never raise; also step 14's tapectl-op and drive-poll unit)
+  --tape-ionice ARGS  ionice arguments for them (default '-c2 -n0'; empty = no I/O priority change)
   --adopt-keys-from DIR
                     steps 7 and 11 adopt DIR/<name>.key (an age identity file) as the operator's and
                     each profile tenant's key instead of minting one (docs/keys-and-recovery.md)
@@ -167,6 +174,8 @@ while [ $# -gt 0 ]; do
     --profile) shift 2 ;;   # already sourced above
     --work-dir) WORK_DIR="$2"; shift 2 ;;
     --staging) STAGING_DIR="$2"; shift 2 ;;
+    --tape-nice) TAPE_NICE="$2"; shift 2 ;;
+    --tape-ionice) TAPE_IONICE="$2"; shift 2 ;;
     --dar) DAR_BIN="$2"; shift 2 ;;
     --adopt-keys-from) ADOPT_KEYS_FROM="$2"; shift 2 ;;
     --escrow-public-key) ESCROW_PUBLIC_KEY="$2"; shift 2 ;;
@@ -175,6 +184,14 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+case "$TAPE_NICE" in
+  '' | [0-9] | 1[0-9] | -[0-9] | -1[0-9] | -20) ;;
+  *) echo "TAPE_NICE / --tape-nice must be an integer from -20 to 19, or empty to never raise; got '$TAPE_NICE'" >&2; exit 2 ;;
+esac
+case "$TAPE_IONICE" in
+  *[!-0-9\ cn]*) echo "TAPE_IONICE / --tape-ionice takes only ionice's -c CLASS and -n LEVEL (e.g. '-c2 -n0'); got '$TAPE_IONICE'" >&2; exit 2 ;;
+esac
 
 # ---------------------------------------------------------------- plumbing
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -291,6 +308,65 @@ run_capture_json_err() {
 # run_nolog: for the one command whose output must never be written to disk
 run_nolog() { printf '   %s$ %s%s\n' "$B" "$*" "$R"; log "\$ $* (output NOT logged)"; "$@"; }
 tc() { if [ -n "$HOME_DIR" ]; then as_svc "$TAPECTL" --home "$HOME_DIR" "$@"; else as_svc "$TAPECTL" "$@"; fi; }
+# tc_tape: `tc` for a command that streams the drive (volume write / resume /
+# verify, cartridge erase). The drive wants an even feed and a busy host
+# starves it (#426: a write used 1.505 bytes of tape per data byte); a process
+# cannot raise its own priority, so ADR-0012 2026-10-15 item 58 raises it as
+# root and then drops to the service user:
+#   sudo nice -n N ionice ARGS runuser -u USER -- tapectl [--home H] ...
+# runuser sets HOME, USER, LOGNAME and the service user's groups, as
+# `sudo -u USER -H` does. It raises only once tape_raise_setup (step 13) has
+# found that it can; until then, and whenever it cannot, this IS `tc`.
+TAPE_RAISE=0
+tc_tape() {
+  if [ "$TAPE_RAISE" != 1 ]; then tc "$@"; return; fi
+  local io=() home=()
+  [ -z "$TAPE_IONICE" ] || read -r -a io <<<"ionice $TAPE_IONICE"
+  [ -z "$HOME_DIR" ] || home=(--home "$HOME_DIR")
+  sudo nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} runuser -u "$SVC_USER" -- "$TAPECTL" ${home[@]+"${home[@]}"} "$@"
+}
+# tape_raise_setup: decide, once per run of step 13, whether tc_tape can raise.
+# Raising needs ROOT's sudo, which is not the sudo this script otherwise uses:
+# home2's sudoers rule (home2-prep.sh part 8) lets the operator run commands AS
+# the service user without a password, and root-level sudo still asks. So:
+# probe with `sudo -n`; if that needs a password and a person is here, ask once
+# (`sudo -v`) and keep the ticket warm while step 13 runs, because the verify
+# that follows a days-long write would otherwise sit at a prompt nobody answers;
+# under --auto, or when sudo refuses, run at normal priority and SAY so. The
+# priority is an aid to the feed, never a reason to fail a write.
+TAPE_KEEPALIVE_PID=""
+tape_raise_stop() {
+  [ -n "$TAPE_KEEPALIVE_PID" ] || return 0
+  pkill -P "$TAPE_KEEPALIVE_PID" 2>/dev/null || true
+  kill "$TAPE_KEEPALIVE_PID" 2>/dev/null || true
+  TAPE_KEEPALIVE_PID=""
+}
+tape_raise_setup() {
+  local io=() probe=()
+  TAPE_RAISE=0
+  if [ -z "$TAPE_NICE" ]; then note "TAPE_NICE is empty: the tape commands run at normal priority"; return 0; fi
+  if [ "$SVC_MODE" != 1 ]; then note "tapectl runs as you (--no-service-user): there is no root-then-drop path, so the tape commands run at normal priority"; return 0; fi
+  [ -z "$TAPE_IONICE" ] || read -r -a io <<<"ionice $TAPE_IONICE"
+  probe=(sudo -n nice -n "$TAPE_NICE" ${io[@]+"${io[@]}"} true)
+  if ! "${probe[@]}" >/dev/null 2>&1; then
+    if [ "$AUTO" = 1 ]; then
+      note "tape commands run at NORMAL priority: raising it needs root's sudo, which asks for a password, and --auto has no one to ask"
+      return 0
+    fi
+    note "raising the tape commands' priority needs root's sudo (it asks for YOUR password, once; the ticket is kept warm for this step)"
+    if ! sudo -v || ! "${probe[@]}" >/dev/null 2>&1; then
+      note "root's sudo is not available to you here"
+      confirm "Run the tape commands at NORMAL priority instead?" || die "stopped — fix sudo, or pass --tape-nice '' to never raise, then re-run scripts/first-run.sh --from 13"
+      return 0
+    fi
+  fi
+  TAPE_RAISE=1
+  # Quits with this script (the kill -0), and sooner if the ticket is gone.
+  ( while kill -0 "$$" 2>/dev/null; do sleep 60; sudo -n -v 2>/dev/null || exit 0; done ) >/dev/null 2>&1 &
+  TAPE_KEEPALIVE_PID=$!
+  trap tape_raise_stop EXIT
+  ok "tape commands run at nice $TAPE_NICE${TAPE_IONICE:+, ionice $TAPE_IONICE}, raised as root and dropped to $SVC_USER (ADR-0012 2026-10-15 item 58)"
+}
 # derive_nodes: NST/NSTN (the canonical st node) and SG (the sg node the
 # kernel binds to it) from $DEVICE. Step 6 computes these; every later step
 # that needs them recomputes them here, so `--from 8/12/13 --device X`
@@ -1195,7 +1271,7 @@ except Exception: pass' 2>/dev/null || true)"
   fi
   tape_lock
   explain <<'EOF'
-A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write and the verify below each read every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. The host's known contenders are the units listed below (CONTENDER_UNITS in its profile); on the dev VM they were the homorg runner's timers, and the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step.
+A QUIET HOST WHILE THE TAPE RUNS. The drive streams at up to 160 MB/s and stops and restarts (wasting tape and time) whenever the host feeds it slower than about 54 MB/s. The write and the verify below each read every byte through this machine, for as long as the data takes. Before you confirm: stop or pause anything on this host that competes for CPU, memory or the staging disk — CI runners and their timers, container builds, other backups. The host's known contenders are the units listed below (CONTENDER_UNITS in its profile); on the dev VM they were the homorg runner's timers, and the end-of-tape fill on 2026-09-24 only ran clean because they were paused. Nothing else should touch the drive: every tapectl harness takes /tmp/tapectl-tape.lock, and so does this step. To help, the tape commands of this step (write, resume, verify, erase) run at raised CPU and I/O priority, raised as root and dropped to the service user (TAPE_NICE and TAPE_IONICE in the profile; ADR-0012 2026-10-15 item 58); that outranks other work on the host, it does not replace the quiet.
 
 `tapectl host check` measures this (load, free memory, memory and I/O pressure, contender processes and units) and runs just before the WRITE confirmation below; you can run it yourself any time.
 EOF
@@ -1219,6 +1295,7 @@ EOF
     die "could not read volume $LABEL from the catalog (above) — fix that, then re-run scripts/first-run.sh --from 13"
   fi
   log "step 13: volume $LABEL is $VSTATE"
+  tape_raise_setup
   # The quiet-host check (ADR-0012, 2026-09-24 amendment, item 7), run right
   # before the WRITE or RESUME confirmation: staging's own dar load is over by
   # then, and what matters is the host the tape I/O will run on. `host check`
@@ -1257,7 +1334,7 @@ THIS VOLUME HAS AN INTERRUPTED WRITE. A run of this step (or a `volume write` by
 EOF
       quiet_host_check
       confirm "Resume the interrupted write of $LABEL on the cartridge in $DEVICE?" || die "stopped before resuming — re-run scripts/first-run.sh --from 13 --label $LABEL when ready"
-      run tc volume resume "$LABEL" --device "$DEVICE" || die "resume did not seal and confirm $LABEL — read the output; the catalog knows exactly why. Re-run scripts/first-run.sh --from 13 --label $LABEL once it is fixed"
+      run tc_tape volume resume "$LABEL" --device "$DEVICE" || die "resume did not seal and confirm $LABEL — read the output; the catalog knows exactly why. Re-run scripts/first-run.sh --from 13 --label $LABEL once it is fixed"
       ;;
     live)
       die "volume $LABEL has a write session in progress RIGHT NOW (another process is writing it — tapectl turns a crashed session into an interrupted one whenever it opens the catalog). Find that process and let it finish; do not start a second writer"
@@ -1478,7 +1555,7 @@ EOF
         confirm_destructive "ERASE the tape in $DEVICE, which holds $ERASE_WORD (shown above)" "$ERASE_WORD" || die "stopped before erasing; nothing was erased"
       fi
       erc=0
-      run tc cartridge erase --device "$DEVICE" --confirm-label "$ERASE_WORD" || erc=$?
+      run tc_tape cartridge erase --device "$DEVICE" --confirm-label "$ERASE_WORD" || erc=$?
       [ "$erc" = 0 ] || die "cartridge erase exited $erc (2 refused, nothing written; 3 unverified; 4 failed part-way; 6 the read-back contradicts the erase): read its message above, then re-run scripts/first-run.sh --from 13"
       ok "the tape is erased, read back and recorded"
       # Continue: init again. The short erase leaves File 0 EMPTY, which init
@@ -1525,7 +1602,7 @@ EOF
   # A write that stops (a signal, a dropped session, an error mid-tape) is
   # picked up by re-running this step: it finds the interrupted session and
   # offers `volume resume` (issue #414).
-  run tc volume write "$LABEL" --device "$DEVICE" --yes || die "write did not seal — read the output; the catalog knows exactly why. If it was interrupted, reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session"
+  run tc_tape volume write "$LABEL" --device "$DEVICE" --yes || die "write did not seal — read the output; the catalog knows exactly why. If it was interrupted, reload the same cartridge and re-run scripts/first-run.sh --from 13 --label $LABEL: it resumes the session"
 fi
   # Issue #265: a failed verify has TWO outcomes and they need opposite
   # responses. ADR-0012's 2026-09-17 amendment: only a mismatch that PROVES the
@@ -1536,7 +1613,7 @@ fi
   # silently changed the catalog.
   VERIFY_JSON="$(dirname "$LOG")/volume-verify-$LABEL.json"
   VERIFY_ERR="$(dirname "$LOG")/volume-verify-$LABEL.err"
-  if run_capture_json_err "$VERIFY_JSON" "$VERIFY_ERR" tc volume verify "$LABEL" --device "$DEVICE" --full --json; then
+  if run_capture_json_err "$VERIFY_JSON" "$VERIFY_ERR" tc_tape volume verify "$LABEL" --device "$DEVICE" --full --json; then
     ok "$LABEL sealed and verified"
   else
     # The loaded tape is not this volume: verify corroborates the cartridge
@@ -1594,6 +1671,7 @@ EOF
   run tc key escrow-kit --out "$KIT_OUT" && note "Reprint $KIT_OUT/COVER.txt — the catalog inside it now knows this tape."
   kit_finish "$KIT_OUT"
 fi
+tape_raise_stop   # the ticket was kept warm for the tape commands above; step 14 is not one
 }
 
 # ================================================================ step 14
@@ -1601,7 +1679,7 @@ hdr 14 "Timers, the operator wrapper, and what comes next"
 explain <<EOF
 Three timers and a wrapper finish the installation (ADR-0012, 2026-09-24 and 2026-10-07): a WEEKLY advisory audit (Monday 09:00, read-only, no tape; exit 1 = warnings is not a failure), a DAILY drive health poll (06:30: the drive's log pages and chip through /dev/sg* only — never the tape node, never a motion; a raised TapeAlert is a failure) and a DAILY catalog backup at 03:00 — \`tapectl db backup\` to $BACKUP_DIR, newest 14 kept, the copy checked for a SQLite header and the live catalog fsck'd — so the catalog outlives this disk. Put that directory on a SECOND disk (--backup-dir); the installer warns when it is on the same one. After a write session, \`sudo systemctl start tapectl-backup.service\` takes a copy at once. The wrapper /usr/local/bin/tapectl-op is \`sudo -u $SVC_USER -H tapectl\`, so you need not type the prefix. scripts/install-systemd.sh does all of it, idempotently — re-run it to change anything, --uninstall reverses it — and nothing in it moves a tape. docs/install.md is the runbook.
 EOF
-INSTALL_ARGS=(--tapectl "$TAPECTL" --backup-dir "$BACKUP_DIR")
+INSTALL_ARGS=(--tapectl "$TAPECTL" --backup-dir "$BACKUP_DIR" --tape-nice "$TAPE_NICE" --tape-ionice "$TAPE_IONICE")
 if [ "$SVC_MODE" = 1 ]; then INSTALL_ARGS+=(--user "$SVC_USER"); else INSTALL_ARGS+=(--user "$USER"); fi
 WRAPPER_INSTALLED=0
 if [ -n "$HOME_DIR" ]; then
@@ -1613,8 +1691,8 @@ elif confirm "Install the audit and backup timers and /usr/local/bin/tapectl-op 
   if run bash "$REPO/scripts/install-systemd.sh" "${INSTALL_ARGS[@]}"; then
     [ -x /usr/local/bin/tapectl-op ] && WRAPPER_INSTALLED=1
     ok "timers installed — systemctl list-timers 'tapectl-*' shows them"
-  else note "install-systemd.sh failed — fix what it printed and re-run it by hand: scripts/install-systemd.sh ${INSTALL_ARGS[*]}"; fi
-else note "skipped — later: scripts/install-systemd.sh ${INSTALL_ARGS[*]}"; fi
+  else note "install-systemd.sh failed — fix what it printed and re-run it by hand: scripts/install-systemd.sh $(printf '%q ' "${INSTALL_ARGS[@]}")"; fi
+else note "skipped — later: scripts/install-systemd.sh $(printf '%q ' "${INSTALL_ARGS[@]}")"; fi
 SUDO_PREFIX="$( [ "$SVC_MODE" = 1 ] && printf 'sudo -u %s -H ' "$SVC_USER" )"
 OP_CMD="${SUDO_PREFIX}tapectl"; [ "$WRAPPER_INSTALLED" = 1 ] && OP_CMD="tapectl-op"
 cat <<EOF
