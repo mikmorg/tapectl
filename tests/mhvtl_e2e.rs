@@ -97,7 +97,18 @@ fn discover_devices(ensure_media: bool) -> Option<MhvtlDevices> {
 }
 
 fn mhvtl_enabled() -> bool {
-    std::env::var("TAPECTL_MHVTL").is_ok() && Path::new(&tape_dev()).exists()
+    let on = std::env::var("TAPECTL_MHVTL").is_ok() && Path::new(&tape_dev()).exists();
+    // #471: the gate sets TAPECTL_GATE_REQUIRE_MEDIA, so a test that would skip
+    // there fails instead. A skip returns early and reports `ok`, which the
+    // gate could not tell from a pass.
+    if !on && std::env::var("TAPECTL_GATE_REQUIRE_MEDIA").is_ok() {
+        panic!(
+            "TAPECTL_GATE_REQUIRE_MEDIA is set but this test would skip: \
+             TAPECTL_MHVTL is unset or {} does not exist",
+            tape_dev()
+        );
+    }
+    on
 }
 
 /// Global lock so parallel tests don't race on the single tape device. Poison

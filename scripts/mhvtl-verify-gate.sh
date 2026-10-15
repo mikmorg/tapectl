@@ -20,7 +20,8 @@
 #      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
 #      real one.
 #
-# 40 checks (#400 is not exercisable on mhvtl; see its section); the `check` lines below are the list.
+# The `check` lines below are the list (43 since #444; #400 is not exercisable on mhvtl, see its
+# section). The verdict judges each by NAME against the manifest, never by a total (#471).
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
 # ticketed defects). The gate exits non-zero on any unexpected failure OR any
@@ -1698,10 +1699,38 @@ check erase_then_init_no_force step_erase_then_init_no_force
 # The build lock is taken here for the same reason line 79 takes it and for no
 # other: `cargo test` compiles. It is NOT wrapped around the whole leg -- the
 # tape work links nothing and must not hold the lock while a worker waits.
-step_rust_e2e() {
+# #471: a cargo leg passes only when every test it is there for ran and said
+# `ok`. cargo exits 0 when a name filter matches nothing, and an on-media test
+# that skips returns early and also says `ok`; TAPECTL_GATE_REQUIRE_MEDIA turns
+# such a skip into a panic, and ran_ok names each test that must have run.
+GATE_REPO="$(cd "$(dirname "$0")/.." && pwd)"
+ignored_tests() { # the #[ignore] test functions of a test file, one per line
+    awk '/^#\[ignore/{f=1; next} f && /^fn [a-z_0-9]+\(/{sub(/^fn /,""); sub(/\(.*/,""); print; f=0}' "$1"
+}
+ran_ok() { # ran_ok <log> <name>...: each named test reported ok
+    local log="$1" n; shift
+    [ "$#" -gt 0 ] || { echo "no test names to look for: the leg would prove nothing"; return 1; }
+    for n in "$@"; do
+        grep -E "^test $n \.\.\. ok\$" "$log" >/dev/null || { echo "test $n did not run and pass (see $log)"; return 1; }
+    done
+    echo "ran and passed: $*"
+}
+cargo_leg() { # cargo_leg <log> <want-count> <test-file> cargo-args...: run, then check every ignored test of the file
+    local log="$1" want="$2" file="$3" names rc; shift 3
+    names="$(ignored_tests "$GATE_REPO/$file")"
+    [ "$(wc -w <<<"$names")" -ge "$want" ] \
+        || { echo "found $(wc -w <<<"$names") ignored test(s) in $file, expected at least $want: the name extraction is broken"; return 1; }
     flock -w 1200 -E 99 /scratch/tapectl-build.lock \
-        env TAPECTL_GATE_TAPE="$TAPE_DEV" TAPECTL_MHVTL=1 \
-        cargo test --test mhvtl_e2e -- --ignored --nocapture
+        env TAPECTL_GATE_TAPE="$TAPE_DEV" TAPECTL_MHVTL=1 TAPECTL_GATE_REQUIRE_MEDIA=1 \
+        cargo test "$@" >"$log" 2>&1
+    rc=$?
+    cat "$log"
+    [ "$rc" = 0 ] || return "$rc"
+    # shellcheck disable=SC2086 # one name per word, by construction
+    ran_ok "$log" $names
+}
+step_rust_e2e() {
+    cargo_leg "$RUN/rust-e2e.out" 12 tests/mhvtl_e2e.rs --test mhvtl_e2e -- --ignored --nocapture
 }
 check rust_e2e          step_rust_e2e
 
@@ -1709,9 +1738,7 @@ check rust_e2e          step_rust_e2e
 # other_cnt. It writes the loaded cartridge, so it runs after every leg that
 # reads what the earlier legs wrote.
 step_rust_motions() {
-    flock -w 1200 -E 99 /scratch/tapectl-build.lock \
-        env TAPECTL_GATE_TAPE="$TAPE_DEV" TAPECTL_MHVTL=1 \
-        cargo test --test mhvtl_motions -- --ignored --nocapture
+    cargo_leg "$RUN/rust-motions.out" 1 tests/mhvtl_motions.rs --test mhvtl_motions -- --ignored --nocapture
 }
 check rust_motions      step_rust_motions
 
@@ -1721,10 +1748,16 @@ check rust_motions      step_rust_motions
 # debug build (measured 2026-10-15: 1.09x of two hash passes, ceiling 3x, ~80 s,
 # 2 GiB of memory), so the gate needs no release build. No tape.
 step_perf_write_2g() {
+    local log="$RUN/perf-write-2g.out" rc
     flock -w 1200 -E 99 /scratch/tapectl-build.lock \
         env TAPECTL_PERF_TESTS=1 \
         cargo test --test performance perf_a_2gib_write_and_full_confirm_through_a_store \
-            -- --ignored --nocapture
+            -- --ignored --nocapture >"$log" 2>&1
+    rc=$?
+    cat "$log"
+    [ "$rc" = 0 ] || return "$rc"
+    # A renamed test would match no filter, run nothing and exit 0 (#471).
+    ran_ok "$log" perf_a_2gib_write_and_full_confirm_through_a_store
 }
 check perf_write_2g     step_perf_write_2g
 

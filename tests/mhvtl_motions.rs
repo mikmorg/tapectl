@@ -14,8 +14,8 @@
 //! Gated as `tests/mhvtl_e2e.rs` is: `#[ignore]`, and a skip unless
 //! `TAPECTL_MHVTL` is set and `TAPECTL_GATE_TAPE` names an existing node.
 //! It WRITES the loaded cartridge from BOT, so `TAPECTL_GATE_TAPE` must be
-//! an mhvtl drive; `scripts/mhvtl-device.sh` refuses anything else. Not run
-//! by the gate.
+//! an mhvtl drive; `scripts/mhvtl-device.sh` refuses anything else. The
+//! gate runs it as its `rust_motions` leg.
 //!
 //!   TAPECTL_GATE_TAPE=/dev/nstN TAPECTL_MHVTL=1 \
 //!       cargo test --test mhvtl_motions -- --ignored --nocapture
@@ -35,7 +35,18 @@ fn tape_dev() -> String {
 }
 
 fn mhvtl_enabled() -> bool {
-    std::env::var("TAPECTL_MHVTL").is_ok() && Path::new(&tape_dev()).exists()
+    let on = std::env::var("TAPECTL_MHVTL").is_ok() && Path::new(&tape_dev()).exists();
+    // #471: the gate sets TAPECTL_GATE_REQUIRE_MEDIA, so a test that would skip
+    // there fails instead. A skip returns early and reports `ok`, which the
+    // gate could not tell from a pass.
+    if !on && std::env::var("TAPECTL_GATE_REQUIRE_MEDIA").is_ok() {
+        panic!(
+            "TAPECTL_GATE_REQUIRE_MEDIA is set but this test would skip: \
+             TAPECTL_MHVTL is unset or {} does not exist",
+            tape_dev()
+        );
+    }
+    on
 }
 
 /// Load a generation-matched cartridge through the one script that knows
