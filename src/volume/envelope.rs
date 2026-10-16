@@ -87,6 +87,59 @@ pub struct OpenedEnvelope {
     /// The operator envelope's `catalog.db` (issue #83), extracted to disk.
     /// `None` for tenant envelopes, which never carry it.
     pub catalog_db: Option<PathBuf>,
+    /// The dar catalogue files (`catalogs/<uuid8>_v<N>.<k>.dar`) of the
+    /// operator envelope, extracted to disk (issue #473). Empty for tenant
+    /// envelopes: the operator envelope carries every unit's catalogue
+    /// (`build::catalogs_for_all`), so reading the tenants' copies as well
+    /// would only double the scratch footprint of a rebuild.
+    pub catalogues: Vec<ExtractedCatalogue>,
+}
+
+/// One dar catalogue file taken out of an operator envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedCatalogue {
+    /// The member's file name inside `catalogs/`, e.g. `1a2b3c4d_v3.1.dar`.
+    pub file_name: String,
+    pub path: PathBuf,
+}
+
+/// `<stem>.<n>.dar` -> `<stem>` for a catalogue member name, else `None`:
+/// the stem a stage set's `catalog_path` ends in
+/// (`<home>/catalogs/<uuid8>/s<id>/<uuid8>_v<version>`), which dar takes as
+/// the base of `<stem>.1.dar`, `<stem>.2.dar`. Only plain file names are
+/// accepted — no separator, no `..` — because the name comes off a tape.
+pub(crate) fn catalogue_stem(file_name: &str) -> Option<&str> {
+    let plain = !file_name.is_empty()
+        && file_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !plain {
+        return None;
+    }
+    let without_dar = file_name.strip_suffix(".dar")?;
+    let (stem, number) = without_dar.rsplit_once('.')?;
+    let numbered = !number.is_empty() && number.chars().all(|c| c.is_ascii_digit());
+    (numbered && !stem.is_empty() && stem != "." && !stem.starts_with('.')).then_some(stem)
+}
+
+/// Whether any dar catalogue file exists on disk for a stage set whose
+/// `catalog_path` is `catalog_path` (the stem; dar's files are
+/// `<stem>.<n>.dar` beside it) — what `build` packs into an envelope, and
+/// silently packs nothing of when there is none (issue #473). The same
+/// discovery rule as `build::catalog_file_paths`, which is private to the
+/// build.
+pub(crate) fn catalogue_on_disk(catalog_path: &str) -> bool {
+    let base = Path::new(catalog_path);
+    let (Some(dir), Some(stem)) = (base.parent(), base.file_name().and_then(|f| f.to_str())) else {
+        return false;
+    };
+    let prefix = format!("{stem}.");
+    fs::read_dir(dir).is_ok_and(|rd| {
+        rd.flatten().any(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with(&prefix) && name.ends_with(".dar")
+        })
+    })
 }
 
 impl OpenedEnvelope {
@@ -214,6 +267,14 @@ fn unpack_envelope(
 
     let mut manifest_text: Option<String> = None;
     let mut catalog_db: Option<PathBuf> = None;
+    let mut catalogues: Vec<ExtractedCatalogue> = Vec::new();
+    let from_operator = matches!(
+        crate::volume::layout_model::ZoneKind::from_type_label(&entry.type_label),
+        Some(
+            crate::volume::layout_model::ZoneKind::OperatorEnvelope
+                | crate::volume::layout_model::ZoneKind::OperatorEnvelopeBackup
+        )
+    );
 
     let mut archive = tar::Archive::new(reader);
     for member in archive.entries().map_err(TapectlError::from)? {
@@ -238,10 +299,32 @@ fn unpack_envelope(
                 std::io::copy(&mut member, &mut out).map_err(TapectlError::from)?;
                 catalog_db = Some(path);
             }
-            // RECOVERY.md, PLAN.toml and the catalog-*.sql helpers are for
-            // a human at a terminal, not for a rebuild. Skipped, not an
-            // error — an envelope is free to carry more than we consume.
-            _ => {}
+            // The unit's dar catalogue (issue #473), operator envelope only:
+            // `catalog rebuild` puts it back where `stage create` would have,
+            // so a copy written after a rebuild carries it again. Streamed to
+            // disk, never held. A name that is not a plain catalogue file
+            // name is skipped like any other member we do not consume.
+            other => {
+                if let Some(file_name) = other.strip_prefix("catalogs/") {
+                    if from_operator && catalogue_stem(file_name).is_some() {
+                        let dir = scratch.join(format!("{:04}_catalogs", entry.position));
+                        fs::create_dir_all(&dir).map_err(TapectlError::from)?;
+                        let path = dir.join(file_name);
+                        let mut out =
+                            BufWriter::new(File::create(&path).map_err(TapectlError::from)?);
+                        std::io::copy(&mut member, &mut out).map_err(TapectlError::from)?;
+                        out.flush().map_err(TapectlError::from)?;
+                        catalogues.push(ExtractedCatalogue {
+                            file_name: file_name.to_string(),
+                            path,
+                        });
+                    }
+                }
+                // RECOVERY.md, PLAN.toml and the catalog-*.sql helpers are
+                // for a human at a terminal, not for a rebuild. Skipped, not
+                // an error — an envelope is free to carry more than we
+                // consume.
+            }
         }
     }
 
@@ -258,6 +341,7 @@ fn unpack_envelope(
         type_label: entry.type_label.clone(),
         manifest,
         catalog_db,
+        catalogues,
     })
 }
 
@@ -319,6 +403,7 @@ mod tests {
             type_label: type_label.to_string(),
             manifest: parse_manifest(&generated_manifest(tenant)).unwrap(),
             catalog_db: None,
+            catalogues: Vec::new(),
         };
         assert!(opened("operator_envelope", "operator").is_operator());
         assert!(opened("operator_envelope_backup", "operator").is_operator());
@@ -340,6 +425,46 @@ mod tests {
         let m = parse_manifest(&legacy).expect("a pre-#134 manifest must still parse");
         assert_eq!(m.units.len(), 1);
         assert_eq!(m.units[0].slices[0].tape_position, 9);
+    }
+
+    /// Issue #473: the catalogue member names an envelope carries
+    /// (`catalogs/<uuid8>_v<N>.<k>.dar`) reduce to the stem a stage set's
+    /// `catalog_path` ends in; anything that is not a plain file name from a
+    /// tape is refused rather than joined onto a path.
+    #[test]
+    fn a_catalogue_member_name_reduces_to_its_stem_and_only_plain_names_do() {
+        assert_eq!(catalogue_stem("1a2b3c4d_v3.1.dar"), Some("1a2b3c4d_v3"));
+        assert_eq!(catalogue_stem("1a2b3c4d_v3.12.dar"), Some("1a2b3c4d_v3"));
+        for bad in [
+            "",
+            "1a2b3c4d_v3.dar",
+            "1a2b3c4d_v3.x.dar",
+            "../1a2b3c4d_v3.1.dar",
+            "a/b_v1.1.dar",
+            ".hidden_v1.1.dar",
+            "..1.dar",
+            "1a2b3c4d_v3.1.dar.age",
+            "a b_v1.1.dar",
+        ] {
+            assert_eq!(catalogue_stem(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn catalogue_on_disk_finds_dars_beside_the_stem_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = dir.path().join("1a2b3c4d_v3");
+        let stem = stem.to_str().unwrap();
+        assert!(!catalogue_on_disk(stem), "nothing yet");
+        fs::write(dir.path().join("1a2b3c4d_v3.txt"), b"x").unwrap();
+        fs::write(dir.path().join("1a2b3c4d_v30.1.dar"), b"x").unwrap();
+        assert!(
+            !catalogue_on_disk(stem),
+            "another version's file is not ours"
+        );
+        fs::write(dir.path().join("1a2b3c4d_v3.1.dar"), b"x").unwrap();
+        assert!(catalogue_on_disk(stem));
+        assert!(!catalogue_on_disk("/nonexistent/dir/stem"));
     }
 
     /// A manifest with no units is well-formed (an empty tenant envelope),

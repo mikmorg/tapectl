@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tapectl::crypto::keys::{generate_keypair, GeneratedKeypair};
 use tapectl::db;
 use tapectl::staging;
-use tapectl::store::{MemStore, Tier};
+use tapectl::store::{MemStore, Store, Tier};
 use tapectl::tape::contact::{ContactSite, Medium, Operation};
 use tapectl::tape::mam::MamInfo;
 
@@ -149,6 +149,19 @@ fn build_sealed_volume(with_catalog_db: bool) -> SealedVolume {
     } else {
         CatalogDb::None
     })
+}
+
+thread_local! {
+    /// When set, every unit's stage set also has the dar catalogue
+    /// `stage create` leaves it (`<uuid8>_v7.1.dar`, bytes
+    /// [`catalogue_bytes`]) and the units carry uuids whose first eight
+    /// characters differ, as real uuids' do (issue #473).
+    static WITH_CATALOGUES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What the fixture's dar catalogue of `unit_name` holds.
+fn catalogue_bytes(unit_name: &str) -> Vec<u8> {
+    format!("dar catalogue of {unit_name}").into_bytes()
 }
 
 thread_local! {
@@ -335,6 +348,10 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
     let escrow = copy_keypair(&keys.escrow);
 
     let slices_dir = tempfile::tempdir().unwrap();
+    // Where the fixture's dar catalogues live while the session builds the
+    // envelopes (issue #473); `build` streams them out of here.
+    let catalogues_dir = tempfile::tempdir().unwrap();
+    let with_catalogues = WITH_CATALOGUES.with(|w| w.get());
     let mut build_units = Vec::new();
     let mut stage_set_ids = Vec::new();
     let mut expected_plain_hashes = Vec::new();
@@ -345,7 +362,11 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         } else {
             &bravo
         };
-        let unit_uuid = format!("unit-uuid-{i:04}");
+        let unit_uuid = if with_catalogues {
+            format!("c{i:07x}-0000-4000-8000-{i:012x}")
+        } else {
+            format!("unit-uuid-{i:04}")
+        };
         conn.execute(
             "INSERT INTO units (uuid, name, tenant_id, current_path, status)
              VALUES (?1, ?2, ?3, ?4, 'active')",
@@ -453,6 +474,18 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
             });
         }
 
+        let catalog_path = with_catalogues.then(|| {
+            // `stage create`'s layout: <catalogs>/<uuid8>/s<id>/<uuid8>_v<N>
+            let stem = format!("{}_v7", &unit_uuid[..8]);
+            let dir = catalogues_dir.path().join(format!("s{stage_set_id}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{stem}.1.dar")),
+                catalogue_bytes(unit_name),
+            )
+            .unwrap();
+            dir.join(&stem).to_string_lossy().into_owned()
+        });
         build_units.push(BuildUnit {
             stage_set_id,
             snapshot_id,
@@ -461,7 +494,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
             tenant_id: tenant.tenant_id,
             dar_version: Some("2.7.20".to_string()),
             dar_command: None,
-            catalog_path: None,
+            catalog_path,
             snapshot_version: 7,
             slices,
         });
@@ -4659,4 +4692,473 @@ fn a_lost_tenant_pair_does_not_mask_a_lost_operator_pair() {
         err.contains(&format!("operator_envelope at position {primary}")),
         "{err}"
     );
+}
+
+// ── Issue #473: a copy written after a rebuild carries its dar catalogues ──
+
+/// A tape whose stage sets had their dar catalogues, built with `keys`.
+fn build_tape_with_catalogues(keys: &FixtureKeys) -> SealedVolume {
+    WITH_CATALOGUES.with(|w| w.set(true));
+    let vol = build_tape(TapeSpec {
+        catalog_db: CatalogDb::New,
+        mam_serial: "REBUILDSERIAL",
+        cartridge_identity_source: Some("mam"),
+        label: LABEL,
+        volume_uuid: VOL_UUID,
+        keys,
+        slices_per_unit: 2,
+    });
+    WITH_CATALOGUES.with(|w| w.set(false));
+    vol
+}
+
+/// The first eight characters of unit `i`'s uuid in a tape built with
+/// catalogues, which name its catalogue file.
+fn catalogue_uuid8(i: usize) -> String {
+    format!("c{i:07x}")
+}
+
+/// A catalog in a tapectl home (a file-backed one: the catalogues are put
+/// under the home it lives in), with `vol` rebuilt into it by the operator
+/// key. `(home, catalog, report)`.
+fn rebuild_into_a_home(
+    vol: &mut SealedVolume,
+) -> (
+    tempfile::TempDir,
+    rusqlite::Connection,
+    rebuild::RebuildReport,
+) {
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(&home.path().join("tapectl.db")).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let report = rebuild(&conn, vol, &secret, scratch.path()).unwrap();
+    (home, conn, report)
+}
+
+fn catalog_path_of(conn: &rusqlite::Connection, unit_name: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT ss.catalog_path FROM stage_sets ss
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE u.name = ?1",
+        rusqlite::params![unit_name],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_rebuild_puts_each_stage_sets_dar_catalogue_back_where_stage_create_leaves_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let keys = FixtureKeys::fresh();
+    let mut vol = build_tape_with_catalogues(&keys);
+    let (home, conn, report) = rebuild_into_a_home(&mut vol);
+
+    assert_eq!(report.catalogues_restored, UNITS.len());
+    assert!(
+        report.sets_without_catalogue.is_empty(),
+        "{:?}",
+        report.sets_without_catalogue
+    );
+    for (i, (unit_name, _, _)) in UNITS.iter().enumerate() {
+        let uuid8 = catalogue_uuid8(i);
+        let (set_id, unit_uuid): (i64, String) = conn
+            .query_row(
+                "SELECT ss.id, u.uuid FROM stage_sets ss
+                 JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
+                rusqlite::params![unit_name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(unit_uuid.starts_with(&uuid8), "{unit_uuid}");
+        // The layout #419 gave `stage create`: per stage set, and `catalog_path`
+        // is the stem dar takes `.1.dar` from.
+        // The catalog's own spelling of its home: SQLite reports the real
+        // path, which differs from a tempdir's when `/tmp` is a link.
+        let home_path = home.path().canonicalize().unwrap();
+        let dir = home_path.join(format!("catalogs/{uuid8}/s{set_id}"));
+        let stem = dir.join(format!("{uuid8}_v7"));
+        assert_eq!(
+            catalog_path_of(&conn, unit_name).as_deref(),
+            Some(stem.to_string_lossy().as_ref()),
+            "{unit_name}"
+        );
+        let file = dir.join(format!("{uuid8}_v7.1.dar"));
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            catalogue_bytes(unit_name),
+            "{unit_name}: the bytes the tape carried"
+        );
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&file),
+            0o600,
+            "{unit_name}: a catalogue lists file names"
+        );
+        assert_eq!(mode(&dir), 0o700);
+    }
+    // Idempotent: a second rebuild finds the catalogues there and changes nothing.
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let again = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert_eq!(again.catalogues_restored, 0);
+    assert!(again.is_noop(), "{again:?}");
+}
+
+/// A catalog rebuilt before catalogues were put back (or one whose
+/// catalogue files were lost) is healed by running the rebuild again.
+#[test]
+fn a_second_rebuild_gives_a_set_that_lost_its_catalogue_one_again() {
+    let keys = FixtureKeys::fresh();
+    let mut vol = build_tape_with_catalogues(&keys);
+    let (home, conn, first) = rebuild_into_a_home(&mut vol);
+    assert_eq!(first.catalogues_restored, UNITS.len());
+    // As a pre-fix rebuild left them: no path, nothing on disk.
+    conn.execute("UPDATE stage_sets SET catalog_path = NULL", [])
+        .unwrap();
+    std::fs::remove_dir_all(home.path().join("catalogs")).unwrap();
+
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+    let healed = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert_eq!(healed.catalogues_restored, UNITS.len());
+    assert!(!healed.is_noop());
+    for (unit_name, _, _) in UNITS {
+        let path = catalog_path_of(&conn, unit_name).expect("a catalog_path again");
+        assert!(
+            Path::new(&format!("{path}.1.dar")).is_file(),
+            "{unit_name}: {path}"
+        );
+    }
+}
+
+/// The operator envelope carries EVERY unit's catalogue, so a tenant
+/// envelope unreadable in every copy (#451) costs the rebuild nothing here.
+#[test]
+fn a_lost_tenant_envelope_pair_does_not_cost_a_unit_its_catalogue() {
+    let keys = FixtureKeys::fresh();
+    let mut vol = build_tape_with_catalogues(&keys);
+    damage_envelope_pair(&mut vol, "tenant_envelope", 0);
+    let (_home, conn, report) = rebuild_into_a_home(&mut vol);
+
+    assert_eq!(report.unreadable_tenant_envelopes.len(), 1);
+    assert_eq!(report.catalogues_restored, UNITS.len());
+    assert!(report.sets_without_catalogue.is_empty());
+    for (unit_name, _, _) in UNITS {
+        assert!(catalog_path_of(&conn, unit_name).is_some(), "{unit_name}");
+    }
+}
+
+/// A tape written from sets that had no catalogue (the copy this issue is
+/// about, or one from before catalogues were kept) has none to give back,
+/// and the report names each such set.
+#[test]
+fn a_tape_that_carries_no_catalogue_names_the_sets_that_have_none() {
+    let mut vol = build_sealed_volume(true);
+    let (_home, conn, report) = rebuild_into_a_home(&mut vol);
+
+    assert_eq!(report.catalogues_restored, 0);
+    assert_eq!(
+        report.sets_without_catalogue,
+        vec![
+            "photos/2019 v7".to_string(),
+            "photos/2020 v7".to_string(),
+            "ledgers/fy24 v7".to_string()
+        ]
+    );
+    assert_eq!(catalog_path_of(&conn, "photos/2019"), None);
+}
+
+/// Read `entry` off `store` and list its tar members, or `None` when `secret`
+/// is not a recipient.
+fn envelope_members(
+    store: &mut MemStore,
+    entry: &tapectl::volume::format::ParsedIndexEntry,
+    secret: &str,
+) -> Option<Vec<String>> {
+    let mut bytes = Vec::new();
+    store.read_file(entry.position as u32, &mut bytes).unwrap();
+    bytes.truncate(entry.size_bytes.unwrap() as usize);
+    let id: age::x25519::Identity = secret.parse().unwrap();
+    let decryptor = age::Decryptor::new(&bytes[..]).unwrap();
+    let reader = match decryptor.decrypt(std::iter::once(&id as &dyn age::Identity)) {
+        Ok(r) => r,
+        Err(age::DecryptError::NoMatchingKeys) => return None,
+        Err(e) => panic!("decrypt: {e}"),
+    };
+    Some(
+        tar::Archive::new(reader)
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect(),
+    )
+}
+
+/// Write the stage sets `read-slices` staged in `conn` to a fresh volume
+/// `label2` in a `MemStore`, through the production session chain, as
+/// `volume write` would.
+fn write_staged_sets_to_a_second_volume(
+    conn: &rusqlite::Connection,
+    keys: &FixtureKeys,
+    label2: &str,
+) -> MemStore {
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+         VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'initialized')",
+        rusqlite::params![label2],
+    )
+    .unwrap();
+    let volume_id = conn.last_insert_rowid();
+
+    // `find_staged_data`'s selection.
+    let mut build_units = Vec::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT ss.id, ss.snapshot_id, u.name, u.uuid, u.tenant_id,
+                    ss.dar_version, ss.dar_command, ss.catalog_path, s.version
+             FROM stage_sets ss
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE ss.status = 'staged' ORDER BY u.name",
+        )
+        .unwrap();
+    let rows: Vec<_> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, i64>(8)?,
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    for (
+        stage_set_id,
+        snapshot_id,
+        unit_name,
+        unit_uuid,
+        tenant_id,
+        dar_version,
+        dar_command,
+        catalog_path,
+        version,
+    ) in rows
+    {
+        let mut slice_stmt = conn
+            .prepare(
+                "SELECT id, slice_number, size_bytes, encrypted_bytes, sha256_plain,
+                        sha256_encrypted, staging_path
+                 FROM stage_slices WHERE stage_set_id = ?1 AND staging_path IS NOT NULL
+                 ORDER BY slice_number",
+            )
+            .unwrap();
+        let slices: Vec<BuildSlice> = slice_stmt
+            .query_map(rusqlite::params![stage_set_id], |r| {
+                Ok(BuildSlice {
+                    slice_id: r.get(0)?,
+                    slice_number: r.get(1)?,
+                    size_bytes: r.get(2)?,
+                    encrypted_bytes: r.get(3)?,
+                    sha256_plain: r.get(4)?,
+                    sha256_encrypted: r.get(5)?,
+                    staging_path: std::path::PathBuf::from(r.get::<_, String>(6)?),
+                })
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            !slices.is_empty(),
+            "{unit_name}: read-slices staged nothing"
+        );
+        build_units.push(BuildUnit {
+            stage_set_id,
+            snapshot_id,
+            unit_name,
+            unit_uuid,
+            tenant_id,
+            dar_version,
+            dar_command,
+            catalog_path,
+            snapshot_version: version,
+            slices,
+        });
+    }
+
+    let tenant_id = |name: &str| -> i64 {
+        conn.query_row(
+            "SELECT id FROM tenants WHERE name = ?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let tenants = [
+        TenantInfo {
+            tenant_id: tenant_id("alpha"),
+            tenant_name: "alpha".to_string(),
+            public_keys: vec![keys.alpha.public_key.clone()],
+        },
+        TenantInfo {
+            tenant_id: tenant_id("bravo"),
+            tenant_name: "bravo".to_string(),
+            public_keys: vec![keys.bravo.public_key.clone()],
+        },
+    ];
+    let inputs = BuildInputs {
+        label: label2.to_string(),
+        volume_uuid: "66666666-7777-8888-9999-000000000000".to_string(),
+        media_type: "LTO-6".to_string(),
+        tapectl_version: "0.1.0-test".to_string(),
+        created_at: "2026-10-15T00:00:00Z".to_string(),
+        block_size: BS,
+        usable_bytes: 64 * 1024 * 1024,
+        enospc_buffer: 1024 * 1024,
+        nominal_capacity: 2_400_000_000,
+        mam_capacity: 2_400_000_000,
+        mam_manufacturer: "TAPECTL-TEST".to_string(),
+        mam_serial: "SECONDSERIAL".to_string(),
+        cartridge_identity_source: Some("mam".to_string()),
+        mam_length: 0,
+        mam_loads: 0,
+        units: build_units.clone(),
+        tenants: tenants.to_vec(),
+        operator_public_keys: vec![keys.operator.public_key.clone()],
+        escrow_public_key: Some(keys.escrow.public_key.clone()),
+        catalog_db_path: None,
+    };
+    let session_dir = tempfile::tempdir().unwrap();
+    let built = build::build(&inputs, session_dir.path()).expect("build succeeds");
+    let available = KeyAvailability {
+        tenant_ids: tenants.iter().map(|t| t.tenant_id).collect(),
+        tenants_with_active_key: tenants.iter().map(|t| t.tenant_id).collect(),
+        operator_key_present: true,
+        escrow_recipient_present: None,
+        stage_sets_lacking_escrow: None,
+    };
+    let mut store = MemStore::new(BS as usize);
+    let validated = built
+        .into_validated(&available, SliceCheck::Size, &mut store)
+        .expect("validate");
+    let planned = validated.plan(conn, volume_id, &build_units).expect("plan");
+    let ready = match planned.execute(conn, &mut store).expect("execute") {
+        ExecuteOutcome::Ready(r) => r,
+        _ => panic!("the second write must reach Ready"),
+    };
+    let sealed = ready.seal(&mut store).expect("seal");
+    match sealed
+        .confirm(conn, &mut store, Tier::Integrity)
+        .expect("confirm")
+    {
+        ConfirmOutcome::Sealed(_) => {}
+        _ => panic!("the second write must seal"),
+    }
+    store
+}
+
+/// The whole of issue #473: rebuild from a tape, `read-slices` it back, and
+/// write a second volume. Its envelopes carry the dar catalogues — before the
+/// fix they carried none, though that volume's RECOVERY.md says each does.
+#[test]
+fn a_copy_written_after_a_rebuild_and_read_slices_carries_the_dar_catalogues() {
+    let keys = FixtureKeys::fresh();
+    let mut vol = build_tape_with_catalogues(&keys);
+    let (home, conn, report) = rebuild_into_a_home(&mut vol);
+    assert_eq!(report.catalogues_restored, UNITS.len());
+
+    // `volume read-slices`, per unit, from the same tape.
+    let mut config = tapectl::config::Config::default();
+    config.staging.directory = home.path().join("staging").to_string_lossy().into_owned();
+    for (unit_name, _, _) in UNITS {
+        tapectl::volume::write::read_slices(
+            &conn,
+            &config,
+            LABEL,
+            unit_name,
+            None,
+            &mut vol.store,
+            ContactSite::new(
+                cfg(),
+                Operation::VolumeReadSlices,
+                "memstore",
+                Medium::NoBackend,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("read-slices {unit_name}: {e}"));
+    }
+
+    let mut second = write_staged_sets_to_a_second_volume(&conn, &keys, "REBUILD02");
+
+    let front_index: Vec<_> = {
+        let text = String::from_utf8_lossy(&second.files[3]).into_owned();
+        tapectl::volume::format::parse_front_index(text.trim_end_matches('\0')).unwrap()
+    };
+    // The operator envelope carries every unit's catalogue, byte for byte.
+    let operator_entry = front_index
+        .iter()
+        .find(|e| e.type_label == "operator_envelope")
+        .unwrap()
+        .clone();
+    let members =
+        envelope_members(&mut second, &operator_entry, &keys.operator.secret_key).unwrap();
+    for (i, (unit_name, _, _)) in UNITS.iter().enumerate() {
+        let name = format!("catalogs/{}_v7.1.dar", catalogue_uuid8(i));
+        assert!(
+            members.contains(&name),
+            "{unit_name}: the second volume's operator envelope holds {name}: {members:?}"
+        );
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let identity: age::x25519::Identity = keys.operator.secret_key.parse().unwrap();
+    let opened = tapectl::volume::envelope::open_envelope(
+        &mut second,
+        &operator_entry,
+        &[identity],
+        scratch.path(),
+    )
+    .map_err(|_| "open the operator envelope")
+    .unwrap();
+    assert_eq!(opened.catalogues.len(), UNITS.len());
+    for c in &opened.catalogues {
+        let i = (0..UNITS.len())
+            .find(|i| c.file_name == format!("{}_v7.1.dar", catalogue_uuid8(*i)))
+            .unwrap_or_else(|| panic!("unexpected catalogue {}", c.file_name));
+        assert_eq!(std::fs::read(&c.path).unwrap(), catalogue_bytes(UNITS[i].0));
+    }
+
+    // Each tenant's envelope holds its own units' catalogues (alpha owns the
+    // first two units, bravo the third) and only those.
+    let mut seen = 0;
+    for entry in front_index
+        .iter()
+        .filter(|e| e.type_label == "tenant_envelope")
+    {
+        if let Some(members) = envelope_members(&mut second, entry, &keys.alpha.secret_key) {
+            seen += 1;
+            let catalogues: Vec<&String> = members
+                .iter()
+                .filter(|m| m.starts_with("catalogs/"))
+                .collect();
+            assert_eq!(
+                catalogues,
+                vec![
+                    &format!("catalogs/{}_v7.1.dar", catalogue_uuid8(0)),
+                    &format!("catalogs/{}_v7.1.dar", catalogue_uuid8(1)),
+                ],
+                "alpha's tenant envelope: {members:?}"
+            );
+        }
+    }
+    assert_eq!(seen, 1, "exactly one tenant envelope is alpha's");
 }

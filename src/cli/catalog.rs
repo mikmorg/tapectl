@@ -416,6 +416,30 @@ fn rebuild_scratch(paths: &crate::config::TapectlPaths) -> Result<tempfile::Temp
     Ok(work)
 }
 
+/// What a rebuild did about the dar catalogues (issue #473): the sets that
+/// got theirs back from the operator envelope, and the ones left without.
+/// Empty when there is nothing to say.
+fn catalogue_lines(report: &crate::volume::rebuild::RebuildReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if report.catalogues_restored > 0 {
+        lines.push(format!(
+            "  dar catalogues: {} stage set(s) got theirs back from the operator envelope, so a \
+             copy written from them carries it again",
+            report.catalogues_restored
+        ));
+    }
+    if !report.sets_without_catalogue.is_empty() {
+        lines.push(format!(
+            "  note: no dar catalogue for {} — the tape carried none for them, or it could not \
+             be put back. A copy written from them has none in its envelopes: RESTORE.sh \
+             `--list` shows no files and `--path` cannot pick any; whole-unit restore is \
+             unaffected, and `tapectl volume write` names them again",
+            report.sets_without_catalogue.join(", ")
+        ));
+    }
+    lines
+}
+
 /// Run a `catalog` command that needs no tapectl home. `catalog rebuild`
 /// does (it decrypts into one) and is refused here; the binary calls
 /// [`run_with_paths`], which runs every command.
@@ -734,6 +758,10 @@ fn dispatch(
                 // could be read, which the rebuild went on without.
                 obj["unreadable_tenant_envelopes"] =
                     serde_json::json!(report.unreadable_tenant_envelopes);
+                // Issue #473: additive. The dar catalogues put back from the
+                // operator envelope, and the stage sets still without one.
+                obj["catalogues_restored"] = serde_json::json!(report.catalogues_restored);
+                obj["sets_without_catalogue"] = serde_json::json!(report.sets_without_catalogue);
                 println!("{obj}");
             } else {
                 println!(
@@ -891,6 +919,9 @@ fn dispatch(
                     );
                 }
                 for line in unreadable_envelope_lines(&report) {
+                    println!("{line}");
+                }
+                for line in catalogue_lines(&report) {
                     println!("{line}");
                 }
                 if !report.units_without_tenant_envelope.is_empty() {

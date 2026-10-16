@@ -6737,6 +6737,50 @@ fn render_staged_selection(label: &str, units: &[BuildUnit]) -> String {
 /// tape or even names a drive.
 fn announce_staged_selection(label: &str, units: &[BuildUnit]) {
     eprint!("{}", render_staged_selection(label, units));
+    eprint!("{}", render_catalogue_warnings(units));
+}
+
+/// A warning for each selected unit whose dar catalogue is not on disk
+/// (issue #473): `catalog_path` NULL (a stage set `catalog rebuild` made
+/// before it put catalogues back) or no `<stem>.<n>.dar` beside it (the
+/// file was removed). `build` packs the catalogue into the envelopes when it
+/// finds one and silently packs nothing otherwise, while the volume's
+/// RECOVERY.md says every unit's envelope holds it; the operator learns here,
+/// before the tape is touched, that this volume's copy of the unit cannot
+/// list or select files with RESTORE.sh. A warning, not a refusal: the
+/// archive itself is whole and restores as a unit. Empty when every unit has
+/// its catalogue.
+///
+/// A pure function for the reason [`render_staged_selection`] is one.
+fn render_catalogue_warnings(units: &[BuildUnit]) -> String {
+    let missing: Vec<&BuildUnit> = units
+        .iter()
+        .filter(|u| {
+            !u.catalog_path
+                .as_deref()
+                .is_some_and(super::envelope::catalogue_on_disk)
+        })
+        .collect();
+    if missing.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "warning: no dar catalogue on disk for these units, so the envelopes on this volume \
+         will carry none for them: RESTORE.sh `--list` will show no files and `--path` cannot \
+         pick any (whole-unit restore is unaffected):\n",
+    );
+    for u in missing {
+        out.push_str(&format!(
+            "  {} v{} (stage set {})\n",
+            u.unit_name, u.snapshot_version, u.stage_set_id
+        ));
+    }
+    out.push_str(
+        "  to give a unit one: load a cartridge that carries it and run `tapectl catalog \
+         rebuild --from-volume --key <operator or escrow key>`, or stage the version again \
+         from source\n",
+    );
+    out
 }
 
 #[cfg(test)]
@@ -12562,6 +12606,64 @@ mod tests {
 
     // ── issue #201: `volume write` announces the staged sets it is about
     // to write ──
+
+    fn unit_with_catalogue(
+        name: &str,
+        stage_set_id: i64,
+        version: i64,
+        catalog_path: Option<String>,
+    ) -> BuildUnit {
+        BuildUnit {
+            stage_set_id,
+            snapshot_id: stage_set_id,
+            unit_name: name.to_string(),
+            unit_uuid: format!("{name}-uuid"),
+            tenant_id: 1,
+            dar_version: None,
+            dar_command: None,
+            catalog_path,
+            snapshot_version: version,
+            slices: Vec::new(),
+        }
+    }
+
+    /// Issue #473: a unit whose dar catalogue is not on disk (no
+    /// `catalog_path`, or no `<stem>.<n>.dar` beside it) is named before the
+    /// tape is touched, because `build` packs a catalogue only if it finds
+    /// one; a unit that has it is not mentioned, and a clean selection says
+    /// nothing at all.
+    #[test]
+    fn render_catalogue_warnings_names_exactly_the_units_with_no_catalogue_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("aaaa1111_v1");
+        fs::write(dir.path().join("aaaa1111_v1.1.dar"), b"catalogue").unwrap();
+        let gone = dir.path().join("cccc3333_v1");
+        let has = unit_with_catalogue("alpha", 1, 1, Some(present.to_string_lossy().into()));
+        let none = unit_with_catalogue("beta", 2, 2, None);
+        let removed = unit_with_catalogue("gamma", 3, 1, Some(gone.to_string_lossy().into()));
+
+        assert_eq!(
+            render_catalogue_warnings(std::slice::from_ref(&has)),
+            "",
+            "a unit with its catalogue is not mentioned"
+        );
+        let warning = render_catalogue_warnings(&[has, none, removed]);
+        assert!(
+            warning.starts_with("warning: no dar catalogue on disk"),
+            "{warning}"
+        );
+        assert!(warning.contains("\n  beta v2 (stage set 2)\n"), "{warning}");
+        assert!(
+            warning.contains("\n  gamma v1 (stage set 3)\n"),
+            "{warning}"
+        );
+        assert!(!warning.contains("alpha"), "{warning}");
+        assert!(
+            warning.contains("catalog rebuild --from-volume")
+                && warning.contains("stage the version again"),
+            "it names the way out: {warning}"
+        );
+    }
 
     /// Exact text, multi-unit multi-version — issue #201's first acceptance
     /// property. Pinned, not `contains`-checked: a silently reworded

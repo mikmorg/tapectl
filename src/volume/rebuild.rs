@@ -320,6 +320,20 @@ pub struct RebuildReport {
     /// `None` whenever a cartridge WAS resolved (bound, registered, or
     /// refused outright).
     pub unbound_reason: Option<String>,
+    /// Stage sets that got their dar catalogue back this run (issue #473):
+    /// the operator envelope's `catalogs/<uuid8>_v<N>.<k>.dar` files copied
+    /// into `<home>/catalogs/<uuid8>/s<id>/` and `stage_sets.catalog_path`
+    /// set, exactly as `stage create` leaves them — so a copy written after
+    /// `volume read-slices` carries the catalogue in its envelopes again.
+    pub catalogues_restored: usize,
+    /// `<unit> v<N>` of each rebuilt stage set of this volume that has no
+    /// catalogue after this run (issue #473): the operator envelope carried
+    /// none for it (a tape written from a set that had none), it could not be
+    /// placed, or the catalog's home is unknown. Their next copy has no
+    /// catalogue in its envelopes (RESTORE.sh `--list` says so, and `--path`
+    /// is refused); `volume write` says so too. Whole-unit restore is
+    /// unaffected.
+    pub sets_without_catalogue: Vec<String>,
 }
 
 /// One unit with a completed write on a volume this rebuild displaced, and
@@ -381,6 +395,7 @@ impl RebuildReport {
             && self.positions == 0
             && self.files == 0
             && self.attested == 0
+            && self.catalogues_restored == 0
             && !self.cartridge_registered
             && !self.cartridge_bound
             && !self.serial_learned
@@ -697,7 +712,7 @@ fn rebuild_contacted(
     // header per unit off the tape, runs after the commit with each receipt
     // its own guarded UPDATE; the event is a second short transaction.
     let tx = crate::db::busy::immediate_tx(conn)?;
-    let volume_id = insert_all(
+    let inserted = insert_all(
         &tx,
         &ident.label,
         &ident.uuid,
@@ -710,6 +725,7 @@ fn rebuild_contacted(
         &supplement,
         &mut report,
     )?;
+    let volume_id = inserted.volume_id;
     resolve_and_bind_cartridge(
         &tx,
         volume_id,
@@ -721,6 +737,12 @@ fn rebuild_contacted(
         &mut report,
     )?;
     tx.commit()?;
+
+    // Issue #473: the dar catalogues, after the rows are committed (files
+    // placed inside the transaction would be orphaned by a rollback, and
+    // `staging clean` would not know them). Best effort per set: a set that
+    // cannot get its catalogue is named in the report, never a failed rebuild.
+    restore_catalogues(conn, operator, &inserted.sets, &mut report);
 
     // The rows above are committed, so the provenance event is recorded even
     // when attestation fails partway (a busy catalog, say); its error is
@@ -1400,7 +1422,7 @@ fn insert_all(
     backend_name: Option<&str>,
     supplement: &Supplement,
     report: &mut RebuildReport,
-) -> Result<i64> {
+) -> Result<Inserted> {
     // Resolved the same way `cli::operations::volume_import` does, falling
     // back to the type string — never an invented name like "rebuilt", which
     // would put a backend in the catalog that no config declares.
@@ -1492,6 +1514,7 @@ fn insert_all(
         }
     };
 
+    let mut sets = Vec::with_capacity(operator.units.len());
     for unit in &operator.units {
         // Resolve the unit BEFORE touching `tenants`: a unit the catalog
         // already knows keeps the tenant it already has, and creating that
@@ -1525,9 +1548,185 @@ fn insert_all(
         }
 
         ensure_files(tx, unit, snapshot_id, supplement, report)?;
+        sets.push(RebuiltSet {
+            stage_set_id,
+            unit_name: unit.name.clone(),
+            unit_uuid: unit.uuid.clone(),
+            version: unit.snapshot_version,
+        });
     }
 
-    Ok(volume_id)
+    Ok(Inserted { volume_id, sets })
+}
+
+/// What [`insert_all`] settled: the volume's row and, for each manifest unit,
+/// the stage set it landed on.
+struct Inserted {
+    volume_id: i64,
+    sets: Vec<RebuiltSet>,
+}
+
+/// A stage set of the volume being rebuilt, with what names its catalogue
+/// among the operator envelope's `catalogs/` members.
+struct RebuiltSet {
+    stage_set_id: i64,
+    unit_name: String,
+    /// The manifest's unit uuid — the one the writing catalogue named the
+    /// catalogue file by (`<uuid8>_v<version>`), which a local unit matched
+    /// by NAME may not share.
+    unit_uuid: String,
+    version: i64,
+}
+
+/// The tapectl home the catalog lives in, as `<home>/tapectl.db`'s directory
+/// — the rule `staging clean` uses for the lockfiles and its leftovers.
+/// `None` for an in-memory catalog, which has no home.
+fn catalog_home(conn: &Connection) -> Option<std::path::PathBuf> {
+    let db = conn.path().filter(|p| !p.is_empty())?;
+    let parent = Path::new(db).parent()?;
+    Some(if parent.as_os_str().is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        parent.to_path_buf()
+    })
+}
+
+/// Give each rebuilt stage set the dar catalogue its tape carried (issue
+/// #473): the operator envelope's `catalogs/<uuid8>_v<N>.<k>.dar` members,
+/// copied into `<home>/catalogs/<uuid8>/s<id>/` at 0600 (0700 directories)
+/// and recorded in `stage_sets.catalog_path` as the stem `stage create`
+/// records.
+///
+/// `catalog rebuild` used to leave `catalog_path` NULL and write nothing, so
+/// a set brought back with `volume read-slices` and written to a second tape
+/// had no catalogue in its envelopes — though that tape's RECOVERY.md still
+/// says it does — and RESTORE.sh `--path` died on it.
+///
+/// A set that already has a catalogue on disk is left alone (never
+/// overwritten: it may be a live set's own). A set the catalog knew before
+/// and that still lacks one gets it now, which is how a second `catalog
+/// rebuild` of the same tape heals a catalog rebuilt before this existed.
+/// Sets still without one are named in `report.sets_without_catalogue`.
+fn restore_catalogues(
+    conn: &Connection,
+    operator: &OpenedEnvelope,
+    sets: &[RebuiltSet],
+    report: &mut RebuildReport,
+) {
+    let home = catalog_home(conn);
+    let paths = home.map(crate::config::TapectlPaths::new);
+    let mut done: HashSet<i64> = HashSet::new();
+    for set in sets {
+        if !done.insert(set.stage_set_id) {
+            continue;
+        }
+        let label = format!("{} v{}", set.unit_name, set.version);
+        match place_catalogue(conn, operator, set, paths.as_ref()) {
+            Ok(Placed::Restored) => report.catalogues_restored += 1,
+            Ok(Placed::AlreadyThere) => {}
+            Ok(Placed::NotOnTape) => report.sets_without_catalogue.push(label),
+            Err(why) => {
+                tracing::warn!(
+                    unit = %set.unit_name,
+                    version = set.version,
+                    error = %why,
+                    "rebuild: could not put the dar catalogue back; the set has none"
+                );
+                report.sets_without_catalogue.push(label);
+            }
+        }
+    }
+}
+
+enum Placed {
+    Restored,
+    AlreadyThere,
+    NotOnTape,
+}
+
+fn place_catalogue(
+    conn: &Connection,
+    operator: &OpenedEnvelope,
+    set: &RebuiltSet,
+    paths: Option<&crate::config::TapectlPaths>,
+) -> Result<Placed> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT catalog_path FROM stage_sets WHERE id = ?1",
+            params![set.stage_set_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if existing.as_deref().is_some_and(envelope::catalogue_on_disk) {
+        return Ok(Placed::AlreadyThere);
+    }
+
+    // The tape's name for this set's catalogue: `<uuid8>_v<version>`.
+    let stem = format!(
+        "{}_v{}",
+        set.unit_uuid.get(..8).unwrap_or(&set.unit_uuid),
+        set.version
+    );
+    let members: Vec<&envelope::ExtractedCatalogue> = operator
+        .catalogues
+        .iter()
+        .filter(|c| envelope::catalogue_stem(&c.file_name) == Some(stem.as_str()))
+        .collect();
+    if members.is_empty() {
+        return Ok(Placed::NotOnTape);
+    }
+    let Some(paths) = paths else {
+        return Err(TapectlError::Other(
+            "the catalog is in memory, so there is no tapectl home to put a catalogue in"
+                .to_string(),
+        ));
+    };
+
+    // The directory is named by the LOCAL unit's uuid, as `stage create`
+    // and `staging clean` derive it.
+    let local_uuid: String = conn.query_row(
+        "SELECT u.uuid FROM stage_sets ss
+         JOIN snapshots sn ON sn.id = ss.snapshot_id
+         JOIN units u ON u.id = sn.unit_id
+         WHERE ss.id = ?1",
+        params![set.stage_set_id],
+        |r| r.get(0),
+    )?;
+    let dir = crate::staging::stage_set_catalogue_dir(paths, &local_uuid, set.stage_set_id);
+    let created = !dir.exists();
+    let copied = (|| -> Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        if let Some(unit_dir) = dir.parent() {
+            crate::config::secure_path(unit_dir, 0o700);
+        }
+        crate::config::secure_path(&dir, 0o700);
+        for member in &members {
+            let to = dir.join(&member.file_name);
+            std::fs::copy(&member.path, &to)?;
+            crate::config::secure_path(&to, 0o600);
+            std::fs::File::open(&to)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = copied {
+        if created {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        return Err(e);
+    }
+    let catalog_path = dir.join(&stem);
+    crate::db::busy::retry(
+        crate::db::busy::BusyPolicy::DEFAULT,
+        "the rebuilt stage set's catalogue",
+        || {
+            Ok(conn.execute(
+                "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
+                params![catalog_path.to_string_lossy().to_string(), set.stage_set_id],
+            )?)
+        },
+    )?;
+    Ok(Placed::Restored)
 }
 
 fn existing_id(tx: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Option<i64>> {
