@@ -368,7 +368,9 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
 
 /// A volume's resolved `verify_interval_days` (ADR-0012 2026-10-07 item 1):
 /// the tightest interval among the units written to it, or `None` when no
-/// unit on it has one.
+/// unit has been written to it at all (every unit has an interval since
+/// ADR-0012 item 75: its archive set's, else `[defaults]`'s, 365 days when
+/// the key is absent).
 ///
 /// The interval is a unit's policy and a volume holds many units, so the
 /// volume answers to the strictest of them. Each unit's interval resolves as

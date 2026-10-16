@@ -1766,8 +1766,9 @@ fn check_volume_verify_age(ctx: &Ctx<'_>) -> Result<Findings> {
 
 /// `defaults_interval` is `[defaults] verify_interval_days` (#453): a unit
 /// with no archive set, or whose set carries no interval, takes it, as
-/// `policy::resolve` does. Without it, a host with no archive sets (home2)
-/// would never have a per-volume clock.
+/// `policy::resolve` does (365 days when the file does not say, ADR-0012
+/// item 75). Without it, a host with no archive sets (home2) would have no
+/// per-volume clock.
 fn volume_verify_age_findings(
     conn: &Connection,
     defaults_interval: Option<i64>,
@@ -3215,8 +3216,9 @@ mod tests {
             // days by default, ADR-0012 item 75) has its own say; the dirty
             // scan must not be among the warnings.
             assert!(
-                warnings.iter().all(|w| w.check != "dirty"),
-                "an unreadable dirty scan must not be downgraded to a warning: {warnings:?}"
+                warnings.iter().all(|w| w.check == "verify_age"),
+                "an unreadable dirty scan must not be downgraded to a warning, and \
+                 nothing but the 365-day verify_age may be left: {warnings:?}"
             );
             assert_eq!(
                 violations.len(),
