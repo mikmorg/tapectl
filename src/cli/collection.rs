@@ -46,7 +46,7 @@ pub enum CollectionCommands {
     /// collection.
     Status,
 
-    /// Show the batch plan (alphabetical first-fit, §7) for every
+    /// Show the batch plan (alphabetical next-fit, §7) for every
     /// configured collection's pending units.
     Plan {
         /// Copies to plan for — informational only (batches don't change;
@@ -475,6 +475,41 @@ fn cmd_status(conn: &Connection, config: &Config, json_output: bool) -> Result<i
     Ok(refused_exit_code(any_refused))
 }
 
+/// `collection plan`'s `largest_unit` JSON object, or `null` when nothing is
+/// pending (issue #456).
+fn largest_unit_json(largest: Option<&collection::plan::LargestUnit>) -> serde_json::Value {
+    match largest {
+        None => serde_json::Value::Null,
+        Some(l) => serde_json::json!({
+            "name": l.name,
+            "bytes": l.size_bytes,
+            "tape_budget_bytes": l.tape_budget_bytes,
+            "percent_of_tape_budget": l.percent_of_tape_budget,
+            "above_a_tenth_of_a_cartridge": l.above_a_tenth_of_a_cartridge,
+        }),
+    }
+}
+
+/// `collection plan`'s largest-unit line (issue #456): the unit, its size and
+/// its share of the tape; past a tenth of a cartridge it says why that
+/// matters (ADR-0012 2026-10-15 item 69).
+fn largest_unit_line(l: &collection::plan::LargestUnit) -> String {
+    let mut line = format!(
+        "largest unit: {}, {} ({:.1}% of the tape's {} budget)",
+        l.name,
+        crate::util::format_bytes_binary(i64::try_from(l.size_bytes).unwrap_or(i64::MAX)),
+        l.percent_of_tape_budget,
+        crate::util::format_bytes_binary(i64::try_from(l.tape_budget_bytes).unwrap_or(i64::MAX)),
+    );
+    if l.above_a_tenth_of_a_cartridge {
+        line.push_str(
+            " — above a tenth of a cartridge: the packing order (alphabetical next-fit) \
+             is due a re-examination (ADR-0012 2026-10-15 item 69)",
+        );
+    }
+    line
+}
+
 fn cmd_plan(
     conn: &Connection,
     config: &Config,
@@ -492,7 +527,7 @@ fn cmd_plan(
     let mut rows = Vec::new();
     let mut any_refused = false;
     for lib in &config.collections {
-        let (batches, refused) = collection::plan::plan_for_collection(
+        let (batches, refused, tape) = collection::plan::plan_for_collection_with_budget(
             conn,
             config,
             lib,
@@ -501,12 +536,15 @@ fn cmd_plan(
             policy_aware,
         )?;
         any_refused |= !refused.is_empty();
-        rows.push((lib.name.clone(), batches, refused));
+        // Issue #456: the largest unit beside the tape, so ADR-0012 item 69's
+        // trigger (a unit above a tenth of a cartridge) is visible.
+        let largest = collection::plan::largest_unit(&batches, &tape);
+        rows.push((lib.name.clone(), batches, refused, largest));
     }
     // `--policy-aware` (issue #144): what each prioritised unit falls short
     // of, printed beside it so the order explains itself.
     let findings = if policy_aware {
-        shortfalls(conn, config, rows.iter().flat_map(|(_, b, _)| b.iter()))?
+        shortfalls(conn, config, rows.iter().flat_map(|(_, b, _, _)| b.iter()))?
     } else {
         std::collections::HashMap::new()
     };
@@ -514,7 +552,7 @@ fn cmd_plan(
     if json_output {
         let json: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, batches, refused)| {
+            .map(|(name, batches, refused, largest)| {
                 let batch_json: Vec<serde_json::Value> = batches
                     .iter()
                     .enumerate()
@@ -538,13 +576,14 @@ fn cmd_plan(
                     "policy_aware": policy_aware,
                     "batches": batch_json,
                     "cartridges_needed": batches.len() as i64 * copies,
+                    "largest_unit": largest_unit_json(largest.as_ref()),
                     "refused": refused_json(refused),
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        for (name, batches, refused) in &rows {
+        for (name, batches, refused, largest) in &rows {
             if batches.is_empty() {
                 println!("collection \"{name}\": nothing pending");
             } else {
@@ -568,6 +607,9 @@ fn cmd_plan(
                     batches.len(),
                     batches.len() as i64 * copies,
                 );
+                if let Some(l) = largest {
+                    println!("  {}", largest_unit_line(l));
+                }
             }
             // Printed regardless of whether `batches` is empty — the
             // `continue` this replaced (issue #285) used to skip refusal
@@ -1204,5 +1246,47 @@ mod checksum_mode_tests {
             "mtime_size",
             "a later [defaults] change must not be applied retroactively"
         );
+    }
+
+    fn largest(bytes: u64, percent: f64, above: bool) -> collection::plan::LargestUnit {
+        collection::plan::LargestUnit {
+            name: "testlib/beta".into(),
+            size_bytes: bytes,
+            tape_budget_bytes: 10 * 1024 * 1024,
+            percent_of_tape_budget: percent,
+            above_a_tenth_of_a_cartridge: above,
+        }
+    }
+
+    /// Issue #456: the human line names the unit, its size and its share of
+    /// the tape; past a tenth of a cartridge it also says the packing order
+    /// is due a re-examination, and below it does not.
+    #[test]
+    fn the_largest_unit_line_names_the_unit_its_size_and_its_share() {
+        let line = largest_unit_line(&largest(3 * 1024 * 1024, 30.0, true));
+        assert!(
+            line.starts_with(
+                "largest unit: testlib/beta, 3.0 MiB (30.0% of the tape's 10.0 MiB budget)"
+            ),
+            "{line}"
+        );
+        assert!(line.contains("above a tenth of a cartridge"), "{line}");
+        assert!(line.contains("item 69"), "{line}");
+
+        let line = largest_unit_line(&largest(512 * 1024, 5.0, false));
+        assert!(line.contains("(5.0% of the tape's"), "{line}");
+        assert!(!line.contains("above a tenth"), "{line}");
+    }
+
+    /// `--json` carries the same facts, and `null` when nothing is pending.
+    #[test]
+    fn the_largest_unit_json_carries_the_share_and_is_null_when_nothing_is_pending() {
+        let json = largest_unit_json(Some(&largest(3 * 1024 * 1024, 30.0, true)));
+        assert_eq!(json["name"], "testlib/beta");
+        assert_eq!(json["bytes"], 3 * 1024 * 1024);
+        assert_eq!(json["tape_budget_bytes"], 10 * 1024 * 1024);
+        assert_eq!(json["percent_of_tape_budget"], 30.0);
+        assert_eq!(json["above_a_tenth_of_a_cartridge"], true);
+        assert!(largest_unit_json(None).is_null());
     }
 }

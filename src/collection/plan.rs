@@ -33,7 +33,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::config::{CollectionConfig, Config};
+use crate::config::{CollectionConfig, Config, TapeBudget};
 use crate::error::{PolicyLayer, Result, TapectlError};
 use crate::policy::coverage;
 
@@ -53,7 +53,7 @@ const BLOCK_SIZE: u64 = 512 * 1024;
 
 /// The budget-agnostic core: pack one collection's pending units against an
 /// already-resolved per-tape budget in bytes. Neither the pending-unit
-/// lookup nor `selector::plan_batches`' first-fit packing cares where the
+/// lookup nor `selector::plan_batches`' next-fit packing cares where the
 /// budget came from — that seam is exactly what lets [`plan_for_collection`]
 /// (a media generation) and [`plan_for_run`] (a destination volume's own
 /// row) share one implementation instead of two copies that could drift.
@@ -247,6 +247,22 @@ pub fn plan_for_collection(
     // `--policy-aware` (issue #144): see `batches_for_budget`.
     policy_aware: bool,
 ) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
+    let (batches, refused, _tape) =
+        plan_for_collection_with_budget(conn, config, lib, media, device, policy_aware)?;
+    Ok((batches, refused))
+}
+
+/// [`plan_for_collection`] and the per-tape budget it packed against, for
+/// `collection plan`'s report of how big the largest unit is beside it
+/// (issue #456, [`largest_unit`]).
+pub fn plan_for_collection_with_budget(
+    conn: &Connection,
+    config: &Config,
+    lib: &CollectionConfig,
+    media: Option<&str>,
+    device: Option<&str>,
+    policy_aware: bool,
+) -> Result<(Vec<Batch>, Vec<RefusedUnit>, TapeBudget)> {
     let backend = crate::config::resolve_lto_backend(config, device)?;
     // `.max(0)` dropped (issue #59): `parse_size_to_bytes` now rejects a
     // negative value with `Err` rather than letting one flow through as a
@@ -256,7 +272,7 @@ pub fn plan_for_collection(
     // one value, so the refusal names the figures the packing used.
     let tape = backend.planning_tape_budget(media)?;
 
-    batches_for_budget(
+    let (batches, refused) = batches_for_budget(
         conn,
         config,
         lib,
@@ -264,7 +280,48 @@ pub fn plan_for_collection(
         &tape.describe(),
         None,
         policy_aware,
-    )
+    )?;
+    Ok((batches, refused, tape))
+}
+
+/// The largest pending unit of a plan, beside the tape it must fit (issue
+/// #456, ADR-0012 2026-10-15 item 69).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LargestUnit {
+    pub name: String,
+    /// The unit's estimated size (the plaintext walk, as the batches carry
+    /// it).
+    pub size_bytes: u64,
+    /// The per-tape budget the plan packed against.
+    pub tape_budget_bytes: u64,
+    /// `size_bytes` as a percentage of `tape_budget_bytes`.
+    pub percent_of_tape_budget: f64,
+    /// The unit is above a tenth of the cartridge generation's capacity: the
+    /// trigger on which §7's next-fit premise (2-15 GB units against 2.2 TB
+    /// tapes) is re-examined (a `--pack` order beside `--policy-aware`).
+    pub above_a_tenth_of_a_cartridge: bool,
+}
+
+/// The largest unit across `batches`, as a share of `tape`. `None` when
+/// nothing is pending. Ties go to the unit placed first.
+pub fn largest_unit(batches: &[Batch], tape: &TapeBudget) -> Option<LargestUnit> {
+    let mut largest: Option<&selector::PendingUnit> = None;
+    for u in batches.iter().flat_map(|b| b.units.iter()) {
+        if largest.is_none_or(|l| u.size_bytes > l.size_bytes) {
+            largest = Some(u);
+        }
+    }
+    largest.map(|u| LargestUnit {
+        name: u.name.clone(),
+        size_bytes: u.size_bytes,
+        tape_budget_bytes: tape.bytes,
+        percent_of_tape_budget: if tape.bytes == 0 {
+            0.0
+        } else {
+            u.size_bytes as f64 * 100.0 / tape.bytes as f64
+        },
+        above_a_tenth_of_a_cartridge: u.size_bytes.saturating_mul(10) > tape.capacity_bytes,
+    })
 }
 
 /// `collection run`'s per-tape budget (issue #175): resolved from the
@@ -2315,5 +2372,87 @@ compression = "bogus"
         let msg = run_one(&conn, &lib).unwrap_err().to_string();
         assert!(msg.contains("can never be batched"), "{msg}");
         assert!(!msg.contains("staged data already"), "{msg}");
+    }
+
+    /// Issue #456: `collection plan` reports the largest pending unit as a
+    /// share of the tape's budget. Three units of 1, 3 and 2 MiB against the
+    /// 10 MB tiny backend: the 3 MiB one is 31.5% of the tape, and above a
+    /// tenth of the cartridge; with no unit pending there is nothing to
+    /// report.
+    #[test]
+    fn the_largest_pending_unit_is_reported_as_a_share_of_the_tape() {
+        let conn = db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let (lib, _root, _home) = collection_of(
+            &conn,
+            &[
+                ("alpha", 1024 * 1024),
+                ("beta", 3 * 1024 * 1024),
+                ("gamma", 2 * 1024 * 1024),
+            ],
+        );
+        let (batches, refused, tape) = plan_for_collection_with_budget(
+            &conn,
+            &config_with_tiny_backend(),
+            &lib,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(refused.is_empty());
+        let largest = largest_unit(&batches, &tape).expect("units are pending");
+        assert_eq!(largest.name, "testlib/beta");
+        // The walk also counts the unit's own dotfile, a few hundred bytes.
+        assert!(
+            (3 * 1024 * 1024..3 * 1024 * 1024 + 4096).contains(&largest.size_bytes),
+            "{}",
+            largest.size_bytes
+        );
+        // `capacity_override = "10M"`: cartridge capacities are decimal.
+        assert_eq!(largest.tape_budget_bytes, 10_000_000);
+        assert!(
+            (31.4..31.6).contains(&largest.percent_of_tape_budget),
+            "{}",
+            largest.percent_of_tape_budget
+        );
+        assert!(largest.above_a_tenth_of_a_cartridge);
+
+        assert_eq!(largest_unit(&[], &tape), None);
+    }
+
+    /// The trigger is a TENTH of the cartridge generation's capacity, not of
+    /// the budget: a unit at exactly a tenth of the capacity is not past it,
+    /// and one byte more is.
+    #[test]
+    fn a_unit_is_above_a_tenth_of_a_cartridge_only_past_a_tenth_of_its_capacity() {
+        let tape = TapeBudget::new("one LTO-8 tape".into(), 1000, 0.9, 0, false);
+        let batch = |bytes: u64| {
+            let mut b = Batch::default();
+            b.units.push(selector::PendingUnit {
+                name: "u".into(),
+                size_bytes: bytes,
+            });
+            vec![b]
+        };
+        assert!(
+            !largest_unit(&batch(100), &tape)
+                .unwrap()
+                .above_a_tenth_of_a_cartridge
+        );
+        assert!(
+            largest_unit(&batch(101), &tape)
+                .unwrap()
+                .above_a_tenth_of_a_cartridge
+        );
+        // The share is of the BUDGET (900 bytes), not the capacity.
+        let share = largest_unit(&batch(90), &tape)
+            .unwrap()
+            .percent_of_tape_budget;
+        assert!((share - 10.0).abs() < 1e-9, "{share}");
     }
 }

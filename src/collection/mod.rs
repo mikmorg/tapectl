@@ -11,8 +11,8 @@
 //!
 //! Deliberately out of scope (§11): filesystem watching/daemons (#13
 //! verdict), scheduled sync, any cross-collection dedup (#12 — full-only
-//! stands), and best-fit-decreasing packing (§7 — alphabetical first-fit
-//! preserves the name-ordered "tape spine").
+//! stands), and best-fit-decreasing packing (§7 — alphabetical next-fit
+//! preserves the name-ordered "tape spine"; issue #456).
 
 pub mod batch;
 pub mod fingerprint;

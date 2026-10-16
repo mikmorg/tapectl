@@ -45,7 +45,7 @@ tapectl\-collection\-status(1)
 Show pending/dirty/missing/under\-copied counts for every configured collection
 .TP
 tapectl\-collection\-plan(1)
-Show the batch plan (alphabetical first\-fit, §7) for every configured collection\*(Aqs pending units
+Show the batch plan (alphabetical next\-fit, §7) for every configured collection\*(Aqs pending units
 .TP
 tapectl\-collection\-run(1)
 Execute one batch: stage every unit in it once, write one session to the destination label, then release staging IF that copy already satisfies every unit\*(Aqs resolved `min_copies` — otherwise staging is retained for the further copies still needed. Targets a single collection (unlike `sync`/`status`/`plan`, which sweep every configured collection) since a batch write is a real, one\-shot tape action

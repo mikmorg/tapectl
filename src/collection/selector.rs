@@ -1,5 +1,8 @@
 //! The batch selector (`docs/design/v2-open-questions.md` §11, formalizing
-//! the §7 ruling): alphabetical first-fit over pending units.
+//! the §7 ruling): alphabetical NEXT-fit over pending units — a batch closes
+//! at the first unit that does not fit and is never reopened (issue #456;
+//! §7 and this module's docstrings called it first-fit, which would go back
+//! to earlier batches for a smaller unit).
 //!
 //! Pure arithmetic over sizes — no filesystem, no DB, no tape — so it can be
 //! drilled at full production scale (~600 units) in milliseconds
@@ -11,7 +14,12 @@
 //! greedy fill wastes ≈ avg_unit/2 ≈ 4 G ≈ 0.2% per tape (worst 0.7%);
 //! size-ordered BFD recovers ≤ 0.6% (~0.04 tapes across the fleet) while
 //! destroying the name-ordered "tape spine" property (tape 9 = M-P), which
-//! has real operational value. Alphabetical first-fit stands.
+//! has real operational value. The alphabetical order stands, and with it
+//! next-fit: reopening an earlier batch for a later, smaller unit would break
+//! the same spine. §7's premise (2-15 G units against 2.2 TB bins) is
+//! re-examined when a registered unit passes a tenth of its cartridge
+//! generation's capacity (ADR-0012 2026-10-15 item 69); `collection plan`
+//! prints the largest pending unit's share of the tape so that is visible.
 
 use crate::volume::layout_model::pad_to_blocks;
 
@@ -91,11 +99,13 @@ impl std::fmt::Display for OversizedUnit {
 
 impl std::error::Error for OversizedUnit {}
 
-/// Greedily fill batches, alphabetical first-fit (§7 ruling — explicitly
-/// NOT best-fit-decreasing): sort pending units by name, then walk the
-/// sorted list, placing each unit into the current batch if it fits (Σ
-/// block-padded sizes ≤ `budget_bytes`), else closing the batch and
-/// starting a new one with that unit.
+/// Greedily fill batches, alphabetical NEXT-fit (§7 ruling — explicitly
+/// NOT best-fit-decreasing, and not first-fit either: issue #456): sort
+/// pending units by name, then walk the sorted list, placing each unit into
+/// the current batch if it fits (Σ block-padded sizes ≤ `budget_bytes`),
+/// else closing the batch for good and starting a new one with that unit. A
+/// closed batch is never reopened for a later, smaller unit; that is what
+/// keeps each tape a contiguous run of the alphabet (the "tape spine").
 ///
 /// `budget_bytes` is the caller's already-netted `usable − enospc_buffer`;
 /// `block_size` is the format constant the caller pads against (512 KiB in
@@ -111,11 +121,11 @@ pub fn plan_batches(
     block_size: u64,
 ) -> Result<Vec<Batch>, Vec<OversizedUnit>> {
     units.sort_by(|a, b| a.name.cmp(&b.name));
-    first_fit(units, budget_bytes, block_size)
+    next_fit(units, budget_bytes, block_size)
 }
 
 /// `--policy-aware` (ADR-0012, 2026-10-07 item 26; issue #144): the same
-/// first-fit as [`plan_batches`], over a different order. The units named
+/// next-fit as [`plan_batches`], over a different order. The units named
 /// in `prioritised` — the caller's set of units whose audit findings a
 /// write would resolve (too few copies, a required location with no copy:
 /// `policy::coverage::shortfall`) — are placed first, in name order, and
@@ -135,12 +145,12 @@ pub fn plan_batches_prioritised(
     units.sort_by(|a, b| {
         (!prioritised.contains(&a.name), &a.name).cmp(&(!prioritised.contains(&b.name), &b.name))
     });
-    first_fit(units, budget_bytes, block_size)
+    next_fit(units, budget_bytes, block_size)
 }
 
-/// The oversized refusal and the greedy fill, over `units` in the order
+/// The oversized refusal and the next-fit fill, over `units` in the order
 /// given — the one implementation both orders share.
-fn first_fit(
+fn next_fit(
     units: Vec<PendingUnit>,
     budget_bytes: u64,
     block_size: u64,
@@ -197,11 +207,11 @@ mod tests {
 
     /// Hand-verifiable small case, block_size = 1 (no padding distortion) so
     /// the arithmetic is exact: sizes [3,4,3,5,2] for names [a,b,c,d,e],
-    /// budget 10. First-fit: a(3)->3, b(4)->7, c(3)->10 (exactly full),
+    /// budget 10. Next-fit: a(3)->3, b(4)->7, c(3)->10 (exactly full),
     /// d(5) doesn't fit (10+5>10) -> close [a,b,c]=10, start d(5)->5,
     /// e(2)->7 (fits) -> final batch [d,e]=7.
     #[test]
-    fn greedy_first_fit_matches_hand_computed_batches() {
+    fn greedy_next_fit_matches_hand_computed_batches() {
         let units = vec![
             unit("a", 3),
             unit("b", 4),
@@ -215,6 +225,20 @@ mod tests {
         assert_eq!(batches[0].padded_bytes, 10);
         assert_eq!(batches[1].unit_names(), vec!["d", "e"]);
         assert_eq!(batches[1].padded_bytes, 7);
+    }
+
+    /// Issue #456: the selector is NEXT-fit. First-fit would send `c(3)` back
+    /// into the first batch's spare 4 and give [a,c] [b]; next-fit closes
+    /// [a] at `b` for good and gives [a] [b,c] — the tape spine (each tape a
+    /// contiguous run of the alphabet) that §7 ruled for.
+    #[test]
+    fn a_closed_batch_is_never_reopened_for_a_later_smaller_unit() {
+        let units = vec![unit("a", 6), unit("b", 6), unit("c", 3)];
+        let batches = plan_batches(units, 10, 1).unwrap();
+        assert_eq!(
+            batches.iter().map(|b| b.unit_names()).collect::<Vec<_>>(),
+            vec![vec!["a"], vec!["b", "c"]],
+        );
     }
 
     #[test]
@@ -276,7 +300,7 @@ mod tests {
     }
 
     /// Issue #144 (ADR-0012 2026-10-07 item 26): the prioritised units are
-    /// placed first, each group in name order, and first-fit runs over that
+    /// placed first, each group in name order, and next-fit runs over that
     /// order — so the prioritised units fill the first batch.
     #[test]
     fn prioritised_units_go_first_each_group_in_name_order() {
@@ -377,7 +401,7 @@ mod tests {
             "name order must be preserved across the whole batch sequence (the tape spine)"
         );
 
-        // Fill guarantee: for any closed (non-final) batch, greedy first-fit
+        // Fill guarantee: for any closed (non-final) batch, greedy next-fit
         // proves fill > 1 - max_padded/budget algebraically (the unit that
         // triggered the close didn't fit in the remaining space, and no
         // unit's padded size exceeds max_padded) — independent of the
