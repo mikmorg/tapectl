@@ -838,10 +838,12 @@ is the same procedure for a service-user host.
    tapectl restore volume L8-0002 --to /srv/restore --device "$TAPE" --dry-run
    tapectl restore volume L8-0002 --to /srv/restore --device "$TAPE"
    ```
-   A rebuilt home has no isolated catalogues on disk, so every unit spools: each
-   slice is decrypted to disk before dar reads it, and the space check asks for
-   every unit plus the largest unit's slices (`--scratch DIR` puts those on
-   another disk). One unit's failure does not stop the rest; the report names
+   `catalog rebuild` puts each stage set's dar catalogue back on disk from the
+   operator envelope (#473; every tape written by tapectl 1.0.0 or later carries
+   them), so those units stream. A unit whose set had none spools: each slice is
+   decrypted to disk before dar reads it, and the space check asks for every unit
+   plus the largest unit's slices (`--scratch DIR` puts those on another disk);
+   `catalog rebuild` names such sets. One unit's failure does not stop the rest; the report names
    it, and the command exits non-zero. tapectl's restore reads only the private
    keys in `<home>/keys/` (step 5), never the escrow secret. With only the
    escrow secret, restore through `RESTORE.sh --key` from

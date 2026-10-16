@@ -901,6 +901,12 @@ considered. `--force` releases the retained ones too, and is wider than the
 gate it overrides: it also drops staged data for sets never written to any
 tape.
 
+It also clears what a killed run left behind (#465, #474): the dar catalogue
+directory of a set that never finished staging, `<home>/tmp` entries whose newest
+file is a day old, and `clone-*` and `compact-*` directories under staging that no
+staged set references and that have been quiet for an hour. They are counted as
+"leftovers of killed runs removed" (`--json`: `home_leftovers_reclaimed`).
+
 ### A quiet host while the tape runs
 
 An LTO-6 drive streams at up to 160 MB/s and *stops and restarts* whenever the
@@ -1118,7 +1124,8 @@ tape, and refuses with nothing read
   disk (under `~/.tapectl/catalogs/`) **streams**: each slice is decrypted
   off the tape straight into dar through a named pipe, so it needs only about
   the unit's size free in `--to`, and the drive keeps reading while dar
-  extracts. Otherwise — a catalog rebuilt from tape, or dar older than 2.7.9 —
+  extracts. Otherwise — a stage set whose catalogue is not on disk (a catalog
+  rebuilt from a tape that carried none), or dar older than 2.7.9 —
   the restore **spools**: every slice is decrypted to disk before dar
   extracts them, in a `.tapectl-restore-tmp` directory inside `--to`, or
   inside `--scratch DIR` when you name one, never in the system temp
@@ -1254,10 +1261,13 @@ layout.
 ```bash
 # Read slices from tape into staging (source cartridge loaded)
 tapectl volume read-slices --from L6-0001 --unit tv/breaking-bad/s01
-# Swap in a blank cartridge, then write
-tapectl volume init L6-0002
-tapectl volume write L6-0002
+# Swap in a blank cartridge, then initialise it and write
+tapectl volume write L6-0002 --init
 ```
+
+`--version N` reads one version; without it, every version of the unit on the
+tape except those marked reclaimable or purged. The staging directory is checked
+for room first, and a read that does not finish removes what it wrote (#474).
 
 ### Mark Tape-Only
 

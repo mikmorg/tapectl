@@ -612,7 +612,7 @@ fn additional_copy_action(conn: &Connection, unit: &Unit, extra: &str) -> Result
         match policy::coverage::in_service_copy_of_version(conn, unit.id, *version)? {
             Some(label) => {
                 steps.push(format!(
-                    "tapectl volume read-slices --from {label} --unit {}",
+                    "tapectl volume read-slices --from {label} --unit {} --version {version}",
                     unit.name
                 ));
                 any_ready = true;
@@ -2181,7 +2181,7 @@ mod tests {
 
         assert_eq!(
             finding.action,
-            "tapectl volume read-slices --from photos-cleaned-SEALED --unit photos && \
+            "tapectl volume read-slices --from photos-cleaned-SEALED --unit photos --version 1 && \
              tapectl volume init <OTHER-LABEL> && tapectl volume write <OTHER-LABEL>",
             "got: {}",
             finding.action

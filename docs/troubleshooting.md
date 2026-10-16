@@ -2051,6 +2051,9 @@ still reads, write it to a new cartridge, then retire the volume:
 tapectl volume read-slices --from L6-0001 --unit family/letters
 ```
 
+(`--version N` reads one version; without it, every version on the tape except
+reclaimable or purged ones. A read that does not finish removes what it wrote.)
+
 Then load a blank cartridge and write the salvaged slices to it:
 
 ```bash

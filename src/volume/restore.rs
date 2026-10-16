@@ -1484,7 +1484,8 @@ pub(crate) fn plan_restore(
 /// slicing may differ too. So a catalogue counts only for the stage set
 /// that made it: the FIRST stage set of the snapshot to record that path.
 /// Once #419 gives each stage set its own path, each is its own first. A
-/// catalog rebuilt from tape records none.
+/// catalog rebuilt from a tape records the catalogue the tape carried, when
+/// it carried one (#473).
 fn own_catalogue(conn: &Connection, stage_set_id: i64) -> Result<Option<PathBuf>> {
     let row: Option<(Option<String>, Option<i64>)> = conn
         .query_row(
