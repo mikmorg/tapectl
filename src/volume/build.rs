@@ -258,7 +258,8 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         source: ContentSource::Materialized(id_thunk_path),
     });
 
-    let guide_bytes = layout::generate_system_guide_v2(&inputs.label, total_files);
+    let guide_bytes =
+        layout::generate_system_guide_v2_for_media(&inputs.label, total_files, &inputs.media_type);
     let (guide_path, guide_size, guide_hash) =
         materialize(session_dir, "0001_system_guide", guide_bytes.as_bytes())?;
     entries.push(LayoutEntry {

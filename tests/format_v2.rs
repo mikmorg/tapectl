@@ -1412,6 +1412,21 @@ fn the_re_pin_leaves_requires_empty_and_the_newer_tape_text_at_1_1_0() {
     );
 }
 
+/// File 1 of a REAL `build()`, for a volume whose `media_type` is LTO-6: the
+/// build passes the generation through, so the tape says an LTO-6 or LTO-7
+/// drive reads it (#448's File 1 half). Recorded bytes only.
+#[test]
+fn file_1_of_a_built_lto6_tape_names_the_drives_that_read_it() {
+    let h = shared_harness();
+    let guide = String::from_utf8_lossy(&h.store.files[1]).to_string();
+    let guide = guide.trim_end_matches('\0');
+    let flat = guide.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("This tape is LTO-6"), "{flat}");
+    assert!(flat.contains("only if it is an LTO-6 or LTO-7 drive"), "{flat}");
+    assert!(flat.contains("SAS"), "{flat}");
+    assert!(flat.contains("--all --to /destination"), "{flat}");
+}
+
 // ── Issue #450 — the plaintext zones, scanned without a tape ──────────────
 
 const VOLUME_UUID_NEEDLES: &str = "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0";

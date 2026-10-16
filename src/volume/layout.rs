@@ -200,7 +200,7 @@ const RESTORE_TOOLS: &[RestoreTool] = &[
     RestoreTool {
         name: "age",
         modes: DECRYPTING,
-        role: "decryption (age-encryption.org). The files are in the age v1 format, which is\n  stable and which the `age` program and `rage` both read; RESTORE.sh runs a\n  program named `age`, so with only `rage` link it under that name",
+        role: "decryption (age-encryption.org). The encrypted files are in the age v1 format, which is stable and which the `age` program and `rage` both read; RESTORE.sh runs a program named `age`, so with only `rage` link it under that name",
     },
     RestoreTool {
         name: "dar",
@@ -255,6 +255,104 @@ pub fn restore_sh_tools() -> Vec<&'static str> {
     tools_for(ALL_MODES)
 }
 
+/// Greedy word wrap to `width` columns, every line after the first indented
+/// by `hang`.
+fn wrap_words(text: &str, width: usize, hang: &str) -> String {
+    let mut out = String::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            out.push_str(&line);
+            out.push('\n');
+            line = hang.to_string();
+        } else if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    out.push_str(&line);
+    out
+}
+
+/// File 1's opening list of tools, drawn from [`RESTORE_TOOLS`] (`mt` first).
+fn guide_tool_sentence() -> String {
+    let names = restore_sh_tools();
+    let (last, init) = names.split_last().expect("RESTORE_TOOLS is not empty");
+    wrap_words(
+        &format!(
+            "tapectl or its database. All you need is: mt, {}, and {last}.",
+            init.join(", ")
+        ),
+        72,
+        "",
+    )
+}
+
+/// "`mt`, `dd`, `sha256sum` and `head`": what `--info` and `--verify` need,
+/// from the same table as the script's own check.
+fn guide_read_only_tools() -> String {
+    let names: Vec<String> = std::iter::once("mt")
+        .chain(tools_for(MODE_READ))
+        .map(|t| format!("`{t}`"))
+        .collect();
+    let (last, init) = names.split_last().expect("not empty");
+    format!("{} and {last}", init.join(", "))
+}
+
+/// File 1's "Tools Required" bullets: `mt`, then every tool of
+/// [`RESTORE_TOOLS`] with its role. The file's own `gpg` and dar-version
+/// bullets follow them.
+fn guide_tools_required() -> String {
+    let mut bullets = vec![wrap_words(
+        "- `mt` (mt-st package) — tape positioning and setting the block size. \
+         The plain `mt` that GNU cpio installs cannot set it: RESTORE.sh warns, \
+         then reads in whatever mode the drive is in",
+        72,
+        "  ",
+    )];
+    for tool in RESTORE_TOOLS {
+        bullets.push(wrap_words(
+            &format!("- `{}` — {}", tool.name, tool.role),
+            72,
+            "  ",
+        ));
+    }
+    bullets.join("\n")
+}
+
+/// File 1's "The tape drive" section: which drives read THIS tape's media
+/// generation (from [`Generation::can_read`], by the same list the cover
+/// sheet uses) and the interface. A `media_type` that is not a generation
+/// this crate knows gets the general statement.
+fn guide_drive_section(media_type: &str) -> String {
+    use crate::crypto::escrow_kit::{drive_phrase, drives_that_read};
+    let readers = crate::media::Generation::parse(media_type)
+        .map(|g| (g, drives_that_read(g)))
+        .filter(|(_, drives)| !drives.is_empty());
+    let which = match readers {
+        Some((g, drives)) => format!(
+            "This tape is {} (File 0 says so: media_type). A drive reads it only if it \
+             is {}: a newer drive often cannot read an older tape (an LTO-8 drive, for \
+             example, reads only LTO-7, LTO-7 Type M and LTO-8).",
+            g.as_str(),
+            drive_phrase(&drives)
+        ),
+        None => "This tape's media generation is in File 0 (media_type). It decides which \
+                 drives can read it: a newer drive often cannot read an older tape (an \
+                 LTO-8 drive, for example, reads only LTO-7, LTO-7 Type M and LTO-8), so \
+                 look the generation up in the maker's compatibility table."
+            .to_string(),
+    };
+    let interface = "The drive connects by SAS (some models by Fibre Channel), so the \
+                     computer needs a matching host adapter (HBA); there is no USB or SATA \
+                     tape drive. A data-recovery firm has all of this if you do not.";
+    format!(
+        "## The tape drive\n\n{}\n\n{}\n",
+        wrap_words(&which, 72, ""),
+        wrap_words(interface, 72, "")
+    )
+}
+
 /// Generate the v2 system guide (File 1) — the heir manual for layout v2.
 /// Rewrites v1's Quick Reference to the v2 zone order (front index at File 3,
 /// tenant envelopes from File 4, seal marker last with an embedded copy of
@@ -264,14 +362,31 @@ pub fn restore_sh_tools() -> Vec<&'static str> {
 /// three-rung degradation ladder with the zero-strip procedure (sheet §3.3,
 /// §3.4).
 pub fn generate_system_guide_v2(label: &str, total_files: i32) -> String {
+    generate_system_guide_v2_for_media(label, total_files, "")
+}
+
+/// The system guide for a tape of a known media generation (`media_type`, as
+/// File 0 states it: `LTO-6`, ...). `build` calls this one: the drives that
+/// read THIS generation depend on it ([`Generation::can_read`]), and a
+/// `media_type` this crate does not recognise (or the empty string, which
+/// [`generate_system_guide_v2`] passes) gets the guide's general statement
+/// instead of a guess.
+pub fn generate_system_guide_v2_for_media(
+    label: &str,
+    total_files: i32,
+    media_type: &str,
+) -> String {
+    let intro_tools = guide_tool_sentence();
+    let tools_required = guide_tools_required();
+    let drive_section = guide_drive_section(media_type);
+    let read_only = guide_read_only_tools();
     format!(
         r#"# tapectl Archival Volume Recovery Guide
 
 ## Volume: {label}
 
 This document describes how to recover data from this tape without
-tapectl or its database. All you need is: mt, dd, age, dar, sha256sum,
-head, truncate, and tar.
+{intro_tools}
 
 ## Quick Reference
 
@@ -291,15 +406,10 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
 - LAST file: SEAL MARKER — asserts the tape is complete, and carries a
   full embedded copy of the front index (used if File 3 is damaged)
 
+{drive_section}
 ## Tools Required
 
-- `mt` (mt-st package) — tape positioning
-- `dd` — reading raw data from tape
-- `age` (age-encryption.org) — decryption
-- `dar` (dar.linux.free.fr) — archive extraction
-- `sha256sum` (coreutils) — integrity verification
-- `head`, `truncate` (coreutils) — trimming block padding to exact sizes
-- `tar` — unpacking your decrypted envelope (it is a tar archive)
+{tools_required}
 - `gpg` (package gnupg) — only if your `dar` was built with GPG support,
   as Debian's and Ubuntu's is: such a dar refuses to start without it
   ("INITIALIZATION FAILED FOR GPGME"). RESTORE.sh checks and says so.
@@ -307,6 +417,23 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
   an older one, or a unit without its catalogue on a dar before 2.7.21,
   is restored by decrypting the slices to disk first (RESTORE.sh
   chooses, and checks the space either way)
+
+RESTORE.sh checks for the tools each mode runs, before it reads the tape,
+and names any that is missing: `--info` and `--verify` need only {read_only}.
+
+## Disk space
+
+RESTORE.sh streams each slice from the tape through `age` into `dar`, so
+`--to` needs room for about ONE unit's size (the unit's slices as stored
+on tape; a unit that was archived compressed restores larger). Nothing
+else is large: the decrypted envelopes (the operator envelope's
+`catalog.db` and the dar catalogues, which grow with the number of files)
+go to a work directory under `$TMPDIR` (default `/tmp`; set `TMPDIR` to
+move it). Two cases keep slices on disk as well, in a scratch directory
+inside `--to` unless `--scratch DIR` names another disk: `--path` (the few
+slices that hold the path) and the older-dar fallback above (all of the
+unit's slices, so about twice its size). The script checks the space
+before it reads any slice.
 
 ## Which device?
 
@@ -356,6 +483,18 @@ The easiest way to recover is the RESTORE.sh script (File 2):
     # Just one file or folder: reads only the slices that hold it
     ./RESTORE.sh --restore --key your-key.age.key --unit UNIT \
         --path some/file --to /destination
+
+With the ESCROW key or the OPERATOR key, which opens every tenant's
+envelope, list what the tape holds first, then restore all of it:
+
+    ./RESTORE.sh --list --key escrow.age.key
+    ./RESTORE.sh --restore --key escrow.age.key --all --to /destination
+
+--all puts each unit in /destination/UNIT. Without --all or --unit,
+--restore takes the first envelope your key opens and, if that lists one
+unit, restores only that unit (it tells you what else the key opened). A
+single TENANT's key opens only that tenant's envelope: it restores that
+tenant's units and nobody else's.
 
 The script reads the tape forward from one rewind, and says what it
 needs if it meets a tape newer than itself (`requires` in File 0).
@@ -5713,5 +5852,134 @@ sha256_encrypted = \"bbb\"
         // A member that only shares a prefix is not the catalogue.
         let close = generate_recovery_md("LAB01", "alice", &units, &["aaaaaaaa_v20.1.dar".to_string()]);
         assert!(!close.contains("dar -l"), "{close}");
+    }
+
+    /// Whitespace-flattened, so a phrase wrapped across lines still matches.
+    fn flat_text(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// #448's File 1 half (ADR-0012 2026-10-16 item 71): File 1 says which
+    /// drives read THIS tape's generation, from `Generation::can_read`, and
+    /// the interface. An LTO-6 tape reads in an LTO-6 or LTO-7 drive and in
+    /// nothing newer; an LTO-8 tape in an LTO-8 or LTO-9 drive. A media_type
+    /// the crate does not know gets the general statement, not a guess.
+    #[test]
+    fn system_guide_v2_names_the_drives_that_read_this_tapes_generation() {
+        let g6 = flat_text(&generate_system_guide_v2_for_media("L6", 20, "LTO-6"));
+        assert!(g6.contains("This tape is LTO-6"), "{g6}");
+        assert!(g6.contains("only if it is an LTO-6 or LTO-7 drive"), "{g6}");
+        assert!(!g6.contains("LTO-8 or LTO-9 drive"), "not for an LTO-6 tape");
+        let g8 = flat_text(&generate_system_guide_v2_for_media("L8", 20, "LTO-8"));
+        assert!(g8.contains("This tape is LTO-8"), "{g8}");
+        assert!(g8.contains("only if it is an LTO-8 or LTO-9 drive"), "{g8}");
+        assert!(!g8.contains("LTO-6 or LTO-7 drive"), "not for an LTO-8 tape");
+        // Type M media is read by an LTO-8 drive alone.
+        let m8 = flat_text(&generate_system_guide_v2_for_media("M8", 20, "LTO-7-M8"));
+        assert!(m8.contains("only if it is an LTO-8 drive"), "{m8}");
+
+        for (what, g) in [("LTO-6", &g6), ("LTO-8", &g8)] {
+            // A newer drive often cannot read an older tape, with the example.
+            assert!(
+                g.contains("an LTO-8 drive, for example, reads only LTO-7, LTO-7 Type M and LTO-8"),
+                "{what}: {g}"
+            );
+            assert!(
+                g.contains("SAS (some models by Fibre Channel)")
+                    && g.contains("host adapter (HBA)")
+                    && g.contains("no USB or SATA tape drive"),
+                "{what}: the interface: {g}"
+            );
+        }
+
+        // An unrecognised media_type, and the 2-argument entry point: the
+        // general statement, never a drive list for a tape it cannot name.
+        for unknown in ["", "DLT-IV", "LTO-99"] {
+            let g = flat_text(&generate_system_guide_v2_for_media("U", 20, unknown));
+            assert!(g.contains("maker's compatibility table"), "{unknown:?}: {g}");
+            assert!(!g.contains("only if it is"), "{unknown:?}: {g}");
+            assert!(g.contains("SAS"), "{unknown:?}: the interface is generation-free");
+        }
+        assert_eq!(
+            generate_system_guide_v2("U", 20),
+            generate_system_guide_v2_for_media("U", 20, ""),
+        );
+    }
+
+    /// File 1's escrow-key restore lists first and restores with --all, and
+    /// says a single tenant's key opens only that tenant's part.
+    #[test]
+    fn system_guide_v2_shows_the_escrow_restore_as_list_then_all() {
+        let g = generate_system_guide_v2_for_media("ESC1", 20, "LTO-6");
+        let list = g
+            .find("./RESTORE.sh --list --key escrow.age.key\n")
+            .expect("the escrow --list example");
+        let all = g
+            .find("./RESTORE.sh --restore --key escrow.age.key --all --to /destination\n")
+            .expect("the escrow --all example");
+        assert!(list < all, "list first, then restore");
+        let flat = flat_text(&g);
+        assert!(flat.contains("A single TENANT's key opens only that tenant's envelope"), "{flat}");
+        assert!(
+            flat.contains("restores only that unit (it tells you what else the key opened)"),
+            "{flat}"
+        );
+    }
+
+    /// File 1's tool list, its opening sentence and RESTORE.sh's checks come
+    /// from one table (#449 item 2): every tool the script may check for is
+    /// in both, with the roles the item names (mt-st, gpg, age/rage format).
+    #[test]
+    fn system_guide_v2_lists_the_tools_restore_sh_checks_for() {
+        let g = generate_system_guide_v2_for_media("TOOLS2", 20, "LTO-6");
+        let intro = g
+            .split_once("All you need is:")
+            .and_then(|(_, rest)| rest.split_once("\n\n"))
+            .map(|(list, _)| flat_text(list))
+            .expect("the guide states its tool list up front");
+        let section = g
+            .split_once("## Tools Required")
+            .and_then(|(_, rest)| rest.split_once("\n## "))
+            .map(|(body, _)| body)
+            .expect("a Tools Required section");
+        for tool in restore_sh_tools() {
+            assert!(intro.contains(tool), "the opening sentence lacks {tool}: {intro}");
+            assert!(
+                section.lines().any(|l| l.starts_with(&format!("- `{tool}`"))),
+                "Tools Required lacks a bullet for {tool}:\n{section}"
+            );
+        }
+        assert!(intro.contains("mt,") && intro.ends_with("and tee."), "{intro}");
+        let section = flat_text(section);
+        assert!(section.contains("`mt` (mt-st package)"), "{section}");
+        assert!(section.contains("cannot set it"), "GNU cpio mt: {section}");
+        assert!(section.contains("`gpg` (package gnupg)"), "{section}");
+        assert!(section.contains("age v1 format"), "{section}");
+        assert!(section.contains("`age` program and `rage` both read"), "{section}");
+        assert!(
+            section.contains("RESTORE.sh runs a program named `age`"),
+            "{section}"
+        );
+        assert!(
+            section.contains("`--info` and `--verify` need only `mt`, `dd`, `sha256sum` and `head`"),
+            "{section}"
+        );
+    }
+
+    /// File 1's disk-space statement matches RESTORE.sh since 1.1.0: about
+    /// one unit's size, the script streams; --scratch is for --path and the
+    /// old-dar fallback.
+    #[test]
+    fn system_guide_v2_states_one_units_disk_space() {
+        let g = flat_text(&generate_system_guide_v2_for_media("DISK1", 20, "LTO-6"));
+        assert!(g.contains("## Disk space"), "{g}");
+        assert!(g.contains("about ONE unit's size"), "{g}");
+        assert!(g.contains("streams each slice from the tape through"), "{g}");
+        assert!(g.contains("`--scratch DIR`") && g.contains("`--path`"), "{g}");
+        assert!(g.contains("older-dar fallback"), "{g}");
+        assert!(g.contains("compressed restores larger"), "{g}");
+        assert!(g.contains("`$TMPDIR`"), "the work directory: {g}");
+        // The pre-1.1.0 claim, from the cover sheet's first version, is not here.
+        assert!(!g.contains("about twice the unit's size free"), "{g}");
     }
 }

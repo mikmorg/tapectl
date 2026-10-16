@@ -330,8 +330,9 @@ fn sealed_places(conn: &Connection) -> Result<Vec<PlaceFact>> {
 }
 
 /// The drives that can read media of generation `media`, in release order
-/// ([`Generation::can_read`]).
-fn drives_that_read(media: Generation) -> Vec<Generation> {
+/// ([`Generation::can_read`]). `pub(crate)`: File 1 (`volume::layout`) says the
+/// same thing for the tape it is written on, from this one list.
+pub(crate) fn drives_that_read(media: Generation) -> Vec<Generation> {
     DRIVE_GENERATIONS
         .iter()
         .copied()
@@ -340,7 +341,7 @@ fn drives_that_read(media: Generation) -> Vec<Generation> {
 }
 
 /// "an LTO-6 or LTO-7 drive", "an LTO-5, LTO-6 or LTO-7 drive".
-fn drive_phrase(drives: &[Generation]) -> String {
+pub(crate) fn drive_phrase(drives: &[Generation]) -> String {
     let names: Vec<&str> = drives.iter().map(|g| g.as_str()).collect();
     match names.as_slice() {
         [] => "no current drive".to_string(),
