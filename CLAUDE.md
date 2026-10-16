@@ -223,6 +223,17 @@ priority for tape commands, the `/etc/tapectl/home` pointer, and a single source
 (dar's `fadvise` neutralised by a seccomp filter on `dar -c`, #441). home2 upgrades in
 place (take `db backup` with 1.1.0 first).
 
+**2026-10-16: 1.1.2, the two reviews' fixes** (`docs/releases/1.1.2.md`; ADR-0012 amendment
+"2026-10-15 (later)", items 65–70). No on-tape change and no migration; home2 goes from 1.1.0
+straight to 1.1.2 by handoff (f). The design review (`docs/audits/2026-10-15-design-review.md`)
+and the first adversarial review of the 1.1 code (`docs/audits/2026-10-15-1.1-diff-review.md`,
+one high: a rebuilt unsealed tape counted as a copy) filed #444–#475, worked in four waves.
+Things to know: an unreadable seal position is not an absent seal unless the drive reports
+END OF DATA (#460; the HP drive proves it at the next step-12 rehearsal); `stage create`
+compares dar's catalogue with what it hashed (#464); `audit` has a per-volume full-readback
+clock and `[defaults] verify_interval_days` (#453, #454; home2 sets 365); the gate's Rust
+legs are judged by test name and its erase leg runs `cartridge erase` then a no-force init.
+
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5

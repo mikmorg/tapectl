@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgrades it to 1.1.1). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgrades it to 1.1.2). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -40,7 +40,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (c) | The fresh start on home2 | **you** (sudo, the escrow key, the cartridges) |
 | (d) | `keepsake` on two cartridges the same day, then the Heir Kit | **you** |
 | (e) | The backlog | agents, in the order below |
-| (f) | Upgrade home2 to 1.1.1, in place | **you**, once `v1.1.1` is tagged |
+| (f) | Upgrade home2 to 1.1.2, in place | **you**, once `v1.1.2` is tagged |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -298,15 +298,16 @@ same day:
 `audit` warns `escrow_kit_stale` after every write session: that is the cue for the next
 refresh.
 
-## (f) Upgrade home2 to 1.1.1, in place
+## (f) Upgrade home2 to 1.1.2, in place
 
-1.1.1 is a patch (`docs/releases/1.1.1.md`): no on-tape change, so no fresh start. It adds one
-catalog migration (036, a new table), applied the first time the new binary opens the catalog.
-There is no downgrade: a 1.1.0 binary refuses a catalog that is ahead of its migration list,
-so the rollback is the 1.1.0 binary kept in step 3 plus `db import` of the backup from step 1,
-losing whatever the catalog recorded in between. Wait for `v1.1.1` to be tagged (the mhvtl gate
-on its commit, then the tag; the review that preceded it is
-`docs/audits/2026-10-15-design-review.md`).
+home2 runs 1.1.0; go straight to 1.1.2, which contains 1.1.1. Both are patches
+(`docs/releases/1.1.1.md`, `docs/releases/1.1.2.md`): no on-tape change, so no fresh start.
+1.1.1 adds one catalog migration (036, a new table), applied the first time the new binary
+opens the catalog; 1.1.2 adds none. There is no downgrade past 036: a 1.1.0 binary refuses a
+catalog that is ahead of its migration list, so the rollback is the 1.1.0 binary kept in step 3
+plus `db import` of the backup from step 1, losing whatever the catalog recorded in between.
+Wait for `v1.1.2` to be tagged (the whole chain on its commit, then the tag; the reviews behind
+it are `docs/audits/2026-10-15-design-review.md` and `docs/audits/2026-10-15-1.1-diff-review.md`).
 
 On home2, inside tmux, with no tapectl command running. Check that with `tapectl-op status`:
 the plain `tapectl status` from your own account works only from 1.1.1 on, through the home
@@ -314,14 +315,14 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
 `~/.tapectl` of its own, the pointer is bypassed even on 1.1.1: rename it first.
 
 1. **Back up the catalog with 1.1.0:** `tapectl-op db backup --to
-   /srv/local_backup/tapectl/tapectl-pre-1.1.1.db` (`--to` is required; the daily backup's
+   /srv/local_backup/tapectl/tapectl-pre-1.1.2.db` (`--to` is required; the daily backup's
    pruning never touches a file named like this), or `sudo systemctl start
    tapectl-backup.service`.
-2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.1.1`.
+2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.1.2`.
 3. **Keep the old binary, then build and install:** `sudo cp -p /usr/local/bin/tapectl
    /usr/local/bin/tapectl-1.1.0`, then `scripts/first-run.sh --profile
    contrib/hosts/home2.profile --from 3 --to 3` (a release build on home2 from the checkout,
-   installed to `/usr/local/bin`; `tapectl --version` should read `1.1.1 (v1.1.1, <date>)`).
+   installed to `/usr/local/bin`; `tapectl --version` should read `1.1.2 (v1.1.2, <date>)`).
    The timers pick the new binary up at their next firing.
 4. **Step 7 again** (`--from 7 --to 7`): it finds the home initialised, skips init, and goes on
    to the ops-group block, which now writes the home pointer `/etc/tapectl/home`, so a plain
@@ -347,10 +348,13 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
    and start it again after): the 06:30 poll opens the drive's sg node, would journal the test
    cartridge into the production catalog, and reads the TapeAlert page the rehearsal's own
    sweep expects to see first. Nothing enforces "no production process" for you;
-   `tapectl-op drive status` names a holder. The rehearsal is also the first run of 1.1.1's
-   proven-blank `volume init` on the real drive (ADR-0012 item 57; mhvtl has proved it, the HP
-   drive has not): until it has run, expect to need `--force` on a new cartridge if the chip's
-   lifetime figures read differently from the fixtures.
+   `tapectl-op drive status` names a holder. The rehearsal is also the first real-drive run of
+   two 1.1.x behaviours mhvtl has proved and the HP drive has not: the proven-blank `volume
+   init` (ADR-0012 item 57: until it has run, expect to need `--force` on a new cartridge if the
+   chip's lifetime figures read differently from the fixtures), and 1.1.2's rule that a seal
+   position which cannot be read is "unreadable", not "absent", unless the drive reports END OF
+   DATA there (#460: if the HP drive did not report it, every fresh write would refuse,
+   failing closed). Record both on #444 with the run.
 
 Your `[[backends.lto]]` keeps its explicit `device_sg`; it still wins and is still checked
 (#431). Removing the line (`tapectl-op config remove 'backends.lto[NAME].device_sg'`) lets
