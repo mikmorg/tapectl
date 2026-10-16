@@ -54,6 +54,11 @@ pub struct StageJob {
     /// A first stage of the version, or a `--version` re-stage: what
     /// admission rechecks (issue #368).
     pub admission: super::Admission,
+    /// Where to read the unit's files when that is a snapshot of the
+    /// collection root rather than the unit's own folder (`collection run`'s
+    /// `snapshot_command`, ADR-0012 2026-10-16 item 75). `None` reads the
+    /// unit where it lives.
+    pub view: Option<super::view::SourceView>,
 }
 
 /// How one unit's stage ended.
@@ -210,6 +215,7 @@ pub fn stage_many(
             job.snapshot_id,
             assume_yes,
             job.admission,
+            job.view.as_ref(),
             &mut std::io::stderr(),
         );
         let ok = result.is_ok();
@@ -478,6 +484,7 @@ mod tests {
                 unit_name: name.to_string(),
                 snapshot_id,
                 admission: crate::staging::Admission::Unstaged,
+                view: None,
             });
         }
         (
@@ -642,6 +649,7 @@ mod tests {
                 unit_name: "ghost".into(),
                 snapshot_id: 999_999,
                 admission: crate::staging::Admission::Unstaged,
+                view: None,
             },
         );
         let out = stage_many(

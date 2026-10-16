@@ -205,6 +205,7 @@ pub fn execute_batch(
                 unit_name: name.to_string(),
                 snapshot_id,
                 admission: crate::staging::Admission::Unstaged,
+                view: None,
             });
         } else {
             crate::staging::stage_create(conn, paths, config, snapshot_id, assume_yes)?;

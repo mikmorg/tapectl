@@ -346,6 +346,7 @@ pub fn run(
                     } else {
                         staging::Admission::Unstaged
                     },
+                    view: None,
                 });
             }
             let outcomes = staging::jobs::stage_many(

@@ -8,6 +8,7 @@ pub mod lock;
 mod plaintext_audit;
 pub mod release;
 pub mod validate;
+pub mod view;
 
 use std::fs;
 use std::io::Write;
@@ -68,6 +69,21 @@ pub fn snapshot_create_detailed(
     unit_name: &str,
     config: &Config,
 ) -> Result<SnapshotOutcome> {
+    snapshot_create_detailed_reading(conn, unit_name, config, None)
+}
+
+/// [`snapshot_create_detailed`], reading the unit's files from `view`'s
+/// snapshot of the collection root instead of the unit's own folder (ADR-0012
+/// 2026-10-16 item 75, issue #455). Only the READS move: the walk and the
+/// content match (which may hash files) read the snapshot's copy of the
+/// folder; the nesting check, and every path the catalog records
+/// (`snapshots.source_path`, the `files` rows), stay the unit's real ones.
+pub fn snapshot_create_detailed_reading(
+    conn: &Connection,
+    unit_name: &str,
+    config: &Config,
+    view: Option<&view::SourceView>,
+) -> Result<SnapshotOutcome> {
     let global_excludes = &config.defaults.global_excludes;
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
@@ -77,8 +93,18 @@ pub fn snapshot_create_detailed(
         .as_deref()
         .ok_or_else(|| TapectlError::Other(format!("unit \"{unit_name}\" has no path")))?;
 
-    if !Path::new(source_path).is_dir() {
-        return Err(TapectlError::UnitPathNotFound(source_path.to_string()));
+    // Where the files are read from: the unit's folder, or its counterpart in
+    // the run's snapshot. `source_path` is what gets recorded.
+    let read_path = view::read_path_of(view, source_path)?;
+    if !Path::new(&read_path).is_dir() {
+        return Err(if view.is_some() {
+            TapectlError::Other(format!(
+                "unit \"{unit_name}\" ({source_path}) has no folder in the snapshot: \
+                 {read_path} is not a directory"
+            ))
+        } else {
+            TapectlError::UnitPathNotFound(source_path.to_string())
+        });
     }
 
     // Nested unit detection (design line 184): "unit init and snapshot
@@ -91,7 +117,7 @@ pub fn snapshot_create_detailed(
     // Walk directory and build manifest — the ONLY walk this function
     // performs. Both the content-match short-circuit immediately below and
     // the mint path that follows it reuse `walked` (issue #159).
-    let (total_size, file_count, walked) = walk_directory(source_path, global_excludes)?;
+    let (total_size, file_count, walked) = walk_directory(&read_path, global_excludes)?;
 
     // ADR-0012 / issue #159: does this walk already match the unit's most
     // recent snapshot? `content_match::latest_snapshot` is the exact same
@@ -116,7 +142,7 @@ pub fn snapshot_create_detailed(
             conn,
             latest_id,
             &unit.checksum_mode,
-            Path::new(source_path),
+            Path::new(&read_path),
             &fresh_stamps,
             crate::staging::validate::hash_source_file,
         )?;
@@ -394,6 +420,33 @@ pub fn stage_create(
     )
 }
 
+/// [`stage_create`], hashing and archiving the unit's files from `view`'s
+/// snapshot of the collection root instead of the unit's own folder (ADR-0012
+/// 2026-10-16 item 75, issue #455): the source check, the sha256 pass, `dar
+/// -c -R` and the post-dar recheck all read the snapshot's copy, so a file
+/// that changes in the living source after the snapshot was taken is not
+/// this stage's business. The recorded source path, and the `-R` in
+/// `stage_sets.dar_command`, stay the unit's real folder.
+pub fn stage_create_reading(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    snapshot_id: i64,
+    assume_yes: bool,
+    view: Option<&view::SourceView>,
+) -> Result<i64> {
+    stage_create_admitting(
+        conn,
+        paths,
+        config,
+        snapshot_id,
+        assume_yes,
+        Admission::Unstaged,
+        view,
+        &mut std::io::stderr(),
+    )
+}
+
 /// [`stage_create`] with its operator notices written to `notices` rather
 /// than straight to stderr — the seam the tests read them through.
 ///
@@ -418,6 +471,7 @@ pub(crate) fn stage_create_reporting(
         snapshot_id,
         assume_yes,
         Admission::Unstaged,
+        None,
         notices,
     )
 }
@@ -440,6 +494,7 @@ pub enum Admission {
 
 /// [`stage_create_reporting`], with what admission rechecks named
 /// ([`Admission`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stage_create_admitting(
     conn: &Connection,
     paths: &TapectlPaths,
@@ -447,6 +502,7 @@ pub(crate) fn stage_create_admitting(
     snapshot_id: i64,
     assume_yes: bool,
     admission: Admission,
+    view: Option<&view::SourceView>,
     notices: &mut dyn Write,
 ) -> Result<i64> {
     let stage_set_id_holder: std::cell::Cell<Option<i64>> = std::cell::Cell::new(None);
@@ -464,6 +520,7 @@ pub(crate) fn stage_create_admitting(
         snapshot_id,
         assume_yes,
         admission,
+        view,
         &stage_set_id_holder,
         &lock_holder,
         notices,
@@ -547,6 +604,7 @@ fn stage_create_inner(
     snapshot_id: i64,
     assume_yes: bool,
     admit_as: Admission,
+    view: Option<&view::SourceView>,
     stage_set_id_holder: &std::cell::Cell<Option<i64>>,
     lock_holder: &std::cell::Cell<Option<lock::StageLock>>,
     notices: &mut dyn Write,
@@ -577,6 +635,18 @@ fn stage_create_inner(
 
     let snapshot = get_snapshot(conn, snapshot_id)?;
     let unit = get_unit_for_snapshot(conn, &snapshot)?;
+    // Where this stage reads the unit's files: the recorded folder, or its
+    // counterpart in the run's snapshot of the collection root (ADR-0012
+    // 2026-10-16 item 75, issue #455). Everything the stage RECORDS keeps
+    // `snapshot.source_path`; only the reads below use `read_root`. A folder
+    // the snapshot lacks is refused here, before anything is staged.
+    let read_root = view::read_path_of(view, &snapshot.source_path)?;
+    if view.is_some() && !Path::new(&read_root).is_dir() {
+        return Err(TapectlError::Other(format!(
+            "unit \"{}\" ({}) has no folder in the snapshot: {read_root} is not a directory",
+            unit.name, snapshot.source_path
+        )));
+    }
     check_file_list_complete(conn, &snapshot, &unit.name)?;
     check_unit_fits_one_tape(config, &unit.name, &snapshot)?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
@@ -728,7 +798,7 @@ fn stage_create_inner(
     let plan = validate::plan(
         conn,
         snapshot_id,
-        &snapshot.source_path,
+        &read_root,
         &config.defaults.global_excludes,
     )?;
     phase.done();
@@ -752,7 +822,7 @@ fn stage_create_inner(
     // (contrast walk_directory/walk_fingerprint's dotfile-only interim
     // state; see exclude::dotfile_patterns's doc comment for why).
     let mut dar_exclude_patterns = config.defaults.global_excludes.clone();
-    dar_exclude_patterns.extend(exclude::dotfile_patterns(Path::new(&snapshot.source_path))?);
+    dar_exclude_patterns.extend(exclude::dotfile_patterns(Path::new(&read_root))?);
     // Issue #359 (c): split into dar's two mask kinds, so what dar archives
     // is exactly what `walk_directory` recorded — a plain pattern is a `-X`
     // basename mask as before, and a directory pattern (`name/`) becomes the
@@ -812,13 +882,13 @@ fn stage_create_inner(
     // read order and recorded in it.
     let unrecorded = plan.unrecorded_regular().to_vec();
     let hashing = validate::ConcurrentHash::spawn(
-        PathBuf::from(&snapshot.source_path),
+        PathBuf::from(&read_root),
         plan,
         validate::hash_threads(config.staging.hash_threads),
     )?;
     let mut dar_run = dar::create::spawn_archive(&dar::create::DarCreateParams {
         dar_binary: &config.dar.binary,
-        source_path: Path::new(&snapshot.source_path),
+        source_path: Path::new(&read_root),
         compression: &compression,
         exclude_patterns: &dar_masks.exclude,
         exclude_paths: &dar_masks.prune,
@@ -828,10 +898,15 @@ fn stage_create_inner(
     })?;
     // MANIFEST.toml carries this to tape. The slicing is tapectl's, so the
     // record says so, in terms an heir can reproduce with dar's own tools.
+    // The recorded command names the unit's real folder after `-R`, whatever
+    // folder dar was pointed at: MANIFEST.toml carries this to tape, where a
+    // transient snapshot path means nothing (ADR-0012 item 75). dar's own
+    // report (`dar_create_reports`) keeps the command as it ran.
+    let recorded_dar =
+        recorded_dar_command(&dar_run.dar_command, &read_root, &snapshot.source_path);
     let dar_command = format!(
-        "{} | tapectl cuts the archive into dar slices of -s {slice_size} \
+        "{recorded_dar} | tapectl cuts the archive into dar slices of -s {slice_size} \
          (the framing `dar_xform -s {slice_size} - <base>` gives) and age-encrypts each",
-        dar_run.dar_command
     );
     // Issue #368: other stages may hold the catalog for a moment; a stage
     // records its progress through the busy policy (#377), never failing on
@@ -950,7 +1025,7 @@ fn stage_create_inner(
     // with `--retry-on-change 0`, so a write during its own read was exit
     // 11 above. Only then is the source validated.
     let phase = progress::phase("recheck", None);
-    validate::recheck(Path::new(&snapshot.source_path), &hashed)?;
+    validate::recheck(Path::new(&read_root), &hashed)?;
     busy::retry(BusyPolicy::DEFAULT, "the source check", || {
         Ok(conn.execute(
             "UPDATE stage_sets SET source_validated_at = datetime('now') WHERE id = ?1",
@@ -1248,6 +1323,36 @@ fn record_dar_report(
 
 fn stopped_archiving(source: &str) -> String {
     format!("dar was stopped while archiving {source}")
+}
+
+/// `dar_command` (as `dar::create` records it) with the folder dar was pointed
+/// at, `read`, put back to the unit's own, `real`, after `-R`. The same string
+/// when they are the same folder.
+fn recorded_dar_command(dar_command: &str, read: &str, real: &str) -> String {
+    if read == real {
+        return dar_command.to_string();
+    }
+    let read_arg = format!("\"-R\" {:?}", std::ffi::OsStr::new(read));
+    let real_arg = format!("\"-R\" {:?}", std::ffi::OsStr::new(real));
+    dar_command.replacen(&read_arg, &real_arg, 1)
+}
+
+#[cfg(test)]
+mod recorded_dar_command_tests {
+    use super::recorded_dar_command;
+
+    /// dar's recorded argv puts the folder it was pointed at after `-R`; the
+    /// recorded command names the unit's own folder instead, and nothing else
+    /// in it moves. The same folder is a no-op.
+    #[test]
+    fn the_snapshot_folder_after_dash_r_becomes_the_units_own() {
+        let ran = "\"dar\" \"-c\" \"-\" \"-N\" \"-R\" \"/mnt/snap/tv/Show\" \"-an\" \"-X\" \"/mnt/snap/tv/Show\"";
+        assert_eq!(
+            recorded_dar_command(ran, "/mnt/snap/tv/Show", "/srv/tv/Show"),
+            "\"dar\" \"-c\" \"-\" \"-N\" \"-R\" \"/srv/tv/Show\" \"-an\" \"-X\" \"/mnt/snap/tv/Show\""
+        );
+        assert_eq!(recorded_dar_command(ran, "/x", "/x"), ran);
+    }
 }
 
 /// The base name dar's on-the-fly catalogue (`-@`) is written under, inside
@@ -3492,6 +3597,7 @@ mod tests {
             snapshot_id,
             false,
             Admission::Restage,
+            None,
             &mut std::io::stderr(),
         )
     }
