@@ -2396,9 +2396,9 @@ tapectl)" item). Follow it there rather than a second copy here;
 two drifting checklists are a failure waiting to happen. The drill's
 essentials: load a real tape, pull `RESTORE.sh` off the plaintext front zone
 with `mt` + `dd`, and run it using **only** the tools the tape's own guide
-lists — `mt`, `dd`, `age`, `dar`, `sha256sum`, `head`, `truncate` and `tar` —
-plus the shell tools any Linux system has, and no `tapectl`, against nothing
-but the printed key material.
+lists — `mt`, `dd`, `age`, `dar`, `sha256sum`, `head`, `truncate`, `tar`, `mkfifo`
+and `tee` — plus the shell tools any Linux system has, and no `tapectl`, against
+nothing but the printed key material.
 
 Nothing automated performs a drill; schedule it yourself, on real hardware.
 
@@ -3008,11 +3008,15 @@ not a signature) are in
 ### If you hold a tenant key: restore directly, no catalog needed
 
 This is the heir path. It needs `mt`, `dd`, `age`, `dar`, `sha256sum`, `head`,
-`truncate` and `tar` — the list the tape's own guide gives, and the tools
-RESTORE.sh checks for before it reads anything — plus the ordinary shell tools
-any Linux system already has (`bash`, `awk`, `sed`, `tr`, `cut`, `grep`, `wc`,
-`mktemp`), which RESTORE.sh uses without checking for them. Notably, it does
-not need `tapectl`.
+`truncate`, `tar`, `mkfifo` and `tee` — the list the tape's own guide gives — plus
+the ordinary shell tools any Linux system already has (`bash`, `awk`, `sed`, `tr`,
+`cut`, `grep`, `wc`, `mktemp`), which RESTORE.sh uses without checking for them.
+Notably, it does not need `tapectl`. The RESTORE.sh of a tape written by 1.2.0 or
+later checks, when a mode starts and before it reads the tape, only the tools that
+mode runs: `--info` and `--verify` need `mt`, `dd`, `sha256sum` and `head`;
+`--find-envelope` adds `age`, `truncate` and `tar`; `--list` adds `dar`;
+`--restore --path` adds `tee`; a whole-unit `--restore` needs `tee` and `mkfifo` too.
+An earlier tape's script checks every tool in every mode.
 
 1. Read the ID thunk (tape file 0), which says what the tape is and how to
    read the rest. With tapectl installed, `tapectl volume identify --device "$TAPE"`
@@ -3044,7 +3048,15 @@ not need `tapectl`.
    way). `--all` restores every unit; `--list` shows a unit's files and
    `--path` restores one, from the dar catalogue in the envelope. The script
    checks space before it reads any slice. A 1.0.x tape's own script needs
-   about twice the unit's size, plus one slice.
+   about twice the unit's size, plus one slice. The decrypted envelopes go to a
+   work directory under `$TMPDIR` (default `/tmp`) on a 1.2.0 tape's script, which
+   warns when that looks too small; set `TMPDIR` to move it.
+
+   On a 1.2.0 tape, a restore with no `--unit` or `--all` that finds one unit in
+   the first envelope your key opens restores it, and then says how many other
+   envelopes the key opened and how many other units they list. An operator or
+   escrow key opens every tenant's envelope, so `--list`, then `--all` into a
+   new directory, is how you take all of it.
 
    **Bring every key you hold, not just the current one.** `--key` may be
    repeated, and each key is tried on its own for the envelope and for every
