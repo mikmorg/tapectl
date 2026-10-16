@@ -515,6 +515,15 @@ as a unit (~1,900 units / ~280 per tape / ~14 cartridges at 2 copies).
   while destroying name-ordered "tape spines" (tape 9 = M–P), which have real
   operational value. Optional tail-plug (fill the final gap with the next units
   that fit, slightly out of order) recovers most of the remainder if ever wanted.
+  *Fact correction, 2026-10-15 (#456, ADR-0012 item 69).* As built the selector
+  is **next-fit** in name order (a batch closes at the first unit that does not
+  fit and the next batch starts with it), which the wording above and the code's
+  docstrings called first-fit. The behaviour is ratified and unchanged. Its
+  premise (2–15 G units against 2.2 TB bins) is re-examined when any registered
+  unit exceeds a tenth of its cartridge generation's capacity: #395 admits units
+  up to half a cartridge, where next-fit can seal a tape half empty. `collection
+  plan` shows the largest pending unit's share of the tape so that trigger is
+  visible.
 - **F4:** staging GC retention extends to "until *every planned copy* is sealed"
   (§3.5 wording), and real batches need staging space (a 2.2 TB batch does not
   fit today's /scratch).
