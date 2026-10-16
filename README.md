@@ -22,8 +22,8 @@ flowchart LR
 
 - **Self-describing tapes.** Each tape begins with a plaintext guide, a `RESTORE.sh`
   and a map of every file on it. With the right key, the data comes back with `mt`,
-  `dd`, `age`, `dar`, `sha256sum`, `head`, `truncate` and `tar` alone — no database,
-  no tapectl.
+  `dd`, `age`, `dar`, `sha256sum`, `head`, `truncate`, `tar`, `mkfifo` and `tee` alone
+  — no database, no tapectl.
 - **Tenants that cannot read each other.** Family, business, a friend's backups: each
   tenant has its own keys, and nothing about a tenant's content — not even file
   names — is written to tape in plaintext.
