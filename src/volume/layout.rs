@@ -592,8 +592,11 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #
 # Disk space: --restore streams each slice from the tape through age into dar,
 # so nothing decrypted is written to disk but the restored files themselves:
-# --to needs about the unit's size free. dar is given the unit's catalogue
-# from the envelope (dar 2.7.13 loses a file's tail streaming without one).
+# --to needs about the unit's size free (counted from the slices' encrypted
+# size on tape: a compressed unit may need more). The envelopes are the other
+# thing on disk: they go to the work directory in ${TMPDIR:-/tmp}, decrypted,
+# and TMPDIR moves it. dar is given the unit's catalogue from the envelope
+# (dar 2.7.13 loses a file's tail streaming without one).
 # Where streaming is not safe (no usable catalogue and a dar before 2.7.21,
 # or a dar before 2.7.9) the slices are decrypted to disk first, as 1.0.x
 # did, in a scratch directory inside --to or --scratch DIR. The script
@@ -627,11 +630,16 @@ BLOCK=524288 # 512 KB — tapectl fixed block size
 # key here is tried independently for the envelope and for every slice.
 KEYS=()
 
-# WORK holds only small files: the tape's text zones, the envelopes, and the
-# FIFOs a restore streams slices through. A slice never lands here — a data
-# slice is up to 10 GiB and /tmp is RAM on many systems. SCRATCH is for the
-# one mode that keeps slices on disk (--path, which reads only a few), a
-# directory created inside --to or --scratch once its size is known.
+# WORK is the work directory, made in ${TMPDIR:-/tmp}: TMPDIR moves it. It
+# holds the tape's text zones, the FIFOs a restore streams slices through, and
+# the ENVELOPES: each is read whole into it, and each one a key opens is kept
+# there decrypted (its MANIFEST.toml, the dar catalogues of its units and, in
+# the operator's, catalog.db) until the run ends; --all keeps every one it
+# opens. These grow with the number of files on the tape. A data slice never
+# lands here — a slice is up to 10 GiB and /tmp is RAM on many systems.
+# SCRATCH is for the one mode that keeps slices on disk (--path, which reads
+# only a few), a directory created inside --to or --scratch once its size is
+# known.
 SCRATCH=""
 SCRATCH_PARENT=""
 SKIP_SPACE_CHECK=0
@@ -766,8 +774,10 @@ die_io() { # <what failed> <file holding the tool's stderr> <directory written t
        command again, with --overwrite if --to now holds part of the unit.
        --restore writes only the restored files to --to (--path also keeps
        the few slices it reads in a scratch directory, inside --to unless
-       --scratch names another disk); everything else this script reads is
-       small and goes to ${TMPDIR:-/tmp}."
+       --scratch names another disk); everything else goes to the work
+       directory in ${TMPDIR:-/tmp}: the decrypted envelopes, which grow with
+       the number of files on the tape. If that is what filled, set TMPDIR to
+       a directory on a larger disk."
   fi
   die "$what
        ${detail:-(no error text)}"
@@ -784,12 +794,20 @@ die_space() { # <directory> <bytes needed> <bytes free>
        it needs about $(size_str "$2"), and $(size_str "$3") is free.
        No slice has been read yet. A restore streams each slice from the tape
        through age into dar, so it needs room for the restored files only,
-       about the size of the unit's slices. --path also keeps the slices it
-       reads on disk until dar has taken the files from them (--scratch DIR
-       puts those on another disk).
+       about the size of the unit's slices. That figure is the slices' size
+       on tape, encrypted: a unit that was stored compressed restores larger,
+       and a compressed unit may need more than this. --path also keeps the
+       slices it reads on disk until dar has taken the files from them
+       (--scratch DIR puts those on another disk).
        Free space there, or choose a larger disk with --to.
        (--no-space-check skips this check, for a filesystem that holds more than
        df reports, such as a compressed or thin-provisioned one.)"
+}
+
+# What the figures above count. dar does not say how large a unit restores
+# before it runs, so the check counts the slices as they sit on tape.
+space_note() {
+  info "            (counted from the slices' encrypted size on tape; a compressed unit may need more)"
 }
 
 # Refuse BEFORE the first slice is read when the restore cannot fit. Running
@@ -811,6 +829,7 @@ check_space() { # <destination> <scratch dir> <bytes of files> <bytes of scratch
   fi
   if [ "$need_scr" -eq 0 ]; then
     info "Disk space: needs about $(size_str "$need_dest") in $dest (the files); $(size_str "$dest_free") free"
+    space_note
     [ "$dest_free" -ge "$need_dest" ] || die_space "$dest" "$need_dest" "$dest_free"
     return 0
   fi
@@ -825,10 +844,12 @@ check_space() { # <destination> <scratch dir> <bytes of files> <bytes of scratch
   if [ -z "$scr_dev" ] || [ "$scr_dev" = "$dest_dev" ]; then
     local need=$((need_scr + need_dest))
     info "Disk space: needs about $(size_str "$need") in $dest (slices read, then the files); $(size_str "$dest_free") free"
+    space_note
     [ "$dest_free" -ge "$need" ] || die_space "$dest" "$need" "$dest_free"
   else
     info "Disk space: needs about $(size_str "$need_scr") in $scr (slices read); $(size_str "$scr_free") free"
     info "            and about $(size_str "$need_dest") in $dest (the files); $(size_str "$dest_free") free"
+    space_note
     [ "$scr_free" -ge "$need_scr" ] || die_space "$scr" "$need_scr" "$scr_free"
     [ "$dest_free" -ge "$need_dest" ] || die_space "$dest" "$need_dest" "$dest_free"
   fi
@@ -1735,6 +1756,36 @@ try_envelope() { # <position>
   return 1
 }
 
+# The work directory's own need, as far as the front index tells it: every
+# envelope is read whole into $WORK (block padded), and each one a key opens
+# is kept there decrypted, about its size again, until the run ends. Which
+# envelopes a key opens is not known before it tries, so this is an upper
+# bound (the largest, read whole, plus every envelope kept) and only a
+# WARNING; a full disk is named when it happens (die_io), and TMPDIR moves
+# the work directory. The sizes come from a plaintext zone, so the sum is
+# done in awk, where a crafted figure cannot overflow shell arithmetic.
+check_work_space() {
+  [ "$SKIP_SPACE_CHECK" = 0 ] || return 0
+  local need free
+  need=$(awk -F'|' -v blk="$BLOCK" '
+    ($2 == "tenant_envelope" || $2 == "operator_envelope") && $3 ~ /^[0-9]+$/ {
+      sum += $3
+      if ($3 + 0 > max) max = $3 + 0
+    }
+    END { if (sum > 0) printf "%.0f\n", sum + max + blk }
+  ' "$FILES_TXT")
+  [ -n "$need" ] || return 0
+  free=$(free_bytes "$WORK")
+  is_uint "$free" || return 0
+  if ! awk -v have="$free" -v want="$need" 'BEGIN { exit (have + 0 >= want + 0) ? 0 : 1 }'; then
+    echo "WARNING: the work directory $WORK has $(size_str "$free") free, and reading the" >&2
+    echo "         envelopes on this tape may need up to $(size_str "$need") there: each envelope is read whole," >&2
+    echo "         and each one a key opens stays decrypted until the run ends. If it fills, the run" >&2
+    echo "         stops and says so; set TMPDIR to a directory on a larger disk to move the work" >&2
+    echo "         directory (a key that opens one small envelope needs far less than this)." >&2
+  fi
+}
+
 # Walk the envelopes in tape order — forward only — trying the keys on each,
 # and call "$1 <position>" for each that opens; it returns 1 to stop the
 # walk. A file whose bytes equal one already tried (an envelope's backup, by
@@ -1742,6 +1793,7 @@ try_envelope() { # <position>
 # read: then the backup is what is read instead.
 walk_envelopes() { # <on-open callback>
   local cb=$1 pos h rc ty seen=" "
+  check_work_space
   while IFS= read -r pos; do
     require_uint envelope_position "$pos"
     h=$(file_hash_at "$pos" "$FILES_TXT")
@@ -2536,7 +2588,8 @@ case "${1:-}" in
   echo ""
   echo "  Disk space: each slice streams from the tape through age into dar,"
   echo "      so --to needs room for the restored files only, about the unit's"
-  echo "      size. The script checks before it reads any slice. Where this"
+  echo "      size (counted from the slices' encrypted size on tape: a compressed"
+  echo "      unit may need more). The script checks before it reads any slice. Where this"
   echo "      dar cannot stream a unit safely (no catalogue in the envelope and"
   echo "      dar older than 2.7.21, or dar older than 2.7.9) its slices are"
   echo "      decrypted to disk first, in --scratch DIR (default: inside --to)."
@@ -2549,6 +2602,10 @@ case "${1:-}" in
   echo ""
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
+  echo "  TMPDIR        Where the work directory is made (default: /tmp). It holds the"
+  echo "      decrypted envelopes (the operator envelope's catalog.db, the dar"
+  echo "      catalogues), which grow with the number of files on the tape; --all"
+  echo "      keeps every envelope it opens. No data slice goes there."
   echo ""
   echo "Requirements: mt (mt-st), __TOOLS_ALL__"
   ;;

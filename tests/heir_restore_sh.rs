@@ -2385,3 +2385,142 @@ fn damage_is_not_blamed_on_a_matching_key_when_no_key_matched() {
     assert!(text.contains(wrong_key_claim), "{text}");
     assert!(!text.contains("no key opened"), "{text}");
 }
+
+// ---- #449 item 4: the work directory, described as it is, and counted ----
+
+/// A `df` that reports `kib` KiB available on every filesystem, and logs
+/// that it was asked among the tape operations (`ops`), so a test can say
+/// WHEN the script measured.
+fn df_with_free_kib(kib: u64) -> String {
+    format!(
+        "#!/bin/sh\necho df >>\"$FAKE_TAPE/ops\"\n\
+         echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
+         echo 'fake 99999999 99999999 {kib} 99% /'\n"
+    )
+}
+
+/// The work directory holds the decrypted envelopes, not "only small files".
+/// The script says where it is and that TMPDIR moves it, in its own help and
+/// where a full disk is reported; and nothing still calls it small.
+#[test]
+fn the_work_directory_is_described_as_it_is() {
+    let script = generate_restore_script_v2(LABEL, template().total_files);
+    assert!(!script.contains("holds only small files"), "the old claim");
+    assert!(
+        !script.contains("everything else this script reads is small"),
+        "the old claim in the disk-full message"
+    );
+    let h = Heir::new();
+    let (code, help) = h.run(&["--help"]);
+    assert_eq!(code, 0, "{help}");
+    assert!(help.contains("TMPDIR"), "--help names TMPDIR:\n{help}");
+    assert!(
+        help.contains("decrypted envelopes"),
+        "--help says what the work directory holds:\n{help}"
+    );
+
+    // A full work directory is named as such, and TMPDIR is the way out.
+    let h = Heir::with_stubs(&[(
+        "dd",
+        "#!/bin/sh\necho 'dd: error writing to /tmp/x: No space left on device' >&2\nexit 1\n",
+    )]);
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("alice")]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("OUT OF DISK SPACE"), "{text}");
+    assert!(
+        text.contains("TMPDIR") && text.contains("decrypted envelopes"),
+        "the full disk is told where the envelopes went and how to move them:\n{text}"
+    );
+}
+
+/// The work directory's own need is estimated from the front index (every
+/// envelope is read whole into it, and each one a key opens is kept decrypted)
+/// before the first envelope is read; a work directory that cannot hold them
+/// is a WARNING naming TMPDIR, not a surprise mid-restore. --no-space-check
+/// silences it, like the other space checks.
+#[test]
+fn a_work_directory_too_small_for_the_envelopes_is_warned_about_before_they_are_read() {
+    // 1 KiB free is less than any envelope.
+    let tiny = df_with_free_kib(1);
+    let h = Heir::with_stubs(&[("df", &tiny)]);
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "only a warning:\n{text}");
+    assert!(text.contains("WARNING"), "{text}");
+    assert!(
+        text.contains("work directory") && text.contains("TMPDIR"),
+        "{text}"
+    );
+    // The measuring happens before the first envelope (file 4) is read.
+    let ops = h.ops();
+    let measured = ops.iter().position(|l| l == "df").expect("df was asked");
+    let first_envelope = ops.iter().position(|l| l == "dd 4").expect("file 4 read");
+    assert!(
+        measured < first_envelope,
+        "measured before the first envelope is read:\n{ops:#?}"
+    );
+
+    // Room enough: silence. (The positive control for the warning above.)
+    let roomy = df_with_free_kib(1 << 30); // 1 TiB
+    let h = Heir::with_stubs(&[("df", &roomy)]);
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!text.contains("work directory"), "{text}");
+
+    // --no-space-check skips it on --restore. A df this small would stop the
+    // restore at its own check, so only the absence of the work-directory
+    // warning is compared.
+    let h = Heir::with_stubs(&[("df", &tiny)]);
+    let (_, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &h.sub("restored"),
+        "--no-space-check",
+    ]);
+    assert!(!text.contains("work directory"), "{text}");
+}
+
+/// The destination check counts the slices' size on tape, which is
+/// encrypted; a unit stored compressed restores larger. The script says so
+/// where it counts and where it refuses, rather than presenting the figure as
+/// exact.
+#[test]
+fn the_space_check_says_its_figure_is_the_encrypted_size() {
+    let h = Heir::new();
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Disk space: needs about"), "{text}");
+    let note = "a compressed unit may need more";
+    assert!(text.contains(note), "the pass line carries the caveat:\n{text}");
+
+    // Refused: the same caveat, in the FATAL.
+    let small = df_with_free_kib(2);
+    let h = Heir::with_stubs(&[("df", &small)]);
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("not enough disk space"), "{text}");
+    let fatal = text.split("FATAL:").nth(1).expect("a FATAL");
+    assert!(
+        fatal.contains("encrypted") && fatal.contains(note),
+        "the refusal says what the figure counts:\n{fatal}"
+    );
+}
