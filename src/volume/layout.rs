@@ -518,6 +518,11 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 
 set -euo pipefail
 
+# This script matches the words of dar and of other tools (dar's skip line,
+# the GPG start-up failure, a full disk). dar and coreutils ship translations,
+# and a translated message would not match: ask for English in any locale.
+export LC_ALL=C
+
 DEVICE="${TAPE_DEVICE:-/dev/nst0}"
 LABEL="__LABEL__"
 BLOCK=524288 # 512 KB — tapectl fixed block size
@@ -5233,5 +5238,33 @@ sha256_encrypted = \"bbb\"
         assert!(s.contains("catalogs/abcdef12_v3.1.dar"), "{s}");
         assert!(s.contains("dar -l catalogs/abcdef12_v3 -N -Q"), "{s}");
         assert!(s.contains("-A catalogs/abcdef12_v3"), "{s}");
+    }
+
+    /// #449 comment 1 (ADR-0012 2026-10-16 item 71): RESTORE.sh greps dar's
+    /// English output (`not restored (user choice)$`, `do not correspond to
+    /// the same data`, `INITIALIZATION FAILED FOR GPGME`, `no space left`)
+    /// and dar ships fr and sv translations, so the script asks for English
+    /// in any locale. The export comes right after `set -euo pipefail`, ahead
+    /// of every function, variable and tool call that follows.
+    #[test]
+    fn restore_sh_exports_lc_all_c_before_it_runs_any_tool() {
+        let s = generate_restore_script_v2("LOCALE1", 20);
+        assert_eq!(s.matches("\nexport LC_ALL=C\n").count(), 1, "exactly once");
+        let export = s.find("\nexport LC_ALL=C\n").unwrap();
+        let strict = s.find("\nset -euo pipefail\n").unwrap();
+        assert!(strict < export, "after the strict-mode line");
+        for first in ["\nDEVICE=", "\nWORK=\"$(mktemp", "\ndie() {", "\ndar_check() {"] {
+            let at = s.find(first).unwrap_or_else(|| panic!("{first:?} missing"));
+            assert!(export < at, "LC_ALL is exported before {first:?}");
+        }
+        // The words it greps are still the English ones.
+        for word in [
+            "not restored (user choice)$",
+            "do not correspond to the same data",
+            "INITIALIZATION FAILED FOR GPGME",
+            "no space left",
+        ] {
+            assert!(s.contains(word), "{word:?}");
+        }
     }
 }

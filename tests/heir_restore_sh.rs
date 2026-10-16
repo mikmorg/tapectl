@@ -2098,3 +2098,41 @@ fn a_dar_that_needs_gpg_is_named_before_the_tape_is_read() {
         h.ops()
     );
 }
+
+// ---- #449 comment 1: the script asks for English ----
+
+/// The script matches dar's English words, and dar ships fr and sv
+/// translations: whatever locale the heir's shell is in, the dar it runs must
+/// be started with LC_ALL=C. A wrapper on PATH records the locale dar was
+/// started under, then runs the real one.
+#[test]
+fn dar_is_started_in_the_c_locale_whatever_the_heirs_locale() {
+    let real = host_tool("dar").expect("dar must be on PATH (issue #43)");
+    let wrapper = format!(
+        "#!/bin/sh\necho \"LC_ALL=${{LC_ALL-unset}} LANG=${{LANG-unset}}\" >>\"$FAKE_TAPE/dar-locale\"\nexec {} \"$@\"\n",
+        real.display()
+    );
+    let h = Heir::with_stubs(&[("dar", &wrapper)]);
+    let (code, text) = h.run_env(
+        &[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--unit",
+            "docs",
+            "--to",
+            &h.sub("restored"),
+        ],
+        &[
+            ("LC_ALL", "fr_FR.UTF-8"),
+            ("LANG", "fr_FR.UTF-8"),
+            ("LANGUAGE", "fr"),
+        ],
+    );
+    assert_eq!(code, 0, "{text}");
+    let seen = std::fs::read_to_string(h.dir.join("dar-locale")).unwrap();
+    assert!(
+        seen.lines().count() >= 2 && seen.lines().all(|l| l.starts_with("LC_ALL=C ")),
+        "every dar run (the version probe, the extraction) is under LC_ALL=C:\n{seen}"
+    );
+}
