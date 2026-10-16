@@ -1174,19 +1174,12 @@ fn volume_write_contacted<'c>(
     // (its ID thunk embeds a `created_at` and a MAM load count that have
     // since moved on). An interrupted session is resumed, never re-written:
     // that is `volume_resume`'s job.
-    let existing_sessions: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM writes WHERE volume_id = ?1 AND status IN ('planned','in_progress','interrupted')",
-        params![volume_id],
-        |r| r.get(0),
-    )?;
-    if existing_sessions > 0 {
-        return Err(TapectlError::Other(format!(
-            "volume \"{label}\" already has an unresolved write session \
-             (status planned/in_progress/interrupted). If it was interrupted, reload the \
-             same cartridge and run `tapectl volume resume {label}` — it continues that \
-             session from its frozen staging files rather than rebuilding it. Otherwise \
-             inspect the `writes`/`write_positions` rows for volume_id {volume_id}."
-        )));
+    //
+    // Both this check and the recorded-seal one below are made by
+    // [`precontact_refusal`], which `collection run`'s destination check
+    // calls too (#475), so the two entry points refuse one fact in one text.
+    if let Some(refusal) = precontact_refusal(conn, label, volume_id)? {
+        return Err(TapectlError::Other(refusal));
     }
 
     // Issue #330: the seal is RECORDED, not inferred (ADR-0012's 2026-09-21
@@ -1202,16 +1195,8 @@ fn volume_write_contacted<'c>(
     // the unresolved-session check so an `interrupted` sealed session still
     // gets that check's resume advice, and before any backend, MAM or
     // drive is touched.
-    let seal_recorded: bool = conn.query_row(
-        "SELECT sealed_at IS NOT NULL FROM volumes WHERE id = ?1",
-        params![volume_id],
-        |r| r.get(0),
-    )?;
-    if seal_recorded {
-        return Err(TapectlError::Other(seal_recorded_refusal(
-            conn, label, volume_id,
-        )?));
-    }
+    // (Made by `precontact_refusal` above, after the unresolved-session
+    // check, in that order.)
 
     // The write's staged-data facts, from the catalog and the disk alone
     // (issues #402, #445): shared with `volume write --init`, which asks
@@ -4005,6 +3990,43 @@ fn describe_file0_identity(found: Option<&super::format::IdThunkIdentity>) -> St
     }
 }
 
+/// The catalog-only refusals a fresh write makes before any backend, MAM or
+/// drive is touched, in this order: an unresolved write session
+/// (`planned`/`in_progress`/`interrupted`: a retry is `volume resume`'s job,
+/// never a fresh write), then a recorded seal (`volumes.sealed_at`, ADR-0003,
+/// absolute). `None` lets the volume through to the tape's own checks. Shared
+/// by `volume_write` and `collection::plan::destination_budget` (#475), so
+/// `collection run` refuses before it stages a batch, in the same words.
+pub(crate) fn precontact_refusal(
+    conn: &Connection,
+    label: &str,
+    volume_id: i64,
+) -> Result<Option<String>> {
+    let unresolved: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM writes WHERE volume_id = ?1 AND status IN ('planned','in_progress','interrupted')",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    if unresolved > 0 {
+        return Ok(Some(format!(
+            "volume \"{label}\" already has an unresolved write session \
+             (status planned/in_progress/interrupted). If it was interrupted, reload the \
+             same cartridge and run `tapectl volume resume {label}` — it continues that \
+             session from its frozen staging files rather than rebuilding it. Otherwise \
+             inspect the `writes`/`write_positions` rows for volume_id {volume_id}."
+        )));
+    }
+    let seal_recorded: bool = conn.query_row(
+        "SELECT sealed_at IS NOT NULL FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    if seal_recorded {
+        return Ok(Some(seal_recorded_refusal(conn, label, volume_id)?));
+    }
+    Ok(None)
+}
+
 /// The refusal for a fresh write to a volume whose seal the catalog records
 /// (issue #330). It names `volume verify` + `volume resume` only when resume
 /// would actually re-confirm this volume's aborted session: the session is
@@ -6564,7 +6586,7 @@ pub(crate) fn write_catalog_preflight(
 }
 
 /// Gather the staged batch as `BuildUnit`s, ready for `build::build`.
-/// `ORDER BY u.name` stays — the alphabetical first-fit ordering ruled in
+/// `ORDER BY u.name` stays — the alphabetical (next-fit) ordering ruled in
 /// sheet §7 (`docs/design/v2-open-questions.md`); `build()` never reorders
 /// its input, so this is where unit order is decided.
 fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
@@ -11360,7 +11382,7 @@ mod tests {
         let tenant_id = conn.last_insert_rowid();
 
         // Inserted zeta-then-alpha, deliberately reverse-alphabetical, to
-        // prove `ORDER BY u.name` (sheet §7's alphabetical first-fit) is what
+        // prove `ORDER BY u.name` (sheet §7's alphabetical next-fit) is what
         // actually orders the result, not insertion order.
         for name in ["zeta", "alpha"] {
             conn.execute(

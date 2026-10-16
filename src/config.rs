@@ -1812,7 +1812,7 @@ fn stale_backend_fields_message(value: &toml::Value) -> Option<String> {
 /// was already deleted (spec W4, ADR-0003 — append is rejected outright), and
 /// `strategy`/`fill_threshold` were `PackingConfig`'s only other fields, with
 /// no reader anywhere (`grep -rn 'packing\.' src/ --include=*.rs` outside this
-/// file returns nothing) — the real batch selector is alphabetical first-fit
+/// file returns nothing) — the real batch selector is alphabetical next-fit
 /// (`src/collection/`), never a configurable best-fit-decreasing strategy,
 /// and no code ever consulted a fill threshold.
 fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
@@ -1829,7 +1829,7 @@ fn stale_packing_fields_message(value: &toml::Value) -> Option<String> {
         return Some(
             "the [packing] section was removed (ADR-0012) — `strategy` and \
              `fill_threshold` were parsed but never read: the real batch selector is \
-             alphabetical first-fit (src/collection/), not a configurable best-fit \
+             alphabetical next-fit (src/collection/), not a configurable best-fit \
              strategy, and no code ever consulted a fill threshold. Delete the \
              [packing] table."
                 .to_string(),

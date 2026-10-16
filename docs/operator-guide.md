@@ -2541,9 +2541,16 @@ tapectl volume init L6-0002 --cartridge L6-0002
 One safeguard on this path: if the barcode you name is still carrying a live
 volume, tapectl refuses rather than displacing it. With no serial it cannot tell
 whether that cartridge was erased or whether you have loaded a different tape
-wearing its sticker. Say the bytes are gone first — `volume retire <volume>` or
-`cartridge mark-erased <barcode>` — and run it again. There is no `--force`;
-this is something tapectl cannot know, not a risk for you to accept.
+wearing its sticker, so decide which it is. If you loaded the wrong tape, load
+the cartridge you meant and run `volume init` again naming its barcode (or
+without `--cartridge` when the drive reads a medium serial), and leave the named
+cartridge alone. If it really is that cartridge and you are reusing it, say the
+bytes are gone first — `volume retire <volume>` or `cartridge mark-erased
+<barcode>` — and run it again. Both refuse while that volume holds the last copy
+of any unit (Tier 3: no `--force`, and `--yes` does not reach it), so make that
+copy on another cartridge first; the refusal prints the steps (#468). There is no
+`--force` for the init itself: this is something tapectl cannot know, not a risk
+for you to accept.
 
 ### Erasing a cartridge
 

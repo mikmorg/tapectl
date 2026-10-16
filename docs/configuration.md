@@ -119,7 +119,7 @@ Every `config.toml` written by `init` before the rename carries both old
 
 ```text
 config: INVALID
-  - configuration error: ~/.tapectl/config.toml: defaults.min_copies_for_tape_only and defaults.min_locations_for_tape_only were renamed: the keys are now defaults.min_copies and defaults.min_locations, with the same meaning — the copy and location requirement every unit starts from (an [[archive_sets]] entry's min_copies overrides it). Rename the lines; the values carry over unchanged.
+  - configuration error: ~/.tapectl/config.toml: defaults.min_copies_for_tape_only and defaults.min_locations_for_tape_only were renamed: the keys are now defaults.min_copies and defaults.min_locations, with the same meaning — the copy requirement every unit starts from (an [[archive_sets]] entry's min_copies overrides it) and the number of distinct locations a tape-only unit's copies must span. Rename the lines; the values carry over unchanged.
   - unknown key: defaults.min_copies_for_tape_only
   - unknown key: defaults.min_locations_for_tape_only
 dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)

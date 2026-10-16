@@ -303,7 +303,10 @@ no extra margin. Other fact lines it can show:
 - when the unit has copies, a line on the weakest of them, just before the
   `(--force …)` line: `coverage for unit "<unit>" rests on <label>, last
   verified <d> days ago`, or `coverage for unit "<unit>" rests on <n> copies;
-  weakest is <label>, never verified`
+  weakest is <label>, never verified`, where <n> is the fewest copies any current
+  version has; when the versions are unequally covered it reads `rests on <n> copy
+  at its least-covered current version — <m> copies are held across all its current
+  versions; weakest of them is <label>, never verified` (#463)
 
 A unit that meets its policy is marked without any question. A unit that was never
 archived is refused whatever the flags (Tier 3): take a snapshot first.
@@ -434,8 +437,9 @@ command refuses it until they are renamed:
 ```text
 error: failed to load config: configuration error: <path>/config.toml: defaults.min_copies_for_tape_only and
 defaults.min_locations_for_tape_only were renamed: the keys are now defaults.min_copies and
-defaults.min_locations, with the same meaning — the copy and location requirement every unit starts from (an
-[[archive_sets]] entry's min_copies overrides it). Rename the lines; the values carry over unchanged.
+defaults.min_locations, with the same meaning — the copy requirement every unit starts from (an
+[[archive_sets]] entry's min_copies overrides it) and the number of distinct locations a tape-only unit's copies
+must span. Rename the lines; the values carry over unchanged.
 ```
 
 `config check` names each one on a line of its own:
