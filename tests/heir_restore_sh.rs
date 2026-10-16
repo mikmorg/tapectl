@@ -1781,7 +1781,11 @@ fn edit_text_file(h: &Heir, pos: i64, edit: impl Fn(&str) -> String) {
     std::fs::write(&f, padded(new.into_bytes())).unwrap();
 }
 
-/// A 1.1.0 tape says what it requires, and requires nothing.
+/// A 1.1.0 tape says what it requires, and requires nothing. This holds for
+/// 1.2.0 too (ADR-0012 2026-10-16 item 73): the re-pin changes RESTORE.sh's
+/// text and not what a reader must understand, so a 1.1.x script reads a
+/// 1.2.0 tape and the other way round. The third place `requires` lives is
+/// RESTORE.sh's own `KNOWN_FEATURES`, which stays empty.
 #[test]
 fn a_new_tape_states_an_empty_requires_in_file_0_and_the_seal() {
     let t = template();
@@ -1789,6 +1793,44 @@ fn a_new_tape_states_an_empty_requires_in_file_0_and_the_seal() {
     let seal = std::fs::read_to_string(t.dir.join(format!("tape/{}", t.total_files - 1))).unwrap();
     assert!(f0.contains("\nrequires = []\n"), "File 0");
     assert!(seal.contains("\nrequires = []\n"), "seal marker");
+    let script = generate_restore_script_v2(LABEL, t.total_files);
+    assert_eq!(
+        script.matches("\nKNOWN_FEATURES=\"\"\n").count(),
+        1,
+        "RESTORE.sh knows no feature a tape could require"
+    );
+}
+
+/// ADR-0012 2026-10-16 item 73, the other fixed point: the text that tells
+/// an heir a tape is newer than the script says "tapectl 1.1.0" and keeps
+/// saying it in 1.2.0; it moves only by hand when a new required feature
+/// arrives (ADR-0012 2026-10-06 item 20). Pinned in the generated text and
+/// in what the heir actually reads when the script refuses a tape.
+#[test]
+fn the_newer_tape_refusal_still_says_tapectl_1_1_0() {
+    let script = generate_restore_script_v2(LABEL, template().total_files);
+    assert_eq!(
+        script
+            .matches("This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely")
+            .count(),
+        1,
+        "die_newer_needed's text"
+    );
+    assert_eq!(
+        script.matches("tapectl 1.").count(),
+        1,
+        "no other tapectl version is named in the script"
+    );
+    let h = Heir::new();
+    edit_text_file(&h, 0, |t| {
+        t.replace("requires = []", "requires = [\"short-seal\"]")
+    });
+    let (code, text) = h.run(&["--info"]);
+    assert_ne!(code, 0, "{text}");
+    assert!(
+        text.contains("(layout v2, tapectl 1.1.0) cannot read it safely"),
+        "{text}"
+    );
 }
 
 /// A tape that requires a feature this script does not know is refused,

@@ -1385,6 +1385,33 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
     assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
 }
 
+/// ADR-0012 2026-10-16 item 73, from a REAL `build()`: the 1.2.0 re-pin
+/// changes generated text, not what a reader must understand. File 0 and the
+/// seal marker still say `requires = []`, and the File 2 the build wrote still
+/// knows no feature and still names "tapectl 1.1.0" as the version a newer
+/// tape would need.
+#[test]
+fn the_re_pin_leaves_requires_empty_and_the_newer_tape_text_at_1_1_0() {
+    let h = shared_harness();
+    let text_of = |pos: usize| {
+        String::from_utf8_lossy(&h.store.files[pos])
+            .trim_end_matches('\0')
+            .to_string()
+    };
+    let last = h.store.files.len() - 1;
+    assert!(text_of(0).contains("\nrequires = []\n"), "File 0");
+    assert!(text_of(last).contains("\nrequires = []\n"), "seal marker");
+    let restore_sh = text_of(2);
+    assert!(
+        restore_sh.contains("\nKNOWN_FEATURES=\"\"\n"),
+        "RESTORE.sh knows no feature"
+    );
+    assert!(
+        restore_sh.contains("This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely"),
+        "die_newer_needed says 1.1.0"
+    );
+}
+
 // ── Issue #450 — the plaintext zones, scanned without a tape ──────────────
 
 const VOLUME_UUID_NEEDLES: &str = "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0";
