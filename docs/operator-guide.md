@@ -470,7 +470,7 @@ Staging reads each unit's files once, while dar archives them, and refuses the
 whole stage if any file changes during that read (ADR-0012, 2026-10-06 item 4:
 dar runs with `--retry-on-change 0`, so a file caught mid-change is never
 archived half-changed). A failed stage starts over (#409): there is no resuming
-it. A unit can be up to half a cartridge, so one stage can take many hours, and
+it. A unit can be up to one cartridge's budget (#395), so one stage can take many hours, and
 one file touched by anything in those hours costs the whole stage.
 
 For a source nothing writes to (a finished photo year, a scanned archive) this

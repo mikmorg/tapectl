@@ -125,6 +125,12 @@ Each open issue was ruled. This checks the premise the ruling rests on, in ADR-0
   for anyone holding the operator or escrow key, and the Heir Kit's `catalog.db.age` does
   the same off tape. R4 helps only a tenant holding a tenant key and nothing else.
   Recommend: keep it open, mark it low, and let a real tenant restore request reopen it.
+- **Erratum, 2026-10-16: the premise above is wrong.** The operator envelope's `catalog.db`
+  holds only the stage sets of that tape's own write (`volume/write.rs`, the
+  `build_catalog_snapshot(conn, &stage_set_ids, …)` call; `volume-format-v2.md` §1.4). No tape
+  indexes another, for any key; only the Heir Kit's `catalog.db.age` is a cross-volume index.
+  R4 is worth more than this section allowed. The CTO ruled on 2026-10-16 to design and build
+  it for 1.3.0.
 
 ### #409 — a failed stage starts over (ruled "not until spanning", 2026-10-07 item 11)
 
@@ -138,6 +144,9 @@ Each open issue was ruled. This checks the premise the ruling rests on, in ADR-0
   Recommend: an operator-guide paragraph now; later, a per-collection snapshot hook so
   `collection run` stages from an LVM, btrfs or ZFS snapshot, which also removes the
   hasher-vs-dar race that the post-dar stat check only detects.
+- **Erratum, 2026-10-16:** #395 refuses a unit only above one whole cartridge's budget (the
+  plaintext walk size against the largest drive's budget, `staging::check_unit_fits_one_tape`);
+  half a cartridge is ADR-0012 2026-10-06 item 17's trigger for designing spanning, not a cap.
 
 ### #364 — staging throughput (epic)
 

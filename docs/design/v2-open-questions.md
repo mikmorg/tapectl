@@ -521,7 +521,8 @@ as a unit (~1,900 units / ~280 per tape / ~14 cartridges at 2 copies).
   docstrings called first-fit. The behaviour is ratified and unchanged. Its
   premise (2–15 G units against 2.2 TB bins) is re-examined when any registered
   unit exceeds a tenth of its cartridge generation's capacity: #395 admits units
-  up to half a cartridge, where next-fit can seal a tape half empty. `collection
+  up to one cartridge's budget (half a cartridge is ADR-0012 2026-10-06 item 17's
+  trigger for designing spanning, not a cap), where next-fit can seal a tape half empty. `collection
   plan` shows the largest pending unit's share of the tape so that trigger is
   visible.
 - **F4:** staging GC retention extends to "until *every planned copy* is sealed"
