@@ -2640,9 +2640,9 @@ fn nothing_to_resume(conn: &Connection, volume_id: i64, label: &str) -> TapectlE
             "volume \"{label}\" has no write sessions at all — there is nothing to resume. Run \
              `tapectl volume write {label}` to start one. If its cartridge was in fact written \
              and sealed by a session this catalog lost (the catalog was restored from a backup \
-             taken before the write), load it and run `tapectl catalog rebuild --from-volume`, \
-             then a full `tapectl volume verify {label}`, then `tapectl volume resume {label}` \
-             (ADR-0012, 2026-09-29 later)."
+             taken before the write), load it and run `tapectl catalog rebuild --from-volume \
+             --key <operator or escrow secret key file>`, then a full `tapectl volume verify \
+             {label}`, then `tapectl volume resume {label}` (ADR-0012, 2026-09-29 later)."
         ));
     }
     if statuses.iter().any(|s| s == "planned") {
@@ -2990,11 +2990,15 @@ fn finish_session(
                 )
                 .map_err(|e| e.in_write_session(label))?;
                 // Exit 4 (issue #408), with the text `Interrupted` printed.
+                // #468: the same command `finish_confirm` names, with
+                // `--full-confirm` when this write asked for the full readback
+                // (a bare resume runs the quick confirm instead).
+                let resume_hint = confirm_resume_hint(label, confirm_tier);
                 return Err(TapectlError::WriteInterrupted(format!(
                     "stopped by a signal: volume \"{label}\": interrupted after seal, before \
                      confirm -- the tape IS sealed but its readback never ran, so the catalog \
-                     cannot yet count it as a copy. Reload the same cartridge and run `tapectl \
-                     volume resume {label}` to re-enter confirm."
+                     cannot yet count it as a copy. Reload the same cartridge and \
+                     {resume_hint}."
                 )));
             }
 
@@ -3159,6 +3163,24 @@ fn park_after_seal(marker: &str) -> bool {
     }
 }
 
+/// The command that re-enters a sealed volume's confirm, as an instruction to
+/// finish "Reload the same cartridge and ...". `volume resume` runs the QUICK
+/// confirm unless it is given `--full-confirm`, so a write that asked for the
+/// full readback names the flag, or the operator's resume would sign off a
+/// shorter check than the one that was stopped (#410, #468). Files a full
+/// readback already read back clean are not read again.
+fn confirm_resume_hint(label: &str, tier: Tier) -> String {
+    match tier {
+        Tier::Integrity => format!(
+            "run `tapectl volume resume {label} --full-confirm` to continue the full readback \
+             (files it already read back clean are not read again)"
+        ),
+        Tier::Navigable => {
+            format!("run `tapectl volume resume {label}` to retry the confirm readback")
+        }
+    }
+}
+
 /// The seal->confirm tail shared by a fresh [`ReadyToSeal`] (which calls
 /// `seal()` first, in [`finish_session`]) and a resume that met
 /// [`ResumeOutcome::Confirming`] (which never does — the tape is already
@@ -3181,13 +3203,7 @@ fn finish_confirm(
     // the seal stays recorded: `volume resume` re-enters confirm. A full
     // readback keeps what it read back clean as it goes (issue #410), so a
     // resume that asks for the full readback again continues it.
-    let resume_hint = match confirm_tier {
-        Tier::Integrity => format!(
-            "run `tapectl volume resume {label} --full-confirm` to continue the full readback \
-             (files it already read back clean are not read again)"
-        ),
-        Tier::Navigable => format!("run `tapectl volume resume {label}` to re-enter confirm"),
-    };
+    let resume_hint = confirm_resume_hint(label, confirm_tier);
     let confirmed = sealed_pending
         .confirm(conn, store, confirm_tier)
         .map_err(|e| match e {
@@ -3246,15 +3262,13 @@ fn finish_confirm(
             .map_err(|e| {
                 TapectlError::ConfirmInconclusive(format!(
                     "volume \"{label}\": confirm could not complete — {detail} (recording the \
-                     event failed: {e}); run `tapectl volume resume {label}` to retry the \
-                     confirm readback."
+                     event failed: {e}); {resume_hint}."
                 ))
             })?;
             // Exit 3 (issue #408).
             Err(TapectlError::ConfirmInconclusive(format!(
                 "volume \"{label}\": confirm could not complete — {detail}. The tape is \
-                 physically unharmed and the write is not lost; run `tapectl volume resume \
-                 {label}` to retry the confirm readback."
+                 physically unharmed and the write is not lost; {resume_hint}."
             )))
         }
     }
@@ -12443,6 +12457,16 @@ mod tests {
                 && msg.contains("tapectl volume verify L6-REBUILT-R"),
             "the #360 refusal names the rebuild, then the verify: {msg}"
         );
+        // #468: `catalog rebuild` refuses to parse without `--key`.
+        crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+            &msg,
+            &[("<operator or escrow secret key file>", "op.key")],
+            &[
+                "tapectl catalog rebuild --from-volume --key op.key",
+                "tapectl volume verify L6-REBUILT-R",
+                "tapectl volume resume L6-REBUILT-R",
+            ],
+        );
         assert!(
             !msg.contains("/nonexistent/tapectl-resume-rebuilt-test-nst"),
             "refused before the tape moves: {msg}"
@@ -12564,6 +12588,17 @@ mod tests {
                 && msg.contains("tapectl volume verify L6-NONE")
                 && msg.contains("tapectl volume resume L6-NONE"),
             "{msg}"
+        );
+        // #468: `catalog rebuild` refuses to parse without `--key`.
+        crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+            &msg,
+            &[("<operator or escrow secret key file>", "op.key")],
+            &[
+                "tapectl volume write L6-NONE",
+                "tapectl catalog rebuild --from-volume --key op.key",
+                "tapectl volume verify L6-NONE",
+                "tapectl volume resume L6-NONE",
+            ],
         );
     }
 
@@ -18883,6 +18918,13 @@ mod tests {
             /// Reading File 3 back returns different bytes from those
             /// written.
             ReadFrontIndexCorrupt,
+            /// Reading a file after File 3 back returns only its first few
+            /// bytes: a short read, which proves nothing about the medium
+            /// (an `Inconclusive` confirm, not a quarantine).
+            ReadContentShort,
+            /// A signal arrives once the seal's write has landed, before the
+            /// confirm begins.
+            SignalAfterSeal,
         }
 
         /// A `MemStore` with one [`Fault`].
@@ -18906,6 +18948,11 @@ mod tests {
                     Fault::SealIo if sync => {
                         Err(TapectlError::TapeIo("injected seal write error".into()))
                     }
+                    Fault::SignalAfterSeal if sync => {
+                        let written = self.inner.execute(src, len, sync);
+                        crate::signal::interrupt_this_thread(true);
+                        written
+                    }
                     _ => self.inner.execute(src, len, sync),
                 }
             }
@@ -18921,6 +18968,13 @@ mod tests {
                         bytes[0] ^= 0xff;
                         sink.write_all(&bytes)?;
                         Ok(n)
+                    }
+                    Fault::ReadContentShort if sealed && position > 3 => {
+                        let mut bytes = Vec::new();
+                        self.inner.read_file(position, &mut bytes)?;
+                        bytes.truncate(5);
+                        sink.write_all(&bytes)?;
+                        Ok(bytes.len() as u64)
                     }
                     _ => self.inner.read_file(position, sink),
                 }
@@ -18940,9 +18994,22 @@ mod tests {
             store: &mut dyn Store,
             prewrite_hash: bool,
         ) -> (Result<()>, i32) {
+            write_outcome_with(label, store, prewrite_hash, false, |_| {})
+        }
+
+        /// [`write_outcome`] with `--full-confirm` chosen and a hook that
+        /// prepares the catalog connection before the write.
+        fn write_outcome_with(
+            label: &str,
+            store: &mut dyn Store,
+            prewrite_hash: bool,
+            full_confirm: bool,
+            prepare: impl FnOnce(&Connection),
+        ) -> (Result<()>, i32) {
             let tmp = tempfile::TempDir::new().unwrap();
             let (conn, mut config, _volume_id) = swept_write_fixture(label, tmp.path());
             config.backends.lto[0].capacity_override = Some("2400G".into());
+            prepare(&conn);
             let paths = TapectlPaths::new(tmp.path().join("home"));
             let mut slot = ContactSlot::empty();
             let r = volume_write_contacted(
@@ -18955,7 +19022,7 @@ mod tests {
                 false,
                 false,
                 prewrite_hash,
-                false,
+                full_confirm,
                 true,
                 &mut slot,
                 ContactStore::Injected(store),
@@ -19105,6 +19172,81 @@ mod tests {
             let err = r.unwrap_err();
             assert!(matches!(err, TapectlError::WriteQuarantined(_)), "{err:?}");
             assert_eq!(code, 6, "{err}");
+        }
+
+        /// #468: every message that sends the operator to `volume resume` to
+        /// re-enter a sealed volume's confirm names `--full-confirm` when the
+        /// write asked for the full readback (a bare resume runs the quick
+        /// confirm), and the command it names is one the CLI accepts. Three
+        /// of the four sites said the bare command.
+        #[test]
+        fn the_resume_a_stopped_confirm_names_matches_the_tier_it_was_stopped_at() {
+            use crate::cli::operations::remedy_commands::assert_names_parsing_commands;
+            fn events_refuse_inconclusive(conn: &Connection) {
+                conn.execute_batch(
+                    "CREATE TRIGGER refuse_inconclusive_event BEFORE INSERT ON events
+                     WHEN NEW.action = 'write_confirm_inconclusive'
+                     BEGIN SELECT RAISE(ABORT, 'injected event failure'); END;",
+                )
+                .unwrap();
+            }
+            // (what stops the confirm, the fault, expected exit code,
+            // prepares the catalog, a phrase proving WHICH site spoke)
+            type Prepare = Option<fn(&Connection)>;
+            let cases: [(&str, Fault, i32, Prepare, &str); 3] = [
+                (
+                    "a signal after the seal",
+                    Fault::SignalAfterSeal,
+                    4,
+                    None,
+                    "interrupted after seal",
+                ),
+                (
+                    "an inconclusive readback",
+                    Fault::ReadContentShort,
+                    3,
+                    None,
+                    "none proving the medium itself is bad",
+                ),
+                (
+                    "an inconclusive readback whose event cannot be recorded",
+                    Fault::ReadContentShort,
+                    3,
+                    Some(events_refuse_inconclusive),
+                    "recording the event failed",
+                ),
+            ];
+            for (n, (what, fault, code, prepare, site)) in cases.into_iter().enumerate() {
+                for full_confirm in [true, false] {
+                    // A short content read happens only in a full readback.
+                    if matches!(fault, Fault::ReadContentShort) && !full_confirm {
+                        continue;
+                    }
+                    let label = format!("RH-{n}-{}", u8::from(full_confirm));
+                    let mut store = Faulty {
+                        inner: MemStore::new(512 * 1024),
+                        fault,
+                    };
+                    let (r, got) =
+                        write_outcome_with(&label, &mut store, false, full_confirm, |conn| {
+                            if let Some(prepare) = prepare {
+                                prepare(conn);
+                            }
+                        });
+                    crate::signal::interrupt_this_thread(false);
+                    let msg = r.expect_err(what).to_string();
+                    assert_eq!(got, code, "{what}: {msg}");
+                    assert!(msg.contains(site), "{what}: wrong site: {msg}");
+                    let bare = format!("tapectl volume resume {label}");
+                    let full = format!("tapectl volume resume {label} --full-confirm");
+                    if full_confirm {
+                        assert_names_parsing_commands(&msg, &[], &[&full]);
+                    } else {
+                        assert_names_parsing_commands(&msg, &[], &[&bare]);
+                        assert!(!msg.contains("--full-confirm"), "{what}: {msg}");
+                    }
+                }
+            }
         }
 
         /// Issue #386: a MemStore write inside a progress session records

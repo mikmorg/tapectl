@@ -506,8 +506,9 @@ pub fn refusal(label: &str, verdict: &LostAdoption) -> TapectlError {
              rebuild --from-volume` of it is recorded, so nothing says those writes came from \
              its tape. If this cartridge was written and sealed by a session this catalog lost \
              (it was restored from a backup taken before the write), load it and run `tapectl \
-             catalog rebuild --from-volume`, then a full `tapectl volume verify {label}`, then \
-             `tapectl volume resume {label}` again (ADR-0012, 2026-09-29 later)."
+             catalog rebuild --from-volume --key <operator or escrow secret key file>`, then a \
+             full `tapectl volume verify {label}`, then `tapectl volume resume {label}` again \
+             (ADR-0012, 2026-09-29 later)."
         ),
         LostAdoption::NoCleanFullVerifyAfterRebuild { rebuilt_at } => format!(
             "volume \"{label}\": no passing full verify is recorded after its rebuild at \
@@ -1154,6 +1155,16 @@ mod tests {
         assert!(
             rebuild.contains("tapectl catalog rebuild --from-volume"),
             "{rebuild}"
+        );
+        // #468: `catalog rebuild` refuses to parse without `--key`.
+        crate::cli::operations::remedy_commands::assert_names_parsing_commands(
+            &rebuild,
+            &[("<operator or escrow secret key file>", "op.key")],
+            &[
+                "tapectl catalog rebuild --from-volume --key op.key",
+                &format!("tapectl volume verify {LABEL}"),
+                &format!("tapectl volume resume {LABEL}"),
+            ],
         );
         let verify = refusal(
             LABEL,
