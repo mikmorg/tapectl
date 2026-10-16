@@ -16,7 +16,9 @@
 //! resolves it:
 //!
 //! 1. **the same volume, actually written:** the tape's File 0 uuid equals
-//!    the catalog row's uuid, and a valid seal marker binds its front index;
+//!    the catalog row's uuid, File 0 does not say this tapectl cannot read the
+//!    tape (a `requires` it does not know, another magic or layout; #476), and
+//!    a valid seal marker binds its front index;
 //! 2. **every byte read back good:** a passing full `volume verify` of this
 //!    volume is recorded after the rebuild — a recorded row, not an
 //!    inference;
@@ -62,6 +64,12 @@ pub enum LostAdoption {
         expected_uuid: String,
         found: String,
     },
+    /// Condition 1, first half: File 0 reads and is this volume's, but says
+    /// this tapectl cannot read the tape — it requires a feature this tapectl
+    /// does not know, or states another magic or layout (`why` is the text
+    /// `volume::raw` and `catalog rebuild` give; #476). Adopting would record
+    /// as a whole sealed copy a tape this tapectl cannot show is whole.
+    UnreadableFile0 { why: String },
     /// Condition 1, second half: no valid seal marker binds the front index
     /// — the write never finished on this tape, or its tail or File 3 does
     /// not read back as what was sealed.
@@ -177,6 +185,14 @@ pub fn adopt(
             expected_uuid,
             found: format!("label {:?}, uuid {:?}", identity.label, identity.uuid),
         });
+    }
+    // The same File 0, asked what it says about the reader it needs (#476,
+    // ADR-0012 2026-10-06 item 15): before the front index or the seal is
+    // read, so a tape this tapectl cannot show is whole is never adopted as
+    // a sealed copy. A File 0 that does not read or parse was refused above,
+    // as it always was; this is only for one that does and says no.
+    if let Err(e) = format::check_id_thunk_readable(&file0) {
+        return Ok(LostAdoption::UnreadableFile0 { why: e.to_string() });
     }
 
     // Condition 1, second half: actually written — a seal binds File 3.
@@ -494,6 +510,11 @@ pub fn refusal(label: &str, verdict: &LostAdoption) -> TapectlError {
              {expected_uuid:?}, and File 0 reads {found}. `volume resume` adopts a write this \
              catalog lost only from the volume's own tape (ADR-0012, 2026-09-29 later, \
              condition 1). Load the cartridge \"{label}\" was initialised on and resume again."
+        ),
+        LostAdoption::UnreadableFile0 { why } => format!(
+            "volume \"{label}\": {why}. `volume resume` adopts a write this catalog lost only \
+             from a tape this tapectl can read (ADR-0012, 2026-09-29 later, condition 1), so \
+             nothing was adopted and the volume's status is unchanged."
         ),
         LostAdoption::NotSealed { why } => format!(
             "volume \"{label}\": no valid seal marker binds this tape's front index ({why}). \
@@ -917,6 +938,96 @@ mod tests {
         assert_refused_untouched(&lost, &verdict);
     }
 
+    /// `Lost`'s sealed tape on a `FakeTape`, so the head motion is recorded;
+    /// File 0's `requires` line replaced by `to` (`STATED` leaves the tape as
+    /// written, and proves the fixture states `requires = []`).
+    fn on_fake_tape(
+        lost: &Lost,
+        to: &str,
+    ) -> (crate::tape::fake::FakeTape, crate::store::TapeStore) {
+        let fake = crate::tape::fake::FakeTape::with_files(lost.store.files.clone(), BS as usize);
+        let old = fake.state().files[0].clone();
+        fake.state().files[0] = format::rewrite_file0(&old, STATED, to);
+        let store = crate::store::TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        (fake, store)
+    }
+
+    const STATED: &str = "\nrequires = []\n";
+
+    /// #476 (ADR-0012 2026-10-06 item 15): File 0 is this volume's and reads,
+    /// but states a feature this tapectl does not know — a tape it cannot
+    /// show is whole must not be adopted as a sealed copy. Refused with the
+    /// text `restore raw-volume` and `catalog rebuild` give, naming the
+    /// feature, from the File 0 already read: File 0 is the only file the
+    /// tape was asked for, and nothing is written.
+    #[test]
+    fn condition_1_refuses_a_tape_that_requires_an_unknown_feature() {
+        use crate::tape::fake::Op;
+        let lost = Lost::ready();
+        let (fake, mut tape) = on_fake_tape(&lost, "\nrequires = [\"unknown-feature\"]\n");
+
+        let verdict = adopt(&lost.conn, &mut tape, lost.volume_id, LABEL, BS).unwrap();
+
+        let expected =
+            format::check_id_thunk_readable(&String::from_utf8_lossy(&fake.state().files[0]))
+                .unwrap_err()
+                .to_string();
+        assert_eq!(
+            verdict,
+            LostAdoption::UnreadableFile0 {
+                why: expected.clone()
+            }
+        );
+        assert!(expected.contains("\"unknown-feature\""), "{expected}");
+        assert_refused_untouched(&lost, &verdict);
+        let message = refusal(LABEL, &verdict).to_string();
+        assert!(message.contains(&expected), "{message}");
+        assert!(message.contains(LABEL), "{message}");
+        let ops = fake.ops();
+        assert_eq!(
+            ops.iter().filter(|o| **o == Op::ReadHead(0)).count(),
+            1,
+            "{ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .all(|o| matches!(o, Op::Rewind | Op::ReadHead(0))),
+            "the front index and the seal were not read: {ops:?}"
+        );
+    }
+
+    /// A `requires` that is not a list cannot be shown to be readable.
+    #[test]
+    fn condition_1_refuses_a_requires_that_is_not_a_list() {
+        let lost = Lost::ready();
+        let (_fake, mut tape) = on_fake_tape(&lost, "\nrequires = \"parts\"\n");
+        let verdict = adopt(&lost.conn, &mut tape, lost.volume_id, LABEL, BS).unwrap();
+        assert!(
+            matches!(&verdict, LostAdoption::UnreadableFile0 { why }
+                if why.contains("TOML parse failed")),
+            "{verdict:?}"
+        );
+        assert_refused_untouched(&lost, &verdict);
+    }
+
+    /// The positive control: the same tape on the same fake, `requires = []`,
+    /// is adopted as before — and the front index and seal ARE read.
+    #[test]
+    fn a_tape_that_requires_nothing_is_adopted_through_the_same_store() {
+        use crate::tape::fake::Op;
+        let lost = Lost::ready();
+        let (fake, mut tape) = on_fake_tape(&lost, STATED);
+        let verdict = adopt(&lost.conn, &mut tape, lost.volume_id, LABEL, BS).unwrap();
+        assert_eq!(verdict, LostAdoption::Adopted { slices: 2 });
+        assert!(
+            fake.ops()
+                .iter()
+                .any(|o| matches!(o, Op::ReadHead(n) if *n > 0)),
+            "the front index and the seal were read: {:?}",
+            fake.ops()
+        );
+    }
+
     #[test]
     fn condition_1_refuses_a_tape_with_no_seal_marker() {
         let mut lost = Lost::ready();
@@ -1183,6 +1294,7 @@ mod tests {
                 expected_uuid: "u".into(),
                 found: "v".into(),
             },
+            LostAdoption::UnreadableFile0 { why: "w".into() },
             LostAdoption::NotSealed { why: "w".into() },
             LostAdoption::NotWhatThisCatalogStaged { why: "w".into() },
         ] {

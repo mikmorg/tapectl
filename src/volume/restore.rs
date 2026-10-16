@@ -1293,10 +1293,7 @@ fn corroborate_at_contact(
         )
         .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
     let phase = progress::phase("identify", None);
-    let file0 = crate::volume::binding::read_file0_facts(store);
-    if let Some(why) = &file0.unreadable {
-        return Err(TapectlError::Other(why.clone()));
-    }
+    let file0 = crate::volume::binding::read_file0_facts(store).readable()?;
     let medium = crate::volume::binding::MediumFacts::new(medium_serial.map(str::to_string), file0);
     crate::volume::binding::corroborate_volume(conn, volume_id, volume_label, &medium)?;
     phase.done();
@@ -7127,22 +7124,10 @@ mod tests {
             const STATED: &str = "\nrequires = []\n";
             const UNKNOWN: &str = "\nrequires = [\"unknown-feature\"]\n";
 
-            /// File 0 with the first `from` replaced by `to`, padded back to
-            /// its on-tape length. Asserts `from` is there: a rewrite that
-            /// matched nothing would make every refusal test below pass or
-            /// fail for the wrong reason.
+            /// [`crate::volume::format::rewrite_file0`], by the name this
+            /// module's tests use.
             fn rewritten(file0: &[u8], from: &str, to: &str) -> Vec<u8> {
-                let text = String::from_utf8_lossy(file0)
-                    .trim_end_matches('\0')
-                    .to_string();
-                assert!(
-                    text.contains(from),
-                    "the fixture's File 0 lacks {from:?}:\n{text}"
-                );
-                let mut out = text.replacen(from, to, 1).into_bytes();
-                assert!(out.len() <= file0.len(), "File 0 outgrew its block");
-                out.resize(file0.len(), 0);
-                out
+                crate::volume::format::rewrite_file0(file0, from, to)
             }
 
             /// [`rewritten`], on the File 0 of the tape in the drive.

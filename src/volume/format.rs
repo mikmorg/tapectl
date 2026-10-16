@@ -801,6 +801,27 @@ pub fn validate_consistency(entries: &[ParsedIndexEntry]) -> Vec<ConsistencyViol
     violations
 }
 
+/// Test support for the readers that refuse a tape by its File 0 claims
+/// (#476): File 0 with the first `from` replaced by `to`, padded back to the
+/// on-tape length it had. Asserts `from` is there — a rewrite that matched
+/// nothing would make a refusal test pass or fail for the wrong reason, and
+/// doubles as the positive control that the fixture's File 0 says what the
+/// test assumes it says (`"\nrequires = []\n"` for every tape from 1.1.0).
+#[cfg(test)]
+pub(crate) fn rewrite_file0(file0: &[u8], from: &str, to: &str) -> Vec<u8> {
+    let text = String::from_utf8_lossy(file0)
+        .trim_end_matches('\0')
+        .to_string();
+    assert!(
+        text.contains(from),
+        "the fixture's File 0 lacks {from:?}:\n{text}"
+    );
+    let mut out = text.replacen(from, to, 1).into_bytes();
+    assert!(out.len() <= file0.len(), "File 0 outgrew its block");
+    out.resize(file0.len(), 0);
+    out
+}
+
 #[cfg(test)]
 mod forward_compat_tests {
     use super::*;

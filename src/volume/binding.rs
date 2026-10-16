@@ -1612,6 +1612,21 @@ pub(crate) struct File0Facts {
 }
 
 impl File0Facts {
+    /// These facts, or the refusal when File 0 said this tapectl cannot read
+    /// the tape ([`File0Facts::unreadable`]; ADR-0012 2026-10-06 item 15,
+    /// #476). The one line every read contact that goes on to read a tape's
+    /// slices or files takes right after `read_file0_facts`, so the refusal is
+    /// the text `volume::raw` and `volume::rebuild` give, before any content
+    /// is read and at no cost to the tape: it is a verdict on the File 0 text
+    /// the contact has already read. A File 0 that could not be read at all
+    /// carries none and passes, as before.
+    pub(crate) fn readable(self) -> Result<Self> {
+        match self.unreadable {
+            Some(why) => Err(TapectlError::Other(why)),
+            None => Ok(self),
+        }
+    }
+
     /// File 0's `cartridge_serial` **if and only if it is a chip serial**.
     ///
     /// `Some("operator")` means the string is a BARCODE, and ADR-0012 says
@@ -4589,5 +4604,68 @@ mod tests {
             lines[1]
         );
         assert!(lines[1].ends_with(')'), "{}", lines[1]);
+    }
+
+    /// #476: every read contact that reads File 0's facts and then goes on to
+    /// read a tape's content takes the claims from that same read
+    /// (`File0Facts::readable`). The defect was a reader that parsed File 0
+    /// for identity alone, and the next such reader is added the same way: so
+    /// a production call of `read_file0_facts` with no `.readable()` on it is
+    /// a reader that cannot refuse a tape it does not know how to read. A
+    /// call that is not meant to refuse (none today) is listed here BY NAME,
+    /// with its reason.
+    #[test]
+    fn every_production_read_of_file0_facts_asks_for_its_claims() {
+        const NOT_REFUSING: &[(&str, &str)] = &[];
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rs_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let (mut calls, mut unasked) = (0, Vec::new());
+        for path in files {
+            // `cost_budget` is declared `#[cfg(test)] mod cost_budget;` whole.
+            if path.file_name().is_some_and(|n| n == "cost_budget.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let production = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
+            for (at, _) in production.match_indices("read_file0_facts(") {
+                let line_start = production[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line = production[line_start..]
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .trim_start();
+                if line.starts_with("//") || line.contains("fn read_file0_facts(") {
+                    continue;
+                }
+                calls += 1;
+                let tail = &production[at..(at + 80).min(production.len())];
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if !tail.contains(".readable()") && !NOT_REFUSING.iter().any(|(f, _)| *f == name) {
+                    unasked.push(format!("{}: {}", path.display(), line));
+                }
+            }
+        }
+        assert!(
+            calls >= 4,
+            "positive control: the scan found the restore and write.rs readers ({calls})"
+        );
+        assert!(
+            unasked.is_empty(),
+            "a read contact reads File 0's facts but never asks whether this tapectl can read \
+             the tape (add `.readable()?`): {unasked:#?}"
+        );
     }
 }

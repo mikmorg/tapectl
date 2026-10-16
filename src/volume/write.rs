@@ -4864,10 +4864,21 @@ fn verify_contacted(
     // Unlike the write path this DOES offer File 0: verify has no consent
     // gate to pre-empt, and File 0's label/uuid is the cheapest statement
     // there is of "this is not the tape you named".
+    //
+    // And File 0's claims (#476, ADR-0012 2026-10-06 item 15): a tape that
+    // requires a feature this tapectl does not know, or states another
+    // magic or layout, is refused here with the text `restore raw-volume`
+    // and `catalog rebuild` give, from the File 0 this read already has. It
+    // is an `Err` before the session row below exists, so it records no
+    // evidence, quarantines nothing, and exits 3 (inconclusive) like every
+    // other error a verify stops on (`ErrorContract::Verify`) — a tape this
+    // tapectl cannot read is not a medium proven bad. A SEAL that requires
+    // an unknown feature is the chain walk's own finding (`SealUnreadable`)
+    // and stays so.
     let phase = progress::phase("identify", None);
     let medium = binding::MediumFacts::new(
         site.medium_serial().map(str::to_string),
-        binding::read_file0_facts(store),
+        binding::read_file0_facts(store).readable()?,
     );
     binding::corroborate_volume(conn, volume_id, label, &medium)?;
 
@@ -5578,9 +5589,10 @@ fn read_slices_contacted(
     // Corroborate at contact, before a single slice is read (ADR-0012,
     // issue #193). Slices read off the wrong tape would fail their sha256
     // one at a time with no word about WHY; this says it once, up front.
+    // And refuse a tape this tapectl cannot read (#476) from the same File 0.
     let medium = binding::MediumFacts::new(
         medium_serial.map(str::to_string),
-        binding::read_file0_facts(store),
+        binding::read_file0_facts(store).readable()?,
     );
     binding::corroborate_volume(conn, from_vol_id, from_label, &medium)?;
 
@@ -5906,10 +5918,11 @@ fn compact_read_contacted(
 
     // Corroborate at contact (ADR-0012, issue #193). `compact-read` is a
     // contact issue #193 did not name — it reads slices off a tape by
-    // position exactly as `read-slices` does, and is wired with it.
+    // position exactly as `read-slices` does, and is wired with it. Like it,
+    // it refuses a tape this tapectl cannot read (#476).
     let medium = binding::MediumFacts::new(
         medium_serial.map(str::to_string),
-        binding::read_file0_facts(store),
+        binding::read_file0_facts(store).readable()?,
     );
     binding::corroborate_volume(conn, volume_id, label, &medium)?;
 
@@ -15718,6 +15731,370 @@ mod tests {
             check_loaded_generation("L6-0001", &detected(Some(Generation::Lto6)), Some("lto6?"))
                 .unwrap();
             check_loaded_generation("L6-0001", &detected(Some(Generation::Lto6)), None).unwrap();
+        }
+    }
+
+    // --- issue #476: a tape's `requires` is checked before its content is read ---
+
+    /// ADR-0012 2026-10-06 item 15: every reader refuses a tape needing a
+    /// feature it does not know. `volume verify`, `volume read-slices` and
+    /// `volume compact-read` read File 0 at contact for identity only; they
+    /// now take its claims from the same read (`File0Facts::readable`) and
+    /// refuse with the text `restore raw-volume` and `catalog rebuild` give,
+    /// before any content file is read. Each test runs on a `FakeTape`, so
+    /// "File 0 was the only file the tape was asked for" is read off the
+    /// recorded head motion.
+    mod requires_fence {
+        use super::*;
+        use crate::tape::fake::{FakeTape, Op};
+        use crate::volume::format::rewrite_file0;
+
+        /// How a 1.1.0+ File 0 and seal marker state that they require nothing.
+        const STATED: &str = "\nrequires = []\n";
+        const UNKNOWN: &str = "\nrequires = [\"unknown-feature\"]\n";
+
+        /// [`loaded_fixture`] with File 0's `requires` line replaced by `to`
+        /// (`STATED` leaves the tape as written — the positive control, which
+        /// also proves the fixture states `requires = []`).
+        fn fixture(label: &str, to: &str) -> (Connection, i64, FakeTape) {
+            let (conn, volume_id, fake) = loaded_fixture(label);
+            let old = fake.state().files[0].clone();
+            fake.state().files[0] = rewrite_file0(&old, STATED, to);
+            (conn, volume_id, fake)
+        }
+
+        /// The refusal `check_id_thunk_readable` gives the File 0 now on the tape.
+        fn expected_refusal(fake: &FakeTape) -> String {
+            let file0 = fake.state().files[0].clone();
+            crate::volume::format::check_id_thunk_readable(&String::from_utf8_lossy(&file0))
+                .expect_err("the fixture's File 0 is fenced")
+                .to_string()
+        }
+
+        fn assert_refusal(err: &str, fake: &FakeTape) {
+            assert!(err.contains("\"unknown-feature\""), "{err}");
+            assert!(err.contains("newer tapectl"), "{err}");
+            assert_eq!(err, expected_refusal(fake), "the text raw and rebuild give");
+        }
+
+        /// File 0 was read, once, and nothing else was: no front index, no
+        /// slice, no seal.
+        fn assert_only_file0_was_read(fake: &FakeTape) {
+            let ops = fake.ops();
+            assert_eq!(
+                ops.iter().filter(|o| **o == Op::ReadHead(0)).count(),
+                1,
+                "File 0, once: {ops:?}"
+            );
+            assert!(
+                ops.iter()
+                    .all(|o| matches!(o, Op::Rewind | Op::ReadHead(0))),
+                "the tape was asked for more than File 0: {ops:?}"
+            );
+        }
+
+        fn count(conn: &Connection, table: &str) -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        }
+
+        fn config_with_staging(dir: &Path) -> Config {
+            let mut config = Config::default();
+            config.staging.directory = dir.to_string_lossy().into_owned();
+            config
+        }
+
+        // ── volume verify ──
+
+        /// THE acceptance test for `volume verify` (#476): the refusal is an
+        /// `Err` before the session row exists, so it records no evidence and
+        /// quarantines nothing, and `volume verify` exits 3 (inconclusive) —
+        /// a tape this tapectl cannot read is not a medium proven bad.
+        #[test]
+        fn verify_refuses_a_tape_requiring_an_unknown_feature_and_records_no_evidence() {
+            for tier in [Tier::Integrity, Tier::Navigable] {
+                let (conn, volume_id, fake) = fixture("RQ-V", UNKNOWN);
+                let mut store = fake_store(&fake);
+                let err = volume_verify_with_store(
+                    &conn,
+                    &mut store,
+                    "RQ-V",
+                    volume_id,
+                    4096,
+                    tier,
+                    site(Operation::VolumeVerify),
+                )
+                .unwrap_err();
+                let text = err.to_string();
+                let code = crate::error::ErrorContract::Verify.exit_code(&anyhow::Error::from(err));
+                let err = text;
+                assert_refusal(&err, &fake);
+                assert_only_file0_was_read(&fake);
+                assert_eq!(count(&conn, "verification_sessions"), 0, "{tier:?}");
+                assert_eq!(count(&conn, "verification_results"), 0, "{tier:?}");
+                let (status, condition): (String, String) = conn
+                    .query_row(
+                        "SELECT status, observed_condition FROM volumes WHERE id = ?1",
+                        params![volume_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    (status.as_str(), condition.as_str()),
+                    ("active", "ok"),
+                    "{tier:?}: nothing about the volume moved"
+                );
+                assert_eq!(
+                    code,
+                    crate::error::EXIT_VERIFY_INCONCLUSIVE,
+                    "{tier:?}: inconclusive, not 'the medium is bad'"
+                );
+                assert_ne!(code, crate::error::EXIT_VERIFY_MEDIUM_BAD);
+                let contacts = contact_rows(&conn);
+                assert_eq!(contacts.len(), 1, "{contacts:?}");
+                assert_eq!(contacts[0].1, Some(volume_id));
+                assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+                assert!(
+                    contacts[0]
+                        .3
+                        .as_deref()
+                        .is_some_and(|d| d.contains("unknown-feature")),
+                    "{contacts:?}"
+                );
+            }
+        }
+
+        /// A `requires` that is not a list is refused the same way.
+        #[test]
+        fn verify_refuses_a_requires_that_is_not_a_list() {
+            let (conn, volume_id, fake) = fixture("RQ-VL", "\nrequires = \"parts\"\n");
+            let mut store = fake_store(&fake);
+            let err = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "RQ-VL",
+                volume_id,
+                4096,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("TOML parse failed"), "{err}");
+            assert_only_file0_was_read(&fake);
+            assert_eq!(count(&conn, "verification_sessions"), 0);
+        }
+
+        /// No label: File 0 is read ONCE by `identify` and the contact's own
+        /// read is served from those bytes, so the fence adds no read; the
+        /// contact names the volume File 0 identified and closes `failed`.
+        #[test]
+        fn a_verify_with_no_label_refuses_a_tape_requiring_an_unknown_feature() {
+            let (conn, volume_id, fake) = fixture("RQ-VLD", UNKNOWN);
+            let mut store = fake_store(&fake);
+            let err = verify_loaded_with_store(
+                &conn,
+                &mut store,
+                4096,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap_err()
+            .to_string();
+            assert_refusal(&err, &fake);
+            assert_only_file0_was_read(&fake);
+            assert_eq!(count(&conn, "verification_sessions"), 0);
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert_eq!(contacts[0].1, Some(volume_id), "the volume File 0 named");
+            assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+        }
+
+        /// The positive control: `requires = []` verifies as before, on the
+        /// same fixture, and reads more than File 0.
+        #[test]
+        fn verify_of_a_tape_requiring_nothing_passes_as_before() {
+            let (conn, volume_id, fake) = fixture("RQ-VOK", STATED);
+            let mut store = fake_store(&fake);
+            let report = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "RQ-VOK",
+                volume_id,
+                4096,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap();
+            assert_eq!(report.failed, 0, "{:?}", report.mismatches);
+            assert!(
+                fake.ops().iter().any(|o| matches!(o, Op::Read(_))),
+                "the content was read: {:?}",
+                fake.ops()
+            );
+            let outcome: String = conn
+                .query_row("SELECT outcome FROM verification_sessions", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(outcome, "passed");
+        }
+
+        /// A seal marker (not File 0) that requires an unknown feature is
+        /// the chain walk's finding, as it was: the verify RUNS, records its
+        /// session, and reports `SealUnreadable` — inconclusive, never
+        /// evidence against the medium (ADR-0012 item 15). The File 0 fence
+        /// leaves it alone.
+        #[test]
+        fn a_seal_only_refusal_is_still_the_chain_walks_finding() {
+            let (conn, volume_id, fake) = fixture("RQ-VS", STATED);
+            let seal_position = fake.state().files.len() - 1;
+            let old = fake.state().files[seal_position].clone();
+            fake.state().files[seal_position] = rewrite_file0(&old, STATED, UNKNOWN);
+            let mut store = fake_store(&fake);
+            let report = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "RQ-VS",
+                volume_id,
+                4096,
+                Tier::Navigable,
+                site(Operation::VolumeVerify),
+            )
+            .expect("the verify ran; the seal is a finding, not an error");
+            assert_eq!(report.failed, 1, "{:?}", report.mismatches);
+            assert_eq!(report.mismatches[0].kind, MismatchKind::SealUnreadable);
+            assert!(
+                report.mismatches[0].actual.contains("unknown-feature"),
+                "{:?}",
+                report.mismatches
+            );
+            assert!(
+                report.quarantine.is_none(),
+                "never evidence of a bad medium"
+            );
+            assert_eq!(count(&conn, "verification_sessions"), 1);
+        }
+
+        // ── volume read-slices ──
+
+        #[test]
+        fn read_slices_refuses_a_tape_requiring_an_unknown_feature_before_reading_a_slice() {
+            let (conn, volume_id, fake) = fixture("RQ-RS", UNKNOWN);
+            let mut store = fake_store(&fake);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = config_with_staging(tmp.path());
+
+            let err = read_slices(
+                &conn,
+                &config,
+                "RQ-RS",
+                "lv-unit",
+                None,
+                &mut store,
+                site(Operation::VolumeReadSlices),
+            )
+            .unwrap_err()
+            .to_string();
+            assert_refusal(&err, &fake);
+            assert_only_file0_was_read(&fake);
+            let staged: Option<String> = conn
+                .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
+                .unwrap();
+            assert!(staged.is_none(), "nothing was staged: {staged:?}");
+            assert_eq!(
+                std::fs::read_dir(tmp.path()).unwrap().count(),
+                0,
+                "no staging directory was made"
+            );
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert_eq!(contacts[0].0, "volume read-slices");
+            assert_eq!(contacts[0].1, Some(volume_id));
+            assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+        }
+
+        /// The positive control: `requires = []` reads and stages the slice.
+        #[test]
+        fn read_slices_of_a_tape_requiring_nothing_stages_the_slice_as_before() {
+            let (conn, _, fake) = fixture("RQ-RSOK", STATED);
+            let mut store = fake_store(&fake);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = config_with_staging(tmp.path());
+            let report = read_slices(
+                &conn,
+                &config,
+                "RQ-RSOK",
+                "lv-unit",
+                None,
+                &mut store,
+                site(Operation::VolumeReadSlices),
+            )
+            .unwrap();
+            assert_eq!(report.slices_read, 1);
+            assert!(
+                fake.ops().contains(&Op::Read(4)),
+                "the slice was read: {:?}",
+                fake.ops()
+            );
+        }
+
+        // ── volume compact-read ──
+
+        #[test]
+        fn compact_read_refuses_a_tape_requiring_an_unknown_feature_before_reading_a_slice() {
+            let (conn, volume_id, fake) = fixture("RQ-CR", UNKNOWN);
+            let mut store = fake_store(&fake);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = config_with_staging(tmp.path());
+
+            let err = compact_read(
+                &conn,
+                &config,
+                "RQ-CR",
+                &mut store,
+                site(Operation::VolumeCompactRead),
+            )
+            .unwrap_err()
+            .to_string();
+            assert_refusal(&err, &fake);
+            assert_only_file0_was_read(&fake);
+            let staged: Option<String> = conn
+                .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
+                .unwrap();
+            assert!(staged.is_none(), "nothing was staged: {staged:?}");
+            assert_eq!(
+                std::fs::read_dir(tmp.path()).unwrap().count(),
+                0,
+                "no compact directory was made"
+            );
+            let contacts = contact_rows(&conn);
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert_eq!(contacts[0].0, "volume compact-read");
+            assert_eq!(contacts[0].1, Some(volume_id));
+            assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+        }
+
+        #[test]
+        fn compact_read_of_a_tape_requiring_nothing_reads_the_slice_as_before() {
+            let (conn, _, fake) = fixture("RQ-CROK", STATED);
+            let mut store = fake_store(&fake);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = config_with_staging(tmp.path());
+            let report = compact_read(
+                &conn,
+                &config,
+                "RQ-CROK",
+                &mut store,
+                site(Operation::VolumeCompactRead),
+            )
+            .unwrap();
+            assert_eq!(report.slices_read, 1);
+            assert!(
+                fake.ops().contains(&Op::Read(4)),
+                "the slice was read: {:?}",
+                fake.ops()
+            );
         }
     }
 
