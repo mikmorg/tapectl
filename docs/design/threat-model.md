@@ -156,8 +156,11 @@ ATTRIBUTE, a MODE SELECT, a LOAD/UNLOAD or a raw CDB over SG, and never runs
 `mt` or `sg_raw` itself (the operator's tools; `first-run.sh` and the
 lifecycle suite use `mt`, the binary does not). `tests/sg_boundary.rs` pins
 both sets — the `sg_*` tools the source names and every program the binary
-starts (dar, `bash -n` over RESTORE.sh, `systemctl`, and the three above) —
-and the exact `sg_logs` argument list: a new SG tool, a new program, or a
+starts (dar, `bash -n` over RESTORE.sh, `systemctl`, and the three above, and
+`sh -c` over the operator's own `snapshot_command` / `release_command` of a
+`[[collections]]` table (ADR-0012 2026-10-16 item 75): the operator's command
+line, run as the user tapectl runs as, given the collection's name and root and
+the snapshot's path and no device) — and the exact `sg_logs` argument list: a new SG tool, a new program, or a
 counter-resetting flag on `sg_logs` fails it.
 
 **Filemarks.** Every file of a volume ends with an *immediate* filemark
