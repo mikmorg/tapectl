@@ -1343,4 +1343,492 @@ mod tests {
         );
         assert_eq!(stage_set_statuses(&conn), vec!["staged".to_string()]);
     }
+
+    // ── ADR-0012 2026-10-16 item 75 (#455): the per-collection snapshot hook ──
+
+    /// The hook's world: `stageable_batch_fixture`'s tenants, escrow and
+    /// staging directory, plus a collection root `root/` holding the units
+    /// `alpha` (two files, one in a subfolder) and `beta`, and a separate
+    /// directory `snaps/` for the snapshot a fake `snapshot_command` makes —
+    /// never under the root and never under staging.
+    struct HookWorld {
+        conn: Connection,
+        paths: TapectlPaths,
+        config: Config,
+        tmp: tempfile::TempDir,
+        root: std::path::PathBuf,
+        snaps: tempfile::TempDir,
+    }
+
+    impl HookWorld {
+        fn new() -> Self {
+            let (conn, paths, config, tmp, _device) = stageable_batch_fixture();
+            let root = tmp.path().join("root");
+            for (unit, files) in [
+                (
+                    "alpha",
+                    &[("f.txt", "alpha original"), ("sub/g.txt", "alpha nested")][..],
+                ),
+                ("beta", &[("f.txt", "beta original")][..]),
+            ] {
+                for (name, text) in files {
+                    let path = root.join(unit).join(name);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(path, text).unwrap();
+                }
+                crate::unit::init_unit(
+                    &conn,
+                    &paths,
+                    root.join(unit).to_str().unwrap(),
+                    "alice",
+                    Some(unit),
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+            let root = std::fs::canonicalize(root).unwrap();
+            Self {
+                conn,
+                paths,
+                config,
+                tmp,
+                root,
+                snaps: tempfile::TempDir::new().unwrap(),
+            }
+        }
+
+        /// Where the fake snapshot command puts its copy.
+        fn copy(&self) -> std::path::PathBuf {
+            self.snaps.path().join("copy")
+        }
+
+        /// A collection over the root. `then` runs after the copy is made
+        /// and before the path is printed (a live-source change, a damaged
+        /// copy); `release` is the `release_command`, if any.
+        fn lib(&self, then: &str, release: Option<&str>) -> CollectionConfig {
+            let copy = self.copy();
+            let mut lib = no_hook_lib();
+            lib.name = "coll".into();
+            lib.root = self.root.to_string_lossy().into_owned();
+            lib.snapshot_command = Some(format!(
+                "rm -rf '{c}' && cp -a \"$TAPECTL_COLLECTION_ROOT\" '{c}' && {then} printf '%s\\n' '{c}'",
+                c = copy.display()
+            ));
+            lib.release_command = release.map(str::to_string);
+            lib
+        }
+
+        /// The `release_command` that appends one line to `releases.log`.
+        fn recording_release(&self) -> (String, std::path::PathBuf) {
+            let log = self.snaps.path().join("releases.log");
+            (
+                format!(
+                    "printf '%s|%s|%s\\n' \"$TAPECTL_COLLECTION\" \"$TAPECTL_COLLECTION_ROOT\" \
+                     \"$TAPECTL_SNAPSHOT_PATH\" >> '{}'",
+                    log.display()
+                ),
+                log,
+            )
+        }
+
+        fn batch(&self) -> Batch {
+            Batch {
+                units: ["alpha", "beta"]
+                    .iter()
+                    .map(|n| PendingUnit {
+                        name: (*n).into(),
+                        size_bytes: 10,
+                    })
+                    .collect(),
+                total_bytes: 20,
+                padded_bytes: 20,
+            }
+        }
+
+        fn stage(&self, lib: &CollectionConfig, assume_yes: bool) -> Result<StagedBatch> {
+            stage_batch(
+                &self.conn,
+                &self.paths,
+                &self.config,
+                lib,
+                &self.batch(),
+                assume_yes,
+            )
+        }
+
+        fn count(&self, table: &str) -> i64 {
+            self.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        }
+
+        fn snapshot_id_of(&self, unit: &str) -> i64 {
+            self.conn
+                .query_row(
+                    "SELECT s.id FROM snapshots s JOIN units u ON u.id = s.unit_id
+                      WHERE u.name = ?1",
+                    [unit],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Acceptance (a): a living file changed AFTER the hook took its snapshot
+    /// does not refuse the stage, and what is staged is the snapshot's
+    /// content: the recorded sha256 is the original bytes', and the change
+    /// (a different size) would have been refused had the live file been read.
+    #[test]
+    fn a_live_file_changed_after_the_snapshot_does_not_refuse_the_stage() {
+        let w = HookWorld::new();
+        let lib = w.lib(
+            "echo 'changed after the snapshot was taken, and longer' > \
+             \"$TAPECTL_COLLECTION_ROOT/alpha/f.txt\" && \
+             echo 'beta changed too, and longer' > \"$TAPECTL_COLLECTION_ROOT/beta/f.txt\" &&",
+            None,
+        );
+        let staged = w.stage(&lib, true).expect("the snapshot is what is staged");
+        assert_eq!(staged.units_staged, 2);
+        assert_eq!(
+            staged.snapshot_path.as_deref(),
+            Some(std::fs::canonicalize(w.copy()).unwrap().to_str().unwrap())
+        );
+        assert_eq!(staged.release_warning, None);
+        assert_eq!(
+            stage_set_statuses(&w.conn),
+            vec!["staged".to_string(), "staged".to_string()]
+        );
+
+        for (unit, original) in [("alpha", "alpha original"), ("beta", "beta original")] {
+            let live = std::fs::read(w.root.join(unit).join("f.txt")).unwrap();
+            assert_ne!(
+                live,
+                original.as_bytes(),
+                "fixture: the live file did change"
+            );
+            let recorded =
+                crate::db::files::fixture::sha256(&w.conn, w.snapshot_id_of(unit), "f.txt");
+            assert_eq!(
+                recorded,
+                Some(sha256_of(original.as_bytes())),
+                "{unit}: the staged bytes are the snapshot's"
+            );
+            assert_ne!(recorded, Some(sha256_of(&live)));
+        }
+    }
+
+    /// The control for the test above: with no snapshot, the same change
+    /// between snapshot and stage is refused as DIRTY. The change is real; it
+    /// is the hook that made it irrelevant.
+    #[test]
+    fn without_a_snapshot_the_same_change_refuses_the_stage() {
+        let w = HookWorld::new();
+        let id = crate::staging::snapshot_create(&w.conn, "alpha", &w.config).unwrap();
+        std::fs::write(
+            w.root.join("alpha/f.txt"),
+            "changed after the snapshot was taken, and longer",
+        )
+        .unwrap();
+        let err = crate::staging::stage_create(&w.conn, &w.paths, &w.config, id, true)
+            .expect_err("a live file at another size is refused");
+        assert!(err.to_string().contains("DIRTY"), "{err}");
+    }
+
+    /// Acceptance (b): every path the run RECORDS is the unit's real one. The
+    /// unit's path, the snapshot's source path, the file list's relative
+    /// paths, `stage_sets.dar_command` (MANIFEST.toml carries it to tape) and
+    /// the stage report never name the snapshot's directory. dar's own report
+    /// keeps the command as it ran, and does: that is the one place the
+    /// operator can see what dar read.
+    #[test]
+    fn every_recorded_path_stays_the_units_real_one() {
+        let w = HookWorld::new();
+        let lib = w.lib("", None);
+        w.stage(&lib, true).unwrap();
+        let snapshot_dir = std::fs::canonicalize(w.copy()).unwrap();
+        let snapshot_dir = snapshot_dir.to_str().unwrap();
+
+        for unit in ["alpha", "beta"] {
+            let live = w.root.join(unit).to_string_lossy().into_owned();
+            let current: String = w
+                .conn
+                .query_row(
+                    "SELECT current_path FROM units WHERE name = ?1",
+                    [unit],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(current, live);
+            let (source, dar_command): (String, String) = w
+                .conn
+                .query_row(
+                    "SELECT s.source_path, ss.dar_command FROM snapshots s
+                       JOIN units u ON u.id = s.unit_id
+                       JOIN stage_sets ss ON ss.snapshot_id = s.id
+                      WHERE u.name = ?1",
+                    [unit],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(source, live, "{unit}: snapshots.source_path");
+            assert!(
+                dar_command.contains(&format!("\"-R\" {live:?}")),
+                "{unit}: dar -R names the real folder: {dar_command}"
+            );
+            assert!(
+                !dar_command.contains(snapshot_dir),
+                "{unit}: dar_command: {dar_command}"
+            );
+            let files = crate::db::files::fixture::non_dirs(&w.conn, w.snapshot_id_of(unit));
+            assert!(!files.is_empty());
+            for (path, _) in &files {
+                assert!(
+                    !path.starts_with('/') && !path.contains(snapshot_dir),
+                    "{unit}: a relative path in the files table: {path}"
+                );
+            }
+        }
+        let alpha_files: Vec<String> =
+            crate::db::files::fixture::non_dirs(&w.conn, w.snapshot_id_of("alpha"))
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+        assert!(
+            alpha_files.contains(&"sub/g.txt".to_string()),
+            "{alpha_files:?}"
+        );
+
+        let reports: Vec<_> = std::fs::read_dir(&w.paths.stage_reports_dir)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports.iter().all(|r| !r.contains(snapshot_dir)),
+            "{reports:?}"
+        );
+
+        let ran: String = w
+            .conn
+            .query_row(
+                "SELECT dar_command FROM dar_create_reports ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ran.contains(snapshot_dir), "dar's own record: {ran}");
+    }
+
+    /// Acceptance (c): `release_command` runs once the staging is over, with
+    /// the collection's name, its (canonical) root and the snapshot's path in
+    /// its environment, on success...
+    #[test]
+    fn the_release_command_runs_after_staging_with_the_snapshot_path() {
+        let w = HookWorld::new();
+        let (release, log) = w.recording_release();
+        w.stage(&w.lib("", Some(&release)), true).unwrap();
+        let lines = std::fs::read_to_string(&log).unwrap();
+        let snapshot = std::fs::canonicalize(w.copy()).unwrap();
+        assert_eq!(
+            lines,
+            format!("coll|{}|{}\n", w.root.display(), snapshot.display())
+        );
+    }
+
+    /// ...and when the stage is refused (here at the staging-space question,
+    /// which a non-interactive run without `--yes` cannot answer, after the
+    /// snapshot was taken and the version minted), or a unit's folder is not
+    /// in the snapshot. The error is the stage's own and the release still
+    /// ran.
+    #[test]
+    fn the_release_command_runs_when_the_stage_is_refused() {
+        let w = HookWorld::new();
+        let (release, log) = w.recording_release();
+        let _free = crate::staging::FreeSpaceOverride::set(1024);
+        let err = w
+            .stage(&w.lib("", Some(&release)), false)
+            .expect_err("no terminal and no --yes: a stage that may not fit is refused");
+        assert!(err.to_string().contains("non-interactive session"), "{err}");
+        assert_eq!(w.count("stage_sets"), 0, "nothing staged");
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+
+        let w = HookWorld::new();
+        let (release, log) = w.recording_release();
+        // A copy that lost a unit's folder, so the stage of `beta` finds none.
+        let mut lib = w.lib("", Some(&release));
+        lib.snapshot_command = Some(format!(
+            "rm -rf '{c}' && cp -a \"$TAPECTL_COLLECTION_ROOT\" '{c}' && \
+             rm -rf '{c}/beta' && printf '%s\\n' '{c}'",
+            c = w.copy().display()
+        ));
+        let err = w
+            .stage(&lib, true)
+            .expect_err("beta has no folder in the snapshot");
+        assert!(
+            err.to_string().contains("unit \"beta\"")
+                && err.to_string().contains("has no folder in the snapshot"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+    }
+
+    /// A `release_command` that fails is a warning, not an error: the units
+    /// are staged, the warning names the command, its exit status and stderr,
+    /// and where the snapshot is.
+    #[test]
+    fn a_failing_release_command_is_a_warning() {
+        let w = HookWorld::new();
+        let staged = w
+            .stage(&w.lib("", Some("echo 'zfs busy' >&2; exit 3")), true)
+            .expect("the staged work stands");
+        assert_eq!(staged.units_staged, 2);
+        let warning = staged.release_warning.expect("a warning");
+        for part in [
+            "release_command",
+            "exit status: 3",
+            "zfs busy",
+            "may still exist",
+            w.copy().to_str().unwrap(),
+        ] {
+            assert!(warning.contains(part), "{part}: {warning}");
+        }
+        assert_eq!(w.count("stage_sets"), 2);
+    }
+
+    /// Acceptance (d): each way a `snapshot_command` can fail refuses the run
+    /// before any unit is read: the error names the command and what it said,
+    /// no snapshot is minted, nothing is staged, staging is untouched, and the
+    /// `release_command` is not run (nothing was taken to release).
+    #[test]
+    fn a_failing_snapshot_command_refuses_before_any_unit_is_read() {
+        let w = HookWorld::new();
+        let (release, log) = w.recording_release();
+        let file = w.snaps.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        let cases: Vec<(&str, String, Vec<String>)> = vec![
+            (
+                "non-zero exit",
+                "echo 'lvcreate: no space left in the volume group' >&2; exit 5".into(),
+                vec![
+                    "exit status: 5".into(),
+                    "lvcreate: no space left in the volume group".into(),
+                ],
+            ),
+            (
+                "no line",
+                "true".into(),
+                vec!["printed nothing on stdout".into()],
+            ),
+            (
+                "two lines",
+                "echo /one; echo /two".into(),
+                vec!["printed 2 lines".into()],
+            ),
+            (
+                "relative path",
+                "echo snap/dir".into(),
+                vec!["not an absolute path".into()],
+            ),
+            (
+                "missing path",
+                "echo /nonexistent/snapshot".into(),
+                vec!["which cannot be read".into()],
+            ),
+            (
+                "not a directory",
+                format!("echo '{}'", file.display()),
+                vec!["which is not a directory".into()],
+            ),
+            (
+                "inside the live root",
+                "echo \"$TAPECTL_COLLECTION_ROOT/alpha\"".into(),
+                vec!["inside the live root".into()],
+            ),
+            (
+                "the live root itself",
+                "echo \"$TAPECTL_COLLECTION_ROOT\"".into(),
+                vec!["inside the live root".into()],
+            ),
+        ];
+        for (what, command, needles) in cases {
+            let mut lib = w.lib("", Some(&release));
+            lib.snapshot_command = Some(command.clone());
+            let err = w.stage(&lib, true).expect_err(what).to_string();
+            for needle in needles.iter().map(String::as_str).chain([
+                "snapshot_command",
+                command.as_str(),
+                "nothing was snapshotted or staged",
+            ]) {
+                assert!(err.contains(needle), "{what}: {needle}: {err}");
+            }
+            assert_eq!(w.count("snapshots"), 0, "{what}: no unit was read");
+            assert_eq!(w.count("stage_sets"), 0, "{what}");
+            assert_eq!(
+                std::fs::read_dir(&w.config.staging.directory)
+                    .unwrap()
+                    .count(),
+                0,
+                "{what}: staging untouched"
+            );
+            assert!(!log.exists(), "{what}: nothing taken, nothing released");
+        }
+    }
+
+    /// Acceptance (e): a collection with no hook is staged exactly as before:
+    /// each unit from where it lives, no snapshot path, no release.
+    #[test]
+    fn a_collection_without_a_hook_reads_its_units_where_they_live() {
+        let w = HookWorld::new();
+        let mut lib = no_hook_lib();
+        lib.root = w.root.to_string_lossy().into_owned();
+        let staged = w.stage(&lib, true).unwrap();
+        assert_eq!(staged.units_staged, 2);
+        assert_eq!(staged.snapshot_path, None);
+        assert_eq!(staged.release_warning, None);
+        assert_eq!(
+            stage_set_statuses(&w.conn),
+            vec!["staged".to_string(), "staged".to_string()]
+        );
+        let ran: String = w
+            .conn
+            .query_row(
+                "SELECT dar_command FROM dar_create_reports ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ran.contains(&w.root.to_string_lossy().to_string()), "{ran}");
+        assert!(!w.snaps.path().join("copy").exists());
+    }
+
+    /// `[staging] jobs` above 1 stages the units on worker threads; the
+    /// snapshot reaches them (each job carries its view), or the changed live
+    /// files would be refused there.
+    #[test]
+    fn units_staged_in_parallel_still_read_the_snapshot() {
+        let mut w = HookWorld::new();
+        w.config.staging.jobs = 2;
+        crate::staging::jobs::MEMORY_OVERRIDE.with(|m| m.set(Some(1 << 40)));
+        let lib = w.lib(
+            "echo 'changed after the snapshot was taken, and longer' > \
+             \"$TAPECTL_COLLECTION_ROOT/alpha/f.txt\" &&",
+            None,
+        );
+        let staged = w.stage(&lib, true).expect("both read the snapshot");
+        assert_eq!(staged.units_staged, 2);
+        assert_eq!(
+            crate::db::files::fixture::sha256(&w.conn, w.snapshot_id_of("alpha"), "f.txt"),
+            Some(sha256_of(b"alpha original"))
+        );
+        let _ = &w.tmp;
+    }
 }
