@@ -392,8 +392,13 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
   `docs/research/2026-10-16-logical-block-protection.md`: the HP LTO-6 offers Reed-Solomon
   only, the setting is not saved across sessions, mhvtl emulates it. The prototype on
   EW7VWMVKF6 and the CTO's ruling remain.
-- **#364 epic:** a per-pass staging benchmark on vm-desk1, before and after, closes it; home2's
-  figure comes with its next staging run (#441: expect about one read of the source).
+- **#364 epic: closed 2026-10-16.** `tests/performance.rs` `perf_staging_throughput_per_pass`
+  measured v1.0.0 to v1.2.0 on vm-desk1 (`docs/perf-baselines.md`: 228 s to 85 s for 4 GiB,
+  source reads 2.78x to 1.00x). home2's figure comes with its next staging run (#441: expect
+  about one read of the source).
+- **On master after v1.2.0, for 1.3.0:** #476, every Rust reader that takes File 0 refuses a
+  tape whose `requires` it does not know (no on-tape change). #477, a fresh heir's File 1
+  findings, waits for the CTO to scope it into the 1.3.0 re-pin.
 - **The 1.1.2 queue, #444–#475:** done and tagged `v1.1.2`. The real-drive half of #444 (both
   blank proofs, the sub-MiB chip measurement) waits for the step-12 rehearsal in (f).
 - **2026-10-07 item 6:** the read-error rate assumes the drive clears log page 0x03 at

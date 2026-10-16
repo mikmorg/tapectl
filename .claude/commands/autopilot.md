@@ -19,8 +19,12 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-16 (evening; NEWEST) — 1.2.0 IS LANDED (master `347e61a`), TAGGED
-  WHEN CI IS GREEN; THE GOAL IS "no open issues except those needing the real drive".** Whole
+- **QUEUE STATE 2026-10-16 (late; NEWEST) — v1.2.0 TAGGED on `347e61a`; master `4461107` adds
+  #476 and #364's benchmark (both closed, chain green, CI green), untagged, for 1.3.0. Open:
+  #409 and #418 wait on the CTO's Round 1 spanning/R4 answers; #477 waits on the CTO's scope for
+  the 1.3.0 re-pin; #444 (drive half), #420 and #388 (prototype) need the real drive.** (Below,
+  the entry as it stood at the landing.) THE GOAL IS "no open issues except those needing the
+  real drive". Whole
   chain green on `347e61a` itself: 3448/0/20, check-docs 0, gate 43/43 (age 1.1.1), fr414,
   lifecycle --all 451/438/0/13, erase proof, plaintext scan. A fresh-reader read of a real 1.2.0
   File 1 (#448's acceptance) found the headline restore example lacked `--all`; fixed inside item
