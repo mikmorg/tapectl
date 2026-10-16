@@ -10578,18 +10578,36 @@ mod tests {
         assert_eq!(volume_condition(&conn, "Q-AGAIN"), "quarantined");
     }
 
+    /// The File 0 of the recovery-read fixtures below: it states the format
+    /// this tapectl reads and nothing about the volume, so the contact has
+    /// no identity to corroborate (an absence, as for a pre-#192 thunk) and
+    /// the read goes on. A one-byte filler there is no File 0 at all, which
+    /// the contact now refuses (#476: claims that do not parse).
+    fn claims_only_file0() -> Vec<u8> {
+        b"[volume]\nmagic = \"tapectl-volume-v2\"\nlayout_version = 2\nrequires = []\n".to_vec()
+    }
+
+    /// The filler file at `position` of a fixture tape: File 0 states a
+    /// readable format; the rest is one byte.
+    fn filler_at(position: u32) -> Vec<u8> {
+        if position == 0 {
+            claims_only_file0()
+        } else {
+            vec![0u8]
+        }
+    }
+
     fn mem_store_with_slice_at(position: u32, bytes: &[u8]) -> MemStore {
         let mut store = MemStore::new(4096);
         for p in 0..=position {
-            if p == position {
-                store
-                    .execute(&mut Cursor::new(bytes.to_vec()), bytes.len() as u64, false)
-                    .unwrap();
+            let file = if p == position {
+                bytes.to_vec()
             } else {
-                store
-                    .execute(&mut Cursor::new(vec![0u8]), 1, false)
-                    .unwrap();
-            }
+                filler_at(p)
+            };
+            store
+                .execute(&mut Cursor::new(file.clone()), file.len() as u64, false)
+                .unwrap();
         }
         store
     }
@@ -10770,7 +10788,7 @@ mod tests {
                 .iter()
                 .find(|(q, _)| *q == p)
                 .map(|(_, b)| b.to_vec())
-                .unwrap_or_else(|| vec![0u8]);
+                .unwrap_or_else(|| filler_at(p));
             store
                 .execute(&mut Cursor::new(bytes.clone()), bytes.len() as u64, false)
                 .unwrap();
