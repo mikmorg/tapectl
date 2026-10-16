@@ -2757,3 +2757,34 @@ fn a_refusal_to_guess_reads_no_further_envelopes() {
     let envelopes_read: Vec<i64> = reads(&h).into_iter().filter(|p| (4..=7).contains(p)).collect();
     assert_eq!(envelopes_read, vec![4], "{:#?}", h.ops());
 }
+
+/// The survey reads envelopes the restore did not need to read before, so it
+/// must not be what fills a small work directory: where the largest remaining
+/// envelope would not fit (read whole, and decrypted), it is skipped with a
+/// line saying so, and the restore goes on as it always did.
+#[test]
+fn the_survey_is_skipped_where_the_work_directory_could_not_hold_it() {
+    let tiny = df_with_free_kib(1);
+    let h2 = Heir::of(lone_template(), &[("df", &tiny)]);
+    let dest = h2.sub("restored");
+    let (code, text) = h2.run(&[
+        "--restore",
+        "--key",
+        &h2.key("esc"),
+        "--to",
+        &dest,
+        "--no-space-check",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        same_tree(&lone_unit("ledgers").src, Path::new(&dest)),
+        "the restore itself is unchanged:\n{text}"
+    );
+    assert!(
+        text.contains("Not looking at the other envelopes"),
+        "{text}"
+    );
+    assert!(!text.contains(LONE_NOTE), "{text}");
+    let envelopes: Vec<i64> = reads(&h2).into_iter().filter(|p| (4..=7).contains(p)).collect();
+    assert_eq!(envelopes, vec![4], "only the envelope used was read:\n{:#?}", h2.ops());
+}

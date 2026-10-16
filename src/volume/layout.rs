@@ -2367,7 +2367,24 @@ count_other_envelope() { # <position>
 }
 
 survey_other_envelopes() { # <the unit being restored>
-  local unit=$1
+  local unit=$1 need free
+  # The survey reads envelopes the restore itself would not have read, so it
+  # must not be what fills a small work directory: the largest one after the
+  # envelope in use is read whole and, if a key opens it, decrypted. Without
+  # room for that the survey is skipped, whatever --no-space-check says.
+  need=$(awk -F'|' -v after="$CHOSEN_POS" -v blk="$BLOCK" '
+    ($2 == "tenant_envelope" || $2 == "operator_envelope") && $1 + 0 > after + 0 && $3 ~ /^[0-9]+$/ {
+      if ($3 + 0 > max) max = $3 + 0
+    }
+    END { if (max > 0) printf "%.0f\n", 2 * max + blk }
+  ' "$FILES_TXT")
+  [ -n "$need" ] || return 0
+  free=$(free_bytes "$WORK")
+  if is_uint "$free" && ! awk -v have="$free" -v want="$need" 'BEGIN { exit (have + 0 >= want + 0) ? 0 : 1 }'; then
+    info "Not looking at the other envelopes: the work directory has $(size_str "$free") free and the"
+    info "  largest needs about $(size_str "$need") (set TMPDIR to a larger disk to see what else this key opens)."
+    return 0
+  fi
   LONE_UNIT=$unit
   : >"$WORK/other_units.txt"
   info "Looking at the other envelopes this key opens, to tell you at the end what else is on this tape..."
