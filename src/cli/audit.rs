@@ -1757,7 +1757,10 @@ fn no_full_verify_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 fn check_volume_verify_age(ctx: &Ctx<'_>) -> Result<Findings> {
     Ok(Findings {
         violations: Vec::new(),
-        warnings: volume_verify_age_findings(ctx.conn, ctx.config.defaults.verify_interval_days)?,
+        warnings: volume_verify_age_findings(
+            ctx.conn,
+            Some(ctx.config.defaults.verify_interval_days),
+        )?,
     })
 }
 
@@ -3208,10 +3211,12 @@ mod tests {
             let (violations, warnings) =
                 collect_findings(&conn, &config, Some("excludes_typo_unit")).unwrap();
 
-            assert_eq!(
-                warnings.len(),
-                0,
-                "an unreadable dirty scan must not be downgraded to a warning"
+            // The unit has a copy and no full readback, so `verify_age` (365
+            // days by default, ADR-0012 item 75) has its own say; the dirty
+            // scan must not be among the warnings.
+            assert!(
+                warnings.iter().all(|w| w.check != "dirty"),
+                "an unreadable dirty scan must not be downgraded to a warning: {warnings:?}"
             );
             assert_eq!(
                 violations.len(),
@@ -4857,8 +4862,10 @@ mod tests {
         }
 
         /// A host with no archive sets (home2) takes its interval from
-        /// `[defaults] verify_interval_days` (#453): with it set, a stale
-        /// volume is named; unset, no unit gives the volume a clock.
+        /// `[defaults] verify_interval_days` (#453), which is 365 days when
+        /// the file does not say (ADR-0012 item 75): a 400-day-old volume is
+        /// named under the code default, and an explicit value moves the line
+        /// either way.
         #[test]
         fn a_unit_with_no_archive_set_takes_the_defaults_interval() {
             let conn = world(None);
@@ -4872,16 +4879,16 @@ mod tests {
                 Some("BC-ONLY"),
                 Some(400),
             );
-            assert!(
-                warnings_of(&conn, "volume_verify_age").is_empty(),
-                "no interval anywhere: no clock"
-            );
+            let found = warnings_of(&conn, "volume_verify_age");
+            assert_eq!(found.len(), 1, "the code default of 365 days: {found:?}");
+            assert!(found[0].message.contains("365-day"), "{}", found[0].message);
+
             let mut config = Config::default();
-            config.defaults.verify_interval_days = Some(365);
+            config.defaults.verify_interval_days = 365;
             let found = warnings_with(&conn, &config, "volume_verify_age");
             assert_eq!(found.len(), 1, "{found:?}");
             assert!(found[0].message.contains("365-day"), "{}", found[0].message);
-            config.defaults.verify_interval_days = Some(500);
+            config.defaults.verify_interval_days = 500;
             assert!(
                 warnings_with(&conn, &config, "volume_verify_age").is_empty(),
                 "inside the defaults interval"
@@ -4992,11 +4999,19 @@ mod tests {
             assert!(warnings_of(&conn, "volume_verify_age").is_empty());
         }
 
-        /// No unit on the volume gives it an interval: no clock, no finding.
+        /// No unit on the volume names an interval: the volume's clock is the
+        /// code default, 365 days (ADR-0012 item 75; it used to have no clock
+        /// at all). A readback inside it is not named, one past it is.
         #[test]
-        fn a_volume_whose_units_have_no_interval_has_no_clock() {
+        fn a_volume_whose_units_have_no_interval_takes_the_code_default() {
             let conn = world(None);
             add_volume(&conn, "L6-OLD", "sealed", Some("home"), None, Some(2000));
+            let found = warnings_of(&conn, "volume_verify_age");
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].message.contains("365-day"), "{}", found[0].message);
+
+            let conn = world(None);
+            add_volume(&conn, "L6-NEW", "sealed", Some("home"), None, Some(300));
             assert!(warnings_of(&conn, "volume_verify_age").is_empty());
         }
 

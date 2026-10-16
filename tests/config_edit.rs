@@ -678,10 +678,11 @@ fn an_edit_under_an_unknown_key_already_in_the_file_is_refused() {
     config_check_passes(home.path());
 }
 
-/// Issue #453 (ADR-0012 2026-10-15 later, item 66): `[defaults]
-/// verify_interval_days` is a key `config set` writes (as an integer, with
-/// the comments kept), refuses at 0 by name with the file untouched, and
-/// `config check --json` prints it — `null` until it is set.
+/// Issue #453 (ADR-0012 2026-10-15 later, item 66; 2026-10-16 item 75):
+/// `[defaults] verify_interval_days` is a key `config set` writes (as an
+/// integer, with the comments kept), refuses at 0 by name with the file
+/// untouched, and `config check --json` prints the value in force: 365 until
+/// the file says otherwise, which is also what `init` writes.
 #[test]
 fn set_of_defaults_verify_interval_days_takes_a_day_count_and_refuses_zero() {
     let home = home();
@@ -691,7 +692,14 @@ fn set_of_defaults_verify_interval_days_takes_a_day_count_and_refuses_zero() {
             .unwrap_or_else(|e| panic!("config check --json is not one document: {e}"));
         v["defaults"]["verify_interval_days"].clone()
     };
-    assert_eq!(json_default(home.path()), serde_json::Value::Null);
+    assert_eq!(json_default(home.path()), serde_json::json!(365));
+    // The human report states it too.
+    let human = ok(home.path(), &["config", "check"]);
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("defaults: verify_interval_days = 365"),
+        "{}",
+        String::from_utf8_lossy(&human.stdout)
+    );
 
     let out = refused(
         home.path(),
@@ -707,16 +715,16 @@ fn set_of_defaults_verify_interval_days_takes_a_day_count_and_refuses_zero() {
 
     ok(
         home.path(),
-        &["config", "set", "defaults.verify_interval_days", "365"],
+        &["config", "set", "defaults.verify_interval_days", "180"],
     );
     let after = read(home.path());
-    assert!(after.contains("verify_interval_days = 365\n"), "{after}");
+    assert!(after.contains("verify_interval_days = 180\n"), "{after}");
     assert!(after.contains("# operator note: slices sized for the basement drive"));
     config_check_passes(home.path());
-    assert_eq!(json_default(home.path()), serde_json::json!(365));
+    assert_eq!(json_default(home.path()), serde_json::json!(180));
     // `config show` prints the file, so the key is there too.
     let shown = ok(home.path(), &["config", "show"]);
-    assert!(String::from_utf8_lossy(&shown.stdout).contains("verify_interval_days = 365"));
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("verify_interval_days = 180"));
 
     // A set value cannot be walked back below one day either.
     refused(

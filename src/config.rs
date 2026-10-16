@@ -721,12 +721,22 @@ pub struct DefaultsConfig {
     /// How many days a copy may go without a passing full `volume verify`
     /// before `audit` calls it overdue (`verify_age`), as the bottom layer of
     /// the policy chain: an `[[archive_sets]]` entry's `verify_interval_days`
-    /// overrides it, and a dotfile cannot set it. Unset by default in 1.1.2 —
-    /// `audit` then checks verification age only for units whose archive set
-    /// carries an interval (the code default of 365 is 1.2.0, issue #453).
-    /// At least 1 ([`validate_verify_interval_days`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verify_interval_days: Option<i64>,
+    /// overrides it, and a dotfile cannot set it. 365 when the key is absent
+    /// (ADR-0012 2026-10-15 item 66, 2026-10-16 item 75; issue #453), so every
+    /// catalog is checked without configuration; `config show` of a file that
+    /// names it and `config check` state the value in force. At least 1
+    /// ([`validate_verify_interval_days`]): there is deliberately no value
+    /// that switches the clock off (a very large number comes closest).
+    #[serde(default = "default_verify_interval_days")]
+    pub verify_interval_days: i64,
+}
+
+/// The `[defaults] verify_interval_days` in force when the key is absent: a
+/// year (ADR-0012 item 66, issue #453).
+pub const DEFAULT_VERIFY_INTERVAL_DAYS: i64 = 365;
+
+fn default_verify_interval_days() -> i64 {
+    DEFAULT_VERIFY_INTERVAL_DAYS
 }
 
 fn default_slice_size() -> String {
@@ -779,7 +789,7 @@ impl Default for DefaultsConfig {
             min_copies: default_min_copies(),
             min_locations: default_min_locations(),
             warehouse_copies: 0,
-            verify_interval_days: None,
+            verify_interval_days: DEFAULT_VERIFY_INTERVAL_DAYS,
         }
     }
 }
@@ -1439,7 +1449,8 @@ impl Config {
         }
         // Issue #422: an archive set's verify interval below one day; issue
         // #453: the same bound on `[defaults]`'s.
-        if let Some(days) = self.defaults.verify_interval_days {
+        {
+            let days = self.defaults.verify_interval_days;
             if let Err(e) = validate_verify_interval_days(days) {
                 problems.push(format!(
                     "{}: defaults.verify_interval_days = {days} {e}",
@@ -4014,18 +4025,32 @@ mod tests {
     }
 
     /// Issue #453 (ADR-0012 2026-10-15 later, item 66): `[defaults]
-    /// verify_interval_days` is optional (unset by default, and not written
-    /// by `init`), loads as a day count, and is refused below one day by
-    /// name — at load, in `config check`'s lenient path, and so in `config
+    /// verify_interval_days` is optional (365 when the key is absent, ADR-0012
+    /// item 75, and written as such by `init`), loads as a day count, and is
+    /// refused below one day by name — at load, in `config check`'s lenient path, and so in `config
     /// set` (which validates through the same collector).
     #[test]
     fn config_load_refuses_a_defaults_verify_interval_below_one_day() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
 
-        assert_eq!(Config::default().defaults.verify_interval_days, None);
+        // Absent from the file: the code default, 365. `init` writes the
+        // serialized default config, so the value in force is in the file.
+        assert_eq!(Config::default().defaults.verify_interval_days, 365);
+        std::fs::write(&path, "[defaults]\nmin_copies = 2\n").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.verify_interval_days,
+            DEFAULT_VERIFY_INTERVAL_DAYS,
+            "a [defaults] table that omits the key"
+        );
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().defaults.verify_interval_days,
+            365,
+            "no [defaults] table at all"
+        );
         let written = toml::to_string_pretty(&Config::default()).unwrap();
-        assert!(!written.contains("verify_interval_days"), "{written}");
+        assert!(written.contains("verify_interval_days = 365"), "{written}");
 
         for days in [0, -7] {
             let body = format!("[defaults]\nverify_interval_days = {days}\n");
@@ -4051,11 +4076,11 @@ mod tests {
 
         std::fs::write(&path, "[defaults]\nverify_interval_days = 365\n").unwrap();
         let cfg = Config::load(&path).expect("365 days is a legitimate interval");
-        assert_eq!(cfg.defaults.verify_interval_days, Some(365));
+        assert_eq!(cfg.defaults.verify_interval_days, 365);
         std::fs::write(&path, "[defaults]\nverify_interval_days = 1\n").unwrap();
         assert_eq!(
             Config::load(&path).unwrap().defaults.verify_interval_days,
-            Some(1)
+            1
         );
         // Round trip: a set value is written back.
         let again = toml::to_string_pretty(&cfg).unwrap();

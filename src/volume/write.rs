@@ -1815,7 +1815,7 @@ fn volume_write_in_contact<'c>(
         block_size as u64,
         execute_outcome.into(),
         confirm_tier,
-        config.defaults.verify_interval_days,
+        Some(config.defaults.verify_interval_days),
     )
     .map(|()| layout_snapshot)
 }
@@ -2099,7 +2099,7 @@ fn volume_resume_contacted<'c>(
         &keys,
         slice_check,
         confirm_tier,
-        config.defaults.verify_interval_days,
+        Some(config.defaults.verify_interval_days),
     );
 
     // ONE post-command sweep per resume contact (issue #342; ADR-0013),
@@ -4950,7 +4950,7 @@ fn verify_contacted(
         Tier::Integrity => session::interrupted_readback(
             conn,
             volume_id,
-            site.config().defaults.verify_interval_days,
+            Some(site.config().defaults.verify_interval_days),
         )?,
         Tier::Navigable => None,
     };
@@ -8095,7 +8095,7 @@ mod tests {
     #[test]
     fn a_full_verify_honours_the_defaults_interval_on_a_home_with_no_archive_sets() {
         let mut config = Config::default();
-        config.defaults.verify_interval_days = Some(30);
+        config.defaults.verify_interval_days = 30;
         let (conn, session, walked) =
             full_verify_after_an_interrupted_readback("VR-DEF", 31, |_| {}, &config);
         assert_read_everything_again(&conn, session, &walked);
@@ -8103,13 +8103,14 @@ mod tests {
 
     /// The controls for the two above: a readback inside the interval IS
     /// continued (so the gate is what made the difference, not the fixture),
-    /// and with no interval anywhere — the 1.1.2 default — one months old is
-    /// too.
+    /// and a home that sets no interval anywhere is held to the code default
+    /// of 365 days (ADR-0012 item 75): a readback 300 days old is continued,
+    /// one 400 days old is read again.
     #[test]
-    fn a_full_verify_continues_a_readback_inside_the_interval_or_with_none_set() {
+    fn a_full_verify_continues_a_readback_inside_the_interval_and_not_past_the_default() {
         use crate::tape::fake::Op;
         let mut config = Config::default();
-        config.defaults.verify_interval_days = Some(30);
+        config.defaults.verify_interval_days = 30;
         let (_, _, walked) = full_verify_after_an_interrupted_readback("VR-IN", 1, |_| {}, &config);
         assert!(
             !walked.contains(&Op::Read(1)) && !walked.contains(&Op::Read(2)),
@@ -8117,12 +8118,16 @@ mod tests {
         );
 
         let none = Config::default();
+        assert_eq!(none.defaults.verify_interval_days, 365);
         let (_, _, walked) =
-            full_verify_after_an_interrupted_readback("VR-NONE", 400, |_| {}, &none);
+            full_verify_after_an_interrupted_readback("VR-DEFIN", 300, |_| {}, &none);
         assert!(
             !walked.contains(&Op::Read(1)) && !walked.contains(&Op::Read(2)),
-            "with no interval there is no age limit: {walked:?}"
+            "inside the code default of 365 days it is continued: {walked:?}"
         );
+        let (conn, session, walked) =
+            full_verify_after_an_interrupted_readback("VR-DEFOUT", 400, |_| {}, &none);
+        assert_read_everything_again(&conn, session, &walked);
     }
 
     /// ADR-0012 2026-10-06 item 24 (#392): a full `volume verify` that

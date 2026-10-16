@@ -3438,12 +3438,11 @@ fn a_closed_stderr_pipe_does_not_panic() {
     );
 }
 
-/// Issue #453 (ADR-0012 2026-10-15 later, item 66): `audit`'s `verify_age`
-/// fires at the `[defaults] verify_interval_days` value for a unit with no
-/// archive set. Before the key is set the same catalog yields no
-/// `verify_age` finding at all (the control: the finding is the key's
-/// doing, not the fixture's), and the archive set's own interval, where a
-/// unit has one, still wins.
+/// Issue #453 (ADR-0012 2026-10-15 later, item 66; 2026-10-16 item 75):
+/// `audit`'s `verify_age` fires at the `[defaults] verify_interval_days`
+/// value for a unit with no archive set, and at 365 days when the key is
+/// absent from the file (the control: the finding is the code default's
+/// doing, and an explicit value moves it).
 #[test]
 fn audit_warns_verify_age_at_the_defaults_interval_with_no_archive_set() {
     let home = TempDir::new().expect("tempdir");
@@ -3473,14 +3472,34 @@ fn audit_warns_verify_age_at_the_defaults_interval_with_no_archive_set() {
             .collect()
     };
 
+    // `init` writes the interval it uses; take the line out so the file is
+    // silent about it and only the code default is left to speak.
+    let config_file = home.path().join(".tapectl").join("config.toml");
+    let written = std::fs::read_to_string(&config_file).expect("read config.toml");
+    assert!(written.contains("verify_interval_days = 365"), "{written}");
+    let silent: String = written
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("verify_interval_days"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&config_file, silent).expect("write config.toml");
+    let found = verify_age(home.path());
+    assert_eq!(
+        found.len(),
+        1,
+        "no archive set and no [defaults] interval: the code default of 365 days applies: {found:?}"
+    );
     assert!(
-        verify_age(home.path()).is_empty(),
-        "no archive set and no [defaults] interval: audit has nothing to say about verification age"
+        found[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not verified within 365 days"),
+        "{found:?}"
     );
 
     let set = run_tapectl_noninteractive(
         home.path(),
-        &["config", "set", "defaults.verify_interval_days", "365"],
+        &["config", "set", "defaults.verify_interval_days", "30"],
     );
     assert!(
         set.status.success(),
@@ -3495,7 +3514,7 @@ fn audit_warns_verify_age_at_the_defaults_interval_with_no_archive_set() {
         found[0]["message"]
             .as_str()
             .unwrap()
-            .contains("not verified within 365 days"),
+            .contains("not verified within 30 days"),
         "{found:?}"
     );
 }

@@ -278,9 +278,12 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
     let ops_lines = describe_ops(paths, loaded.and_then(|cfg| cfg.ops.as_ref()));
 
     // Issue #453: `[defaults] verify_interval_days` as the config in force
-    // has it (`null` while unset, and while the config did not parse well
-    // enough to say). `config show` prints the file, so a set value is there
-    // too; this is the one place `--json` states it outright.
+    // has it: the file's value, else the code default of 365 (ADR-0012 item
+    // 75); `null` only when the config did not parse well enough to say.
+    // `config show` prints the file, which names the key only when it was set
+    // or written by `init`; this is the one place `--json` states the value in
+    // force outright, and the human report's last line states it too.
+    let verify_interval_days = loaded.map(|cfg| cfg.defaults.verify_interval_days);
     let defaults_json = loaded.map(|cfg| {
         serde_json::json!({
             "verify_interval_days": cfg.defaults.verify_interval_days,
@@ -322,6 +325,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
             &capacity_override_hits,
             host_check.as_ref(),
             &ops_lines,
+            verify_interval_days,
         );
     }
 
@@ -543,6 +547,7 @@ fn print_human(
     capacity_override_hits: &[&str],
     host_check: Option<&(bool, crate::config::HostCheckConfig)>,
     ops_lines: &[String],
+    verify_interval_days: Option<i64>,
 ) {
     if report.valid {
         println!("config: valid");
@@ -642,6 +647,13 @@ fn print_human(
     }
     for line in ops_lines {
         println!("{line}");
+    }
+    if let Some(days) = verify_interval_days {
+        println!(
+            "defaults: verify_interval_days = {days} (`audit` warns when a unit has gone \
+             longer without a passing full `volume verify`; an archive set that names its \
+             own interval overrides this for its units)"
+        );
     }
 }
 

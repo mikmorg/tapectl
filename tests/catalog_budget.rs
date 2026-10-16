@@ -330,9 +330,9 @@ fn budget(command: Command) -> (usize, usize, &'static [&'static str]) {
         // Totals over every version: one pass over `snapshots` is the job.
         Command::Stats => (4, 0, &["snapshots"]),
         Command::RestoreSelect => (3, 0, &[]),
-        // Per unit by design today: six statements a unit (its checks run
+        // Per unit by design today: eight statements a unit (its checks run
         // unit by unit), plus one pass over `writes` (w) and `volumes` (v)
-        // for the whole-catalog checks. The slope is pinned so a seventh
+        // for the whole-catalog checks. The slope is pinned so a ninth
         // per-unit statement is a decision, not a drift. `tenancy` (#383)
         // reads every tenant and its keys and every written stage set once
         // (`tenant_directory`, `written_stage_sets`: three statements, not
@@ -344,8 +344,14 @@ fn budget(command: Command) -> (usize, usize, &'static [&'static str]) {
         // cartridge and the place, grouped by volume) — 14 + 6 a unit, no
         // new full scan (`v` and `w` are already read in full by the other
         // whole-catalog checks). A per-volume query would have moved the
-        // slope, not the intercept.
-        Command::Audit => (14 + 6 * LARGE, 6, &["encryption_keys", "h", "v", "w"]),
+        // slope, not the intercept. Then the 365-day `verify_interval_days`
+        // default (ADR-0012 item 75, #453): `verify_age` is live for EVERY
+        // unit now, not only those whose archive set names an interval, and
+        // it runs two statements a unit (the unit's copy count, and the
+        // newest passing full readback of a copy): 14 + 8 a unit. Neither is
+        // a full scan (the pinned scan set is unchanged); the slope moved on
+        // purpose, because the check now applies to every unit.
+        Command::Audit => (14 + 8 * LARGE, 8, &["encryption_keys", "h", "v", "w"]),
         // Per unit by design today: the unit list, then for each unit
         // under the root its policy (`policy::resolve`) and its copy count
         // — three statements a unit.

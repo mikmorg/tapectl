@@ -93,10 +93,11 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
                 detail: format!("config.toml [defaults] slice_size is invalid: {e}"),
             }
         })?,
-        // Level 3 (issue #453): `[defaults] verify_interval_days`, `None`
-        // unless the operator set one. An archive set's own value, below,
-        // replaces it; a dotfile cannot set the key at all.
-        verify_interval_days: defaults.verify_interval_days,
+        // Level 3 (issue #453): `[defaults] verify_interval_days`, 365 when
+        // the key is absent (ADR-0012 item 75), so a unit always has an
+        // interval. An archive set's own value, below, replaces it; a
+        // dotfile cannot set the key at all.
+        verify_interval_days: Some(defaults.verify_interval_days),
         preserve_xattrs: defaults.preserve_xattrs,
         preserve_acls: defaults.preserve_acls,
         preserve_fsa: defaults.preserve_fsa,
@@ -438,7 +439,8 @@ mod tests {
         assert_eq!(p.compression, "none");
         assert!(p.encrypt);
         assert!(p.required_locations.is_empty());
-        assert!(p.verify_interval_days.is_none());
+        // 365 days with no archive set and no `[defaults]` key (ADR-0012 item 75).
+        assert_eq!(p.verify_interval_days, Some(365));
     }
 
     #[test]
@@ -463,12 +465,14 @@ mod tests {
         assert_eq!(p.verify_interval_days, Some(90));
     }
 
-    /// Issue #453 (ADR-0012 2026-10-15 later, item 66): `verify_interval_days`
-    /// resolves archive set, then `[defaults]`, then none. A unit with no
-    /// archive set, or one whose set carries no interval, gets the defaults
-    /// value; a set's own interval wins over it; with neither there is none.
+    /// Issue #453 (ADR-0012 2026-10-15 later, item 66; 2026-10-16 item 75):
+    /// `verify_interval_days` resolves archive set, then `[defaults]`, which is
+    /// 365 days when the key is absent. A unit with no archive set, or one
+    /// whose set carries no interval, gets the defaults value; a set's own
+    /// interval wins over it, whether the defaults value is the code default
+    /// or an explicit one.
     #[test]
-    fn resolve_verify_interval_is_archive_set_then_defaults_then_none() {
+    fn resolve_verify_interval_is_archive_set_then_defaults() {
         let conn = fresh_conn();
         conn.execute(
             "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('tight', 30)",
@@ -484,23 +488,28 @@ mod tests {
         let silent = conn.last_insert_rowid();
 
         let mut config = Config::default();
-        // Neither: none.
+        // No `[defaults]` key: the code default, 365, below a set's own.
         for set in [None, Some(silent), Some(tight)] {
             let p = resolve(&conn, &config, &make_unit(set, None)).unwrap();
-            let want = if set == Some(tight) { Some(30) } else { None };
-            assert_eq!(p.verify_interval_days, want, "no [defaults] interval");
+            let want = if set == Some(tight) {
+                Some(30)
+            } else {
+                Some(365)
+            };
+            assert_eq!(p.verify_interval_days, want, "code default, set {set:?}");
         }
 
-        config.defaults.verify_interval_days = Some(365);
-        // [defaults] applies where the set has none (or there is no set)...
+        config.defaults.verify_interval_days = 180;
+        // An explicit [defaults] value applies where the set has none (or
+        // there is no set)...
         for set in [None, Some(silent)] {
             let p = resolve(&conn, &config, &make_unit(set, None)).unwrap();
-            assert_eq!(p.verify_interval_days, Some(365), "set {set:?}");
+            assert_eq!(p.verify_interval_days, Some(180), "set {set:?}");
         }
         // ...and the set's own value wins over it, in either direction.
         let p = resolve(&conn, &config, &make_unit(Some(tight), None)).unwrap();
         assert_eq!(p.verify_interval_days, Some(30));
-        config.defaults.verify_interval_days = Some(7);
+        config.defaults.verify_interval_days = 7;
         let p = resolve(&conn, &config, &make_unit(Some(tight), None)).unwrap();
         assert_eq!(p.verify_interval_days, Some(30), "a looser set still wins");
     }
@@ -512,7 +521,7 @@ mod tests {
     fn resolve_rejects_verify_interval_days_in_a_dotfile_policy_table() {
         let conn = fresh_conn();
         let mut config = Config::default();
-        config.defaults.verify_interval_days = Some(365);
+        config.defaults.verify_interval_days = 365;
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join(".tapectl-unit.toml"),

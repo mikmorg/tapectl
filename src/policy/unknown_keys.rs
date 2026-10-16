@@ -179,13 +179,12 @@ min_copies = 5
         assert!(scan(text).is_empty(), "{:?}", scan(text));
     }
 
-    /// An `Option` field that is `None` is not serialized, so the guard
-    /// below never sees it: `[defaults] verify_interval_days` (issue #453)
-    /// is pinned here with a value, written and scanned.
+    /// `[defaults] verify_interval_days` (issue #453) is pinned here with a
+    /// non-default value, written and scanned.
     #[test]
     fn a_serialized_config_with_the_optional_defaults_set_reports_nothing() {
         let mut cfg = crate::config::Config::default();
-        cfg.defaults.verify_interval_days = Some(365);
+        cfg.defaults.verify_interval_days = 365;
         let text = toml::to_string_pretty(&cfg).unwrap();
         assert!(text.contains("verify_interval_days = 365"), "{text}");
         assert!(
