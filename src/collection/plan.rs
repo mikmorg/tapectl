@@ -68,6 +68,12 @@ const BLOCK_SIZE: u64 = 512 * 1024;
 /// for one tape (issues #391, #395: the refusal names the overage and the
 /// per-generation limit, ADR-0012 2026-10-06 items 16 and 17).
 ///
+/// `staged` (issue #475): the destination budget, when the caller has one
+/// (`collection run`). Staged data that will ride along to the tape comes out
+/// of `budget` before packing, so a unit too big for what is LEFT, though it
+/// fits an empty tape, is refused as that — staged data to write first — and
+/// not as a unit that "can never be batched".
+///
 /// `policy_aware` (ADR-0012 2026-10-07 item 26, issue #144): order the
 /// selection so the units whose audit findings a write would resolve —
 /// [`coverage::Shortfall`], the audit's own `copy_count` and
@@ -83,6 +89,7 @@ fn batches_for_budget(
     lib: &CollectionConfig,
     budget: u64,
     limit: &str,
+    staged: Option<&DestinationBudget>,
     policy_aware: bool,
 ) -> Result<(Vec<Batch>, Vec<RefusedUnit>)> {
     let mut scan = super::fingerprint::pending_units_for_collection(
@@ -142,22 +149,81 @@ fn batches_for_budget(
     } else {
         selector::plan_batches(synthetic, budget, BLOCK_SIZE)
     };
-    let batches = planned.map_err(|oversized| {
-        TapectlError::Other(format!(
-            "collection \"{}\": {} unit(s) exceed the per-tape budget and can never be \
+    let batches =
+        planned.map_err(|oversized| oversized_refusal(&lib.name, &oversized, limit, staged))?;
+    Ok((batches, scan.refused))
+}
+
+/// The refusal for units the selector found too big for the budget it was
+/// given (issues #391, #395, #475).
+///
+/// A unit larger than the whole tape can never be batched: a unit is never
+/// split across tapes (ADR-0012), and `--fill-ceiling` raises the ceiling
+/// only up to the whole cartridge. But `collection run`'s budget is what is
+/// LEFT after the staged data that will ride along (issue #232 item 1), and
+/// when that data fills the destination the budget saturates to zero and
+/// every unit reads as oversized. A unit that fits `budget + staged` does
+/// fit an empty tape; the true statement is that the staged data has to be
+/// written first, so that is what is said (issue #475).
+fn oversized_refusal(
+    collection: &str,
+    oversized: &[selector::OversizedUnit],
+    limit: &str,
+    staged: Option<&DestinationBudget>,
+) -> TapectlError {
+    let dec = |b: u64| crate::util::format_bytes_decimal(i64::try_from(b).unwrap_or(i64::MAX));
+    let (blocked, never): (Vec<&selector::OversizedUnit>, Vec<&selector::OversizedUnit>) =
+        match staged {
+            Some(b) if b.already_staged_bytes > 0 => oversized.iter().partition(|o| {
+                o.padded_bytes <= o.budget_bytes.saturating_add(b.already_staged_bytes)
+            }),
+            _ => (Vec::new(), oversized.iter().collect()),
+        };
+    let never_batched = |units: &[&selector::OversizedUnit]| {
+        format!(
+            "{} unit(s) exceed the per-tape budget and can never be \
              batched (a unit is never split across tapes; ADR-0012): {}. The limit: {limit}. \
              A unit this size cannot be written until spanning is designed; `--fill-ceiling` \
              raises the ceiling only up to the whole cartridge",
-            lib.name,
-            oversized.len(),
-            oversized
+            units.len(),
+            units
                 .iter()
                 .map(|o| o.to_string())
                 .collect::<Vec<_>>()
                 .join("; "),
-        ))
-    })?;
-    Ok((batches, scan.refused))
+        )
+    };
+    let Some(b) = staged.filter(|_| !blocked.is_empty()) else {
+        return TapectlError::Other(format!(
+            "collection \"{collection}\": {}",
+            never_batched(&never)
+        ));
+    };
+    let mut msg = format!(
+        "collection \"{collection}\": {}; write it first (`tapectl volume write {}`), then run \
+         the collection again onto an empty initialised volume. {} pending unit(s) fit an \
+         empty tape but not beside the staged data: {}. The limit: {limit}",
+        if b.bytes == 0 {
+            "staged data already fills this tape".to_string()
+        } else {
+            format!(
+                "staged data already takes {} of this tape, leaving {}",
+                dec(b.already_staged_bytes),
+                dec(b.bytes)
+            )
+        },
+        b.binding_label,
+        blocked.len(),
+        blocked
+            .iter()
+            .map(|o| format!("\"{}\" ({})", o.name, dec(o.padded_bytes)))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    if !never.is_empty() {
+        msg.push_str(&format!(". Also, {}", never_batched(&never)));
+    }
+    TapectlError::Other(msg)
 }
 
 /// Compute one collection's batches against its resolved LTO backend
@@ -196,6 +262,7 @@ pub fn plan_for_collection(
         lib,
         tape.bytes,
         &tape.describe(),
+        None,
         policy_aware,
     )
 }
@@ -353,9 +420,11 @@ fn riding_stage_set_ids(conn: &Connection) -> Result<Vec<i64>> {
 /// ADR-0012 2026-09-16 amendment (issue #199) case where a status of
 /// `initialized` alone is not sufficient (a `catalog rebuild --from-volume`
 /// row can hold a completed write while never leaving `initialized`).
-/// Checking both is deliberately NOT stricter than `volume_write` itself —
-/// it is the same predicate pair, in the same order — so no label that
-/// would pass `volume_write` can be refused here.
+/// Issue #475 added the other two catalog-only refusals `volume_write` makes
+/// before it touches anything -- an unresolved write session and a recorded
+/// seal ([`super::precheck`]). Checking all four is deliberately NOT stricter
+/// than `volume_write` itself — it is the same predicates, in the same order
+/// — so no label that would pass `volume_write` can be refused here.
 ///
 /// The usable-capacity factor and ENOSPC buffer still come from the DRIVE
 /// (ADR-0010, "Read paths stay usable without a configured drive": write
@@ -427,6 +496,16 @@ pub fn destination_budget(
             return Err(TapectlError::VolumeHasRecordedWrite {
                 label: label.clone(),
             });
+        }
+        // The other two catalog-only refusals `volume_write` makes before it
+        // touches anything (issue #475), in its order: an unresolved write
+        // session (a retry after an interrupted write is `volume resume`'s,
+        // not a fresh run's) and a recorded seal. Without them a `collection
+        // run --label L` retried after an interrupted write planned, staged
+        // for hours, and was only then refused -- the late refusal #224
+        // removed for the other two.
+        if let Some(refusal) = super::precheck::refusal(conn, label, volume_id)? {
+            return Err(TapectlError::Other(refusal));
         }
         // Copy distinctness (ADR-0012 2026-10-07 item 26, issue #144), the
         // check `volume_write` makes at its plan time, made here against the
@@ -535,6 +614,7 @@ pub fn plan_for_run(
         lib,
         budget.bytes,
         &budget.describe(),
+        Some(&budget),
         policy_aware,
     )?;
     Ok((batches, budget, refused))
@@ -966,7 +1046,7 @@ mod tests {
         assert_eq!(budget.num_destinations, 2);
 
         let (batches, refused) =
-            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", false).unwrap();
+            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", None, false).unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -1725,7 +1805,7 @@ mod tests {
         );
 
         let (batches, refused) =
-            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", false).unwrap();
+            batches_for_budget(&conn, &config, &lib, budget.bytes, "test", None, false).unwrap();
         assert!(refused.is_empty());
         assert_eq!(
             batches.len(),
@@ -2006,5 +2086,234 @@ compression = "bogus"
         let (batches, _, refused) = plan_for_run(&conn, &config, &lib, "/dev/null", &label, true)
             .expect("one unit's [policy] fault must not abort `collection run --policy-aware`");
         check(&batches, &refused);
+    }
+
+    /// A catalog with `L1` (`initialized`, 10 MiB) and one write session of
+    /// the given status on it, its seal recorded or not: what a `collection
+    /// run --label L1` retried after an interrupted write finds (issue #475).
+    fn volume_with_session(write_status: &str, sealed: bool) -> Connection {
+        let conn = db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 'media', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (1, 'u-old', 'old', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (1, 1, 1, 'staged', '/tmp', 1, 10);
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size) VALUES (1, 1, 'staged', 524288);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status)
+             VALUES (1, 'L1', 'lto', 'p', ?1, 'initialized')",
+            params![10 * 1024 * 1024_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (1, 1, 1, ?1)",
+            params![write_status],
+        )
+        .unwrap();
+        if sealed {
+            conn.execute(
+                "UPDATE volumes SET sealed_at = datetime('now') WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn run_one(conn: &Connection, lib: &CollectionConfig) -> Result<()> {
+        plan_for_run(
+            conn,
+            &config_with_tiny_backend(),
+            lib,
+            "/dev/null",
+            &["L1".to_string()],
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// Issue #475 item 1: `volume write` refuses a volume with an unresolved
+    /// write session, and a `collection run --label L` retried after an
+    /// interrupted write used to plan, stage for hours, and only then be told
+    /// to run `volume resume`. Refused at plan time now, with that remedy --
+    /// for each of the three unresolved statuses. The positive control: the
+    /// same session `aborted` is resolved, and the destination plans.
+    #[test]
+    fn run_refuses_a_destination_with_an_unresolved_write_session_before_staging() {
+        let (lib, _root) = empty_collection();
+        for status in ["planned", "in_progress", "interrupted"] {
+            let conn = volume_with_session(status, false);
+            let msg = run_one(&conn, &lib).unwrap_err().to_string();
+            assert!(
+                msg.contains("unresolved write session")
+                    && msg.contains("`tapectl volume resume L1`"),
+                "{status}: {msg}"
+            );
+        }
+        let conn = volume_with_session("aborted", false);
+        run_one(&conn, &lib).expect("an aborted session is resolved: the destination plans");
+    }
+
+    /// Issue #475 item 1, the other half: a recorded seal is refused at plan
+    /// time (ADR-0003; `--force` does not reach it in `volume write` either),
+    /// naming the retire path. The control is the same `aborted` session with
+    /// no recorded seal, which plans.
+    #[test]
+    fn run_refuses_a_destination_whose_seal_is_recorded_before_staging() {
+        let (lib, _root) = empty_collection();
+        let conn = volume_with_session("aborted", true);
+        let msg = run_one(&conn, &lib).unwrap_err().to_string();
+        assert!(
+            msg.contains("RECORDS its seal") && msg.contains("`tapectl volume retire L1`"),
+            "{msg}"
+        );
+        let conn = volume_with_session("aborted", false);
+        run_one(&conn, &lib).expect("no recorded seal: the destination plans");
+    }
+
+    /// `volume write` answers an interrupted sealed session with resume's
+    /// advice, not the seal's: the unresolved-session check comes first.
+    #[test]
+    fn an_interrupted_sealed_session_gets_resumes_advice_first() {
+        let (lib, _root) = empty_collection();
+        let conn = volume_with_session("interrupted", true);
+        let msg = run_one(&conn, &lib).unwrap_err().to_string();
+        assert!(msg.contains("`tapectl volume resume L1`"), "{msg}");
+        assert!(!msg.contains("RECORDS its seal"), "{msg}");
+    }
+
+    /// A collection of `(folder, bytes)` units, synced, ready to plan.
+    fn collection_of(
+        conn: &Connection,
+        units: &[(&str, usize)],
+    ) -> (CollectionConfig, tempfile::TempDir, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        for (name, bytes) in units {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("f.dat"), vec![0u8; *bytes]).unwrap();
+        }
+        let lib = CollectionConfig {
+            name: "testlib".into(),
+            root: root.path().to_string_lossy().to_string(),
+            tenant: "media".into(),
+            unit_depth: 1,
+            exclude: vec![],
+            archive_set: None,
+            dotfiles: true,
+        };
+        let paths = TapectlPaths::new(home.path().to_path_buf());
+        super::super::sync::sync_collection(conn, &paths, &lib, false, &[]).unwrap();
+        (lib, root, home)
+    }
+
+    /// `L1` (`initialized`, 10 MiB) with one `staged` stage set of
+    /// `staged_bytes` encrypted bytes riding along (a live slice), on a
+    /// tenant `media`: the state between a batch's first and second copy.
+    fn destination_with_staged_data(staged_bytes: i64) -> Connection {
+        let conn = db::open_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO tenants (id, name, is_operator, status) VALUES (1, 'media', 0, 'active');
+             INSERT INTO units (id, uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (1, 'u-old', 'old', 1, 'mtime_size', 1, 'active');
+             INSERT INTO snapshots (id, unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (1, 1, 1, 'staged', '/tmp', 1, 10);
+             INSERT INTO stage_sets (id, snapshot_id, status, slice_size) VALUES (1, 1, 'staged', 524288);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted, staging_path)
+             VALUES (1, 1, ?1, ?1, 'a', 'b', '/nonexistent/s1')",
+            params![staged_bytes],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+             VALUES ('L1', 'lto', 'p', ?1, 'initialized')",
+            params![10 * 1024 * 1024_i64],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Issue #475 item 2: retained staged data that fills the destination
+    /// saturates the budget to zero, and every pending unit used to be
+    /// reported "can never be batched ... until spanning is designed" -- false
+    /// for a unit that fits an empty tape. The refusal says the staged data
+    /// fills the tape and names `volume write`.
+    #[test]
+    fn a_destination_filled_by_staged_data_says_write_it_first_not_never_batched() {
+        let conn = destination_with_staged_data(10 * 1024 * 1024);
+        let (lib, _root, _home) = collection_of(&conn, &[("alpha", 1024 * 1024)]);
+        let msg = run_one(&conn, &lib).unwrap_err().to_string();
+        assert!(
+            msg.contains(
+                "staged data already fills this tape; write it first \
+                 (`tapectl volume write L1`)"
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("\"testlib/alpha\""), "{msg}");
+        assert!(!msg.contains("can never be batched"), "{msg}");
+        assert!(!msg.contains("spanning"), "{msg}");
+    }
+
+    /// The same defect short of zero: staged data takes 9 of the 10 MiB, so
+    /// a 3 MiB unit that fits an empty tape does not fit beside it.
+    #[test]
+    fn a_destination_mostly_filled_by_staged_data_names_what_is_left() {
+        let conn = destination_with_staged_data(9 * 1024 * 1024);
+        let (lib, _root, _home) = collection_of(&conn, &[("alpha", 3 * 1024 * 1024)]);
+        let msg = run_one(&conn, &lib).unwrap_err().to_string();
+        assert!(
+            msg.contains("staged data already takes")
+                && msg.contains("leaving")
+                && msg.contains("`tapectl volume write L1`"),
+            "{msg}"
+        );
+        assert!(!msg.contains("can never be batched"), "{msg}");
+    }
+
+    /// A unit bigger than the whole tape stays "can never be batched" with
+    /// staged data present -- writing the staged data first cannot help it
+    /// -- and is named beside the units the staged data is blocking.
+    #[test]
+    fn a_unit_too_big_for_any_tape_is_still_never_batched_beside_staged_data() {
+        let conn = destination_with_staged_data(10 * 1024 * 1024);
+        let (lib, _root, _home) =
+            collection_of(&conn, &[("alpha", 1024 * 1024), ("huge", 12 * 1024 * 1024)]);
+        let msg = run_one(&conn, &lib).unwrap_err().to_string();
+        assert!(
+            msg.contains("staged data already fills this tape; write it first"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("1 unit(s) exceed the per-tape budget and can never be batched")
+                && msg.contains("testlib/huge"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("1 pending unit(s) fit an empty tape")
+                && msg.contains("\"testlib/alpha\""),
+            "{msg}"
+        );
+    }
+
+    /// The positive control: with no staged data a unit that does not fit is
+    /// refused exactly as before.
+    #[test]
+    fn without_staged_data_an_oversized_unit_is_still_never_batched() {
+        let conn = destination_with_staged_data(1024 * 1024);
+        conn.execute("DELETE FROM stage_slices", []).unwrap();
+        let (lib, _root, _home) = collection_of(&conn, &[("huge", 12 * 1024 * 1024)]);
+        let msg = run_one(&conn, &lib).unwrap_err().to_string();
+        assert!(msg.contains("can never be batched"), "{msg}");
+        assert!(!msg.contains("staged data already"), "{msg}");
     }
 }

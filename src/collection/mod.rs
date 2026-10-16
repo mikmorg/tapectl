@@ -18,6 +18,7 @@ pub mod batch;
 pub mod fingerprint;
 pub mod outside;
 pub mod plan;
+pub mod precheck;
 pub mod selector;
 pub mod status;
 pub mod sync;
