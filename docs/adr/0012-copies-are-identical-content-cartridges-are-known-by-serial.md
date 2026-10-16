@@ -1544,3 +1544,13 @@ Ruled by the CTO, 2026-10-16 ("Approve re-pin"), answering #449's acceptance cri
     Items 66 (a code default of 365 days) and 68 (the per-collection snapshot hook) were ruled
     "in 1.2.0" before this re-pin was; whether they ride this release is put to the CTO before
     the version bump. #418 R4 and #420 are not ruled for 1.2.0 and stay out.
+
+Ruled the same day, answering item 74's question:
+
+75. **Both ride 1.2.0**: item 66's code default (`[defaults] verify_interval_days` is 365 when
+    unset) and item 68's per-collection snapshot hook. The hook is `collection run`'s: a
+    `[[collections]]` command run once before the batch is snapshotted and staged, printing the
+    path of a read-only snapshot of the collection's root, which the run's snapshot and stage
+    read in place of the root while every recorded path stays the unit's real one; a matching
+    release command after, whatever the outcome. A failing hook refuses the run before any unit
+    is read. `stage create` on its own is unchanged, and `config check` runs neither command.
