@@ -75,6 +75,26 @@
 //! walks, reading a backup only when its primary is damaged or does not
 //! read. The previous pin was `e8ca5902…`.
 //!
+//! **RE-PINNED 2026-10-16 for tapectl 1.2.0, under the CTO's "Approve re-pin"
+//! (ADR-0012 2026-10-16 items 71-74, #449 and #448's File 1 half),** bounded by
+//! item 72: this pin only, ending when v1.2.0 is installed. Five changes to
+//! RESTORE.sh's bytes (File 1 and RECOVERY.md also change that day, but they
+//! are not pinned here): a lone-unit restore (no `--unit`, no `--all`) says,
+//! before RESTORE COMPLETE, how many other envelopes its key opened and how
+//! many other units they list, and names `--list` and `--all` (it reads the
+//! remaining envelopes first, forward only, and skips that where the work
+//! directory could not hold the largest); each mode checks the tools it runs
+//! (`TOOLS_READ`, `TOOLS_ENVELOPE`, `TOOLS_LIST`, `TOOLS_PATH`,
+//! `TOOLS_RESTORE`, drawn from one table in `layout.rs`) instead of every tool
+//! in every mode; the DAMAGED message says "a key matched" only when one did;
+//! the work directory is described as it is (the decrypted envelopes, in
+//! `${TMPDIR:-/tmp}`), with a pre-read estimate and a note that the space
+//! check counts the slices' encrypted size; and `export LC_ALL=C`. The
+//! Requirements lines and every other ruled item below are byte-identical.
+//! Two things did not move (item 73) and are asserted below: "tapectl 1.1.0" in
+//! `die_newer_needed`, and `requires` (empty, `KNOWN_FEATURES=""`). The
+//! MANIFEST.toml pin did not move. The previous pin was `2a09fe98…`.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -91,7 +111,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "2a09fe98d3b3a10b7a0a9113d23806070f605d8d8c23366d04edc5ffa900e36e";
+const RESTORE_SH_SHA256: &str = "6c7bb948869ea17a9872f5477adff6d9060e16fe8f72667d90941418bc511cec";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -106,14 +126,22 @@ fn restore_sh_bytes_are_pinned() {
          do not re-pin without one."
     );
     // The prerequisite check: tar (#349), mt or mt-st, and the FIFO tools
-    // the streaming restore needs (1.1.0).
-    assert_eq!(
-        script
-            .matches("for tool in dd age sha256sum dar head truncate tar mkfifo tee; do\n")
-            .count(),
-        1,
-        "the prerequisite line"
+    // the streaming restore needs (1.1.0); per mode since 1.2.0 (#449): each
+    // mode checks only what it runs, and --restore's set is the union.
+    assert!(
+        !script.contains("for tool in dd age"),
+        "no mode checks every tool any more"
     );
+    for line in [
+        "# --info, --verify:\nTOOLS_READ=(dd sha256sum head)\n",
+        "# --find-envelope:\nTOOLS_ENVELOPE=(dd age sha256sum head truncate tar)\n",
+        "# --list:\nTOOLS_LIST=(dd age dar sha256sum head truncate tar)\n",
+        "# --restore --path:\nTOOLS_PATH=(dd age dar sha256sum head truncate tar tee)\n",
+        "# --restore, whole units (every tool any mode may run):\nTOOLS_RESTORE=(dd age dar sha256sum head truncate tar mkfifo tee)\n",
+        "require_tools() { # <tool>...\n",
+    ] {
+        assert_eq!(script.matches(line).count(), 1, "the prerequisite set {line:?}");
+    }
     // Every item of the 2026-09-30 ruling still standing, and of 1.1.0's, is
     // in the pinned bytes.
     for ruled in [
@@ -154,11 +182,45 @@ fn restore_sh_bytes_are_pinned() {
         // ADR-0012 item 15 (#384): requires, the seal at end of data
         "check_requires \"File 0\" \"$WORK/thunk.toml\"",
         "\"$MT\" -f \"$DEVICE\" bsfm 2 2>/dev/null || return 1",
+        // 1.2.0 (ADR-0012 2026-10-16 item 71, #449): locale, per-mode tools,
+        // the survey behind the lone-unit note, "a key matched" only when one
+        // did, the work directory and its estimate
+        "\nexport LC_ALL=C\n",
+        "require_tools \"${TOOLS_RESTORE[@]}\"",
+        "require_tools \"${TOOLS_PATH[@]}\"",
+        "walk_envelopes count_other_envelope \"$CHOSEN_POS\"",
+        "survey_other_envelopes \"${unit_names[0]}\"",
+        "  note_other_units\n  echo \"\"\n  info \"RESTORE COMPLETE\"",
+        "  if [ \"$MATCHED_DAMAGED\" -gt 0 ]; then\n    die \"$headline that could be opened.",
+        "    MATCHED_DAMAGED=$((MATCHED_DAMAGED + 1))\n",
+        "# WORK is the work directory, made in ${TMPDIR:-/tmp}: TMPDIR moves it.",
+        "check_work_space() {",
+        "  info \"            (counted from the slices' encrypted size on tape; a compressed unit may need more)\"",
+        "  echo \"  TMPDIR        Where the work directory is made (default: /tmp). It holds the\"",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
     // The two placeholders must both have been substituted.
     assert!(!script.contains("__LABEL__") && !script.contains("__TOTAL_FILES__"));
+    assert!(!script.contains("__AWK_") && !script.contains("__TOOLS_"));
+    // ADR-0012 2026-10-16 item 73: the two things the re-pin does not move.
+    assert_eq!(
+        script
+            .matches("This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely")
+            .count(),
+        1,
+        "die_newer_needed still says tapectl 1.1.0"
+    );
+    assert_eq!(
+        script.matches("tapectl 1.").count(),
+        1,
+        "no other version named"
+    );
+    assert_eq!(
+        script.matches("\nKNOWN_FEATURES=\"\"\n").count(),
+        1,
+        "RESTORE.sh still knows no feature a tape could require"
+    );
     assert!(script.contains("LABEL=\"GOLD01\""));
     assert!(script.contains("# Total files on tape: 12"));
 }
