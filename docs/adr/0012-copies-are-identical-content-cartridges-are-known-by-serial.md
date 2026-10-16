@@ -1554,3 +1554,32 @@ Ruled the same day, answering item 74's question:
     read in place of the root while every recorded path stays the unit's real one; a matching
     release command after, whatever the outcome. A failing hook refuses the run before any unit
     is read. `stage create` on its own is unchanged, and `config check` runs neither command.
+
+## Amendment, 2026-10-16 (evening): spanning and the cross-volume index, Round 1
+
+*Ruled by the CTO on 2026-10-16*, answering Round 1 of the design draft
+`docs/research/2026-10-16-spanning-and-cross-volume-index.md` (#409, #418 R4). The CTO had asked
+the same day for spanning to be designed now and for R4 to be designed and built for 1.3.0.
+
+76. **A Copy of a divided version is counted by its least-covered piece.** Once a version can be
+    divided across cartridges, it is as covered as its least-covered piece, each piece's copies
+    counted over eligible volumes as today, and pieces from different copies combine. With one
+    piece this is exactly today's count. "A unit is as covered as its least-covered live version"
+    becomes, one level down, "a version is as covered as its least-covered piece". This is the
+    set-aware Copy #12 asked to land as its own ruling. It is built with spanning, not before:
+    until then a divided version is refused, so today's count stays right.
+77. **Spanning is designed now and built later.** 1.3.0 ships R4 alone. Spanning is built when a
+    registered unit passes about half a cartridge (item 17 of 2026-10-06), as its own minor
+    release, fencing only the tapes that carry a piece of a divided version with a `requires`
+    feature. Nothing in 1.3.0 may foreclose it: R4's unit map carries the piece columns from its
+    first release. What a divided unit is divided into (Round 1 question 1) is still open: the
+    CTO asked to discuss it before ruling.
+78. **R4 is a tenant index plus an operator unit map.** Each tenant envelope lists that tenant's
+    units on all volumes as the catalog knows them at the write; the operator envelope adds a
+    small map of which volumes hold which version and piece, for every tenant, with no per-file
+    rows of other writes. Both are tab-separated text, readable with awk and grep by RESTORE.sh
+    and an heir. They need no `requires` entry: older readers ignore new envelope members.
+    `catalog rebuild` reads the map as a to-do list of tapes the catalog lacks and never imports
+    it (ADR-0001: a claim about a tape needs contact with that tape). The correction behind it:
+    each tape's `catalog.db` holds only its own write's stage sets, so before R4 no tape indexes
+    another; only the Heir Kit does.

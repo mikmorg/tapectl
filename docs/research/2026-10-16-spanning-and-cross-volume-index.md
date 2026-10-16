@@ -1,7 +1,8 @@
 # Spanning and the cross-volume index (R4): a design draft for the CTO's grilling
 
-**Status: DRAFT, decisions open.** Round 1 (§10: D1, D2, D3, I1) was put to the CTO on
-2026-10-16 and is unanswered. Nothing here is ratified; nothing is built on it. Rulings will be
+**Status: DRAFT, decisions partly ruled.** Round 1 (§10) was answered on 2026-10-16: D2 (a),
+D3 (b) and I1 (c) are ratified as ADR-0012 items 76-78; D1 (what is divided) is open, under
+discussion with the CTO. Nothing is built on it yet. Rulings will be
 recorded in ADR-0012 and the normative format docs, as the plaintext-free-staging note's were.
 Issues: #409 (spanning), #418 R4 (the cross-volume index).
 
