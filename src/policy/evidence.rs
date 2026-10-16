@@ -53,6 +53,15 @@ pub struct CoverageEvidence {
     pub last_verified: Option<String>,
     pub deposited_at: Option<String>,
     pub location: Option<String>,
+    /// How many copies the unit's LEAST-covered current version has in this
+    /// remaining coverage — [`crate::policy::coverage::copy_count_expr`]'s
+    /// per-version minimum (ADR-0012: a unit is as covered as its
+    /// least-covered live version), the number [`describe`] states as "rests
+    /// on N copies" (issue #463). One figure for the whole unit, carried on
+    /// each of its rows by [`remaining_coverage_evidence`] so a row set can
+    /// be described without the query that made it; `None` on a row not built
+    /// for that line ([`per_volume_verification`]).
+    pub least_covered_copies: Option<i64>,
 }
 
 /// The shared query behind [`remaining_coverage_evidence`] and
@@ -140,6 +149,7 @@ fn tape_rows(
             last_verified: row.get(1)?,
             deposited_at: None,
             location: None,
+            least_covered_copies: None,
         })
     };
     match exclude_volume_id {
@@ -260,10 +270,11 @@ pub fn sealed_without_full_verify(conn: &Connection, label: Option<&str>) -> Res
 /// the deposits — are scoped to the unit's `'current'` snapshots, so the
 /// line they feed (`cli::consent::confirm` prints it alone) never counts or
 /// names a volume whose only claim on the unit is a version the operator
-/// released. What it does NOT do is take the count per version, the minimum,
-/// as `copy_count_expr` does: a row is a volume or a deposit, so a unit with
-/// several current versions (the ordinary state until older ones are
-/// released) reads the union of the volumes carrying any of them.
+/// released. A row is a volume or a deposit, so a unit with several current
+/// versions (the ordinary state until older ones are released) has rows for
+/// the union of the volumes carrying any of them; the count the line states
+/// is the per-version minimum `copy_count_expr` takes, carried on every row
+/// as [`CoverageEvidence::least_covered_copies`].
 ///
 /// The eligibility gate and the query shape itself now live in the shared
 /// [`tape_rows`] helper (issue #196 added a second caller,
@@ -313,6 +324,7 @@ pub fn remaining_coverage_evidence(
             last_verified: None,
             location: row.get(1)?,
             deposited_at: row.get(2)?,
+            least_covered_copies: None,
         })
     };
     let deposits: Vec<CoverageEvidence> = match exclude_volume_id {
@@ -324,7 +336,38 @@ pub fn remaining_coverage_evidence(
             .collect::<std::result::Result<Vec<_>, _>>()?,
     };
     rows.extend(deposits);
+    let least = least_covered_copies(conn, unit_id, exclude_volume_id)?;
+    for row in &mut rows {
+        row.least_covered_copies = Some(least);
+    }
     Ok(rows)
+}
+
+/// The copy count of `unit_id`'s least-covered CURRENT version once
+/// `exclude_volume_id` (when given) is set aside: [`copy_count_expr`]'s own
+/// answer, so the Tier-1 line states the number the policy and the Tier-3
+/// floor use (issue #463), not the union of volumes holding any current
+/// version that the rows themselves add up to.
+///
+/// [`copy_count_expr`]: crate::policy::coverage::copy_count_expr
+fn least_covered_copies(
+    conn: &Connection,
+    unit_id: i64,
+    exclude_volume_id: Option<i64>,
+) -> Result<i64> {
+    use crate::policy::coverage::{copy_count_expr, CoverageQuery, CoverageScope};
+    let query = CoverageQuery {
+        scope: CoverageScope::Unit {
+            id_expr: "?1",
+            current_only: true,
+        },
+        exclude_volume: exclude_volume_id.map(|_| "?2"),
+    };
+    let sql = format!("SELECT {}", copy_count_expr(&query));
+    Ok(match exclude_volume_id {
+        Some(exclude_id) => conn.query_row(&sql, params![unit_id, exclude_id], |r| r.get(0))?,
+        None => conn.query_row(&sql, params![unit_id], |r| r.get(0))?,
+    })
 }
 
 /// The relative weakness of one piece of evidence, used to pick the
@@ -388,6 +431,13 @@ fn weakness_rank(w: &Weakness) -> i64 {
 /// copy-count context that `print_retire_impact` and the `--json`
 /// `evidence` array supply. So the plural case states the count first and
 /// labels the named volume as the weakest of them.
+///
+/// **The count is the least-covered current version's (issue #463)**, carried
+/// on the rows as [`CoverageEvidence::least_covered_copies`], not the number of
+/// rows: v1 on A and B and v2 on C alone is three rows and one copy of v2,
+/// and the line says "rests on 1 copy" with the three held across the
+/// versions beside it. Rows without the figure (built by hand, as the unit
+/// tests do) count themselves.
 pub fn describe(
     unit_name: &str,
     evidence: &[CoverageEvidence],
@@ -475,21 +525,36 @@ pub fn describe(
         format!(" ({tape_words}, {deposit_words}{caveat})")
     };
 
-    let weakest_clause = match named.kind {
-        EvidenceKind::Tape => format!(
-            "weakest is {}, {}",
-            named.volume_label,
-            tape_detail(named, now)
+    // Issue #463: the count is the unit's least-covered current version's
+    // (`copy_count_expr`'s per-version minimum), not the number of rows, which
+    // is the union of the volumes carrying ANY current version. They agree for
+    // a unit with one current version or equally covered ones, and then the
+    // line reads as it always has. When they differ the line says both, and
+    // the weakest copy it names is the weakest of all those held.
+    let held = evidence.len() as i64;
+    let least = evidence.iter().filter_map(|e| e.least_covered_copies).min();
+    let (count_phrase, lead) = match least {
+        Some(n) if n != held => (
+            format!(
+                "{n} {} at its least-covered current version — {held} copies are held across \
+                 all its current versions",
+                if n == 1 { "copy" } else { "copies" }
+            ),
+            "weakest of them is",
         ),
+        _ => (format!("{held} copies"), "weakest is"),
+    };
+
+    let weakest_clause = match named.kind {
+        EvidenceKind::Tape => format!("{lead} {}, {}", named.volume_label, tape_detail(named, now)),
         EvidenceKind::WarehouseDeposit => format!(
-            "weakest is {} — never re-verified, and warehouse copies do not refresh",
+            "{lead} {} — never re-verified, and warehouse copies do not refresh",
             deposit_phrase(named)
         ),
     };
 
     Some(format!(
-        "coverage for unit \"{unit_name}\" rests on {} copies{composition}; {weakest_clause}",
-        evidence.len()
+        "coverage for unit \"{unit_name}\" rests on {count_phrase}{composition}; {weakest_clause}"
     ))
 }
 
@@ -558,6 +623,7 @@ mod tests {
             last_verified: last_verified.map(str::to_string),
             deposited_at: None,
             location: None,
+            least_covered_copies: None,
         }
     }
 
@@ -569,6 +635,7 @@ mod tests {
             last_verified: None,
             deposited_at: Some(deposited_at.to_string()),
             location: Some(location.to_string()),
+            least_covered_copies: None,
         }
     }
 
@@ -868,6 +935,69 @@ mod tests {
         assert_eq!(labels(&rows), ["B"], "{rows:?}");
         let rows = remaining_coverage_evidence(&conn, unit_id, Some(b)).unwrap();
         assert_eq!(labels(&rows), ["C"], "{rows:?}");
+    }
+
+    /// Issue #463: the line says how many copies the unit's LEAST-covered
+    /// current version has, not how many volumes hold some current version.
+    /// v1 is current on A and B and v2 is current on C alone: three rows,
+    /// but the unit rests on one copy (v2's), and a line that said "rests on
+    /// 3 copies" would tell the operator the opposite at the moment they
+    /// consent to a retire.
+    #[test]
+    fn the_count_is_the_least_covered_current_versions_not_the_union_of_volumes() {
+        let (conn, unit_id, _a, _b, c) = setup_released_and_current_versions();
+        conn.execute(
+            "UPDATE snapshots SET status = 'current' WHERE unit_id = ?1 AND version = 1",
+            params![unit_id],
+        )
+        .unwrap();
+
+        let rows = remaining_coverage_evidence(&conn, unit_id, None).unwrap();
+        assert_eq!(labels(&rows), ["A", "B", "C"], "{rows:?}");
+        assert!(
+            rows.iter().all(|r| r.least_covered_copies == Some(1)),
+            "{rows:?}"
+        );
+        let line = describe("unit1", &rows, now()).unwrap();
+        assert!(
+            line.contains("rests on 1 copy at its least-covered current version"),
+            "{line}"
+        );
+        assert!(
+            line.contains("3 copies are held across all its current versions"),
+            "{line}"
+        );
+        assert!(!line.contains("rests on 3 copies"), "{line}");
+        assert!(line.contains("weakest of them is"), "{line}");
+
+        // Setting C aside leaves v2 with nothing while v1 keeps two: the
+        // unit's least-covered version has no copy, and the line says so
+        // (the retire family refuses this before the line is read).
+        let rows = remaining_coverage_evidence(&conn, unit_id, Some(c)).unwrap();
+        assert_eq!(labels(&rows), ["A", "B"], "{rows:?}");
+        let line = describe("unit1", &rows, now()).unwrap();
+        assert!(
+            line.contains("rests on 0 copies at its least-covered current version"),
+            "{line}"
+        );
+
+        // Positive control: with v1 released and v2 on two volumes, the rows
+        // and the least-covered version's count agree, so the line is the
+        // ordinary one with no qualification.
+        let (conn, unit_id, _a, b, _c) = setup_released_and_current_versions();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             SELECT ss.id, s.id, ?2, 'completed'
+             FROM snapshots s JOIN stage_sets ss ON ss.snapshot_id = s.id
+             WHERE s.unit_id = ?1 AND s.version = 2",
+            params![unit_id, b],
+        )
+        .unwrap();
+        let rows = remaining_coverage_evidence(&conn, unit_id, None).unwrap();
+        assert_eq!(labels(&rows), ["B", "C"], "{rows:?}");
+        let line = describe("unit1", &rows, now()).unwrap();
+        assert!(line.contains("rests on 2 copies; weakest is"), "{line}");
+        assert!(!line.contains("least-covered"), "{line}");
     }
 
     /// `catalog locate` is the other reader of `tape_rows`, and it shows

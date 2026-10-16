@@ -4558,6 +4558,7 @@ mod tests {
                     last_verified: None,
                     deposited_at: None,
                     location: None,
+                    least_covered_copies: None,
                 }],
                 at_stake: Vec::new(),
             }],
