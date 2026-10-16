@@ -18,10 +18,11 @@
 
 use rusqlite::Connection;
 
-use crate::config::{Config, TapectlPaths};
+use crate::config::{CollectionConfig, Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 use crate::staging::clean::CleanReport;
 pub use crate::staging::release::CopyProgress;
+use crate::staging::view::SourceView;
 
 use super::selector::Batch;
 
@@ -77,6 +78,13 @@ pub struct BatchExecutionReport {
     /// the run exits as if the release had been retained (ADR-0012
     /// 2026-10-07 item 33); `cleaned` is `None` and `under_copied` empty.
     pub release_warning: Option<String>,
+    /// The snapshot of the collection root this run's snapshot and stage read
+    /// in place of the live one, when the collection has a `snapshot_command`
+    /// (ADR-0012 2026-10-16 item 75).
+    pub snapshot_path: Option<String>,
+    /// `Some` when the collection's `release_command` failed: the warning,
+    /// already said on stderr. The run's work stands.
+    pub snapshot_release_warning: Option<String>,
 }
 
 /// Execute one batch: stage every unit once, write one session per
@@ -154,6 +162,7 @@ pub fn execute_batch(
     conn: &Connection,
     paths: &TapectlPaths,
     config: &Config,
+    lib: &CollectionConfig,
     batch: &Batch,
     copy_labels: &[String],
     device: &str,
@@ -176,7 +185,115 @@ pub fn execute_batch(
     }
 
     // Stage once: snapshot + stage every unit in this batch, in the
-    // batch's own (name-ordered) sequence.
+    // batch's own (name-ordered) sequence — from a snapshot of the root when
+    // the collection has a `snapshot_command` (see [`stage_batch`]), released
+    // before any tape is touched.
+    let staged = stage_batch(conn, paths, config, lib, batch, assume_yes)?;
+
+    // Session per copy — sequential, abort-on-first-failure (see doc
+    // comment above). `force=false`: each `label` is documented as "already
+    // `volume init`'d on its own cartridge" (`CollectionCommands::Run`'s own
+    // doc comment) — a contact-check refusal here means the wrong physical
+    // cartridge got loaded for this batch, which must hard-refuse, not
+    // silently override (issue #27).
+    for (copy, label) in copy_labels.iter().enumerate() {
+        crate::volume::write::volume_write(
+            conn,
+            paths,
+            config,
+            label,
+            device,
+            block_size,
+            false,
+            false,
+            prewrite_hash,
+            confirm.full_for_copy(copy),
+            assume_yes,
+        )?;
+    }
+
+    // Release staging only when this batch's copy just sealed is enough —
+    // see `release_if_covered`'s own doc comment for the gate and the #248
+    // scoping it applies.
+    let (cleaned, under_copied, release_warning) =
+        release_after_copies(conn, config, batch, copy_labels);
+
+    Ok(BatchExecutionReport {
+        units_staged: staged.units_staged,
+        copies_written: copy_labels.len(),
+        cleaned,
+        under_copied,
+        release_warning,
+        snapshot_path: staged.snapshot_path,
+        snapshot_release_warning: staged.release_warning,
+    })
+}
+
+/// What [`stage_batch`] did.
+#[derive(Debug)]
+pub(crate) struct StagedBatch {
+    /// How many units had `stage_create` called for them.
+    pub units_staged: usize,
+    /// The snapshot the run read, when the collection has a `snapshot_command`.
+    pub snapshot_path: Option<String>,
+    /// The `release_command`'s failure, if it failed (already said on stderr).
+    pub release_warning: Option<String>,
+}
+
+/// The staging half of a batch: take the collection's snapshot if it has a
+/// `snapshot_command`, snapshot + stage every unit (reading the snapshot's
+/// copy of each folder while recording the real one), then run the
+/// `release_command` whether the staging succeeded or not (ADR-0012
+/// 2026-10-16 item 75, issue #455).
+///
+/// A `snapshot_command` that fails refuses the run before any unit is read,
+/// and nothing is released: nothing was taken. The release runs here, before
+/// `execute_batch` touches a tape, so a snapshot is held for the staging and
+/// not for the hours of writing after it. `execute_batch` cannot be driven
+/// without a drive; this can, so it is where the hook is tested.
+pub(crate) fn stage_batch(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    lib: &CollectionConfig,
+    batch: &Batch,
+    assume_yes: bool,
+) -> Result<StagedBatch> {
+    let held = super::hook::take_snapshot(lib)?;
+    if let Some(held) = &held {
+        crate::progress::stderr_println(&format!(
+            "collection \"{}\": reading each unit from the snapshot at {}; every recorded \
+             path stays the unit's real one",
+            lib.name,
+            held.snapshot_path().display()
+        ));
+    }
+    let view = held.as_ref().map(super::hook::Held::view);
+    let staged = stage_units(conn, paths, config, batch, assume_yes, view.as_ref());
+    let snapshot_path = held
+        .as_ref()
+        .map(|h| h.snapshot_path().display().to_string());
+    let release_warning = held.and_then(super::hook::Held::release);
+    Ok(StagedBatch {
+        units_staged: staged?,
+        snapshot_path,
+        release_warning,
+    })
+}
+
+/// Snapshot + stage every unit of `batch`, reading each from `view`'s
+/// snapshot of the root when there is one. Returns how many units had
+/// `stage_create` called for them.
+fn stage_units(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    batch: &Batch,
+    assume_yes: bool,
+    view: Option<&SourceView>,
+) -> Result<usize> {
+    // Snapshot + stage every unit in this batch, in the batch's own
+    // (name-ordered) sequence.
     //
     // ADR-0012 / issue #159: `snapshot_create_detailed` may report an
     // existing version instead of minting one. `selector`/`plan` picked
@@ -205,16 +322,24 @@ pub fn execute_batch(
                 unit_name: name.to_string(),
                 snapshot_id,
                 admission: crate::staging::Admission::Unstaged,
-                view: None,
+                view: view.cloned(),
             });
         } else {
-            crate::staging::stage_create(conn, paths, config, snapshot_id, assume_yes)?;
+            crate::staging::stage_create_reading(
+                conn,
+                paths,
+                config,
+                snapshot_id,
+                assume_yes,
+                view,
+            )?;
         }
         Ok(())
     };
     let mut units_staged = 0usize;
     for u in &batch.units {
-        let outcome = crate::staging::snapshot_create_detailed(conn, &u.name, config)?;
+        let outcome =
+            crate::staging::snapshot_create_detailed_reading(conn, &u.name, config, view)?;
         match (outcome.minted, outcome.status.as_str()) {
             // A fresh version was minted — always needs staging.
             (true, _) => {
@@ -273,41 +398,7 @@ pub fn execute_batch(
         crate::staging::jobs::first_failure(outcomes)?;
     }
 
-    // Session per copy — sequential, abort-on-first-failure (see doc
-    // comment above). `force=false`: each `label` is documented as "already
-    // `volume init`'d on its own cartridge" (`CollectionCommands::Run`'s own
-    // doc comment) — a contact-check refusal here means the wrong physical
-    // cartridge got loaded for this batch, which must hard-refuse, not
-    // silently override (issue #27).
-    for (copy, label) in copy_labels.iter().enumerate() {
-        crate::volume::write::volume_write(
-            conn,
-            paths,
-            config,
-            label,
-            device,
-            block_size,
-            false,
-            false,
-            prewrite_hash,
-            confirm.full_for_copy(copy),
-            assume_yes,
-        )?;
-    }
-
-    // Release staging only when this batch's copy just sealed is enough —
-    // see `release_if_covered`'s own doc comment for the gate and the #248
-    // scoping it applies.
-    let (cleaned, under_copied, release_warning) =
-        release_after_copies(conn, config, batch, copy_labels);
-
-    Ok(BatchExecutionReport {
-        units_staged,
-        copies_written: copy_labels.len(),
-        cleaned,
-        under_copied,
-        release_warning,
-    })
+    Ok(units_staged)
 }
 
 /// The release step after every copy of the batch is sealed and confirmed:
@@ -514,6 +605,12 @@ mod tests {
         )
         .unwrap();
         unit_id
+    }
+
+    /// A collection with no snapshot hook: `execute_batch` reads its units
+    /// where they live, as it did before the hook existed.
+    fn no_hook_lib() -> CollectionConfig {
+        toml::from_str("name = 'testlib'\nroot = '/nonexistent-root'\ntenant = 'alice'\n").unwrap()
     }
 
     fn one_unit_batch(name: &str) -> Batch {
@@ -1129,6 +1226,7 @@ mod tests {
             &conn,
             &paths,
             &config,
+            &no_hook_lib(),
             &batch,
             &["VOL-B".to_string()],
             &device,
@@ -1168,6 +1266,7 @@ mod tests {
             &conn,
             &paths,
             &config,
+            &no_hook_lib(),
             &one_unit_batch("unit1"),
             &["VOL-B".to_string()],
             &device,
@@ -1199,6 +1298,7 @@ mod tests {
             &conn,
             &paths,
             &config,
+            &no_hook_lib(),
             &batch,
             &labels,
             &device,
@@ -1227,6 +1327,7 @@ mod tests {
             &conn,
             &paths,
             &config,
+            &no_hook_lib(),
             &batch,
             &labels,
             &device,

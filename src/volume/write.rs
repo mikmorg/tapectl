@@ -17281,10 +17281,14 @@ mod tests {
                 padded_bytes: 10,
             };
 
+            let lib: crate::config::CollectionConfig =
+                toml::from_str("name = 'photos'\nroot = '/nonexistent-root'\ntenant = 'alice'\n")
+                    .unwrap();
             let err = crate::collection::batch::execute_batch(
                 &conn,
                 &paths,
                 &config,
+                &lib,
                 &batch,
                 &["WC-COLL".to_string()],
                 GENCHK_DEVICE,

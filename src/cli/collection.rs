@@ -722,6 +722,8 @@ fn cmd_run(
                     "units": batch.unit_names(),
                     "labels": labels,
                     "dry_run": true,
+                    "snapshot_command": lib.snapshot_command,
+                    "release_command": lib.release_command,
                     "refused": refused_json(&refused),
                     "warnings": budget.warnings,
                 })
@@ -738,6 +740,11 @@ fn cmd_run(
                 println!("    {u}");
             }
             println!("  destination(s): {}", labels.join(", "));
+            if let Some(command) = &lib.snapshot_command {
+                println!(
+                    "  snapshot_command (would run before any unit is read; not run now): {command}"
+                );
+            }
         }
         // Copy-distinctness warnings (issue #144). Only a dry run prints
         // them here: a real run's `volume write` names them as it writes.
@@ -751,6 +758,7 @@ fn cmd_run(
         conn,
         paths,
         config,
+        lib,
         batch,
         labels,
         device,
@@ -778,6 +786,8 @@ fn cmd_run(
                     "min_copies": p.min_copies,
                 })).collect::<Vec<_>>(),
                 "release_warning": report.release_warning,
+                "snapshot_path": report.snapshot_path,
+                "snapshot_release_warning": report.snapshot_release_warning,
                 "refused": refused_json(&refused),
             })
         );
