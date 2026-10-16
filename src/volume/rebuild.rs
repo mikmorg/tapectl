@@ -1694,6 +1694,17 @@ fn place_catalogue(
         |r| r.get(0),
     )?;
     let dir = crate::staging::stage_set_catalogue_dir(paths, &local_uuid, set.stage_set_id);
+    // Named by the LOCAL unit's uuid too, not the tape's: the next copy's
+    // MANIFEST.toml lists the local uuid, and its RECOVERY.md and RESTORE.sh
+    // look for `catalogs/<first 8 of that uuid>_v<N>.1.dar`. The two differ
+    // only for a unit this catalog already had under the same NAME with a
+    // different uuid (`existing_unit`'s fallback). dar does not bind a
+    // catalogue to its file name.
+    let local_stem = format!(
+        "{}_v{}",
+        local_uuid.get(..8).unwrap_or(&local_uuid),
+        set.version
+    );
     let created = !dir.exists();
     let copied = (|| -> Result<()> {
         std::fs::create_dir_all(&dir)?;
@@ -1702,7 +1713,9 @@ fn place_catalogue(
         }
         crate::config::secure_path(&dir, 0o700);
         for member in &members {
-            let to = dir.join(&member.file_name);
+            // `.<k>.dar`: the tape's stem is a prefix of every member name.
+            let suffix = &member.file_name[stem.len()..];
+            let to = dir.join(format!("{local_stem}{suffix}"));
             std::fs::copy(&member.path, &to)?;
             crate::config::secure_path(&to, 0o600);
             std::fs::File::open(&to)?.sync_all()?;
@@ -1715,7 +1728,7 @@ fn place_catalogue(
         }
         return Err(e);
     }
-    let catalog_path = dir.join(&stem);
+    let catalog_path = dir.join(&local_stem);
     crate::db::busy::retry(
         crate::db::busy::BusyPolicy::DEFAULT,
         "the rebuilt stage set's catalogue",

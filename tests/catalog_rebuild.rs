@@ -4807,6 +4807,53 @@ fn a_rebuild_puts_each_stage_sets_dar_catalogue_back_where_stage_create_leaves_i
     assert!(again.is_noop(), "{again:?}");
 }
 
+/// A unit this catalog already had under the same NAME but another uuid is
+/// the one the tape's sets are filed under (`existing_unit`'s fallback). The
+/// next copy's MANIFEST.toml, RECOVERY.md and RESTORE.sh name its catalogue
+/// by THAT uuid, so the files are put back under it, not the tape's.
+#[test]
+fn a_unit_matched_by_name_gets_its_catalogue_under_its_own_uuid() {
+    let keys = FixtureKeys::fresh();
+    let mut vol = build_tape_with_catalogues(&keys);
+    let home = tempfile::tempdir().unwrap();
+    let conn = db::open(&home.path().join("tapectl.db")).unwrap();
+    conn.execute(
+        "INSERT INTO tenants (name, is_operator, status) VALUES ('legacy', 0, 'active')",
+        [],
+    )
+    .unwrap();
+    let tenant_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+         VALUES ('f00dcafe-0000-4000-8000-000000000000', 'photos/2019', ?1, '/src', 'active')",
+        rusqlite::params![tenant_id],
+    )
+    .unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let secret = vol.operator_secret.clone();
+
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+
+    assert_eq!(report.catalogues_restored, UNITS.len());
+    let path = catalog_path_of(&conn, "photos/2019").expect("a catalog_path");
+    assert!(
+        path.ends_with("/f00dcafe_v7"),
+        "named by the local uuid: {path}"
+    );
+    assert!(path.contains("/catalogs/f00dcafe/s"), "{path}");
+    assert_eq!(
+        std::fs::read(format!("{path}.1.dar")).unwrap(),
+        catalogue_bytes("photos/2019"),
+        "the tape's catalogue bytes"
+    );
+    // A unit the catalog did not have keeps the tape's own uuid.
+    let other = catalog_path_of(&conn, "photos/2020").expect("a catalog_path");
+    assert!(
+        other.ends_with(&format!("/{}_v7", catalogue_uuid8(1))),
+        "{other}"
+    );
+}
+
 /// A catalog rebuilt before catalogues were put back (or one whose
 /// catalogue files were lost) is healed by running the rebuild again.
 #[test]
