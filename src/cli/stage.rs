@@ -402,6 +402,65 @@ pub fn run(
     Ok(())
 }
 
+/// The status of the live `writes` row behind a
+/// [`staging::clean::ReleaseBlocker::WriteInFlight`] refusal: `in_progress`
+/// when any of `stage_set_ids`' rows on that volume is, else `planned`
+/// (`release_blocker` ranks them the same way). `label` is the volume the
+/// blocker named; with none, every live row of the sets counts. `None` only
+/// if the row vanished between the two reads.
+fn write_in_flight_status(
+    conn: &Connection,
+    stage_set_ids: &[i64],
+    label: Option<&str>,
+) -> Result<Option<String>> {
+    let mut found: Vec<String> = Vec::new();
+    for id in stage_set_ids {
+        let mut stmt = conn.prepare(
+            "SELECT w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
+             WHERE w.stage_set_id = ?1 AND w.status IN ('in_progress', 'planned')
+               AND (?2 IS NULL OR v.label = ?2)",
+        )?;
+        let rows = stmt
+            .query_map(params![id, label], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        found.extend(rows);
+    }
+    Ok(["in_progress", "planned"]
+        .into_iter()
+        .find(|s| found.iter().any(|f| f == s))
+        .map(str::to_string))
+}
+
+/// What to do when a write session `staging clean` / `stage create` found
+/// "running" is in fact not (#468). `tapectl db fsck` checks integrity and
+/// foreign keys; it sweeps no session. The two live states differ:
+///
+/// - `in_progress`: a dead process's row is marked `interrupted` by the next
+///   `db::open` (`recover_orphaned_sessions`, lock-aware), so one still
+///   `in_progress` here is held by a live process. Once swept, `volume
+///   resume` continues the session from these staged files and `volume
+///   abort` abandons it.
+/// - `planned`: the process was killed after planning, before it began to
+///   write. Nothing sweeps that row and nothing reached the tape, so it is
+///   cleared with `volume abort` (`write::nothing_to_resume` says the same).
+fn write_in_flight_remedy(label: Option<&str>, status: Option<String>) -> String {
+    let label = label.unwrap_or("<LABEL>");
+    match status.as_deref() {
+        Some("planned") => format!(
+            "If no write is actually running, the session was killed after it was planned \
+             and before it began to write: nothing reached the tape and the catalog still \
+             records it as `planned`, which nothing sweeps. Clear it with `tapectl volume \
+             abort {label}`, then write again."
+        ),
+        _ => format!(
+            "If no write is actually running, the session died without recording an \
+             outcome: the next tapectl command to open the catalog marks it `interrupted`, \
+             and then `tapectl volume resume {label}` continues it from these staged files \
+             or `tapectl volume abort {label}` abandons it."
+        ),
+    }
+}
+
 /// The snapshot `stage create NAME [--version V]` stages: the unit's latest
 /// unstaged snapshot, or version `V` when no stage set of it has live slices
 /// (issue #53's re-stage, with the refusals that name what to do instead).
@@ -527,13 +586,16 @@ fn snapshot_to_stage(conn: &Connection, name: &String, version: Option<i64>) -> 
                             Some(l) => format!(" onto volume \"{l}\""),
                             None => String::new(),
                         };
+                        // #468: which command clears a session that is not
+                        // really running depends on the state its row is in.
+                        let status =
+                            write_in_flight_status(conn, &live_ids, volume_label.as_deref())?;
+                        let remedy = write_in_flight_remedy(volume_label.as_deref(), status);
                         format!(
                             "{head}, and a write session is using them RIGHT NOW{onto}. \
                              Let it finish — `tapectl volume write` is consuming these \
                              slices, and releasing them under a running session is not \
-                             something --force should be pointed at. If no write is \
-                             actually running, the session died without recording an \
-                             outcome; `tapectl db fsck` sweeps that."
+                             something --force should be pointed at. {remedy}"
                         )
                     }
                     // Issue #325: an aborted session whose seal is
@@ -891,7 +953,18 @@ mod tests {
     /// writes — the recorded rows `volume resume`'s adoption of an aborted
     /// session reads (ADR-0012, 2026-09-23).
     fn refusal_with_write_on_volume(status: &str, volume_status: &str, sealed: bool) -> String {
-        let (conn, paths, config, _tmp) = setup();
+        let (conn, paths, config, _tmp) = staged_unit_with_write(status, volume_status, sealed);
+        stage_version_1_refusal(&conn, &paths, &config)
+    }
+
+    /// `unit1` staged once, with one `writes` row in `status` on volume
+    /// `L6-0007` (the setup [`refusal_with_write_on_volume`] describes).
+    fn staged_unit_with_write(
+        status: &str,
+        volume_status: &str,
+        sealed: bool,
+    ) -> (Connection, TapectlPaths, Config, TempDir) {
+        let (conn, paths, config, tmp) = setup();
         crate::staging::snapshot_create(&conn, "unit1", &Config::default()).unwrap();
         run(
             &conn,
@@ -950,11 +1023,15 @@ mod tests {
             )
             .unwrap();
         }
+        (conn, paths, config, tmp)
+    }
 
+    /// The refusal `stage create unit1 --version 1` gives now.
+    fn stage_version_1_refusal(conn: &Connection, paths: &TapectlPaths, config: &Config) -> String {
         run(
-            &conn,
-            &paths,
-            &config,
+            conn,
+            paths,
+            config,
             &StageCommands::Create {
                 name: vec!["unit1".to_string()],
                 jobs: None,
@@ -1018,6 +1095,72 @@ mod tests {
                  running session: {msg}"
             );
         }
+    }
+
+    /// #468: the live-write refusal used to end "`tapectl db fsck` sweeps
+    /// that", which is false (`db fsck` checks integrity and foreign keys). A
+    /// `planned` session is cleared by `volume abort`, and an `in_progress`
+    /// one is swept to `interrupted` by the next open of the catalog; each
+    /// refusal names the command for ITS state, and the CLI accepts it.
+    #[test]
+    fn a_live_write_refusal_names_the_command_for_its_state() {
+        use crate::cli::operations::remedy_commands::assert_names_parsing_commands;
+        let planned = refusal_with_write_status("planned");
+        assert!(!planned.contains("db fsck"), "{planned}");
+        assert_names_parsing_commands(&planned, &[], &["tapectl volume abort L6-0007"]);
+        assert!(
+            !planned.contains("volume resume"),
+            "nothing reached the tape, so there is nothing to resume: {planned}"
+        );
+
+        let running = refusal_with_write_status("in_progress");
+        assert!(!running.contains("db fsck"), "{running}");
+        assert!(running.contains("marks it `interrupted`"), "{running}");
+        assert_names_parsing_commands(
+            &running,
+            &[],
+            &[
+                "tapectl volume resume L6-0007",
+                "tapectl volume abort L6-0007",
+            ],
+        );
+    }
+
+    /// #468, the named commands in the state they are named for. A `planned`
+    /// row from a dead process: `volume abort` clears it, and the refusal
+    /// then becomes the abandoned-session one (`--force` is the release).
+    #[test]
+    fn volume_abort_clears_the_planned_session_the_refusal_names() {
+        let (conn, paths, config, _tmp) = staged_unit_with_write("planned", "initialized", false);
+        let before = stage_version_1_refusal(&conn, &paths, &config);
+        assert!(before.contains("RIGHT NOW"), "{before}");
+        crate::volume::write::volume_abort(&conn, "L6-0007", true)
+            .expect("the named `volume abort` works on a planned session");
+        let after = stage_version_1_refusal(&conn, &paths, &config);
+        assert!(!after.contains("RIGHT NOW"), "{after}");
+        assert!(after.contains("--force"), "{after}");
+    }
+
+    /// #468: an `in_progress` row whose process is gone is marked
+    /// `interrupted` the next time the catalog is opened, and the refusal then
+    /// names `volume resume`, which is what the first refusal said would
+    /// follow; `volume abort` abandons it.
+    #[test]
+    fn a_dead_in_progress_session_becomes_interrupted_at_the_next_open() {
+        let (conn, paths, config, _tmp) =
+            staged_unit_with_write("in_progress", "initialized", false);
+        let before = stage_version_1_refusal(&conn, &paths, &config);
+        assert!(before.contains("RIGHT NOW"), "{before}");
+        let reopened = crate::db::open(&paths.db_file).unwrap();
+        let status: String = reopened
+            .query_row("SELECT status FROM writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "interrupted", "the next open sweeps it");
+        let after = stage_version_1_refusal(&reopened, &paths, &config);
+        assert!(after.contains("INTERRUPTED"), "{after}");
+        assert!(after.contains("`tapectl volume resume L6-0007`"), "{after}");
+        crate::volume::write::volume_abort(&reopened, "L6-0007", true)
+            .expect("the named `volume abort` works on the swept session");
     }
 
     /// Issue #292's POSITIVE CONTROL for `--force`: an aborted or failed

@@ -10332,3 +10332,72 @@ mod tests {
         assert!(report.issues.is_empty(), "issues: {:?}", report.issues);
     }
 }
+
+/// Test support for remedy strings (#468): a message that tells the operator
+/// to run a command is only right if the CLI's own definition accepts that
+/// command line, and a substring pin cannot say so.
+#[cfg(test)]
+pub(crate) mod remedy_commands {
+    use clap::Parser;
+
+    /// Every `tapectl ...` command a message puts in backticks, in order, with
+    /// each `<PLACEHOLDER>` (which may contain spaces) filled by `fill`
+    /// (matched by its text including the angle brackets) or, failing that,
+    /// by the word `placeholder`. Backtick spans that do not start with
+    /// `tapectl ` are not commands.
+    pub(crate) fn named_commands(msg: &str, fill: &[(&str, &str)]) -> Vec<String> {
+        msg.split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("tapectl "))
+            .map(|span| {
+                let mut out = String::new();
+                let mut rest = span;
+                while let Some(open) = rest.find('<') {
+                    out.push_str(&rest[..open]);
+                    let Some(len) = rest[open..].find('>') else {
+                        out.push_str(&rest[open..]);
+                        rest = "";
+                        break;
+                    };
+                    let name = &rest[open..=open + len];
+                    out.push_str(
+                        fill.iter()
+                            .find(|(from, _)| *from == name)
+                            .map_or("placeholder", |(_, to)| *to),
+                    );
+                    rest = &rest[open + len + 1..];
+                }
+                out.push_str(rest);
+                out.split_whitespace().collect::<Vec<_>>().join(" ")
+            })
+            .collect()
+    }
+
+    /// Panics unless `command` (a whole `tapectl ...` line) is a command line
+    /// the CLI parses.
+    pub(crate) fn assert_parses(command: &str) {
+        let argv: Vec<&str> = command.split_whitespace().collect();
+        crate::cli::Cli::try_parse_from(&argv)
+            .unwrap_or_else(|e| panic!("{command:?} is not a command line the CLI accepts: {e}"));
+    }
+
+    /// `msg` puts each of `expected` in backticks (placeholders already
+    /// filled as `fill` fills them) and the CLI parses each. A message may
+    /// also mention a command to explain it (`tapectl volume write` as the
+    /// thing consuming a file), which is not a remedy and is not parsed.
+    pub(crate) fn assert_names_parsing_commands(
+        msg: &str,
+        fill: &[(&str, &str)],
+        expected: &[&str],
+    ) {
+        let named = named_commands(msg, fill);
+        for want in expected {
+            assert!(
+                named.iter().any(|n| n == want),
+                "{want:?} is not among the commands named: {named:?}\nin: {msg}"
+            );
+            assert_parses(want);
+        }
+    }
+}
