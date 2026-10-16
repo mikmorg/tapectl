@@ -1151,7 +1151,9 @@ snapshot create <unit>`) and stage that.
 Stop whatever is writing to the source (a sync client, a download, an
 editor's autosave), then stage again. For a source that is always in use, stage
 from a read-only filesystem snapshot: the operator guide's "Staging a source
-that is in use" gives the LVM, btrfs and ZFS commands.
+that is in use" gives the LVM, btrfs and ZFS commands, and, for `collection run`,
+a hook that takes and drops the snapshot (see
+[its refusals](#collection-run-snapshot-hook-refusals-120)).
 
 For a real edit or a deleted file, take a new snapshot and stage that:
 
@@ -1212,6 +1214,81 @@ The filter that keeps dar from evicting the source's pages did not take in the
 dar child (#441, #447). The stage carries on and is correct; the source is read
 from disk twice, as before 1.1.1. A dar with file capabilities (`setcap`) also
 loses them under the filter's `no_new_privs`, so run a plain dar binary.
+
+### `collection run`: snapshot hook refusals (1.2.0)
+
+A `[[collections]]` table with a `snapshot_command` makes `collection run` take a
+snapshot first and read each unit from it (the operator guide's
+[snapshot hook](operator-guide.md#a-snapshot-hook-for-collection-run)). When
+the hook is wrong the run is refused **before any unit is read**: nothing was
+snapshotted or staged, no tape was touched, and the exit code is 2. Every
+refusal has this shape, naming the collection and the command:
+
+```text
+collection "media": snapshot_command `/usr/local/bin/tapectl-snap-take` failed (exit status: 1).
+Its stderr:
+<what the command wrote to stderr>
+The run is refused before any unit is read; nothing was snapshotted or staged.
+```
+
+The words after `` snapshot_command `…` `` say what was wrong:
+
+| It says | What happened and what to do |
+|---|---|
+| `could not be started: <error>` | `sh -c` could not run the command line. Check the path and its execute bit, as the user tapectl runs as. |
+| `failed (exit status: N)` | The command exited non-zero. Its stderr is printed under `Its stderr:`. Run the command by hand with `TAPECTL_COLLECTION` and `TAPECTL_COLLECTION_ROOT` set, as the same user (a script that calls `sudo` needs its sudoers entry). |
+| `printed nothing on stdout (it must print one line: the absolute path of a read-only snapshot of <root>)` | The command succeeded and printed no path. Print the snapshot's path with `echo`. |
+| `printed N lines on stdout (it must print exactly one: … send everything else to stderr)` | A snapshot tool wrote its own messages to stdout (`btrfs subvolume snapshot` does). Redirect them with `>&2` and print only the path. |
+| `printed output that is not valid UTF-8` | The command's stdout is not text. Print the path only. |
+| `printed "<line>", which is not an absolute path` | A relative path. Print an absolute one. |
+| `printed <line>, which cannot be read: <error>` | The path does not exist, or the user tapectl runs as cannot reach it. A snapshot mounted for root alone is the usual cause. |
+| `printed <line>, which is not a directory` | The path names a file or a device node. Mount the snapshot and print its mount point. |
+| `printed <line>, which is inside the live root <root>: the snapshot must be somewhere else …` | The snapshot lives under the root it is a snapshot of. For ZFS this is `<root>/.zfs/snapshot/<name>`: clone the snapshot, or bind-mount it read-only elsewhere, and print that path. |
+
+Once the snapshot is accepted, a unit that has no folder in it is refused by the
+run's snapshot or stage step, and the run stops there (units before it in name order
+may already be staged, and stay staged):
+
+```text
+unit "media/Alien.1979" (/srv/media/Alien.1979) has no folder in the snapshot: /mnt/tapectl-media/Alien.1979 is not a directory
+```
+
+The snapshot does not mirror the root's layout. A unit registered after the
+snapshot was taken is not in it either; run `collection run` again. If the root is
+a subdirectory of the snapshotted filesystem, print the matching subdirectory of
+the snapshot, not the snapshot's top. (A unit that is not under the collection's
+root at all says `unit path <path> is not under the collection root <root>, so it
+has no counterpart in the snapshot at <snapshot>`; a unit is never read from its
+live path in a run that was promised a snapshot.)
+
+A snapshot that could not be released is a warning, not a refusal. The run's work
+stands:
+
+```text
+warning: collection "media": release_command `/usr/local/bin/tapectl-snap-drop` failed (exit status: 1).
+Its stderr:
+<what the command wrote to stderr>
+The snapshot at /srv/.snap-tapectl-media may still exist; remove it by hand.
+```
+
+Remove it with the tool that made it (`btrfs subvolume delete`, `umount` and
+`lvremove`, `zfs destroy`). `--json` carries the same text as
+`snapshot_release_warning`. A `release_command` also does not run if tapectl is
+stopped by a second signal or killed with SIGKILL. Nothing prints a warning then, so
+look for a snapshot your script named.
+
+Two refusals come earlier, when the config loads (and in `config check` and
+`config set`):
+
+```text
+~/.tapectl/config.toml: collections[0] ("media").snapshot_command is empty (leave the key out for no command)
+~/.tapectl/config.toml: collections[0] ("media").release_command is set but snapshot_command is not: nothing takes a snapshot, so there is nothing to release
+```
+
+An empty `release_command` is refused the same way as an empty `snapshot_command`.
+`config check` runs neither command, so the first time either runs is in a real
+`collection run`: try the hook on a small collection, or run the two scripts by hand,
+before a long batch.
 
 ### A unit larger than one cartridge
 
@@ -2363,6 +2440,32 @@ every slice to disk first and needed about twice the unit's size; tapes before
 1.0.0 put the slices in `/tmp`. Any layout-v2 tape can be read with the
 RESTORE.sh from a newer tape, or with `tapectl restore`.
 
+The `--to` figure is the slices' size on tape, encrypted. A unit that was stored
+compressed restores larger, so it may need more than the script says.
+
+**The work directory (tapes written by 1.2.0 or later).** Everything else the
+script decrypts goes to a work directory it makes in `${TMPDIR:-/tmp}`: the
+operator's `catalog.db` and the unit's dar catalogues, which grow with the number
+of files on the tape, and every envelope an `--all` run opens. No data slice goes
+there. `/tmp` can be a small RAM disk. When the front index says the envelopes
+may not fit, the script warns before it reads any of them:
+
+```text
+WARNING: the work directory /tmp/tapectl-restore.Ab12Cd has 120.0 MiB free, and reading the
+         envelopes on this tape may need up to 1.4 GiB there: each envelope is read whole,
+         and each one a key opens stays decrypted until the run ends. If it fills, the run
+         stops and says so; set TMPDIR to a directory on a larger disk to move the work
+         directory (a key that opens one small envelope needs far less than this).
+```
+
+It is an upper bound, and only a warning (`--no-space-check` silences it). If the
+directory does fill, the message is `OUT OF DISK SPACE in /tmp/…` and it says to set
+`TMPDIR` to a directory on a larger disk:
+
+```bash
+TMPDIR=/mnt/big ./RESTORE.sh --restore --key your-key.age.key --to /destination
+```
+
 ### RESTORE.sh: `dar cannot start here: it was built with GPG support`
 
 The machine's dar (Debian's and Ubuntu's among them) was built with GPG
@@ -2395,6 +2498,51 @@ A leftover `.tapectl-restore.*` directory is named and refused even with
 Remove it and run again. If dar still declines a file, the restore fails as
 `INCOMPLETE` and names it.
 
+### RESTORE.sh: `missing required tool`
+
+```text
+FATAL: missing required tool: truncate
+```
+
+RESTORE.sh checks for its tools when a mode starts, before it reads the tape, and
+names the first one it does not find. Install it (the name is a command; `truncate`,
+`head` and `mkfifo` are in coreutils, `mt` is the package `mt-st`) and run again.
+A tape written by 1.2.0 or later carries a script that checks only the tools the
+mode you ran uses, so a host can read and hash a tape with fewer tools than it needs
+to restore one:
+
+| Mode | Tools checked (and `mt`) |
+|---|---|
+| `--info`, `--verify` | `dd`, `sha256sum`, `head` |
+| `--find-envelope` | those, and `age`, `truncate`, `tar` |
+| `--list` | those, and `dar` |
+| `--restore --path` | `--list`'s, and `tee` |
+| `--restore` (whole units) | all of them, and `mkfifo` |
+
+A script from an earlier tape checks every tool in every mode, and one from before
+2026-09-28 does not check for `tar`: a missing one shows up only after the envelope
+has been read and decrypted. A bare `RESTORE.sh`, `--help` and a mistyped mode check
+nothing.
+
+### RESTORE.sh: `NOTE: only '<unit>' was restored`
+
+```text
+>>> NOTE: only 'family/letters' was restored: no --unit or --all said what to restore, so the
+>>>       first envelope this key opened decided. This key opened 2 other envelope(s)
+>>>       on this tape, which list 5 other unit(s) besides it.
+```
+
+You gave `--restore` no `--unit` and no `--all`, and the first envelope your key
+opened lists one unit, so the script restored that one. On a tape written by 1.2.0 or
+later it then reads the remaining envelopes forward (before any slice is read) and
+says here what else your key opened. An operator or escrow key opens every tenant's
+envelope. Look first (`./RESTORE.sh --list --key …`), then restore everything into
+a new, empty directory (`./RESTORE.sh --restore --key … --all --to /another/destination`).
+The note is silent when the other envelopes add no units. The script skips the look,
+and says so, when its work directory could not hold the largest remaining envelope
+(`Not looking at the other envelopes: the work directory has … free`); set `TMPDIR`
+to a larger disk to see it. `--no-space-check` does not override that skip.
+
 ### RESTORE.sh: `this tape requires feature(s) …`
 
 ```text
@@ -2413,7 +2561,11 @@ to quarantine the cartridge.
 
 A key matched the envelope (age got past its header) but the payload would
 not decrypt, or the envelope's bytes do not match the front index. That is
-damage, not a wrong key: another key will not help. The operator envelope has
+damage, not a wrong key: another key will not help. (A RESTORE.sh from a tape
+written by 1.2.0 or later says "a key matched" only when one did. When the envelopes
+could not be read or failed their hash and no key opened any of them, it says so
+and suggests other keys: it is then damage, a key that is not a recipient, or
+both.) The operator envelope has
 a backup copy on every tape, which an operator or escrow key opens
 (`--find-envelope` tries it); otherwise use another copy of the volume. Since 1.1.0
 every tenant envelope has a backup too.
@@ -2576,7 +2728,7 @@ whole-archive audit, not with `--unit`.
 | `dirty` | warning | `source has drifted since last archive (<a> added, <r> removed, <m> modified)` | The source moved on after its last snapshot. This is routine. Fix: `snapshot create`, `stage create`, `volume init`, then `volume write`, as the `fix:` line spells out. |
 | `dirty` | violation | `dirty scan could not run (<error>)` | tapectl could not even read the source to compare it (permissions, a missing path). Fix the access or the unit's dotfile. |
 | `no_archive` | warning | `no current snapshot or tape copies` | Never archived. Fix: snapshot, stage, init and write. |
-| `verify_age` | warning | `not verified within <d> days (last: <date or never>)` | Only when the policy sets a verify interval. Only a full readback counts, dated by when it started (a continued one by its oldest checkpoint). Fix: `volume verify <LABEL>` on a volume holding it. Only a readback of a volume that still counts as a copy (sealed, condition ok, with a completed write of the unit) refreshes the clock (#454). |
+| `verify_age` | warning | `not verified within <d> days (last: <date or never>)` | Always: 365 days unless the unit's archive set or `[defaults] verify_interval_days` says otherwise (1.2.0; `tapectl config check` prints the value in force). A unit with a copy and no full readback at all shows `(last: never)`, and so does every unit just written with a quick confirm: that is expected, and it clears when a full `volume verify` passes (or the write used `--full-confirm`). Only a full readback counts, dated by when it started (a continued one by its oldest checkpoint). Fix: `volume verify <LABEL>` on a volume holding it. Only a readback of a volume that still counts as a copy (sealed, condition ok, with a completed write of the unit) refreshes the clock (#454). |
 | `escrow_coverage` | warning | `volume <label> (stage set <id>): <reason> — the current escrow key cannot recover it` | That copy cannot be opened by the escrow key. `coverage unknown …` means a catalog rebuilt from a tape with no recipient list; `catalog rebuild --key <escrow key>` attests it. Otherwise re-stage and rewrite, or accept that only the original recipients can open it. |
 | `tenancy` | warning | `the catalog says tenant "<t>" owns this unit, but <dir>/.tapectl-unit.toml names tenant "<other>"` | The unit's dotfile names another owner than the catalog. The catalog is the authority: set `tenant` under `[unit]` in the dotfile to the catalog's tenant. The dotfile is not content, so the edit creates no new version. |
 | `tenancy` | warning | `volume <label> (stage set <id>, v<n>) is encrypted to none of tenant "<t>"'s keys — …` | The catalog holds keys for that tenant, and none of them is a recipient of that copy. A retired key of the tenant counts as one of its keys. Two causes: the copy was encrypted before the unit moved to its current tenant (`tenant reassign`), or the catalog was rebuilt from tape and the tenant's key that opens the copy was never imported. Either way the operator and escrow keys still open it. Fix: if the tenant has a key the catalog does not list, [`key import`](cli/key.md#tapectl-key-import) its public key and run `audit` again. Otherwise re-stage and write a new copy if the tenant's key holders need it, or accept it. A tenant the catalog holds no key for at all (a rebuilt catalog before any `key import`) is not judged, so this check reports nothing for its copies. |
@@ -2585,7 +2737,7 @@ whole-archive audit, not with `--unit`.
 | `escrow_kit_stale` | warning | `` <n> volume(s) were sealed after the last heir kit (<date>): the kit's escrow secret still opens them (it is a recipient of every tape), but the kit's encrypted catalog (catalog.db.age) does not list them — regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog rebuild --from-volume` `` | Only the kit's catalog (and the cover sheet's list of places) is behind; its secret opens every tape. Two causes, one finding: a volume sealed after the kit, or a volume moved with `volume move` / `cartridge move` after it; for a move the message adds `<n> volume(s) were moved to another place after the last heir kit` (#448). Fix: `tapectl key escrow-kit --out <dir>`, reprint COVER.txt, correct its "Tapes are at" box, and replace the stored copies. The escrow secret itself does not change. |
 | `escrow_identity_mismatch` | warning | `<n> stage set(s) the current escrow key cannot open all name a recipient this catalog does not recognise: <key> — …` | Typical after a disaster rebuild that created a **new** escrow identity. No command replaces a registered escrow identity. The fix is to re-initialise a fresh home with `tapectl init --escrow-public-key <original>` (from the heir kit) and run `catalog rebuild` again. |
 | `no_full_verify` | warning | `volume "<label>" is sealed with no full readback recorded — its write confirmed the front index and seal only` | A write's confirm reads back only the front index and the seal marker unless `--full-confirm` was given (ADR-0012, 2026-10-06), so this volume counts as a copy with none of its data read back yet. Fix: `tapectl volume verify <label>` (full, the default); a passing one clears it, a `--quick` one does not. |
-| `volume_verify_age` | warning | `volume "<label>" (cartridge <barcode>, at <place>) was last read back in full on <date>, <n> days ago: past the <d>-day verify interval of the unit on it with the shortest one, whatever the unit's other copies show` | The per-volume clock (#454): `verify_age` is satisfied by the newest readback of any copy, so a fresh home copy would hide a stale offsite one. The interval is the shortest resolved `verify_interval_days` among the units on the volume (an archive set's, else `[defaults]`). A volume never read back in full is `no_full_verify`'s alone. Fix: fetch the cartridge from the place named and run `tapectl volume verify <label>`. |
+| `volume_verify_age` | warning | `volume "<label>" (cartridge <barcode>, at <place>) was last read back in full on <date>, <n> days ago: past the <d>-day verify interval of the unit on it with the shortest one, whatever the unit's other copies show` | The per-volume clock (#454): `verify_age` is satisfied by the newest readback of any copy, so a fresh home copy would hide a stale offsite one. The interval is the shortest resolved `verify_interval_days` among the units on the volume (an archive set's, else `[defaults]`, 365 days when that is absent). A volume never read back in full is `no_full_verify`'s alone. Fix: fetch the cartridge from the place named and run `tapectl volume verify <label>`. |
 | `tape_alert` | warning | `volume "<label>": the drive raised a TapeAlert — <n> <flag>; … — at <time> during "<command>" with cartridge <barcode> loaded on drive <serial>` | A contact with this volume, or with the cartridge it is on (a [`drive poll`](operator-guide.md#the-daily-drive-poll) included), read page 0x2E with a flag raised, not before the volume's last passed full verify started (an alert raised during a readback, its own included, is not answered by it). Retired, erased and quarantined volumes are not named; an `initialized` one an interrupted write left is. A warning, never a violation: a flag may be the medium ("Media", "Read failure") or only the drive ("Cleaning required"), and the volume still counts as a copy. A cleaning flag (TapeAlert 20-23) is printed with its action, `<n> <flag> => clean the drive: …` (22 and 23 name the cleaning cartridge instead); the fix column is still the verify, which is what clears the warning. Fix: `tapectl volume verify <label>` — a pass clears it; a failure quarantines the volume and the copy checks take over. `report health` lists every sighting. |
 
 ---
