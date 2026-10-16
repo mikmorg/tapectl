@@ -404,11 +404,17 @@ pub(crate) fn require_named_cartridge(
 ///
 /// So this is refused rather than gated — incoherence, not risk (ADR-0008).
 /// Like [`refuse_retired`] and [`require_named_cartridge`] it takes no `force`
-/// AT ALL, structurally, so a caller cannot defeat it by mistake. The way past
-/// is the operator saying the bytes are gone, in the vocabulary that already
-/// exists for exactly that statement: `volume retire` or `cartridge
-/// mark-erased`. Where the serial DOES match, ADR-0010's original reasoning
-/// still governs and the displacement is recorded, not relitigated.
+/// AT ALL, structurally, so a caller cannot defeat it by mistake. There are two
+/// ways past, one per half of the ambiguity (#468). If the tape in the drive
+/// is not the one meant (the wrong cartridge is loaded, or another tape wears
+/// the sticker), load the right one. If it really is the named cartridge and
+/// is to be reused, the operator says the bytes are gone, in the vocabulary
+/// that already exists for exactly that statement: `volume retire` or
+/// `cartridge mark-erased`. Both of those stop at the absolute zero floor
+/// ([`crate::cli::operations::refuse_last_eligible_copy`]), so the message
+/// names the units a live volume holds the last copy of, and the copy that
+/// has to be made first. Where the serial DOES match, ADR-0010's original
+/// reasoning still governs and the displacement is recorded, not relitigated.
 ///
 /// "Live" is [`crate::policy::coverage::in_service`], the named predicate,
 /// never an inlined status list (issue #96). An `initialized` volume is
@@ -441,20 +447,21 @@ pub(crate) fn refuse_unwitnessed_displacement(
     // self-mount to exclude. Every open mount found here belongs to some
     // OTHER volume by construction.
     let sql = format!(
-        "SELECT v.label FROM cartridge_volumes cv
+        "SELECT v.id, v.label FROM cartridge_volumes cv
          JOIN volumes v ON v.id = cv.volume_id
          WHERE cv.cartridge_id = ?1 AND cv.unmounted_at IS NULL AND {}
          ORDER BY v.id",
         crate::policy::coverage::in_service("v")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let live: Vec<String> = stmt
-        .query_map(params![row.id], |r| r.get(0))?
+    let live_rows: Vec<(i64, String)> = stmt
+        .query_map(params![row.id], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
-    if live.is_empty() {
+    if live_rows.is_empty() {
         return Ok(());
     }
+    let live: Vec<String> = live_rows.iter().map(|(_, label)| label.clone()).collect();
 
     let barcode = &row.barcode;
     let labels = live
@@ -483,6 +490,43 @@ pub(crate) fn refuse_unwitnessed_displacement(
              permanently, so the real \"{barcode}\" could never be bound again"
         ),
     };
+    // The units the way past below would be refused for: `volume retire` and
+    // `cartridge mark-erased` both stop at the absolute zero floor
+    // (`refuse_last_eligible_copy`), so where a live volume holds the LAST
+    // copy of a version the remedy has a step before it.
+    let mut only_copies: Vec<String> = Vec::new();
+    for (volume_id, label) in &live_rows {
+        for impact in retire_impacts(conn, *volume_id)? {
+            for version in impact.at_stake.iter().filter(|v| v.copies_after == 0) {
+                only_copies.push(format!(
+                    "\"{label}\" holds the only copy of unit \"{}\" v{}",
+                    impact.unit_name, version.version
+                ));
+            }
+        }
+    }
+    let copy_first = if only_copies.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Right now {}, so those two commands refuse (ADR-0008 Tier 3: no --force, \
+             and --yes does not reach it) until another cartridge holds a copy. \
+             Running either one prints the steps that make it.\n\
+             \n",
+            only_copies.join(" and ")
+        )
+    };
+    // Which way the "different tape" half goes depends on whether the drive
+    // can name the medium it holds.
+    let own_cartridge = match serial {
+        Some(_) => "re-run this init without `--cartridge`, so `volume init` registers the \
+                    medium in the drive from its serial"
+            .to_string(),
+        None => "re-run this init with `--cartridge` naming that tape's own barcode \
+                 (register it first if it is new: `tapectl cartridge register --barcode \
+                 <BARCODE> --generation <GEN>`)"
+            .to_string(),
+    };
     Err(TapectlError::Other(format!(
         "{why}, so tapectl cannot confirm the tape in the drive is cartridge \
          \"{barcode}\" — and \"{barcode}\" is bound to {volume_s} \
@@ -495,11 +539,20 @@ pub(crate) fn refuse_unwitnessed_displacement(
          nothing about which cartridge that is. Only a matching medium serial proves \
          that, and there is none here.\n\
          \n\
-         Say the bytes are gone first, then re-run this init:\n\
+         Decide which it is.\n\
+         \n\
+         If the tape in the drive is not the one you meant to initialise (the wrong \
+         cartridge is loaded, or another tape wears \"{barcode}\"'s sticker), load the \
+         cartridge you meant and {own_cartridge}. Leave \"{barcode}\" alone: it is the \
+         one holding {labels}.\n\
+         \n\
+         If it really is \"{barcode}\" and is to be reused, its bytes are about to be \
+         overwritten, so say they are gone first, then re-run this init:\n\
          {retires}\n\
          or, if the whole cartridge is wiped:\n    \
          tapectl cartridge mark-erased {barcode}\n\
          \n\
+         {copy_first}\
          There is no --force for this — it is a fact tapectl cannot resolve on its own, \
          not a risk to accept."
     )))
@@ -2791,6 +2844,122 @@ mod tests {
         assert!(
             err.contains("no --force for this"),
             "the refusal must close the --force door explicitly; got: {err}"
+        );
+    }
+
+    /// #468: the refusal's remedy offered only `volume retire` and `cartridge
+    /// mark-erased`, which the absolute zero floor refuses when the volume is
+    /// a unit's only copy, and never offered the other half of its own
+    /// dichotomy (the wrong cartridge is loaded). It now names both halves,
+    /// and where a live volume holds a last copy it says so and what has to
+    /// exist before the two commands run.
+    #[test]
+    fn the_unwitnessed_displacement_remedy_names_both_halves_and_the_zero_floor() {
+        use crate::cli::operations::{refuse_last_eligible_copy, remedy_commands};
+        let conn = db::open_memory().unwrap();
+        register(&conn, "BC002", "LTO-6", None, "available");
+        let sealed = bind_then_set_status(&conn, "BC002", None, "L6-SEALED", "sealed");
+        // `photos` v1 is carried by L6-SEALED alone.
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('media', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('u1', 'photos', 1, 'mtime_size', 1, 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+             VALUES (1, 1, 'full', 'current', '/srv/photos')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+             VALUES (1, 'staged', 524288)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (1, 1, ?1, 'completed')",
+            params![sealed],
+        )
+        .unwrap();
+        let refusal = |serial: Option<&str>| {
+            let found = lookup_cartridge(&conn, serial, Some("BC002")).unwrap();
+            refuse_unwitnessed_displacement(&conn, serial, found.row.as_ref())
+                .expect_err("no serial witnesses this displacement")
+                .to_string()
+        };
+        let fill = [("<BARCODE>", "BC009"), ("<GEN>", "LTO-6")];
+
+        // A drive that reads no serial: the other tape is named by barcode.
+        let err = refusal(None);
+        assert!(
+            err.contains("load the cartridge you meant") && err.contains("really is \"BC002\""),
+            "both halves of the ambiguity get a remedy: {err}"
+        );
+        remedy_commands::assert_names_parsing_commands(
+            &err,
+            &fill,
+            &[
+                "tapectl cartridge register --barcode BC009 --generation LTO-6",
+                "tapectl volume retire L6-SEALED",
+                "tapectl cartridge mark-erased BC002",
+            ],
+        );
+        assert!(
+            err.contains("\"L6-SEALED\" holds the only copy of unit \"photos\" v1"),
+            "the unit the two commands would be refused for is named: {err}"
+        );
+
+        // The claim is true in that state: both commands stop at the floor,
+        // and the refusal names the copy-out steps the message points at.
+        let impacts = retire_impacts(&conn, sealed).unwrap();
+        let floor =
+            refuse_last_eligible_copy(&conn, "retire volume \"L6-SEALED\"", "L6-SEALED", &impacts)
+                .expect_err("the only copy cannot be retired")
+                .to_string();
+        assert!(
+            floor.contains("tapectl volume read-slices --from L6-SEALED --unit photos"),
+            "{floor}"
+        );
+
+        // A drive that reads a serial the row lacks: the other tape is
+        // registered from its own serial, no `--cartridge`.
+        let err = refusal(Some("SER-9"));
+        assert!(
+            err.contains("without `--cartridge`") && !err.contains("cartridge register"),
+            "{err}"
+        );
+
+        // Positive control: once another cartridge holds the copy, the floor
+        // is gone and so is the sentence about it.
+        let copy = new_volume(&conn, "L6-COPY");
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
+            params![copy],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (1, 1, ?1, 'completed')",
+            params![copy],
+        )
+        .unwrap();
+        let impacts = retire_impacts(&conn, sealed).unwrap();
+        refuse_last_eligible_copy(&conn, "retire volume \"L6-SEALED\"", "L6-SEALED", &impacts)
+            .expect("with a copy elsewhere the retire is allowed");
+        let err = refusal(None);
+        assert!(!err.contains("only copy"), "{err}");
+        remedy_commands::assert_names_parsing_commands(
+            &err,
+            &fill,
+            &["tapectl volume retire L6-SEALED"],
         );
     }
 

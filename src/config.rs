@@ -706,7 +706,9 @@ pub struct DefaultsConfig {
     /// old name is refused at load with the rename to make.
     #[serde(default = "default_min_copies")]
     pub min_copies: i32,
-    /// How many distinct locations a unit's copies must span. Named
+    /// How many distinct locations a TAPE-ONLY unit's copies must span (a
+    /// unit that is not tape-only has no such floor; an archive set names
+    /// places with `required_locations` instead). Named
     /// `min_locations_for_tape_only` before issue #348.
     #[serde(default = "default_min_locations")]
     pub min_locations: i32,
@@ -1883,9 +1885,10 @@ fn stale_defaults_fields_message(value: &toml::Value) -> Option<String> {
     if !renamed.is_empty() {
         return Some(format!(
             "defaults.{} renamed: the keys are now defaults.min_copies and \
-             defaults.min_locations, with the same meaning — the copy and location \
-             requirement every unit starts from (an [[archive_sets]] entry's min_copies \
-             overrides it). Rename {}; the values carry over unchanged.",
+             defaults.min_locations, with the same meaning — the copy requirement every \
+             unit starts from (an [[archive_sets]] entry's min_copies overrides it) and \
+             the number of distinct locations a tape-only unit's copies must span. Rename \
+             {}; the values carry over unchanged.",
             match renamed.as_slice() {
                 [one] => format!("{one} was"),
                 _ => format!("{} were", renamed.join(" and defaults.")),
@@ -3008,6 +3011,16 @@ mod tests {
             assert!(
                 msg.contains("defaults.min_locations"),
                 "must name the new location key: {body:?} -> {msg}"
+            );
+            // #468: only the copy requirement starts every unit; the place
+            // floor binds a tape-only unit alone.
+            assert!(
+                msg.contains("distinct locations a tape-only unit's copies must span"),
+                "must say whom min_locations binds: {body:?} -> {msg}"
+            );
+            assert!(
+                !msg.contains("copy and location requirement every unit starts from"),
+                "min_locations is not every unit's requirement: {body:?} -> {msg}"
             );
         }
     }

@@ -10340,15 +10340,20 @@ mod tests {
 pub(crate) mod remedy_commands {
     use clap::Parser;
 
-    /// Every `tapectl ...` command a message puts in backticks, in order, with
-    /// each `<PLACEHOLDER>` (which may contain spaces) filled by `fill`
-    /// (matched by its text including the angle brackets) or, failing that,
-    /// by the word `placeholder`. Backtick spans that do not start with
-    /// `tapectl ` are not commands.
+    /// Every `tapectl ...` command a message names, in order: each backtick
+    /// span that starts with `tapectl `, and each line that is nothing but
+    /// one (the indented recipe lines of a refusal). Each `<PLACEHOLDER>`
+    /// (which may contain spaces) is filled by `fill` (matched by its text
+    /// including the angle brackets) or, failing that, by the word
+    /// `placeholder`.
     pub(crate) fn named_commands(msg: &str, fill: &[(&str, &str)]) -> Vec<String> {
-        msg.split('`')
-            .skip(1)
-            .step_by(2)
+        let spans = msg.split('`').skip(1).step_by(2);
+        let lines = msg
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.contains('`'));
+        spans
+            .chain(lines)
             .filter(|span| span.starts_with("tapectl "))
             .map(|span| {
                 let mut out = String::new();
