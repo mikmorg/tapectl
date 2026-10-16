@@ -355,7 +355,8 @@ seals the volume (ADR-0012, 2026-10-06). It does not read the data back, so
 the `volume verify` straight after it is the volume's first full readback —
 every file hashed against the front index, the one check that spans host,
 cable, drive and medium. Until one passes, `audit` names the volume
-(`no_full_verify`) and `report verify-status` lists it. `volume write
+(`no_full_verify`) and each unit on it (`verify_age`, `last: never`), and
+`report verify-status` lists the volume. `volume write
 --full-confirm` does the full readback as part of the write instead (hours on
 a full cartridge); `volume verify` afterwards is then a second, independent
 read-back. Here `audit`
@@ -489,14 +490,131 @@ create` or `collection run`:
       sudo -u tapectl -H tapectl stage create <unit>'
   ```
 
-  Then remove the snapshot. A per-collection hook that does this for `collection
-  run` is planned for 1.2.0 (#455).
+  Then remove the snapshot. For `collection run`, the snapshot hook below does
+  all of this for you. `stage create` on its own has no hook and keeps this recipe.
 - **Or hold the source still** for the stage's duration: stop sync clients,
   downloads and anything that autosaves into it, and do not edit it.
 
 `collection run` stages units in name order (several at once with `[staging]
 jobs`), so the stage report's start and end lines say which folders are being
 read at any moment.
+
+#### A snapshot hook for `collection run`
+
+Since 1.2.0 a `[[collections]]` table can name two commands of yours. `collection run`
+runs `snapshot_command` once, before it snapshots or stages any unit. The command takes
+a read-only snapshot of the collection's root and prints its path. The run then reads
+each unit's folder inside that snapshot. When staging is over, it runs
+`release_command` to drop the snapshot.
+
+```toml
+[[collections]]
+name = "media"
+root = "/srv/media"
+tenant = "family"
+snapshot_command = "/usr/local/bin/tapectl-snap-take"
+release_command = "/usr/local/bin/tapectl-snap-drop"
+```
+
+The two commands are yours. tapectl runs each under `sh -c`, as the user tapectl runs
+as, with its standard input closed. Both get these environment variables:
+
+| Variable | Value |
+|---|---|
+| `TAPECTL_COLLECTION` | The collection's name. |
+| `TAPECTL_COLLECTION_ROOT` | Its root, as a canonical path. |
+| `TAPECTL_SNAPSHOT_PATH` | The snapshot's path. `release_command` only. |
+
+`snapshot_command` must print exactly one non-empty line on **stdout**: the absolute
+path of a read-only snapshot that mirrors the root's layout, so that `<root>/Alien.1979`
+is `<that path>/Alien.1979`. Everything else the command says goes to stderr, which
+tapectl shows. Many snapshot tools print to stdout (`btrfs subvolume snapshot` does),
+so redirect them with `>&2`. The snapshot must not be inside the root. tapectl reads it
+as the user it runs as, as it reads the live root.
+
+Anything else refuses the run **before any unit is read**, and the refusal names the
+command and what it said on stderr: a non-zero exit, no line or several, a relative
+path, a path that cannot be read or is not a directory, a path inside the live root, or
+a unit whose folder is not in the snapshot (see
+[the refusals](troubleshooting.md#collection-run-snapshot-hook-refusals-120)).
+
+What changes during the run, and what does not:
+
+- The walk, the content match, the source check, the sha256 pass, `dar -c -R` and the
+  check after dar all read the unit's folder in the snapshot. A file touched in the
+  living source after the snapshot was taken is not the stage's business.
+- Every path tapectl **records** stays the real one: `units.current_path`,
+  `snapshots.source_path`, the file lists, and the `-R` in the stage set's `dar_command`,
+  which MANIFEST.toml carries to tape. `dar_create_reports` keeps the command exactly as
+  dar ran it, so it shows the snapshot's path.
+- `release_command` needs `snapshot_command`; the key alone is refused. It runs when the
+  run's staging is over, whether the staging worked or not, and **before any tape is
+  touched**, so the snapshot is held for the staging and not for the hours of writing
+  after it. It does not run when `snapshot_command` itself failed, because nothing was
+  taken. A failure of `release_command` is a warning on stderr (`snapshot_release_warning`
+  in `--json`) naming the snapshot, and the run goes on: remove the snapshot by hand.
+- `collection run --json` gains `snapshot_path` and `snapshot_release_warning`.
+  `collection run --dry-run` shows `snapshot_command` (and `--json` both commands) and
+  runs neither. `collection plan`, `status` and `sync` never run either, and neither does
+  `config check`, which only checks that the keys are well formed.
+- A first Ctrl-C, SIGTERM or SIGHUP stops the staging at its next safe point, and
+  `release_command` still runs. A second signal, which stops tapectl at once, or a
+  SIGKILL means `release_command` never runs. The snapshot stays until you remove it.
+
+If a script mounts or snapshots, it needs root, and the tapectl user is not root. Give it
+a sudoers entry for exactly the commands it runs. For btrfs, with `/srv/media` a
+subvolume:
+
+```bash
+#!/bin/sh
+# /usr/local/bin/tapectl-snap-take
+set -eu
+sudo /usr/bin/btrfs subvolume snapshot -r /srv/media /srv/.snap-tapectl-media >&2
+echo /srv/.snap-tapectl-media
+```
+
+```bash
+#!/bin/sh
+# /usr/local/bin/tapectl-snap-drop
+set -eu
+sudo /usr/bin/btrfs subvolume delete /srv/.snap-tapectl-media >&2
+```
+
+```text
+# /etc/sudoers.d/tapectl-snapshot (edit it with visudo)
+tapectl ALL=(root) NOPASSWD: /usr/bin/btrfs subvolume snapshot -r /srv/media /srv/.snap-tapectl-media, /usr/bin/btrfs subvolume delete /srv/.snap-tapectl-media
+```
+
+For LVM, make the snapshot, mount it read-only, and print the directory that mirrors
+the root. If `/srv/media` is the mount point of the origin volume `vg/media`:
+
+```bash
+#!/bin/sh
+# /usr/local/bin/tapectl-snap-take (create /mnt/tapectl-media once)
+set -eu
+sudo /usr/sbin/lvcreate --snapshot --name tapectl-media --size 20G vg/media >&2
+sudo /usr/bin/mount -o ro /dev/vg/tapectl-media /mnt/tapectl-media >&2
+echo /mnt/tapectl-media
+```
+
+The release script unmounts it and runs `lvremove -f vg/tapectl-media`, each through
+`sudo`, with sudoers entries as above. An XFS snapshot also needs `-o ro,nouuid`,
+because XFS refuses to mount a second filesystem that has the origin's UUID. Size the
+snapshot for the changes the living source takes while the staging runs: a classic LVM
+snapshot that fills up is invalidated.
+
+Two things to get right:
+
+- **The printed path must mirror the root, not the filesystem.** If the root is a
+  subdirectory of the snapshotted filesystem (the root is `/srv/media/movies` and the
+  filesystem is mounted at `/srv/media`), print the matching subdirectory inside the
+  snapshot (`/mnt/tapectl-media/movies`).
+- **ZFS: the `.zfs/snapshot` directory is inside the root and is refused.** With
+  `pool/media` mounted at `/srv/media`, its snapshot is readable at
+  `/srv/media/.zfs/snapshot/<name>`, and that path is under the live root. Clone the
+  snapshot (`zfs clone -o readonly=on -o mountpoint=/mnt/tapectl-media
+  pool/media@<name> pool/tapectl-media`) or bind-mount it read-only somewhere else, and
+  print that path. The release destroys the clone and then the snapshot.
 
 ### Watching a long operation: progress and the session log
 
@@ -1345,8 +1463,9 @@ interval, …) that units can be assigned to (`unit init --archive-set`). Policy
 resolves in three layers: the unit's dotfile, then its archive set, then
 `[defaults]` in config.toml. Not every key exists in every layer. A dotfile's
 `[policy]` table takes only `checksum_mode`, `compression`, `slice_size` and
-`warehouse_copies`. `required_locations` and `verify_interval_days` exist only
-on an archive set, so a unit outside one has neither.
+`warehouse_copies`. `required_locations` exists only on an archive set, so a unit
+outside one names no place. `verify_interval_days` exists on an archive set and in
+`[defaults]`, where it is 365 days when the file does not say, so every unit has one.
 
 ```bash
 # Create a policy template
@@ -1849,19 +1968,28 @@ tapectl report verify-status
 
 Run `tapectl audit`. It runs eleven compliance checks, including copy count,
 location presence, and **verification age**. The verification-age check
-covers only a unit whose archive set sets `verify_interval_days`. That key
-exists on archive sets and nowhere else. A `[defaults]` key stops config.toml
-loading, and a dotfile `[policy]` key makes the unit's policy unresolvable. For
-the units it covers, `audit` produces your "what is overdue" list, and you do
-not track it yourself. Any other unit gets no verification-age finding at all.
-On an install that has never set an interval, that is every unit, and
-`tapectl report verify-status` is the list you read by eye (see
-[Monthly](#monthly--verify-a-rotating-slice-of-the-library)). To have `audit`
-track it, set the interval on the archive set your units belong to
-(`tapectl archive-set edit <name> --verify-interval-days 365`). A unit joins
-an archive set when it is registered (`unit init --archive-set <name>`). Per
-ADR-0004 the check is advisory: it warns, it never blocks, and a stale volume
-still counts as a copy.
+covers every unit that has a copy. Since 1.2.0 each unit has an interval: its
+archive set's `verify_interval_days`, else `[defaults] verify_interval_days`,
+which is 365 days when the file does not say (`tapectl config check` prints the
+value in force). A dotfile `[policy]` key makes the unit's policy unresolvable,
+so it cannot set one. `audit` produces your "what is overdue" list, and you do
+not track it yourself. `tapectl report verify-status` is the same list by
+recency (see [Monthly](#monthly--verify-a-rotating-slice-of-the-library)).
+To change the interval for a group of units, set it on the archive set they
+belong to (`tapectl archive-set edit <name> --verify-interval-days 180`). A unit
+joins an archive set when it is registered (`unit init --archive-set <name>`).
+To change it for every unit, `tapectl config set defaults.verify_interval_days
+180`. There is no way to switch the check off; a very large number is the
+nearest thing. Per ADR-0004 the check is advisory: it warns, it never blocks,
+and a stale volume still counts as a copy.
+
+**A new unit warns at once.** A write's quick confirm reads back the front index
+and the seal marker, not the data, so it is no full readback. A unit written that
+way has a copy and no full readback, so `audit` warns `verify_age` with `(last:
+never)` the moment the write ends, and `no_full_verify` for the volume. Both
+clear when a full `tapectl volume verify` passes, or when the write used
+`--full-confirm`. That is expected, not a fault: a quick-confirmed tape has not yet
+proved its data reads.
 
 `tapectl report dirty` and `tapectl report pending` are the companion glance —
 what has drifted since its last snapshot, and which stage sets still owe a
@@ -1905,8 +2033,8 @@ verify-status`, and its exit status is `audit`'s:
 | anything else | no verdict: the audit did not complete (a crash, say) | failure |
 
 Warnings are not a failure on purpose. `audit` warns for ordinary drift — an
-overdue verification (for a unit whose archive set sets an interval; see
-[Weekly](#weekly--cheap-no-tape)), a source changed since its last snapshot, a Heir Kit
+overdue verification (see [Weekly](#weekly--cheap-no-tape); a unit just written with a
+quick confirm shows one until its first full readback), a source changed since its last snapshot, a Heir Kit
 older than the newest tape — and ADR-0004 is explicit that the audit advises
 and never blocks. A timer that alerts on exit 1 would turn the advisory audit
 into a blocking one by the back door. A unit short of its copies or of a
@@ -1915,8 +2043,9 @@ unit fails: that is the finding you want to hear about.
 
 `report verify-status` always exits 0; it runs for the journal record, not as a
 check. The verification-age *check*, with a real exit code, is `audit`'s, and
-it covers only units whose archive set sets `verify_interval_days`. For every
-other unit, the verify-status listing in the journal is the only record.
+it covers every unit that has a copy (365 days unless the archive set or `[defaults]`
+says otherwise). The verify-status listing in the journal is the record of what was
+read, and when.
 
 Set `TAPECTL_HEALTHCHECK_URL` in the service to ping a healthchecks.io-style
 endpoint (`/start` before, bare URL on 0 or 1, `/fail` on 2 and on any code
@@ -2109,7 +2238,8 @@ $ tapectl report verify-status
 
 **First, every newly written volume.** A write's confirm reads back only the
 front index and the seal marker unless you passed `--full-confirm`, so a new
-volume has had none of its data read back. Give it a full `volume verify`
+volume has had none of its data read back. Its units show `verify_age` with
+`(last: never)` in `audit` until it has one (a warning, and expected). Give it a full `volume verify`
 soon after the write — pass `--keep-staging` to the write that completes a unit's
 copies (otherwise that write releases staging), so the verify runs while
 the staged slices can still rewrite a bad copy cheaply. `collection run` gives
@@ -2123,7 +2253,8 @@ verify-status` ends with the volumes still owed one:
     L8-0002
 ```
 
-and `audit` warns about each (`no_full_verify`) until a full verify passes. A
+and `audit` warns about each (`no_full_verify`), and about each unit on it
+(`verify_age`), until a full verify passes. A
 `--quick` verify does not clear it. Until then the volume does count as a copy
 — the quick confirm proved it is sealed and navigable — but `volume resume`
 will not adopt an aborted session on it without a full verify on record.
@@ -2133,8 +2264,9 @@ Then the rotation: pick the N volumes whose newest pass is oldest, such that
 12-month interval, that is roughly 2 per month. The interval `audit` checks is
 `verify_interval_days`: an archive set's (`tapectl archive-set edit <name>
 --verify-interval-days N`), else `[defaults] verify_interval_days` (`tapectl
-config set defaults.verify_interval_days 365`, #453). With neither, nothing
-checks it.
+config set defaults.verify_interval_days 180`, #453), which is 365 days when the
+file does not say (1.2.0). So `audit` always checks it, and `tapectl config check`
+prints the value in force.
 
 `audit` judges each volume on its own as well: `volume_verify_age` warns when a
 volume's newest full readback is older than the shortest interval of the units
@@ -2173,8 +2305,9 @@ marker as always, skips the files already read back clean, and reads the
 rest. It continues only the volume's latest readback (a write's interrupted
 `--full-confirm` included), only while the front index on the tape is the
 one those files were checked against, and only while the oldest of those reads
-is within the volume's `verify_interval_days` (the shortest set by the archive
-sets of the units on it; no limit when none sets one); otherwise it reads
+is within the volume's `verify_interval_days` (the shortest among the units on it:
+an archive set's, else `[defaults]`'s, 365 days when absent; no limit only on a volume
+no unit was written to); otherwise it reads
 everything. A verify that continues is recorded as started when its oldest
 carried read was made, not when you re-ran it — `report verify-status` and
 `volume info` show that time (ADR-0012, 2026-10-07).
