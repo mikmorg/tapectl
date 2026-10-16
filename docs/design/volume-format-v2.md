@@ -322,8 +322,8 @@ boundary became visible. A sealed volume promises two things and withholds
 a third:
 
 1. **Data.** Every unit on it is restorable by its tenant with that tenant's
-   key and standard tools — `mt`, `dd`, `age`, `dar`, `sha256sum` — with no
-   tapectl and no database (`RESTORE.sh`, tape file 2). This is the heir path
+   key and standard tools — `mt`, `dd`, `age`, `dar`, `sha256sum` and a few
+   coreutils (§6) — with no tapectl and no database (`RESTORE.sh`, tape file 2). This is the heir path
    and it is proven on real hardware.
 2. **Catalog.** With the operator or escrow key, `catalog rebuild --from-volume`
    reconstructs everything the catalog knew about this write *at staging
@@ -513,7 +513,7 @@ not part of this chain — the Linux `st` data path does not expose it (ADR-0007
 enabled out of band it is recorded only as supplementary evidence, never as the
 basis of the seal.
 
-## 6. Heir path — end to end with only `mt`, `dd`, `age`, `dar`, `sha256sum`
+## 6. Heir path — end to end with `mt`, `dd`, `age`, `dar`, `sha256sum` (and `head`, `truncate`, `tar`; RESTORE.sh also uses `mkfifo` and `tee`)
 
 No database, no tapectl, no operator. This is the normative Heir Path (CONTEXT.md);
 RESTORE.sh and the system guide implement it literally. **The tape is read
@@ -557,6 +557,46 @@ any doubt is a rewind). The manual steps below read in that order.
    unless `--overwrite`, and fails on dar's "not restored (user choice)".
    For one file, `--path` reads only the slices the catalogue names for it and
    the last.
+
+**Since 1.2.0** (ADR-0012 2026-10-16 items 71–73; the golden pin of RESTORE.sh
+moved, MANIFEST.toml's did not). RESTORE.sh changed in these ways, and a tape
+written before 1.2.0 carries the earlier script:
+
+- **Tools, per mode.** A mode checks the tools it runs when it starts, before the
+  first tape read, and `mt` (or `mt-st`) for every mode that reads the tape. One
+  table (`RESTORE_TOOLS` in `layout.rs`) draws the script's five sets and File 1's
+  list: `--info` and `--verify` need `dd`, `sha256sum` and `head`; `--find-envelope`
+  adds `age`, `truncate` and `tar`; `--list` adds `dar`; `--restore --path` adds
+  `tee`; a whole-unit `--restore` needs `tee` and `mkfifo` too. A bare invocation,
+  `--help` and an unknown mode check nothing. Before, every mode checked every tool.
+- **`export LC_ALL=C`**, right after `set -euo pipefail`, so the greps of dar's
+  English output hold in any locale.
+- **DAMAGED wording.** The message says "a key matched" only when a key did. When
+  no key opened a damaged envelope, it says that and suggests other keys.
+- **The work directory** is described as it is: the decrypted envelopes, made in
+  `${TMPDIR:-/tmp}` (`--help` has a `TMPDIR` entry). Before any envelope is read,
+  a WARNING says so when the free space there looks too small (the largest
+  envelope plus the sum of all, from the front index); `--no-space-check` silences
+  it. The `--to` figure counts the slices' encrypted size on tape, so a unit
+  stored compressed may need more.
+- **A lone-unit restore** (no `--unit`, no `--all`, one unit in the first envelope
+  that opens) restores it as before. Before any slice is read it then reads the
+  remaining envelopes forward only, and just before `RESTORE COMPLETE` says how
+  many other envelopes the key opened and how many other units they list, naming
+  `--list` and `--all` into a new directory. It says nothing when they add no
+  units, and skips the look, with a line saying so, when the work directory could
+  not hold the largest remaining envelope.
+- **File 1** gains "The tape drive" (which drives read this tape's generation: an
+  LTO-6 tape reads in an LTO-6 or LTO-7 drive, an LTO-8 tape in an LTO-8 or LTO-9
+  drive, and a general statement for any other; the interface is SAS, some models
+  Fibre Channel, through a host adapter, never USB or SATA) and "Disk space" (one
+  unit's size, what `--scratch` is for, where the envelopes go) sections, gives the
+  escrow restore as `--list` then `--restore --all` with the single-tenant-key note,
+  and draws its tool bullets from the same table. RECOVERY.md names a unit's dar
+  catalogue (the `dar -l` paragraph and the `-A` hint) only when the envelope holds it.
+- **Fixed points (item 73).** RESTORE.sh's "this tape needs tapectl ≥" text stays
+  "tapectl 1.1.0" and `requires` stays empty, so a 1.1.x RESTORE.sh reads a 1.2.0
+  tape and a 1.2.0 one reads a 1.1.x tape.
 
 ## 7. Block mode
 
