@@ -535,8 +535,8 @@ If RESTORE.sh is not available, follow these steps:
    decryption), verify its sha256 against File 3's `sha256_encrypted`,
    decrypt with age, and remove the encrypted copy. Work on a disk
    with room for all of the unit's decrypted slices at once (about the
-   unit's size, and as much again for step 8's restored files), not in
-   /tmp, which is RAM on many systems. Your
+   unit's size, and as much again for step 8's restored files), and
+   not in /tmp, which is RAM on many systems. Your
    envelope's RECOVERY.md writes these commands out for your units,
    and its `catalogs/` holds each unit's dar catalogue
    (`dar -l catalogs/NAME -N -Q` lists the files without the tape)
