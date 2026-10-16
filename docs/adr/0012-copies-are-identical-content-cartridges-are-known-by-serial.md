@@ -1583,3 +1583,21 @@ the same day for spanning to be designed now and for R4 to be designed and built
     it (ADR-0001: a claim about a tape needs contact with that tape). The correction behind it:
     each tape's `catalog.db` holds only its own write's stage sets, so before R4 no tape indexes
     another; only the Heir Kit does.
+
+Ruled the same evening, Round 2 (R4 and #477):
+
+79. **R4's tenant index lists units and every path.** Each tenant envelope carries
+    `index/units.tsv` (each version and piece of that tenant's units, with the volumes holding
+    it) and `index/paths.tsv` (each path of those versions, with its unit, version and piece), so
+    an heir holding one tenant key finds which tape holds a file from the newest tape alone. The
+    operator envelope carries `index/units.tsv` across all tenants (item 78), without paths.
+80. **The index lists every current version with a live copy**: each current version with at
+    least one completed write on a sealed, unretired volume, plus the versions this write itself
+    carries. A quarantined holder is listed and marked as such, since a quarantined medium may
+    still read. Reclaimable and purged versions are not listed.
+81. **All eleven of #477's File 1 findings ride the 1.3.0 re-pin** with R4's own changes to
+    RESTORE.sh, RECOVERY.md and File 1; File 1 is then read again by a fresh reader with no
+    design docs, and the verdict is recorded on #477. The 1.3.0 re-pin is approved for exactly
+    these (items 78-81), bounded as item 72 was: it ends when v1.3.0 is installed. `requires`
+    stays empty (R4 adds envelope members, which older readers ignore), so RESTORE.sh's "this
+    tape needs tapectl" text stays "tapectl 1.1.0" (item 20 of 2026-10-06).
