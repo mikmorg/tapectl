@@ -370,24 +370,29 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
 /// unit on it has one.
 ///
 /// The interval is a unit's policy and a volume holds many units, so the
-/// volume answers to the strictest of them. This reads the archive sets'
-/// intervals only — not a dotfile key (there is none), and not
-/// `[defaults] verify_interval_days` either, which [`resolve`] does apply
-/// (issue #453) but which this function has no `Config` to read: it reads
-/// `archive_sets` directly rather than resolving every unit (which would
-/// read every unit's dotfile, and fail a readback on a bad one). So the
-/// readback age gate bounds a continued readback by an archive set's
-/// interval alone. Every `writes` row counts, whatever its status: a
-/// write's own confirm runs while its rows are still `in_progress`.
-pub fn volume_verify_interval_days(conn: &Connection, volume_id: i64) -> Result<Option<i64>> {
+/// volume answers to the strictest of them. Each unit's interval resolves as
+/// [`resolve`] resolves it (issue #453): its archive set's, else
+/// `default_days` (`[defaults] verify_interval_days`, which the caller reads
+/// from its `Config`); a dotfile has no such key. It reads `archive_sets`
+/// directly rather than resolving every unit, which would read every unit's
+/// dotfile and fail a readback on a bad one. A unit with no archive set, or
+/// one whose set carries no interval, takes the default, so a home whose
+/// interval lives only in `[defaults]` bounds a continued readback as `audit`
+/// judges overdue. Every `writes` row counts, whatever its status: a write's
+/// own confirm runs while its rows are still `in_progress`.
+pub fn volume_verify_interval_days(
+    conn: &Connection,
+    volume_id: i64,
+    default_days: Option<i64>,
+) -> Result<Option<i64>> {
     Ok(conn.query_row(
-        "SELECT MIN(a.verify_interval_days)
+        "SELECT MIN(COALESCE(a.verify_interval_days, ?2))
            FROM writes w
            JOIN snapshots s ON s.id = w.snapshot_id
            JOIN units u ON u.id = s.unit_id
-           JOIN archive_sets a ON a.id = u.archive_set_id
+           LEFT JOIN archive_sets a ON a.id = u.archive_set_id
           WHERE w.volume_id = ?1",
-        params![volume_id],
+        params![volume_id, default_days],
         |r| r.get(0),
     )?)
 }

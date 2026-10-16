@@ -1830,6 +1830,7 @@ fn volume_write_in_contact<'c>(
         block_size as u64,
         execute_outcome.into(),
         confirm_tier,
+        config.defaults.verify_interval_days,
     )
     .map(|()| layout_snapshot)
 }
@@ -2113,6 +2114,7 @@ fn volume_resume_contacted<'c>(
         &keys,
         slice_check,
         confirm_tier,
+        config.defaults.verify_interval_days,
     );
 
     // ONE post-command sweep per resume contact (issue #342; ADR-0013),
@@ -2181,6 +2183,7 @@ fn volume_resume_in_contact(
     keys: &KeyAvailability,
     slice_check: SliceCheck,
     confirm_tier: Tier,
+    default_verify_interval_days: Option<i64>,
 ) -> Result<()> {
     binding::corroborate_volume(
         conn,
@@ -2230,6 +2233,7 @@ fn volume_resume_in_contact(
         block_size as u64,
         outcome,
         confirm_tier,
+        default_verify_interval_days,
     )
 }
 
@@ -2920,6 +2924,7 @@ fn finish_session(
     block_size: u64,
     outcome: ResumeOutcome,
     confirm_tier: Tier,
+    default_verify_interval_days: Option<i64>,
 ) -> Result<()> {
     match outcome {
         ResumeOutcome::Ready(ready) => {
@@ -3011,6 +3016,7 @@ fn finish_session(
                 block_size,
                 sealed_pending,
                 confirm_tier,
+                default_verify_interval_days,
             )
         }
         // ADR-0012's 2026-09-21 amendment (issues #260/#267): resume found
@@ -3029,6 +3035,7 @@ fn finish_session(
             block_size,
             sealed_pending,
             confirm_tier,
+            default_verify_interval_days,
         ),
         ResumeOutcome::Quarantined(q) => Err(quarantine_error(label, &q.reason)),
         ResumeOutcome::Interrupted(i) => {
@@ -3196,6 +3203,7 @@ fn finish_confirm(
     block_size: u64,
     sealed_pending: session::SealedPending,
     confirm_tier: Tier,
+    default_verify_interval_days: Option<i64>,
 ) -> Result<()> {
     // Issue #404: a signal during the readback stops it between files.
     // `confirm` returns before recording anything, so its rows keep their
@@ -3205,7 +3213,7 @@ fn finish_confirm(
     // resume that asks for the full readback again continues it.
     let resume_hint = confirm_resume_hint(label, confirm_tier);
     let confirmed = sealed_pending
-        .confirm(conn, store, confirm_tier)
+        .confirm_under_default_interval(conn, store, confirm_tier, default_verify_interval_days)
         .map_err(|e| match e {
             // Exit 4 (issue #408): a signal stopped the readback.
             TapectlError::Interrupted(at) => TapectlError::WriteInterrupted(format!(
@@ -4613,7 +4621,7 @@ pub(crate) fn verify_loaded_with_store(
         found.volume_id,
         block_size,
         tier,
-        site.medium_serial(),
+        &site,
     );
     close_verify_contact(conn, guard, &site, volume, tier, &mut r);
     Ok((found, r?))
@@ -4671,15 +4679,7 @@ pub(crate) fn volume_verify_with_store(
     let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, Some(volume_id));
     phase.done();
-    let mut r = verify_contacted(
-        conn,
-        store,
-        label,
-        volume_id,
-        block_size,
-        tier,
-        site.medium_serial(),
-    );
+    let mut r = verify_contacted(conn, store, label, volume_id, block_size, tier, &site);
     close_verify_contact(conn, guard, &site, Some((volume_id, label)), tier, &mut r);
     r
 }
@@ -4823,7 +4823,7 @@ fn verify_contacted(
     volume_id: i64,
     block_size: usize,
     tier: Tier,
-    medium_serial: Option<&str>,
+    site: &ContactSite<'_>,
 ) -> Result<VerifyReport> {
     // CORROBORATE FIRST, before reading anything else (issue #164). A
     // verification session is CONTEXT.md's *Evidence*, and evidence recorded
@@ -4844,7 +4844,7 @@ fn verify_contacted(
     // there is of "this is not the tape you named".
     let phase = progress::phase("identify", None);
     let medium = binding::MediumFacts::new(
-        medium_serial.map(str::to_string),
+        site.medium_serial().map(str::to_string),
         binding::read_file0_facts(store),
     );
     binding::corroborate_volume(conn, volume_id, label, &medium)?;
@@ -4925,7 +4925,11 @@ fn verify_contacted(
     // continues. The continuation is read before the row exists, which
     // would otherwise be "the latest" itself.
     let resume = match tier {
-        Tier::Integrity => session::interrupted_readback(conn, volume_id)?,
+        Tier::Integrity => session::interrupted_readback(
+            conn,
+            volume_id,
+            site.config().defaults.verify_interval_days,
+        )?,
         Tier::Navigable => None,
     };
     if let Some(r) = &resume {
@@ -7925,36 +7929,35 @@ mod tests {
         );
     }
 
-    /// ADR-0012 2026-10-07 item 1: an interrupted readback whose oldest
-    /// checkpoint is older than the volume's resolved `verify_interval_days`
-    /// is not continued — the next full verify reads every file again, and
-    /// is dated from its own start.
-    #[test]
-    fn a_full_verify_reads_everything_again_when_the_interrupted_readback_is_older_than_the_interval(
-    ) {
-        use crate::tape::fake::{FakeTape, Op};
+    /// A site on `config`, for a test whose answer depends on one.
+    fn site_with_config(operation: Operation, config: &Config) -> ContactSite<'_> {
+        ContactSite::new(config, operation, TEST_DEVICE, Medium::NoBackend)
+    }
+
+    /// An earlier full readback of volume `label` stopped after Files 0-2,
+    /// `age_days` ago; `configure` sets up the catalog (an archive set's
+    /// verify interval) and `config` carries `[defaults]`'s. Then a full
+    /// `volume verify` runs. Returns the catalog, the new session's id and
+    /// the tape operations it performed.
+    fn full_verify_after_an_interrupted_readback(
+        label: &str,
+        age_days: u32,
+        configure: impl FnOnce(&Connection),
+        config: &Config,
+    ) -> (Connection, i64, Vec<crate::tape::fake::Op>) {
+        use crate::tape::fake::FakeTape;
 
         let conn = crate::db::open_memory().unwrap();
         let good = b"intact slice bytes, repeated a few times. ".repeat(4);
-        seed_one_slice_fixture(&conn, "VR-OLD", "vo-unit", 4, &good, "completed", "staged");
+        seed_one_slice_fixture(&conn, label, "vo-unit", 4, &good, "completed", "staged");
         let volume_id: i64 = conn
-            .query_row("SELECT id FROM volumes WHERE label = 'VR-OLD'", [], |r| {
+            .query_row("SELECT id FROM volumes WHERE label = ?1", [label], |r| {
                 r.get(0)
             })
             .unwrap();
-        conn.execute(
-            "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('monthly', 30)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE units SET archive_set_id = ?1 WHERE name = 'vo-unit'",
-            params![conn.last_insert_rowid()],
-        )
-        .unwrap();
-        let mem = mem_store_v2_tape("VR-OLD", &good, &good);
+        configure(&conn);
+        let mem = mem_store_v2_tape(label, &good, &good);
 
-        // An earlier full readback stopped after Files 0-2, months ago.
         let fi_text = String::from_utf8_lossy(&mem.files[3]).to_string();
         let fi_true = fi_text.trim_end_matches('\0');
         let fi_hash = direct_hash(fi_true.as_bytes());
@@ -7971,12 +7974,13 @@ mod tests {
             conn.execute(
                 "INSERT INTO readback_checkpoints
                      (session_id, position, sha256, front_index_sha256, checked_at)
-                 VALUES (?1, ?2, ?3, ?4, datetime('now', '-31 days'))",
+                 VALUES (?1, ?2, ?3, ?4, datetime('now', ?5))",
                 params![
                     first,
                     p,
                     claim.sha256_encrypted.as_deref().unwrap(),
-                    fi_hash
+                    fi_hash,
+                    format!("-{age_days} days"),
                 ],
             )
             .unwrap();
@@ -7987,22 +7991,31 @@ mod tests {
         let report = volume_verify_with_store(
             &conn,
             &mut store,
-            "VR-OLD",
+            label,
             volume_id,
             4096,
             Tier::Integrity,
-            site(Operation::VolumeVerify),
+            site_with_config(Operation::VolumeVerify, config),
         )
         .unwrap();
         assert_eq!(report.failed, 0, "mismatches: {:?}", report.mismatches);
-        let walked = fake.ops();
+        (conn, report.session_id.unwrap(), fake.ops())
+    }
+
+    /// The full verify above read Files 1 and 2 again, was dated from its
+    /// own start, and carries no read from the old readback.
+    fn assert_read_everything_again(
+        conn: &Connection,
+        session: i64,
+        walked: &[crate::tape::fake::Op],
+    ) {
+        use crate::tape::fake::Op;
         for p in [1, 2] {
             assert!(
                 walked.contains(&Op::Read(p)),
                 "file {p} must be read again: {walked:?}"
             );
         }
-        let session = report.session_id.unwrap();
         let (started_at, stale): (String, i64) = conn
             .query_row(
                 "SELECT started_at,
@@ -8022,6 +8035,72 @@ mod tests {
             )
             .unwrap();
         assert!(recent, "dated from its own start: {started_at}");
+    }
+
+    /// ADR-0012 2026-10-07 item 1: an interrupted readback whose oldest
+    /// checkpoint is older than the volume's resolved `verify_interval_days`
+    /// is not continued — the next full verify reads every file again, and
+    /// is dated from its own start.
+    #[test]
+    fn a_full_verify_reads_everything_again_when_the_interrupted_readback_is_older_than_the_interval(
+    ) {
+        let config = Config::default();
+        let (conn, session, walked) = full_verify_after_an_interrupted_readback(
+            "VR-OLD",
+            31,
+            |conn| {
+                conn.execute(
+                    "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('monthly', 30)",
+                    [],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE units SET archive_set_id = ?1 WHERE name = 'vo-unit'",
+                    params![conn.last_insert_rowid()],
+                )
+                .unwrap();
+            },
+            &config,
+        );
+        assert_read_everything_again(&conn, session, &walked);
+    }
+
+    /// Issue #453: the interval a home sets only in `[defaults]` bounds a
+    /// continued readback too. With no archive set at all and
+    /// `verify_interval_days = 30` there, a readback whose oldest read is 31
+    /// days old is refused as `audit` would call it overdue — it used to be
+    /// continued, because the gate read archive sets alone.
+    #[test]
+    fn a_full_verify_honours_the_defaults_interval_on_a_home_with_no_archive_sets() {
+        let mut config = Config::default();
+        config.defaults.verify_interval_days = Some(30);
+        let (conn, session, walked) =
+            full_verify_after_an_interrupted_readback("VR-DEF", 31, |_| {}, &config);
+        assert_read_everything_again(&conn, session, &walked);
+    }
+
+    /// The controls for the two above: a readback inside the interval IS
+    /// continued (so the gate is what made the difference, not the fixture),
+    /// and with no interval anywhere — the 1.1.2 default — one months old is
+    /// too.
+    #[test]
+    fn a_full_verify_continues_a_readback_inside_the_interval_or_with_none_set() {
+        use crate::tape::fake::Op;
+        let mut config = Config::default();
+        config.defaults.verify_interval_days = Some(30);
+        let (_, _, walked) = full_verify_after_an_interrupted_readback("VR-IN", 1, |_| {}, &config);
+        assert!(
+            !walked.contains(&Op::Read(1)) && !walked.contains(&Op::Read(2)),
+            "inside the interval it is continued: {walked:?}"
+        );
+
+        let none = Config::default();
+        let (_, _, walked) =
+            full_verify_after_an_interrupted_readback("VR-NONE", 400, |_| {}, &none);
+        assert!(
+            !walked.contains(&Op::Read(1)) && !walked.contains(&Op::Read(2)),
+            "with no interval there is no age limit: {walked:?}"
+        );
     }
 
     /// ADR-0012 2026-10-06 item 24 (#392): a full `volume verify` that

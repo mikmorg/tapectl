@@ -1058,7 +1058,10 @@ impl Continuation {
 /// ADR-0012 2026-10-07 item 1): the readback that concludes is dated from
 /// that read ([`STARTED_AT_FROM_CHECKPOINTS`]), and must not be one the
 /// policy already calls overdue. With no interval on the volume, there is
-/// no age limit.
+/// no age limit. `default_verify_interval_days` is `[defaults]
+/// verify_interval_days`, the interval of every unit whose archive set names
+/// none (issue #453); a caller with no `Config` passes `None` and gets the
+/// archive sets' intervals alone.
 ///
 /// Shared by the write's confirm and `volume verify` (both record their
 /// readbacks in `verification_sessions`), so either continues the other's
@@ -1067,6 +1070,7 @@ impl Continuation {
 pub(crate) fn interrupted_readback(
     conn: &Connection,
     volume_id: i64,
+    default_verify_interval_days: Option<i64>,
 ) -> Result<Option<Continuation>> {
     let latest: Option<(i64, String, String)> = conn
         .query_row(
@@ -1123,7 +1127,9 @@ pub(crate) fn interrupted_readback(
     // past any date is no limit; and a `checked_at` that does not parse is
     // read again — never an error, which would block every full confirm and
     // verify of the volume until the set was edited.
-    if let Some(days) = crate::policy::volume_verify_interval_days(conn, volume_id)? {
+    if let Some(days) =
+        crate::policy::volume_verify_interval_days(conn, volume_id, default_verify_interval_days)?
+    {
         let cutoff = chrono::Duration::try_days(days.max(0))
             .and_then(|d| chrono::Utc::now().naive_utc().checked_sub_signed(d));
         let too_old = match (
@@ -2232,17 +2238,38 @@ impl SealedPending {
     /// touched on `volumes`, `writes` 'interrupted' so `volume resume` can
     /// re-enter this same method (staging kept in every case — this method
     /// never touches staging).
+    ///
+    /// This form has no `Config`, so a continued full readback is bounded by
+    /// the archive sets' `verify_interval_days` alone. Every production path
+    /// (`volume write`, `volume resume`) goes through
+    /// [`Self::confirm_under_default_interval`] instead.
     pub fn confirm(
         self,
         conn: &Connection,
         store: &mut dyn Store,
         tier: Tier,
     ) -> Result<ConfirmOutcome> {
+        self.confirm_under_default_interval(conn, store, tier, None)
+    }
+
+    /// [`Self::confirm`] with `[defaults] verify_interval_days` for the
+    /// readback age gate (issue #453): the interval of every unit whose
+    /// archive set names none, so a home that sets it only in `[defaults]`
+    /// does not continue a readback its own policy calls overdue.
+    pub fn confirm_under_default_interval(
+        self,
+        conn: &Connection,
+        store: &mut dyn Store,
+        tier: Tier,
+        default_verify_interval_days: Option<i64>,
+    ) -> Result<ConfirmOutcome> {
         let verify_type = tier.verify_type();
         // Issue #410: read before this confirm's own row exists, which
         // would otherwise be "the latest" itself.
         let resume = match tier {
-            Tier::Integrity => interrupted_readback(conn, self.volume_id)?,
+            Tier::Integrity => {
+                interrupted_readback(conn, self.volume_id, default_verify_interval_days)?
+            }
             Tier::Navigable => None,
         };
         if let Some(r) = &resume {
@@ -8462,13 +8489,15 @@ mod tests {
             params![id],
         )
         .unwrap();
-        assert_eq!(interrupted_readback(conn, f.volume_id).unwrap(), None);
+        assert_eq!(interrupted_readback(conn, f.volume_id, None).unwrap(), None);
         conn.execute(
             "UPDATE verification_sessions SET outcome = 'aborted' WHERE id = ?1",
             params![id],
         )
         .unwrap();
-        let r = interrupted_readback(conn, f.volume_id).unwrap().unwrap();
+        let r = interrupted_readback(conn, f.volume_id, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.session_id, id);
         assert_eq!(r.checkpoints.front_index_sha256, "bb");
         assert_eq!(r.checkpoints.passed.get(&4).map(String::as_str), Some("aa"));
@@ -8478,7 +8507,7 @@ mod tests {
             params![id],
         )
         .unwrap();
-        assert_eq!(interrupted_readback(conn, f.volume_id).unwrap(), None);
+        assert_eq!(interrupted_readback(conn, f.volume_id, None).unwrap(), None);
     }
 
     /// ADR-0012's 2026-09-23 adoption rule wants a full readback wholly
@@ -8514,12 +8543,14 @@ mod tests {
         };
         abort_at("2026-01-01 00:00:00");
         assert!(
-            interrupted_readback(conn, f.volume_id).unwrap().is_some(),
+            interrupted_readback(conn, f.volume_id, None)
+                .unwrap()
+                .is_some(),
             "positive control: every read postdates that abort"
         );
         abort_at("2026-01-02 00:00:00");
         assert_eq!(
-            interrupted_readback(conn, f.volume_id).unwrap(),
+            interrupted_readback(conn, f.volume_id, None).unwrap(),
             None,
             "a read in the abort's second is not after it"
         );
@@ -8565,7 +8596,9 @@ mod tests {
         // No archive set names an interval: no limit (the positive control).
         read_days_ago(400);
         assert!(
-            interrupted_readback(conn, f.volume_id).unwrap().is_some(),
+            interrupted_readback(conn, f.volume_id, None)
+                .unwrap()
+                .is_some(),
             "with no verify interval, any interrupted readback is continued"
         );
 
@@ -8591,7 +8624,9 @@ mod tests {
         set_of_unit(loose);
         read_days_ago(31);
         assert!(
-            interrupted_readback(conn, f.volume_id).unwrap().is_some(),
+            interrupted_readback(conn, f.volume_id, None)
+                .unwrap()
+                .is_some(),
             "31 days is inside a 90-day interval"
         );
         // A second unit on the same volume, in the tighter set: the
@@ -8623,14 +8658,95 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            interrupted_readback(conn, f.volume_id).unwrap(),
+            interrupted_readback(conn, f.volume_id, None).unwrap(),
             None,
             "the oldest read (31 days) is older than the volume's 30-day interval"
         );
         read_days_ago(29);
         assert!(
-            interrupted_readback(conn, f.volume_id).unwrap().is_some(),
+            interrupted_readback(conn, f.volume_id, None)
+                .unwrap()
+                .is_some(),
             "29 days is inside it"
+        );
+    }
+
+    /// Issue #453: `[defaults] verify_interval_days` is the interval of every
+    /// unit whose archive set names none (`policy::resolve`'s order), so it
+    /// bounds a continued readback too. The same readback, 31 days old, is
+    /// continued with no default, refused under a 30-day one, continued under
+    /// a 90-day one; a unit in a set that names no interval takes the default
+    /// like a unit in no set; and a set's own, looser interval still wins.
+    #[test]
+    fn the_defaults_interval_bounds_a_readback_for_units_whose_set_names_none() {
+        let f = make_fixture();
+        let conn = &f.conn;
+        let u = &f.units[0];
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'interrupted')",
+            params![u.stage_set_id, u.snapshot_id, f.volume_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
+             VALUES (?1, 'full', 'aborted')",
+            params![f.volume_id],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        for p in [4, 5] {
+            conn.execute(
+                "INSERT INTO readback_checkpoints
+                     (session_id, position, sha256, front_index_sha256, checked_at)
+                 VALUES (?1, ?2, 'aa', 'bb', datetime('now', '-31 days'))",
+                params![id, p],
+            )
+            .unwrap();
+        }
+        let continued = |default: Option<i64>| {
+            interrupted_readback(conn, f.volume_id, default)
+                .unwrap()
+                .is_some()
+        };
+
+        assert!(continued(None), "no default, no set: no limit");
+        assert!(!continued(Some(30)), "31 days is past a 30-day default");
+        assert!(continued(Some(90)), "31 days is inside a 90-day default");
+
+        // A set that names no interval defers to the default, as `resolve` does.
+        conn.execute(
+            "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('silent', NULL)",
+            [],
+        )
+        .unwrap();
+        let set = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE units SET archive_set_id = ?1 WHERE name = 'unit-alpha'",
+            params![set],
+        )
+        .unwrap();
+        assert!(continued(None));
+        assert!(!continued(Some(30)), "a set naming none takes the default");
+
+        // A set's own interval wins over the default, looser or tighter.
+        conn.execute(
+            "UPDATE archive_sets SET verify_interval_days = 90 WHERE id = ?1",
+            params![set],
+        )
+        .unwrap();
+        assert!(
+            continued(Some(30)),
+            "the set's 90 days outranks the default"
+        );
+        conn.execute(
+            "UPDATE archive_sets SET verify_interval_days = 7 WHERE id = ?1",
+            params![set],
+        )
+        .unwrap();
+        assert!(
+            !continued(Some(365)),
+            "the set's 7 days outranks the default"
         );
     }
 
@@ -8686,7 +8802,7 @@ mod tests {
                 params![days, set],
             )
             .unwrap();
-            interrupted_readback(conn, f.volume_id)
+            interrupted_readback(conn, f.volume_id, None)
                 .unwrap_or_else(|e| panic!("verify_interval_days = {days}: {e:#}"))
         };
 
