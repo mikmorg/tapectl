@@ -739,8 +739,8 @@ rm -rf ~/heir-kit                      # the PRINTED, sealed kit is the artifact
 ```
 
 Tapes are not affected by any of this. A sealed volume is self-describing: with
-`mt`, `dd`, `age`, `dar`, `tar` and a key, `RESTORE.sh` off the tape restores it
-on a machine that has never seen tapectl (operator guide, "Disaster Recovery").
+`mt`, `dd`, `age`, `dar`, `tar`, a few more coreutils (File 1 lists them) and a key,
+`RESTORE.sh` off the tape restores it on a machine that has never seen tapectl (operator guide, "Disaster Recovery").
 
 ---
 

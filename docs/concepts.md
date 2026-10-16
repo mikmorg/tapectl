@@ -862,7 +862,7 @@ and four slices.
 | File | Zone | On tape | What it holds |
 |---|---|---|---|
 | 0 | ID thunk | plaintext | Label, uuid, format version, where the front index and seal marker are, and a `[media]` block describing the cartridge. What `volume identify` prints. |
-| 1 | System guide | plaintext | The heir's manual: how to recover with `mt`, `dd`, `age`, `dar`, `tar`, `sha256sum`. |
+| 1 | System guide | plaintext | The heir's manual: how to recover with `mt`, `dd`, `age`, `dar`, `tar`, `sha256sum` and a few more coreutils it lists. |
 | 2 | `RESTORE.sh` | plaintext | A standalone recovery script that reads the front index and restores with the same standard tools. |
 | 3 | Front index | plaintext | The map: for every file, its position, type, byte size, and sha256 of its on-tape bytes. No names. |
 | 4 … | Tenant envelopes | encrypted to tenant + operator + escrow | One per tenant on the tape: `MANIFEST.toml` (each unit's name, uuid and version, the `dar` version and command, and each slice's position, sizes and plaintext and encrypted sha256), `RECOVERY.md`, and the `dar` catalogs, which are where the archived file names are. |
@@ -909,7 +909,7 @@ seal marker is visibly unsealed.
 A sealed volume promises two things and withholds a third:
 
 1. **Data.** Every unit on it can be restored by its tenant, with that tenant's
-   key and standard tools (`mt`, `dd`, `age`, `dar`, `tar`, `sha256sum`), with no
+   key and standard tools (`mt`, `dd`, `age`, `dar`, `tar`, `sha256sum` and the few more coreutils File 1 lists), with no
    tapectl and no database. This is the heir path.
 2. **Catalog.** With the operator or escrow key,
    [`catalog rebuild --from-volume`](cli/catalog.md#tapectl-catalog-rebuild)

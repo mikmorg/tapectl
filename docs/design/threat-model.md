@@ -26,7 +26,7 @@ operator's control.
 | Party | Has | tapectl's stance |
 |---|---|---|
 | The operator | the catalog, every key, the cartridges | trusted |
-| An heir | a cartridge, the Heir Kit (escrow secret, catalog copy) | trusted; must be able to restore with `mt`, `dd`, `age`, `dar`, `tar` and no tapectl |
+| An heir | a cartridge, the Heir Kit (escrow secret, catalog copy) | trusted; must be able to restore with `mt`, `dd`, `age`, `dar`, `tar` (and the coreutils File 1 lists) and no tapectl |
 | A tenant | their own key files | trusted for their own data only; tenant isolation (below) |
 | Someone who finds or steals a cartridge | the tape, nothing else | must learn nothing about content |
 | Someone who can rewrite a cartridge and put it back | the tape, write access to it | **out of scope** for authenticity; see §1.2 |
