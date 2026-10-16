@@ -1239,6 +1239,8 @@ mod tests {
             exclude: vec![],
             archive_set: None,
             dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
         };
 
         let scan = pending_units_for_collection(&conn, &lib, &global_excludes).unwrap();
@@ -1360,6 +1362,8 @@ pattern = ["*.tmp"]
             exclude: vec![],
             archive_set: None,
             dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
         };
 
         let scan = pending_units_for_collection(&conn, &lib, &[])

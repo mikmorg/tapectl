@@ -61,6 +61,8 @@ fn collection_sync_dry_run_against_a_generated_microcosm_collection_reports_sens
         exclude: vec![],
         archive_set: None,
         dotfiles: true,
+        snapshot_command: None,
+        release_command: None,
     };
     let paths = TapectlPaths::new(home.path().to_path_buf());
 

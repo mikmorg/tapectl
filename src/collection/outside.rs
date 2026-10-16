@@ -118,6 +118,8 @@ mod tests {
             exclude: exclude.iter().map(|s| s.to_string()).collect(),
             archive_set: None,
             dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
         }
     }
 

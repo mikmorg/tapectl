@@ -733,6 +733,72 @@ fn set_of_defaults_verify_interval_days_takes_a_day_count_and_refuses_zero() {
     );
 }
 
+/// ADR-0012 2026-10-16 item 75 (#455): `config set` writes a collection's
+/// `snapshot_command` and `release_command` as strings (shell syntax intact),
+/// `config check` accepts them and runs neither, and the two refusals
+/// (`release_command` alone, an empty command) leave the file untouched.
+#[test]
+fn set_of_a_collections_snapshot_hook_commands() {
+    let home = home();
+    ok(
+        home.path(),
+        &[
+            "config",
+            "add",
+            "collections",
+            "name=movies",
+            "root=/srv/media/movies",
+            "tenant=family",
+        ],
+    );
+    let out = refused(
+        home.path(),
+        &[
+            "config",
+            "set",
+            "collections[movies].release_command",
+            "zfs destroy tank/media@tapectl",
+        ],
+    );
+    assert!(
+        out.contains("release_command is set but snapshot_command is not"),
+        "{out}"
+    );
+    let out = refused(
+        home.path(),
+        &["config", "set", "collections[movies].snapshot_command", " "],
+    );
+    assert!(out.contains("snapshot_command is empty"), "{out}");
+
+    let take = "zfs snapshot tank/media@tapectl && echo /tank/media/.zfs/snapshot/tapectl";
+    ok(
+        home.path(),
+        &[
+            "config",
+            "set",
+            "collections[movies].snapshot_command",
+            take,
+        ],
+    );
+    ok(
+        home.path(),
+        &[
+            "config",
+            "set",
+            "collections[movies].release_command",
+            "zfs destroy tank/media@tapectl",
+        ],
+    );
+    let after = read(home.path());
+    assert!(
+        after.contains(&format!("snapshot_command = \"{take}\"\n")),
+        "{after}"
+    );
+    assert!(after.contains("release_command = \"zfs destroy tank/media@tapectl\"\n"));
+    assert!(after.contains("# operator note"), "{after}");
+    config_check_passes(home.path());
+}
+
 /// Issue #453: `config set` refuses a copy floor below 1 and a place floor
 /// below 0, at the defaults level and on an archive set, by name, with the
 /// file untouched; the smallest legitimate values go through.

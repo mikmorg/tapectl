@@ -114,6 +114,8 @@ mod tests {
             exclude: vec![],
             archive_set: None,
             dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();
@@ -149,6 +151,8 @@ mod tests {
             exclude: vec![],
             archive_set: None,
             dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
         };
         let paths = TapectlPaths::new(home.path().to_path_buf());
         super::super::sync::sync_collection(&conn, &paths, &lib, false, &[]).unwrap();

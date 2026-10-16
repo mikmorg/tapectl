@@ -898,6 +898,8 @@ pattern = ["*.tmp"]
             exclude: vec![],
             archive_set: None,
             dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
         }
     }
 
@@ -994,6 +996,8 @@ pattern = ["*.tmp"]
                 exclude: vec![],
                 archive_set: None,
                 dotfiles: true,
+                snapshot_command: None,
+                release_command: None,
             });
             let home = tempfile::tempdir().unwrap();
             let paths = TapectlPaths::new(home.path().to_path_buf());
@@ -1138,6 +1142,8 @@ mod checksum_mode_tests {
             exclude: vec![],
             archive_set: None,
             dotfiles,
+            snapshot_command: None,
+            release_command: None,
         }
     }
 

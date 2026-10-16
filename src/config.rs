@@ -889,6 +889,26 @@ pub struct CollectionConfig {
     /// robustness for zero on-disk footprint.
     #[serde(default = "default_true")]
     pub dotfiles: bool,
+    /// A shell command `collection run` runs once, before it snapshots or
+    /// stages any unit, to take a read-only snapshot of `root` (LVM, btrfs,
+    /// ZFS, a bind mount). It runs under `sh -c` as the user tapectl runs as,
+    /// with `TAPECTL_COLLECTION` (this collection's name) and
+    /// `TAPECTL_COLLECTION_ROOT` (the root, canonical) in its environment, and
+    /// must print one line on stdout: the absolute path of the snapshot, which
+    /// mirrors `root`. The run's snapshot and stage then read
+    /// `<that path>/<unit's path relative to root>` while every recorded path
+    /// stays the unit's real one (ADR-0012 2026-10-16 item 75, issue #455).
+    /// A command that fails, or prints anything else, refuses the run before
+    /// any unit is read. `config check` validates the key and runs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_command: Option<String>,
+    /// A shell command `collection run` runs once its staging is over,
+    /// whether it succeeded or not, to drop the snapshot `snapshot_command`
+    /// took: the same environment plus `TAPECTL_SNAPSHOT_PATH`. Best effort:
+    /// a failure is a warning, never a reason to fail the run. Needs
+    /// `snapshot_command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_command: Option<String>,
 }
 
 fn default_unit_depth() -> usize {
@@ -1455,6 +1475,31 @@ impl Config {
                 problems.push(format!(
                     "{}: defaults.verify_interval_days = {days} {e}",
                     path.display()
+                ));
+            }
+        }
+        // ADR-0012 2026-10-16 item 75 (#455): a collection's snapshot hook.
+        for (i, lib) in self.collections.iter().enumerate() {
+            for (key, value) in [
+                ("snapshot_command", &lib.snapshot_command),
+                ("release_command", &lib.release_command),
+            ] {
+                if value.as_deref().is_some_and(|c| c.trim().is_empty()) {
+                    problems.push(format!(
+                        "{}: collections[{i}] (\"{}\").{key} is empty (leave the key out \
+                         for no command)",
+                        path.display(),
+                        lib.name
+                    ));
+                }
+            }
+            if lib.release_command.is_some() && lib.snapshot_command.is_none() {
+                problems.push(format!(
+                    "{}: collections[{i}] (\"{}\").release_command is set but \
+                     snapshot_command is not: nothing takes a snapshot, so there is nothing \
+                     to release",
+                    path.display(),
+                    lib.name
                 ));
             }
         }
@@ -4085,6 +4130,69 @@ mod tests {
         // Round trip: a set value is written back.
         let again = toml::to_string_pretty(&cfg).unwrap();
         assert!(again.contains("verify_interval_days = 365"), "{again}");
+    }
+
+    /// ADR-0012 2026-10-16 item 75 (#455): a collection's `snapshot_command`
+    /// and `release_command` load as strings and round-trip; an empty one is
+    /// refused by name, a `release_command` with nothing to release is
+    /// refused by name, `config check`'s lenient path lists both, and an
+    /// unknown key beside them is still refused.
+    #[test]
+    fn config_load_checks_a_collections_snapshot_hook_keys() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let head = "[[collections]]\nname = \"movies\"\nroot = \"/srv/movies\"\ntenant = \"t\"\n";
+
+        std::fs::write(&path, head).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.collections[0].snapshot_command, None);
+        assert_eq!(cfg.collections[0].release_command, None);
+        assert!(!toml::to_string_pretty(&cfg).unwrap().contains("_command"));
+
+        let body = format!(
+            "{head}snapshot_command = \"/usr/local/bin/snap-take\"\n\
+             release_command = \"/usr/local/bin/snap-drop\"\n"
+        );
+        std::fs::write(&path, &body).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(
+            cfg.collections[0].snapshot_command.as_deref(),
+            Some("/usr/local/bin/snap-take")
+        );
+        let again = toml::to_string_pretty(&cfg).unwrap();
+        assert!(again.contains("release_command = \"/usr/local/bin/snap-drop\""));
+
+        for (extra, needle) in [
+            (
+                "snapshot_command = \"  \"\n",
+                "collections[0] (\"movies\").snapshot_command is empty",
+            ),
+            (
+                "snapshot_command = \"x\"\nrelease_command = \"\"\n",
+                "collections[0] (\"movies\").release_command is empty",
+            ),
+            (
+                "release_command = \"drop\"\n",
+                "collections[0] (\"movies\").release_command is set but snapshot_command is not",
+            ),
+        ] {
+            let body = format!("{head}{extra}");
+            std::fs::write(&path, &body).unwrap();
+            let msg = Config::load(&path).unwrap_err().to_string();
+            assert!(msg.contains(needle), "{needle}: {msg}");
+            let report = crate::policy::lenient_config::check(&body, &path);
+            assert!(!report.valid, "{extra}");
+            assert!(
+                report.problems.iter().any(|p| p.contains(needle)),
+                "{:?}",
+                report.problems
+            );
+        }
+
+        // Unknown keys are refused as everywhere: a near miss is not ignored.
+        std::fs::write(&path, format!("{head}snapshot_cmd = \"x\"\n")).unwrap();
+        let msg = Config::load(&path).unwrap_err().to_string();
+        assert!(msg.contains("snapshot_cmd"), "{msg}");
     }
 
     /// Issue #453 (the #452 review, catalog lens 8): a `min_copies` below 1

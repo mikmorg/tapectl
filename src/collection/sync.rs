@@ -477,6 +477,8 @@ mod tests {
             exclude: vec!["*.partial".to_string()],
             archive_set: None,
             dotfiles: true,
+            snapshot_command: None,
+            release_command: None,
         }
     }
 
