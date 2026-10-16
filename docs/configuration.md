@@ -278,7 +278,7 @@ These are the system-wide defaults. They form the bottom layer of
 | `large_file_warn_threshold` | size (binary) | `"100G"` | `snapshot create` warns about any file bigger than this. It only warns and never refuses. | [`snapshot create`](cli/snapshot.md#tapectl-snapshot-create) |
 | `min_copies` | integer | `2` | The number of Copies each Version of a unit needs, unless the unit's archive set sets its own `min_copies` (a dotfile cannot set this key). It is the bottom layer of every unit's copy requirement. A tape-only unit needs it times [`tape_only_safety_multiplier`](#compaction) everywhere it is judged. At least 1: 0 or below is refused by name at load, `config check` and `config set` (#453). | `audit`, `report summary/fire-risk/pending/supersedable`, `collection status/run`, `staging clean`, `unit mark-tape-only`, `snapshot mark-reclaimable`, and the retire gate of `volume retire`, `cartridge retire` and `volume compact-finish` (see below the table) |
 | `min_locations` | integer | `2` | How many distinct locations a tape-only unit's copies must span, as set. [`tape_only_safety_multiplier`](#compaction) never raises it (a tape-only unit needs more copies, not more places), and a unit that is not tape-only has no such floor. [`unit mark-tape-only`](cli/unit.md#tapectl-unit-mark-tape-only) asks it before accepting a unit without consent. After that, `audit` holds the unit to it (`location_count`, a violation) and `snapshot mark-reclaimable` / `report supersedable` ask it of the version that supersedes the one released. It exists only here: an archive set names places with `required_locations` instead. 0 or more: a negative value is refused by name (#453). | `unit mark-tape-only`, `audit`, `snapshot mark-reclaimable`, `report supersedable` |
-| `verify_interval_days` | integer | unset | The full-readback clock for every unit whose archive set gives none (#453): `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit's copies, or a volume, have had no passing full readback within this many days. At least 1, refused by name otherwise. An archive set's own `verify_interval_days` overrides it; a dotfile cannot set it. Unset means a unit with no archive-set interval is not checked (365 becomes the default in 1.2.0). | [`audit`](cli/audit.md#tapectl-audit) |
+| `verify_interval_days` | integer | `365` | The full-readback clock for every unit whose archive set gives none (#453): `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit's copies, or a volume, have had no passing full readback within this many days. At least 1, refused by name otherwise. An archive set's own `verify_interval_days` overrides it; a dotfile cannot set it. Absent from the file means 365 (1.2.0); `init` writes it. There is no way to switch the clock off; a very large number is the nearest thing. `config check` prints the value in force. | [`audit`](cli/audit.md#tapectl-audit) |
 | `warehouse_copies` | integer | `0` | How many warehouse deposits each unit should have in addition to its tape copies ([ADR-0006](adr/0006-storage-interface-first-class-stores.md)). `0` means none are expected, and `audit` says nothing about warehouses. | `audit` |
 
 `unit mark-tape-only` checks the unit against the floors of a tape-only unit, which
@@ -402,7 +402,7 @@ written to the database, and each has a matching `archive-set create`/`edit` fla
 | `compression` | closed set, as in `[defaults]` | Overrides `[defaults] compression`. | `--compression` |
 | `checksum_mode` | closed set, as in `[defaults]` | Overrides `[defaults] checksum_mode` for units registered into this set. Units already registered keep their mode. | `--checksum-mode` |
 | `slice_size` | size (binary) | Overrides `[defaults] slice_size`. | `--slice-size` |
-| `verify_interval_days` | integer | `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit with copies has had no passing full `volume verify` within this many days. Overrides `[defaults] verify_interval_days`; with neither, verify age is not checked. It also bounds how old an interrupted full readback may be and still be continued: a full verify or `--full-confirm` does not continue one whose oldest read is older than the shortest interval among the units on that volume, and reads everything again (ADR-0012, 2026-10-07). It must be at least 1: `archive-set create`, `edit` and `sync` refuse a smaller value by name, and so do loading config.toml and `config check` (#422). A catalog row written with one before then keeps working; at 0 or below, no interrupted readback is continued. | `--verify-interval-days` |
+| `verify_interval_days` | integer | `audit` warns (`verify_age`, and per volume `volume_verify_age`) when a unit with copies has had no passing full `volume verify` within this many days. Overrides `[defaults] verify_interval_days` (365 days when that is absent). It also bounds how old an interrupted full readback may be and still be continued: a full verify or `--full-confirm` does not continue one whose oldest read is older than the shortest interval among the units on that volume, and reads everything again (ADR-0012, 2026-10-07). It must be at least 1: `archive-set create`, `edit` and `sync` refuse a smaller value by name, and so do loading config.toml and `config check` (#422). A catalog row written with one before then keeps working; at 0 or below, no interrupted readback is continued. | `--verify-interval-days` |
 | `preserve_xattrs`, `preserve_acls`, `preserve_fsa` | bool | Override their `[defaults]` namesakes for this set's units, with the same effect. `preserve_acls` still has no effect of its own. | `--preserve-xattrs`, `--preserve-acls`, `--preserve-fsa` (each `true\|false`) |
 | `dirty_on_metadata_change` | bool | Stored and resolved, but read by nothing, as in `[defaults]`. `config check` names it when `true`. | `--dirty-on-metadata-change true\|false` |
 
@@ -456,11 +456,14 @@ archives), where registering units one at a time would be a chore. See
 | `exclude` | list of globs | `[]` | Unit folders to skip. Case never matters. A plain pattern is matched against the candidate **folder's own name**: `"*.partial"` skips an in-flight copy such as `Beta.PARTIAL`. A pattern ending in `/` (`"incoming/"`) skips a candidate folder of that name and, with `unit_depth` 2 or more, every candidate below one. The same patterns silence a loose file or symlink above the unit folders that `collection sync` and `status` would otherwise report as outside any unit. This is separate from `global_excludes`, which applies to files *inside* units. |
 | `archive_set` | string | unset | The archive set new units are bound to. It must already exist in the database (run `archive-set sync` first). Unset means the units use `[defaults]`. |
 | `dotfiles` | bool | `true` | `true`: each new unit gets a `.tapectl-unit.toml`, so renaming or moving the folder keeps its identity. `false`: units are identified by path, for read-only sources you cannot write to. A renamed folder then looks like a new unit. |
+| `snapshot_command` | string | unset | Run once per `collection run`, before any unit is snapshotted or staged, under `sh -c` as the user tapectl runs as, with `TAPECTL_COLLECTION` and `TAPECTL_COLLECTION_ROOT` (the canonical root) in its environment and its stdin closed. It must print exactly one line on stdout: the absolute path of a read-only snapshot that mirrors the root's layout and is not inside the root. The run's snapshot and stage read each unit's folder there while every recorded path stays the real one. Any other outcome (a non-zero exit, no line or several, a relative path, a path that is not a directory, a path inside the root) refuses the run before any unit is read, naming the command and its stderr. An empty command is refused at load, in `config check` and in `config set`. `config check` validates the key and runs nothing; `collection run --dry-run` shows the command and runs nothing. See [a source that is in use](operator-guide.md#a-snapshot-hook-for-collection-run). |
+| `release_command` | string | unset | Needs `snapshot_command` (the key alone is refused by name). Run when the run's staging is over, whether it succeeded or not, before any tape is touched, with the same variables plus `TAPECTL_SNAPSHOT_PATH`. Best effort: a failure is a warning on stderr (`snapshot_release_warning` in `--json`), never a reason to fail the run. It does not run when `snapshot_command` itself failed, because nothing was taken. |
 
 Read by: [`collection sync`](cli/collection.md#tapectl-collection-sync),
 [`status`](cli/collection.md#tapectl-collection-status),
 [`plan`](cli/collection.md#tapectl-collection-plan) and
-[`run`](cli/collection.md#tapectl-collection-run).
+[`run`](cli/collection.md#tapectl-collection-run). Only `run` uses
+`snapshot_command` and `release_command`; the other three never start either.
 
 Ordinary media-library names such as `Alien (1979)` break the unit-name rules.
 `collection sync` registers every folder whose name is valid, prints one error for
@@ -887,7 +890,7 @@ shows which layer can carry which field:
 |---|---|---|---|
 | copies required | — | `min_copies` | `min_copies` |
 | places required | — | `required_locations` (names) | — (none named) |
-| verify interval | — | `verify_interval_days` | `verify_interval_days` (unset: not checked) |
+| verify interval | — | `verify_interval_days` | `verify_interval_days` (365 when absent) |
 | slice size | `slice_size` | `slice_size` | `slice_size` |
 | compression | `compression` | `compression` | `compression` |
 | checksum mode (at registration) | `checksum_mode` | `checksum_mode` | `checksum_mode` |
@@ -1026,6 +1029,7 @@ config: valid
 dar: 2.7.13 at '/usr/bin/dar' (meets minimum 2.6)
 staging: '/srv/staging' exists and is writable
 host check (defaults, no [host_check] table): units none; processes cargo, rustc, docker, Runner.Worker; max load 1.00/CPU; min available 2048 MiB; max memory pressure 10.00%; max I/O pressure 10.00% — `tapectl host check` runs it
+defaults: verify_interval_days = 365 (`audit` warns when a unit has gone longer without a passing full `volume verify`; an archive set that names its own interval overrides this for its units)
 ```
 
 How to read it:
@@ -1047,6 +1051,7 @@ How to read it:
 | `[defaults].… is not a recognised setting …` | A misspelled or unknown `[defaults]` key. |
 | `host check (…)` | The quiet-host limits in force, and whether they came from a `[host_check]` table or the defaults. |
 | `ops: …` / `warning: ops: …` | Only with an [`[ops]`](#ops) table: the group that may read the session logs, and anything about the group, its membership or the home's modes that is not yet as it needs to be. |
+| `defaults: verify_interval_days = N (…)` | The full-readback clock in force: the file's value, or 365 when the key is absent (1.2.0). It is the last line of the report. |
 
 Everything after the first line is advice. It never changes the exit code, and
 `config check` never edits your files or touches a tape. `--json` gives the same
@@ -1054,7 +1059,8 @@ report as one object, with fields such as `valid`, `problems`, `dar`, `staging`,
 `staging_space`, `tape_devices`, `shadowing_dotfiles`, `unknown_keys`,
 `decorative_keys` (keys that do nothing, such as `dirty_on_metadata_change = true`),
 `subsumed_policy_fields` (the `preserve_acls` notes), `host_check` (with `warnings`
-for contender names longer than 15 characters), `ops` and more.
+for contender names longer than 15 characters), `ops`, `defaults` (its
+`verify_interval_days` is the value in force; the object is `null` only when the file did not load) and more.
 
 Other commands fail on an invalid config with the first problem only, and exit 2:
 
@@ -1067,7 +1073,8 @@ error: failed to load config: configuration error: ~/.tapectl/config.toml: defau
 [`config show`](cli/config.md#tapectl-config-show) prints `config.toml` exactly as
 it is on disk, comments included. With `--json`, it prints the parsed TOML as JSON
 instead, without the comments. It shows only what the file contains, not the
-defaults filled in for keys you left out. Unlike `config check`, it loads the
+defaults filled in for keys you left out: a file that lacks `verify_interval_days`
+does not show the 365 in force (`config check` does). Unlike `config check`, it loads the
 config strictly first, so it fails on a file that is invalid.
 
 ```bash
