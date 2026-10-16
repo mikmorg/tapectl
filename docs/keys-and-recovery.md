@@ -595,12 +595,16 @@ a rotation in between needs nothing from you. Full reference:
 
 ### B. A tenant holding only their key files and a tape
 
-This is the Heir Path. It needs `mt`, `dd`, `age`, `dar`, `sha256sum`, `tar`, `bash`
-and coreutils. It does not need tapectl. Install them all first. `RESTORE.sh`
-checks for each one before it touches the tape and stops with
-`FATAL: missing required tool: <name>`. On tapes written before that check
-gained `tar` (2026-09-28), a missing `tar` shows up only later, after the
-envelope has been read and decrypted.
+This is the Heir Path. It needs `mt` (package `mt-st`), `dd`, `head`, `truncate`, `tar`,
+`mkfifo`, `tee`, `sha256sum`, `age`, `dar`, `bash` and coreutils (and `gpg` only when the
+dar was built with GPG support). It does not need tapectl. A tape written by 1.2.0 or later
+has a RESTORE.sh that checks, when a mode starts and before it reads the tape, only the tools
+that mode runs, and stops with `FATAL: missing required tool: <name>`: `--info` and
+`--verify` need only `mt`, `dd`, `sha256sum` and `head`; `--find-envelope` adds `age`,
+`truncate` and `tar`; `--list` adds `dar`; `--restore --path` adds `tee`; a whole-unit
+`--restore` needs `tee` and `mkfifo` too. A RESTORE.sh from an earlier tape checks every
+tool in every mode (and before 2026-09-28 not `tar`: a missing one showed up only after the
+envelope had been decrypted).
 
 1. **Read the tape's identity** (File 0) to confirm you have the right cartridge:
    ```bash
@@ -661,7 +665,10 @@ envelope has been read and decrypted.
    ```
    Without `--version N` the newest version on the tape is restored. Without
    `--unit` the script restores the unit if the envelope it opened holds only
-   one. With several, it lists them and stops with `FATAL: multiple units found —
+   one. On a 1.2.0 tape it then says, before RESTORE COMPLETE, how many other
+   envelopes your key opened and how many other units they list, and names `--list`
+   and `--all`: an escrow or operator key opens every tenant's envelope, so look
+   before you assume the tape held one unit. With several, it lists them and stops with `FATAL: multiple units found —
    specify one with --unit NAME` (exit 1). Run it again with `--unit`.
    Each slice is checked against the front index's hash before it is decrypted.
 
@@ -673,6 +680,12 @@ envelope has been read and decrypted.
    measures this before it reads any slice and stops with
    `not enough disk space` if it will not fit. Do not restore into `/tmp`,
    which is RAM on many systems.
+
+   The decrypted envelopes (the operator's catalog.db and the dar catalogues, which grow with the
+   number of files) go to a work directory under $TMPDIR (default /tmp); set TMPDIR to move it.
+   The script warns before reading them when that directory looks too small. The `--to` figure
+   counts the slices' encrypted size on tape, so a unit stored compressed may need more. A
+   1.2.0 RESTORE.sh sets LC_ALL=C so its reading of dar's messages holds in any locale.
 
    If the envelope holds no usable dar catalogue for the unit and the
    machine's dar is older than 2.7.21 (Debian's and Ubuntu's is 2.7.13),
@@ -694,7 +707,8 @@ envelope has been read and decrypted.
    only the slices that hold it.
 
 The same steps work with the operator key or the escrow secret, which open every
-tenant's envelope. `--unit` then picks the right one.
+tenant's envelope. `--unit` then picks the right one, or `--list` first and
+`--restore … --all` takes every unit.
 
 ### C. The catalog is gone, and you hold the operator or escrow key
 
@@ -1142,7 +1156,8 @@ tapectl, needs to know this:
   program named `age`), `dar` ([dar.linux.free.fr](http://dar.linux.free.fr)),
   `gpg` (package `gnupg`) only when the dar was built with GPG support, as
   Debian's and Ubuntu's is, and `bash`. Any Linux machine has them or can
-  install them; RESTORE.sh checks for each before it reads the tape.
+  install them; RESTORE.sh (1.2.0 and later) checks, before it reads the tape,
+  the tools the mode you ran needs.
 - **The key is the secret handwritten on the cover sheet** (`AGE-SECRET-KEY-1…`).
   The printed `age1…` value is only a check. Type the secret on one line of a
   file and confirm that `age-keygen -y` on that file prints the `age1…`.
