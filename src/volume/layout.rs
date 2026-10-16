@@ -1638,12 +1638,24 @@ die_no_envelope() { # [unit]
   if [ -n "${1:-}" ]; then
     headline="no envelope for unit '$1' matched $(keys_phrase)"
   fi
-  if [ "$DAMAGED_ENVELOPES" -gt 0 ]; then
+  if [ "$MATCHED_DAMAGED" -gt 0 ]; then
     die "$headline that could be opened.
        $DAMAGED_ENVELOPES envelope(s) on this tape are DAMAGED (see the WARNING
        lines above): a key matched, so this is not a wrong key. Another copy of
        this volume, or the operator or escrow key (which open the operator
        envelope and its backup), can still recover the data.
+       Keys tried: $(keys_list)"
+  fi
+  if [ "$DAMAGED_ENVELOPES" -gt 0 ]; then
+    die "$headline that could be opened.
+       $DAMAGED_ENVELOPES envelope(s) on this tape are DAMAGED (see the WARNING
+       lines above), but no key opened any of them: they could not be read or
+       failed their hash, so this is damage, a key that is not a recipient, or
+       both. Another copy of this volume, or the operator or escrow key (which
+       open the operator envelope and its backup), can still recover the data.
+       Tape in $DEVICE identifies as '${TAPE_LABEL:-<unreadable>}'; this script is for '$LABEL'.
+       If you hold other keys, try them: an envelope is sealed with the key
+       that was active when THIS tape was written.
        Keys tried: $(keys_list)"
   fi
   die "$headline
@@ -1664,6 +1676,10 @@ die_no_envelope() { # [unit]
 # the front index's keyless hash says so before any key is tried.
 ENV_KEY=""
 DAMAGED_ENVELOPES=0
+# How many of those a key MATCHED (age got past the header, the payload would
+# not decrypt). Only then is "not a wrong key" true; an envelope that would not
+# read, or failed its hash with no key opening it, says nothing about the keys.
+MATCHED_DAMAGED=0
 try_envelope() { # <position>
   local pos=$1 esize ehash actual keyfile mismatch=0
   ENV_KEY=""
@@ -1707,6 +1723,7 @@ try_envelope() { # <position>
     # The key matched (age got past the header), so no other key can do
     # better: these bytes are damaged.
     DAMAGED_ENVELOPES=$((DAMAGED_ENVELOPES + 1))
+    MATCHED_DAMAGED=$((MATCHED_DAMAGED + 1))
     echo "WARNING: key $keyfile matched the envelope at file $pos, but the envelope is DAMAGED:" >&2
     cat "$WORK/age.err" "$WORK/tar.err" 2>/dev/null | sed 's/^/         /' >&2 || true
     return 2

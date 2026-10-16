@@ -1334,6 +1334,10 @@ fn a_damaged_envelope_is_reported_as_damage_not_as_a_wrong_key() {
         !text.contains("try your OTHER keys"),
         "damage is not a key problem:\n{text}"
     );
+    assert!(
+        text.contains("a key matched, so this is not a wrong key"),
+        "a key did match here, and the script says so:\n{text}"
+    );
 
     // Control: a key that matches nothing still gets the rotation hint.
     let h = Heir::new();
@@ -2309,4 +2313,75 @@ fn each_mode_is_refused_for_the_tools_it_runs_and_no_others() {
             "{mode}: {text}"
         );
     }
+}
+
+// ---- #449 item 3: "a key matched" only when one did ----
+
+/// An envelope that is DAMAGED because it will not read, or fails its hash,
+/// was never opened by any key, so the script cannot say "a key matched, so
+/// this is not a wrong key". The case behind the finding: a tenant's key, an
+/// unreadable operator envelope (which that key could never have opened), and
+/// a unit the tenant's own envelope does not list. The three counted cases
+/// are the three places try_envelope calls an envelope DAMAGED.
+#[test]
+fn damage_is_not_blamed_on_a_matching_key_when_no_key_matched() {
+    let wrong_key_claim = "a key matched, so this is not a wrong key";
+    let unreadable_operator = |h: &Heir, env: &[(&str, &str)]| {
+        h.run_env(
+            &[
+                "--restore",
+                "--key",
+                &h.key("alice"),
+                "--unit",
+                "ledgers", // bob's, not in alice's envelope
+                "--to",
+                &h.sub("restored"),
+            ],
+            env,
+        )
+    };
+
+    // 1. The operator envelope (file 7) will not read. alice's key never
+    //    could have opened it.
+    let h = Heir::new();
+    let (code, text) = unreadable_operator(&h, &[("FAKE_DD_FAIL", "7")]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("DAMAGED"), "{text}");
+    assert!(
+        !text.contains(wrong_key_claim),
+        "no key opened the unreadable envelope:\n{text}"
+    );
+    assert!(
+        text.contains("no key opened"),
+        "it says what is known instead:\n{text}"
+    );
+    assert!(
+        text.contains("try them"),
+        "a wrong key is still on the table, so the other keys are suggested:\n{text}"
+    );
+
+    // 2. The operator envelope reads but fails its front-index hash, and
+    //    alice's key does not open it.
+    let h = Heir::new();
+    for pos in [7, 8] {
+        let f = h.dir.join("tape").join(pos.to_string());
+        let mut bytes = std::fs::read(&f).unwrap();
+        bytes[100] ^= 0xff; // inside the ciphertext, past the stub header
+        std::fs::write(&f, bytes).unwrap();
+    }
+    let (code, text) = unreadable_operator(&h, &[]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("does not match the front index"), "{text}");
+    assert!(!text.contains(wrong_key_claim), "{text}");
+    assert!(text.contains("no key opened"), "{text}");
+
+    // 3. Control: when a key DID match a damaged envelope, it still says so
+    //    (alice's own envelope and its backup are damaged after the header).
+    let h = Heir::new();
+    damage_envelope(&h, 4);
+    damage_envelope(&h, backup_of(4));
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("alice")]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains(wrong_key_claim), "{text}");
+    assert!(!text.contains("no key opened"), "{text}");
 }
