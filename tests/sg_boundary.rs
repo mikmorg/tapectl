@@ -175,6 +175,11 @@ const SPAWNS: &[(&str, &str)] = &[
     ("src/tape/log_pages.rs", "LOG_TOOL"),        // `sg_logs -V`
     ("src/tape/log_pages.rs", "&argv[0]"),        // SgLogs::read_argv / decode_argv, pinned above
     ("src/tape/mam.rs", "MAM_TOOL"),              // sg_read_attr: READ ATTRIBUTE
+    // `sh -c` over the operator's own `snapshot_command` / `release_command` of a
+    // `[[collections]]` table (ADR-0012 2026-10-16 item 75): the operator's command
+    // line, run as the user tapectl runs as, given the collection's name and root
+    // and the snapshot's path and no device. tapectl does not choose what it runs.
+    ("src/collection/hook.rs", "\"sh\""),
 ];
 
 #[test]
