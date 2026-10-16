@@ -66,6 +66,8 @@ BACKUP_DIR="/var/backups/tapectl"  # step 14: where the daily `db backup` copies
 WORK_DIR=""            # build lock + step-12 rehearsal workspace; default /scratch if present, else ~/.cache/tapectl
 STAGING_DIR=""         # step 7: staging.directory default
 STAGING_JOBS=""        # step 7: [staging] jobs, units staged at once (#368); empty = leave the config's value
+VERIFY_INTERVAL_DAYS="" # step 7: [defaults] verify_interval_days, the full-readback clock audit keeps per unit
+                       # and per volume (#453, #454; ADR-0012 items 66-67); empty = leave the config's value
 # CONTENDER_PROCESSES=(…) step 7: [host_check] contender_processes, the WHOLE list (the built-in one is
 #                        cargo rustc docker Runner.Worker; repeat it when adding). Unset = leave the config's value.
 DAR_BIN=""             # step 2/4/7: the dar to check, test with and write into [dar] binary
@@ -834,6 +836,11 @@ if [ -n "$STAGING_JOBS" ]; then
   # #368: units staged at once, measured per host (home2: 2, ADR-0012 2026-10-13).
   run tc config set staging.jobs "$STAGING_JOBS" || die "could not set staging.jobs = $STAGING_JOBS"
   ok "staging.jobs = $STAGING_JOBS (units staged at once)"
+fi
+if [ -n "$VERIFY_INTERVAL_DAYS" ]; then
+  run tc config set defaults.verify_interval_days "$VERIFY_INTERVAL_DAYS" \
+    || die "could not set defaults.verify_interval_days = $VERIFY_INTERVAL_DAYS"
+  ok "defaults.verify_interval_days = $VERIFY_INTERVAL_DAYS (audit warns when a unit or a volume has not been read back in full for longer)"
 fi
 if declare -p CONTENDER_PROCESSES >/dev/null 2>&1 && [ "${#CONTENDER_PROCESSES[@]}" -gt 0 ]; then
   # The processes `host check` names before a write (ADR-0012 2026-10-13 item 55).

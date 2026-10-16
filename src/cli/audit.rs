@@ -1746,9 +1746,8 @@ fn no_full_verify_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 // volume that counts as a copy (`coverage::eligible`) and holds a completed
 // write, the newest passing FULL readback, dated by its start
 // (`evidence::full_readback_date`, ADR-0012 2026-10-07 item 30), against the
-// shortest `verify_interval_days` among the archive sets of the units on it
-// (the rule `volume_verify_interval_days` applies to a continued readback;
-// only an archive set carries the key). Past it, the volume is named with its
+// shortest resolved `verify_interval_days` among the units on it (an archive
+// set's, else `[defaults] verify_interval_days`, #453). Past it, the volume is named with its
 // cartridge and its place, so the operator knows which tape to fetch.
 //
 // A volume with no passing full readback at all is `no_full_verify`'s, named
@@ -1758,19 +1757,26 @@ fn no_full_verify_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
 fn check_volume_verify_age(ctx: &Ctx<'_>) -> Result<Findings> {
     Ok(Findings {
         violations: Vec::new(),
-        warnings: volume_verify_age_findings(ctx.conn)?,
+        warnings: volume_verify_age_findings(ctx.conn, ctx.config.defaults.verify_interval_days)?,
     })
 }
 
-fn volume_verify_age_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
+/// `defaults_interval` is `[defaults] verify_interval_days` (#453): a unit
+/// with no archive set, or whose set carries no interval, takes it, as
+/// `policy::resolve` does. Without it, a host with no archive sets (home2)
+/// would never have a per-volume clock.
+fn volume_verify_age_findings(
+    conn: &Connection,
+    defaults_interval: Option<i64>,
+) -> Result<Vec<AuditFinding>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT v.label, c.barcode, l.name,
                 MAX({dated}) AS last_full,
-                (SELECT MIN(a.verify_interval_days)
+                (SELECT MIN(COALESCE(a.verify_interval_days, ?1))
                    FROM writes w2
                    JOIN snapshots s2 ON s2.id = w2.snapshot_id
                    JOIN units u2 ON u2.id = s2.unit_id
-                   JOIN archive_sets a ON a.id = u2.archive_set_id
+                   LEFT JOIN archive_sets a ON a.id = u2.archive_set_id
                   WHERE w2.volume_id = v.id AND w2.status = 'completed') AS interval_days
            FROM volumes v
            JOIN verification_sessions vs
@@ -1787,7 +1793,7 @@ fn volume_verify_age_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
         eligible = policy::coverage::eligible("v"),
     ))?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params![defaults_interval], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
@@ -1818,8 +1824,8 @@ fn volume_verify_age_findings(conn: &Connection) -> Result<Vec<AuditFinding>> {
             check: "volume_verify_age".into(),
             message: format!(
                 "volume \"{label}\" ({cartridge}, {at}) was last read back in full on \
-                 {last_full}{age}: past the {days}-day verify interval of the tightest \
-                 archive set on it, whatever the unit's other copies show",
+                 {last_full}{age}: past the {days}-day verify interval of the unit on it \
+                 with the shortest one, whatever the unit's other copies show",
                 cartridge = barcode.map_or("no cartridge recorded".to_string(), |b| format!(
                     "cartridge {b}"
                 )),
@@ -4838,12 +4844,48 @@ mod tests {
         }
 
         fn warnings_of(conn: &Connection, check: &str) -> Vec<AuditFinding> {
-            let (violations, warnings) = collect_findings(conn, &Config::default(), None).unwrap();
+            warnings_with(conn, &Config::default(), check)
+        }
+
+        fn warnings_with(conn: &Connection, config: &Config, check: &str) -> Vec<AuditFinding> {
+            let (violations, warnings) = collect_findings(conn, config, None).unwrap();
             assert!(
                 violations.iter().all(|f| f.check != check),
                 "{check} is a warning, never a violation (exit 1, not 2): {violations:?}"
             );
             warnings.into_iter().filter(|f| f.check == check).collect()
+        }
+
+        /// A host with no archive sets (home2) takes its interval from
+        /// `[defaults] verify_interval_days` (#453): with it set, a stale
+        /// volume is named; unset, no unit gives the volume a clock.
+        #[test]
+        fn a_unit_with_no_archive_set_takes_the_defaults_interval() {
+            let conn = world(None);
+            conn.execute("UPDATE units SET archive_set_id = NULL", [])
+                .unwrap();
+            add_volume(
+                &conn,
+                "L6-ONLY",
+                "sealed",
+                Some("home"),
+                Some("BC-ONLY"),
+                Some(400),
+            );
+            assert!(
+                warnings_of(&conn, "volume_verify_age").is_empty(),
+                "no interval anywhere: no clock"
+            );
+            let mut config = Config::default();
+            config.defaults.verify_interval_days = Some(365);
+            let found = warnings_with(&conn, &config, "volume_verify_age");
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(found[0].message.contains("365-day"), "{}", found[0].message);
+            config.defaults.verify_interval_days = Some(500);
+            assert!(
+                warnings_with(&conn, &config, "volume_verify_age").is_empty(),
+                "inside the defaults interval"
+            );
         }
 
         /// The acceptance case: a fresh home copy and a two-year-old offsite

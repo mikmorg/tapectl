@@ -507,7 +507,10 @@ Once a kit exists and volumes have been sealed after it, the warning is
 (*time*): the kit's escrow secret still opens them (it is a recipient of every
 tape), but the kit's encrypted catalog (catalog.db.age) does not list them —
 regenerate the kit, or rebuild the catalog from those tapes with `tapectl catalog
-rebuild --from-volume`". Both suggest `tapectl key escrow-kit --out <dir>`.
+rebuild --from-volume`". Both suggest `tapectl key escrow-kit --out <dir>`. The same
+warning fires when a `volume move` or `cartridge move` happened after the kit: the
+cover sheet's list of places and the locations in `catalog.db.age` are then out of
+date, so reprint COVER.txt and correct its "Tapes are at" box (#448).
 
 A refresh changes `catalog.db.age` **and the cover sheet that describes it**. The
 sheet prints the catalog's size in bytes (under WHAT ELSE IS IN THIS ENVELOPE)
@@ -1119,19 +1122,25 @@ tapectl, needs to know this:
 - **Do not erase, degauss or reformat the cartridges.** Left alone, they stay
   readable for decades.
 - **You need an LTO drive that can read that generation.** The label on the
-  cartridge and File 0 (`Media: LTO-6`, for example) name the generation. Check
-  the drive maker's read-compatibility table, because not every generation reads
-  the ones two back. A data-recovery firm can read a cartridge if you cannot
-  find a drive.
+  cartridge and File 0 (`Media: LTO-6`, for example) name the generation. An
+  LTO-6 cartridge reads only in an LTO-6 or LTO-7 drive; an LTO-8 drive reads
+  only LTO-7, LTO-7 Type M and LTO-8. The cover sheet prints the drives for the
+  generations on the tapes it knew (#448). The drive connects by SAS (some models
+  Fibre Channel), so the reading computer needs a matching host adapter (HBA);
+  there is no USB or SATA tape drive. A data-recovery firm can read a cartridge
+  if you cannot find a drive.
 - **Find the drive's device name.** The cover sheet and every tape print their
   commands with `/dev/nst0`, and say that is only an example.
   `ls -l /dev/tape/by-id/` lists the tape drives. Use the entry ending in `-nst`
   wherever those commands say `/dev/nst0`. A wrong device reads a different tape,
   or fails.
-- **Tools:** `mt` (package `mt-st`), `dd`, `age` and `age-keygen`
-  ([age-encryption.org](https://age-encryption.org)), `dar`
-  ([dar.linux.free.fr](http://dar.linux.free.fr)), `sha256sum`, `head`,
-  `truncate`, `tar` and `bash`, which any Linux machine has or can install.
+- **Tools:** `mt` (package `mt-st`), `dd`, `head`, `truncate`, `tar`, `mkfifo`,
+  `tee`, `sha256sum`, `age` and `age-keygen` ([age-encryption.org](https://age-encryption.org);
+  the files are age v1 format, which `rage` reads too, but RESTORE.sh runs a
+  program named `age`), `dar` ([dar.linux.free.fr](http://dar.linux.free.fr)),
+  `gpg` (package `gnupg`) only when the dar was built with GPG support, as
+  Debian's and Ubuntu's is, and `bash`. Any Linux machine has them or can
+  install them; RESTORE.sh checks for each before it reads the tape.
 - **The key is the secret handwritten on the cover sheet** (`AGE-SECRET-KEY-1…`).
   The printed `age1…` value is only a check. Type the secret on one line of a
   file and confirm that `age-keygen -y` on that file prints the `age1…`.

@@ -2121,9 +2121,17 @@ will not adopt an aborted session on it without a full verify on record.
 Then the rotation: pick the N volumes whose newest pass is oldest, such that
 **every volume gets one full pass within your verification interval**. If you hold 24 volumes on a
 12-month interval, that is roughly 2 per month. The interval `audit` checks is
-`verify_interval_days`, which only an archive set carries
-(`tapectl archive-set edit <name> --verify-interval-days N`). For a unit
-outside such a set, the interval is yours to keep, and nothing checks it.
+`verify_interval_days`: an archive set's (`tapectl archive-set edit <name>
+--verify-interval-days N`), else `[defaults] verify_interval_days` (`tapectl
+config set defaults.verify_interval_days 365`, #453). With neither, nothing
+checks it.
+
+`audit` judges each volume on its own as well: `volume_verify_age` warns when a
+volume's newest full readback is older than the shortest interval of the units
+on it, and names the volume, its cartridge and its location (#454), so a fresh
+home copy no longer hides an offsite copy nobody has read. Once a year, swap the
+home and offsite copies and verify the one that came home, so no tape goes
+unread for more than a year plus the interval.
 
 Two tiers, and the distinction matters:
 

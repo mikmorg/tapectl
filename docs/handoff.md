@@ -337,7 +337,10 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
    /usr/local/bin/tapectl` (the raised and the fallback paths must resolve the same home and
    user; `drive status` through the wrapper is not a tape command and does not exercise it).
 6. **Look:** `tapectl status`, `tapectl-op drive status`, `tapectl-op audit` (the new
-   `location_count` check, #425, should be clean: keepsake is in two places).
+   `location_count` check, #425, should be clean: keepsake is in two places). On 1.1.2,
+   also set the full-readback clock once (home2 has no archive sets):
+   `tapectl-op config set defaults.verify_interval_days 365` (#453; the profile's
+   `VERIFY_INTERVAL_DAYS=365` does it for a fresh install).
 7. **Before the next write,** step 12's rehearsal proves the new binary on the drive (step 13
    looks for its marker). A write through `tapectl-op volume write` directly does not check it.
    Stop the drive-poll timer for the rehearsal (`sudo systemctl stop tapectl-drive-poll.timer`,

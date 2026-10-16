@@ -24,6 +24,9 @@ ESCROW_PUBLIC_KEY=""
 # #368, measured on home2 2026-10-13 (7 keepsake units, ~35 GiB): 1 job 13m08s,
 # 2 jobs 8m02s, 4 jobs 7m29s. Two at once (ADR-0012, 2026-10-13, item 53).
 STAGING_JOBS=2
+# audit's full-readback clock, per unit and per volume (#453, #454): every tape is read back
+# in full at least once a year. home2 has no archive sets, so this is where the interval lives.
+VERIFY_INTERVAL_DAYS=365
 
 # What `host check` names before a write (ADR-0012, 2026-10-13, item 55): the
 # built-in list plus java — the minecraft server here, which on 2026-10-12 made
