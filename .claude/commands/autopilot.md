@@ -19,7 +19,16 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-16 (NEWEST) — 1.1.2 IS DONE AND TAGGED; THE LOOP STOPPED.** `v1.1.2` on
+- **QUEUE STATE 2026-10-16 (later; NEWEST) — 1.2.0, THE RE-PIN. The CTO said "Approve re-pin"
+  and then "Both".** ADR-0012 items 71-75: 1.2.0 = #449's RESTORE.sh items (+ LC_ALL=C), RECOVERY.md's
+  conditional catalogue line, #448's File 1 half, the golden re-pin in its own commit (authorized
+  until v1.2.0 is installed), item 66's 365-day default and item 68's snapshot hook. Fixed points:
+  `die_newer_needed` stays "tapectl 1.1.0"; `requires` stays empty. Worker rules:
+  scratchpad `w120/common.md`. Branches `w120-repin` (layout.rs, heir tests, golden) and
+  `w120-hook` (config, collection, staging root mapping). Then: integrate, docs hunks, version
+  1.2.0, release notes, handoff (f) to 1.2.0, the whole chain, tag v1.2.0. Label `1.2.0`.
+
+- **QUEUE STATE 2026-10-16 — 1.1.2 IS DONE AND TAGGED; THE LOOP STOPPED (history).** `v1.1.2` on
   master `e16dd77` (whole chain green: 3407/0/20, gate, lifecycle --all 451/438/0/13, fr414,
   erase proof, plaintext scan, CI). The `1.1.2` label is empty: W0 (the #452 review, 1 high)
   and W1–W4 landed #444–#475 in four waves. What is open needs the CTO or home2's drive:
