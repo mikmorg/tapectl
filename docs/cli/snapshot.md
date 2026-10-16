@@ -75,6 +75,7 @@ tapectl snapshot delete [OPTIONS] --version <VERSION> <NAME>
 
 **Options**
 
+- `--version <VERSION>` *(required)* — Snapshot version to delete
 - `--force` — Force delete even if staged (but not written)
 
 ### tapectl snapshot purge
@@ -88,6 +89,10 @@ tapectl snapshot purge [OPTIONS] --version <VERSION> <NAME>
 **Arguments**
 
 - `<NAME>` — Unit name
+
+**Options**
+
+- `--version <VERSION>` *(required)* — Snapshot version
 
 ### tapectl snapshot mark-reclaimable
 
@@ -103,5 +108,6 @@ tapectl snapshot mark-reclaimable [OPTIONS] --version <VERSION> <NAME>
 
 **Options**
 
+- `--version <VERSION>` *(required)* — Snapshot version
 - `--force` — Confirm in advance, as the global --yes does: mark the version even though the version superseding it is short of its policy's min_copies or required_locations (for a tape-only unit, the multiplied floors). Without either flag a terminal asks, and a non-interactive run refuses, naming the shortfall. Only --force (not --yes, not a prompt) marks a version no current version supersedes — that releases the unit's only current version
 

@@ -30,6 +30,10 @@ tapectl catalog ls [OPTIONS] <UNIT>
 
 - `<UNIT>` — Unit name
 
+**Options**
+
+- `--version <VERSION>` — Snapshot version (default: latest)
+
 ### tapectl catalog search
 
 Search for files by pattern, in each unit's newest version

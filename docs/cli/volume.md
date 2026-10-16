@@ -212,6 +212,7 @@ tapectl volume read-slices [OPTIONS] --from <FROM> --unit <UNIT>
 
 - `--from <FROM>` *(required)* — Source volume label
 - `--unit <UNIT>` *(required)* — Unit name to read
+- `--version <N>` — Read only this version of the unit (a reclaimable or purged version is read when named). Without it, every version on the volume except the reclaimable and purged ones is read
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
 
 ### tapectl volume compact-read

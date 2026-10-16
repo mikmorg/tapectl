@@ -31,6 +31,7 @@ tapectl restore unit [OPTIONS] --unit <UNIT> --to <TO>
 - `--from <FROM>` — Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says. Not with --dry-run, which opens no drive
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--version <VERSION>` — Snapshot version to restore. Defaults to the newest version of the unit on this volume (the same rule RESTORE.sh applies); a version the volume does not carry is refused, naming the ones it does
 - `--scratch <DIR>` — Where the restore's scratch directory is made (removed when the restore ends); defaults to inside --to, never the system temp directory. A unit whose isolated catalogue from `stage create` is on disk streams its slices into dar and puts only named pipes there; otherwise (a rebuilt catalog, dar older than 2.7.9) every decrypted slice waits there, as large as the unit
 - `--overwrite` — Restore into a destination that already holds files, replacing any that collide. Without it a destination that is not empty is refused before the tape is touched
 - `--no-space-check` — Skip the free-space check (the unit's size when it streams; about twice that when its slices are spooled, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
@@ -78,6 +79,7 @@ tapectl restore file [OPTIONS] --file <FILE> --unit <UNIT> --to <TO>
 - `--from <FROM>` — Volume label. Without it the loaded tape names itself: File 0 is read and the volume is found in this catalog by its uuid, and the one chosen is printed. A label that is given is checked against File 0 as ever. A tape this catalog does not know is refused, naming what File 0 says
 - `--to <TO>` *(required)* — Destination directory
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--version <VERSION>` — Snapshot version to restore. Defaults to the newest version of the unit on this volume (the same rule RESTORE.sh applies); a version the volume does not carry is refused, naming the ones it does
 - `--scratch <DIR>` — Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside --to, never the system temp directory. With the unit's isolated catalogue from `stage create` on disk only the slices holding the file (and the last) are read; otherwise every slice
 - `--overwrite` — Replace a file of the same name already in --to. Without it one is refused before the tape is touched
 - `--no-space-check` — Skip the free-space check (the decrypted slices read, plus the file, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one

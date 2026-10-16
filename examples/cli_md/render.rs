@@ -8,7 +8,7 @@
 //! GitHub these pages ARE the reference; they come from the same `Cli` the
 //! binary parses, so they cannot describe a flag that does not exist.
 
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 
 /// `(relative path, contents)` for every page, index first.
 pub fn render_all(cmd: &Command) -> Vec<(String, String)> {
@@ -108,8 +108,16 @@ fn cell(s: &str) -> String {
     s.replace('|', "\\|")
 }
 
+/// clap's own `-h/--help` and `-V/--version` flags, which every page would
+/// repeat. Told apart by ACTION, not by id: a command that declares its own
+/// `--version <N>` option (`stage create`, `snapshot create`, `staging
+/// clean`: the version of a unit) has the id `version` too, and filtering by
+/// id left it out of the reference (issue #472).
 fn is_auto(a: &Arg) -> bool {
-    matches!(a.get_id().as_str(), "help" | "version")
+    matches!(
+        a.get_action(),
+        ArgAction::Help | ArgAction::HelpShort | ArgAction::HelpLong | ArgAction::Version
+    )
 }
 
 fn render_command(out: &mut String, cmd: &Command, path: &str, depth: usize) {
