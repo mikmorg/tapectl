@@ -410,6 +410,9 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
 ## Tools Required
 
 {tools_required}
+- `bash`, `awk` and the basic coreutils every Linux system has (`tr`,
+  `stat`, `wc`, `tail`, `od`): RESTORE.sh is a bash script, and the
+  manual steps below use them
 - `gpg` (package gnupg) — only if your `dar` was built with GPG support,
   as Debian's and Ubuntu's is: such a dar refuses to start without it
   ("INITIALIZATION FAILED FOR GPGME"). RESTORE.sh checks and says so.
@@ -424,15 +427,18 @@ and names any that is missing: `--info` and `--verify` need only {read_only}.
 ## Disk space
 
 RESTORE.sh streams each slice from the tape through `age` into `dar`, so
-`--to` needs room for about ONE unit's size (the unit's slices as stored
-on tape; a unit that was archived compressed restores larger). Nothing
+`--to` needs room for about the size of the units you restore: one
+unit's size for one unit, the sum of them with `--all` (each unit's
+slices as stored on tape; a unit that was archived compressed restores
+larger). `--find-envelope` lists each unit with its size. Nothing
 else is large: the decrypted envelopes (the operator envelope's
 `catalog.db` and the dar catalogues, which grow with the number of files)
 go to a work directory under `$TMPDIR` (default `/tmp`; set `TMPDIR` to
 move it). Two cases keep slices on disk as well, in a scratch directory
 inside `--to` unless `--scratch DIR` names another disk: `--path` (the few
 slices that hold the path) and the older-dar fallback above (all of the
-unit's slices, so about twice its size). The script checks the space
+unit's slices, then the restored files: about twice its size). The
+script checks the space
 before it reads any slice.
 
 ## Which device?
@@ -473,12 +479,12 @@ The easiest way to recover is the RESTORE.sh script (File 2):
     # (no data slice is read)
     ./RESTORE.sh --list --key your-key.age.key --unit UNIT
 
-    # Full restore to an EMPTY directory. Each slice streams from the
-    # tape through age into dar, so /destination needs about the unit's
-    # size free. The script checks first. --all restores every unit,
-    # each into /destination/UNIT; --overwrite finishes a restore that
-    # stopped part way.
-    ./RESTORE.sh --restore --key your-key.age.key --to /destination
+    # Full restore to an EMPTY directory: --all restores every unit
+    # your key opens, each into /destination/UNIT. Each slice streams
+    # from the tape through age into dar, so /destination needs about
+    # those units' size free; the script checks first. --overwrite
+    # finishes a restore that stopped part way.
+    ./RESTORE.sh --restore --key your-key.age.key --all --to /destination
 
     # Just one file or folder: reads only the slices that hold it
     ./RESTORE.sh --restore --key your-key.age.key --unit UNIT \
@@ -490,7 +496,9 @@ envelope, list what the tape holds first, then restore all of it:
     ./RESTORE.sh --list --key escrow.age.key
     ./RESTORE.sh --restore --key escrow.age.key --all --to /destination
 
---all puts each unit in /destination/UNIT. Without --all or --unit,
+--all restores every unit of the largest envelope your key opens, each
+in /destination/UNIT: with the escrow or operator key that is every unit
+on the tape. Without --all or --unit,
 --restore takes the first envelope your key opens and, if that lists one
 unit, restores only that unit (it tells you what else the key opened). A
 single TENANT's key opens only that tenant's envelope: it restores that
@@ -527,7 +535,8 @@ If RESTORE.sh is not available, follow these steps:
    decryption), verify its sha256 against File 3's `sha256_encrypted`,
    decrypt with age, and remove the encrypted copy. Work on a disk
    with room for all of the unit's decrypted slices at once (about the
-   unit's size), not in /tmp, which is RAM on many systems. Your
+   unit's size, and as much again for step 8's restored files), not in
+   /tmp, which is RAM on many systems. Your
    envelope's RECOVERY.md writes these commands out for your units,
    and its `catalogs/` holds each unit's dar catalogue
    (`dar -l catalogs/NAME -N -Q` lists the files without the tape)
@@ -564,8 +573,8 @@ checksums, ownership, or any file content — all of that lives only
 inside the age-encrypted envelopes and slices.
 
 **Accepted size disclosure.** Encryption overhead is deterministic and
-this tape uses no compression, so an on-tape size approximates the
-plaintext content size it encloses. If your units are archived one
+tapectl archives without compression unless its operator chose it, so an
+on-tape size approximates the content size it encloses. If your units are archived one
 folder per slice — the common case — the size of each data slice
 effectively discloses that unit's approximate content size and
 reveals unit boundaries: someone holding this tape could in principle
@@ -5996,6 +6005,35 @@ sha256_encrypted = \"bbb\"
     /// File 1's tool list, its opening sentence and RESTORE.sh's checks come
     /// from one table (#449 item 2): every tool the script may check for is
     /// in both, with the roles the item names (mt-st, gpg, age/rage format).
+    /// #448's acceptance read (2026-10-16): a reader who had not seen the
+    /// design docs took the headline "Full restore" example, which named no
+    /// `--all`, as restoring everything. Every full-restore example names
+    /// `--all`, the disk-space figure covers `--all`, and the guide never says
+    /// the tape is uncompressed while also saying a compressed unit restores
+    /// larger.
+    #[test]
+    fn the_guides_full_restore_examples_restore_everything_the_key_opens() {
+        let g = generate_system_guide_v2_for_media("FULL1", 20, "LTO-6");
+        assert!(
+            g.contains("./RESTORE.sh --restore --key your-key.age.key --all --to /destination\n"),
+            "{g}"
+        );
+        for line in g.lines().filter(|l| l.contains("./RESTORE.sh --restore")) {
+            assert!(
+                line.contains("--all") || line.contains("--unit UNIT"),
+                "a restore example names neither --all nor --unit: {line}"
+            );
+        }
+        let flat = flat_text(&g);
+        assert!(flat.contains("the sum of them with `--all`"), "{flat}");
+        assert!(flat.contains("every unit on the tape"), "{flat}");
+        assert!(!flat.contains("uses no compression"), "{flat}");
+        assert!(
+            flat.contains("`bash`, `awk` and the basic coreutils"),
+            "{flat}"
+        );
+    }
+
     #[test]
     fn system_guide_v2_lists_the_tools_restore_sh_checks_for() {
         let g = generate_system_guide_v2_for_media("TOOLS2", 20, "LTO-6");
@@ -6052,7 +6090,7 @@ sha256_encrypted = \"bbb\"
     fn system_guide_v2_states_one_units_disk_space() {
         let g = flat_text(&generate_system_guide_v2_for_media("DISK1", 20, "LTO-6"));
         assert!(g.contains("## Disk space"), "{g}");
-        assert!(g.contains("about ONE unit's size"), "{g}");
+        assert!(g.contains("one unit's size for one unit"), "{g}");
         assert!(
             g.contains("streams each slice from the tape through"),
             "{g}"
