@@ -19,7 +19,23 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-16 (later; NEWEST) — 1.2.0, THE RE-PIN. The CTO said "Approve re-pin"
+- **QUEUE STATE 2026-10-16 (evening; NEWEST) — 1.2.0 IS LANDED (master `347e61a`), TAGGED
+  WHEN CI IS GREEN; THE GOAL IS "no open issues except those needing the real drive".** Whole
+  chain green on `347e61a` itself: 3448/0/20, check-docs 0, gate 43/43 (age 1.1.1), fr414,
+  lifecycle --all 451/438/0/13, erase proof, plaintext scan. A fresh-reader read of a real 1.2.0
+  File 1 (#448's acceptance) found the headline restore example lacked `--all`; fixed inside item
+  71 before the tag; the rest is #477 (for the 1.3.0 re-pin, CTO scopes it). The CTO's 2026-10-16
+  answers: #409 "design spanning now"; #418 R4 "design and build it (1.3.0)"; #364 "benchmark
+  here, close"; #388 "write the research note" (done: `docs/research/2026-10-16-logical-block-protection.md`).
+  The spanning + R4 draft (scratchpad `design/spanning-r4-draft.md`, sent to the CTO) is in a
+  grilling: Round 1 (Q1 what is divided A/A'/B, Q2 a Copy of a divided version, Q3 when spanning
+  ships, Q4 R4's scope) is with the CTO. CORRECTION I owed and made: each tape's `catalog.db`
+  holds only its own write's stage sets (no tape indexes another); the design review carries an
+  erratum. #476 (restore readers never checked `requires`) is built on branch `w130-requires`
+  for 1.3.0 and being extended to verify/read-slices/compact/adopt-lost. Next: tag v1.2.0, close
+  #448 #449 #453 #455, the #364 benchmark on a quiet vm-desk1, then Round 2 on the CTO's answers.
+
+- **QUEUE STATE 2026-10-16 (later) — 1.2.0, THE RE-PIN (history). The CTO said "Approve re-pin"
   and then "Both".** ADR-0012 items 71-75: 1.2.0 = #449's RESTORE.sh items (+ LC_ALL=C), RECOVERY.md's
   conditional catalogue line, #448's File 1 half, the golden re-pin in its own commit (authorized
   until v1.2.0 is installed), item 66's 365-day default and item 68's snapshot hook. Fixed points:
