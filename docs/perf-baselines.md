@@ -192,8 +192,13 @@ a fresh home and an empty staging directory for every run.
 **Method.** Each command ran as `/usr/bin/time -f '%e %U %S %I %O %M'` with
 the fixture evicted from the page cache first: `sync`, then
 `posix_fadvise(POSIX_FADV_DONTNEED)` on every fixture file (no root, and no
-one else's pages are dropped). `mincore(2)` counted 0.0 of 4095.6 MiB resident
-after each eviction, in every run (the positive control). "Disk reads" is `%I`
+one else's pages are dropped). The helper was shown to take 24 MiB of resident
+pages (`mincore(2)`) to 0; in the measured runs the fixture was already
+0.0 to 0.2 MiB resident before each eviction (the previous run's staging output
+had pushed it out) and 0.0 after, so the eviction was a precaution there, and
+the disk-read ratios below are the proof that the reads came off the disk. The
+new test's floor (at least half the source read from disk) is the same control
+in the repository. "Disk reads" is `%I`
 (the process tree's block reads, dar included) over the source size, so a
 second read of every byte is 2.0x and a first read only is 1.00x. Three runs
 per row; the table gives the median and, in brackets, the range. Every
