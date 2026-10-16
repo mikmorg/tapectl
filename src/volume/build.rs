@@ -2000,7 +2000,12 @@ mod tests {
             dar_command: None,
             catalog_path,
             snapshot_version: 1,
-            slices: vec![fake_slice(src.path(), id, 1, format!("slice {id}").as_bytes())],
+            slices: vec![fake_slice(
+                src.path(),
+                id,
+                1,
+                format!("slice {id}").as_bytes(),
+            )],
         };
         let units = vec![
             unit(

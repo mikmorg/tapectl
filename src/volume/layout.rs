@@ -5029,7 +5029,10 @@ sha256_encrypted = \"bbb\"
         std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (code, text) = run(&restore);
-        assert_eq!(code, 1, "control: it then stops at the missing key:\n{text}");
+        assert_eq!(
+            code, 1,
+            "control: it then stops at the missing key:\n{text}"
+        );
         assert!(!text.contains("missing required tool"), "{text}");
         assert!(text.contains("key file not found"), "{text}");
 
@@ -5061,7 +5064,17 @@ sha256_encrypted = \"bbb\"
         let union: Vec<String> = restore_sh_tools().iter().map(|t| t.to_string()).collect();
         assert_eq!(
             union,
-            ["dd", "age", "dar", "sha256sum", "head", "truncate", "tar", "mkfifo", "tee"],
+            [
+                "dd",
+                "age",
+                "dar",
+                "sha256sum",
+                "head",
+                "truncate",
+                "tar",
+                "mkfifo",
+                "tee"
+            ],
             "the union, in the order RESTORE.sh's Requirements lines have always listed it"
         );
         assert_eq!(set("TOOLS_RESTORE"), union, "--restore checks the union");
@@ -5742,12 +5755,7 @@ sha256_encrypted = \"bbb\"
             dar_command: None,
             slices: vec![slice(1, 10), slice(2, 11), slice(3, 14)],
         }];
-        let s = generate_recovery_md(
-            "LAB01",
-            "alice",
-            &units,
-            &["abcdef12_v3.1.dar".to_string()],
-        );
+        let s = generate_recovery_md("LAB01", "alice", &units, &["abcdef12_v3.1.dar".to_string()]);
         assert_eq!(s.matches("mt -f /dev/nst0 rewind").count(), 1, "{s}");
         assert!(
             s.contains("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 10\n"),
@@ -5785,7 +5793,12 @@ sha256_encrypted = \"bbb\"
         let export = s.find("\nexport LC_ALL=C\n").unwrap();
         let strict = s.find("\nset -euo pipefail\n").unwrap();
         assert!(strict < export, "after the strict-mode line");
-        for first in ["\nDEVICE=", "\nWORK=\"$(mktemp", "\ndie() {", "\ndar_check() {"] {
+        for first in [
+            "\nDEVICE=",
+            "\nWORK=\"$(mktemp",
+            "\ndie() {",
+            "\ndar_check() {",
+        ] {
             let at = s.find(first).unwrap_or_else(|| panic!("{first:?} missing"));
             assert!(export < at, "LC_ALL is exported before {first:?}");
         }
@@ -5855,16 +5868,28 @@ sha256_encrypted = \"bbb\"
             .copied()
             .unwrap();
         let without = section("without");
-        assert!(with_v2.contains("dar -l catalogs/aaaaaaaa_v2 -N -Q"), "{with_v2}");
-        assert!(with_v2.contains("`catalogs/aaaaaaaa_v2.1.dar`"), "{with_v2}");
+        assert!(
+            with_v2.contains("dar -l catalogs/aaaaaaaa_v2 -N -Q"),
+            "{with_v2}"
+        );
+        assert!(
+            with_v2.contains("`catalogs/aaaaaaaa_v2.1.dar`"),
+            "{with_v2}"
+        );
         assert!(with_v2.contains("-A catalogs/aaaaaaaa_v2"), "{with_v2}");
         for (what, sec) in [("without", without), ("the other version", with_v3)] {
             assert!(!sec.contains("dar -l"), "{what} has no dar -l:\n{sec}");
-            assert!(!sec.contains("catalogs/"), "{what} names no catalogue:\n{sec}");
+            assert!(
+                !sec.contains("catalogs/"),
+                "{what} names no catalogue:\n{sec}"
+            );
             assert!(!sec.contains("-A "), "{what} has no -A hint:\n{sec}");
             assert!(!sec.contains("also holds the unit"), "{what}:\n{sec}");
             // The recipe itself is untouched.
-            assert!(sec.contains("dar -x restore -R /destination -O -Q -N"), "{sec}");
+            assert!(
+                sec.contains("dar -x restore -R /destination -O -Q -N"),
+                "{sec}"
+            );
             assert!(sec.contains("mt -f /dev/nst0 setblk 524288"), "{sec}");
         }
         // And no catalogue at all: no dar -l anywhere in the document.
@@ -5872,7 +5897,12 @@ sha256_encrypted = \"bbb\"
         assert!(!none.contains("dar -l"), "{none}");
         assert!(!none.contains("catalogs/"), "{none}");
         // A member that only shares a prefix is not the catalogue.
-        let close = generate_recovery_md("LAB01", "alice", &units, &["aaaaaaaa_v20.1.dar".to_string()]);
+        let close = generate_recovery_md(
+            "LAB01",
+            "alice",
+            &units,
+            &["aaaaaaaa_v20.1.dar".to_string()],
+        );
         assert!(!close.contains("dar -l"), "{close}");
     }
 
@@ -5891,11 +5921,17 @@ sha256_encrypted = \"bbb\"
         let g6 = flat_text(&generate_system_guide_v2_for_media("L6", 20, "LTO-6"));
         assert!(g6.contains("This tape is LTO-6"), "{g6}");
         assert!(g6.contains("only if it is an LTO-6 or LTO-7 drive"), "{g6}");
-        assert!(!g6.contains("LTO-8 or LTO-9 drive"), "not for an LTO-6 tape");
+        assert!(
+            !g6.contains("LTO-8 or LTO-9 drive"),
+            "not for an LTO-6 tape"
+        );
         let g8 = flat_text(&generate_system_guide_v2_for_media("L8", 20, "LTO-8"));
         assert!(g8.contains("This tape is LTO-8"), "{g8}");
         assert!(g8.contains("only if it is an LTO-8 or LTO-9 drive"), "{g8}");
-        assert!(!g8.contains("LTO-6 or LTO-7 drive"), "not for an LTO-8 tape");
+        assert!(
+            !g8.contains("LTO-6 or LTO-7 drive"),
+            "not for an LTO-8 tape"
+        );
         // Type M media is read by an LTO-8 drive alone.
         let m8 = flat_text(&generate_system_guide_v2_for_media("M8", 20, "LTO-7-M8"));
         assert!(m8.contains("only if it is an LTO-8 drive"), "{m8}");
@@ -5918,9 +5954,15 @@ sha256_encrypted = \"bbb\"
         // general statement, never a drive list for a tape it cannot name.
         for unknown in ["", "DLT-IV", "LTO-99"] {
             let g = flat_text(&generate_system_guide_v2_for_media("U", 20, unknown));
-            assert!(g.contains("maker's compatibility table"), "{unknown:?}: {g}");
+            assert!(
+                g.contains("maker's compatibility table"),
+                "{unknown:?}: {g}"
+            );
             assert!(!g.contains("only if it is"), "{unknown:?}: {g}");
-            assert!(g.contains("SAS"), "{unknown:?}: the interface is generation-free");
+            assert!(
+                g.contains("SAS"),
+                "{unknown:?}: the interface is generation-free"
+            );
         }
         assert_eq!(
             generate_system_guide_v2("U", 20),
@@ -5941,7 +5983,10 @@ sha256_encrypted = \"bbb\"
             .expect("the escrow --all example");
         assert!(list < all, "list first, then restore");
         let flat = flat_text(&g);
-        assert!(flat.contains("A single TENANT's key opens only that tenant's envelope"), "{flat}");
+        assert!(
+            flat.contains("A single TENANT's key opens only that tenant's envelope"),
+            "{flat}"
+        );
         assert!(
             flat.contains("restores only that unit (it tells you what else the key opened)"),
             "{flat}"
@@ -5965,25 +6010,37 @@ sha256_encrypted = \"bbb\"
             .map(|(body, _)| body)
             .expect("a Tools Required section");
         for tool in restore_sh_tools() {
-            assert!(intro.contains(tool), "the opening sentence lacks {tool}: {intro}");
             assert!(
-                section.lines().any(|l| l.starts_with(&format!("- `{tool}`"))),
+                intro.contains(tool),
+                "the opening sentence lacks {tool}: {intro}"
+            );
+            assert!(
+                section
+                    .lines()
+                    .any(|l| l.starts_with(&format!("- `{tool}`"))),
                 "Tools Required lacks a bullet for {tool}:\n{section}"
             );
         }
-        assert!(intro.contains("mt,") && intro.ends_with("and tee."), "{intro}");
+        assert!(
+            intro.contains("mt,") && intro.ends_with("and tee."),
+            "{intro}"
+        );
         let section = flat_text(section);
         assert!(section.contains("`mt` (mt-st package)"), "{section}");
         assert!(section.contains("cannot set it"), "GNU cpio mt: {section}");
         assert!(section.contains("`gpg` (package gnupg)"), "{section}");
         assert!(section.contains("age v1 format"), "{section}");
-        assert!(section.contains("`age` program and `rage` both read"), "{section}");
+        assert!(
+            section.contains("`age` program and `rage` both read"),
+            "{section}"
+        );
         assert!(
             section.contains("RESTORE.sh runs a program named `age`"),
             "{section}"
         );
         assert!(
-            section.contains("`--info` and `--verify` need only `mt`, `dd`, `sha256sum` and `head`"),
+            section
+                .contains("`--info` and `--verify` need only `mt`, `dd`, `sha256sum` and `head`"),
             "{section}"
         );
     }
@@ -5996,8 +6053,14 @@ sha256_encrypted = \"bbb\"
         let g = flat_text(&generate_system_guide_v2_for_media("DISK1", 20, "LTO-6"));
         assert!(g.contains("## Disk space"), "{g}");
         assert!(g.contains("about ONE unit's size"), "{g}");
-        assert!(g.contains("streams each slice from the tape through"), "{g}");
-        assert!(g.contains("`--scratch DIR`") && g.contains("`--path`"), "{g}");
+        assert!(
+            g.contains("streams each slice from the tape through"),
+            "{g}"
+        );
+        assert!(
+            g.contains("`--scratch DIR`") && g.contains("`--path`"),
+            "{g}"
+        );
         assert!(g.contains("older-dar fallback"), "{g}");
         assert!(g.contains("compressed restores larger"), "{g}");
         assert!(g.contains("`$TMPDIR`"), "the work directory: {g}");

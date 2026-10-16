@@ -1422,7 +1422,10 @@ fn file_1_of_a_built_lto6_tape_names_the_drives_that_read_it() {
     let guide = guide.trim_end_matches('\0');
     let flat = guide.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.contains("This tape is LTO-6"), "{flat}");
-    assert!(flat.contains("only if it is an LTO-6 or LTO-7 drive"), "{flat}");
+    assert!(
+        flat.contains("only if it is an LTO-6 or LTO-7 drive"),
+        "{flat}"
+    );
     assert!(flat.contains("SAS"), "{flat}");
     assert!(flat.contains("--all --to /destination"), "{flat}");
 }

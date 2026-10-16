@@ -2576,7 +2576,10 @@ fn the_space_check_says_its_figure_is_the_encrypted_size() {
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("Disk space: needs about"), "{text}");
     let note = "a compressed unit may need more";
-    assert!(text.contains(note), "the pass line carries the caveat:\n{text}");
+    assert!(
+        text.contains(note),
+        "the pass line carries the caveat:\n{text}"
+    );
 
     // Refused: the same caveat, in the FATAL.
     let small = df_with_free_kib(2);
@@ -2638,7 +2641,9 @@ fn a_lone_unit_restore_says_what_else_the_key_opened() {
         same_tree(&lone_unit("ledgers").src, Path::new(&dest)),
         "{text}"
     );
-    let note = text.find(LONE_NOTE).unwrap_or_else(|| panic!("no notice:\n{text}"));
+    let note = text
+        .find(LONE_NOTE)
+        .unwrap_or_else(|| panic!("no notice:\n{text}"));
     let complete = text.find("RESTORE COMPLETE").expect("RESTORE COMPLETE");
     assert!(note < complete, "the notice comes first:\n{text}");
     let notice = &text[note..complete];
@@ -2660,7 +2665,10 @@ fn a_lone_unit_restore_says_what_else_the_key_opened() {
     assert_eq!(got, sorted, "one ascending pass:\n{:#?}", h.ops());
     // The surveyed envelopes are not kept: only the one used stays decrypted.
     assert!(
-        std::fs::read_dir(h.dir.join("tmp")).unwrap().next().is_none(),
+        std::fs::read_dir(h.dir.join("tmp"))
+            .unwrap()
+            .next()
+            .is_none(),
         "the work directory is removed at the end"
     );
 }
@@ -2719,7 +2727,9 @@ fn the_lone_unit_notice_is_only_where_it_applies() {
         &h.sub("d"),
     ]);
     assert_eq!(code, 0, "{text}");
-    let note = text.find(LONE_NOTE).unwrap_or_else(|| panic!("no notice:\n{text}"));
+    let note = text
+        .find(LONE_NOTE)
+        .unwrap_or_else(|| panic!("no notice:\n{text}"));
     assert!(note < text.find("RESTORE COMPLETE").unwrap(), "{text}");
     assert!(text.contains("--all"), "{text}");
 }
@@ -2754,7 +2764,10 @@ fn a_refusal_to_guess_reads_no_further_envelopes() {
     let (code, text) = h.run(&["--restore", "--key", &h.key("esc"), "--to", &h.sub("x")]);
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("multiple units found"), "{text}");
-    let envelopes_read: Vec<i64> = reads(&h).into_iter().filter(|p| (4..=7).contains(p)).collect();
+    let envelopes_read: Vec<i64> = reads(&h)
+        .into_iter()
+        .filter(|p| (4..=7).contains(p))
+        .collect();
     assert_eq!(envelopes_read, vec![4], "{:#?}", h.ops());
 }
 
@@ -2785,6 +2798,14 @@ fn the_survey_is_skipped_where_the_work_directory_could_not_hold_it() {
         "{text}"
     );
     assert!(!text.contains(LONE_NOTE), "{text}");
-    let envelopes: Vec<i64> = reads(&h2).into_iter().filter(|p| (4..=7).contains(p)).collect();
-    assert_eq!(envelopes, vec![4], "only the envelope used was read:\n{:#?}", h2.ops());
+    let envelopes: Vec<i64> = reads(&h2)
+        .into_iter()
+        .filter(|p| (4..=7).contains(p))
+        .collect();
+    assert_eq!(
+        envelopes,
+        vec![4],
+        "only the envelope used was read:\n{:#?}",
+        h2.ops()
+    );
 }
