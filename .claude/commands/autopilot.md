@@ -19,7 +19,18 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-15 (NEWEST; everything below it is history) — THE 1.1.2 QUEUE.**
+- **QUEUE STATE 2026-10-16 (NEWEST) — 1.1.2 IS DONE AND TAGGED; THE LOOP STOPPED.** `v1.1.2` on
+  master `e16dd77` (whole chain green: 3407/0/20, gate, lifecycle --all 451/438/0/13, fr414,
+  erase proof, plaintext scan, CI). The `1.1.2` label is empty: W0 (the #452 review, 1 high)
+  and W1–W4 landed #444–#475 in four waves. What is open needs the CTO or home2's drive:
+  1.2.0 (#449 and #448's File 1 half at the next re-pin, #453 part 2, #455 part 2, #418 R4,
+  #420 after its past-early-warning measurement), the real-drive session (#444's two proofs
+  and sub-MiB measurement, #460's END OF DATA fact; handoff (f) step 7), and #388/#409/#364.
+  The next step is the CTO's: upgrade home2 to 1.1.2 by handoff (f). Integration lessons this
+  round: two workers on disjoint files can still each miss the other's change (the per-volume
+  verify clock and the `[defaults]` interval); read each pair's reports together.
+
+- **QUEUE STATE 2026-10-15 — THE 1.1.2 QUEUE (history).**
   Production is home2 on 1.1.0, upgrading in place to 1.1.1 (`docs/handoff.md` (f)).
   `v1.1.1` goes on master `d165ef7` once the mhvtl gate passes on it (its `src/`,
   `scripts/`, `Cargo.*` are byte-identical to `4cb98a0`, the last code commit).
