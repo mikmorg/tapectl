@@ -270,7 +270,10 @@ collection "films": 0 created, 1 moved, 0 reactivated, 0 missing, 1 pending, 0 d
 The unit kept its name, `films/alien-1979`, and its history. `collection plan`
 and `collection run` then batch the pending units onto tapes, filling each
 batch in alphabetical order. See [configuration](configuration.md) for every
-collection key.
+collection key. A collection of a living source can also name a snapshot hook
+(`snapshot_command`, `release_command`, since 1.2.0): `collection run` then reads a
+read-only snapshot of the root, and every path the catalog and the tape record is still
+the unit's real one (the [operator guide](operator-guide.md#a-snapshot-hook-for-collection-run)).
 
 ## Versions of content: snapshots, stage sets, slices, receipts
 
