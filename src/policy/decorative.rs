@@ -54,7 +54,7 @@
 //! - `packing.min_free_for_append` — append is rejected outright
 //!   (ADR-0003); there is no append path for this knob to gate.
 //! - `packing.strategy` (issue #172) — the real batch selector is
-//!   alphabetical first-fit (`src/collection/`), not a configurable
+//!   alphabetical next-fit (`src/collection/`), not a configurable
 //!   best-fit-decreasing strategy.
 //! - `packing.fill_threshold` (issue #172) — no bin-packing code ever
 //!   consulted a fill threshold.

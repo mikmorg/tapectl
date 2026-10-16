@@ -420,7 +420,7 @@ In `tests/mhvtl_e2e.rs` (helpers: `write_volume`:161, `read_tape_file_at`:278):
 **Goal:** the §11 design, verbatim: `[[libraries]]` config block, `library
 sync|status|plan` CLI (new `src/cli/library.rs` + `src/library/` module),
 batch execution = stage once → session per copy → release staging per the GC
-rule. Selector = alphabetical first-fit against `usable − enospc_buffer`
+rule. Selector = alphabetical next-fit (name order; #456) against `usable − enospc_buffer`
 (no BFD — ruled out). Multi-tape drill test at microcosm scale (~600 units ⇒
 2+ tapes; assert name-ordered spines + ≥99% fill net of padding).
 
