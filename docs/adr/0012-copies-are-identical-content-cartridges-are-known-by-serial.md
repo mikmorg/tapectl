@@ -1514,3 +1514,33 @@ Not adopted on 2026-10-15: the review's items 2 (a `key escrow-verify` that prov
 secret), 5 (a drive-generation migration trigger and a `volume copy`), 7 (a compromised-host
 paragraph in the threat model) and 8 (an off-host copy of the catalog backup). The review record
 keeps them as considered.
+
+## Amendment, 2026-10-16: the 1.2.0 re-pin
+
+Ruled by the CTO, 2026-10-16 ("Approve re-pin"), answering #449's acceptance criterion:
+
+71. **The next re-pin is approved, and it carries exactly these changes to generated on-tape
+    text** (#449 and its comments, #448's File 1 half):
+    - RESTORE.sh, a lone-unit restore (no `--unit`, no `--all`) says before `RESTORE COMPLETE`
+      how many other envelopes this key opened and how many units they list, and names `--all`;
+    - RESTORE.sh checks for the tools each mode runs, not every tool in every mode;
+    - RESTORE.sh's DAMAGED message says "a key matched" only when one did;
+    - RESTORE.sh's work directory is described as it is (the decrypted envelopes, in
+      `${TMPDIR:-/tmp}`), and its space check accounts for that;
+    - RESTORE.sh exports `LC_ALL=C`, so its greps of dar's output hold in any locale;
+    - RECOVERY.md names a unit's dar catalogue only when the envelope holds it;
+    - File 1 gives the escrow-key restore with `--list` then `--all`, the drive generations that
+      read this tape's generation and the SAS/HBA interface, one unit's disk space, and the tool
+      list the script's own checks use.
+72. **This authorization is bounded.** It covers the golden re-pin those changes need
+    (`tests/on_tape_golden.rs`), recorded in its own commit with the byte changes summarized, and
+    it ends when v1.2.0 is installed: from then on a failing golden is a CTO decision again, as
+    after item 40.
+73. **Two things do not move with it:** RESTORE.sh's "this tape needs tapectl ≥" text stays
+    "tapectl 1.1.0" (item 20 of 2026-10-06: it moves only when a new required feature arrives),
+    and `requires` stays empty, so a 1.1.x RESTORE.sh reads a 1.2.0 tape and a 1.2.0 one reads a
+    1.1.x tape.
+74. **The release is 1.2.0** (the version rule of 2026-09-30: generated on-tape bytes change).
+    Items 66 (a code default of 365 days) and 68 (the per-collection snapshot hook) were ruled
+    "in 1.2.0" before this re-pin was; whether they ride this release is put to the CTO before
+    the version bump. #418 R4 and #420 are not ruled for 1.2.0 and stay out.
