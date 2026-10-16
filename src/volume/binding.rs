@@ -1591,11 +1591,24 @@ pub(crate) struct BoundCartridge {
 /// no `[media]` table, a pre-#192 `[media]` with no identity source. None of
 /// those is a contradiction (issue #193: "Corroboration refuses a
 /// contradiction, never an absence").
+///
+/// [`File0Facts::unreadable`] is the one field that is not a fact about the
+/// cartridge's identity but about this reader.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct File0Facts {
     pub label: Option<String>,
     pub uuid: Option<String>,
     pub media: Option<crate::volume::format::IdThunkMedia>,
+    /// Why this tapectl cannot read the tape File 0 describes, when File 0
+    /// WAS read and says so: the sentence [`crate::volume::format::check_id_thunk_readable`]
+    /// gives raw and rebuild (an unknown `requires` feature, another magic or
+    /// layout, claims that do not parse; ADR-0012 2026-10-06 item 15, #476).
+    /// `None` is both "readable" and "File 0 could not be read at all" — an
+    /// absence, which proceeds. A read path that goes on to read the tape's
+    /// content refuses on `Some`, before it makes a scratch directory, loads
+    /// a key or reads a slice; the facts carry the verdict so that costs no
+    /// second read of File 0.
+    pub unreadable: Option<String>,
 }
 
 impl File0Facts {
@@ -1693,6 +1706,9 @@ pub(crate) fn file0_facts_from_text(text: &str) -> File0Facts {
         label: identity.as_ref().map(|i| i.label.clone()),
         uuid: identity.as_ref().map(|i| i.uuid.clone()),
         media: format::parse_id_thunk_media(text).ok(),
+        unreadable: format::check_id_thunk_readable(text)
+            .err()
+            .map(|e| e.to_string()),
     }
 }
 
@@ -4083,6 +4099,7 @@ mod tests {
                     cartridge_manufacturer: None,
                     tape_length_meters: None,
                 }),
+                unreadable: None,
             }
         }
 

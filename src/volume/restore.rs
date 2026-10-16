@@ -1268,6 +1268,17 @@ fn restore_unit_contacted(
 /// directory is made, before a key is loaded and before a single slice is
 /// read. Restoring from the wrong tape used to surface as a per-slice
 /// sha256 failure with no word about why. Reads File 0.
+///
+/// The same File 0 is also checked for whether this tapectl can read the
+/// tape at all (ADR-0012 2026-10-06 item 15, #476): a `requires` naming a
+/// feature it does not know, another magic or layout, or claims that do not
+/// parse refuse with the text `volume::raw` and `volume::rebuild` give, ahead
+/// of the identity check. It rides the one File 0 read the contact already
+/// takes ([`crate::volume::binding::File0Facts::unreadable`]), so it costs the tape nothing; a File 0
+/// that could not be read at all is an absence and proceeds, as before. This
+/// is where every restore of slices (`restore unit`, `restore file`,
+/// `restore volume`, with or without a label, streamed or `--spool`ed)
+/// meets the tape; `restore raw` has its own check in `volume::raw`.
 fn corroborate_at_contact(
     conn: &Connection,
     volume_label: &str,
@@ -1282,10 +1293,11 @@ fn corroborate_at_contact(
         )
         .map_err(|_| TapectlError::VolumeNotFound(volume_label.to_string()))?;
     let phase = progress::phase("identify", None);
-    let medium = crate::volume::binding::MediumFacts::new(
-        medium_serial.map(str::to_string),
-        crate::volume::binding::read_file0_facts(store),
-    );
+    let file0 = crate::volume::binding::read_file0_facts(store);
+    if let Some(why) = &file0.unreadable {
+        return Err(TapectlError::Other(why.clone()));
+    }
+    let medium = crate::volume::binding::MediumFacts::new(medium_serial.map(str::to_string), file0);
     crate::volume::binding::corroborate_volume(conn, volume_id, volume_label, &medium)?;
     phase.done();
     Ok(())
@@ -7092,6 +7104,406 @@ mod tests {
                     "spooled slices are on disk: {:?}",
                     m.fake.watched_bytes()
                 );
+            }
+        }
+
+        // ── issue #476: a tape's `requires` is checked before its slices are read ──
+
+        /// ADR-0012 2026-10-06 item 15: every reader checks File 0's
+        /// `layout_version`, `magic` and `requires` and refuses a tape needing
+        /// a feature it does not know. `restore raw` and `catalog rebuild`
+        /// always did; restore of slices read File 0 for identity only, so a
+        /// tape fenced with `requires = ["parts"]` (#409) would have restored
+        /// one part of a divided version as the whole of it. The refusal rides
+        /// the contact's one File 0 read, so these tests also pin that nothing
+        /// but that read touched the tape.
+        mod requires_fence {
+            use super::multi::{multi, noise, volume_of, Multi, DEVICE};
+            use super::*;
+            use crate::tape::fake::Op;
+            use crate::volume::restore_record::rows;
+
+            /// How a 1.1.0+ File 0 states that it requires nothing.
+            const STATED: &str = "\nrequires = []\n";
+            const UNKNOWN: &str = "\nrequires = [\"unknown-feature\"]\n";
+
+            /// File 0 with the first `from` replaced by `to`, padded back to
+            /// its on-tape length. Asserts `from` is there: a rewrite that
+            /// matched nothing would make every refusal test below pass or
+            /// fail for the wrong reason.
+            fn rewritten(file0: &[u8], from: &str, to: &str) -> Vec<u8> {
+                let text = String::from_utf8_lossy(file0)
+                    .trim_end_matches('\0')
+                    .to_string();
+                assert!(
+                    text.contains(from),
+                    "the fixture's File 0 lacks {from:?}:\n{text}"
+                );
+                let mut out = text.replacen(from, to, 1).into_bytes();
+                assert!(out.len() <= file0.len(), "File 0 outgrew its block");
+                out.resize(file0.len(), 0);
+                out
+            }
+
+            /// [`rewritten`], on the File 0 of the tape in the drive.
+            fn rewrite(m: &Multi, from: &str, to: &str) {
+                let old = m.fake.state().files[0].clone();
+                m.fake.state().files[0] = rewritten(&old, from, to);
+            }
+
+            fn one() -> Multi {
+                multi(
+                    "RQ-1",
+                    "rq-unit",
+                    &[("a.txt", b"alpha".to_vec()), ("b.bin", noise(100_000, 3))],
+                    "64k",
+                    true,
+                )
+            }
+
+            fn three() -> Multi {
+                let a = [("a.bin", noise(90_000, 1)), ("a.txt", b"alpha".to_vec())];
+                let b = [("b.bin", noise(120_000, 2))];
+                let c = [("c.txt", b"charlie".to_vec())];
+                volume_of(
+                    "RQ-3",
+                    &[("ua", &a, "64k"), ("ub", &b, "64k"), ("uc", &c, "64k")],
+                    true,
+                )
+            }
+
+            fn volume(m: &Multi, root: &Path) -> Result<UnitsReport> {
+                let reqs: Vec<UnitRequest> = m
+                    .units
+                    .iter()
+                    .map(|u| UnitRequest {
+                        unit: u.name.clone(),
+                        version: None,
+                        dest_dir: root.join(&u.name).to_string_lossy().into_owned(),
+                    })
+                    .collect();
+                restore_units(
+                    &m.conn,
+                    &m.paths,
+                    &Config::default(),
+                    "RQ-3",
+                    &reqs,
+                    &RestoreOptions::default(),
+                    false,
+                    DEVICE,
+                    4096,
+                    false,
+                )
+            }
+
+            /// File 0 was read once and nothing else was: no slice, no
+            /// second look at File 0.
+            fn assert_only_file0_was_read(ops: &[Op]) {
+                assert_eq!(
+                    ops.iter().filter(|o| **o == Op::ReadHead(0)).count(),
+                    1,
+                    "File 0, once: {ops:?}"
+                );
+                assert!(
+                    !ops.iter().any(|o| matches!(o, Op::Read(_))),
+                    "a slice was read: {ops:?}"
+                );
+                assert!(
+                    !ops.iter().any(|o| matches!(o, Op::Space(_))),
+                    "the head moved toward a slice: {ops:?}"
+                );
+            }
+
+            /// The refusal is the one `restore raw` and `catalog rebuild` give.
+            fn assert_unknown_feature_refusal(err: &str) {
+                assert!(err.contains("\"unknown-feature\""), "{err}");
+                assert!(err.contains("newer tapectl"), "{err}");
+                assert!(err.contains("RESTORE.sh"), "{err}");
+                assert!(err.contains("Nothing has been read past it"), "{err}");
+                let raw = crate::volume::format::check_id_thunk_readable(
+                    &String::from_utf8(
+                        tape_labelled("RQ-1").files[0]
+                            .iter()
+                            .copied()
+                            .filter(|b| *b != 0)
+                            .collect(),
+                    )
+                    .unwrap()
+                    .replacen(STATED, UNKNOWN, 1),
+                )
+                .unwrap_err()
+                .to_string();
+                assert_eq!(err, raw, "the same text raw and rebuild give");
+            }
+
+            /// THE acceptance test for `restore unit` and `restore file`
+            /// (#476): a tape whose File 0 requires a feature this tapectl
+            /// does not know is refused by name at the contact, whether the
+            /// restore would stream or spool, before a scratch directory is
+            /// made, a key loaded or a slice read. The contact and the
+            /// `restores` row record the refusal, as they do a wrong tape.
+            #[test]
+            fn restore_unit_and_file_refuse_a_tape_requiring_an_unknown_feature() {
+                for spool in [false, true] {
+                    for as_file in [false, true] {
+                        let m = one();
+                        rewrite(&m, STATED, UNKNOWN);
+                        let dest = TempDir::new().unwrap();
+                        let options = RestoreOptions {
+                            spool,
+                            ..RestoreOptions::default()
+                        };
+                        let err = if as_file {
+                            m.file("RQ-1", "rq-unit", "a.txt", dest.path(), &options)
+                                .unwrap_err()
+                        } else {
+                            m.unit("RQ-1", "rq-unit", dest.path(), &options)
+                                .unwrap_err()
+                        }
+                        .to_string();
+                        let what = format!("spool={spool} file={as_file}");
+                        assert_unknown_feature_refusal(&err);
+                        assert_only_file0_was_read(&m.fake.ops());
+                        assert!(
+                            !dest.path().join(SCRATCH_NAME).exists(),
+                            "{what}: no scratch directory"
+                        );
+                        assert_eq!(
+                            fs::read_dir(dest.path()).unwrap().count(),
+                            0,
+                            "{what}: nothing was made in the destination"
+                        );
+                        let all = rows(&m.conn).unwrap();
+                        assert_eq!(all.len(), 1, "{what}: {all:?}");
+                        assert_eq!(all[0].outcome, "failed", "{what}");
+                        assert!(
+                            all[0]
+                                .error
+                                .as_deref()
+                                .is_some_and(|e| e.contains("\"unknown-feature\"")),
+                            "{what}: {all:?}"
+                        );
+                        assert_eq!(all[0].slices_read, Some(0), "{what}");
+                        let (_, outcome) = only_contact(&m.conn);
+                        assert_eq!(outcome.as_deref(), Some("failed"), "{what}");
+                    }
+                }
+            }
+
+            /// `restore volume`: one corroboration refuses the whole set, so
+            /// every unit's row is `failed` with the reason and no unit's
+            /// destination is made, on one contact with one File 0 read.
+            #[test]
+            fn restore_volume_refuses_a_tape_requiring_an_unknown_feature() {
+                let m = three();
+                rewrite(&m, STATED, UNKNOWN);
+                let root = TempDir::new().unwrap();
+                let err = volume(&m, root.path()).unwrap_err().to_string();
+                assert_unknown_feature_refusal(&err);
+                assert_only_file0_was_read(&m.fake.ops());
+                let all = rows(&m.conn).unwrap();
+                assert_eq!(all.len(), 3, "{all:?}");
+                for r in &all {
+                    assert_eq!(r.outcome, "failed", "{r:?}");
+                    assert!(
+                        r.error
+                            .as_deref()
+                            .is_some_and(|e| e.contains("\"unknown-feature\"")),
+                        "{r:?}"
+                    );
+                }
+                for u in &m.units {
+                    assert!(!root.path().join(&u.name).exists(), "{} was made", u.name);
+                }
+                let (operation, outcome) = only_contact(&m.conn);
+                assert_eq!(operation, "restore volume");
+                assert_eq!(outcome.as_deref(), Some("failed"));
+            }
+
+            /// A `requires` that is not a list of strings cannot be shown to
+            /// be readable (`check_id_thunk_readable`): refused on both paths
+            /// with the parse error, never restored as if it required nothing.
+            #[test]
+            fn a_requires_that_is_not_a_list_is_refused() {
+                let m = one();
+                rewrite(&m, STATED, "\nrequires = \"parts\"\n");
+                let dest = TempDir::new().unwrap();
+                let err = m
+                    .unit("RQ-1", "rq-unit", dest.path(), &RestoreOptions::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("TOML parse failed"), "{err}");
+                assert!(err.contains("requires"), "{err}");
+                assert_only_file0_was_read(&m.fake.ops());
+                assert!(!dest.path().join(SCRATCH_NAME).exists());
+
+                let m = three();
+                rewrite(&m, STATED, "\nrequires = \"parts\"\n");
+                let root = TempDir::new().unwrap();
+                let err = volume(&m, root.path()).unwrap_err().to_string();
+                assert!(err.contains("TOML parse failed"), "{err}");
+                assert_only_file0_was_read(&m.fake.ops());
+                assert!(rows(&m.conn).unwrap().iter().all(|r| r.outcome == "failed"));
+            }
+
+            /// Another layout or magic is the same refusal (the rest of
+            /// `FormatClaims::refusal`, which the restore path now reaches).
+            #[test]
+            fn another_layout_is_refused_on_restore() {
+                let m = one();
+                rewrite(&m, "\nlayout_version = 2\n", "\nlayout_version = 3\n");
+                let dest = TempDir::new().unwrap();
+                let err = m
+                    .unit("RQ-1", "rq-unit", dest.path(), &RestoreOptions::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("layout_version = 3"), "{err}");
+                assert_only_file0_was_read(&m.fake.ops());
+            }
+
+            /// The positive controls: a File 0 that states `requires = []`
+            /// (every tape from 1.1.0), states none (every tape before it) or
+            /// carries a key nobody requires restores exactly as before — on
+            /// the unit path and the volume path — and the slices ARE read,
+            /// so the refusals above are the fence and not a tape that
+            /// cannot be restored at all.
+            #[test]
+            fn a_tape_that_requires_nothing_restores_as_before() {
+                for (what, to) in [
+                    ("states requires = []", STATED),
+                    ("states no requires, as before 1.1.0", "\n"),
+                    (
+                        "carries a key nobody requires",
+                        "\nrequires = []\nfuture_key = \"x\"\n",
+                    ),
+                ] {
+                    let m = one();
+                    rewrite(&m, STATED, to);
+                    let dest = TempDir::new().unwrap();
+                    m.unit("RQ-1", "rq-unit", dest.path(), &RestoreOptions::default())
+                        .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    m.assert_restored(dest.path());
+                    assert!(
+                        m.fake.ops().iter().any(|o| matches!(o, Op::Read(_))),
+                        "{what}: the slices were read"
+                    );
+                    assert_eq!(rows(&m.conn).unwrap()[0].outcome, "ok", "{what}");
+
+                    let m = three();
+                    rewrite(&m, STATED, to);
+                    let root = TempDir::new().unwrap();
+                    let report = volume(&m, root.path()).unwrap_or_else(|e| panic!("{what}: {e}"));
+                    assert_eq!(report.failed(), 0, "{what}: {report:?}");
+                    assert!(
+                        m.fake.ops().iter().any(|o| matches!(o, Op::Read(_))),
+                        "{what}: the slices were read"
+                    );
+                }
+            }
+
+            /// A File 0 that cannot be read at all is an absence, and proceeds
+            /// as it did: the fence turns away a tape that SAYS it needs
+            /// something, not one that said nothing. (A blank File 0 reads as
+            /// empty, so the restore goes on to fail later, on its own terms
+            /// — never on `requires`.)
+            #[test]
+            fn an_unreadable_file0_is_not_a_new_refusal() {
+                let m = one();
+                m.fake.state().files.truncate(0);
+                let dest = TempDir::new().unwrap();
+                let err = m
+                    .unit("RQ-1", "rq-unit", dest.path(), &RestoreOptions::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(!err.contains("requires"), "{err}");
+                assert!(!err.contains("newer tapectl"), "{err}");
+            }
+
+            // ── the tape that is loaded, named by no label (#435) ──
+
+            /// `restore unit` with no `--from`: File 0 is read ONCE (by
+            /// `identify`) and the contact check is served from those bytes,
+            /// so the fence adds no read; it refuses ahead of the scratch
+            /// directory, the key and every slice, on the one contact.
+            #[test]
+            fn restore_with_no_from_refuses_a_tape_requiring_an_unknown_feature() {
+                let conn = crate::db::open_memory().unwrap();
+                let volume_id = seed_loaded(&conn, "RL-FENCE", "rl-unit");
+                let mut tape = tape_labelled("RL-FENCE");
+                tape.files[0] = rewritten(&tape.files[0], STATED, UNKNOWN);
+                let dest = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(dest.path().to_path_buf());
+                let dest_dir = dest.path().to_string_lossy().into_owned();
+                let (fake, mut store) = on_fake_tape(&tape);
+
+                let err = restore_unit_from_loaded_store(
+                    &conn,
+                    &paths,
+                    &Config::default(),
+                    "rl-unit",
+                    RestoreTarget::Unit {
+                        dest_dir: &dest_dir,
+                    },
+                    &RestoreOptions::default(),
+                    None,
+                    &mut store,
+                    site(Operation::RestoreUnit),
+                )
+                .unwrap_err()
+                .to_string();
+
+                assert!(err.contains("\"unknown-feature\""), "{err}");
+                assert!(err.contains("newer tapectl"), "{err}");
+                assert_only_file0_was_read(&fake.ops());
+                assert!(!dest.path().join(SCRATCH_NAME).exists());
+                let contacts = contact_rows(&conn);
+                assert_eq!(contacts.len(), 1, "{contacts:?}");
+                assert_eq!(contacts[0].1, Some(volume_id));
+                assert_eq!(contacts[0].2.as_deref(), Some("failed"));
+                assert!(
+                    contacts[0]
+                        .3
+                        .as_deref()
+                        .is_some_and(|d| d.contains("unknown-feature")),
+                    "{contacts:?}"
+                );
+            }
+
+            /// `restore volume` with no label: the same, for the set.
+            #[test]
+            fn restore_volume_with_no_label_refuses_a_tape_requiring_an_unknown_feature() {
+                let conn = crate::db::open_memory().unwrap();
+                seed_loaded(&conn, "RL-FENCE3", "rl-unit");
+                let mut tape = tape_labelled("RL-FENCE3");
+                tape.files[0] = rewritten(&tape.files[0], STATED, UNKNOWN);
+                let dest = TempDir::new().unwrap();
+                let paths = TapectlPaths::new(dest.path().to_path_buf());
+                let to = dest.path().join("out");
+                let (fake, mut store) = on_fake_tape(&tape);
+
+                let err = restore_units_from_loaded_store(
+                    &conn,
+                    &paths,
+                    &Config::default(),
+                    &[],
+                    &to.to_string_lossy(),
+                    &RestoreOptions::default(),
+                    false,
+                    &mut store,
+                    site(Operation::RestoreVolume),
+                )
+                .unwrap_err()
+                .to_string();
+
+                assert!(err.contains("\"unknown-feature\""), "{err}");
+                assert_only_file0_was_read(&fake.ops());
+                assert!(!to.join("rl-unit").exists());
+                let (operation, outcome) = only_contact(&conn);
+                assert_eq!(operation, "restore volume");
+                assert_eq!(outcome.as_deref(), Some("failed"));
+                let restores = rows(&conn).unwrap();
+                assert_eq!(restores.len(), 1, "{restores:?}");
+                assert_eq!(restores[0].outcome, "failed");
             }
         }
     }

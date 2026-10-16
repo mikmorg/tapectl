@@ -512,6 +512,7 @@ mod tests {
             label: label.map(str::to_string),
             uuid: uuid.map(str::to_string),
             media: None,
+            unreadable: None,
         }
     }
 
