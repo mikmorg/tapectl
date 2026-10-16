@@ -46,8 +46,9 @@ clap_mangen = "0.2"
 # catalog commands' statement and query-plan budgets (issue #416).
 rusqlite = { version = "0.39", features = ["hooks", "trace"] }
 # `inotify`: the staging audit watches every file `stage create` makes under
-# staging (issue #370, `staging::plaintext_audit`). Tests only.
-nix = { version = "0.29", features = ["inotify"] }
+# staging (issue #370, `staging::plaintext_audit`). `resource`: `getrusage`,
+# for the staging benchmark's disk-read count (issue #364). Tests only.
+nix = { version = "0.29", features = ["inotify", "resource"] }
 
 [profile.release]
 lto = true

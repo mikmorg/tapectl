@@ -40,6 +40,14 @@ fn find_dar() -> String {
     "dar".into()
 }
 
+/// `TAPECTL_PERF_SCRATCH`, or the harness default: where every scenario's
+/// temporary tree, and the staging scenario's reusable fixture, live.
+fn perf_scratch() -> PathBuf {
+    PathBuf::from(
+        std::env::var("TAPECTL_PERF_SCRATCH").unwrap_or_else(|_| "/scratch/tapectl-perf".into()),
+    )
+}
+
 struct PerfHarness {
     _root: TempDir,
     paths: TapectlPaths,
@@ -53,9 +61,7 @@ fn setup(name: &str) -> PerfHarness {
     // the gate script's TAPECTL_GATE_SCRATCH (issue #111). Nothing changes
     // for anyone who does not set it; a machine without /scratch can now run
     // the suite without editing the harness.
-    let scratch = PathBuf::from(
-        std::env::var("TAPECTL_PERF_SCRATCH").unwrap_or_else(|_| "/scratch/tapectl-perf".into()),
-    );
+    let scratch = perf_scratch();
     fs::create_dir_all(&scratch).unwrap();
     let root = tempfile::Builder::new()
         .prefix(&format!("{name}-"))
@@ -1094,5 +1100,427 @@ fn perf_a_2gib_write_and_full_confirm_through_a_store() {
         ratio <= CEILING,
         "a {mib} MiB write and full confirm took {elapsed:?}, {ratio:.2}x the two sha256 \
          passes it needs ({one_pass:.1} s each at this machine's rate), over {CEILING}x"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #364: what staging costs, pass by pass.
+
+/// xorshift64*: a generator written out here, not taken from `rand`, so the
+/// fixture's bytes are the same on every machine and every release of any
+/// crate. Fast (about a byte per cycle) and, for this purpose, incompressible.
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn new(seed: u64) -> Self {
+        Xorshift(seed | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn fill(&mut self, buf: &mut [u8]) {
+        for word in buf.chunks_exact_mut(8) {
+            word.copy_from_slice(&self.next().to_le_bytes());
+        }
+    }
+}
+
+/// Bump when the generator or the layout below changes, so a fixture an
+/// older generator left is rebuilt and not reused.
+const STAGE_FIXTURE_FORMAT: u32 = 1;
+/// Disk reads that are not the source: the test binary's own pages, the
+/// catalog, dar's and the helpers' libraries. About 45 MiB measured; this
+/// much is allowed on top of the ratio, so a small fixture is not mistaken
+/// for a second read.
+const STAGE_READ_SLACK: u64 = 128 << 20;
+/// "A few large files": three, together three quarters of the source.
+const STAGE_FIXTURE_LARGE_FILES: u64 = 3;
+/// Small files per directory, so a few thousand of them are not one listing.
+const STAGE_FIXTURE_PER_DIR: u64 = 100;
+
+/// One file of the staging fixture.
+struct FixtureFile {
+    rel: PathBuf,
+    size: u64,
+    seed: u64,
+}
+
+fn fixture_seed(n: u64) -> u64 {
+    0x9E37_79B9_7F4A_7C15u64.wrapping_mul(n + 1)
+}
+
+/// The files of a `total_mib` source of which `small_files` are small: the
+/// large ones share three quarters of it, the small ones the other quarter,
+/// each between a quarter and seven quarters of the small files' mean (so
+/// 64 to 448 KiB at the defaults). Pure arithmetic on the knobs, so a
+/// fixture on disk can be checked against it.
+fn stage_fixture_plan(total_mib: u64, small_files: u64) -> Vec<FixtureFile> {
+    let total = total_mib << 20;
+    let small_total = if small_files == 0 { 0 } else { total / 4 };
+    let large_each = (total - small_total) / STAGE_FIXTURE_LARGE_FILES;
+    let mut plan: Vec<FixtureFile> = (0..STAGE_FIXTURE_LARGE_FILES)
+        .map(|i| FixtureFile {
+            rel: PathBuf::from(format!("large-{i}.bin")),
+            size: large_each,
+            seed: fixture_seed(i),
+        })
+        .collect();
+    if small_files > 0 {
+        let mean = small_total / small_files;
+        let mut sizes = Xorshift::new(fixture_seed(1 << 32));
+        for i in 0..small_files {
+            plan.push(FixtureFile {
+                rel: PathBuf::from(format!("d{:03}/s{i:06}.bin", i / STAGE_FIXTURE_PER_DIR)),
+                size: mean / 4 + sizes.next() % (mean * 3 / 2 + 1),
+                seed: fixture_seed((1 << 33) + i),
+            });
+        }
+    }
+    plan
+}
+
+/// Whether `data` holds exactly the files of `plan`, at their sizes (the
+/// unit dotfile a previous run's `init_unit` left is not one of them).
+fn stage_fixture_matches(data: &Path, plan: &[FixtureFile]) -> bool {
+    let found = walkdir::WalkDir::new(data)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && e.file_name() != ".tapectl-unit.toml")
+        .count();
+    found == plan.len()
+        && plan.iter().all(|f| {
+            fs::metadata(data.join(&f.rel))
+                .map(|m| m.len() == f.size)
+                .unwrap_or(false)
+        })
+}
+
+/// The staging scenario's source tree: deterministic, incompressible, and
+/// kept between runs. It lives at a fixed path under `TAPECTL_PERF_SCRATCH`
+/// (the harness's own tempdir is deleted at the end of every scenario), and a
+/// `READY` marker, written last, names its parameters; it is reused only when
+/// the marker, the file count and every file's size agree with the plan, and
+/// rebuilt otherwise. Returns the tree and its size in bytes.
+fn stage_fixture(total_mib: u64, small_files: u64) -> (PathBuf, u64) {
+    use std::io::Write as _;
+    let root = perf_scratch().join(format!("stage-fixture-{total_mib}m-{small_files}f"));
+    let data = root.join("data");
+    let plan = stage_fixture_plan(total_mib, small_files);
+    let bytes: u64 = plan.iter().map(|f| f.size).sum();
+    let marker = format!(
+        "format={STAGE_FIXTURE_FORMAT} mib={total_mib} small={small_files} files={} bytes={bytes}\n",
+        plan.len()
+    );
+    if fs::read_to_string(root.join("READY")).is_ok_and(|m| m == marker)
+        && stage_fixture_matches(&data, &plan)
+    {
+        eprintln!("[perf] stage_fixture reusing {}", data.display());
+        return (data, bytes);
+    }
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&data).unwrap();
+    let started = Instant::now();
+    let mut buf = vec![0u8; 1 << 20];
+    for f in &plan {
+        let path = data.join(&f.rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut out = fs::File::create(&path).unwrap();
+        let mut rng = Xorshift::new(f.seed);
+        let mut left = f.size;
+        while left > 0 {
+            rng.fill(&mut buf);
+            let n = left.min(buf.len() as u64) as usize;
+            out.write_all(&buf[..n]).unwrap();
+            left -= n as u64;
+        }
+    }
+    fs::write(root.join("READY"), &marker).unwrap();
+    report(
+        "stage_fixture",
+        &format!("generate {} files, {} MiB", plan.len(), bytes >> 20),
+        started.elapsed(),
+    );
+    (data, bytes)
+}
+
+/// Drop every page of every file under `dir` from the page cache, so the
+/// next read comes off the disk. `sync` first, because only clean pages go;
+/// then `posix_fadvise(POSIX_FADV_DONTNEED)` on each file. This stands in for
+/// dropping the system cache, which needs root and would evict everyone
+/// else's pages too.
+fn evict_from_page_cache(dir: &Path) {
+    use std::os::unix::io::AsRawFd;
+    nix::unistd::sync();
+    for e in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if e.file_type().is_file() {
+            if let Ok(f) = fs::File::open(e.path()) {
+                let _ = nix::fcntl::posix_fadvise(
+                    f.as_raw_fd(),
+                    0,
+                    0,
+                    nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+    }
+}
+
+/// Bytes the kernel fetched from, and sent to, the block layer for this
+/// process (`/proc/self/io`: every thread of it) and, separately, for the
+/// children it has reaped (`RUSAGE_CHILDREN`'s `ru_inblock`/`ru_oublock`, in
+/// 512-byte blocks) — dar, here. Both are page-cache misses and writeback,
+/// not `read(2)` calls: a read the cache answers does not count. Read twice
+/// and subtract; the suite runs with `--test-threads=1`, so no other
+/// scenario's children are reaped in between.
+#[derive(Clone, Copy)]
+struct IoBytes {
+    own_read: u64,
+    own_written: u64,
+    child_read: u64,
+    child_written: u64,
+}
+
+impl IoBytes {
+    fn now() -> IoBytes {
+        let text = fs::read_to_string("/proc/self/io").expect("/proc/self/io");
+        let field = |name: &str| -> u64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(|| panic!("{name} in /proc/self/io"))
+        };
+        let children =
+            nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_CHILDREN).unwrap();
+        IoBytes {
+            own_read: field("read_bytes:"),
+            own_written: field("write_bytes:"),
+            child_read: children.block_reads() as u64 * 512,
+            child_written: children.block_writes() as u64 * 512,
+        }
+    }
+
+    fn since(self, earlier: IoBytes) -> IoBytes {
+        IoBytes {
+            own_read: self.own_read - earlier.own_read,
+            own_written: self.own_written - earlier.own_written,
+            child_read: self.child_read - earlier.child_read,
+            child_written: self.child_written - earlier.child_written,
+        }
+    }
+
+    fn read(self) -> u64 {
+        self.own_read + self.child_read
+    }
+
+    fn written(self) -> u64 {
+        self.own_written + self.child_written
+    }
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 20) as f64
+}
+
+fn mib_per_s(bytes: u64, over: Duration) -> f64 {
+    mib(bytes) / over.as_secs_f64().max(1e-9)
+}
+
+/// Issue #364 (the staging-throughput epic's benchmark): one unit of
+/// incompressible data, a few large files and a few thousand small ones,
+/// through the library's real `snapshot create` and `stage create`, with the
+/// fixture evicted from the page cache first so every read is a disk read.
+///
+/// Reports, in MiB/s over the source's size (1 MiB = 1,048,576 bytes): the
+/// whole run and each step; every phase `stage create` records in
+/// `phase_timings` (the rows `volume info` and the stage report are made
+/// from, taken from the catalog and not timed here); how many bytes the
+/// whole run, dar included, read from disk, as a multiple of the source; and
+/// how many it wrote. Only `archive` counts bytes, so only it has a rate
+/// (dar, the source hash and the age encryption run inside it, together).
+///
+/// Asserts only what holds on any machine: the stage succeeds, the
+/// `archive` phase was recorded, and the disk reads are at least half the
+/// source and at most one and a half times it plus [`STAGE_READ_SLACK`]. The
+/// upper bound is the one-read-per-byte promise of #370 and #441 with room
+/// for what is not the source (this test binary's own page-ins, the catalog;
+/// before #441 dar's `fadvise` made the second read come off the disk: 1.96x
+/// on a 2 GiB fixture); the lower bound is the positive control for the
+/// eviction: under half means the source came from the cache, or the scratch
+/// is a filesystem that reads no blocks, and every figure here would measure
+/// the page cache. Never a timing.
+///
+/// Knobs: `TAPECTL_PERF_STAGE_MIB` (source size, 4096),
+/// `TAPECTL_PERF_STAGE_SMALL` (small files, 4000, in a quarter of it),
+/// `TAPECTL_PERF_STAGE_SLICE` (dar `-s`, 1G, the 1.1 default) and
+/// `TAPECTL_PERF_HASH_THREADS` (`[staging] hash_threads`; the shipped
+/// default is 1, which leaves #366's pool idle).
+#[test]
+#[ignore = "perf suite: set TAPECTL_PERF_TESTS=1 and pass --ignored"]
+fn perf_staging_throughput_per_pass() {
+    use tapectl::progress::{start_session, Display};
+
+    if !perf_enabled() {
+        eprintln!("skip: TAPECTL_PERF_TESTS not set");
+        return;
+    }
+    let env_u64 = |name: &str, default: u64| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let total_mib = env_u64("TAPECTL_PERF_STAGE_MIB", 4096);
+    let small_files = env_u64("TAPECTL_PERF_STAGE_SMALL", 4000);
+    let (source, source_bytes) = stage_fixture(total_mib, small_files);
+
+    let mut h = setup("stage-throughput");
+    h.config.defaults.slice_size =
+        std::env::var("TAPECTL_PERF_STAGE_SLICE").unwrap_or_else(|_| "1G".into());
+    if let Some(threads) = std::env::var("TAPECTL_PERF_HASH_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        h.config.staging.hash_threads = threads;
+    }
+    tenant::add_tenant(&h.conn, &h.paths, "op", None, true).unwrap();
+
+    // `init_unit` writes the unit's dotfile into the source; take a previous
+    // run's away first and this run's away after, so the fixture stays as
+    // generated.
+    let dotfile = source.join(".tapectl-unit.toml");
+    let _ = fs::remove_file(&dotfile);
+    unit::init_unit(
+        &h.conn,
+        &h.paths,
+        &source.to_string_lossy(),
+        "op",
+        Some("stage-unit"),
+        &[],
+        None,
+    )
+    .unwrap();
+    eprintln!(
+        "[perf] stage_throughput source {:.1} MiB in {} files, slice {}, hash_threads {}",
+        mib(source_bytes),
+        stage_fixture_plan(total_mib, small_files).len(),
+        h.config.defaults.slice_size,
+        h.config.staging.hash_threads,
+    );
+
+    evict_from_page_cache(&source);
+    let io_start = IoBytes::now();
+    let run = Instant::now();
+
+    let t = Instant::now();
+    let sid = staging::snapshot_create(&h.conn, "stage-unit", &h.config).unwrap();
+    let snapshot_elapsed = t.elapsed();
+    let io_snapshot = IoBytes::now().since(io_start);
+
+    // A session of its own, so the phases are recorded: `phase_timings::record`
+    // does nothing on a thread without one (`main` opens one for the command).
+    let session = start_session(Some(&h.paths.logs_dir), "stage-create", Display::Off, false);
+    let t = Instant::now();
+    let staged = staging::stage_create(&h.conn, &h.paths, &h.config, sid, true);
+    let stage_elapsed = t.elapsed();
+    let total_elapsed = run.elapsed();
+    let io = IoBytes::now().since(io_start);
+    drop(session);
+    let _ = fs::remove_file(&dotfile);
+    let stage_set_id = staged.expect("stage_create");
+
+    let phases = tapectl::db::phase_timings::latest_for_stage_set(&h.conn, stage_set_id).unwrap();
+    let (slice_bytes, plain_bytes): (i64, i64) = h
+        .conn
+        .query_row(
+            "SELECT total_encrypted_size, total_dar_size FROM stage_sets WHERE id = ?1",
+            params![stage_set_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    report(
+        "stage_throughput",
+        &format!(
+            "snapshot_create, {:.1} MiB read from disk",
+            mib(io_snapshot.read())
+        ),
+        snapshot_elapsed,
+    );
+    report(
+        "stage_throughput",
+        &format!(
+            "stage_create, {:.1} MiB/s over the source",
+            mib_per_s(source_bytes, stage_elapsed)
+        ),
+        stage_elapsed,
+    );
+    report(
+        "stage_throughput",
+        &format!(
+            "total, {:.1} MiB/s over the source",
+            mib_per_s(source_bytes, total_elapsed)
+        ),
+        total_elapsed,
+    );
+    for p in &phases {
+        let d = Duration::from_millis(p.duration_ms.max(0) as u64);
+        let rate = match p.bytes {
+            Some(b) => format!(
+                "{:.1} MiB/s over {:.1} MiB",
+                mib_per_s(b as u64, d),
+                mib(b as u64)
+            ),
+            None => "no byte count".into(),
+        };
+        report(
+            "stage_throughput",
+            &format!("phase {:<9} {rate}", p.phase),
+            d,
+        );
+    }
+    let ratio = io.read() as f64 / source_bytes as f64;
+    eprintln!(
+        "[perf] stage_throughput read from disk {:.1} MiB = {ratio:.2}x the source \
+         (own {:.1} MiB, dar and other children {:.1} MiB)",
+        mib(io.read()),
+        mib(io.own_read),
+        mib(io.child_read),
+    );
+    eprintln!(
+        "[perf] stage_throughput written {:.1} MiB (own {:.1}, children {:.1}); \
+         staged slices {:.1} MiB from a {:.1} MiB dar stream",
+        mib(io.written()),
+        mib(io.own_written),
+        mib(io.child_written),
+        mib(slice_bytes as u64),
+        mib(plain_bytes as u64),
+    );
+
+    assert!(
+        phases
+            .iter()
+            .any(|p| p.phase == "archive" && p.outcome == "ok"),
+        "stage create recorded no ok `archive` phase: {phases:?}"
+    );
+    assert!(
+        ratio >= 0.5,
+        "only {ratio:.2}x the source was read from disk: the fixture was still in the page \
+         cache (or {} reads no blocks), so every rate above is a cache rate",
+        source.display()
+    );
+    assert!(
+        io.read() as f64 <= 1.5 * source_bytes as f64 + STAGE_READ_SLACK as f64,
+        "staging read {ratio:.2}x the source from disk ({:.1} MiB for {:.1} MiB): it is \
+         reading the source more than once (issues #370, #441)",
+        mib(io.read()),
+        mib(source_bytes)
     );
 }
