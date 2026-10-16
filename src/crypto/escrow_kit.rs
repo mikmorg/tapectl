@@ -1198,19 +1198,29 @@ mod tests {
     /// added to it and not to the sheet fails here.
     #[test]
     fn the_tool_list_covers_every_tool_restore_sh_checks_for() {
+        // Since 1.2.0 each RESTORE.sh mode checks its own tools (#449 item 2);
+        // the set `--restore` checks is the union of them all, and the one
+        // list this sheet must cover.
         let script = crate::volume::layout::generate_restore_script_v2("L6-0001", 3);
         let line = script
             .lines()
-            .find(|l| l.starts_with("for tool in ") && l.ends_with("; do"))
-            .expect("RESTORE.sh has a prerequisite loop");
+            .find(|l| l.starts_with("TOOLS_RESTORE=("))
+            .expect("RESTORE.sh has a --restore prerequisite set");
         let tools: Vec<&str> = line
-            .trim_start_matches("for tool in ")
-            .trim_end_matches("; do")
+            .trim_start_matches("TOOLS_RESTORE=(")
+            .split(')')
+            .next()
+            .unwrap()
             .split_whitespace()
             .collect();
         assert!(
             tools.len() >= 9 && tools.contains(&"mkfifo") && tools.contains(&"tee"),
             "parsed the wrong line: {line:?}"
+        );
+        assert_eq!(
+            tools,
+            crate::volume::layout::restore_sh_tools(),
+            "the --restore set is the union the table names"
         );
         let txt = render_cover_text(&facts_for(&[], &[]));
         for tool in &tools {

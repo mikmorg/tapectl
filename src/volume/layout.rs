@@ -164,6 +164,97 @@ load_count_at_write = {mam_loads}
     )
 }
 
+/// The modes of RESTORE.sh that run external tools, as bits of
+/// [`RestoreTool::modes`]. `--info` and `--verify` run the same ones.
+const MODE_READ: u8 = 1; // --info, --verify
+const MODE_ENVELOPE: u8 = 2; // --find-envelope
+const MODE_LIST: u8 = 4; // --list
+const MODE_PATH: u8 = 8; // --restore --path
+const MODE_RESTORE: u8 = 16; // --restore
+
+/// A tool RESTORE.sh runs (beyond `mt`, which every mode needs, and the
+/// everyday text tools it does not check for), the modes that run it, and
+/// what File 1 says it is for. THE one list: RESTORE.sh's per-mode checks,
+/// its `# Requirements:` and `--help` lines, File 1's tool list and (through
+/// the generated script) the cover sheet's are all drawn from it, so they
+/// cannot drift apart again (#448, #449). A tool added to a mode's code path
+/// in the script is added here, and `restore_sh_tool_sets_are_drawn_from_one_table`
+/// reads the script's own sets back to hold it to that.
+struct RestoreTool {
+    name: &'static str,
+    modes: u8,
+    /// File 1's bullet, after the tool's name in backticks.
+    role: &'static str,
+}
+
+const ALL_MODES: u8 = MODE_READ | MODE_ENVELOPE | MODE_LIST | MODE_PATH | MODE_RESTORE;
+const DECRYPTING: u8 = MODE_ENVELOPE | MODE_LIST | MODE_PATH | MODE_RESTORE;
+
+/// In the order RESTORE.sh's `Requirements:` lines have always listed them.
+const RESTORE_TOOLS: &[RestoreTool] = &[
+    RestoreTool {
+        name: "dd",
+        modes: ALL_MODES,
+        role: "reading raw data from tape",
+    },
+    RestoreTool {
+        name: "age",
+        modes: DECRYPTING,
+        role: "decryption (age-encryption.org). The files are in the age v1 format, which is\n  stable and which the `age` program and `rage` both read; RESTORE.sh runs a\n  program named `age`, so with only `rage` link it under that name",
+    },
+    RestoreTool {
+        name: "dar",
+        modes: MODE_LIST | MODE_PATH | MODE_RESTORE,
+        role: "archive extraction (dar.linux.free.fr)",
+    },
+    RestoreTool {
+        name: "sha256sum",
+        modes: ALL_MODES,
+        role: "integrity verification (coreutils)",
+    },
+    RestoreTool {
+        name: "head",
+        modes: ALL_MODES,
+        role: "trimming and hashing exact byte counts (coreutils)",
+    },
+    RestoreTool {
+        name: "truncate",
+        modes: DECRYPTING,
+        role: "trimming block padding to exact sizes (coreutils)",
+    },
+    RestoreTool {
+        name: "tar",
+        modes: DECRYPTING,
+        role: "unpacking your decrypted envelope (it is a tar archive)",
+    },
+    RestoreTool {
+        name: "mkfifo",
+        modes: MODE_RESTORE,
+        role: "the named pipes a restore streams each slice through into dar (coreutils)",
+    },
+    RestoreTool {
+        name: "tee",
+        modes: MODE_PATH | MODE_RESTORE,
+        role: "hashing a slice as it streams, and keeping dar's output (coreutils)",
+    },
+];
+
+/// The tools of one mode (or of all of them, with [`ALL_MODES`]), in table order.
+fn tools_for(modes: u8) -> Vec<&'static str> {
+    RESTORE_TOOLS
+        .iter()
+        .filter(|t| t.modes & modes != 0)
+        .map(|t| t.name)
+        .collect()
+}
+
+/// Every tool RESTORE.sh may check for beyond `mt`, in the order its
+/// `--restore` check lists them: the union of all its modes, and the one list
+/// File 1 and the cover sheet render.
+pub fn restore_sh_tools() -> Vec<&'static str> {
+    tools_for(ALL_MODES)
+}
+
 /// Generate the v2 system guide (File 1) — the heir manual for layout v2.
 /// Rewrites v1's Quick Reference to the v2 zone order (front index at File 3,
 /// tenant envelopes from File 4, seal marker last with an embedded copy of
@@ -422,8 +513,9 @@ padding can be defeated without knowing the exact size:
 /// `key = value` lines, the §3.1 grammar contract); every value read from a
 /// plaintext tape metadata zone goes through `require_uint` before it
 /// reaches arithmetic, `fsf`, or `seq` (S2 hardening, carried over from v1).
-/// Tools used: mt, dd, age, dar, sha256sum, head, truncate, tar, plus standard
-/// coreutils (awk/sed/grep/tr) — no TOML collection, per the grammar contract.
+/// Tools used: mt, and the ones in `RESTORE_TOOLS` (each mode checks only
+/// those it runs), plus standard coreutils (awk/sed/grep/tr) — no TOML
+/// collection, per the grammar contract.
 /// **`--key` is repeatable (issue #288, CTO ruling 2026-09-22).** A volume's
 /// tenant envelope is sealed at WRITE time to the tenant's then-current public
 /// keys (`build.rs`), while its data slices were sealed at STAGE time
@@ -507,7 +599,8 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 # did, in a scratch directory inside --to or --scratch DIR. The script
 # measures the space before it reads any slice.
 #
-# Requirements: mt (mt-st), dd, age, dar, sha256sum, head, truncate, tar, mkfifo, tee
+# Requirements: mt (mt-st), __TOOLS_ALL__
+# Each mode checks only the tools it runs (see the prerequisite check below).
 # Total files on tape: __TOTAL_FILES__
 #
 # Degradation ladder (see the system guide, File 1, "If All Else Fails"):
@@ -830,11 +923,23 @@ dar_at_least() {
 
 # ---- prerequisite check ----
 
-command -v mt >/dev/null 2>&1 || command -v mt-st >/dev/null 2>&1 ||
-  die "missing required tool: mt (package mt-st)"
-for tool in dd age sha256sum dar head truncate tar mkfifo tee; do
-  command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
-done
+# What each mode runs, besides mt (every mode that reads the tape). A mode
+# checks its own tools when it starts, before the first tape read, so a host
+# that can only read and hash a tape is not refused for tools a restore needs.
+TOOLS_READ=(__TOOLS_READ__)         # --info, --verify
+TOOLS_ENVELOPE=(__TOOLS_ENVELOPE__) # --find-envelope
+TOOLS_LIST=(__TOOLS_LIST__)         # --list
+TOOLS_PATH=(__TOOLS_PATH__)         # --restore --path
+TOOLS_RESTORE=(__TOOLS_RESTORE__)   # --restore
+
+require_tools() { # <tool>...
+  local tool
+  command -v mt >/dev/null 2>&1 || command -v mt-st >/dev/null 2>&1 ||
+    die "missing required tool: mt (package mt-st)"
+  for tool in "$@"; do
+    command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
+  done
+}
 
 # ---- tape helpers ----
 
@@ -2277,9 +2382,11 @@ restore_paths() { # <slices file> <envelope dir> <unit> <version> <destination> 
 
 case "${1:-}" in
 --info)
+  require_tools "${TOOLS_READ[@]}"
   do_info
   ;;
 --verify)
+  require_tools "${TOOLS_READ[@]}"
   do_verify
   ;;
 --find-envelope)
@@ -2297,6 +2404,7 @@ case "${1:-}" in
     esac
   done
   [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --find-envelope --key KEYFILE"
+  require_tools "${TOOLS_ENVELOPE[@]}"
   require_key_files
   do_find_envelope
   ;;
@@ -2344,6 +2452,11 @@ case "${1:-}" in
   if [ "$RESTORE_ALL" = 1 ] && [ ${#RESTORE_UNITS[@]} -gt 0 ]; then
     die "--all restores every unit; give it without --unit"
   fi
+  if [ ${#RESTORE_PATHS[@]} -gt 0 ]; then
+    require_tools "${TOOLS_PATH[@]}"
+  else
+    require_tools "${TOOLS_RESTORE[@]}"
+  fi
   require_key_files
   [ -z "$want" ] || require_uint version "$want"
   do_restore "$dest" "$want" "$scratch"
@@ -2369,6 +2482,7 @@ case "${1:-}" in
     esac
   done
   [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --list --key KEYFILE [--unit U] [--version N]"
+  require_tools "${TOOLS_LIST[@]}"
   require_key_files
   [ -z "$want" ] || require_uint version "$want"
   do_list "$want"
@@ -2419,7 +2533,7 @@ case "${1:-}" in
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
   echo ""
-  echo "Requirements: mt (mt-st), dd, age, dar, sha256sum, head, truncate, tar, mkfifo, tee"
+  echo "Requirements: mt (mt-st), __TOOLS_ALL__"
   ;;
 "")
   echo "RESTORE.sh for tapectl volume $LABEL"
@@ -2446,6 +2560,12 @@ esac
         .replace("__AWK_MT_POSITION__", AWK_MT_POSITION)
         .replace("__AWK_UNITS_TABLE__", AWK_UNITS_TABLE)
         .replace("__AWK_UNIT_UUID__", AWK_UNIT_UUID)
+        .replace("__TOOLS_READ__", &tools_for(MODE_READ).join(" "))
+        .replace("__TOOLS_ENVELOPE__", &tools_for(MODE_ENVELOPE).join(" "))
+        .replace("__TOOLS_LIST__", &tools_for(MODE_LIST).join(" "))
+        .replace("__TOOLS_PATH__", &tools_for(MODE_PATH).join(" "))
+        .replace("__TOOLS_RESTORE__", &tools_for(MODE_RESTORE).join(" "))
+        .replace("__TOOLS_ALL__", &restore_sh_tools().join(", "))
         .replace("__LABEL__", label)
         .replace("__TOTAL_FILES__", &total_files.to_string());
 
@@ -2455,8 +2575,8 @@ esac
     // tape. Debug-only: `no_awk_placeholder_survives_assembly` (mod tests)
     // covers the release-mode case unconditionally.
     debug_assert!(
-        !result.contains("__AWK_"),
-        "an __AWK_*__ placeholder was not substituted in generate_restore_script_v2"
+        !result.contains("__AWK_") && !result.contains("__TOOLS_"),
+        "a placeholder was not substituted in generate_restore_script_v2"
     );
 
     result
@@ -4506,7 +4626,9 @@ sha256_encrypted = \"bbb\"
     /// Issue #349, CTO ruling 2026-09-28: RESTORE.sh unpacks the decrypted
     /// envelope with `tar xf -`, so an heir without `tar` must be told so up
     /// front by the prerequisite check, not meet a confusing failure after
-    /// the tape has already been read and decrypted.
+    /// the tape has already been read and decrypted. Since 1.2.0 the check
+    /// belongs to each mode (#449 item 2): `--restore` runs tar, and a bare
+    /// invocation, `--help` and a typo'd mode run nothing and need nothing.
     ///
     /// Executed, not grepped: the script runs on a PATH holding every other
     /// tool the check demands (inert stubs, plus the real `mktemp`/`rm` the
@@ -4524,17 +4646,10 @@ sha256_encrypted = \"bbb\"
         std::fs::create_dir_all(&bin).unwrap();
         let sh = dir.join("RESTORE.sh");
         std::fs::write(&sh, generate_restore_script_v2("NOTAR1", 20)).unwrap();
-        for tool in [
-            "mt",
-            "dd",
-            "age",
-            "dar",
-            "sha256sum",
-            "head",
-            "truncate",
-            "mkfifo",
-            "tee",
-        ] {
+        for tool in ["mt"].into_iter().chain(restore_sh_tools()) {
+            if tool == "tar" {
+                continue;
+            }
             let stub = bin.join(tool);
             std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4543,9 +4658,10 @@ sha256_encrypted = \"bbb\"
             std::os::unix::fs::symlink(host_tool(tool), bin.join(tool)).unwrap();
         }
         let bash = host_tool("bash");
-        let run = || -> (i32, String) {
+        let run = |args: &[&str]| -> (i32, String) {
             let o = Command::new(&bash)
                 .arg(&sh)
+                .args(args)
                 .env("PATH", &bin)
                 .output()
                 .expect("spawn script");
@@ -4553,27 +4669,107 @@ sha256_encrypted = \"bbb\"
             text.push_str(&String::from_utf8_lossy(&o.stderr));
             (o.status.code().unwrap_or(-1), text)
         };
+        let restore = ["--restore", "--key", "k.key", "--to", "out"];
 
-        let (code, text) = run();
+        let (code, text) = run(&restore);
         assert_eq!(code, 1, "no tar on PATH must be a fatal exit:\n{text}");
         assert!(
             text.contains("missing required tool: tar"),
             "the prerequisite check must name tar:\n{text}"
         );
 
-        // Positive control: the same PATH plus tar gets past the check (a
-        // bare invocation is a friendly no-op that exits 0).
+        // A mode that runs no tar does not ask for it: --info and --verify
+        // read and hash, and get as far as the (stub) tape.
+        for mode in ["--info", "--verify"] {
+            let (_, text) = run(&[mode]);
+            assert!(
+                !text.contains("missing required tool"),
+                "{mode} runs no tar:\n{text}"
+            );
+        }
+        let (code, text) = run(&[]);
+        assert_eq!(code, 0, "a bare invocation needs no tool:\n{text}");
+        let (code, _) = run(&["--help"]);
+        assert_eq!(code, 0, "--help needs no tool");
+
+        // Positive control: the same PATH plus tar gets past the check (the
+        // key file does not exist, which is the next thing the mode asks).
         let stub = bin.join("tar");
         std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (code, text) = run();
-        assert_eq!(
-            code, 0,
-            "control: with tar present the check passes:\n{text}"
-        );
+        let (code, text) = run(&restore);
+        assert_eq!(code, 1, "control: it then stops at the missing key:\n{text}");
         assert!(!text.contains("missing required tool"), "{text}");
+        assert!(text.contains("key file not found"), "{text}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #449 item 2, the one source of truth: RESTORE.sh's per-mode sets are
+    /// read back out of the generated script and compared to the table they
+    /// come from. The union is what `--restore` checks, what File 1 and the
+    /// cover sheet list, and what the Requirements lines say; every smaller
+    /// set is drawn from it; and the sets widen the way the modes do.
+    #[test]
+    fn restore_sh_tool_sets_are_drawn_from_one_table() {
+        let s = generate_restore_script_v2("TOOLSET", 20);
+        assert!(!s.contains("__TOOLS_"), "a placeholder survived assembly");
+        let set = |name: &str| -> Vec<String> {
+            let line = s
+                .lines()
+                .find(|l| l.starts_with(&format!("{name}=(")))
+                .unwrap_or_else(|| panic!("no {name} line"));
+            line.trim_start_matches(&format!("{name}=("))
+                .split(')')
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        let union: Vec<String> = restore_sh_tools().iter().map(|t| t.to_string()).collect();
+        assert_eq!(
+            union,
+            ["dd", "age", "dar", "sha256sum", "head", "truncate", "tar", "mkfifo", "tee"],
+            "the union, in the order RESTORE.sh's Requirements lines have always listed it"
+        );
+        assert_eq!(set("TOOLS_RESTORE"), union, "--restore checks the union");
+        let (read, envelope, list, path) = (
+            set("TOOLS_READ"),
+            set("TOOLS_ENVELOPE"),
+            set("TOOLS_LIST"),
+            set("TOOLS_PATH"),
+        );
+        for (name, sub) in [
+            ("read", &read),
+            ("envelope", &envelope),
+            ("list", &list),
+            ("path", &path),
+        ] {
+            for tool in sub {
+                assert!(union.contains(tool), "{name}: {tool} is not in the union");
+            }
+        }
+        // The widening: --info/--verify read and hash; --find-envelope adds
+        // what unpacks an envelope; --list adds dar; --path adds tee;
+        // --restore adds mkfifo.
+        assert_eq!(read, ["dd", "sha256sum", "head"]);
+        assert_eq!(
+            envelope,
+            ["dd", "age", "sha256sum", "head", "truncate", "tar"]
+        );
+        assert_eq!(
+            list,
+            ["dd", "age", "dar", "sha256sum", "head", "truncate", "tar"]
+        );
+        assert!(path.contains(&"tee".to_string()) && !path.contains(&"mkfifo".to_string()));
+        assert!(path.iter().all(|t| list.contains(t) || t == "tee"));
+        // The two Requirements lines say the union, mt first.
+        let req = format!("mt (mt-st), {}", union.join(", "));
+        assert!(s.contains(&format!("# Requirements: {req}\n")));
+        assert!(s.contains(&format!("echo \"Requirements: {req}\"")));
+        // The prerequisite loop is gone: no mode checks tools it does not run.
+        assert!(!s.contains("for tool in dd age"), "the every-mode loop");
     }
 
     /// Issue #349: File 1 is where an heir learns what to install before

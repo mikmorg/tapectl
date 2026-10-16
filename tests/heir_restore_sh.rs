@@ -762,6 +762,13 @@ impl Heir {
         self
     }
 
+    /// Take one of the host's own tools off `PATH`, as a minimal system
+    /// would not have it (a tool that is a stub goes with `without`).
+    fn without_host(self, name: &str) -> Self {
+        std::fs::remove_file(self.dir.join("hostbin").join(name)).unwrap();
+        self
+    }
+
     fn key(&self, name: &str) -> String {
         self.dir
             .join("keys")
@@ -2135,4 +2142,171 @@ fn dar_is_started_in_the_c_locale_whatever_the_heirs_locale() {
         seen.lines().count() >= 2 && seen.lines().all(|l| l.starts_with("LC_ALL=C ")),
         "every dar run (the version probe, the extraction) is under LC_ALL=C:\n{seen}"
     );
+}
+
+// ---- #449 item 2: each mode checks the tools it runs ----
+
+/// A host that can read a tape but nothing more: no age, dar, tar, mkfifo or
+/// tee. --info and --verify run on it, because they run none of those; every
+/// mode that decrypts or restores is refused up front, naming the tool and
+/// before the tape is touched.
+#[test]
+fn a_verify_only_host_runs_info_and_verify_and_is_refused_a_restore() {
+    let bare = || {
+        Heir::new()
+            .without("age")
+            .without_host("dar")
+            .without_host("tar")
+            .without_host("mkfifo")
+            .without_host("tee")
+    };
+
+    let h = bare();
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Verdict: SEALED"), "{text}");
+    let (code, text) = h.run(&["--verify"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("VERIFY: PASS"), "{text}");
+    assert!(
+        !text.contains("missing required tool"),
+        "a verify-only host is not refused for tools --verify never runs:\n{text}"
+    );
+
+    // Positive control: the same host IS refused where the tool is needed.
+    for (mode, tool) in [
+        (vec!["--find-envelope", "--key", "KEY"], "age"),
+        (vec!["--list", "--key", "KEY"], "age"),
+        (vec!["--restore", "--key", "KEY", "--to", "OUT"], "age"),
+    ] {
+        let args: Vec<String> = mode
+            .iter()
+            .map(|a| match *a {
+                "KEY" => h.key("alice"),
+                "OUT" => h.sub("restored"),
+                other => other.to_string(),
+            })
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, text) = h.run(&args);
+        assert_eq!(code, 1, "{mode:?}: {text}");
+        assert!(
+            text.contains(&format!("missing required tool: {tool}")),
+            "{mode:?}: names the tool:\n{text}"
+        );
+        assert!(
+            h.ops().is_empty(),
+            "{mode:?}: refused before any tape motion or read:\n{:#?}",
+            h.ops()
+        );
+    }
+}
+
+/// The modes widen one tool at a time: each is refused for exactly the tool
+/// IT runs and no other.
+#[test]
+fn each_mode_is_refused_for_the_tools_it_runs_and_no_others() {
+    let alice = |h: &Heir| h.key("alice");
+    let dest = |h: &Heir| h.sub("restored");
+
+    // No dar: --find-envelope runs (it decrypts and unpacks, it does not run
+    // dar); --list and --restore need dar.
+    let h = Heir::new().without_host("dar");
+    let (code, text) = h.run(&["--find-envelope", "--key", &alice(&h)]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("photos/2019"), "{text}");
+    for args in [
+        vec!["--list", "--key", &alice(&h)],
+        vec![
+            "--restore",
+            "--key",
+            &alice(&h),
+            "--unit",
+            "docs",
+            "--to",
+            &dest(&h),
+        ],
+    ] {
+        let (code, text) = h.run(&args);
+        assert_eq!(code, 1, "{args:?}: {text}");
+        assert!(text.contains("missing required tool: dar"), "{text}");
+        assert!(h.ops().is_empty(), "{:#?}", h.ops());
+    }
+
+    // No mkfifo: a whole-unit restore streams through FIFOs and is refused;
+    // --path reads a few slices to disk and never makes one.
+    let h = Heir::new().without_host("mkfifo");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &alice(&h),
+        "--unit",
+        "docs",
+        "--to",
+        &dest(&h),
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("missing required tool: mkfifo"), "{text}");
+    assert!(h.ops().is_empty(), "{:#?}", h.ops());
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &alice(&h),
+        "--unit",
+        "docs",
+        "--path",
+        "sub/note.txt",
+        "--to",
+        &h.sub("one-file"),
+    ]);
+    assert_eq!(code, 0, "--path needs no mkfifo:\n{text}");
+    assert!(
+        std::fs::read_to_string(h.dir.join("one-file/sub/note.txt")).is_ok(),
+        "{text}"
+    );
+
+    // No tee: --path pipes dar's output through tee, so it is refused too;
+    // --find-envelope and --list never use it.
+    let h = Heir::new().without_host("tee");
+    for args in [
+        vec![
+            "--restore",
+            "--key",
+            &alice(&h),
+            "--unit",
+            "docs",
+            "--to",
+            &dest(&h),
+        ],
+        vec![
+            "--restore",
+            "--key",
+            &alice(&h),
+            "--unit",
+            "docs",
+            "--path",
+            "sub/note.txt",
+            "--to",
+            &dest(&h),
+        ],
+    ] {
+        let (code, text) = h.run(&args);
+        assert_eq!(code, 1, "{args:?}: {text}");
+        assert!(text.contains("missing required tool: tee"), "{text}");
+        assert!(h.ops().is_empty(), "{:#?}", h.ops());
+    }
+    let (code, text) = h.run(&["--list", "--key", &alice(&h), "--unit", "docs"]);
+    assert_eq!(code, 0, "--list needs no tee:\n{text}");
+
+    // No mt at all: every mode that reads the tape says so first. (A
+    // control: it is the one tool every mode needs.)
+    let h = Heir::new().without("mt").without("mt-st");
+    for mode in ["--info", "--verify"] {
+        let (code, text) = h.run(&[mode]);
+        assert_eq!(code, 1, "{mode}: {text}");
+        assert!(
+            text.contains("missing required tool: mt (package mt-st)"),
+            "{mode}: {text}"
+        );
+    }
 }
