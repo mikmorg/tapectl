@@ -199,7 +199,7 @@ exit code:
 |---|---|---|
 | 0 | every checked file matched | nothing |
 | 2 | the verify **proved the medium bad**: the volume is quarantined (or, verified again, still is) and no longer counts as a copy | salvage what still reads and write it to another cartridge ([Verifying a volume](#verifying-a-volume)) |
-| 3 | **inconclusive**: a read or transport failure, or an error before any verdict: no cartridge loaded, the wrong tape, an unknown label, a drive that cannot read this generation, `--dry-run` (which `verify` refuses), a database or config error, a command line that does not parse after `verify`. The volume is untouched | check the drive, the cartridge in it or the command line, then verify again |
+| 3 | **inconclusive**: a read or transport failure, or an error before any verdict: no cartridge loaded, the wrong tape, an unknown label, a drive that cannot read this generation, a File 0 saying this tapectl cannot read the tape (a `requires` it does not know, #476), `--dry-run` (which `verify` refuses), a database or config error, a command line that does not parse after `verify`. The volume is untouched | check the drive, the cartridge in it or the command line, then verify again |
 
 Once its command line has reached `verify`, `volume verify` exits 2 only
 through a quarantine. A script whose command line is known to parse can
@@ -2553,9 +2553,13 @@ A tape written by a newer tapectl says in File 0 (and its seal marker) what a
 reader must understand, as `requires = [...]`. A RESTORE.sh or tapectl that
 does not know a feature refuses rather than misread the tape. Use the
 RESTORE.sh on that tape (file 2), which knows, or a newer tapectl. tapectl
-itself refuses the same way (`restore raw-volume`, `catalog rebuild`), and
-`volume verify` reports the seal as unreadable — inconclusive, never a reason
-to quarantine the cartridge.
+itself refuses the same way, before a scratch directory, a key or a slice:
+`restore raw-volume` and `catalog rebuild`, and from the release after 1.2.0
+(#476) also `restore unit`, `restore file`, `restore volume`, `volume verify`,
+`volume read-slices`, `volume compact-read`, `volume compact` and `volume
+resume`. `volume verify` exits 3 and records nothing for a File 0 it refuses,
+and reports a seal that needs an unknown feature as unreadable. Either way it
+is inconclusive, never a reason to quarantine the cartridge.
 
 ### RESTORE.sh: an envelope is `DAMAGED`
 

@@ -2293,7 +2293,7 @@ The exit status says which of three things happened, so a script needs no
 |---|---|---|
 | 0 | every checked file matched | nothing |
 | 2 | the verify **proved the medium bad**: the volume is quarantined and no longer counts as a copy | write its content to another cartridge |
-| 3 | **inconclusive**: a drive or transport failure, or an error before any verdict (no cartridge loaded, the wrong tape, an unknown label, a mistyped command line); the volume is untouched | check the drive, then verify again |
+| 3 | **inconclusive**: a drive or transport failure, or an error before any verdict (no cartridge loaded, the wrong tape, an unknown label, a File 0 saying this tapectl cannot read the tape, a mistyped command line); the volume is untouched | check the drive, then verify again |
 
 An empty drive is refused at once with `no cartridge loaded in <device>`, by
 `volume verify` and by every other command that reads or writes a tape.

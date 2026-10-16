@@ -129,7 +129,11 @@ requires = []
 `requires` lists the features a reader must understand to read this tape
 correctly. 1.1.0 knows none, and requires none. The rules every reader keeps
 — tapectl's (`format::FormatClaims`, checked by `restore raw-volume`,
-`catalog rebuild`, the confirm/verify chain walk) and RESTORE.sh's
+`catalog rebuild`, and, since #476, `restore unit`, `restore file`, `restore volume`,
+`volume verify`, `volume read-slices`, `volume compact-read` (and `volume compact`'s
+first step) and `volume resume`'s adoption of a lost write, each at its File 0
+contact from the one read it already takes; the confirm/verify chain walk checks the
+seal's) and RESTORE.sh's
 (`check_magic`, `check_requires`):
 
 1. **Refuse what you do not know, by name.** A tape whose File 0 or seal
