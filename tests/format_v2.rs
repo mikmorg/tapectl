@@ -28,7 +28,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use common::{generate_collection, MicroSpec, UnitFixture, MICRO_BLOCK};
-use tapectl::crypto::keys::generate_keypair;
+use tapectl::crypto::keys::{generate_keypair, GeneratedKeypair};
 use tapectl::db;
 use tapectl::staging;
 use tapectl::store::{MemStore, MismatchKind, Store, Tier};
@@ -59,6 +59,10 @@ struct TenantFixture {
     tenant_id: i64,
     name: String,
     public_key: String,
+    /// What the catalog records as the key's fingerprint. Today that is the
+    /// `age1…` public key itself; kept as its own field so a scan for it
+    /// stays a scan for the fingerprint if that ever changes.
+    fingerprint: String,
     secret_key: String,
 }
 
@@ -69,10 +73,51 @@ struct UnitPlain {
     unit_uuid: String,
     tenant_id: i64,
     plaintext: Vec<u8>,
+    /// The `sha256_plain` the catalog recorded for the unit's one slice: the
+    /// real hash of `plaintext` when the build asked for it
+    /// ([`HarnessSpec::real_plaintext_hash`]), else the harness placeholder.
+    sha256_plain: String,
+}
+
+/// What a sealed-harness build is made of beyond its fixture units: the names
+/// the tenants are known by, and whether the plaintext hash and the escrow
+/// recipient are real. The default is the long-standing shared harness
+/// (`operator`, `alpha`, `bravo`, a placeholder `sha256_plain`, no escrow);
+/// the plaintext-zone scan (issue #450) asks for unique names, real hashes
+/// and an escrow recipient, so every needle it searches for is a string only
+/// the fixture could have put on the tape.
+struct HarnessSpec<'a> {
+    operator: &'a str,
+    /// The two content tenants; the fixture's first half of units goes to
+    /// the first, the rest to the second.
+    tenants: [&'a str; 2],
+    /// Hash each unit's real plaintext into `stage_slices.sha256_plain`
+    /// instead of the placeholder every other test shares (a second full
+    /// hash pass per unit, wanted only where the hash is a needle).
+    real_plaintext_hash: bool,
+    /// Register an escrow recipient: slices and envelopes are then also
+    /// encrypted to it (`volume-format-v2.md` §1: enc(t+op+esc)).
+    escrow: bool,
+}
+
+impl Default for HarnessSpec<'_> {
+    fn default() -> Self {
+        HarnessSpec {
+            operator: "operator",
+            tenants: ["alpha", "bravo"],
+            real_plaintext_hash: false,
+            escrow: false,
+        }
+    }
 }
 
 /// Everything downstream assertions need from a fully sealed session.
 struct Harness {
+    /// The operator's identity, and the escrow recipient when the build
+    /// registered one: with `tenants`, every key whose fingerprint or `age1…`
+    /// string must stay off the plaintext zones.
+    operator: TenantFixture,
+    escrow: Option<GeneratedKeypair>,
     /// Snapshot of the sealed `BuiltLayout`'s `Layout`, taken BEFORE it was
     /// consumed by the typestate chain (`into_validated` -> ... -> `confirm`
     /// does not hand it back). Its only legitimate use downstream is File 3's
@@ -120,6 +165,7 @@ fn insert_tenant(conn: &rusqlite::Connection, name: &str, is_operator: bool) -> 
         tenant_id,
         name: name.to_string(),
         public_key: kp.public_key,
+        fingerprint: kp.fingerprint,
         secret_key: kp.secret_key,
     }
 }
@@ -137,7 +183,17 @@ fn insert_tenant(conn: &rusqlite::Connection, name: &str, is_operator: bool) -> 
 fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness {
     let root = tempfile::tempdir().unwrap();
     let fixtures = generate_collection(root.path(), &MicroSpec { n_units, seed });
+    build_sealed_harness_from(&fixtures, &HarnessSpec::default(), volume_uuid)
+}
 
+/// [`build_sealed_harness`] over fixture units the caller made, named and
+/// keyed as `spec` says. The fixtures' files must still exist: their bytes
+/// are read here.
+fn build_sealed_harness_from(
+    fixtures: &[UnitFixture],
+    spec: &HarnessSpec<'_>,
+    volume_uuid: &str,
+) -> Harness {
     // `db::open_memory` is `#[cfg(test)]`-gated (unit-test-only), so it does
     // not exist in the normal rlib an integration test links against. A real
     // temp-file DB via the unconditionally-`pub` `db::open` is functionally
@@ -145,10 +201,12 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
     // path) and needs no `src/` change.
     let db_dir = tempfile::tempdir().unwrap();
     let conn = db::open(&db_dir.path().join("t7.db")).unwrap();
-    let operator = insert_tenant(&conn, "operator", true);
-    let tenant_a = insert_tenant(&conn, "alpha", false);
-    let tenant_b = insert_tenant(&conn, "bravo", false);
+    let operator = insert_tenant(&conn, spec.operator, true);
+    let tenant_a = insert_tenant(&conn, spec.tenants[0], false);
+    let tenant_b = insert_tenant(&conn, spec.tenants[1], false);
     let tenants = vec![tenant_a, tenant_b];
+    let escrow = spec.escrow.then(generate_keypair);
+    let escrow_public_key = escrow.as_ref().map(|k| k.public_key.clone());
 
     conn.execute(
         "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
@@ -204,7 +262,8 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
         // operator (`volume-format-v2.md` §1: data slices are enc(t+op+esc);
         // escrow is skipped here, same as session.rs's own fixture, since
         // `escrow_recipient_present: None` below opts the check out).
-        let recipients = vec![tenant.public_key.clone(), operator.public_key.clone()];
+        let mut recipients = vec![tenant.public_key.clone(), operator.public_key.clone()];
+        recipients.extend(escrow_public_key.clone());
         let encrypted = staging::encrypt_data(&plaintext, &recipients).unwrap();
         // sha256_plain is never read back by any of this suite's assertions
         // or by the validate/execute/confirm code paths under test (only
@@ -213,7 +272,11 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
         // ~N MiB debug-mode hash pass per unit purely for test wall-clock,
         // matching `build.rs`'s own test fixture's identical shortcut
         // (`sha_hex(b"plaintext hash is not exercised by this fixture")`).
-        let sha_plain = sha256_hex(b"plaintext hash is not exercised by this harness");
+        let sha_plain = if spec.real_plaintext_hash {
+            sha256_hex(&plaintext)
+        } else {
+            sha256_hex(b"plaintext hash is not exercised by this harness")
+        };
         let sha_enc = sha256_hex(&encrypted);
 
         conn.execute(
@@ -253,7 +316,7 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
                 slice_number: 1,
                 size_bytes: plaintext.len() as i64,
                 encrypted_bytes: encrypted.len() as i64,
-                sha256_plain: sha_plain,
+                sha256_plain: sha_plain.clone(),
                 sha256_encrypted: sha_enc,
                 staging_path: slice_path,
             }],
@@ -263,6 +326,7 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
             unit_uuid,
             tenant_id: tenant.tenant_id,
             plaintext,
+            sha256_plain: sha_plain,
         });
     }
 
@@ -297,7 +361,7 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
             })
             .collect(),
         operator_public_keys: vec![operator.public_key.clone()],
-        escrow_public_key: None,
+        escrow_public_key: escrow_public_key.clone(),
         catalog_db_path: None,
     };
 
@@ -312,7 +376,7 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
         tenant_ids: tenants.iter().map(|t| t.tenant_id).collect(),
         tenants_with_active_key: tenants.iter().map(|t| t.tenant_id).collect(),
         operator_key_present: true,
-        escrow_recipient_present: None,
+        escrow_recipient_present: escrow_public_key.as_ref().map(|_| true),
         stage_sets_lacking_escrow: None,
     };
 
@@ -349,6 +413,8 @@ fn build_sealed_harness(seed: u64, n_units: usize, volume_uuid: &str) -> Harness
     }
 
     Harness {
+        operator,
+        escrow,
         layout: layout_snapshot,
         store,
         tenants,
@@ -1317,4 +1383,220 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
     // padded seal bytes are not hashed by anything on the tape).
     let evidence = with(seal.replacen("requires = []", "requires = []\nended_after = 7", 1));
     assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
+}
+
+// ── Issue #450 — the plaintext zones, scanned without a tape ──────────────
+
+const VOLUME_UUID_NEEDLES: &str = "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0";
+
+/// Unique strings: nothing the system guide, RESTORE.sh, the front index or
+/// the ID thunk say in their own words can contain one, so a hit is a leak
+/// and not a coincidence of vocabulary. (The shared harness's `alpha`,
+/// `operator` and `movie.mkv` are ordinary words, which RESTORE.sh and the
+/// guide use; scanning for them would only ever prove the scan noisy.)
+const NEEDLE_OPERATOR: &str = "op-needle-w3z8v";
+const NEEDLE_TENANT_A: &str = "tnt-alpha-q7x2k";
+const NEEDLE_TENANT_B: &str = "tnt-bravo-m4k9p";
+const NEEDLE_UNIT_A: &str = "unit-alpha-q7x2k";
+const NEEDLE_UNIT_B: &str = "unit-bravo-m4k9p";
+const NEEDLE_FILES_A: [&str; 2] = ["secret-report-q7x2k-alpha.pdf", "diary-q7x2k-alpha.txt"];
+const NEEDLE_FILES_B: [&str; 1] = ["secret-report-m4k9p-bravo.pdf"];
+
+/// One fixture unit: a folder `name` holding `files`, each with content that
+/// is its own (so its plaintext hash is its own).
+fn needle_unit(root: &std::path::Path, name: &str, files: &[&str]) -> UnitFixture {
+    let path = root.join(name);
+    std::fs::create_dir_all(&path).unwrap();
+    let mut listed = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        let body = format!("{name} / {file} / part {i}\n")
+            .repeat(64)
+            .into_bytes();
+        std::fs::write(path.join(file), &body).unwrap();
+        listed.push((file.to_string(), body.len() as u64));
+    }
+    UnitFixture {
+        folder_name: name.to_string(),
+        path,
+        total_bytes: listed.iter().map(|(_, n)| n).sum(),
+        files: listed,
+    }
+}
+
+/// Every needle in `bytes`, as raw bytes (no decoding: a lossy decode is
+/// where a needle split across a multi-byte sequence could be swallowed).
+/// The scan's ONE routine: the assertion on the real tape and every positive
+/// control below call it, so a control that passes proves the very search
+/// the assertion runs.
+fn find_needles<'a>(bytes: &[u8], needles: &'a [String]) -> Vec<&'a str> {
+    needles
+        .iter()
+        .filter(|n| bytes.windows(n.len()).any(|w| w == n.as_bytes()))
+        .map(String::as_str)
+        .collect()
+}
+
+/// `(position, needle)` for every needle found in the files at `positions`.
+fn leaks_in(files: &[Vec<u8>], positions: &[usize], needles: &[String]) -> Vec<(usize, String)> {
+    positions
+        .iter()
+        .flat_map(|&p| {
+            find_needles(&files[p], needles)
+                .into_iter()
+                .map(move |n| (p, n.to_string()))
+        })
+        .collect()
+}
+
+/// Everything the isolation invariant (`volume-format-v2.md` §2) says no
+/// plaintext file may reveal, for this fixture: tenant and unit names, file
+/// names, plaintext hashes (each unit's `sha256_plain` and each file's own),
+/// and key fingerprints, with the `age1…` recipient strings.
+fn plaintext_zone_needles(h: &Harness, fixtures: &[UnitFixture]) -> Vec<String> {
+    let mut needles = Vec::new();
+    for t in h.tenants.iter().chain(std::iter::once(&h.operator)) {
+        needles.extend([t.name.clone(), t.public_key.clone(), t.fingerprint.clone()]);
+    }
+    if let Some(escrow) = &h.escrow {
+        needles.extend([escrow.public_key.clone(), escrow.fingerprint.clone()]);
+    }
+    for f in fixtures {
+        needles.push(f.folder_name.clone());
+        for (file, _) in &f.files {
+            needles.push(file.clone());
+            needles.push(sha256_hex(&std::fs::read(f.path.join(file)).unwrap()));
+        }
+    }
+    needles.extend(h.units.iter().map(|u| u.sha256_plain.clone()));
+    needles.sort();
+    needles.dedup();
+    needles
+}
+
+/// Issue #450: the isolation invariant, machine-checked in CI. The only
+/// scans of a volume's plaintext zones were `mhvtl_no_plaintext_tenant_
+/// metadata` (mhvtl-gated) and the gate's leak scan; nothing ungated looked,
+/// and nothing looked for key fingerprints or `age1…` strings at all. This
+/// seals a volume onto a `MemStore` whose fixture carries unique tenant,
+/// unit and file names, real plaintext hashes, three keys and an escrow
+/// recipient, and scans File 0 (ID thunk), File 1 (system guide), File 2
+/// (RESTORE.sh), File 3 (front index) and the seal marker for every one.
+///
+/// Every assertion is an absence, and an absence cannot tell "searched and
+/// found nothing" from "searched nothing", so each is paired with a control
+/// that runs the same routine over bytes that DO hold the needle.
+#[test]
+fn no_plaintext_zone_reveals_a_tenant_unit_file_hash_or_key() {
+    let root = tempfile::tempdir().unwrap();
+    let fixtures = vec![
+        needle_unit(root.path(), NEEDLE_UNIT_A, &NEEDLE_FILES_A),
+        needle_unit(root.path(), NEEDLE_UNIT_B, &NEEDLE_FILES_B),
+    ];
+    let spec = HarnessSpec {
+        operator: NEEDLE_OPERATOR,
+        tenants: [NEEDLE_TENANT_A, NEEDLE_TENANT_B],
+        real_plaintext_hash: true,
+        escrow: true,
+    };
+    let h = build_sealed_harness_from(&fixtures, &spec, VOLUME_UUID_NEEDLES);
+    let needles = plaintext_zone_needles(&h, &fixtures);
+
+    // The needle set is what the invariant lists, and none of it is trivial.
+    assert!(
+        needles.iter().all(|n| n.len() >= 15),
+        "a short needle matches ordinary vocabulary: {needles:?}"
+    );
+    assert_eq!(
+        needles.iter().filter(|n| n.starts_with("age1")).count(),
+        4,
+        "the operator's, both tenants' and the escrow recipient's age1 strings: {needles:?}"
+    );
+    for want in [
+        NEEDLE_TENANT_A,
+        NEEDLE_TENANT_B,
+        NEEDLE_OPERATOR,
+        NEEDLE_UNIT_A,
+        NEEDLE_FILES_A[1],
+        NEEDLE_FILES_B[0],
+    ] {
+        assert!(needles.iter().any(|n| n == want), "{want} is not a needle");
+    }
+    for u in &h.units {
+        assert_eq!(
+            u.sha256_plain,
+            sha256_hex(&u.plaintext),
+            "the recorded plaintext hash is the real one, so the scan looks for the real one"
+        );
+        assert!(needles.contains(&u.sha256_plain));
+    }
+
+    // The plaintext-by-design positions (§2): 0, 1, 2, the front index at 3,
+    // and the seal marker, last.
+    let (front_index, _) = front_index_position_and_true_len(&h.layout);
+    assert_eq!(front_index, 3, "the front index sits at File 3");
+    let files = &h.store.files;
+    let seal_marker = files.len() - 1;
+    let plaintext_zones = [0usize, 1, 2, front_index, seal_marker];
+
+    // The assertion: none of it is on the real recorded bytes.
+    let leaks = leaks_in(files, &plaintext_zones, &needles);
+    assert!(leaks.is_empty(), "plaintext zones reveal: {leaks:?}");
+
+    // Control 1: with every needle planted mid-file in a copy of each zone's
+    // own bytes, the same routine finds every one. Mid-file on purpose: it
+    // can split a multi-byte sequence.
+    let planted_all: Vec<u8> = needles
+        .iter()
+        .flat_map(|n| format!("\n{n}\n").into_bytes())
+        .collect();
+    for &zone in &plaintext_zones {
+        let mid = files[zone].len() / 2;
+        let planted = [&files[zone][..mid], &planted_all[..], &files[zone][mid..]].concat();
+        assert_eq!(
+            find_needles(&planted, &needles).len(),
+            needles.len(),
+            "File {zone}: the scan missed a planted needle"
+        );
+    }
+
+    // Control 2 (the failing case): a tenant name planted into File 1 is
+    // reported at File 1, and only that name, at only that file.
+    let mut tampered = files.clone();
+    let mid = tampered[1].len() / 2;
+    tampered[1].splice(mid..mid, NEEDLE_TENANT_A.bytes());
+    assert_eq!(
+        leaks_in(&tampered, &plaintext_zones, &needles),
+        vec![(1, NEEDLE_TENANT_A.to_string())],
+        "a tenant name planted into File 1 must be the one leak, found at File 1"
+    );
+
+    // Control 3: the scan does see what IS plaintext by design. File 0 names
+    // the volume's label and uuid, so a scan that reads File 0 finds them.
+    let by_design = ["T7MICRO".to_string(), VOLUME_UUID_NEEDLES.to_string()];
+    assert_eq!(
+        find_needles(&files[0], &by_design),
+        ["T7MICRO", VOLUME_UUID_NEEDLES],
+        "File 0 must carry the label and uuid the scan is shown to find"
+    );
+
+    // Everything else is age ciphertext, and holds no needle either.
+    let age_magic = b"age-encryption.org/v1";
+    for (pos, data) in files.iter().enumerate() {
+        if plaintext_zones.contains(&pos) {
+            continue;
+        }
+        assert!(
+            data.starts_with(age_magic),
+            "File {pos} is not age-encrypted: {:?}",
+            &data[..data.len().min(32)]
+        );
+        assert!(
+            find_needles(data, &needles).is_empty(),
+            "encrypted File {pos} holds a needle in the clear"
+        );
+    }
+    assert!(
+        files.len() > plaintext_zones.len(),
+        "no encrypted file scanned"
+    );
 }

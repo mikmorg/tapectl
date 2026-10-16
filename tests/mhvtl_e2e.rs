@@ -753,6 +753,34 @@ fn slice_plaintext_hashes(conn: &Connection, unit_name: &str) -> Vec<String> {
     hashes
 }
 
+/// Every key the catalog holds -- the operator's, each tenant's, the escrow
+/// recipient -- as the strings that must stay off a tape's plaintext files:
+/// the fingerprint and the `age1…` public key (today one string; both are
+/// collected so a fingerprint that stops being the public key is still a
+/// needle). Issue #450.
+fn key_recipients(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT public_key, fingerprint FROM encryption_keys")
+        .unwrap();
+    let mut keys: Vec<String> = stmt
+        .query_map([], |row| {
+            Ok([row.get::<_, String>(0)?, row.get::<_, String>(1)?])
+        })
+        .unwrap()
+        .flat_map(|r| r.unwrap())
+        .filter(|k| !k.is_empty())
+        .collect();
+    keys.sort();
+    keys.dedup();
+    // The positive control for the query itself: an empty set would make the
+    // scan below look for nothing and pass.
+    assert!(
+        keys.iter().filter(|k| k.starts_with("age1")).count() >= 4,
+        "expected the operator's, two tenants' and the escrow recipient's age1 keys: {keys:?}"
+    );
+    keys
+}
+
 /// The plaintext-leak scan's ONE routine: every needle found in `data`, read
 /// as lossy UTF-8. The leak assertions and their positive controls both call
 /// this, so a control that passes proves the very search the assertion runs
@@ -813,6 +841,9 @@ fn mhvtl_no_plaintext_tenant_metadata() {
     ];
     forbidden.extend(slice_plaintext_hashes(&h.conn, u_alpha));
     forbidden.extend(slice_plaintext_hashes(&h.conn, u_bravo));
+    // Key fingerprints and `age1…` recipient strings (issue #450): the
+    // invariant lists them (volume-format-v2.md sec 2) and no scan looked.
+    forbidden.extend(key_recipients(&h.conn));
 
     // force=true: `mhvtl_load()` only loads slot 1 (`mtx load`) — it does NOT
     // erase the virtual tape's contents (confirmed: `mhvtl_load`'s own
