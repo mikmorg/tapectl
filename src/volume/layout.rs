@@ -2906,8 +2906,35 @@ pub fn generate_manifest_toml(label: &str, tenant_name: &str, units: &[ManifestU
     manifest.to_toml()
 }
 
-/// Generate RECOVERY.md for a tenant envelope.
-pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUnit]) -> String {
+/// The stem of a unit's dar catalogue inside its envelope: the `catalogs/`
+/// members are `<stem>.N.dar` (`staging` names them `<uuid8>_v<version>`).
+fn catalogue_stem(unit: &ManifestUnit) -> String {
+    format!(
+        "{}_v{}",
+        unit.uuid.get(..8).unwrap_or(&unit.uuid),
+        unit.snapshot_version
+    )
+}
+
+/// Does an envelope whose `catalogs/` members are `members` (bare file names,
+/// as `build` puts them in the tar) hold the dar catalogue `stem`?
+fn holds_catalogue(members: &[String], stem: &str) -> bool {
+    let prefix = format!("{stem}.");
+    members
+        .iter()
+        .any(|m| m.starts_with(&prefix) && m.ends_with(".dar"))
+}
+
+/// Generate RECOVERY.md for an envelope. `catalogue_members` are the bare
+/// names of the `catalogs/` members the envelope actually holds: a unit's
+/// section names its dar catalogue (`dar -l`, `-A`) only when the envelope
+/// carries it (#449). A unit staged without one has no such paragraph.
+pub fn generate_recovery_md(
+    label: &str,
+    tenant_name: &str,
+    units: &[ManifestUnit],
+    catalogue_members: &[String],
+) -> String {
     let now = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let mut s = format!(
         "# Recovery Guide for {tenant_name}\n\n\
@@ -2952,21 +2979,27 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
     s.push('\n');
 
     for unit in units {
-        let catalogue = format!(
-            "catalogs/{}_v{}",
-            unit.uuid.get(..8).unwrap_or(&unit.uuid),
-            unit.snapshot_version
-        );
+        let stem = catalogue_stem(unit);
+        let held = holds_catalogue(catalogue_members, &stem);
+        let catalogue = format!("catalogs/{stem}");
         s.push_str(&format!(
             "## {}\n\n\
-             UUID: `{}`  ·  snapshot v{}\n\n\
-             This envelope also holds the unit's dar catalogue, `{cat}.1.dar`. It\n\
-             lists every file of the unit without reading the tape:\n\n\
-             ```bash\n\
-             dar -l {cat} -N -Q              # every file, with sizes and dates\n\
-             dar -l {cat} -N -Q -T slice     # which slice holds each file\n\
-             ```\n\n\
-             Put the drive in fixed 512KB block mode, then read, trim, verify and\n\
+             UUID: `{}`  ·  snapshot v{}\n\n",
+            unit.name, unit.uuid, unit.snapshot_version,
+        ));
+        if held {
+            s.push_str(&format!(
+                "This envelope also holds the unit's dar catalogue, `{cat}.1.dar`. It\n\
+                 lists every file of the unit without reading the tape:\n\n\
+                 ```bash\n\
+                 dar -l {cat} -N -Q              # every file, with sizes and dates\n\
+                 dar -l {cat} -N -Q -T slice     # which slice holds each file\n\
+                 ```\n\n",
+                cat = catalogue,
+            ));
+        }
+        s.push_str(
+            "Put the drive in fixed 512KB block mode, then read, trim, verify and\n\
              decrypt each slice, in order: the tape is wound to the first slice\n\
              once, and each read leaves it at the start of the next file.\n\
              `/dev/nst0` below is an example — run `ls -l /dev/tape/by-id/` and\n\
@@ -2977,11 +3010,7 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
              mt -f /dev/nst0 setblk 524288\n\n\
              # On each `age -d` line, add `-i <file>` for every other key you hold\n\
              # (see \"Which key\" above).\n\n",
-            unit.name,
-            unit.uuid,
-            unit.snapshot_version,
-            cat = catalogue,
-        ));
+        );
         let mut next: Option<i64> = None;
         for slice in &unit.slices {
             // The number in `restore.N.dar` MUST be dar's slice number, and the
@@ -3018,7 +3047,7 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
                 sha = slice.sha256_encrypted,
             ));
         }
-        s.push_str(&format!(
+        s.push_str(
             "# Reassemble and extract all slices (they share the base name `restore`),\n\
              # into an EMPTY directory:\n\
              dar -x restore -R /destination -O -Q -N\n\
@@ -3027,11 +3056,17 @@ pub fn generate_recovery_md(label: &str, tenant_name: &str, units: &[ManifestUni
              `-N` keeps a `~/.darrc` on your machine from changing what is restored.\n\
              dar keeps a file that already exists and still reports success, so\n\
              restore into an empty directory; to finish a restore that stopped part\n\
-             way, run the same `dar -x` again with `-w` (overwrite) added. If dar\n\
-             cannot read the last slice's catalogue, `-A {cat}` gives it this\n\
-             envelope's copy instead.\n\n",
-            cat = catalogue,
-        ));
+             way, run the same `dar -x` again with `-w` (overwrite) added.",
+        );
+        if held {
+            s.push_str(&format!(
+                " If dar\n\
+                 cannot read the last slice's catalogue, `-A {cat}` gives it this\n\
+                 envelope's copy instead.",
+                cat = catalogue,
+            ));
+        }
+        s.push_str("\n\n");
     }
 
     s.push_str(
@@ -3301,7 +3336,7 @@ mod tests {
                 sha256_encrypted: "def456".into(),
             }],
         }];
-        let s = generate_recovery_md("LAB01", "alice", &units);
+        let s = generate_recovery_md("LAB01", "alice", &units, &[]);
         // Correct commands present:
         assert!(s.contains("mt -f /dev/nst0 setblk 524288"));
         assert!(s.contains("dd if=/dev/nst0 bs=512k of=restore.1.dar.age"));
@@ -3342,7 +3377,7 @@ mod tests {
                 sha256_encrypted: "def".into(),
             }],
         }];
-        let s = generate_recovery_md("LAB01", "alice", &units);
+        let s = generate_recovery_md("LAB01", "alice", &units, &[]);
         assert!(
             s.contains("not necessarily the key that opens the slices"),
             "must say the envelope's key may not open the slices"
@@ -3418,7 +3453,7 @@ mod tests {
             ),
             (
                 "RECOVERY.md",
-                generate_recovery_md("DEV130", "alice", &units),
+                generate_recovery_md("DEV130", "alice", &units, &[]),
             ),
         ] {
             // The runnable example stays — an heir needs something to type.
@@ -5546,7 +5581,12 @@ sha256_encrypted = \"bbb\"
             dar_command: None,
             slices: vec![slice(1, 10), slice(2, 11), slice(3, 14)],
         }];
-        let s = generate_recovery_md("LAB01", "alice", &units);
+        let s = generate_recovery_md(
+            "LAB01",
+            "alice",
+            &units,
+            &["abcdef12_v3.1.dar".to_string()],
+        );
         assert_eq!(s.matches("mt -f /dev/nst0 rewind").count(), 1, "{s}");
         assert!(
             s.contains("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 10\n"),
@@ -5597,5 +5637,81 @@ sha256_encrypted = \"bbb\"
         ] {
             assert!(s.contains(word), "{word:?}");
         }
+    }
+
+    /// #449 comment 2 (ADR-0012 2026-10-16 item 71): RECOVERY.md said every
+    /// unit's dar catalogue was in the envelope. It is there only when the
+    /// unit was staged with one, so the `dar -l` paragraph and the `-A` hint
+    /// belong to the units whose catalogue the envelope holds, and a unit
+    /// without one gets neither (RECOVERY.md is not golden-pinned: this test
+    /// is its only guard).
+    #[test]
+    fn recovery_md_names_a_catalogue_only_when_the_envelope_holds_it() {
+        let unit = |name: &str, uuid: &str, ver: i64| ManifestUnit {
+            name: name.into(),
+            uuid: uuid.into(),
+            snapshot_version: ver,
+            stage_set_id: 1,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![ManifestSlice {
+                number: 1,
+                tape_position: 9,
+                size_bytes: 1,
+                encrypted_bytes: 2,
+                sha256_plain: "p".into(),
+                sha256_encrypted: "e".into(),
+            }],
+        };
+        let units = vec![
+            unit("with", "aaaaaaaa-0000-0000-0000-000000000000", 2),
+            unit("without", "bbbbbbbb-0000-0000-0000-000000000000", 1),
+            // The same stem as `with`, another version: its own catalogue.
+            unit("with", "aaaaaaaa-0000-0000-0000-000000000000", 3),
+        ];
+        let members = vec![
+            "aaaaaaaa_v2.1.dar".to_string(),
+            "aaaaaaaa_v2.2.dar".to_string(),
+        ];
+        let s = generate_recovery_md("LAB01", "alice", &units, &members);
+        let sections: Vec<&str> = s.split("\n## ").collect();
+        let section = |header: &str| -> &str {
+            sections
+                .iter()
+                .find(|x| x.starts_with(header))
+                .copied()
+                .unwrap_or_else(|| panic!("no {header:?} section:\n{s}"))
+        };
+        // Sections in order: the unit table is under "Units in this envelope".
+        let with_v2 = sections
+            .iter()
+            .find(|x| x.contains("snapshot v2"))
+            .copied()
+            .unwrap();
+        let with_v3 = sections
+            .iter()
+            .find(|x| x.contains("snapshot v3"))
+            .copied()
+            .unwrap();
+        let without = section("without");
+        assert!(with_v2.contains("dar -l catalogs/aaaaaaaa_v2 -N -Q"), "{with_v2}");
+        assert!(with_v2.contains("`catalogs/aaaaaaaa_v2.1.dar`"), "{with_v2}");
+        assert!(with_v2.contains("-A catalogs/aaaaaaaa_v2"), "{with_v2}");
+        for (what, sec) in [("without", without), ("the other version", with_v3)] {
+            assert!(!sec.contains("dar -l"), "{what} has no dar -l:\n{sec}");
+            assert!(!sec.contains("catalogs/"), "{what} names no catalogue:\n{sec}");
+            assert!(!sec.contains("-A "), "{what} has no -A hint:\n{sec}");
+            assert!(!sec.contains("also holds the unit"), "{what}:\n{sec}");
+            // The recipe itself is untouched.
+            assert!(sec.contains("dar -x restore -R /destination -O -Q -N"), "{sec}");
+            assert!(sec.contains("mt -f /dev/nst0 setblk 524288"), "{sec}");
+        }
+        // And no catalogue at all: no dar -l anywhere in the document.
+        let none = generate_recovery_md("LAB01", "alice", &units, &[]);
+        assert!(!none.contains("dar -l"), "{none}");
+        assert!(!none.contains("catalogs/"), "{none}");
+        // A member that only shares a prefix is not the catalogue.
+        let close = generate_recovery_md("LAB01", "alice", &units, &["aaaaaaaa_v20.1.dar".to_string()]);
+        assert!(!close.contains("dar -l"), "{close}");
     }
 }

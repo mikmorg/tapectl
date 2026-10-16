@@ -565,7 +565,12 @@ fn build_template(tag: &str, tenants: &[TenantSpec]) -> Template {
     let envelope = |tenant: &str, recipients: &str, which: &[&Staged]| -> Vec<u8> {
         let units: Vec<ManifestUnit> = which.iter().map(|s| s.unit.clone()).collect();
         let manifest = generate_manifest_toml(LABEL, tenant, &units);
-        let recovery = generate_recovery_md(LABEL, tenant, &units);
+        let members: Vec<String> = which
+            .iter()
+            .filter(|s| s.catalogue.is_some())
+            .map(|s| format!("{}_v{}.1.dar", &s.unit.uuid[..8], s.unit.snapshot_version))
+            .collect();
+        let recovery = generate_recovery_md(LABEL, tenant, &units, &members);
         let mut tar = tar::Builder::new(Vec::new());
         let mut add = |name: &str, bytes: &[u8]| {
             let mut h = tar::Header::new_gnu();

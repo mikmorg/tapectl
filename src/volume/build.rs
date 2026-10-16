@@ -292,9 +292,15 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         let manifest_units = build_manifest_units(inputs, tenant_id, &slice_positions);
         let manifest =
             layout::generate_manifest_toml(&inputs.label, &tenant.tenant_name, &manifest_units);
-        let recovery =
-            layout::generate_recovery_md(&inputs.label, &tenant.tenant_name, &manifest_units);
         let catalogs = catalogs_for_tenant(inputs, tenant_id);
+        // RECOVERY.md names a unit's dar catalogue only if this envelope
+        // carries it (#449): the members are what `catalogs` puts in the tar.
+        let recovery = layout::generate_recovery_md(
+            &inputs.label,
+            &tenant.tenant_name,
+            &manifest_units,
+            &catalogue_member_names(&catalogs),
+        );
         // PLAN.toml is operator-only (`volume-format-v2.md` §1's middle-zone
         // table: "PLAN.toml (op only)") — tenant envelopes never carry it.
 
@@ -352,14 +358,18 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
     let all_manifest_units = build_manifest_units_all(inputs, &slice_positions);
     let op_manifest =
         layout::generate_manifest_toml(&inputs.label, "operator", &all_manifest_units);
-    let mut op_recovery =
-        layout::generate_recovery_md(&inputs.label, "operator", &all_manifest_units);
+    let all_catalogs = catalogs_for_all(inputs);
+    let mut op_recovery = layout::generate_recovery_md(
+        &inputs.label,
+        "operator",
+        &all_manifest_units,
+        &catalogue_member_names(&all_catalogs),
+    );
     if inputs.catalog_db_path.is_some() {
         // Issue #83: make the operator-only catalog subset discoverable
         // rather than a mystery file next to MANIFEST.toml/PLAN.toml.
         op_recovery.push_str(RECOVERY_CATALOG_DB);
     }
-    let all_catalogs = catalogs_for_all(inputs);
     // PLAN.toml survives the standalone v1 planning-header zone as an
     // operator-envelope tar member (`volume-format-v2.md` §8's "What v2
     // removes": "the standalone zone... [is] removed at the write flip"; the
@@ -858,6 +868,11 @@ fn build_manifest_units_all(
         .iter()
         .map(|u| to_manifest_unit(u, positions))
         .collect()
+}
+
+/// The bare `catalogs/` member names an envelope will carry, for RECOVERY.md.
+fn catalogue_member_names(catalogs: &[(String, PathBuf)]) -> Vec<String> {
+    catalogs.iter().map(|(name, _)| name.clone()).collect()
 }
 
 fn catalogs_for_tenant(inputs: &BuildInputs, tenant_id: i64) -> Vec<(String, PathBuf)> {
@@ -1955,6 +1970,114 @@ mod tests {
             op_members.contains(&"catalog.db".to_string()),
             "operator envelope must carry catalog.db: {op_members:?}"
         );
+    }
+
+    /// #449 comment 2: RECOVERY.md names a unit's dar catalogue only when the
+    /// envelope holds it. Built for real: a tenant with two units, one staged
+    /// with a catalogue (files beside its `catalog_path` stem, as `staging`
+    /// writes them) and one without. The tenant envelope's RECOVERY.md has the
+    /// `dar -l` lines for the first and none for the second; the operator
+    /// envelope's likewise; and every `catalogs/` member the text names is a
+    /// member of the tar.
+    #[test]
+    fn recovery_md_names_only_the_catalogues_the_envelope_holds() {
+        let src = tempfile::tempdir().unwrap();
+        let kp = crate::crypto::keys::generate_keypair();
+        let op = crate::crypto::keys::generate_keypair();
+        let uuid_with = "aaaaaaaa-1111-4222-8333-444444444444";
+        let uuid_without = "bbbbbbbb-1111-4222-8333-444444444444";
+        let stem = src.path().join("aaaaaaaa_v1");
+        std::fs::write(format!("{}.1.dar", stem.display()), b"catalogue bytes").unwrap();
+
+        let unit = |id: i64, name: &str, uuid: &str, catalog_path: Option<String>| BuildUnit {
+            stage_set_id: id,
+            snapshot_id: id,
+            unit_name: name.to_string(),
+            unit_uuid: uuid.to_string(),
+            tenant_id: 1,
+            dar_version: None,
+            dar_command: None,
+            catalog_path,
+            snapshot_version: 1,
+            slices: vec![fake_slice(src.path(), id, 1, format!("slice {id}").as_bytes())],
+        };
+        let units = vec![
+            unit(
+                1,
+                "with-catalogue",
+                uuid_with,
+                Some(stem.to_string_lossy().into_owned()),
+            ),
+            unit(2, "no-catalogue", uuid_without, None),
+        ];
+        let inputs = BuildInputs {
+            operator_public_keys: vec![op.public_key.clone()],
+            ..base_inputs(
+                "550e8400-e29b-41d4-a716-4466554400a9",
+                vec![TenantInfo {
+                    tenant_id: 1,
+                    tenant_name: "alpha".to_string(),
+                    public_keys: vec![kp.public_key.clone()],
+                }],
+                units,
+            )
+        };
+        let session = tempfile::tempdir().unwrap();
+        let built = build(&inputs, session.path()).unwrap();
+
+        for (what, kind_is, key) in [
+            (
+                "tenant",
+                (|k: &ZoneKind| matches!(k, ZoneKind::TenantEnvelope { .. }))
+                    as fn(&ZoneKind) -> bool,
+                &kp.secret_key,
+            ),
+            (
+                "operator",
+                (|k: &ZoneKind| matches!(k, ZoneKind::OperatorEnvelope)) as fn(&ZoneKind) -> bool,
+                &op.secret_key,
+            ),
+        ] {
+            let tar_bytes = decrypt_envelope_tar(&built, kind_is, key);
+            let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+            let mut members = Vec::new();
+            let mut recovery = String::new();
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let name = entry.path().unwrap().to_string_lossy().into_owned();
+                if name == "RECOVERY.md" {
+                    std::io::Read::read_to_string(&mut entry, &mut recovery).unwrap();
+                }
+                members.push(name);
+            }
+            assert!(
+                members.contains(&"catalogs/aaaaaaaa_v1.1.dar".to_string()),
+                "{what}: {members:?}"
+            );
+            let sections: Vec<&str> = recovery.split("\n## ").collect();
+            let with = sections
+                .iter()
+                .find(|s| s.starts_with("with-catalogue"))
+                .unwrap();
+            let without = sections
+                .iter()
+                .find(|s| s.starts_with("no-catalogue"))
+                .unwrap();
+            assert!(
+                with.contains("dar -l catalogs/aaaaaaaa_v1 -N -Q"),
+                "{what}:\n{with}"
+            );
+            assert!(!without.contains("dar -l"), "{what}:\n{without}");
+            assert!(!without.contains("catalogs/"), "{what}:\n{without}");
+            // Every catalogue the text names is in the tar.
+            for line in recovery.lines().filter(|l| l.contains("`catalogs/")) {
+                let named = line
+                    .split('`')
+                    .find(|p| p.starts_with("catalogs/"))
+                    .unwrap();
+                assert!(members.contains(&named.to_string()), "{what}: {named}");
+            }
+        }
     }
 
     // ── streaming envelope construction (issue #87) ──
