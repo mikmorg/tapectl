@@ -5726,16 +5726,19 @@ fn read_slices_into(
         // is read, so a stop leaves the stage set as it was — and, since
         // issue #474, takes back the slices already read.
         crate::signal::check(|| {
-            let read_slices = match version {
-                Some(v) => {
-                    format!("read-slices --from {from_label} --unit {unit_name} --version {v}")
+            let again = match version {
+                Some(v) => format!(
+                    "tapectl volume read-slices --from {from_label} --unit {unit_name} \
+                     --version {v}"
+                ),
+                None => {
+                    format!("tapectl volume read-slices --from {from_label} --unit {unit_name}")
                 }
-                None => format!("read-slices --from {from_label} --unit {unit_name}"),
             };
             format!(
                 "volume read-slices stopped after {} of {slice_count} slices of \
                  \"{unit_name}\"; nothing was promoted for writing and the slices already \
-                 read were removed from staging. Run `tapectl volume {read_slices}` again.",
+                 read were removed from staging. Run `{again}` again.",
                 tally.slices_read
             )
         })?;
@@ -5968,11 +5971,15 @@ fn compact_read_contacted(
                 left_alone.len(),
             )
         };
+        if !whole.is_empty() {
+            message.push_str(&format!(
+                "\n{} stage set(s) read in full were staged.",
+                whole.len()
+            ));
+        }
         message.push_str(&format!(
-            "\n{} stage set(s) read in full are staged. These were NOT staged, because a \
-             slice of each could not be read from \"{label}\" (they stay as they were; what was \
-             read for them was removed):",
-            whole.len()
+            "\nNOT staged — a slice of each could not be read from \"{label}\"; each stays as it \
+             was, and what was read for it was removed:"
         ));
         for ss_id in &left_alone {
             message.push_str(&unpromoted_set_line(conn, *ss_id, volume_id)?);
