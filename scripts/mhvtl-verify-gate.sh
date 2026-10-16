@@ -625,8 +625,37 @@ step_leakscan() {
     # Negative needles. grep's rc 1 (no match) is the real pass; rc >= 2 is
     # an error and must never be read as "clean" -- that read is exactly
     # what issue #275 was.
-    for needle in "$CANARY" "unitA"; do
-        grep -a -q "$needle" "$dump"
+    # #450: the isolation invariant names key fingerprints and recipients too
+    # (volume-format-v2.md §2). A key's fingerprint is its age1 recipient
+    # string; every one of both tenants' keys is a needle. At least two must be
+    # found, or the needle list is empty and the scan proves nothing about keys.
+    local keys t
+    keys="$(for t in alice bob; do TCTL key list --tenant "$t" --json 2>/dev/null; echo; done | python3 -c '
+import json, sys
+out, dec, text, i = set(), json.JSONDecoder(), sys.stdin.read(), 0
+while i < len(text):
+    if text[i].isspace():
+        i += 1; continue
+    try:
+        d, i = dec.raw_decode(text, i)
+    except ValueError:
+        break
+    for r in (d if isinstance(d, list) else [d]):
+        if isinstance(r, dict):
+            for k in ("fingerprint", "public_key"):
+                v = r.get(k)
+                if isinstance(v, str) and v.startswith("age1"):
+                    out.add(v)
+print("\n".join(sorted(out)))')"
+    [ "$(grep -c "^age1" <<<"$keys")" -ge 2 ] || {
+        echo "leakscan: could not read the tenants' age1 recipients from key list --json -- the key needles would prove nothing"
+        return 1
+    }
+    local needles=("$CANARY" "unitA")
+    while IFS= read -r needle; do [ -n "$needle" ] && needles+=("$needle"); done <<<"$keys"
+    echo "leakscan: ${#needles[@]} needles (canary, unit name, $(( ${#needles[@]} - 2 )) key recipients)"
+    for needle in "${needles[@]}"; do
+        grep -a -q -F -- "$needle" "$dump"
         rc=$?
         case "$rc" in
             0) echo "leakscan: PLAINTEXT LEAK -- \"$needle\" appears on tape"; return 1 ;;
