@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgrades it to 1.1.2). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgrades it to 1.2.0). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -40,7 +40,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (c) | The fresh start on home2 | **you** (sudo, the escrow key, the cartridges) |
 | (d) | `keepsake` on two cartridges the same day, then the Heir Kit | **you** |
 | (e) | The backlog | agents, in the order below |
-| (f) | Upgrade home2 to 1.1.2, in place | **you**, once `v1.1.2` is tagged |
+| (f) | Upgrade home2 to 1.2.0, in place | **you**, once `v1.2.0` is tagged |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -298,16 +298,20 @@ same day:
 `audit` warns `escrow_kit_stale` after every write session: that is the cue for the next
 refresh.
 
-## (f) Upgrade home2 to 1.1.2, in place
+## (f) Upgrade home2 to 1.2.0, in place
 
-home2 runs 1.1.0; go straight to 1.1.2, which contains 1.1.1. Both are patches
-(`docs/releases/1.1.1.md`, `docs/releases/1.1.2.md`): no on-tape change, so no fresh start.
-1.1.1 adds one catalog migration (036, a new table), applied the first time the new binary
-opens the catalog; 1.1.2 adds none. There is no downgrade past 036: a 1.1.0 binary refuses a
-catalog that is ahead of its migration list, so the rollback is the 1.1.0 binary kept in step 3
-plus `db import` of the backup from step 1, losing whatever the catalog recorded in between.
-Wait for `v1.1.2` to be tagged (the whole chain on its commit, then the tag; the reviews behind
-it are `docs/audits/2026-10-15-design-review.md` and `docs/audits/2026-10-15-1.1-diff-review.md`).
+home2 runs 1.1.0; go straight to 1.2.0, which contains 1.1.1 and 1.1.2
+(`docs/releases/1.1.1.md`, `docs/releases/1.1.2.md`, `docs/releases/1.2.0.md`). The 1.1.x
+releases are patches. 1.2.0 changes only text that tapectl generates onto a tape (RESTORE.sh,
+File 1 and RECOVERY.md); the layout, the front index, MANIFEST.toml and `requires` (still
+empty) are unchanged, so there is no fresh start: a 1.1.x RESTORE.sh reads a 1.2.0 tape and the
+reverse, and L6-0001 and L6-0002 stay as they are. 1.1.1 adds one catalog migration (036, a new
+table), applied the first time the new binary opens the catalog; 1.1.2 and 1.2.0 add none. There
+is no downgrade past 036: a 1.1.0 binary refuses a catalog that is ahead of its migration list,
+so the rollback is the 1.1.0 binary kept in step 3 plus `db import` of the backup from step 1,
+losing whatever the catalog recorded in between. Wait for `v1.2.0` to be tagged (the whole chain
+on its commit, then the tag; the reviews behind 1.1.2 are
+`docs/audits/2026-10-15-design-review.md` and `docs/audits/2026-10-15-1.1-diff-review.md`).
 
 On home2, inside tmux, with no tapectl command running. Check that with `tapectl-op status`:
 the plain `tapectl status` from your own account works only from 1.1.1 on, through the home
@@ -315,14 +319,14 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
 `~/.tapectl` of its own, the pointer is bypassed even on 1.1.1: rename it first.
 
 1. **Back up the catalog with 1.1.0:** `tapectl-op db backup --to
-   /srv/local_backup/tapectl/tapectl-pre-1.1.2.db` (`--to` is required; the daily backup's
+   /srv/local_backup/tapectl/tapectl-pre-1.2.0.db` (`--to` is required; the daily backup's
    pruning never touches a file named like this), or `sudo systemctl start
    tapectl-backup.service`.
-2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.1.2`.
+2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.2.0`.
 3. **Keep the old binary, then build and install:** `sudo cp -p /usr/local/bin/tapectl
    /usr/local/bin/tapectl-1.1.0`, then `scripts/first-run.sh --profile
    contrib/hosts/home2.profile --from 3 --to 3` (a release build on home2 from the checkout,
-   installed to `/usr/local/bin`; `tapectl --version` should read `1.1.2 (v1.1.2, <date>)`).
+   installed to `/usr/local/bin`; `tapectl --version` should read `1.2.0 (v1.2.0, <date>)`).
    The timers pick the new binary up at their next firing.
 4. **Step 7 again** (`--from 7 --to 7`): it finds the home initialised, skips init, and goes on
    to the ops-group block, which now writes the home pointer `/etc/tapectl/home`, so a plain
@@ -338,10 +342,12 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
    /usr/local/bin/tapectl` (the raised and the fallback paths must resolve the same home and
    user; `drive status` through the wrapper is not a tape command and does not exercise it).
 6. **Look:** `tapectl status`, `tapectl-op drive status`, `tapectl-op audit` (the new
-   `location_count` check, #425, should be clean: keepsake is in two places). On 1.1.2,
-   also set the full-readback clock once (home2 has no archive sets):
-   `tapectl-op config set defaults.verify_interval_days 365` (#453; the profile's
-   `VERIFY_INTERVAL_DAYS=365` does it for a fresh install).
+   `location_count` check, #425, should be clean: keepsake is in two places). From 1.2.0
+   the full-readback clock is 365 days with no setting (#453), and `tapectl-op config check`
+   ends with `defaults: verify_interval_days = 365`. `audit` now applies it to every unit: a
+   unit whose copies were only quick-confirmed warns `verify_age … (last: never)` until one
+   of its volumes has a full readback (`tapectl-op volume verify L6-0001`, whose default tier
+   is the full one). That warning is expected, not a fault.
 7. **Before the next write,** step 12's rehearsal proves the new binary on the drive (step 13
    looks for its marker). A write through `tapectl-op volume write` directly does not check it.
    Stop the drive-poll timer for the rehearsal (`sudo systemctl stop tapectl-drive-poll.timer`,
@@ -354,7 +360,10 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
    chip's lifetime figures read differently from the fixtures), and 1.1.2's rule that a seal
    position which cannot be read is "unreadable", not "absent", unless the drive reports END OF
    DATA there (#460: if the HP drive did not report it, every fresh write would refuse,
-   failing closed). Record both on #444 with the run.
+   failing closed). Record both on #444 with the run. It is also the first run on the real
+   drive, with the real `age`, `dar`, `mt` and `tar`, of 1.2.0's RESTORE.sh (the per-mode tool
+   checks, the lone-unit note, the work-directory warning); the mhvtl gate's heir legs are the
+   only other real-tool run (ADR-0012 item 70). Record `age --version` with it.
 
 Your `[[backends.lto]]` keeps its explicit `device_sg`; it still wins and is still checked
 (#431). Removing the line (`tapectl-op config remove 'backends.lto[NAME].device_sg'`) lets
@@ -372,15 +381,21 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
   and the drive's behaviour past early warning is measured (the 2026-09-23 fill stopped at
   the first `ENOSPC`; whether st accepts writes after it is the open measurement). It is a
   1.x on-tape change: a CTO decision and a re-pin.
-- **#418 R4:** the cross-volume per-tenant index (1.2.0 or later).
-- **#388:** Logical Block Protection: research, then a prototype on EW7VWMVKF6 only.
-- **#409:** stays "not until spanning".
-- **#364 epic:** re-measure staging on home2 after #441 (the single source read), then
-  close it or plan what is left.
-- **The 1.1.2 queue, #444–#457:** the waves in `docs/audits/2026-10-15-design-review.md`
-  §9 (ratified 2026-10-15, ADR-0012 items 65–70). #452, the adversarial review of the 1.1
-  diff, runs first and only on your word; the real-drive session at the end of §9 is yours
-  or an agent's on your go-ahead.
+- **#418 R4:** the cross-volume per-tenant index. Ruled 2026-10-16: designed and built for
+  1.3.0, with its own re-pin, after the CTO rules on the design. The draft is being grilled
+  with the spanning design below. Correction: no tape indexes another today (each tape's
+  `catalog.db` holds only its own write); see the design review's erratum.
+- **#409 and spanning:** the CTO asked on 2026-10-16 for spanning to be designed now. The
+  design (what is divided, what a Copy of a divided version is, when it ships) goes to the CTO
+  in rounds; #409 is resolved by its answer.
+- **#388:** Logical Block Protection. The research note is
+  `docs/research/2026-10-16-logical-block-protection.md`: the HP LTO-6 offers Reed-Solomon
+  only, the setting is not saved across sessions, mhvtl emulates it. The prototype on
+  EW7VWMVKF6 and the CTO's ruling remain.
+- **#364 epic:** a per-pass staging benchmark on vm-desk1, before and after, closes it; home2's
+  figure comes with its next staging run (#441: expect about one read of the source).
+- **The 1.1.2 queue, #444–#475:** done and tagged `v1.1.2`. The real-drive half of #444 (both
+  blank proofs, the sub-MiB chip measurement) waits for the step-12 rehearsal in (f).
 - **2026-10-07 item 6:** the read-error rate assumes the drive clears log page 0x03 at
   load. Check it on home2's first two full verifies (L6-0001 and L6-0002), and revisit
   the rate if the drive keeps the counters.
@@ -448,5 +463,6 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
   which records the full readback as part of the write; or pass `--keep-staging` to the
   write that completes a unit's copies and run `volume verify --full` before `staging
   clean`. On 1.1.1 the write that completes the policy releases staging itself otherwise.
-- **The on-tape authorization ends with the v1.1.0 install.** After it, a failing
+- **The on-tape authorization of 2026-10-16 ends when v1.2.0 is installed** (ADR-0012 item
+  72; the 2026-10-07 one ended with the v1.1.0 install, item 40). After it, a failing
   `tests/on_tape_golden.rs` is a CTO decision, never an agent's re-pin.

@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), and upgrades in place to 1.1.1 (handoff (f)).
+(`keepsake` on L6-0001 and L6-0002), and upgrades in place to 1.2.0 (handoff (f)).
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -224,8 +224,7 @@ priority for tape commands, the `/etc/tapectl/home` pointer, and a single source
 place (take `db backup` with 1.1.0 first).
 
 **2026-10-16: 1.1.2, the two reviews' fixes** (`docs/releases/1.1.2.md`; ADR-0012 amendment
-"2026-10-15 (later)", items 65–70). No on-tape change and no migration; home2 goes from 1.1.0
-straight to 1.1.2 by handoff (f). The design review (`docs/audits/2026-10-15-design-review.md`)
+"2026-10-15 (later)", items 65–70). No on-tape change and no migration. The design review (`docs/audits/2026-10-15-design-review.md`)
 and the first adversarial review of the 1.1 code (`docs/audits/2026-10-15-1.1-diff-review.md`,
 one high: a rebuilt unsealed tape counted as a copy) filed #444–#475, worked in four waves.
 Things to know: an unreadable seal position is not an absent seal unless the drive reports
@@ -233,6 +232,23 @@ END OF DATA (#460; the HP drive proves it at the next step-12 rehearsal); `stage
 compares dar's catalogue with what it hashed (#464); `audit` has a per-volume full-readback
 clock and `[defaults] verify_interval_days` (#453, #454; home2 sets 365); the gate's Rust
 legs are judged by test name and its erase leg runs `cartridge erase` then a no-force init.
+
+**2026-10-16: 1.2.0, the re-pin** (`docs/releases/1.2.0.md`; ADR-0012 amendment
+"2026-10-16", items 71–75). The minor moved because generated on-tape text changed:
+RESTORE.sh checks each mode's own tools from one table (`RESTORE_TOOLS` in `layout.rs`),
+exports `LC_ALL=C`, says "a key matched" only when one did, describes its work directory
+(the decrypted envelopes under `${TMPDIR:-/tmp}`) and warns before filling it, and after a
+lone-unit restore says what else the key opened; RECOVERY.md names a dar catalogue only when
+the envelope holds it; File 1 names the drives that read the tape, the SAS interface, one
+unit's disk space and the tool list. The golden RESTORE.sh pin moved once, in its own commit;
+MANIFEST.toml, File 0, the front index, the seal and the envelopes did not, `requires` stays
+empty and the "needs tapectl" text stays "tapectl 1.1.0" (item 73), so 1.1.x and 1.2.0 read
+each other's tapes. Also in it: `[defaults] verify_interval_days` is 365 when absent (#453),
+and `[[collections]]` `snapshot_command`/`release_command` let `collection run` read every
+unit from a read-only snapshot while every recorded path stays real (#455; `collection::hook`,
+`staging::view`). No migration. home2 goes from 1.1.0 straight to 1.2.0 by handoff (f); the
+2026-10-16 on-tape authorization ends when v1.2.0 is installed (item 72). Next: the spanning
+and #418 R4 design (1.3.0), put to the CTO in rounds.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
