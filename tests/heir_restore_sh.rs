@@ -363,13 +363,74 @@ fn template() -> &'static Template {
                 ],
             },
         ];
-        build_template(&tenants)
+        build_template("main", &tenants)
     })
 }
 
-fn build_template(tenants: &[TenantSpec]) -> Template {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("heir-restore-sh-template-{}", std::process::id()));
+/// A second volume, for the lone-unit restore (#449 item 1): the FIRST tenant
+/// envelope lists exactly one unit, and the other tenant lists three, so an
+/// operator or escrow key opens more than the envelope a default restore
+/// uses. Smaller than the main one: only the envelopes are the point.
+fn lone_template() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let small = |name, uuid, version, seed| UnitSpec {
+            cat: Cat::Matched,
+            name,
+            uuid,
+            version,
+            seed,
+            files: 2,
+            file_len: 110_000,
+        };
+        let tenants = vec![
+            TenantSpec {
+                name: "bob",
+                units: vec![small(
+                    "ledgers",
+                    "33333333-4444-5555-6666-777777777777",
+                    3,
+                    13,
+                )],
+            },
+            TenantSpec {
+                name: "alice",
+                units: vec![
+                    small("photos", "11111111-2222-3333-4444-555555555555", 2, 11),
+                    small("docs", "22222222-3333-4444-5555-666666666666", 1, 12),
+                    small("notes", "66666666-7777-8888-9999-000000000000", 1, 14),
+                ],
+            },
+        ];
+        build_template("lone", &tenants)
+    })
+}
+
+/// One tenant with one unit: the operator envelope lists the same unit.
+fn solo_template() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let tenants = vec![TenantSpec {
+            name: "bob",
+            units: vec![UnitSpec {
+                cat: Cat::Matched,
+                name: "ledgers",
+                uuid: "33333333-4444-5555-6666-777777777777",
+                version: 3,
+                seed: 13,
+                files: 2,
+                file_len: 110_000,
+            }],
+        }];
+        build_template("solo", &tenants)
+    })
+}
+
+fn build_template(tag: &str, tenants: &[TenantSpec]) -> Template {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "heir-restore-sh-template-{tag}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     for sub in ["tape", "src", "keys", "work"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
@@ -712,7 +773,15 @@ impl Heir {
 
     /// A fresh copy, with extra or replacement stubs on `PATH` (name, body).
     fn with_stubs(stubs: &[(&str, &str)]) -> Self {
-        let t = template();
+        Self::of(template(), stubs)
+    }
+
+    /// A fresh copy of the lone-unit volume (`lone_template`).
+    fn lone() -> Self {
+        Self::of(lone_template(), &[])
+    }
+
+    fn of(t: &Template, stubs: &[(&str, &str)]) -> Self {
         let root = tempfile::Builder::new()
             .prefix("tapectl-heirsh-")
             .tempdir()
@@ -2523,4 +2592,163 @@ fn the_space_check_says_its_figure_is_the_encrypted_size() {
         fatal.contains("encrypted") && fatal.contains(note),
         "the refusal says what the figure counts:\n{fatal}"
     );
+}
+
+// ---- #449 item 1: a lone-unit restore says what else the key opened ----
+
+fn lone_unit(name: &str) -> UnitOnTape {
+    lone_template()
+        .units
+        .iter()
+        .find(|u| u.name == name)
+        .unwrap_or_else(|| panic!("no unit {name} in the lone template"))
+        .clone()
+}
+
+/// The sentence-level facts of the notice, found in the output.
+const LONE_NOTE: &str = "only 'ledgers' was restored";
+
+/// With no --unit and no --all, the first envelope the key opens decides,
+/// and when it lists one unit that unit is restored (ratified; unchanged).
+/// An escrow key opens two more envelopes, which list three more units: the
+/// script says so BEFORE it says RESTORE COMPLETE, naming --list and --all,
+/// so an heir does not stop believing the tape held one unit. Reading the
+/// rest of the envelopes costs no rewind: they come before every slice.
+#[test]
+fn a_lone_unit_restore_says_what_else_the_key_opened() {
+    let h = Heir::lone();
+    // The harness reads: bob's envelope is first and lists one unit.
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("ledgers") && text.contains("photos") && text.contains("notes"),
+        "the escrow key opens all of it:\n{text}"
+    );
+
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&["--restore", "--key", &h.key("esc"), "--to", &dest]);
+    assert_eq!(code, 0, "{text}");
+    // The default is unchanged: the first envelope's one unit, alone, in --to.
+    assert!(
+        same_tree(&lone_unit("ledgers").src, Path::new(&dest)),
+        "{text}"
+    );
+    let note = text.find(LONE_NOTE).unwrap_or_else(|| panic!("no notice:\n{text}"));
+    let complete = text.find("RESTORE COMPLETE").expect("RESTORE COMPLETE");
+    assert!(note < complete, "the notice comes first:\n{text}");
+    let notice = &text[note..complete];
+    assert!(notice.contains("2 other envelope(s)"), "{notice}");
+    assert!(notice.contains("3 other unit(s)"), "{notice}");
+    assert!(
+        notice.contains("--all") && notice.contains("--list"),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("(4 units here)"),
+        "the largest envelope lists the whole tape, 4 units:\n{notice}"
+    );
+    // Forward only: one rewind, every read in ascending order.
+    assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
+    let got = reads(&h);
+    let mut sorted = got.clone();
+    sorted.sort();
+    assert_eq!(got, sorted, "one ascending pass:\n{:#?}", h.ops());
+    // The surveyed envelopes are not kept: only the one used stays decrypted.
+    assert!(
+        std::fs::read_dir(h.dir.join("tmp")).unwrap().next().is_none(),
+        "the work directory is removed at the end"
+    );
+}
+
+/// No notice when there is nothing to say: --all, --unit, or a key that opens
+/// only the envelope it used. And the same notice before the --path form's
+/// own RESTORE COMPLETE.
+#[test]
+fn the_lone_unit_notice_is_only_where_it_applies() {
+    let h = Heir::lone();
+    let keep = |text: &str| text.contains(LONE_NOTE) || text.contains("other envelope(s)");
+
+    // --unit: the user said what to restore.
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("esc"),
+        "--unit",
+        "ledgers",
+        "--to",
+        &h.sub("a"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!keep(&text), "{text}");
+
+    // --all: it restores every unit of the largest envelope.
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("esc"),
+        "--all",
+        "--to",
+        &h.sub("b"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!keep(&text), "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+
+    // bob's own key opens bob's envelope and nothing else.
+    let (code, text) = h.run(&["--restore", "--key", &h.key("bob"), "--to", &h.sub("c")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(!keep(&text), "{text}");
+    assert!(
+        same_tree(&lone_unit("ledgers").src, Path::new(&h.sub("c"))),
+        "{text}"
+    );
+
+    // --path, with no unit named, takes the same lone unit and says the same.
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("esc"),
+        "--path",
+        "sub/note.txt",
+        "--to",
+        &h.sub("d"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    let note = text.find(LONE_NOTE).unwrap_or_else(|| panic!("no notice:\n{text}"));
+    assert!(note < text.find("RESTORE COMPLETE").unwrap(), "{text}");
+    assert!(text.contains("--all"), "{text}");
+}
+
+/// One tenant, one unit: the operator envelope opens as a second envelope and
+/// lists the very unit just restored. The survey runs (the operator envelope
+/// is read) and finds nothing to add, so there is no notice.
+#[test]
+fn an_other_envelope_that_lists_nothing_new_is_not_worth_a_notice() {
+    let h = Heir::of(solo_template(), &[]);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&["--restore", "--key", &h.key("op"), "--to", &dest]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        same_tree(&solo_template().units[0].src, Path::new(&dest)),
+        "{text}"
+    );
+    // Control: the operator envelope (file 5) WAS opened and looked at.
+    assert!(reads(&h).contains(&5), "{:#?}", h.ops());
+    assert!(
+        !text.contains("other envelope(s)") && !text.contains("only 'ledgers' was restored"),
+        "{text}"
+    );
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+}
+
+/// Where the script refuses to guess (the first envelope lists several units)
+/// it stops there: it does not read on through the other envelopes first.
+#[test]
+fn a_refusal_to_guess_reads_no_further_envelopes() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--restore", "--key", &h.key("esc"), "--to", &h.sub("x")]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("multiple units found"), "{text}");
+    let envelopes_read: Vec<i64> = reads(&h).into_iter().filter(|p| (4..=7).contains(p)).collect();
+    assert_eq!(envelopes_read, vec![4], "{:#?}", h.ops());
 }

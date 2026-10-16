@@ -1790,14 +1790,23 @@ check_work_space() {
 # and call "$1 <position>" for each that opens; it returns 1 to stop the
 # walk. A file whose bytes equal one already tried (an envelope's backup, by
 # its front-index hash) is skipped unless that one was damaged or would not
-# read: then the backup is what is read instead.
-walk_envelopes() { # <on-open callback>
-  local cb=$1 pos h rc ty seen=" "
-  check_work_space
+# read: then the backup is what is read instead. With a second argument the
+# walk RESUMES after that position (a walk a callback stopped), remembering
+# what the first one tried.
+WALK_SEEN=" "
+walk_envelopes() { # <on-open callback> [<resume after this position>]
+  local cb=$1 after=${2:-} pos h rc ty
+  if [ -z "$after" ]; then
+    WALK_SEEN=" "
+    check_work_space
+  fi
   while IFS= read -r pos; do
     require_uint envelope_position "$pos"
+    if [ -n "$after" ] && [ "$pos" -le "$after" ]; then
+      continue
+    fi
     h=$(file_hash_at "$pos" "$FILES_TXT")
-    case "$seen" in
+    case "$WALK_SEEN" in
     *" $h "*)
       [ -z "$h" ] || {
         info "File $pos holds the same bytes as an envelope already tried (its backup): skipped"
@@ -1808,7 +1817,7 @@ walk_envelopes() { # <on-open callback>
     info "Trying envelope at file $pos..."
     rc=0
     try_envelope "$pos" || rc=$?
-    [ "$rc" = 2 ] || [ -z "$h" ] || seen="$seen$h "
+    [ "$rc" = 2 ] || [ -z "$h" ] || WALK_SEEN="$WALK_SEEN$h "
     if [ "$rc" = 0 ]; then
       ty=$(file_type_at "$pos" "$FILES_TXT")
       case "$ty" in
@@ -2189,6 +2198,55 @@ pick_for_restore() { # <position>
   return 1
 }
 
+# A restore that names no unit and no --all restores the one unit the first
+# envelope its key opens lists, when it lists exactly one (the default is
+# deliberate). The same key may open more envelopes that list more units, and
+# an heir who sees RESTORE COMPLETE would take the tape for that one unit. So,
+# before a single slice is read, the envelopes after the one used are looked
+# at, only to count what they list besides it. They all come before every
+# slice, so this moves the tape forward only; each is dropped once counted.
+LONE_UNIT=""
+OTHER_ENVELOPES=0
+OTHER_UNITS=0
+OTHER_BIGGEST=0
+count_other_envelope() { # <position>
+  local pos=$1 m="$WORK/opened.$1/MANIFEST.toml" n
+  if [ -f "$m" ]; then
+    OTHER_ENVELOPES=$((OTHER_ENVELOPES + 1))
+    awk '__AWK_UNIT_LIST__' "$m" >"$WORK/listed.txt"
+    cat "$WORK/listed.txt" >>"$WORK/other_units.txt"
+    n=$(wc -l <"$WORK/listed.txt")
+    [ "$n" -le "$OTHER_BIGGEST" ] || OTHER_BIGGEST=$n
+  fi
+  rm -rf "$WORK/opened.$pos"
+  return 0
+}
+
+survey_other_envelopes() { # <the unit being restored>
+  local unit=$1
+  LONE_UNIT=$unit
+  : >"$WORK/other_units.txt"
+  info "Looking at the other envelopes this key opens, to tell you at the end what else is on this tape..."
+  walk_envelopes count_other_envelope "$CHOSEN_POS"
+  OTHER_UNITS=$(U="$unit" awk '$0 != ENVIRON["U"] && !seen[$0]++' "$WORK/other_units.txt" | wc -l)
+}
+
+# Said just before RESTORE COMPLETE, and only when the survey found units the
+# restore did not cover.
+note_other_units() {
+  if [ -z "$LONE_UNIT" ] || [ "$OTHER_UNITS" -eq 0 ]; then
+    return 0
+  fi
+  echo ""
+  info "NOTE: only '$LONE_UNIT' was restored: no --unit or --all said what to restore, so the"
+  info "      first envelope this key opened decided. This key opened $OTHER_ENVELOPES other envelope(s)"
+  info "      on this tape, which list $OTHER_UNITS other unit(s) besides it."
+  info "      See what each lists:   $0 --list $(keys_args)"
+  info "      Restore every unit of the envelope that lists the most ($OTHER_BIGGEST units here), each into"
+  info "      --to/UNIT (use another, empty directory):"
+  info "        $0 --restore $(keys_args) --all --to /another/destination"
+}
+
 # Pick the slices of one unit (one version) from the manifest into $3, checked
 # against the file map before any slice is read. Sets PICKED_VERSION and
 # PICKED_BYTES.
@@ -2266,6 +2324,7 @@ do_restore() {
     targets=("${RESTORE_UNITS[@]}")
   elif [ ${#unit_names[@]} -eq 1 ]; then
     targets=("${unit_names[0]}")
+    survey_other_envelopes "${unit_names[0]}"
   else
     echo "Units in this envelope:"
     for uname in "${unit_names[@]}"; do echo "  - $uname"; done
@@ -2280,6 +2339,7 @@ do_restore() {
     pick_slices "$manifest" "${targets[0]}" "$WORK/slices.0" "$want_version"
     info "Restoring from '${targets[0]}' snapshot version ${PICKED_VERSION:-unknown}"
     restore_paths "$WORK/slices.0" "$CHOSEN_ENV" "${targets[0]}" "$PICKED_VERSION" "$destdir" "$scratch_parent"
+    note_other_units
     echo ""
     info "RESTORE COMPLETE"
     info "${RESTORE_PATHS[*]} of '${targets[0]}' restored to: $destdir"
@@ -2321,6 +2381,7 @@ do_restore() {
     done_lines+=("Unit '${targets[$i]}' restored to: $dest_i")
   done < <(printf '%s\n' "${order_lines[@]}" | sort -t'|' -k1,1n)
 
+  note_other_units
   echo ""
   info "RESTORE COMPLETE"
   for line in "${done_lines[@]}"; do
