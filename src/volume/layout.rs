@@ -1086,11 +1086,16 @@ dar_at_least() {
 # What each mode runs, besides mt (every mode that reads the tape). A mode
 # checks its own tools when it starts, before the first tape read, so a host
 # that can only read and hash a tape is not refused for tools a restore needs.
-TOOLS_READ=(__TOOLS_READ__)         # --info, --verify
-TOOLS_ENVELOPE=(__TOOLS_ENVELOPE__) # --find-envelope
-TOOLS_LIST=(__TOOLS_LIST__)         # --list
-TOOLS_PATH=(__TOOLS_PATH__)         # --restore --path
-TOOLS_RESTORE=(__TOOLS_RESTORE__)   # --restore
+# --info, --verify:
+TOOLS_READ=(__TOOLS_READ__)
+# --find-envelope:
+TOOLS_ENVELOPE=(__TOOLS_ENVELOPE__)
+# --list:
+TOOLS_LIST=(__TOOLS_LIST__)
+# --restore --path:
+TOOLS_PATH=(__TOOLS_PATH__)
+# --restore, whole units (every tool any mode may run):
+TOOLS_RESTORE=(__TOOLS_RESTORE__)
 
 require_tools() { # <tool>...
   local tool
