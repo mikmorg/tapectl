@@ -1732,3 +1732,16 @@ Ruled 2026-10-17, measuring drives instead of assuming them:
      2026-10-06: also the most one damaged slice or a single-file restore costs) unless the room
      is smaller. If st refuses every write after the warning, the walk cannot run; that is itself
      #420's finding, and the drive-reported figure is the only one.
+101. **Copies protect slice by slice, and a bad chunk costs only itself** (both in 1.3.0). Each
+     slice is already its own age file under a fresh key; what failed was coarser. (a) A slice
+     that fails its ciphertext hash on one tape is read from another copy holding the same slice
+     (matched by its `sha256_encrypted`, which is equal across copies because they are written
+     from one staging): `tapectl restore` asks for that cartridge by label and serial, and
+     RESTORE.sh accepts slices from a second tape or a directory. A unit whose copies are damaged
+     in different slices then still restores whole. (b) tapectl's own restore skips an age chunk
+     that fails authentication, leaving a hole instead of stopping, so a 64 KiB defect costs 64
+     KiB and the files in it rather than the rest of its slice; no unauthenticated byte is ever
+     written, and dar's per-file checks name the damaged files. RESTORE.sh, which runs the `age`
+     program, cannot do (b). Item 81's 1.3.0 re-pin widens to carry RESTORE.sh's half of (a),
+     still ending when v1.3.0 is installed. Item 13 (no parity) stands: copies remain the defence,
+     now at a finer grain.
