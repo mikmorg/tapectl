@@ -1678,6 +1678,121 @@ mod tests {
             .expect("a budget that fits the backups too is enough");
     }
 
+    /// Hand-made index files for `two_tenant_inputs` (tenants 1 and 2),
+    /// `paths_bytes` long each for a tenant's `paths.tsv`: the index as
+    /// `build()` is handed it, whatever made it.
+    fn index_files(dir: &Path, paths_bytes: usize) -> IndexFiles {
+        use std::collections::BTreeMap;
+        let write = |name: &str, bytes: Vec<u8>| {
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        };
+        let row = b"photos\t1\tf\t1234\talbum/some/where/a-reasonably-long-file-name.jpg\n";
+        let mut tenants = BTreeMap::new();
+        for id in [1i64, 2] {
+            let mut paths = index::PATHS_COLUMNS.join("\t").into_bytes();
+            paths.push(b'\n');
+            while paths.len() < paths_bytes {
+                paths.extend_from_slice(row);
+            }
+            tenants.insert(
+                id,
+                index::TenantIndexFiles {
+                    units: write(
+                        &format!("t{id}_units.tsv"),
+                        b"unit\tversion\tvolume\n".to_vec(),
+                    ),
+                    paths: write(&format!("t{id}_paths.tsv"), paths),
+                },
+            );
+        }
+        IndexFiles {
+            operator_units: write(
+                "operator_units.tsv",
+                b"tenant\tunit\tversion\tvolume\n".to_vec(),
+            ),
+            tenants,
+            generated: index::Generated::default(),
+        }
+    }
+
+    /// The capacity gate counts the cross-volume index (`volume-format-v2.md`
+    /// §1.5, "Size"): it is in the envelopes before their size and hash are
+    /// read, so a budget that fits the tape without it and not with it is
+    /// refused, and one that fits the index too is not. The index adds to
+    /// BOTH copies of an envelope, the backup being a byte copy.
+    #[test]
+    fn the_capacity_gate_counts_the_cross_volume_index() {
+        let (mut inputs, _src) = two_tenant_inputs("550e8400-e29b-41d4-a716-446655440000");
+        let without = tempfile::tempdir().unwrap();
+        let before = build(&inputs, without.path()).unwrap().layout;
+        let total_before = before.on_tape_bytes().unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let paths_bytes = 3 * 512 * 1024;
+        inputs.index = Some(index_files(work.path(), paths_bytes));
+        let with = tempfile::tempdir().unwrap();
+        let after = build(&inputs, with.path()).unwrap().layout;
+        let total_after = after.on_tape_bytes().unwrap();
+
+        // Every envelope, primary and backup, grew by at least the tenant's
+        // paths.tsv (the operator's by its small units.tsv).
+        for (b, a) in before.entries.iter().zip(&after.entries) {
+            assert_eq!(b.kind, a.kind);
+            let grew = a.size_bytes.unwrap() - b.size_bytes.unwrap().min(a.size_bytes.unwrap());
+            match b.kind {
+                ZoneKind::TenantEnvelope { .. } | ZoneKind::TenantEnvelopeBackup { .. } => {
+                    assert!(grew >= paths_bytes as u64, "{:?} grew {grew}", b.kind)
+                }
+                ZoneKind::OperatorEnvelope | ZoneKind::OperatorEnvelopeBackup => {
+                    assert!(grew > 0, "{:?} grew {grew}", b.kind)
+                }
+                _ => {}
+            }
+        }
+        assert!(total_after >= total_before + 4 * paths_bytes as u64);
+
+        let reserve = after.budget.reserve_bytes;
+        inputs.usable_bytes = total_before + reserve;
+        let session = tempfile::tempdir().unwrap();
+        let errs = build(&inputs, session.path())
+            .unwrap()
+            .validate(&ok_keys(&inputs), SliceCheck::Size)
+            .unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, LayoutError::CapacityExceeded { .. })),
+            "a budget that fits the tape without its index must refuse it with: {errs:?}"
+        );
+        inputs.usable_bytes = total_after + reserve;
+        let session = tempfile::tempdir().unwrap();
+        build(&inputs, session.path())
+            .unwrap()
+            .validate(&ok_keys(&inputs), SliceCheck::Size)
+            .expect("a budget that fits the index too is enough");
+    }
+
+    /// A build handed an index with no files for a tenant that has an
+    /// envelope refuses, rather than writing a tape whose tenant index is
+    /// silently not there. (The members' names and order are read back from
+    /// decrypted envelopes in `tests/format_v2.rs`.)
+    #[test]
+    fn a_tenant_with_an_envelope_but_no_index_files_is_refused() {
+        let (mut inputs, _src) = two_tenant_inputs("550e8400-e29b-41d4-a716-446655440000");
+        let work = tempfile::tempdir().unwrap();
+        let mut files = index_files(work.path(), 4096);
+        inputs.index = Some(files.clone());
+        let session = tempfile::tempdir().unwrap();
+        build(&inputs, session.path()).expect("positive control: both tenants have files");
+
+        files.tenants.remove(&2);
+        inputs.index = Some(files);
+        let session = tempfile::tempdir().unwrap();
+        let err = build(&inputs, session.path()).unwrap_err().to_string();
+        assert!(err.contains("no files for tenant 2"), "{err}");
+    }
+
     #[test]
     fn validate_catches_a_missing_staged_slice() {
         let (inputs, src) = two_tenant_inputs("550e8400-e29b-41d4-a716-446655440000");

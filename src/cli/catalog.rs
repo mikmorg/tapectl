@@ -1507,6 +1507,92 @@ mod tests {
         assert!(text.contains("RESTORE.sh"), "{text}");
     }
 
+    /// #418 R4: the rebuild lists the volumes the tape's cross-volume index
+    /// names that the catalog lacks, in the human report and in `--json`,
+    /// and says nothing of an index a tape does not have.
+    #[test]
+    fn the_rebuild_reports_the_volumes_the_index_names_as_a_to_do_list() {
+        use crate::volume::rebuild::{IndexedUnit, IndexedVolume, RebuildReport};
+        let none = RebuildReport::default();
+        assert!(
+            super::index_lines(&none).is_empty(),
+            "no index: nothing to say"
+        );
+        let json = super::index_json(&none);
+        assert_eq!(json["present"], false);
+        assert_eq!(json["volumes_missing"], serde_json::json!([]));
+
+        let known = RebuildReport {
+            had_index: true,
+            ..Default::default()
+        };
+        let text = super::index_lines(&known).join("\n");
+        assert!(
+            text.contains("names no other volume that this catalog lacks"),
+            "{text}"
+        );
+
+        let report = RebuildReport {
+            had_index: true,
+            index_volumes_missing: vec![IndexedVolume {
+                label: "L6-0002".to_string(),
+                uuid: "5e6f7a8b-0000-4000-8000-000000000002".to_string(),
+                cartridge_serial: "HUM12345".to_string(),
+                generation: "LTO-6".to_string(),
+                state: "quarantined".to_string(),
+                sealed_at: "2026-10-14T09:08:07Z".to_string(),
+                units: vec![IndexedUnit {
+                    tenant: "alpha".to_string(),
+                    unit: "photos/2019".to_string(),
+                    versions: vec![1, 2],
+                }],
+            }],
+            ..Default::default()
+        };
+        let text = super::index_lines(&report).join("\n");
+        assert!(
+            text.contains("names 1 other volume(s) this catalog has no row for"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was added from it"), "{text}");
+        assert!(
+            text.contains("tapectl catalog rebuild --from-volume --key <key>"),
+            "{text}"
+        );
+        assert!(text.contains("L6-0002"), "{text}");
+        assert!(
+            text.contains("uuid 5e6f7a8b-0000-4000-8000-000000000002"),
+            "{text}"
+        );
+        assert!(text.contains("cartridge serial HUM12345"), "{text}");
+        assert!(text.contains("LTO-6"), "{text}");
+        assert!(text.contains("quarantined 2026-10-14T09:08:07Z"), "{text}");
+        assert!(text.contains("alpha: photos/2019 v1, v2"), "{text}");
+
+        let json = super::index_json(&report);
+        assert_eq!(json["present"], true);
+        assert_eq!(json["problem"], serde_json::Value::Null);
+        let v = &json["volumes_missing"][0];
+        assert_eq!(v["label"], "L6-0002");
+        assert_eq!(v["cartridge_serial"], "HUM12345");
+        assert_eq!(v["state"], "quarantined");
+        assert_eq!(v["units"][0]["unit"], "photos/2019");
+        assert_eq!(v["units"][0]["versions"], serde_json::json!([1, 2]));
+
+        let broken = RebuildReport {
+            had_index: true,
+            index_problem: Some("units.tsv: the header has no `volume` column".to_string()),
+            ..Default::default()
+        };
+        let text = super::index_lines(&broken).join("\n");
+        assert!(text.contains("could not be used"), "{text}");
+        assert!(text.contains("no `volume` column"), "{text}");
+        assert_eq!(
+            super::index_json(&broken)["problem"],
+            "units.tsv: the header has no `volume` column"
+        );
+    }
+
     /// Issue #458: a tape with no valid seal is said to be unsealed and not a
     /// copy, with what to do with the cartridge; a sealed one says nothing.
     /// The advice that applies to a lost write the catalog can adopt
