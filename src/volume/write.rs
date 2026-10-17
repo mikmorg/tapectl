@@ -19590,6 +19590,210 @@ mod tests {
             assert_eq!(code, 0);
         }
 
+        /// #418 R4, through the real write path: the cross-volume index
+        /// (`volume-format-v2.md` §1.5) reaches the envelopes - this tape and
+        /// the other sealed one the catalog holds, in the operator's map and
+        /// in the tenant's own, with the tenant's paths - and none of it, nor
+        /// any path of the archive, is ever in the clear under staging; the
+        /// work directory it was built in is gone when the write is.
+        #[test]
+        fn a_volume_write_puts_the_cross_volume_index_in_the_envelopes_and_none_of_it_under_staging(
+        ) {
+            use crate::volume::{envelope, format, index};
+            const NEEDLE: &str = "idx-needle-q7x2k.jpg";
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (conn, mut config, _volume_id) = swept_write_fixture("IDX-1", tmp.path());
+            config.backends.lto[0].capacity_override = Some("2400G".into());
+
+            // Keys this test holds: the fixture registers public halves only.
+            let op = crate::crypto::keys::generate_keypair();
+            let alpha = crate::crypto::keys::generate_keypair();
+            for (alias, kp) in [("operator-key", &op), ("alpha-key", &alpha)] {
+                conn.execute(
+                    "UPDATE encryption_keys SET public_key = ?1, fingerprint = ?2 WHERE alias = ?3",
+                    params![kp.public_key, kp.fingerprint, alias],
+                )
+                .unwrap();
+            }
+            // The version this write carries has a path; the unit has a later
+            // version, current, on another sealed tape.
+            let (unit_id, snapshot_id): (i64, i64) = conn
+                .query_row("SELECT unit_id, id FROM snapshots", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            crate::db::files::insert_version(
+                &conn,
+                snapshot_id,
+                [Ok(crate::db::files::FileEntry {
+                    path: NEEDLE.to_string(),
+                    kind: crate::db::files::FileKind::Regular,
+                    size_bytes: 1234,
+                    mtime_ns: None,
+                    sha256: None,
+                    link_target: None,
+                })],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, uuid, sealed_at)
+                 VALUES ('IDX-HIST', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed',
+                         'hist-uuid', '2026-09-01 12:00:00')",
+                [],
+            )
+            .unwrap();
+            let hist_volume = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path)
+                 VALUES (?1, 2, 'current', '/hist')",
+                params![unit_id],
+            )
+            .unwrap();
+            let hist_snapshot = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'cleaned', 1)",
+                params![hist_snapshot],
+            )
+            .unwrap();
+            let hist_set = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![hist_set, hist_snapshot, hist_volume],
+            )
+            .unwrap();
+
+            let paths = TapectlPaths::new(tmp.path().join("home"));
+            let mut store = MemStore::new(512 * 1024);
+            let mut slot = ContactSlot::empty();
+            let r = volume_write_contacted(
+                &conn,
+                &paths,
+                &config,
+                "IDX-1",
+                GENCHK_DEVICE,
+                512 * 1024,
+                false,
+                false,
+                false,
+                false,
+                true,
+                &mut slot,
+                ContactStore::Injected(&mut store),
+            );
+            slot.finish_result(r).expect("the write seals");
+
+            // Staging holds no plaintext of the index: no tsv by name, no
+            // header, no path. The positive controls: it holds the session
+            // directory's files, and the same scan finds a planted path.
+            let scan = |dir: &std::path::Path| -> (usize, Vec<String>) {
+                let (mut seen, mut bad) = (0, Vec::new());
+                let mut stack = vec![dir.to_path_buf()];
+                while let Some(d) = stack.pop() {
+                    for entry in std::fs::read_dir(&d).unwrap() {
+                        let path = entry.unwrap().path();
+                        if path.is_dir() {
+                            stack.push(path);
+                            continue;
+                        }
+                        seen += 1;
+                        let bytes = std::fs::read(&path).unwrap();
+                        let has = |n: &str| bytes.windows(n.len()).any(|w| w == n.as_bytes());
+                        if path.extension().is_some_and(|e| e == "tsv")
+                            || has(NEEDLE)
+                            || has(&index::PATHS_COLUMNS.join("\t"))
+                            || has(&index::UNITS_COLUMNS.join("\t"))
+                        {
+                            bad.push(path.display().to_string());
+                        }
+                    }
+                }
+                (seen, bad)
+            };
+            let staging = std::path::Path::new(&config.staging.directory);
+            let (seen, bad) = scan(staging);
+            assert!(
+                seen >= 8,
+                "the scan reached the session's files: saw {seen}"
+            );
+            assert!(bad.is_empty(), "plaintext under staging: {bad:?}");
+            let control = tmp.path().join("control");
+            std::fs::create_dir_all(&control).unwrap();
+            std::fs::write(control.join("x"), format!("row\t{NEEDLE}\n")).unwrap();
+            assert_eq!(scan(&control).1.len(), 1, "the scan finds a planted path");
+            // And the tapectl home's work directory was removed with the write.
+            let left: Vec<_> = std::fs::read_dir(paths.home.join("tmp"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert!(left.is_empty(), "work directory left behind: {left:?}");
+
+            // On the tape: the operator envelope's map, read back by the
+            // rebuild's own reader.
+            let fi = crate::store::read_small_bytes(&mut store, 3, "front index").unwrap();
+            let entries = format::parse_front_index(&String::from_utf8_lossy(&fi)).unwrap();
+            let entry = |kind: &str| {
+                entries
+                    .iter()
+                    .find(|e| e.type_label == kind)
+                    .unwrap_or_else(|| panic!("no {kind}"))
+                    .clone()
+            };
+            let op_id: age::x25519::Identity = op.secret_key.parse().unwrap();
+            let scratch = tempfile::TempDir::new().unwrap();
+            let opened = envelope::open_envelope(
+                &mut store,
+                &entry("operator_envelope"),
+                &[op_id],
+                scratch.path(),
+            )
+            .expect("the operator envelope opens");
+            let map =
+                std::fs::read_to_string(opened.index_units.expect("the operator map")).unwrap();
+            let rows = index::parse_units(&map).unwrap();
+            let key = |r: &index::UnitsRow| (r.volume.clone(), r.version, r.state.clone());
+            assert_eq!(
+                rows.iter().map(key).collect::<Vec<_>>(),
+                vec![
+                    ("IDX-1".to_string(), 1, "this-tape".to_string()),
+                    ("IDX-HIST".to_string(), 2, "sealed".to_string()),
+                ]
+            );
+            assert!(rows
+                .iter()
+                .all(|r| r.tenant == "alpha" && r.unit == "photos"));
+
+            // The tenant's own envelope, with its key: units and paths.
+            let tenant = entry("tenant_envelope");
+            let mut bytes = Vec::new();
+            store.read_file(tenant.position as u32, &mut bytes).unwrap();
+            bytes.truncate(tenant.size_bytes.unwrap() as usize);
+            let alpha_id: age::x25519::Identity = alpha.secret_key.parse().unwrap();
+            let reader = age::Decryptor::new(&bytes[..])
+                .unwrap()
+                .decrypt(std::iter::once(&alpha_id as &dyn age::Identity))
+                .unwrap();
+            let mut members = std::collections::BTreeMap::new();
+            for m in tar::Archive::new(reader).entries().unwrap() {
+                let mut m = m.unwrap();
+                let name = m.path().unwrap().to_string_lossy().to_string();
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut m, &mut text).unwrap_or(0);
+                members.insert(name, text);
+            }
+            assert!(
+                members["index/units.tsv"].contains("IDX-HIST"),
+                "{members:?}"
+            );
+            let paths_rows = index::parse_paths(&members["index/paths.tsv"]).unwrap();
+            assert_eq!(
+                paths_rows.iter().map(|r| (r.version, r.path.as_str())).collect::<Vec<_>>(),
+                vec![(1, NEEDLE)],
+                "this write's version has its path; the later version on IDX-HIST has none recorded"
+            );
+        }
+
         /// 2: refused before anything was written — the loaded tape is
         /// another volume's (the File 0 check), and a signal during the
         /// pre-write hash. Neither leaves a session to resume.
