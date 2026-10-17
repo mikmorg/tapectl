@@ -59,7 +59,7 @@ def _ioc(direction, nr, size):
 MTIOCTOP = _ioc(1, 1, struct.calcsize(MTOP_FMT))
 MTIOCGET = _ioc(2, 2, struct.calcsize(MTGET_FMT))
 MTIOCPOS = _ioc(2, 3, struct.calcsize(MTPOS_FMT))
-MTFSF, MTWEOF, MTREW, MTSETBLK, MTSEEK = 1, 5, 6, 20, 22
+MTFSF, MTWEOF, MTSETBLK, MTSEEK = 1, 5, 20, 22
 
 GMT_FLAGS = [
     (0x80000000, "EOF"), (0x40000000, "BOT"), (0x20000000, "EOT"),
@@ -179,15 +179,6 @@ class Log(object):
                 self.console = False
 
 
-def outcome_of(n, err):
-    """One write(2) result as a word: ok, ENOSPC, EIO, zero, short(N)."""
-    if err is not None:
-        return errname(err)
-    if n == 0:
-        return "zero"
-    return "ok"   # callers compare n against the block size first
-
-
 def is_refusal(outcome):
     return outcome in ("ENOSPC", "zero")
 
@@ -202,15 +193,30 @@ def rle(seq):
     return out
 
 
-def rle_text(runs, limit=14):
-    parts = ["%s x%d" % (o, c) for o, c in runs]
-    if len(parts) > limit:
-        tot = {}
+def rle_text(runs, limit=12, totals=None, nruns=None):
+    """'ENOSPC x1 -> ok x2048'; a long pattern is cut to `limit` runs and followed by exact totals."""
+    nruns = len(runs) if nruns is None else nruns
+    parts = ["%s x%d" % (o, c) for o, c in runs[:limit]]
+    if nruns <= limit:
+        return " -> ".join(parts)
+    if totals is None:
+        totals = {}
         for o, c in runs:
-            tot[o] = tot.get(o, 0) + c
-        return (" -> ".join(parts[:limit]) + " -> ... (%d runs; totals: %s)"
-                % (len(runs), ", ".join("%s x%d" % kv for kv in sorted(tot.items()))))
-    return " -> ".join(parts)
+            totals[o] = totals.get(o, 0) + c
+    return (" -> ".join(parts) + " -> ... (%d runs in all; totals: %s)"
+            % (nruns, ", ".join("%s x%d" % kv for kv in sorted(totals.items()))))
+
+
+def describe(rec):
+    """The post-refusal outcome sequence of a write_blocks() record, in words."""
+    runs, totals, nruns = rec.get("outcomes_rle") or [], rec.get("outcome_totals"), rec.get("outcomes_runs", 0)
+    if nruns == 2 and is_refusal(runs[0][0]) and runs[1][0] == "ok":
+        return "%d refusal%s (%s), then %d accepted" % (runs[0][1], "" if runs[0][1] == 1 else "s", runs[0][0], runs[1][1])
+    if nruns >= 4 and all(c == 1 for _, c in runs) and all(
+            is_refusal(runs[i][0]) != is_refusal(runs[i + 1][0]) for i in range(len(runs) - 1)):
+        return ("ALTERNATING: every accepted write was followed by one refusal, then accepted again (%s)"
+                % ", ".join("%s x%d" % kv for kv in sorted((totals or {}).items())))
+    return rle_text(runs, 12, totals, nruns)
 
 
 # ------------------------------------------------------------------- writer --
@@ -385,9 +391,13 @@ class Writer(object):
                              % (region, accepted, accepted * self.bs / 1e9, refusals))
         flush_run()
         runs = rle(outcomes)
+        totals = {}
+        for o, c in runs:
+            totals[o] = totals.get(o, 0) + c
         return {"region": region, "first_block": g0, "accepted": accepted, "attempts": seq,
                 "refusals": refusals, "max_consecutive_refusals": maxconsec, "stop": stop,
-                "seconds": time.time() - t_start, "outcomes_rle": runs[:400], "outcomes_runs": len(runs)}
+                "seconds": time.time() - t_start, "outcomes_rle": runs[:400], "outcomes_runs": len(runs),
+                "outcome_totals": totals}
 
     def filemark(self, label):
         lb = self.dev.mtpos()
@@ -487,7 +497,7 @@ class Writer(object):
         res["slice"] = sl
         self.log.say("slice: %d of %d blocks accepted in %.1f s; %d refusals (longest run %d); stop: %s; outcomes: %s"
                      % (sl["accepted"], o.slice_blocks, sl["seconds"], sl["refusals"],
-                        sl["max_consecutive_refusals"], sl["stop"], rle_text(sl["outcomes_rle"])))
+                        sl["max_consecutive_refusals"], sl["stop"], describe(sl)))
         self.log.say("st state after the slice: %s; position %s" % (fmt_mtget(sl["mtget"]), sl["lba_after"]))
         if sl["stop"] == "interrupted":
             return
@@ -513,7 +523,7 @@ class Writer(object):
         he["lba_after"] = self.dev.mtpos()
         he["mtget"] = self.dev.mtget()
         if he["stop"] == "complete":
-            he["stop"] = "cap reached (the drive had not refused)"
+            he["stop"] = "cap reached (no non-recoverable error before it)"
         he["bytes_past_first_refusal"] = (sl["accepted"] + he["accepted"]) * self.bs
         self.res["hard_end"] = he
         self.log.say("hard end: %d more blocks accepted; %.2f GB past the first refusal in all; stop: %s; %s"
@@ -619,7 +629,7 @@ class Reader(object):
             self.check("slice-blocks", None, "no slice block was accepted")
         else:
             self.slice_checks(n, k, start, fm1, seal, fm2, res)
-            self.fsf_check(n, k, start, fm1)
+            self.fsf_check(n, k, start, seal)
         self.hard_end_checks(n + k, res.get("hard_end"))
 
     def position_checks(self, start, k, sl, fm1, seal, fm2):
@@ -631,14 +641,18 @@ class Reader(object):
             self.check("physical-block-count", got - start == k,
                        "READ POSITION after the slice = %d; expected fill start %d + %d slice blocks accepted = %d"
                        % (got, start, k, start + k))
-        if fm1.get("ok") and None not in (fm1.get("lba_before"), fm1.get("lba_after")):
-            self.check("position-after-filemark1", fm1["lba_after"] == fm1["lba_before"] + 1,
-                       "%s -> %s" % (fm1["lba_before"], fm1["lba_after"]))
-        if seal.get("ok") and fm2.get("ok") and None not in (fm1.get("lba_after"), fm2.get("lba_before"), fm2.get("lba_after")):
+        if None not in (fm1.get("lba_before"), fm1.get("lba_after")):
+            moved = fm1["lba_after"] - fm1["lba_before"]
+            self.check("position-after-filemark1", moved == (1 if fm1.get("ok") else 0),
+                       "MTWEOF reported %s; READ POSITION %s -> %s (moved %d)"
+                       % ("ok" if fm1.get("ok") else ",".join(fm1.get("attempts", [])), fm1["lba_before"], fm1["lba_after"], moved))
+        if None not in (fm1.get("lba_after"), fm2.get("lba_before"), fm2.get("lba_after")):
+            m_seal, m_fm2 = fm2["lba_before"] - fm1["lba_after"], fm2["lba_after"] - fm2["lba_before"]
             self.check("position-after-seal-and-filemark2",
-                       fm2["lba_before"] == fm1["lba_after"] + 1 and fm2["lba_after"] == fm2["lba_before"] + 1,
-                       "after filemark1 %s, before filemark2 %s, after it %s"
-                       % (fm1["lba_after"], fm2["lba_before"], fm2["lba_after"]))
+                       m_seal == (1 if seal.get("ok") else 0) and m_fm2 == (1 if fm2.get("ok") else 0),
+                       "seal block reported %s, moved %d; MTWEOF reported %s, moved %d"
+                       % ("ok" if seal.get("ok") else ",".join(seal.get("attempts", [])), m_seal,
+                          "ok" if fm2.get("ok") else ",".join(fm2.get("attempts", [])), m_fm2))
 
     def slice_checks(self, n, k, start, fm1, seal, fm2, res):
         ok, err = self.seek(start)
@@ -684,37 +698,45 @@ class Reader(object):
                       "; read stopped: %s" % stop_at[1] if stop_at else "") + ("; " + shift if shift else ""))
         if stop_at:
             return
-        if not fm1.get("ok"):
-            self.check("filemark-after-slice", None, "filemark 1 was not accepted at write time")
-            return
-        kind, err = self.read()
-        self.check("filemark-after-slice", kind == "fm", "the read after the last slice block returned %s" % self.word(kind, err))
-        if kind != "fm":
-            return
-        if not seal.get("ok"):
-            self.check("seal-block", None, "the seal block was not accepted at write time")
-            return
-        kind, err = self.read()
-        if kind != "data":
-            self.check("seal-block", False, "the read after the filemark returned %s" % self.word(kind, err))
-            return
-        raw = bytes(self.buf)
-        head = raw.split(b"\0", 1)[0]
-        pad = raw[len(head):]
-        self.check("seal-block", head.decode("ascii", "replace") == seal.get("text") and not pad.strip(b"\0"),
-                   "header %d bytes as written, %d bytes of zero padding" % (len(head), len(pad)))
-        kind, err = self.read()
-        if fm2.get("ok"):
-            self.check("filemark-after-seal", kind == "fm", "the read after the seal block returned %s" % self.word(kind, err))
-            if kind == "fm" and not res.get("hard_end"):
-                kind, err = self.read()
-                self.log.say("readback (information) the read after the final filemark returned %s; %s"
-                             % (self.word(kind, err), fmt_mtget(self.dev.mtget())))
-                self.checks.append({"name": "read-after-final-filemark", "status": "INFO", "detail": self.word(kind, err)})
+        # what physically follows the slice, in order, against what the writer was told it wrote
+        expect = (["FM"] if fm1.get("ok") else []) + (["SEAL"] if seal.get("ok") else []) + (["FM"] if fm2.get("ok") else [])
+        found, seal_raw = [], None
+        for _ in range(max(len(expect), 1)):
+            kind, err = self.read()
+            if kind == "fm":
+                found.append("FM")
+            elif kind == "data":
+                raw = bytes(self.buf)
+                head = raw.split(b"\0", 1)[0]
+                if head.startswith(b"LTO6-FILL-SEAL-MARKER"):
+                    found.append("SEAL")
+                    seal_raw = (head, raw[len(head):])
+                else:
+                    found.append("DATA")
+            else:
+                found.append("EOD(%s)" % self.word(kind, err))
+                break
+        agree = found == expect if expect else not (set(found) & set(["FM", "SEAL"]))
+        self.check("objects-after-slice", agree,
+                   "reported written: %s; read back: %s" % (" ".join(expect) or "nothing", " ".join(found)))
+        if seal.get("ok"):
+            if seal_raw is None:
+                self.check("seal-block-content", False, "no seal block was found to compare")
+            else:
+                head, pad = seal_raw
+                self.check("seal-block-content", head.decode("ascii", "replace") == seal.get("text") and not pad.strip(b"\0"),
+                           "header %d bytes as written, %d bytes of zero padding" % (len(head), len(pad)))
+        if expect and found == expect and not res.get("hard_end"):
+            kind, err = self.read()
+            self.log.say("readback (information) the read after the final filemark returned %s; %s"
+                         % (self.word(kind, err), fmt_mtget(self.dev.mtget())))
+            self.checks.append({"name": "read-after-final-filemark", "status": "INFO", "detail": self.word(kind, err)})
+        self.found_fm_first = bool(found) and found[0] == "FM"
 
-    def fsf_check(self, n, k, start, fm1):
+    def fsf_check(self, n, k, start, seal):
         """LOCATE to the last slice block, then space ONE filemark: that must land on the seal block."""
-        if not fm1.get("ok"):
+        if not getattr(self, "found_fm_first", False) or not seal.get("ok"):
+            self.check("fsf1-from-last-slice-block", None, "no filemark and seal block were read back after the slice")
             return
         ok, err = self.seek(start + k - 1)
         if not ok:
@@ -795,7 +817,24 @@ def make_summary(run, prior):
     p = out.append
     p("== lto6-fill summary (issue #420: what st and the drive do after the first write refusal) ==")
     p("run directory: %s" % run)
-    p("stage reached: %s (started %s, finished %s)" % (res.get("stage"), res.get("started"), res.get("finished")))
+    stage, end = res.get("stage"), fill.get("end")
+    if end == "cap":
+        word = "NO REFUSAL before the runaway cap: an emulator, or a drive that reported no early warning; nothing past the warning was measured"
+    elif end == "error":
+        word = "THE FILL STOPPED ON A WRITE ERROR THAT IS NOT A REFUSAL (%s): no past-warning phase" % (res.get("fill_error") or {}).get("outcome")
+    elif end == "interrupted":
+        word = "INTERRUPTED before any refusal"
+    elif stage == "stopped-at-warning":
+        word = "STOPPED AT THE FIRST REFUSAL (--stop-at-warning); nothing was written after it"
+    elif sl and sl.get("stop") == "interrupted":
+        word = "INTERRUPTED during the past-warning phase"
+    elif sl and stage == "done":
+        word = "MEASUREMENT COMPLETE (readback: %s)" % ("FAIL" if any(c["status"] == "FAIL" for c in rb.get("checks", []))
+                                                       else "PASS" if rb.get("checks") else "not run")
+    else:
+        word = "INCOMPLETE (stage %s)" % stage
+    p("status: %s" % word)
+    p("stage reached: %s (started %s, finished %s)" % (stage, res.get("started"), res.get("finished")))
     p("")
     p("1. BEFORE THE FIRST REFUSAL")
     p("bytes accepted before the first refusal: %s (%s blocks of %d); fill ended: %s; host feed %.1f MB/s over %.2f h"
@@ -820,11 +859,7 @@ def make_summary(run, prior):
     p("")
     p("2. AFTER THE FIRST REFUSAL (what write(2) returned for each attempt, run-length)")
     if sl:
-        runs = sl.get("outcomes_rle") or []
-        if len(runs) == 2 and is_refusal(runs[0][0]) and runs[1][0] == "ok":
-            p("%d refusal%s (%s), then %d accepted" % (runs[0][1], "" if runs[0][1] == 1 else "s", runs[0][0], runs[1][1]))
-        else:
-            p(rle_text(runs, 40))
+        p(describe(sl))
         p("full slice of %d blocks accepted: %s (%d accepted; stop reason: %s; %d refusals, longest run %d; "
           "refusal-run limit %s)" % (target, "YES" if sl["accepted"] >= target else "NO", sl["accepted"], sl["stop"],
                                      sl["refusals"], sl["max_consecutive_refusals"], res.get("refusal_run_limit")))
@@ -864,7 +899,7 @@ def make_summary(run, prior):
         p("accepted %s more blocks after the seal; %.3f GB past the first refusal in all (slice + walk); stop: %s"
           % (commas(he["accepted"]), he["bytes_past_first_refusal"] / 1e9, he["stop"]))
         p("refusals during the walk: %d (longest run %d); outcomes: %s"
-          % (he["refusals"], he["max_consecutive_refusals"], rle_text(he["outcomes_rle"], 12)))
+          % (he["refusals"], he["max_consecutive_refusals"], describe(he)))
         p("st state at the end: %s" % fmt_mtget(he.get("mtget")))
     else:
         p("not run (--to-hard-end writes into the drive's end-of-partition reserve; it is off by default)")
@@ -926,6 +961,8 @@ class FakeTape(object):
         if v == "ENOSPC+data":
             self._put(bytes(buf))
             raise OSError(errno.ENOSPC, "No space left on device")
+        if v == "DROP":                      # reported as written, never reaches the tape (mhvtl past its capacity)
+            return len(buf)
         if isinstance(v, tuple):
             return v[1]
         raise OSError(getattr(errno, v), os.strerror(getattr(errno, v)))
@@ -935,6 +972,9 @@ class FakeTape(object):
             self.fm_attempts += 1
             v = self.fm_verdict(self.fm_attempts)
             if v:
+                if v.endswith("+mark"):      # reported as failed, but the mark is on the tape
+                    self._put(None)
+                    v = v[:-5]
                 return False, getattr(errno, v)
             self._put(None)
         elif op == MTSEEK:
@@ -984,12 +1024,12 @@ def selftest(argv=None):
     with open(src, "wb") as f:
         f.write(os.urandom(bs * nblk))
 
-    def scenario(name, verdict, fm_verdict=None, hard=False, cap_bytes=None, limit=8, stop_flag=False, **kw):
+    def scenario(name, verdict, fm_verdict=None, hard=False, cap_bytes=None, limit=8, stop_flag=False, slice_n=None, **kw):
         print("scenario: %s" % name)
         run = os.path.join(root, name.replace(" ", "_"))
         os.makedirs(run)
         tape = FakeTape(bs, verdict, fm_verdict)
-        o = argparse.Namespace(slice_blocks=slice_blocks, refusal_run_limit=limit, stop_at_warning=kw.get("stop_at_warning", False),
+        o = argparse.Namespace(slice_blocks=slice_n or slice_blocks, refusal_run_limit=limit, stop_at_warning=kw.get("stop_at_warning", False),
                                to_hard_end=hard, hard_end_cap=kw.get("hard_cap", 10 ** 9),
                                max_fill_bytes=cap_bytes or 10 ** 9, sg="", progress_s=1e9)
         log = Log(os.path.join(run, "writer.log"))
@@ -1033,7 +1073,13 @@ def selftest(argv=None):
     expect(res["slice"]["accepted"] == slice_blocks and res["slice"]["max_consecutive_refusals"] == 1
            and res["slice"]["refusals"] == slice_blocks, "alternating refusals do not trip the run limit")
     expect(not any(c["status"] == "FAIL" for c in rd.checks), "readback clean after alternation")
-    expect("totals: ENOSPC x%d, ok x%d" % (slice_blocks, slice_blocks) in text, "summary condenses a long alternation to totals")
+    expect("ALTERNATING" in text and "ENOSPC x%d, ok x%d" % (slice_blocks, slice_blocks) in text, "summary names the alternation and gives totals")
+
+    # C2: an alternation longer than the 400 runs the result file keeps: the totals stay exact
+    rc, res, rd, text, tape = scenario("long alternation", lambda a, w: "ENOSPC" if a > fill_n and (a - fill_n) % 2 == 1 else None, slice_n=300)
+    expect(res["slice"]["outcomes_runs"] == 600 and len(res["slice"]["outcomes_rle"]) == 400
+           and res["slice"]["outcome_totals"] == {"ENOSPC": 300, "ok": 300}, "600 runs: 400 kept, exact totals kept")
+    expect("ENOSPC x300, ok x300" in text, "the summary prints the exact totals")
 
     # D: a hard error after a few accepted blocks
     rc, res, rd, text, tape = scenario("eio", lambda a, w: "ENOSPC" if a == fill_n + 1 else ("EIO" if a == fill_n + 6 else None))
@@ -1077,6 +1123,17 @@ def selftest(argv=None):
     rc, res, rd, text, tape = scenario("filemark retried", lambda a, w: "ENOSPC" if a == fill_n + 1 else None,
                                        fm_verdict=lambda a: "ENOSPC" if a == 1 else None)
     expect(res["filemark1"]["attempts"] == ["ENOSPC", "ok"] and res["filemark1"]["ok"], "a refused filemark is retried and logged")
+
+    # M: MTWEOF reports EIO but the mark is on the tape -- the readback must disagree with the report
+    rc, res, rd, text, tape = scenario("filemark reported failed but written", lambda a, w: "ENOSPC" if a == fill_n + 1 else None,
+                                       fm_verdict=lambda a: "EIO+mark" if a == 1 else None)
+    expect(res["filemark1"]["ok"] is False and "FAIL" in status(rd, "objects-after-slice"),
+           "a filemark reported failed but present is caught by the object-sequence check")
+
+    # N: the seal block is reported accepted but dropped by the drive (mhvtl past its capacity)
+    rc, res, rd, text, tape = scenario("seal dropped", lambda a, w: "ENOSPC" if a == fill_n + 1 else ("DROP" if a == fill_n + slice_blocks + 2 else None))
+    expect(res["seal"]["ok"] and "FAIL" in status(rd, "objects-after-slice") and "FAIL" in status(rd, "position-after-seal-and-filemark2"),
+           "a dropped seal block is caught by the object sequence and by READ POSITION")
 
     Log.console = True
     shutil.rmtree(root)
