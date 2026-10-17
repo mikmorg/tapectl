@@ -254,9 +254,14 @@ enum Command {
     RestoreSelect,
     Audit,
     CollectionStatus,
+    /// The cross-volume index a write would carry (#418 R4, `volume-format-v2.md`
+    /// §1.5), generated into a sink: not a read command, but the write path's
+    /// one catalog pass over every listed version and path, held to the same
+    /// budget so a statement per path (or per unit and holder) cannot slip in.
+    IndexBuild,
 }
 
-const COMMANDS: [Command; 7] = [
+const COMMANDS: [Command; 8] = [
     Command::Ls,
     Command::Search,
     Command::Locate,
@@ -264,6 +269,7 @@ const COMMANDS: [Command; 7] = [
     Command::RestoreSelect,
     Command::Audit,
     Command::CollectionStatus,
+    Command::IndexBuild,
 ];
 
 fn run(command: Command, conn: &Connection, config: &Config) {
@@ -290,6 +296,24 @@ fn run(command: Command, conn: &Connection, config: &Config) {
         }
         Command::Audit => {
             tapectl::cli::audit::run(conn, config, None, false, true).unwrap();
+        }
+        Command::IndexBuild => {
+            // A write carrying unit-0000's stage set (the first the fixture
+            // made): its tenant has an envelope here, so the index lists
+            // every unit's version and reads every one's paths.
+            let measured = tapectl::volume::index::measure(
+                conn,
+                &tapectl::policy::coverage::IndexThisTape {
+                    label: "L6-9999",
+                    uuid: "uuid-this",
+                    cartridge_serial: "THIS",
+                    generation: "LTO-6",
+                },
+                &[1],
+            )
+            .unwrap();
+            // Positive control: it read the paths, not only the unit map.
+            assert!(measured.total_bytes() > (FILES * 40) as u64, "{measured:?}");
         }
         Command::CollectionStatus => {
             let s = tapectl::collection::status::status_for_collection(
@@ -356,6 +380,14 @@ fn budget(command: Command) -> (usize, usize, &'static [&'static str]) {
         // under the root its policy (`policy::resolve`) and its copy count
         // — three statements a unit.
         Command::CollectionStatus => (2 + 3 * LARGE, 3, &[]),
+        // The index is built in 2 statements plus one per listed version,
+        // whatever its files: the holders (all tenants), this tape's own rows,
+        // and for each version one statement reading its paths, in index
+        // order so no sorter spills plaintext outside the home (one per
+        // VERSION, never per path: FILES a unit would show here as 60 a
+        // unit). `writes` is read in full for the holders, as `audit` reads
+        // it (`volumes` and the rest are reached by key). Measured 2026-10-17.
+        Command::IndexBuild => (2 + LARGE, 1, &["w"]),
     }
 }
 
