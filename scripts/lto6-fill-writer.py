@@ -59,7 +59,7 @@ def _ioc(direction, nr, size):
 MTIOCTOP = _ioc(1, 1, struct.calcsize(MTOP_FMT))
 MTIOCGET = _ioc(2, 2, struct.calcsize(MTGET_FMT))
 MTIOCPOS = _ioc(2, 3, struct.calcsize(MTPOS_FMT))
-MTFSF, MTWEOF, MTSETBLK, MTSEEK = 1, 5, 20, 22
+MTFSF, MTWEOF, MTSETBLK, MTSEEK, MTCOMPRESSION, MTWEOFI = 1, 5, 20, 22, 32, 35
 
 GMT_FLAGS = [
     (0x80000000, "EOF"), (0x40000000, "BOT"), (0x20000000, "EOT"),
@@ -269,11 +269,15 @@ class Writer(object):
         if tape and (st["dsreg"] & 0xFFFFFF) != self.bs:
             raise SystemExit("the drive is not in fixed %d-byte block mode (block size %d): refusing"
                              % (self.bs, st["dsreg"] & 0xFFFFFF))
+        # tapectl's TapeStore::open turns the drive's hardware compression off before any write
+        # (encrypted data is incompressible); so does this run, best effort, as it does.
+        comp_ok, comp_err = self.dev.top(MTCOMPRESSION, 0) if tape else (None, None)
         lba0 = self.dev.mtpos()
-        self.res["setup"] = {"tape": tape, "setblk_ok": ok, "setblk_errno": err,
-                             "mtget": st, "lba0": lba0}
-        self.log.say("device open; %s; position (READ POSITION) = %s"
-                     % (fmt_mtget(st) if tape else "not a tape device (test mode)", lba0))
+        self.res["setup"] = {"tape": tape, "setblk_ok": ok, "setblk_errno": err, "mtget": st, "lba0": lba0,
+                             "compression_off_ok": comp_ok, "compression_off_errno": comp_err}
+        self.log.say("device open; %s; compression off: %s; position (READ POSITION) = %s"
+                     % (fmt_mtget(st) if tape else "not a tape device (test mode)",
+                        "n/a" if comp_ok is None else "ok" if comp_ok else errname(comp_err), lba0))
 
     # ----- step 1: the fill, one open, to the first refusal
     def fill(self):
@@ -399,22 +403,23 @@ class Writer(object):
                 "seconds": time.time() - t_start, "outcomes_rle": runs[:400], "outcomes_runs": len(runs),
                 "outcome_totals": totals}
 
-    def filemark(self, label):
+    def filemark(self, label, op, opname):
+        """tapectl ends a data file with an immediate filemark (MTWEOFI) and the seal marker's with a synchronous one (MTWEOF)."""
         lb = self.dev.mtpos()
         outs = []
         ok = False
         for _ in range(self.o.refusal_run_limit):
             t = time.time()
-            ok, err = self.dev.top(MTWEOF, 1)
+            ok, err = self.dev.top(op, 1)
             outs.append("ok" if ok else errname(err))
-            self.log.file("%s: MTWEOF -> %s ts=%s" % (label, outs[-1], stamp(t)))
+            self.log.file("%s: %s -> %s ts=%s" % (label, opname, outs[-1], stamp(t)))
             if ok or err != errno.ENOSPC:
                 break
-        rec = {"ok": ok, "attempts": outs, "lba_before": lb, "lba_after": self.dev.mtpos(),
+        rec = {"ok": ok, "op": opname, "attempts": outs, "lba_before": lb, "lba_after": self.dev.mtpos(),
                "mtget": self.dev.mtget()}
         self.res[label] = rec
-        self.log.say("%s: %s (attempts: %s); position %s -> %s; %s"
-                     % (label, "accepted" if ok else "NOT accepted", ", ".join(outs), lb, rec["lba_after"],
+        self.log.say("%s (%s): %s (attempts: %s); position %s -> %s; %s"
+                     % (label, opname, "accepted" if ok else "NOT accepted", ", ".join(outs), lb, rec["lba_after"],
                         fmt_mtget(rec["mtget"])))
         return ok
 
@@ -502,14 +507,18 @@ class Writer(object):
         if sl["stop"] == "interrupted":
             return
         self.stage("filemark-seal-filemark")
-        self.filemark("filemark1")
+        self.filemark("filemark1", MTWEOFI, "MTWEOFI")
         self.seal(sl)
-        self.filemark("filemark2")
+        self.filemark("filemark2", MTWEOF, "MTWEOF")
         res["after_seal"] = {"mtget": self.dev.mtget(), "lba": self.dev.mtpos()}
         self.log.say("after the seal: %s; position %s" % (fmt_mtget(res["after_seal"]["mtget"]), res["after_seal"]["lba"]))
         self.save()
-        if o.to_hard_end and sl["stop"] in ("complete",) and not self.stop_flag:
-            self.hard_end(n_fill, sl)
+        if o.to_hard_end:
+            if sl["stop"] == "complete" and not self.stop_flag:
+                self.hard_end(n_fill, sl)
+            else:
+                res["hard_end_skipped"] = "the slice did not complete (stop: %s)" % sl["stop"]
+                self.log.say("hard end skipped: %s" % res["hard_end_skipped"])
 
     def hard_end(self, n_fill, sl):
         self.stage("hard-end")
@@ -644,14 +653,15 @@ class Reader(object):
         if None not in (fm1.get("lba_before"), fm1.get("lba_after")):
             moved = fm1["lba_after"] - fm1["lba_before"]
             self.check("position-after-filemark1", moved == (1 if fm1.get("ok") else 0),
-                       "MTWEOF reported %s; READ POSITION %s -> %s (moved %d)"
-                       % ("ok" if fm1.get("ok") else ",".join(fm1.get("attempts", [])), fm1["lba_before"], fm1["lba_after"], moved))
+                       "%s reported %s; READ POSITION %s -> %s (moved %d)"
+                       % (fm1.get("op", "MTWEOF"), "ok" if fm1.get("ok") else ",".join(fm1.get("attempts", [])),
+                          fm1["lba_before"], fm1["lba_after"], moved))
         if None not in (fm1.get("lba_after"), fm2.get("lba_before"), fm2.get("lba_after")):
             m_seal, m_fm2 = fm2["lba_before"] - fm1["lba_after"], fm2["lba_after"] - fm2["lba_before"]
             self.check("position-after-seal-and-filemark2",
                        m_seal == (1 if seal.get("ok") else 0) and m_fm2 == (1 if fm2.get("ok") else 0),
-                       "seal block reported %s, moved %d; MTWEOF reported %s, moved %d"
-                       % ("ok" if seal.get("ok") else ",".join(seal.get("attempts", [])), m_seal,
+                       "seal block reported %s, moved %d; %s reported %s, moved %d"
+                       % ("ok" if seal.get("ok") else ",".join(seal.get("attempts", [])), m_seal, fm2.get("op", "MTWEOF"),
                           "ok" if fm2.get("ok") else ",".join(fm2.get("attempts", [])), m_fm2))
 
     def slice_checks(self, n, k, start, fm1, seal, fm2, res):
@@ -866,8 +876,13 @@ def make_summary(run, prior):
         p("slice written in %.1f s = %.1f MB/s" % (sl["seconds"], sl["accepted"] * bs / max(sl["seconds"], 1e-9) / 1e6))
         for lab, key in (("filemark after the slice", "filemark1"), ("seal block", "seal"), ("filemark after the seal", "filemark2")):
             r = res.get(key)
-            p("%s: %s (attempts: %s)" % (lab, "accepted" if r and r.get("ok") else "NOT accepted" if r else "not attempted",
-                                         ", ".join(r.get("attempts", [])) if r else "-"))
+            p("%s%s: %s (attempts: %s)" % (lab, " (%s)" % r["op"] if r and r.get("op") else "",
+                                           "accepted" if r and r.get("ok") else "NOT accepted" if r else "not attempted",
+                                           ", ".join(r.get("attempts", [])) if r else "-"))
+        su = res.get("setup") or {}
+        if su.get("compression_off_ok") is not None:
+            p("hardware compression turned off before the fill, as tapectl does: %s (the 2026-09-24 fill ran in the drive's "
+              "as-found state, which may differ)" % ("yes" if su["compression_off_ok"] else "NO, errno %s" % su.get("compression_off_errno")))
         f0 = (fr.get("mtget") or {}).get("fileno")
         fn = lambda d: (d or {}).get("fileno")   # noqa: E731
         p("file numbers (MTIOCGET): at the first refusal %s; after filemark 1 %s; after the seal block and filemark 2 %s; "
@@ -901,6 +916,8 @@ def make_summary(run, prior):
         p("refusals during the walk: %d (longest run %d); outcomes: %s"
           % (he["refusals"], he["max_consecutive_refusals"], describe(he)))
         p("st state at the end: %s" % fmt_mtget(he.get("mtget")))
+    elif res.get("hard_end_skipped"):
+        p("requested but skipped: %s" % res["hard_end_skipped"])
     else:
         p("not run (--to-hard-end writes into the drive's end-of-partition reserve; it is off by default)")
     p("")
@@ -934,7 +951,7 @@ def make_summary(run, prior):
           % fr["snapshot_seconds"])
     p("")
     p("detail in this directory: result.json, readback.json, writer.log (every attempt of the slice), fill.log,")
-    p("*.mt.txt, *.page_*.txt, *.mam.txt")
+    p("dmesg-tail.txt (empty or 'not permitted' means: run `sudo dmesg -T | tail -400` and send that too), *.mt.txt, *.page_*.txt, *.mam.txt")
     return "\n".join(out) + "\n"
 
 
@@ -968,7 +985,7 @@ class FakeTape(object):
         raise OSError(getattr(errno, v), os.strerror(getattr(errno, v)))
 
     def top(self, op, count):
-        if op == MTWEOF:
+        if op in (MTWEOF, MTWEOFI):
             self.fm_attempts += 1
             v = self.fm_verdict(self.fm_attempts)
             if v:

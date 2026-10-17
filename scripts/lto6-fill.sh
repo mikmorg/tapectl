@@ -52,13 +52,17 @@
 #      run of 3 already shows a sticky refusal; 8 survives any alternating
 #      accept/refuse pattern and costs nothing, a refused write returning in
 #      microseconds.
-#   3. Write a filemark, then ONE block standing in for the seal marker (a text
-#      header with the time and the accepted-block count, zero-padded to
-#      512 KiB), then a filemark, logging each result and the drive's block
-#      address (READ POSITION) around them.
+#   3. Write a filemark (MTWEOFI, immediate, as tapectl ends a data file), then
+#      ONE block standing in for the seal marker (a text header with the time
+#      and the accepted-block count, zero-padded to 512 KiB), then a filemark
+#      (MTWEOF, synchronous, as tapectl ends its seal), logging each result and
+#      the drive's block address (READ POSITION) around them.
 #   4. With --to-hard-end (OFF by default): keep writing blocks until a
 #      non-recoverable error, capped at 110 GB past the warning. THIS WRITES INTO
 #      THE DRIVE'S END-OF-PARTITION RESERVE (about 99 GB on this drive).
+# Hardware compression is turned off first, as tapectl does before any write (the
+# 2026-09-24 fill ran in the drive's as-found state), so bytes accepted may differ
+# slightly from that run's figure for this reason too.
 # The tape then holds file F = the fill and, in the same file, the slice (no
 # filemark ever separates them; F is the file number at the refusal, 0 on a
 # fresh tape), a filemark, the seal block as file F+1, a filemark.
@@ -164,6 +168,11 @@ for bin in mt sg_read_attr sg_logs openssl python3 flock df; do
     command -v "$bin" >/dev/null || die "required binary missing: $bin"
 done
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' || die "python3 3.7 or newer is required (the writer uses os.preadv)"
+# The log-page reads below use these sg_logs options (home2's sg3-utils is older than the dev VM's).
+SG_LOGS_HELP="$(sg_logs --help 2>&1)"
+for opt in '--maxlen' '--in=' '--pdt' '--raw' '--page'; do
+    case "$SG_LOGS_HELP" in *"$opt"*) ;; *) die "this sg_logs does not list the $opt option; the log-page reads would fail" ;; esac
+done
 WRITER="$(dirname "$(readlink -f "$0")")/lto6-fill-writer.py"
 [ -r "$WRITER" ] || die "the writer helper is missing: $WRITER"
 
@@ -194,6 +203,7 @@ case "$AVAIL" in ''|*[!0-9]*) die "cannot read the free space of $OUT_DIR" ;; es
 # ---------- the drive, through the canonical node (issue #334 idiom) ----------
 TAPE_REAL="$(readlink -f "$TAPE_DEV")"; ST_NODE="$(basename "$TAPE_REAL")"
 [ -d "/sys/class/scsi_tape/$ST_NODE" ] || die "$TAPE_DEV ($TAPE_REAL) is not an st tape node"
+case "$ST_NODE" in nst[0-9]*) ;; *) die "$TAPE_DEV is $TAPE_REAL, a REWINDING node: the readback and every position in the summary assume the non-rewinding one (the by-id name ending -nst)" ;; esac
 SG_ENTRIES=(); for e in "/sys/class/scsi_tape/$ST_NODE/device/scsi_generic"/sg*; do [ -e "$e" ] && SG_ENTRIES+=("$(basename "$e")"); done
 [ "${#SG_ENTRIES[@]}" -eq 1 ] || die "cannot resolve exactly one sg node for $TAPE_DEV (got ${SG_ENTRIES[*]:-none})"
 DRIVE_SG="/dev/${SG_ENTRIES[0]}"
@@ -282,6 +292,8 @@ if [ "$STOP_AT_WARNING" -eq 0 ] && [ "$WRC" -eq 0 ]; then
     mt -f "$TAPE_DEV" rewind || true
 fi
 
+# The kernel's own account of the writes and filemarks (best effort: dmesg may need root).
+{ dmesg -T 2>&1 || journalctl -k --no-pager 2>&1; } | grep -iE '\bn?st[0-9]|scsi|tape|\bsg[0-9]|overflow|medium|not permitted|authoriz' | tail -n 500 > "$RUN/dmesg-tail.txt"
 python3 "$WRITER" summary --run "$RUN" | tee -a "$RUN/fill.log"
 log "done; raw captures and summary.txt in $RUN -- send that whole directory back"
 [ "$WRC" -eq 0 ] || exit "$WRC"
