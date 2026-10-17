@@ -172,8 +172,11 @@ class Log(object):
     def say(self, msg):
         self.file(msg)
         if self.console:
-            sys.stdout.write("[%s] %s\n" % (time.strftime("%H:%M:%S", time.gmtime()), msg))
-            sys.stdout.flush()
+            try:
+                sys.stdout.write("[%s] %s\n" % (time.strftime("%H:%M:%S", time.gmtime()), msg))
+                sys.stdout.flush()
+            except OSError:      # the reader of our stdout went away (tee killed): the file log still has it
+                self.console = False
 
 
 def outcome_of(n, err):
@@ -804,6 +807,16 @@ def make_summary(run, prior):
     if fr:
         p("first refusal: %s%s at %s" % (fr.get("outcome"), " (errno %s)" % fr["errno"] if fr.get("errno") else "", fr.get("time")))
         p("st/drive state at the refusal (MTIOCGET, as `mt status` prints it): %s" % fr.get("mt_status"))
+    b_max = grab(os.path.join(run, "before.mam.txt"), "Maximum capacity in partition")
+    used = grab(os.path.join(run, "after-rewind.page_0x17.txt"), "Total used native capacity")
+    written = (fill.get("bytes") or 0) + ((sl or {}).get("accepted", 0) + (res.get("hard_end") or {}).get("accepted", 0)
+                                          + (1 if (res.get("seal") or {}).get("ok") else 0)) * bs
+    if fill.get("bytes") and b_max:
+        p("bytes accepted / MAM maximum capacity (%s MiB): %.4f; / the 2.5 TB planning figure: %.4f"
+          % (commas(b_max), fill["bytes"] / (b_max * 1048576.0), fill["bytes"] / 2.5e12))
+    if used and written:
+        p("native capacity used per data byte, all data blocks written (page 0x17 after rewind %s MB / %s bytes): %.4f"
+          % (commas(used), commas(written), used * 1e6 / written))
     p("")
     p("2. AFTER THE FIRST REFUSAL (what write(2) returned for each attempt, run-length)")
     if sl:
@@ -835,6 +848,13 @@ def make_summary(run, prior):
         c = res.get("close")
         if c:
             p("close: %s" % ("ok" if c.get("ok") else errname(c.get("errno") or 0)))
+        try:
+            with open(os.path.join(run, "after-close.mt.txt"), errors="replace") as f:
+                mtl = [l.strip() for l in f if "File number" in l or "General status" in l or l.strip().startswith(("BOT", "EOT", "EOD", "ONLINE"))]
+            p("`mt status` after the writer closed (st wrote its own filemark on close if the last operation was a write): %s"
+              % (" | ".join(mtl) or "unavailable"))
+        except OSError:
+            pass
     else:
         p("(no past-warning slice was written)")
     p("")
@@ -1069,8 +1089,8 @@ def install_signals(w):
     def handler(signum, frame):
         w.stop_flag = True
         w.log.say("signal %d: stopping after the current write" % signum)
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handler)
     if hasattr(signal, "SIGXFSZ"):
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
 
