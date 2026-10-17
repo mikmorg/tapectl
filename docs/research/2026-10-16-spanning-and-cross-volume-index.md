@@ -53,8 +53,11 @@ by hand"; whether "hidden underneath" covers it is the CTO's call.
 | LTO-8 | 12.0 TB | 11.64 TB | 6.00 TB | ~10,840 |
 
 Measured on home2's real drive, a fresh LTO-6 took 2,501,995,134,976 bytes before ENOSPC,
-and early warning sits about 99,008 MB before it
-(`docs/runs/2026-09-23-real-drive-rehearsal.md:137-164`).
+which is the drive's early warning: it stops host writes there and keeps a reserve of about
+99,008 MB between early warning and the physical end (page 0x0c, "Minimum native capacity from
+EW to EOP"; `docs/runs/2026-09-23-real-drive-rehearsal.md:137-164`). So the default fill
+ceiling (97%, about 2.425 TB) sits about 77 GB before early warning. (Corrected 2026-10-17: an
+earlier draft read the reserve as lying before ENOSPC.)
 
 **Real units.**
 - The whole first production tape is `keepsake`, about 1.3 TB, one unit per folder

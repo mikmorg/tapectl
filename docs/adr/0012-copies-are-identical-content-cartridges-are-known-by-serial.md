@@ -1656,3 +1656,21 @@ Ruled the same night, after discussion (Round 1 question 1 and its consequences)
     failed stages and the hours each lost, derived from the facts the catalog already keeps. Once
     spanning has run, that data is reviewed with the CTO, who names the threshold at which the
     parts question reopens; none is set before the data exists.
+
+Ruled 2026-10-17, refining spanning:
+
+92. **No unit is larger than one tape, spanning or not.** Item 82's exception (a unit larger
+    than one cartridge admitted if it allows spanning) is withdrawn: item 17 of 2026-10-06 refuses
+    every unit larger than one cartridge, and spanning exists only to fill tapes, never to admit a
+    unit that could not fit on one.
+93. **Consecutive copies at one location make a whole tape.** When copies of a spanning version
+    are written one after another onto one location's cartridges, the tape after copy k's cut
+    begins with copy k+1's head, slices 1 to K (cut at the same slice as copy k, a planned point
+    rather than early warning), followed by copy k's tail, slices K+1 to N. That tape holds the
+    version whole and in slice order, and restores it alone in one forward pass; item 92 makes
+    sure it fits. Copy k+1's tail begins the next tape the same way, and the last copy's tail
+    simply begins its tape. Every slice is then on as many distinct volumes as there are copies
+    (item 76): with two copies, the middle tape is one whole copy and the tapes either side of it
+    together are the other, so losing any one tape leaves a restorable copy. This amends items 83
+    and 84 for those tapes only: copy k+1's head is placed first and ends at K. Copies bound for
+    different locations never share a cartridge, so this applies within one location.
