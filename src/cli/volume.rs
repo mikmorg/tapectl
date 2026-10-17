@@ -2165,16 +2165,7 @@ pub fn run(
                     (factor * 100.0).round() as i64
                 );
                 if let Some(index) = index {
-                    // The index is in every envelope, and every envelope is on
-                    // the tape twice (§1.3): about twice its plaintext size,
-                    // counted by the capacity gate with every other file.
-                    println!(
-                        "cross-volume index: about {} per tape, {} on it with the envelope \
-                         backups (an estimate: all of the above on one tape, as the catalog \
-                         stands now)",
-                        crate::util::format_bytes_binary(index),
-                        crate::util::format_bytes_binary(2 * index),
-                    );
+                    println!("{}", plan_index_line(index));
                 }
             }
         }
@@ -3801,6 +3792,19 @@ struct PlanRow {
 /// listing: `volume write` selects every staged set regardless
 /// (`find_staged_data`), so here there is no selection for the flag to
 /// change.
+/// `volume plan`'s line about the cross-volume index (#418 R4): the index is
+/// in every envelope, and every envelope is on the tape twice (§1.3), so about
+/// twice its plaintext size, counted by the capacity gate with every other
+/// file. Said to be an estimate, with why (see [`planned_index_bytes`]).
+fn plan_index_line(index: i64) -> String {
+    format!(
+        "cross-volume index: about {} per tape, {} on it with the envelope backups \
+         (an estimate: all of the above on one tape, as the catalog stands now)",
+        crate::util::format_bytes_binary(index),
+        crate::util::format_bytes_binary(2 * index),
+    )
+}
+
 /// The size, in bytes, of the cross-volume index (`volume-format-v2.md`
 /// §1.5) that a write of everything now staged would put in each copy of the
 /// envelopes, before tar and age overhead: the real generator, run into a sink
@@ -3896,6 +3900,22 @@ fn staged_plan_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #418 R4: `volume plan` names the index's size, twice it for the
+    /// envelope backups, and calls it an estimate.
+    #[test]
+    fn the_plan_line_for_the_index_doubles_it_for_the_backups_and_says_estimate() {
+        let line = plan_index_line(3 * 1024 * 1024);
+        assert!(
+            line.starts_with("cross-volume index: about 3.0 MiB per tape"),
+            "{line}"
+        );
+        assert!(
+            line.contains("6.0 MiB on it with the envelope backups"),
+            "{line}"
+        );
+        assert!(line.contains("an estimate"), "{line}");
+    }
 
     /// Issue #440: what `volume write` and `volume resume` do about staging
     /// once the copy is sealed and confirmed. The write itself needs a tape

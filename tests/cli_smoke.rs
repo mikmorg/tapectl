@@ -900,6 +900,9 @@ fn volume_plan_json_parses_with_nothing_staged() {
     assert_eq!(parsed["total_slices"], serde_json::json!(0));
     assert_eq!(parsed["total_bytes"], serde_json::json!(0));
     assert_eq!(parsed["units"], serde_json::json!([]));
+    // Nothing staged, nothing to put in an index: no estimate to give.
+    assert_eq!(parsed["index_bytes"], serde_json::Value::Null);
+    assert_eq!(parsed["index_bytes_on_tape"], serde_json::Value::Null);
 }
 
 /// Issue #271's populated-case companion: `volume plan --json` must ALSO
@@ -947,6 +950,22 @@ fn volume_plan_json_parses_with_one_staged_unit() {
         params![snapshot_id],
     )
     .expect("insert stage_set");
+    let paths = ["a.jpg", "album/b.jpg", "album/c.jpg"];
+    tapectl::db::files::insert_version(
+        &conn,
+        snapshot_id,
+        paths.iter().map(|p| {
+            Ok(tapectl::db::files::FileEntry {
+                path: p.to_string(),
+                kind: tapectl::db::files::FileKind::Regular,
+                size_bytes: 10,
+                mtime_ns: None,
+                sha256: None,
+                link_target: None,
+            })
+        }),
+    )
+    .expect("insert paths");
     drop(conn);
 
     let out = run_tapectl(home.path(), &["volume", "plan", "--json"]);
@@ -966,6 +985,18 @@ fn volume_plan_json_parses_with_one_staged_unit() {
     let units = parsed["units"].as_array().expect("units must be an array");
     assert_eq!(units.len(), 1, "{units:?}");
     assert_eq!(units[0]["unit"], "photos");
+    // #418 R4: the cross-volume index this write would put in each copy of
+    // the envelopes - an estimate that counts the one unit's one version, its
+    // three paths, and the envelope backups' doubling.
+    let index = parsed["index_bytes"]
+        .as_i64()
+        .expect("index_bytes is a number");
+    let paths_text_min: i64 = paths.iter().map(|p| p.len() as i64).sum();
+    assert!(
+        index > paths_text_min,
+        "{index} bytes cannot hold the three paths"
+    );
+    assert_eq!(parsed["index_bytes_on_tape"], serde_json::json!(2 * index));
 }
 
 /// Calling `db fsck` before `init` must fail loudly (non-zero exit), not
