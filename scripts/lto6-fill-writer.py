@@ -965,7 +965,7 @@ def make_summary(run, prior):
     else:
         p("(no past-warning slice was written)")
     p("")
-    p("3. HEADROOM PAST THE WARNING (--to-hard-end)")
+    p("3. HEADROOM PAST THE WARNING (the walk to the hard end)")
     he = res.get("hard_end")
     if he:
         p("accepted %s more blocks after the seal; %.3f GB past the first refusal in all (slice + walk); stop: %s"
@@ -978,7 +978,7 @@ def make_summary(run, prior):
     elif res.get("hard_end_skipped"):
         p("requested but skipped: %s" % res["hard_end_skipped"])
     else:
-        p("not run (--to-hard-end writes into the drive's end-of-partition reserve; it is off by default)")
+        p("not run (--no-hard-end was given, or the run stopped at the warning)")
     p("")
     p("4. READBACK (by LOCATE and one filemark spacing; the whole tape is never read)")
     if rb.get("checks"):

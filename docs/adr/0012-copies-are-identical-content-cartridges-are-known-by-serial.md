@@ -1721,3 +1721,14 @@ Ruled 2026-10-17, measuring drives instead of assuming them:
     Units staged after the session began are not written onto it; they wait for the next tape.
     Considered and not chosen: writing whole units past the ceiling without listing them, never
     counted, known only to the catalog.
+100. **The room from early warning to the hard end is measured, and it caps the slice size.** The
+     #420 fill (`scripts/lto6-fill.sh`) walks past its seal to the hard end by default
+     (`--no-hard-end` skips it) and records that room beside the drive's own figure (page 0x0c,
+     "minimum native capacity from EW to EOP": 99,008 MB on the HP LTO-6, 2026-09-23). The
+     profiling toolkit (item 96) records it per drive as a drive-level key. A slice plus the seal
+     must fit in half the smallest such room among the configured drives (a 2x margin for wear
+     and variance), the lower of the measured and the drive-reported figure being used; `config
+     check` and `stage create` refuse a larger `slice_size`. The default stays 1 GiB (item 10 of
+     2026-10-06: also the most one damaged slice or a single-file restore costs) unless the room
+     is smaller. If st refuses every write after the warning, the walk cannot run; that is itself
+     #420's finding, and the drive-reported figure is the only one.

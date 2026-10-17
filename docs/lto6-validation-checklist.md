@@ -136,8 +136,10 @@ turns hardware compression off as tapectl does, and at the first ENOSPC records 
 next: it writes one 1 GiB slice (2048 blocks) a block at a time, logging every return, stops
 after 8 consecutive refusals or any other error, then writes a filemark, a seal-sized block and
 a filemark, and reads the slice and the seal back by LOCATE, comparing them with what was
-written. `--stop-at-warning` keeps the old stop; `--to-hard-end` also measures the reserve past
-the warning (about 99 GB, about 12 minutes more). The script refuses while
+written. It then keeps writing to the hard end (capped at 110 GB past the warning, about 12
+minutes), measuring the room from early warning to the hard end, which bounds the slice size
+(ADR-0012 item 100); `--no-hard-end` skips that walk and `--stop-at-warning` keeps the old
+stop. The script refuses while
 `tapectl-drive-poll.timer` is active, on a rewinding node, or without room for its 2 GiB
 keystream in the out dir (`/scratch/tapectl-lto6`, or `~/.cache/tapectl/lto6` where there is
 no `/scratch`). About 5 hours in all; `summary.txt` in the run directory is what to read, and
@@ -146,6 +148,8 @@ exit 1 ("MEASUREMENT COMPLETE (readback: FAIL)") is a finding, not a failure.
 - [ ] Record: what st returned after the first refusal (refused once then accepted, kept
       refusing, or short counts); whether the whole slice, the filemark and the seal block
       were accepted; each readback check.
+- [ ] Record the room from early warning to the hard end, beside page 0x0c's "minimum native
+      capacity from EW to EOP" (99,008 MB on 2026-09-23).
 - [ ] Erase the cartridge afterwards before it serves as the step-12 test cartridge again.
 
 ## After a pass

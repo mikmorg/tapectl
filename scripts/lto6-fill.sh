@@ -57,9 +57,11 @@
 #      and the accepted-block count, zero-padded to 512 KiB), then a filemark
 #      (MTWEOF, synchronous, as tapectl ends its seal), logging each result and
 #      the drive's block address (READ POSITION) around them.
-#   4. With --to-hard-end (OFF by default): keep writing blocks until a
-#      non-recoverable error, capped at 110 GB past the warning. THIS WRITES INTO
-#      THE DRIVE'S END-OF-PARTITION RESERVE (about 99 GB on this drive).
+#   4. By default (--no-hard-end skips it): keep writing blocks until a
+#      non-recoverable error, capped at 110 GB past the warning, to measure the
+#      room from early warning to the hard end, which bounds the slice size
+#      (ADR-0012 item 100). THIS WRITES INTO THE DRIVE'S END-OF-PARTITION RESERVE
+#      (about 99 GB on this drive by page 0x0c).
 # Hardware compression is turned off first, as tapectl does before any write (the
 # 2026-09-24 fill ran in the drive's as-found state), so bytes accepted may differ
 # slightly from that run's figure for this reason too.
@@ -72,7 +74,7 @@
 # post-warning slice (1 GiB, seconds) and compares every block with the
 # keystream, checks the filemark after it, spaces ONE filemark from the last
 # slice block to the seal block (fsf 1), reads the seal block and the filemark
-# after it, and (with --to-hard-end) the first and last blocks of the walk. A
+# after it, and (unless --no-hard-end) the first and last blocks of the walk. A
 # filemark-count spacing from BOT cannot reach the slice -- it lies inside file
 # 0 -- and its speed across 2.5 TB has never been measured, so it is not used.
 # Each check prints PASS or FAIL; the drive's READ POSITION is compared with the
@@ -82,7 +84,7 @@
 # accepted before the first refusal; what write(2) returned for each attempt
 # after it (run-length, e.g. "1 refusal (ENOSPC), then 2048 accepted"); whether a
 # full slice, the filemark and the seal block were accepted; the headroom with
-# --to-hard-end; each readback check; the drive counters before, at the warning
+# the hard-end walk; each readback check; the drive counters before, at the warning
 # and after; the host feed rate. Send the whole run directory back.
 #
 # THIS SCRIPT ERASES THE LOADED CARTRIDGE, and takes hours (about 4.5 h to the
@@ -118,10 +120,13 @@ minutes after it.
                                  lacks room for the keystream plus 512 MiB.
   --chunk-gib N                  Keystream file size in GiB (default 2).
   --stop-at-warning              The old behaviour: stop at the first refusal, write nothing more.
-  --to-hard-end                  After the seal, keep writing until a non-recoverable error
-                                 or 110 GB past the warning. OFF by default. THIS WRITES
-                                 INTO THE DRIVE'S END-OF-PARTITION RESERVE.
-  --hard-end-cap-gb N            The --to-hard-end cap (default 110).
+  --no-hard-end                  Skip the walk to the hard end. By default, after the seal,
+                                 the fill keeps writing until a non-recoverable error or
+                                 110 GB past the warning, measuring the room from early
+                                 warning to the hard end. THIS WRITES INTO THE DRIVE'S
+                                 END-OF-PARTITION RESERVE. (--to-hard-end, the old opt-in,
+                                 is still accepted and changes nothing.)
+  --hard-end-cap-gb N            The hard-end walk's cap (default 110).
   --refusal-run-limit N          Consecutive refusals that end a step (default 8).
   --slice-blocks N               Blocks in the post-warning slice (default 2048 = 1 GiB).
                                  Change only for rehearsals on emulated media.
@@ -136,7 +141,7 @@ USAGE
 }
 
 TAPE_DEV=""; LOSE_SERIAL=""; CHUNK_GIB=2; OUT_DIR=""
-STOP_AT_WARNING=0; TO_HARD_END=0; HARD_END_CAP_GB=110; RUN_LIMIT=8; SLICE_BLOCKS=2048
+STOP_AT_WARNING=0; TO_HARD_END=1; HARD_END_CAP_GB=110; RUN_LIMIT=8; SLICE_BLOCKS=2048
 WARNING_SNAPSHOT=1; FILL_CAP=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -146,6 +151,7 @@ while [ $# -gt 0 ]; do
         --chunk-gib) CHUNK_GIB="${2:-}"; shift 2 ;;
         --stop-at-warning) STOP_AT_WARNING=1; shift ;;
         --to-hard-end) TO_HARD_END=1; shift ;;
+        --no-hard-end) TO_HARD_END=0; shift ;;
         --hard-end-cap-gb) HARD_END_CAP_GB="${2:-}"; shift 2 ;;
         --refusal-run-limit) RUN_LIMIT="${2:-}"; shift 2 ;;
         --slice-blocks) SLICE_BLOCKS="${2:-}"; shift 2 ;;
