@@ -178,6 +178,13 @@ pub(super) fn finish(
                 .or_insert_with(|| "not restored".to_string());
         }
     }
+    if !ex.holes.is_empty() {
+        // dar's own verdict cannot be trusted over a hole: measured with a
+        // slice's header zeroed, it exits 0 having skipped files, and says
+        // nothing of others. So the files a damaged slice can have damaged
+        // are checked against the checksums staging recorded.
+        suspect_check(ctx, ex, &expected, &mut lost)?;
+    }
     if let Some(only) = only {
         // `restore file` extracts just that entry: a dar that failed or
         // reported it is the loss; nothing else is its business.
@@ -226,6 +233,54 @@ pub(super) fn finish(
 
 fn supply_subject(ctx: &Finish<'_>) -> String {
     format!("unit \"{}\" v{}", ctx.unit_name, ctx.version)
+}
+
+/// Hash the restored files a damaged slice can have damaged — those with
+/// data in it, by the stage set's own catalogue, or every file when that is
+/// gone — and count a mismatch as lost. A file with no recorded checksum can
+/// only be trusted if dar stood up to the hole.
+fn suspect_check(
+    ctx: &Finish<'_>,
+    ex: &Extracted,
+    expected: &[Expected],
+    lost: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let slices: std::collections::BTreeSet<i64> = ex.holes.iter().map(|h| h.slice_number).collect();
+    let suspects: Option<std::collections::BTreeSet<String>> =
+        match own_catalogue(ctx.conn, ctx.stage_set_id)? {
+            Some(catalogue) => {
+                dar::restore::entries_in_slices(&ctx.config.dar.binary, &catalogue, &slices)
+                    .unwrap_or(None)
+            }
+            None => None,
+        };
+    let phase = progress::phase("verify-holes", None);
+    for e in expected {
+        if lost.contains_key(&e.path) || e.kind != FileKind::Regular {
+            continue;
+        }
+        if suspects.as_ref().is_some_and(|s| !s.contains(&e.path)) {
+            continue;
+        }
+        phase.item(e.path.clone());
+        let at = ex.root.join(&e.path);
+        match e.sha256 {
+            Some(_) => {
+                if let Err(why) = verified(&at, Some(e)) {
+                    lost.insert(e.path.clone(), format!("damaged by a hole: {why}"));
+                }
+            }
+            None if ex.dar_failure.is_some() => {
+                lost.insert(
+                    e.path.clone(),
+                    "cannot be verified after a hole: the catalog records no checksum".to_string(),
+                );
+            }
+            None => {}
+        }
+    }
+    phase.done();
+    Ok(())
 }
 
 /// The catalog's non-directory entries of the version (or `only` of them).
@@ -386,6 +441,7 @@ fn fill_from(
             &holder.label,
             holder.standing == Standing::Quarantined,
             why,
+            "the same files",
             "go without it (those files stay damaged or missing)",
         )? {
             Changed::Loaded => {}

@@ -19,6 +19,8 @@ use crate::volume::restore_record::{self, RestoreRecord};
 mod fill;
 mod supply;
 #[cfg(test)]
+mod tests_480;
+#[cfg(test)]
 use supply::FixedBay;
 use supply::{Bay, DeviceBay, SliceSink, Supply};
 
@@ -1912,6 +1914,7 @@ fn stream_into_dar(
 
     let phase = progress::phase("read", Some(ciphertext_bytes(positions)));
     let mut failure = None;
+    let damage_before = supply.damage.len();
     for (i, (wp, pipe)) in positions.iter().zip(&pipes).enumerate() {
         note_slice(&phase, unit_name, i, positions.len(), wp);
         // Issue #404: between slices. dar has been extracting as the slices
@@ -1933,6 +1936,20 @@ fn stream_into_dar(
             Ok(read) => {
                 trace.slices_read += 1;
                 trace.bytes_decrypted += read.authentic_bytes as i64;
+                if read.dar_gone {
+                    // dar gave up reading. If a hole is why (a slice nobody
+                    // could give whole, written as zeros over something dar
+                    // needs), the later slices are of no use to it, and the
+                    // restore is judged by what it left. Otherwise dar died
+                    // of its own accord, and that is the failure.
+                    if supply.damage.len() == damage_before {
+                        failure = Some(TapectlError::Dar(format!(
+                            "dar stopped reading slice {}",
+                            wp.slice_number
+                        )));
+                    }
+                    break;
+                }
             }
             Err(e) => {
                 failure = Some(e);
@@ -1946,6 +1963,9 @@ fn stream_into_dar(
         darx.kill();
     } else {
         phase.done();
+        if supply.damage.len() > damage_before {
+            settle_dar(&darx, &pipes);
+        }
     }
     let (report, verdict) = darx.finish();
     record_dar(config, trace, report);
@@ -1965,6 +1985,36 @@ fn stream_into_dar(
         });
     }
     Ok(verdict)
+}
+
+/// How long dar is given to end once every slice has been fed to it and a
+/// hole was written into one.
+const SETTLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Let a dar that is still running after a restore with holes end. A hole
+/// over something dar needs (a slice's header) can leave it waiting to
+/// re-open a slice's pipe that nobody is feeding; a pipe held open for it
+/// and closed at once gives it the end of file it needs to fail and exit.
+/// A dar that is still there after [`SETTLE_PATIENCE`] is stopped: what it
+/// left is judged as ever, by the files.
+fn settle_dar(darx: &dar::restore::SequentialExtract, pipes: &[PathBuf]) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let started = std::time::Instant::now();
+    while !darx.exited() {
+        if started.elapsed() > SETTLE_PATIENCE {
+            warn!("dar did not end after the holes; stopping it");
+            darx.kill();
+            return;
+        }
+        for pipe in pipes {
+            // Succeeds only while dar is waiting to open it; dropped at once.
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(pipe);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Open the named pipe dar will read a slice from, for writing — once dar

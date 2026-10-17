@@ -1,0 +1,889 @@
+//! Issue #480 (ADR-0012 items 101 and 102): a damaged slice is read from
+//! another copy, a bad age chunk costs only itself, and lost files are filled
+//! from another stage set of the same version.
+//!
+//! Everything here is real except the drives: a real dar archive cut into
+//! several slices, real age encryption (one file per slice, a fresh key
+//! each), real `Supply`, real contacts and `restores` rows. The cartridges
+//! are in-memory tapes behind a [`TestBay`], which plays the operator too: a
+//! script of what is loaded when a cartridge is asked for, and a record of
+//! what was asked.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::io::Cursor;
+
+use tempfile::TempDir;
+
+use super::supply::{Answer, Arrival, Bay, Want};
+use super::*;
+use crate::store::{MemStore, TapeStore};
+use crate::tape::contact::Medium;
+use crate::tape::fake::FakeTape;
+use crate::volume::layout;
+
+/// Tape file number of slice 1, as in the other restore fixtures.
+const FIRST: usize = 4;
+
+/// What the operator does when a cartridge is asked for.
+#[derive(Debug, Clone, Copy)]
+enum Reply {
+    /// Load this cartridge and press Enter.
+    Load(&'static str),
+    /// Press Enter without changing the cartridge.
+    Enter,
+    /// "skip".
+    Skip,
+    /// "stop".
+    Stop,
+}
+
+/// A drive and an operator, scripted.
+struct TestBay {
+    carts: BTreeMap<String, Box<dyn Store>>,
+    /// What the st driver has open (`None` between a release and a load).
+    open: Option<String>,
+    /// What is physically in the drive.
+    physical: Option<String>,
+    attended: bool,
+    script: VecDeque<Reply>,
+    /// `(label asked for, the reason shown)`, in order.
+    asked: Vec<(String, String)>,
+    releases: usize,
+}
+
+impl TestBay {
+    fn asked_labels(&self) -> Vec<&str> {
+        self.asked.iter().map(|(l, _)| l.as_str()).collect()
+    }
+}
+
+impl Bay for TestBay {
+    fn store(&mut self) -> &mut dyn Store {
+        let label = self.open.clone().expect("the drive is open");
+        self.carts
+            .get_mut(&label)
+            .expect("a known cartridge")
+            .as_mut()
+    }
+
+    fn release(&mut self) {
+        self.open = None;
+        self.releases += 1;
+    }
+
+    fn load<'c, 'a>(&mut self, _: &'c Connection, _: &'a Config) -> Result<Arrival<'c, 'a>> {
+        match &self.physical {
+            Some(label) => {
+                self.open = Some(label.clone());
+                Ok(Arrival::unread())
+            }
+            None => Err(TapectlError::Other("no cartridge is loaded".into())),
+        }
+    }
+
+    fn attended(&self) -> bool {
+        self.attended
+    }
+
+    fn ask(&mut self, want: &Want) -> Answer {
+        self.asked
+            .push((want.label.clone(), want.lines().join(" | ")));
+        match self.script.pop_front().unwrap_or(Reply::Stop) {
+            Reply::Load(label) => {
+                self.physical = Some(label.to_string());
+                Answer::Loaded
+            }
+            Reply::Enter => Answer::Loaded,
+            Reply::Skip => Answer::Skip,
+            Reply::Stop => Answer::Stop,
+        }
+    }
+}
+
+/// A site with no backend: the honest description of a test machine.
+fn site() -> ContactSite<'static> {
+    static CFG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+    ContactSite::new(
+        CFG.get_or_init(Config::default),
+        Operation::RestoreUnit,
+        "/nonexistent/tapectl-480-nst",
+        Medium::NoBackend,
+    )
+}
+
+fn sha_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Pseudo-random bytes (incompressible), seeded so each file differs.
+fn noise(len: usize, seed: u32) -> Vec<u8> {
+    (0..len as u32)
+        .map(|i| (i.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect()
+}
+
+/// A tree of six 100 KB files: several dar slices at `-s 150k`.
+fn tree() -> Vec<(String, Vec<u8>)> {
+    (0..6)
+        .map(|i| (format!("f{i}.bin"), noise(100_000, i * 7919 + 1)))
+        .collect()
+}
+
+/// One staging: a stage set, its slices (plaintext and ciphertext), and
+/// where its catalogue is.
+struct Staging {
+    stage_set_id: i64,
+    plains: Vec<Vec<u8>>,
+    ciphers: Vec<Vec<u8>>,
+}
+
+impl Staging {
+    fn slices(&self) -> usize {
+        self.ciphers.len()
+    }
+
+    /// The ciphertext byte offset of a byte inside chunk `chunk` of slice
+    /// `slice` (1-based), counted from the start of the file on tape.
+    fn byte_in_chunk(&self, slice: usize, chunk: usize) -> usize {
+        let plain = self.plains[slice - 1].len();
+        let cipher = self.ciphers[slice - 1].len();
+        let chunks = plain.div_ceil(crate::crypto::chunks::CHUNK).max(1);
+        let header = cipher - plain - 16 * chunks;
+        assert!(
+            chunk < chunks,
+            "slice {slice} has {chunks} chunk(s), not {chunk}"
+        );
+        header + chunk * crate::crypto::chunks::ENCRYPTED_CHUNK + 10
+    }
+
+    fn chunks_of(&self, slice: usize) -> usize {
+        self.plains[slice - 1]
+            .len()
+            .div_ceil(crate::crypto::chunks::CHUNK)
+            .max(1)
+    }
+}
+
+struct Fixture {
+    conn: Connection,
+    paths: TapectlPaths,
+    _home: TempDir,
+    unit: String,
+    snapshot_id: i64,
+    public_key: String,
+    files: Vec<(String, Vec<u8>)>,
+    mems: BTreeMap<String, MemStore>,
+    volume_ids: BTreeMap<String, i64>,
+    /// Where each cartridge holds each stage set's slice 1.
+    first_position: BTreeMap<(String, i64), usize>,
+}
+
+impl Fixture {
+    /// Cartridges `labels`, each empty but for its File 0, and unit
+    /// `unit-480` with `files` as version 1.
+    fn new(labels: &[&str], files: Vec<(String, Vec<u8>)>) -> Fixture {
+        let conn = crate::db::open_memory().unwrap();
+        let home = TempDir::new().unwrap();
+        let paths = TapectlPaths::new(home.path().join(".tapectl"));
+        paths.ensure_dirs().unwrap();
+        let kp = keys::generate_and_save(&paths.keys_dir, "t1", "primary").unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+             VALUES ('unit-480-uuid', 'unit-480', ?1, 'mtime_size', 1, 'active')",
+            params![tenant_id],
+        )
+        .unwrap();
+        let unit_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 1, 'staged', '/tmp', 1, 16)",
+            params![unit_id],
+        )
+        .unwrap();
+        let snapshot_id = conn.last_insert_rowid();
+        for (path, bytes) in &files {
+            crate::db::files::fixture::insert(
+                &conn,
+                snapshot_id,
+                path,
+                bytes.len() as i64,
+                "regular",
+                Some(&sha_hex(bytes)),
+            );
+        }
+        let mut mems = BTreeMap::new();
+        let mut volume_ids = BTreeMap::new();
+        for label in labels {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                params![label],
+            )
+            .unwrap();
+            volume_ids.insert(label.to_string(), conn.last_insert_rowid());
+            let thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+                label,
+                uuid: &format!("aaaaaaaa-bbbb-cccc-dddd-{:012}", mems.len()),
+                media_type: "LTO-6",
+                tapectl_version: "0.0.0-test",
+                nominal_capacity: 2_500_000_000_000,
+                mam_capacity: 2_400_000_000_000,
+                total_files: 6,
+                mam_manufacturer: "TESTCO",
+                mam_serial: "",
+                mam_length: 846,
+                mam_loads: 1,
+                created_at: "2026-10-17T00:00:00Z",
+                cartridge_identity_source: None,
+            })
+            .into_bytes();
+            let mut mem = MemStore::new(4096);
+            mem.execute(&mut Cursor::new(thunk.clone()), thunk.len() as u64, false)
+                .unwrap();
+            for filler in 1..FIRST {
+                mem.execute(&mut Cursor::new(vec![filler as u8; 100]), 100, false)
+                    .unwrap();
+            }
+            mems.insert(label.to_string(), mem);
+        }
+        Fixture {
+            conn,
+            paths,
+            _home: home,
+            unit: "unit-480".to_string(),
+            snapshot_id,
+            public_key: kp.public_key,
+            files,
+            mems,
+            volume_ids,
+            first_position: BTreeMap::new(),
+        }
+    }
+
+    /// One staging of `files` (a real dar run, slices of `slice_size`, each
+    /// encrypted to the tenant), as `stage create` records it.
+    fn stage(&self, files: &[(String, Vec<u8>)], slice_size: &str, catalogue: bool) -> Staging {
+        self.conn
+            .execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                 VALUES (?1, 'staged', 524288)",
+                params![self.snapshot_id],
+            )
+            .unwrap();
+        let stage_set_id = self.conn.last_insert_rowid();
+        let work = TempDir::new().unwrap();
+        let src = work.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for (path, bytes) in files {
+            fs::write(src.join(path), bytes).unwrap();
+        }
+        let base = work.path().join("arch");
+        let created = std::process::Command::new("dar")
+            .arg("-c")
+            .arg(&base)
+            .arg("-R")
+            .arg(&src)
+            .arg("-s")
+            .arg(slice_size)
+            .arg("-Q")
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "dar -c failed in test setup: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        if catalogue {
+            let dir = self.paths.catalogs_dir.join(format!("ss{stage_set_id}"));
+            fs::create_dir_all(&dir).unwrap();
+            let catalogue = dir.join(format!("ss{stage_set_id}_v1"));
+            crate::dar::create::extract_catalog("dar", &base, &catalogue).unwrap();
+            self.conn
+                .execute(
+                    "UPDATE stage_sets SET catalog_path = ?1 WHERE id = ?2",
+                    params![catalogue.to_string_lossy(), stage_set_id],
+                )
+                .unwrap();
+        }
+        let plains: Vec<Vec<u8>> = (1..)
+            .map(|n| work.path().join(format!("arch.{n}.dar")))
+            .take_while(|p| p.exists())
+            .map(|p| fs::read(p).unwrap())
+            .collect();
+        let ciphers: Vec<Vec<u8>> = plains
+            .iter()
+            .map(|p| {
+                crate::staging::encrypt_data(p, std::slice::from_ref(&self.public_key)).unwrap()
+            })
+            .collect();
+        for (i, (plain, cipher)) in plains.iter().zip(&ciphers).enumerate() {
+            self.conn
+                .execute(
+                    "INSERT INTO stage_slices
+                        (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                         sha256_plain, sha256_encrypted)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        stage_set_id,
+                        i as i64 + 1,
+                        plain.len() as i64,
+                        cipher.len() as i64,
+                        sha_hex(plain),
+                        sha_hex(cipher)
+                    ],
+                )
+                .unwrap();
+        }
+        Staging {
+            stage_set_id,
+            plains,
+            ciphers,
+        }
+    }
+
+    /// Write the staging's slices to cartridge `label` and record the copy:
+    /// a completed write with a position per slice.
+    fn write(&mut self, st: &Staging, label: &str) {
+        let volume_id = self.volume_ids[label];
+        self.conn
+            .execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                params![st.stage_set_id, self.snapshot_id, volume_id],
+            )
+            .unwrap();
+        let write_id = self.conn.last_insert_rowid();
+        let mem = self.mems.get_mut(label).unwrap();
+        self.first_position
+            .insert((label.to_string(), st.stage_set_id), mem.files.len());
+        for (i, cipher) in st.ciphers.iter().enumerate() {
+            let position = mem.files.len();
+            mem.execute(&mut Cursor::new(cipher.clone()), cipher.len() as u64, false)
+                .unwrap();
+            let slice_id: i64 = self
+                .conn
+                .query_row(
+                    "SELECT id FROM stage_slices WHERE stage_set_id = ?1 AND slice_number = ?2",
+                    params![st.stage_set_id, i as i64 + 1],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            self.conn
+                .execute(
+                    "INSERT INTO write_positions
+                        (write_id, stage_slice_id, position, status, sha256_on_volume)
+                     VALUES (?1, ?2, ?3, 'written', ?4)",
+                    params![write_id, slice_id, position.to_string(), sha_hex(cipher)],
+                )
+                .unwrap();
+        }
+    }
+
+    /// Flip one byte inside chunk `chunk` of slice `slice` as cartridge
+    /// `label` holds it.
+    fn corrupt(&mut self, label: &str, st: &Staging, slice: usize, chunk: usize) {
+        let position = self.first_position[&(label.to_string(), st.stage_set_id)] + slice - 1;
+        let at = st.byte_in_chunk(slice, chunk);
+        self.mems.get_mut(label).unwrap().files[position][at] ^= 0xFF;
+    }
+
+    /// The bay, with `start` in the drive: `fake` puts each cartridge on a
+    /// [`FakeTape`] (for the motions), otherwise memory.
+    fn bay(&self, start: &str, attended: bool, script: &[Reply]) -> TestBay {
+        let carts = self
+            .mems
+            .iter()
+            .map(|(label, mem)| (label.clone(), Box::new(clone_mem(mem)) as Box<dyn Store>))
+            .collect();
+        TestBay {
+            carts,
+            open: Some(start.to_string()),
+            physical: Some(start.to_string()),
+            attended,
+            script: script.iter().copied().collect(),
+            asked: Vec::new(),
+            releases: 0,
+        }
+    }
+
+    /// Like [`Self::bay`], each cartridge on its own [`FakeTape`], handed
+    /// back by label for its operation record.
+    fn fake_bay(&self, start: &str, script: &[Reply]) -> (TestBay, BTreeMap<String, FakeTape>) {
+        let mut fakes = BTreeMap::new();
+        let carts = self
+            .mems
+            .iter()
+            .map(|(label, mem)| {
+                let fake = FakeTape::with_files(mem.files.clone(), 4096);
+                let store = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+                fakes.insert(label.clone(), fake);
+                (label.clone(), Box::new(store) as Box<dyn Store>)
+            })
+            .collect();
+        (
+            TestBay {
+                carts,
+                open: Some(start.to_string()),
+                physical: Some(start.to_string()),
+                attended: true,
+                script: script.iter().copied().collect(),
+                asked: Vec::new(),
+                releases: 0,
+            },
+            fakes,
+        )
+    }
+
+    /// `restore unit` from `label`, version 1, through `bay`.
+    fn restore(
+        &self,
+        label: &str,
+        bay: &mut TestBay,
+        dest: &Path,
+        options: &RestoreOptions,
+    ) -> Result<RestoreReport> {
+        let dest = dest.to_string_lossy().into_owned();
+        restore_unit_from_bay(
+            &self.conn,
+            &self.paths,
+            &Config::default(),
+            &self.unit,
+            label,
+            1,
+            RestoreTarget::Unit { dest_dir: &dest },
+            options,
+            bay,
+            site(),
+        )
+    }
+
+    fn assert_restored(&self, dest: &Path) {
+        for (path, bytes) in &self.files {
+            assert_eq!(
+                &fs::read(dest.join(path)).unwrap_or_default(),
+                bytes,
+                "{path} restored wrong"
+            );
+        }
+    }
+
+    /// Paths in `dest` whose bytes are not the original's.
+    fn differing(&self, dest: &Path) -> Vec<String> {
+        self.files
+            .iter()
+            .filter(|(path, bytes)| fs::read(dest.join(path)).ok().as_ref() != Some(bytes))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// `(volume label, outcome, detail)` of every contact, in order.
+    fn contacts(&self) -> Vec<(String, String, Option<String>)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT COALESCE(v.label, '-'), COALESCE(c.outcome, '-'), c.detail
+                   FROM cartridge_contacts c LEFT JOIN volumes v ON v.id = c.volume_id
+                  ORDER BY c.id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+}
+
+/// A copy of an in-memory tape, file for file.
+fn clone_mem(mem: &MemStore) -> MemStore {
+    let mut copy = MemStore::new(4096);
+    for file in &mem.files {
+        copy.execute(&mut Cursor::new(file.clone()), file.len() as u64, false)
+            .unwrap();
+    }
+    copy
+}
+
+const A: &str = "L6-0001";
+const B: &str = "L6-0002";
+const C: &str = "L6-0003";
+
+/// Two copies of one staging, a catalogue or not (stream or spool).
+fn two_copies(catalogue: bool) -> (Fixture, Staging) {
+    let mut fx = Fixture::new(&[A, B], tree());
+    let st = fx.stage(&tree(), "150k", catalogue);
+    assert!(
+        st.slices() >= 4,
+        "want a many-slice archive: {}",
+        st.slices()
+    );
+    assert!(st.chunks_of(2) >= 2, "want a slice of several chunks");
+    fx.write(&st, A);
+    fx.write(&st, B);
+    (fx, st)
+}
+
+/// THE acceptance test of the slice half: two copies, a different slice bad
+/// on each, `restore unit` comes back whole with ONE cartridge swap — the
+/// operator is asked once, for the copy that holds the slice the first
+/// could not give, and that cartridge then serves the rest. Both ways dar
+/// can be fed.
+#[test]
+fn two_copies_with_different_bad_slices_restore_whole_with_one_swap() {
+    for catalogue in [true, false] {
+        let (mut fx, st) = two_copies(catalogue);
+        // A is bad at slice 3; B at slice 2, which A gives whole, so B's
+        // damage is never reached.
+        fx.corrupt(A, &st, 3, 0);
+        fx.corrupt(B, &st, 2, 0);
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let report = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("catalogue={catalogue}: {e}"));
+        fx.assert_restored(dest.path());
+
+        assert_eq!(
+            bay.asked_labels(),
+            [B],
+            "catalogue={catalogue}: one swap prompt"
+        );
+        assert!(
+            bay.asked[0].1.contains("Slice 3") && bay.asked[0].1.contains("checksum mismatch"),
+            "the prompt names the slice and why: {:?}",
+            bay.asked
+        );
+        assert_eq!(report.substitutions.len(), 1);
+        let sub = &report.substitutions[0];
+        assert_eq!(
+            (
+                sub.slice_number,
+                sub.supplied_by.as_str(),
+                sub.damaged_on.as_str()
+            ),
+            (3, B, A)
+        );
+        assert!(report.filled.is_empty());
+
+        // Two cartridges were in the drive, so two contacts, each closed.
+        let contacts = fx.contacts();
+        assert_eq!(contacts.len(), 2, "{contacts:?}");
+        assert_eq!((contacts[0].0.as_str(), contacts[0].1.as_str()), (A, "ok"));
+        assert_eq!((contacts[1].0.as_str(), contacts[1].1.as_str()), (B, "ok"));
+        assert!(
+            contacts[0]
+                .2
+                .as_deref()
+                .unwrap_or("")
+                .contains("slice 3 damaged here"),
+            "{contacts:?}"
+        );
+        assert!(
+            contacts[1]
+                .2
+                .as_deref()
+                .unwrap_or("")
+                .contains("supplied slice 3"),
+            "{contacts:?}"
+        );
+        // And the restore is one record, under the first contact.
+        let rows = crate::volume::restore_record::rows(&fx.conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "ok");
+        assert_eq!(rows[0].volume_label.as_deref(), Some(A));
+        assert_eq!(rows[0].slices_read, Some(st.slices() as i64));
+    }
+}
+
+/// And the rule that keeps swaps few: A is bad at slice 2 and B at slice 4,
+/// so the cartridge asked for at slice 2 (B) is bad at 4 and A is asked for
+/// again — two swaps for two bad slices, never one per slice read.
+#[test]
+fn each_bad_slice_run_costs_one_swap_and_a_cartridge_is_kept_while_it_serves() {
+    let (mut fx, st) = two_copies(true);
+    fx.corrupt(A, &st, 2, 1);
+    fx.corrupt(B, &st, 4, 0);
+    let mut bay = fx.bay(A, true, &[Reply::Load(B), Reply::Load(A)]);
+    let dest = TempDir::new().unwrap();
+    let report = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap();
+    fx.assert_restored(dest.path());
+    assert_eq!(bay.asked_labels(), [B, A]);
+    assert_eq!(
+        report
+            .substitutions
+            .iter()
+            .map(|s| (s.slice_number, s.supplied_by.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(2, B), (4, A)]
+    );
+    // Slices 2 and 3 came from B though only 2 was bad on A: B stayed in
+    // the drive while it served, and A's slice 3 was never asked for.
+    assert_eq!(fx.contacts().len(), 3);
+
+    // Consecutive bad slices on the first cartridge are ONE swap.
+    let (mut fx, st) = two_copies(true);
+    fx.corrupt(A, &st, 2, 0);
+    fx.corrupt(A, &st, 3, 0);
+    fx.corrupt(A, &st, 4, 0);
+    let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    fx.restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap();
+    fx.assert_restored(dest.path());
+    assert_eq!(
+        bay.asked_labels(),
+        [B],
+        "three bad slices in a row, one swap"
+    );
+}
+
+/// A slice damaged in a DIFFERENT chunk on each copy is whole from the two
+/// together: A gives chunks up to its bad one, B carries on and gives
+/// everything A could not, then A is asked for again for what lies past B's
+/// bad chunk, because the bytes already delivered are the same bytes on every
+/// copy.
+#[test]
+fn a_slice_bad_in_different_chunks_on_each_copy_is_whole_from_both() {
+    for catalogue in [true, false] {
+        let (mut fx, st) = two_copies(catalogue);
+        assert!(st.chunks_of(2) >= 3, "{}", st.chunks_of(2));
+        fx.corrupt(A, &st, 2, 0);
+        fx.corrupt(B, &st, 2, 2);
+        let mut bay = fx.bay(A, true, &[Reply::Load(B), Reply::Load(A)]);
+        let dest = TempDir::new().unwrap();
+        fx.restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("catalogue={catalogue}: {e}"));
+        fx.assert_restored(dest.path());
+        assert_eq!(bay.asked_labels(), [B, A], "catalogue={catalogue}");
+    }
+}
+
+/// No terminal, no swap: the read refuses by name, listing the volumes that
+/// hold the slice, and asks nothing. What was restored before stays.
+#[test]
+fn without_a_terminal_the_restore_refuses_by_name_and_lists_the_holders() {
+    let (mut fx, st) = two_copies(false);
+    fx.corrupt(A, &st, 3, 0);
+    let mut bay = fx.bay(A, false, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    let err = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("slice 3"), "{err}");
+    assert!(err.contains(&format!("\"unit-480\"")), "{err}");
+    assert!(err.contains(B), "the holder is named: {err}");
+    assert!(err.contains("swaps no cartridge"), "{err}");
+    assert!(err.contains("--from L6-0002"), "{err}");
+    assert!(
+        err.contains("checksum mismatch"),
+        "the cause is named: {err}"
+    );
+    assert!(bay.asked.is_empty(), "nobody was asked");
+    assert_eq!(bay.releases, 0, "the drive was left alone");
+    assert!(
+        !dest.path().join(SCRATCH_NAME).exists(),
+        "no decrypted slice is left behind"
+    );
+    let rows = crate::volume::restore_record::rows(&fx.conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, "failed");
+    assert!(rows[0]
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("swaps no cartridge"));
+}
+
+/// The operator declines the swap: the slice is read from the cartridge in
+/// the drive with a hole where its chunk fails to authenticate. The restore
+/// names exactly the files that came back damaged and fails; every other
+/// file is whole, and the hole is zeros, not the unauthenticated plaintext.
+#[test]
+fn a_declined_swap_leaves_a_hole_and_the_restore_names_the_damaged_files() {
+    for catalogue in [true, false] {
+        let (mut fx, st) = two_copies(catalogue);
+        fx.corrupt(A, &st, 3, 0);
+        let mut bay = fx.bay(A, true, &[Reply::Skip]);
+        let dest = TempDir::new().unwrap();
+        let err = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .expect_err(&format!("catalogue={catalogue}"))
+            .to_string();
+        assert!(err.contains("INCOMPLETE"), "{err}");
+        assert!(err.contains("slice 3 on L6-0001"), "{err}");
+        let differing = fx.differing(dest.path());
+        assert!(
+            !differing.is_empty() && differing.len() < fx.files.len(),
+            "a chunk costs some files, not all: {differing:?}"
+        );
+        for path in &differing {
+            assert!(err.contains(path.as_str()), "{path} is named: {err}");
+        }
+        for (path, _) in &fx.files {
+            if !differing.contains(path) {
+                assert!(
+                    !err.contains(&format!("    {path} (")),
+                    "{path} came back whole yet is named lost: {err}"
+                );
+            }
+        }
+        // The one swap was offered, and the cartridge never left.
+        assert_eq!(bay.asked_labels(), [B]);
+        let contacts = fx.contacts();
+        assert_eq!(
+            contacts.last().unwrap().0,
+            A,
+            "the first cartridge came back: {contacts:?}"
+        );
+    }
+}
+
+/// A slice bad in the SAME chunk on every copy cannot be had whole: after
+/// every copy has been tried, the chunk is a hole, the files it fell in are
+/// named, and the restore fails.
+#[test]
+fn a_chunk_bad_on_every_copy_is_a_hole_after_every_copy_was_tried() {
+    let (mut fx, st) = two_copies(true);
+    fx.corrupt(A, &st, 3, 1);
+    fx.corrupt(B, &st, 3, 1);
+    let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    let err = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
+    assert!(err.contains("slice 3"), "{err}");
+    assert_eq!(
+        bay.asked_labels(),
+        [B],
+        "the only other copy was tried once"
+    );
+    let differing = fx.differing(dest.path());
+    assert!(!differing.is_empty());
+    for path in &differing {
+        assert!(err.contains(path.as_str()), "{path}: {err}");
+    }
+}
+
+/// The acceptance test of the chunk half, with real dar and real age and no
+/// other copy: one corrupted byte inside a slice costs only the files in its
+/// 64 KiB chunk. The restore names them, exits non-zero, and nothing
+/// unauthenticated is written — the files that are not named are byte for
+/// byte whole, and the damaged ones carry zeros where the chunk was.
+#[test]
+fn a_single_corrupted_byte_costs_only_the_files_in_its_chunk() {
+    for catalogue in [true, false] {
+        let mut fx = Fixture::new(&[A], tree());
+        let st = fx.stage(&tree(), "150k", catalogue);
+        fx.write(&st, A);
+        fx.corrupt(A, &st, 2, 1);
+        let mem = clone_mem(&fx.mems[A]);
+        let mut mem = mem;
+        let dest = TempDir::new().unwrap();
+        let dest_str = dest.path().to_string_lossy().into_owned();
+        let err = restore_unit_from_store(
+            &fx.conn,
+            &fx.paths,
+            &Config::default(),
+            &fx.unit,
+            A,
+            1,
+            RestoreTarget::Unit {
+                dest_dir: &dest_str,
+            },
+            &RestoreOptions::default(),
+            &mut mem,
+            site(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("INCOMPLETE"), "{err}");
+        let differing = fx.differing(dest.path());
+        assert!(
+            !differing.is_empty() && differing.len() <= 2,
+            "one 64 KiB chunk of 100 KB files costs one or two files: {differing:?}"
+        );
+        for path in &differing {
+            assert!(err.contains(path.as_str()), "{path} is named: {err}");
+            // A hole is zeros: some 4 KiB run of the damaged file is all zero.
+            let bytes = fs::read(dest.path().join(path)).unwrap();
+            assert!(
+                bytes.windows(4096).any(|w| w.iter().all(|&b| b == 0)),
+                "{path} carries no hole of zeros"
+            );
+        }
+        for (path, bytes) in &fx.files {
+            if !differing.contains(path) {
+                assert_eq!(&fs::read(dest.path().join(path)).unwrap(), bytes, "{path}");
+            }
+        }
+        let rows = crate::volume::restore_record::rows(&fx.conn).unwrap();
+        assert_eq!(rows[0].outcome, "failed");
+        assert!(rows[0].error.as_deref().unwrap().contains("INCOMPLETE"));
+        assert!(
+            !dest.path().join(SCRATCH_NAME).exists(),
+            "the scratch directory is gone"
+        );
+    }
+}
+
+/// A wrong cartridge in the drive when the right one is asked for is
+/// refused by the identity check — File 0 names another volume — and the
+/// operator is asked again, naming the cartridge; and a substitute whose File
+/// 0 requires a feature this tapectl does not know is refused by the same
+/// text `restore raw` gives (#476).
+#[test]
+fn a_substitute_must_pass_the_identity_check_too() {
+    let (mut fx, st) = two_copies(false);
+    let mut other = fx.mems.remove(B).unwrap();
+    // B requires a feature nobody has.
+    let old = other.files[0].clone();
+    other.files[0] = crate::volume::format::rewrite_file0(
+        &old,
+        "\nrequires = []\n",
+        "\nrequires = [\"unknown-feature\"]\n",
+    );
+    fx.mems.insert(B.to_string(), other);
+    fx.corrupt(A, &st, 3, 0);
+    // Enter without changing anything leaves A in the drive: wrong tape;
+    // then B is loaded: refused for its requires; then give up.
+    let mut bay = fx.bay(A, true, &[Reply::Enter, Reply::Load(B), Reply::Stop]);
+    let dest = TempDir::new().unwrap();
+    let err = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("stopped at the operator's request"), "{err}");
+    assert_eq!(
+        bay.asked_labels(),
+        [B, B, B],
+        "asked again after each refusal"
+    );
+    // Every refused arrival is a contact, closed failed.
+    let contacts = fx.contacts();
+    let failed: Vec<_> = contacts.iter().filter(|c| c.1 == "failed").collect();
+    assert_eq!(failed.len(), 2, "{contacts:?}");
+    assert!(
+        failed[0].2.as_deref().unwrap_or("").contains("wrong tape"),
+        "{contacts:?}"
+    );
+    assert!(
+        failed[1]
+            .2
+            .as_deref()
+            .unwrap_or("")
+            .contains("unknown-feature"),
+        "{contacts:?}"
+    );
+}

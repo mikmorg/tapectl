@@ -99,14 +99,12 @@ pub(crate) enum Answer {
 /// A cartridge the restore asks the operator for.
 #[derive(Debug, Clone)]
 pub(crate) struct Want {
-    /// What is being restored, for the prompt: `unit "photos" v2`.
-    pub subject: String,
     /// Why this cartridge: the damaged slice, or the files to fill.
     pub why: String,
+    /// What the cartridge is, in the operator's terms: its label, its
+    /// sticker and chip serial, and that it holds what is wanted.
+    pub holds: String,
     pub label: String,
-    pub shelf: Shelf,
-    /// A quarantined volume, asked for only because nothing else holds it.
-    pub quarantined: bool,
     /// The drive, as the operator named it.
     pub device: String,
     /// What `Skip` would do, in the prompt's words.
@@ -116,21 +114,20 @@ pub(crate) struct Want {
 impl Want {
     /// The lines the operator reads before the answer is asked for.
     pub(crate) fn lines(&self) -> Vec<String> {
-        let mut lines = vec![self.why.clone()];
-        let mut holds = format!(
-            "{} holds an identical copy ({}).",
-            self.label,
-            self.shelf.describe()
-        );
-        if self.quarantined {
-            holds.push_str(
-                " It is quarantined (a verify proved its medium bad), so it is the last \
-                 resort.",
-            );
-        }
-        lines.push(holds);
-        lines
+        vec![self.why.clone(), self.holds.clone()]
     }
+}
+
+/// `L6-0002 holds an identical copy (cartridge ABC, chip serial XYZ).` and,
+/// for a volume a verify proved bad, that it is the last resort.
+fn holds_line(label: &str, shelf: &Shelf, what: &str, quarantined: bool) -> String {
+    let mut line = format!("{label} holds {what} ({}).", shelf.describe());
+    if quarantined {
+        line.push_str(
+            " It is quarantined (a verify proved its medium bad), so it is the last resort.",
+        );
+    }
+    line
 }
 
 /// The drive end of a restore: the cartridge in it, and the person at it.
@@ -321,6 +318,8 @@ pub(super) struct SliceOut<'a> {
     delivered: u64,
     /// The spans of `delivered` that are holes.
     holes: Vec<Range<u64>>,
+    /// The named pipe's reader is gone: dar stopped reading.
+    gone: bool,
 }
 
 impl<'a> SliceOut<'a> {
@@ -331,6 +330,7 @@ impl<'a> SliceOut<'a> {
             slice_number,
             delivered: 0,
             holes: Vec::new(),
+            gone: false,
         }
     }
 
@@ -338,24 +338,36 @@ impl<'a> SliceOut<'a> {
         if self.file.is_some() {
             return Ok(());
         }
-        self.file = Some(match &self.sink {
-            SliceSink::File(path) => std::fs::File::create(path)?,
-            SliceSink::Pipe { path, dar } => open_pipe_for_dar(path, dar, self.slice_number)?,
-        });
-        Ok(())
+        let opened = match &self.sink {
+            SliceSink::File(path) => std::fs::File::create(path).map_err(Into::into),
+            SliceSink::Pipe { path, dar } => open_pipe_for_dar(path, dar, self.slice_number),
+        };
+        match opened {
+            Ok(file) => {
+                self.file = Some(file);
+                Ok(())
+            }
+            Err(e) => {
+                // dar exited before it opened the pipe.
+                self.gone = matches!(e, TapectlError::Dar(_));
+                Err(e)
+            }
+        }
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.open()?;
         let file = self.file.as_mut().expect("opened");
+        let slice_number = self.slice_number;
+        let gone = &mut self.gone;
         file.write_all(bytes).map_err(|e| {
             if e.kind() == std::io::ErrorKind::BrokenPipe {
+                *gone = true;
                 TapectlError::Dar(format!(
-                    "dar stopped reading slice {} (it gave up on the archive)",
-                    self.slice_number
+                    "dar stopped reading slice {slice_number} (it gave up on the archive)"
                 ))
             } else {
-                TapectlError::Other(format!("slice {}: {e}", self.slice_number))
+                TapectlError::Other(format!("slice {slice_number}: {e}"))
             }
         })?;
         self.delivered += bytes.len() as u64;
@@ -403,6 +415,10 @@ pub(super) struct SliceRead {
     pub authentic_bytes: u64,
     /// The holes: plaintext byte ranges of the slice written as zeros.
     pub holes: Vec<Range<u64>>,
+    /// dar stopped reading before the slice was all delivered (a streamed
+    /// restore whose archive a hole made unreadable): no later slice can
+    /// be of use.
+    pub dar_gone: bool,
 }
 
 /// Why a slice could not be had from the cartridge it was read from.
@@ -558,6 +574,8 @@ pub(crate) enum Changed {
 
 /// What the decrypt thread of one attempt ended on.
 struct Ended {
+    /// The sink's reader is gone (dar exited): nothing more can be written.
+    sink_gone: bool,
     /// Strict mode stopped at a chunk that did not authenticate.
     stopped: bool,
     /// The file could not be opened as an age file for these identities.
@@ -568,6 +586,8 @@ struct Ended {
 enum Attempt {
     /// Every chunk the sink still lacked authenticated and was written.
     Complete,
+    /// dar stopped reading: the slice cannot be delivered any further.
+    SinkGone,
     /// It stopped, and why.
     Stopped(Defect),
 }
@@ -729,6 +749,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 Ok(SliceRead {
                     authentic_bytes: out.delivered - hole_bytes,
                     holes: out.holes,
+                    dar_gone: out.gone,
                 })
             }
             Err(e) => {
@@ -782,6 +803,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                             }
                             return Ok(());
                         }
+                        Attempt::SinkGone => return Ok(()),
                         Attempt::Stopped(defect) => {
                             let label = self.here_label().unwrap_or_default();
                             warn!(
@@ -818,6 +840,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                         &holder.label,
                         holder.standing == Standing::Quarantined,
                         why,
+                        "an identical copy of it",
                         "leave a hole where the slice is damaged",
                     )? {
                         Changed::Loaded => {}
@@ -1104,6 +1127,9 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 None => Err(e),
             };
         }
+        if ended.sink_gone {
+            return Ok(Attempt::SinkGone);
+        }
         if ended.stopped {
             return Ok(Attempt::Stopped(defect.unwrap_or(Defect::Chunk)));
         }
@@ -1169,12 +1195,13 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         label: &str,
         quarantined: bool,
         why: String,
+        what: &str,
         skip_means: &'static str,
     ) -> Result<Changed> {
         if self.here_volume() == Some(volume_id) {
             return Ok(Changed::Loaded);
         }
-        self.change_to(volume_id, label, quarantined, why, skip_means)
+        self.change_to(volume_id, label, quarantined, why, what, skip_means)
     }
 
     /// Ask for `label`'s cartridge: close the one in the drive (its contact,
@@ -1186,17 +1213,17 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         label: &str,
         quarantined: bool,
         why: String,
+        what: &str,
         skip_means: &'static str,
     ) -> Result<Changed> {
         let previous = self.here.as_ref().map(|p| (p.volume_id, p.label.clone()));
         let saved_position = self.last_position;
         self.leave();
+        let shelf = slice_holders::shelf_of(self.conn, volume_id, label);
         let want = Want {
-            subject: self.subject.clone(),
             why,
+            holds: holds_line(label, &shelf, what, quarantined),
             label: label.to_string(),
-            shelf: slice_holders::shelf_of(self.conn, volume_id, label),
-            quarantined,
             device: self.device.clone(),
             skip_means,
         };
@@ -1218,7 +1245,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                             self.subject
                         )));
                     };
-                    self.arrive(pv, &pl)?;
+                    self.return_to(pv, &pl)?;
                     self.last_position = saved_position;
                     return Ok(Changed::Declined);
                 }
@@ -1229,6 +1256,33 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                         self.subject
                     )))
                 }
+            }
+        }
+    }
+
+    /// Go on without the cartridge asked for: the one that was in the drive
+    /// is opened again. If something else is in it by now (a cartridge that
+    /// was tried and refused), it is asked for back.
+    fn return_to(&mut self, volume_id: Option<i64>, label: &str) -> Result<()> {
+        loop {
+            let e = match self.arrive(volume_id, label) {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            progress::stderr_println(&format!("{e}"));
+            self.bay.release();
+            let shelf = volume_id
+                .map(|id| slice_holders::shelf_of(self.conn, id, label))
+                .unwrap_or_default();
+            let want = Want {
+                why: format!("To go on, {label} has to be back in the drive."),
+                holds: format!("{label} is {}.", shelf.describe()),
+                label: label.to_string(),
+                device: self.device.clone(),
+                skip_means: "give up (there is nothing else to go on with)",
+            };
+            if self.bay.ask(&want) != Answer::Loaded {
+                return Err(e);
             }
         }
     }
@@ -1337,46 +1391,58 @@ fn decrypt_chunks(
         Ok(chunks) => chunks,
         Err(e) => {
             return Ok(Ended {
+                sink_gone: false,
                 stopped: false,
                 open_error: Some(e),
             })
         }
     };
-    out.open()?;
-    let skip = out.delivered;
-    let mut pos = 0u64;
-    let mut buf = Vec::with_capacity(chunks::CHUNK);
-    loop {
-        let next = chunks
-            .next(&mut buf)
-            .map_err(|e| TapectlError::TapeIo(format!("slice {}: {e}", out.slice_number)))?;
-        match next {
-            Next::End => break,
-            Next::Authentic => {
-                let end = pos + buf.len() as u64;
-                if end > skip {
-                    let from = skip.saturating_sub(pos) as usize;
-                    out.write(&buf[from..])?;
-                }
-                pos = end;
-            }
-            Next::Damaged { plain_len } => {
-                let end = pos + plain_len as u64;
-                if end > skip {
-                    if mode == Mode::Strict {
-                        return Ok(Ended {
-                            stopped: true,
-                            open_error: None,
-                        });
+    let mut stopped = false;
+    let delivered = (|| -> Result<()> {
+        out.open()?;
+        let skip = out.delivered;
+        let mut pos = 0u64;
+        let mut buf = Vec::with_capacity(chunks::CHUNK);
+        loop {
+            let next = chunks
+                .next(&mut buf)
+                .map_err(|e| TapectlError::TapeIo(format!("slice {}: {e}", out.slice_number)))?;
+            match next {
+                Next::End => return Ok(()),
+                Next::Authentic => {
+                    let end = pos + buf.len() as u64;
+                    if end > skip {
+                        let from = skip.saturating_sub(pos) as usize;
+                        out.write(&buf[from..])?;
                     }
-                    out.hole(end - skip.max(pos))?;
+                    pos = end;
                 }
-                pos = end;
+                Next::Damaged { plain_len } => {
+                    let end = pos + plain_len as u64;
+                    if end > skip {
+                        if mode == Mode::Strict {
+                            stopped = true;
+                            return Ok(());
+                        }
+                        out.hole(end - skip.max(pos))?;
+                    }
+                    pos = end;
+                }
             }
         }
+    })();
+    match delivered {
+        Ok(()) => Ok(Ended {
+            sink_gone: false,
+            stopped,
+            open_error: None,
+        }),
+        // dar stopped reading: not a failure of the medium or the slice.
+        Err(_) if out.gone => Ok(Ended {
+            sink_gone: true,
+            stopped: false,
+            open_error: None,
+        }),
+        Err(e) => Err(e),
     }
-    Ok(Ended {
-        stopped: false,
-        open_error: None,
-    })
 }

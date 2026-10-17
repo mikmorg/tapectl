@@ -446,12 +446,12 @@ pub fn entries_slices(
     ))
 }
 
-/// [`entries_slices`]'s parser: every row's path (the text after the flag
-/// groups and the permission string) mapped to its slices, then the union
-/// over `paths` and each one's ancestors.
-fn slices_of_paths(text: &str, paths: &[String]) -> Option<std::collections::BTreeSet<i64>> {
-    let mut by_path: std::collections::HashMap<&str, std::collections::BTreeSet<i64>> =
-        std::collections::HashMap::new();
+/// Every row of a `dar -l -Tslicing` listing: the entry's path (the text
+/// after the flag groups and the permission string) and its slices.
+fn slicing_rows(
+    text: &str,
+) -> Option<std::collections::HashMap<&str, std::collections::BTreeSet<i64>>> {
+    let mut by_path = std::collections::HashMap::new();
     for line in text.lines() {
         let Some((field, rest)) = line.split_once('\t') else {
             continue;
@@ -486,6 +486,13 @@ fn slices_of_paths(text: &str, paths: &[String]) -> Option<std::collections::BTr
         }
         by_path.insert(path, slices);
     }
+    Some(by_path)
+}
+
+/// [`entries_slices`]'s parser: the union over `paths` and each one's
+/// ancestors.
+fn slices_of_paths(text: &str, paths: &[String]) -> Option<std::collections::BTreeSet<i64>> {
+    let by_path = slicing_rows(text)?;
     let mut needed = std::collections::BTreeSet::new();
     for path in paths {
         needed.extend(by_path.get(path.as_str())?.iter().copied());
@@ -498,6 +505,35 @@ fn slices_of_paths(text: &str, paths: &[String]) -> Option<std::collections::BTr
         }
     }
     Some(needed)
+}
+
+/// The entries of an isolated catalogue that have data in any of `slices`:
+/// the files a damaged slice can have damaged. `Ok(None)` when the listing
+/// cannot be read, and the caller must suspect every file.
+pub fn entries_in_slices(
+    dar_binary: &str,
+    catalogue: &Path,
+    slices: &std::collections::BTreeSet<i64>,
+) -> Result<Option<std::collections::BTreeSet<String>>> {
+    let output = super::command(dar_binary)
+        .arg("-l")
+        .arg(catalogue)
+        .arg("-Tslicing")
+        .arg("-Q")
+        .arg("-N")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| TapectlError::Dar(e.to_string()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(slicing_rows(&text).map(|rows| {
+        rows.into_iter()
+            .filter(|(_, s)| s.iter().any(|n| slices.contains(n)))
+            .map(|(p, _)| p.to_string())
+            .collect()
+    }))
 }
 
 /// The files dar's report says it could not restore intact: the
