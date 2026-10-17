@@ -287,13 +287,97 @@ A tapectl from before 1.1.0 refuses a generation-3 file (it finds no
 file, so the change needs no `requires` entry (§1.2 rule 3). Rebuild keeps
 reading generations 1 and 2 for as long as any such tape exists.
 
+### 1.5 The cross-volume index (normative, tapectl 1.3.0)
+
+Ruled 2026-10-16 (ADR-0012 items 78-80, #418 R4). Before it, each tape described only itself:
+the operator envelope's `catalog.db` (§1.4) holds this write's stage sets and nothing else, so
+no tape said where a unit's other copies or older versions were. A tape written by 1.3.0 or
+later carries an **index of the archive as the catalog knew it when this tape's Layout was
+built**: which volumes hold which version of each unit, and, for a tenant, every path.
+
+**Where it is.**
+
+| Envelope (and its byte-copied backup, §1.3) | Members |
+|---|---|
+| each tenant envelope | `index/units.tsv` (that tenant's units only) and `index/paths.tsv` |
+| the operator envelope | `index/units.tsv` (every tenant's units, with a `tenant` column); no `paths.tsv` |
+
+The members follow `catalogs/` in the tar. A tenant learns the labels of the tapes holding its
+own units and nothing of another tenant's (§2); the operator and escrow keys see the
+cross-tenant map.
+
+**Encoding.** UTF-8 text. The first line is a header naming the columns; every further line is
+one row; fields are separated by one TAB and rows end with one LF. Inside a field, four
+characters are escaped and nothing else: backslash as `\\`, TAB as `\t`, LF as `\n`, CR as `\r`
+(a path may contain any of them). An empty field means "not known". A reader finds columns by
+their header name and ignores a column it does not know, so columns can be added without a
+`requires` entry. Rows are sorted as given below, so the bytes are deterministic for a given
+catalog.
+
+**`index/units.tsv`**: one row per (version, holding volume). Sorted by `tenant` (operator only),
+`unit`, `version`, then `volume`.
+
+| Column | Meaning |
+|---|---|
+| `tenant` | the tenant's name (operator envelope only) |
+| `unit` | the unit's name |
+| `unit_uuid` | the unit's uuid |
+| `version` | the version's ordinal (CONTEXT.md "Version") |
+| `num_slices` | the number of slices of this version's stage set |
+| `first_slice`, `last_slice` | the range of those slices this volume holds: `1` and `num_slices` for a whole version. Under spanning (ADR-0012 items 82-87, not built) a volume holds one range of a spanning version, and the version is as covered as its least-covered range (item 76) |
+| `version_bytes` | the stage set's ciphertext bytes, all slices |
+| `volume` | the holding volume's label |
+| `volume_uuid` | its uuid (File 0's `uuid`) |
+| `cartridge_serial` | the chip serial of the cartridge it was written on; empty when none was read |
+| `generation` | the medium's LTO generation (File 0's `media_type`), so the reader knows which drives read it (`media.rs`) |
+| `state` | `sealed`, `quarantined` (sealed, but a verify proved the medium bad; it may still partly read), or `this-tape` (the tape this index is on) |
+| `sealed_at` | when that volume sealed (RFC 3339, UTC); empty for `this-tape` |
+
+**Which versions and holders** (item 80): every current version with at least one completed
+write on a sealed, unretired volume, plus every version this write carries. Its holders are the
+sealed, unretired volumes holding a completed write of it, quarantined ones included and marked,
+and this tape. Unsealed, retired and erased volumes are not listed; reclaimable and purged
+versions are not listed. Where a cartridge is kept is never on a tape (§2): find it from the
+label or serial.
+
+**`index/paths.tsv`** (tenant envelopes only, item 79): one row per path of each version listed
+in that tenant's `units.tsv`. Sorted by `unit`, `version`, then `path` (bytewise).
+
+| Column | Meaning |
+|---|---|
+| `unit` | the unit's name |
+| `version` | the version's ordinal |
+| `kind` | `d` directory, `f` regular file, `l` symlink, `s` special (FIFO, socket, device) |
+| `size_bytes` | lstat's size; 0 for a directory |
+| `path` | relative to the unit's root, escaped as above |
+
+**Staleness.** An index is as of its own tape's write: it never names a tape written after it,
+and a holder it names may since have been retired or erased. The newest tape's index is the most
+complete; RESTORE.sh and File 1 say so.
+
+**Size.** Uncapped: `paths.tsv` grows with the files of the listed versions (about 100 MB per
+million paths, written twice per tape with the backup). The capacity gate counts envelopes as it
+counts every file, and `volume plan` prints the index's size.
+
+**Who reads it.**
+- RESTORE.sh: `--where UNIT` prints the rows of `units.tsv` for a unit (every version and the
+  tapes holding it); `--find PATH` prints the rows of `paths.tsv` whose path contains the text
+  given, with the holders of each match. Both read the envelopes the key opens.
+- `catalog rebuild --from-volume` reads the operator envelope's `units.tsv` and reports the
+  volumes it names that the catalog lacks, as a to-do list for disaster recovery. It never
+  creates a row from it (item 78; ADR-0001: a claim about a tape needs contact with that tape).
+
+**Older tapes and readers.** A tape written before 1.3.0 has no `index/` members and is read as
+before. A reader that does not know them (RESTORE.sh before 1.3.0; tapectl reads envelope members
+by name) ignores them, so the index needs no `requires` entry (§1.2 rule 3).
+
 ## 2. Plaintext vs encrypted, and the isolation invariant
 
 | Zone | On tape | Why |
 |---|---|---|
 | ID thunk, system guide, RESTORE.sh | plaintext | heir reads them with no key |
 | **Front index (File 3)** | **plaintext** | navigation must work with no key; carries position/type/size and ciphertext hashes only |
-| Tenant/operator envelopes, data slices | age-encrypted | *all* content metadata (filenames, content sizes, `sha256_plain`, dar catalogs, the packing plan) lives here and nowhere else |
+| Tenant/operator envelopes, data slices | age-encrypted | *all* content metadata (filenames, content sizes, `sha256_plain`, dar catalogs, the packing plan, and since 1.3.0 the cross-volume index of §1.5) lives here and nowhere else |
 | **Seal marker (File M)** | **plaintext** | structural completeness assertion; its `front_index_sha256` is a hash of a plaintext file |
 
 **Isolation invariant (v2, normative).** No plaintext file on the tape may reveal:
