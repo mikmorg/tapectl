@@ -3628,3 +3628,282 @@ fn the_index_modes_have_usage_errors_and_are_in_help() {
         "{info}"
     );
 }
+
+// ---- 1.3.0: File 1's own commands, run as written (#477) ----
+
+/// The code lines (indented four spaces or more) of the block of `section` that
+/// holds a line containing `needle`: a block is a run of such lines.
+fn guide_block(section: &str, needle: &str) -> Vec<String> {
+    let mut blocks: Vec<Vec<String>> = vec![Vec::new()];
+    for line in section.lines() {
+        if line.starts_with("    ") && !line.trim().is_empty() {
+            blocks.last_mut().unwrap().push(line.trim().to_string());
+        } else if !blocks.last().unwrap().is_empty() {
+            blocks.push(Vec::new());
+        }
+    }
+    blocks
+        .into_iter()
+        .find(|b| b.iter().any(|l| l.contains(needle)))
+        .unwrap_or_else(|| panic!("no code block with {needle:?} in:\n{section}"))
+}
+
+/// A section of the guide: from `## title` to the next `## `.
+fn guide_section(guide: &str, title: &str) -> String {
+    let head = format!("## {title}");
+    let from = guide.find(&head).expect("section") + head.len();
+    let rest = &guide[from..];
+    rest[..rest.find("\n## ").unwrap_or(rest.len())].to_string()
+}
+
+/// File 1's "Manual Recovery Steps", run command by command against the fake
+/// tape, as an heir with only `mt`, `dd`, `age`, `tar`, `sha256sum` and `dar`
+/// would: File 0, the front index, the seal marker (with `eod` and `bsfm 2`),
+/// an envelope the key opens after one it does not, the manifest, the slices
+/// named `restore.N.dar`, and dar into an empty directory. The unit that comes
+/// out is the unit that went in.
+#[test]
+fn the_manual_path_in_file_1_restores_a_unit_as_written() {
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let manual = guide_section(&guide, "Manual Recovery Steps");
+    let work = h.dir.join("manual");
+    std::fs::create_dir_all(&work).unwrap();
+    let run = |lines: &[String], subs: &[(&str, String)]| -> (bool, String) {
+        let mut script = lines.join("\n");
+        for (from, to) in subs {
+            script = script.replace(from, to);
+        }
+        let o = Command::new("bash")
+            .args(["-e", "-o", "pipefail", "-c", &script])
+            .current_dir(&work)
+            .env("PATH", &h.path)
+            .env("FAKE_TAPE", &h.dir)
+            .env("HOME", h.dir.join("home"))
+            .output()
+            .expect("spawn bash");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        (o.status.success(), text)
+    };
+
+    // Steps 1-4: block mode, File 0, File 3 with its hash, the seal marker.
+    let (ok, text) = run(&guide_block(&manual, "setblk 524288"), &[]);
+    assert!(ok, "{text}");
+    let (ok, text) = run(&guide_block(&manual, "> file0.txt"), &[]);
+    assert!(ok, "{text}");
+    let file0 = std::fs::read_to_string(work.join("file0.txt")).unwrap();
+    assert!(file0.contains(&format!("label = \"{LABEL}\"")), "{file0}");
+    let (ok, text) = run(&guide_block(&manual, "> front_index.toml"), &[]);
+    assert!(ok, "{text}");
+    let fi_hash = text.split_whitespace().next().unwrap().to_string();
+    let (ok, text) = run(&guide_block(&manual, "> seal.toml"), &[]);
+    assert!(ok, "eod then bsfm 2 reaches the seal marker: {text}");
+    let seal = std::fs::read_to_string(work.join("seal.toml")).unwrap();
+    assert!(
+        seal.contains(&format!("front_index_sha256 = \"{fi_hash}\"")),
+        "the seal binds the front index the manual path read:\n{seal}"
+    );
+    assert!(
+        seal.contains(&format!("file_count = {}", template().total_files)),
+        "{seal}"
+    );
+
+    // Step 5: the envelope entries, in order. bob's key opens the second.
+    let fi = std::fs::read_to_string(work.join("front_index.toml")).unwrap();
+    let mut entries: Vec<(String, String, String, String)> = Vec::new();
+    for chunk in fi.split("[[files]]").skip(1) {
+        let get = |key: &str| {
+            chunk
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{key} = ")))
+                .map(|v| v.trim_matches('"').to_string())
+                .unwrap_or_default()
+        };
+        entries.push((
+            get("position"),
+            get("type"),
+            get("size_bytes"),
+            get("sha256_encrypted"),
+        ));
+    }
+    let envelope_block = guide_block(&manual, "> envelope.tar");
+    let mut opened = None;
+    for (pos, ty, size, sha) in &entries {
+        if ty != "tenant_envelope" && ty != "operator_envelope" {
+            continue;
+        }
+        let (ok, text) = run(
+            &envelope_block,
+            &[
+                ("POSITION", pos.clone()),
+                ("SIZE", size.clone()),
+                ("YOUR_KEY.age.key", h.key("bob")),
+            ],
+        );
+        if ok {
+            assert!(
+                text.contains(sha),
+                "the sha256sum printed equals the front index's: {text}"
+            );
+            opened = Some(pos.clone());
+            break;
+        }
+        assert!(
+            text.contains("no identity matched any of the recipients"),
+            "a key that does not open an envelope says so: {text}"
+        );
+    }
+    assert_eq!(opened.as_deref(), Some("5"), "bob's envelope is the second");
+    let (ok, text) = run(&guide_block(&manual, "tar xf envelope.tar"), &[]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("catalogs") && text.contains("index"),
+        "{text}"
+    );
+
+    // Step 6-7: the manifest, then each slice as the guide names the commands.
+    let manifest = tapectl::volume::manifest::Manifest::from_toml(
+        &std::fs::read_to_string(work.join("env/MANIFEST.toml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.units.len(), 1);
+    assert_eq!(manifest.units[0].name, "ledgers");
+    let slice_block = guide_block(&manual, "> restore.NUMBER.dar");
+    for sl in &manifest.units[0].slices {
+        let (ok, text) = run(
+            &slice_block,
+            &[
+                ("SHA256_ENCRYPTED", sl.sha256_encrypted.clone()),
+                ("TAPE_POSITION", sl.tape_position.to_string()),
+                ("ENCRYPTED_BYTES", sl.encrypted_bytes.to_string()),
+                ("NUMBER", sl.number.to_string()),
+                ("YOUR_KEY.age.key", h.key("bob")),
+            ],
+        );
+        assert!(ok, "slice {}: {text}", sl.number);
+        assert!(
+            work.join(format!("restore.{}.dar", sl.number)).exists(),
+            "restore.N.dar naming"
+        );
+        assert!(
+            !work.join(format!("restore.{}.dar.age", sl.number)).exists(),
+            "the encrypted copy is removed once decrypted"
+        );
+    }
+
+    // Step 8: the guide's dar line, into an empty directory.
+    let snippet = |starts: &str| -> String {
+        manual
+            .split('`')
+            .find(|c| c.starts_with(starts))
+            .unwrap_or_else(|| panic!("the guide has no `{starts}...` command"))
+            .to_string()
+    };
+    let mkdir_cmd = snippet("mkdir /destination");
+    let dar_cmd = snippet("dar -x restore -R /destination -O -Q -N");
+    let (ok, text) = run(
+        &[mkdir_cmd, dar_cmd],
+        &[("/destination", h.sub("manual-restored"))],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("inode(s) restored"), "{text}");
+    assert!(
+        same_tree(&unit("ledgers").src, &h.dir.join("manual-restored")),
+        "the unit that came out is the unit that went in"
+    );
+}
+
+/// File 1's completeness check, run on a real restore: dar's summary says
+/// nothing failed, and the number of catalogue entries `--list` shows, counted
+/// with the guide's own `grep`, equals the "inode(s) restored" figure.
+#[test]
+fn the_completeness_check_in_file_1_counts_what_dar_restored() {
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let sec = guide_section(&guide, "Did the restore get everything?");
+    let grep_line = sec
+        .lines()
+        .find(|l| l.contains("grep -c -E"))
+        .expect("the guide's count command")
+        .trim()
+        .to_string();
+    let pattern = grep_line
+        .split('\'')
+        .nth(1)
+        .expect("the pattern is single-quoted")
+        .to_string();
+
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &h.sub("restored"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    let restored: usize = text
+        .lines()
+        .find_map(|l| l.trim().strip_suffix(" inode(s) restored"))
+        .expect("dar's summary line")
+        .trim()
+        .parse()
+        .unwrap();
+    for line in [
+        "0 inode(s) not restored (not saved in archive)",
+        "0 inode(s) not restored (overwriting policy decision)",
+        "0 inode(s) ignored (excluded by filters)",
+        "0 inode(s) failed to restore (filesystem error)",
+    ] {
+        assert!(text.contains(line), "the guide quotes dar: {line}\n{text}");
+    }
+
+    let (code, listing) = h.run(&["--list", "--key", &h.key("alice"), "--unit", "docs"]);
+    assert_eq!(code, 0, "{listing}");
+    let counted = listing
+        .lines()
+        .filter(|l| {
+            // grep -E '^\[.{5}\]\[.\] ', as the guide prints it.
+            let b = l.as_bytes();
+            pattern == "^\\[.{5}\\]\\[.\\] "
+                && l.starts_with('[')
+                && b.len() > 10
+                && b[6] == b']'
+                && b[7] == b'['
+                && b[9] == b']'
+                && b[10] == b' '
+        })
+        .count();
+    assert!(
+        restored >= 3,
+        "a positive control: {restored} inodes in docs"
+    );
+    assert_eq!(
+        counted, restored,
+        "the guide's count equals dar's:\n{listing}"
+    );
+    // And the real grep agrees with the reading above.
+    let real = Command::new("bash")
+        .arg("-c")
+        .arg(format!("grep -c -E '{pattern}'"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            c.stdin.take().unwrap().write_all(listing.as_bytes())?;
+            c.wait_with_output()
+        })
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&real.stdout).trim(),
+        restored.to_string(),
+        "grep -c -E agrees"
+    );
+}
