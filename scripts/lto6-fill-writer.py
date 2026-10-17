@@ -208,6 +208,17 @@ def rle_text(runs, limit=12, totals=None, nruns=None):
             % (nruns, ", ".join("%s x%d" % kv for kv in sorted(totals.items()))))
 
 
+def signature(rec):
+    """How long each outcome's write(2) took and which st flags followed it: a refusal that costs no I/O and flips
+    the status bit is st's own bookkeeping after an EOM-flagged write, not the drive refusing a command."""
+    t, f = rec.get("timing") or {}, rec.get("flags_after") or {}
+    if not t:
+        return ""
+    return ("write(2) took (median, max): %s; st flags right after: %s"
+            % ("; ".join("%s %.2f ms, %.2f ms (n=%d)" % (o, v["median_ms"], v["max_ms"], v["n"]) for o, v in sorted(t.items())),
+               "; ".join("%s -> %s" % (o, "+".join(v)) for o, v in sorted(f.items())) or "n/a"))
+
+
 def describe(rec):
     """The post-refusal outcome sequence of a write_blocks() record, in words."""
     runs, totals, nruns = rec.get("outcomes_rle") or [], rec.get("outcome_totals"), rec.get("outcomes_runs", 0)
@@ -243,18 +254,20 @@ class Writer(object):
         self.res["stage"] = name
         self.save()
 
-    # one write(2): returns (outcome, n, err, t)
+    # one write(2): returns (outcome, n, err, t, seconds the call took)
     def write_buf(self, buf):
         t = time.time()
+        m0 = time.monotonic()
         try:
             n = self.dev.write(buf)
         except OSError as e:
-            return errname(e.errno), None, e.errno, t
+            return errname(e.errno), None, e.errno, t, time.monotonic() - m0
+        took = time.monotonic() - m0
         if n == self.bs:
-            return "ok", n, None, t
+            return "ok", n, None, t, took
         if n == 0:
-            return "zero", 0, None, t
-        return "short(%d)" % n, n, None, t
+            return "zero", 0, None, t, took
+        return "short(%d)" % n, n, None, t, took
 
     def block_buf(self, g):
         if self.buf_g != g:
@@ -343,6 +356,8 @@ class Writer(object):
         t_start = time.time()
         last_prog = time.monotonic()
         run = [0, 0]   # accepted-run length and its first block, for the condensed log
+        took_by = {}   # outcome -> seconds each write(2) took (first 4096): a refusal that costs no I/O is st's own
+        flags_after = {}   # outcome -> the st status flags seen right after it (EOT = st re-armed, EOD = it refused)
 
         def flush_run():
             if run[0]:
@@ -353,16 +368,19 @@ class Writer(object):
             if self.stop_flag:
                 stop = "interrupted"
                 break
-            outcome, n, err, t = self.write_buf(self.block_buf(g))
+            outcome, n, err, t, took = self.write_buf(self.block_buf(g))
             seq += 1
             outcomes.append(outcome)
+            lst = took_by.setdefault(outcome, [])
+            if len(lst) < 4096:
+                lst.append(took)
             dt = 0.0 if prev_t is None else t - prev_t
             prev_t = t
             changed = len(outcomes) < 2 or outcomes[-2] != outcome
             if outcome == "ok":
                 if detail:
-                    self.log.file("%s attempt %d block %d (accepted %d): ok ret=%d dt=%.6f ts=%s"
-                                  % (region, seq, g, accepted + 1, n, dt, stamp(t)))
+                    self.log.file("%s attempt %d block %d (accepted %d): ok ret=%d took=%.6f dt=%.6f ts=%s"
+                                  % (region, seq, g, accepted + 1, n, took, dt, stamp(t)))
                 else:
                     if run[0] == 0:
                         run[1] = g
@@ -375,7 +393,8 @@ class Writer(object):
             else:
                 flush_run()
                 what = (" errno=%d (%s)" % (err, os.strerror(err))) if err is not None else " ret=%s" % n
-                self.log.file("%s attempt %d block %d: %s%s dt=%.6f ts=%s" % (region, seq, g, outcome, what, dt, stamp(t)))
+                self.log.file("%s attempt %d block %d: %s%s took=%.6f dt=%.6f ts=%s"
+                              % (region, seq, g, outcome, what, took, dt, stamp(t)))
                 if is_refusal(outcome):
                     refusals += 1
                     consec += 1
@@ -388,8 +407,11 @@ class Writer(object):
                     break
             if changed and trans < 40:
                 trans += 1
-                self.log.file("%s st state after the outcome changed to %s: %s"
-                              % (region, outcome, fmt_mtget(self.dev.mtget())))
+                st = self.dev.mtget()
+                self.log.file("%s st state after the outcome changed to %s: %s" % (region, outcome, fmt_mtget(st)))
+                if "error" not in st:
+                    names = set(n_ for bit, n_ in GMT_FLAGS if st["gstat"] & bit) & set(["BOT", "EOF", "EOT", "EOD", "SM"])
+                    flags_after.setdefault(outcome, set()).update(names or ["-"])
             if not detail and time.monotonic() - last_prog >= 60:
                 last_prog = time.monotonic()
                 self.log.say("%s: %d blocks accepted so far (%.2f GB), %d refusals"
@@ -399,25 +421,38 @@ class Writer(object):
         totals = {}
         for o, c in runs:
             totals[o] = totals.get(o, 0) + c
+        timing = {}
+        for o_, lst in took_by.items():
+            lst = sorted(lst)
+            timing[o_] = {"n": len(lst), "median_ms": lst[len(lst) // 2] * 1000.0, "max_ms": lst[-1] * 1000.0}
         return {"region": region, "first_block": g0, "accepted": accepted, "attempts": seq,
                 "refusals": refusals, "max_consecutive_refusals": maxconsec, "stop": stop,
                 "seconds": time.time() - t_start, "outcomes_rle": runs[:400], "outcomes_runs": len(runs),
-                "outcome_totals": totals}
+                "outcome_totals": totals, "timing": timing,
+                "flags_after": dict((k_, sorted(v_)) for k_, v_ in flags_after.items())}
 
     def filemark(self, label, op, opname):
-        """tapectl ends a data file with an immediate filemark (MTWEOFI) and the seal marker's with a synchronous one (MTWEOF)."""
-        lb = self.dev.mtpos()
-        outs = []
+        """tapectl ends a data file with an immediate filemark (MTWEOFI) and the seal marker's with a synchronous one (MTWEOF).
+        A refused attempt is retried only while READ POSITION shows it left no mark behind."""
+        lb = prev = self.dev.mtpos()
+        outs, positions = [], []
         ok = False
         for _ in range(self.o.refusal_run_limit):
             t = time.time()
             ok, err = self.dev.top(op, 1)
             outs.append("ok" if ok else errname(err))
-            self.log.file("%s: %s -> %s ts=%s" % (label, opname, outs[-1], stamp(t)))
+            pos = self.dev.mtpos()
+            positions.append(pos)
+            self.log.file("%s: %s -> %s position %s ts=%s" % (label, opname, outs[-1], pos, stamp(t)))
             if ok or err != errno.ENOSPC:
                 break
-        rec = {"ok": ok, "op": opname, "attempts": outs, "lba_before": lb, "lba_after": self.dev.mtpos(),
-               "mtget": self.dev.mtget()}
+            if prev is not None and pos is not None and pos != prev:
+                self.log.say("%s: refused (%s) but READ POSITION moved %s -> %s: the mark is on the tape; not retrying"
+                             % (label, outs[-1], prev, pos))
+                break
+            prev = pos if pos is not None else prev
+        rec = {"ok": ok, "op": opname, "attempts": outs, "positions": positions, "lba_before": lb,
+               "lba_after": self.dev.mtpos(), "mtget": self.dev.mtget()}
         self.res[label] = rec
         self.log.say("%s (%s): %s (attempts: %s); position %s -> %s; %s"
                      % (label, opname, "accepted" if ok else "NOT accepted", ", ".join(outs), lb, rec["lba_after"],
@@ -435,19 +470,27 @@ class Writer(object):
 
     def seal(self, slice_rec):
         buf = self.seal_buf(slice_rec)
-        outs = []
+        outs, positions = [], []
         ok = False
-        lb = self.dev.mtpos()
+        lb = prev = self.dev.mtpos()
         for _ in range(self.o.refusal_run_limit):
-            outcome, n, err, t = self.write_buf(buf)
+            outcome, n, err, t, took = self.write_buf(buf)
             outs.append(outcome)
-            self.log.file("seal block: %s ts=%s" % (outcome, stamp(t)))
+            pos = self.dev.mtpos()
+            positions.append(pos)
+            self.log.file("seal block: %s position %s ts=%s" % (outcome, pos, stamp(t)))
             if outcome == "ok":
                 ok = True
                 break
             if not is_refusal(outcome):
                 break
-        rec = {"ok": ok, "attempts": outs, "lba_before": lb, "text": bytes(buf).split(b"\0", 1)[0].decode("ascii")}
+            if prev is not None and pos is not None and pos != prev:
+                self.log.say("seal block: refused (%s) but READ POSITION moved %s -> %s: the block is on the tape; not retrying"
+                             % (outcome, prev, pos))
+                break
+            prev = pos if pos is not None else prev
+        rec = {"ok": ok, "attempts": outs, "positions": positions, "lba_before": lb,
+               "text": bytes(buf).split(b"\0", 1)[0].decode("ascii")}
         self.res["seal"] = rec
         self.log.say("seal block: %s (attempts: %s)" % ("accepted" if ok else "NOT accepted", ", ".join(outs)))
         return ok
@@ -882,6 +925,8 @@ def make_summary(run, prior):
     p("2. AFTER THE FIRST REFUSAL (what write(2) returned for each attempt, run-length)")
     if sl:
         p(describe(sl))
+        if signature(sl):
+            p(signature(sl))
         p("full slice of %d blocks accepted: %s (%d accepted; stop reason: %s; %d refusals, longest run %d; "
           "refusal-run limit %s)" % (target, "YES" if sl["accepted"] >= target else "NO", sl["accepted"], sl["stop"],
                                      sl["refusals"], sl["max_consecutive_refusals"], res.get("refusal_run_limit")))
@@ -927,6 +972,8 @@ def make_summary(run, prior):
           % (commas(he["accepted"]), he["bytes_past_first_refusal"] / 1e9, he["stop"]))
         p("refusals during the walk: %d (longest run %d); outcomes: %s"
           % (he["refusals"], he["max_consecutive_refusals"], describe(he)))
+        if signature(he):
+            p(signature(he))
         p("st state at the end: %s" % fmt_mtget(he.get("mtget")))
     elif res.get("hard_end_skipped"):
         p("requested but skipped: %s" % res["hard_end_skipped"])
@@ -1153,6 +1200,21 @@ def selftest(argv=None):
                                        fm_verdict=lambda a: "ENOSPC" if a == 1 else None)
     expect(res["filemark1"]["attempts"] == ["ENOSPC", "ok"] and res["filemark1"]["ok"], "a refused filemark is retried and logged")
 
+    # P: a refused filemark that left a mark behind is not retried (marks would stack)
+    rc, res, rd, text, tape = scenario("refused filemark left a mark", lambda a, w: "ENOSPC" if a == fill_n + 1 else None,
+                                       fm_verdict=lambda a: "ENOSPC+mark" if a == 1 else None)
+    expect(res["filemark1"]["attempts"] == ["ENOSPC"] and not res["filemark1"]["ok"],
+           "a refused filemark whose READ POSITION moved is not retried")
+    expect("FAIL" in status(rd, "objects-after-slice") or "PASS" in status(rd, "objects-after-slice"), "and the readback still ran")
+
+    # Q: a refused seal block that reached the tape is not retried either
+    rc, res, rd, text, tape = scenario("refused seal kept", lambda a, w: "ENOSPC" if a == fill_n + 1 else ("ENOSPC+data" if a == fill_n + slice_blocks + 2 else None))
+    expect(res["seal"]["attempts"] == ["ENOSPC"] and not res["seal"]["ok"], "a refused seal block whose READ POSITION moved is not retried")
+
+    # R: timing and flags are recorded per outcome
+    rc, res, rd, text, tape = scenario("signature", lambda a, w: "ENOSPC" if a > fill_n and (a - fill_n) % 2 == 1 else None)
+    expect(set(res["slice"]["timing"]) == set(["ENOSPC", "ok"]) and "write(2) took" in text, "the summary carries a per-outcome timing line")
+
     # O: a bug that only hardware reaches (an unexpected exception mid-slice): rc 6, device closed, results kept
     def boom(a, w):
         if a == fill_n + 5:
@@ -1184,8 +1246,9 @@ def install_signals(w):
     def handler(signum, frame):
         w.stop_flag = True
         w.log.say("signal %d: stopping after the current write" % signum)
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, handler)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)     # a dropped terminal must not end a multi-hour fill
     if hasattr(signal, "SIGXFSZ"):
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
 

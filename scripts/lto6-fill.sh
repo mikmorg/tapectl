@@ -156,6 +156,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 die() { echo "lto6-fill: $*" >&2; exit 2; }
+# A dropped terminal must not end a multi-hour fill (run it inside tmux anyway); children inherit "ignored".
+trap '' HUP
 
 [ -n "$TAPE_DEV" ] || die "--device is required; there is no default (/dev/nstN numbering moves)"
 [ -e "$TAPE_DEV" ] || die "$TAPE_DEV does not exist"
@@ -217,7 +219,9 @@ SERIAL="$(echo "$MAM_TXT" | grep -iE '^[[:space:]]*medium serial number[[:space:
 [ "$SERIAL" = "$LOSE_SERIAL" ] || die "loaded cartridge reports serial '$SERIAL' but you named '$LOSE_SERIAL' -- refusing"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"; RUN="$OUT_DIR/fill-$STAMP"; mkdir -p "$RUN" || die "cannot create $RUN"
-log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$RUN/fill.log"; }
+# A gone terminal must not stop the log file being written: tee keeps going past a failed stdout where it can.
+TEE_OPT=(); if tee --output-error=warn </dev/null >/dev/null 2>&1; then TEE_OPT=(--output-error=warn); fi
+log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "${TEE_OPT[@]}" "$RUN/fill.log"; }
 log "drive $DRIVE_SERIAL at $TAPE_DEV ($TAPE_REAL, $DRIVE_SG); cartridge $SERIAL verified; run $RUN"
 log "options: stop-at-warning=$STOP_AT_WARNING to-hard-end=$TO_HARD_END (cap ${HARD_END_CAP_GB} GB) refusal-run-limit=$RUN_LIMIT slice-blocks=$SLICE_BLOCKS warning-snapshot=$WARNING_SNAPSHOT; out dir has $((AVAIL / 1048576)) MiB free"
 
@@ -268,11 +272,11 @@ WARGS=(--device "$TAPE_DEV" --src "$SRC" --run "$RUN" --max-fill-bytes "$FILL_CA
 
 if [ "$STOP_AT_WARNING" -eq 1 ]; then NEXT="and stopping"; else NEXT="then the past-warning phase"; fi
 log "writing: ONE process, one open of the device, 512 KiB write(2)s from BOT until the first refusal, $NEXT"
-# The writer handles SIGINT / SIGTERM / SIGHUP itself (it stops after the current
-# write and closes the device); this shell and tee must not die first, so they
-# ignore SIGINT meanwhile.
+# The writer handles SIGINT / SIGTERM itself (it stops after the current write and
+# closes the device; SIGHUP is ignored); this shell and tee must not die first, so
+# they ignore SIGINT meanwhile.
 trap '' INT
-python3 "$WRITER" write "${WARGS[@]}" 2>&1 | tee -a "$RUN/fill.log"
+python3 "$WRITER" write "${WARGS[@]}" 2>&1 | tee -a "${TEE_OPT[@]}" "$RUN/fill.log"
 WRC=${PIPESTATUS[0]}
 trap - INT
 log "writer exited rc=$WRC (0 done, 3 interrupted, 4 no refusal before the runaway cap, 5 stopped on a write error that is not a refusal, 6 unexpected error in the writer, partial results kept)"
@@ -288,14 +292,14 @@ VRC=0
 # Readback runs after a clean run, an interrupt or a writer error: it reads whatever slice result.json records.
 if [ "$STOP_AT_WARNING" -eq 0 ] && { [ "$WRC" -eq 0 ] || [ "$WRC" -eq 3 ] || [ "$WRC" -eq 6 ]; }; then
     log "readback: LOCATE to the post-warning slice and the seal block (the whole tape is never read)"
-    python3 "$WRITER" verify --device "$TAPE_DEV" --src "$SRC" --run "$RUN" 2>&1 | tee -a "$RUN/fill.log"
+    python3 "$WRITER" verify --device "$TAPE_DEV" --src "$SRC" --run "$RUN" 2>&1 | tee -a "${TEE_OPT[@]}" "$RUN/fill.log"
     VRC=${PIPESTATUS[0]}
     mt -f "$TAPE_DEV" rewind || true
 fi
 
 # The kernel's own account of the writes and filemarks (best effort: dmesg may need root).
 { dmesg -T 2>&1 || journalctl -k --no-pager 2>&1; } | grep -iE '\bn?st[0-9]|scsi|tape|\bsg[0-9]|overflow|medium|not permitted|authoriz' | tail -n 500 > "$RUN/dmesg-tail.txt"
-python3 "$WRITER" summary --run "$RUN" | tee -a "$RUN/fill.log"
+python3 "$WRITER" summary --run "$RUN" | tee -a "${TEE_OPT[@]}" "$RUN/fill.log"
 log "done; raw captures and summary.txt in $RUN -- send that whole directory back"
 [ "$WRC" -eq 0 ] || exit "$WRC"
 [ "$VRC" -eq 0 ] || exit 1
