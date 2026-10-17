@@ -1613,15 +1613,42 @@ fn volume_write_in_contact<'c>(
     let catalog_db_path = catalog_work.path().join("catalog_snapshot.db");
     crate::db::catalog_snapshot::build_catalog_snapshot(conn, &stage_set_ids, &catalog_db_path)?;
 
+    // The generation of the medium this volume was initialised on, not the
+    // drive's (ADR-0010). Only a pre-ADR-0010 row can lack one, and the
+    // drive's own generation is a better ID-thunk value than a blank.
+    let media_type = volume_media_type
+        .clone()
+        .unwrap_or_else(|| backend.generation.clone());
+
+    // The cross-volume index (`volume-format-v2.md` §1.5, #418 R4): which
+    // volumes hold which version of each unit, and every path of a tenant's
+    // versions. Plaintext, so built beside the `catalog.db` above, in the
+    // same tapectl-home work dir, streamed into the envelopes by `build()`
+    // and removed with `catalog_work` -- never under staging. It is generated
+    // BEFORE `build()` sizes the envelopes, so the capacity gate below counts
+    // it like every other byte. This tape is described as File 0 will say it
+    // (the binding that gives the catalog its serial runs after the build):
+    // an operator-named cartridge's barcode is not a chip serial.
+    let index = crate::volume::index::generate_files(
+        conn,
+        &crate::policy::coverage::IndexThisTape {
+            label,
+            uuid: &volume_uuid,
+            cartridge_serial: if cartridge_identity.source.as_deref() == Some("operator") {
+                ""
+            } else {
+                &cartridge_identity.serial
+            },
+            generation: &media_type,
+        },
+        &stage_set_ids,
+        &catalog_work.path().join("index"),
+    )?;
+
     let inputs = BuildInputs {
         label: label.to_string(),
         volume_uuid,
-        // The generation of the medium this volume was initialised on, not
-        // the drive's (ADR-0010). Only a pre-ADR-0010 row can lack one, and
-        // the drive's own generation is a better ID-thunk value than a blank.
-        media_type: volume_media_type
-            .clone()
-            .unwrap_or_else(|| backend.generation.clone()),
+        media_type,
         tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at,
         block_size: block_size as u64,
@@ -1639,6 +1666,7 @@ fn volume_write_in_contact<'c>(
         operator_public_keys,
         escrow_public_key,
         catalog_db_path: Some(catalog_db_path),
+        index: Some(index),
     };
 
     let built = build::build(&inputs, &session_dir)?;

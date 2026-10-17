@@ -708,6 +708,7 @@ mod tests {
             operator_public_keys: vec![operator.public_key.clone()],
             escrow_public_key: None,
             catalog_db_path: None,
+            index: None,
         };
         let session_dir = tempfile::tempdir().unwrap();
         let built = build::build(&inputs, session_dir.path()).unwrap();

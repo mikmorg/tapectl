@@ -7,6 +7,7 @@ pub mod envelope;
 pub mod erase;
 pub mod figures;
 pub mod format;
+pub mod index;
 pub mod layout;
 pub mod layout_model;
 pub(crate) mod loaded;

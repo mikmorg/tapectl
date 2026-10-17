@@ -219,6 +219,7 @@ fn write(probe: &Probe, check: SliceCheck, tier: Tier) -> WriteCost {
         operator_public_keys: vec![s.operator.clone()],
         escrow_public_key: Some(s.escrow.clone()),
         catalog_db_path: None,
+        index: None,
     };
     let session_dir: PathBuf = s.root.path().join("session");
     fs::create_dir_all(&session_dir).unwrap();

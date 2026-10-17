@@ -556,6 +556,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         operator_public_keys: vec![operator.public_key.clone()],
         escrow_public_key: Some(escrow.public_key.clone()),
         catalog_db_path,
+        index: None,
     };
 
     let session_dir = tempfile::tempdir().unwrap();
@@ -5084,6 +5085,7 @@ fn write_staged_sets_to_a_second_volume(
         operator_public_keys: vec![keys.operator.public_key.clone()],
         escrow_public_key: Some(keys.escrow.public_key.clone()),
         catalog_db_path: None,
+        index: None,
     };
     let session_dir = tempfile::tempdir().unwrap();
     let built = build::build(&inputs, session_dir.path()).expect("build succeeds");

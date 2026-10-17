@@ -628,6 +628,7 @@ fn perf_rebuild_from_a_tape_carrying_a_184k_file_version() {
         operator_public_keys: vec![operator.public_key.clone()],
         escrow_public_key: Some(escrow.public_key.clone()),
         catalog_db_path: Some(catalog_db),
+        index: None,
     };
     let session_dir = root.path().join("session");
     fs::create_dir_all(&session_dir).unwrap();
@@ -1049,6 +1050,7 @@ fn perf_a_2gib_write_and_full_confirm_through_a_store() {
         operator_public_keys: vec![operator.public_key.clone()],
         escrow_public_key: Some(escrow.public_key.clone()),
         catalog_db_path: None,
+        index: None,
     };
     let session_dir = slice_dir.join("session");
     fs::create_dir_all(&session_dir).unwrap();

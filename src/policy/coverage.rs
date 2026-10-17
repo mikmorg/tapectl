@@ -1546,6 +1546,235 @@ pub fn versions_at_stake(
     Ok(rows)
 }
 
+// ── The cross-volume index's versions and holders (ADR-0012 items 78-80) ──
+
+/// The volumes the cross-volume index (`volume-format-v2.md` §1.5) names as
+/// holding a version: sealed, and neither retired nor erased, **whatever
+/// their condition**. A volume has one `status`, so `sealed` alone says
+/// "sealed and unretired"; a verify-quarantined volume (`observed_condition`,
+/// [`condition_ok`]) is still `sealed`, and the index lists it, marked, since
+/// a medium proven bad may still read in part (item 80).
+///
+/// A FOURTH question beside [`eligible`] ("is this a copy?"), [`in_service`]
+/// ("is this inventory?") and [`holds_sealed_bytes`] ("does it physically hold
+/// restorable bytes?"), and it is none of them: [`eligible`] drops the
+/// quarantined volume the index keeps, [`in_service`] adds the imported
+/// `active` volume the index leaves out (no tapectl layout wrote it), and
+/// [`holds_sealed_bytes`] adds the sealed-but-unconfirmed volume (status
+/// still `initialized`) §1.5 calls unsealed. **Never a copy count.**
+pub fn index_holder(volume_alias: &str) -> String {
+    status_in(volume_alias, &["sealed"])
+}
+
+/// What an index row says of the volume it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexHolderState {
+    /// Sealed, and no reason to distrust the medium.
+    Sealed,
+    /// Sealed, but a verify proved the medium bad (it may still partly read).
+    Quarantined,
+    /// The tape the index is on.
+    ThisTape,
+}
+
+impl IndexHolderState {
+    /// The spelling in `units.tsv`'s `state` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexHolderState::Sealed => "sealed",
+            IndexHolderState::Quarantined => "quarantined",
+            IndexHolderState::ThisTape => "this-tape",
+        }
+    }
+}
+
+/// The tape a write is building, as File 0 will say it — taken from the
+/// write's own facts rather than the catalog, because the binding that gives
+/// the catalog its cartridge serial runs AFTER the Layout is built, and the
+/// index must agree with File 0 on what it says of this tape.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexThisTape<'a> {
+    pub label: &'a str,
+    pub uuid: &'a str,
+    /// The chip serial, or `""` when none was read (an operator-named
+    /// cartridge's barcode is not one).
+    pub cartridge_serial: &'a str,
+    /// File 0's `media_type`.
+    pub generation: &'a str,
+}
+
+/// One (version, holding volume) pair of the index: a row of `units.tsv`
+/// before it is formatted. Facts only; the file's sort order and spelling are
+/// `volume::index`'s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexVersionRow {
+    pub tenant_id: i64,
+    pub tenant: String,
+    pub unit_id: i64,
+    pub unit: String,
+    pub unit_uuid: String,
+    pub snapshot_id: i64,
+    pub version: i64,
+    /// The holder's own stage set's slices (`COUNT` over `stage_slices`, not
+    /// the nullable `stage_sets.num_slices`).
+    pub num_slices: i64,
+    /// Their ciphertext bytes, all slices.
+    pub version_bytes: i64,
+    pub volume: String,
+    pub volume_uuid: String,
+    pub cartridge_serial: String,
+    pub generation: String,
+    pub state: IndexHolderState,
+    /// The catalog's `volumes.sealed_at` text (`YYYY-MM-DD HH:MM:SS`, UTC);
+    /// empty for this tape, and when the catalog recorded none.
+    pub sealed_at: String,
+}
+
+/// **The** cross-volume index query (ADR-0012 item 80, `volume-format-v2.md`
+/// §1.5): every version the index lists, with each volume that holds it.
+///
+/// The versions are every CURRENT version with at least one completed write
+/// on an [`index_holder`] volume, plus every version `write_stage_sets`
+/// carries — by id, never by status: at build time this write's snapshots are
+/// `staged`, not yet `current`. The holders of a listed version are its
+/// completed writes on [`index_holder`] volumes (quarantined ones marked),
+/// and this tape, as [`IndexHolderState::ThisTape`], for each version
+/// `write_stage_sets` carries. Unsealed, retired and erased volumes hold
+/// nothing here, and a reclaimable or purged version is listed only when
+/// this write itself carries it.
+///
+/// ONE statement for the holders and one for this tape's own rows, for every
+/// tenant at once (the caller splits by `tenant_id`), however many units
+/// there are. One row per (snapshot, volume): a snapshot with two stage sets
+/// on one volume reports the lower stage set id's. Unordered;
+/// `volume::index` sorts.
+pub fn index_versions(
+    conn: &Connection,
+    this: &IndexThisTape<'_>,
+    write_stage_sets: &[i64],
+) -> crate::error::Result<Vec<IndexVersionRow>> {
+    // ?1 is this tape's label; ?2.. are the write's stage sets.
+    let in_list = (0..write_stage_sets.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let slices = |stage_set: &str| {
+        format!(
+            "(SELECT COUNT(*) FROM stage_slices sl WHERE sl.stage_set_id = {stage_set}),
+             (SELECT COALESCE(SUM(sl.encrypted_bytes), 0) FROM stage_slices sl
+               WHERE sl.stage_set_id = {stage_set})"
+        )
+    };
+    let holders_sql = format!(
+        "SELECT t.id, t.name, u.id, u.name, u.uuid, s.id, s.version,
+                {holder_slices},
+                v.label, COALESCE(v.uuid, ''), COALESCE(c.serial_number, ''),
+                COALESCE(v.media_type, ''),
+                COALESCE(v.sealed_at, ''),
+                CASE WHEN {condition_ok} THEN 0 ELSE 1 END, w.stage_set_id
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         JOIN tenants t ON t.id = u.tenant_id
+         JOIN volumes v ON v.id = w.volume_id
+         LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
+         LEFT JOIN cartridges c ON c.id = cv.cartridge_id
+         WHERE w.status = 'completed' AND {holder} AND v.label <> ?1
+           AND (s.status = 'current'
+                OR s.id IN (SELECT snapshot_id FROM stage_sets WHERE id IN ({in_list})))",
+        holder_slices = slices("w.stage_set_id"),
+        condition_ok = condition_ok("v"),
+        holder = index_holder("v"),
+    );
+    let this_sql = format!(
+        "SELECT t.id, t.name, u.id, u.name, u.uuid, s.id, s.version,
+                {this_slices}, ss.id
+         FROM stage_sets ss
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         JOIN tenants t ON t.id = u.tenant_id
+         WHERE ss.id IN ({in_list})",
+        this_slices = slices("ss.id"),
+    );
+
+    let mut bound: Vec<rusqlite::types::Value> = vec![this.label.to_string().into()];
+    bound.extend(write_stage_sets.iter().map(|id| (*id).into()));
+
+    // (row, the stage set it came from: the tie-break below).
+    let mut rows: Vec<(IndexVersionRow, i64)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(&holders_sql)?;
+        let mapped = stmt.query_map(rusqlite::params_from_iter(bound.iter()), |r| {
+            let quarantined: i64 = r.get(14)?;
+            Ok((
+                IndexVersionRow {
+                    tenant_id: r.get(0)?,
+                    tenant: r.get(1)?,
+                    unit_id: r.get(2)?,
+                    unit: r.get(3)?,
+                    unit_uuid: r.get(4)?,
+                    snapshot_id: r.get(5)?,
+                    version: r.get(6)?,
+                    num_slices: r.get(7)?,
+                    version_bytes: r.get(8)?,
+                    volume: r.get(9)?,
+                    volume_uuid: r.get(10)?,
+                    cartridge_serial: r.get(11)?,
+                    generation: r.get(12)?,
+                    state: if quarantined == 0 {
+                        IndexHolderState::Sealed
+                    } else {
+                        IndexHolderState::Quarantined
+                    },
+                    sealed_at: r.get(13)?,
+                },
+                r.get::<_, i64>(15)?,
+            ))
+        })?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    }
+    if !write_stage_sets.is_empty() {
+        let mut stmt = conn.prepare(&this_sql)?;
+        let mapped = stmt.query_map(rusqlite::params_from_iter(bound.iter()), |r| {
+            Ok((
+                IndexVersionRow {
+                    tenant_id: r.get(0)?,
+                    tenant: r.get(1)?,
+                    unit_id: r.get(2)?,
+                    unit: r.get(3)?,
+                    unit_uuid: r.get(4)?,
+                    snapshot_id: r.get(5)?,
+                    version: r.get(6)?,
+                    num_slices: r.get(7)?,
+                    version_bytes: r.get(8)?,
+                    volume: this.label.to_string(),
+                    volume_uuid: this.uuid.to_string(),
+                    cartridge_serial: this.cartridge_serial.to_string(),
+                    generation: this.generation.to_string(),
+                    state: IndexHolderState::ThisTape,
+                    sealed_at: String::new(),
+                },
+                r.get::<_, i64>(9)?,
+            ))
+        })?;
+        for row in mapped {
+            rows.push(row?);
+        }
+    }
+
+    // One row per (snapshot, volume): the lowest stage set's.
+    rows.sort_by(|a, b| {
+        (a.0.snapshot_id, &a.0.volume, a.1).cmp(&(b.0.snapshot_id, &b.0.volume, b.1))
+    });
+    rows.dedup_by(|later, kept| {
+        kept.0.snapshot_id == later.0.snapshot_id && kept.0.volume == later.0.volume
+    });
+    Ok(rows.into_iter().map(|(row, _)| row).collect())
+}
+
 /// `{alias}.status IN ('a','b',...)`. The single place a status list is
 /// turned into SQL, so the quoting is written once.
 fn status_in(volume_alias: &str, statuses: &[&str]) -> String {

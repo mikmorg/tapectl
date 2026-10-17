@@ -3189,6 +3189,7 @@ mod tests {
             operator_public_keys: vec![op_key.public_key],
             escrow_public_key: None,
             catalog_db_path: None,
+            index: None,
         };
 
         let session_dir = tempfile::tempdir().unwrap();
