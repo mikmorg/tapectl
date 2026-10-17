@@ -2094,6 +2094,13 @@ pub fn run(
 
             let total_bytes: i64 = rows.iter().map(|(_, _, _, s)| s.unwrap_or(0)).sum();
             let total_slices: i64 = rows.iter().map(|(_, _, n, _)| n.unwrap_or(0)).sum();
+            // The cross-volume index (#418 R4, `volume-format-v2.md` §1.5)
+            // every envelope of a tape written from this will carry.
+            let index = if rows.is_empty() {
+                None
+            } else {
+                Some(planned_index_bytes(conn, config, generation.as_deref(), device.as_deref())?)
+            };
 
             // Issue #271: `--json` must be checked BEFORE the `is_empty`
             // branch, not after it -- the empty case used to fall into a
@@ -2117,6 +2124,9 @@ pub fn run(
                         "copies": copies, "total_slices": total_slices,
                         "total_bytes": total_bytes, "units": units,
                         "policy_aware": policy_aware,
+                        // #418 R4: an estimate, see `planned_index_bytes`.
+                        "index_bytes": index,
+                        "index_bytes_on_tape": index.map(|n| 2 * n),
                     })
                 );
             } else if rows.is_empty() {
@@ -2149,6 +2159,18 @@ pub fn run(
                     "estimated tapes: {tapes_needed} (at the {}% fill ceiling)",
                     (factor * 100.0).round() as i64
                 );
+                if let Some(index) = index {
+                    // The index is in every envelope, and every envelope is on
+                    // the tape twice (§1.3): about twice its plaintext size,
+                    // counted by the capacity gate with every other file.
+                    println!(
+                        "cross-volume index: about {} per tape, {} on it with the envelope \
+                         backups (an estimate: all of the above on one tape, as the catalog \
+                         stands now)",
+                        crate::util::format_bytes_binary(index),
+                        crate::util::format_bytes_binary(2 * index),
+                    );
+                }
             }
         }
 
@@ -3774,6 +3796,49 @@ struct PlanRow {
 /// listing: `volume write` selects every staged set regardless
 /// (`find_staged_data`), so here there is no selection for the flag to
 /// change.
+/// The size, in bytes, of the cross-volume index (`volume-format-v2.md`
+/// §1.5) that a write of everything now staged would put in each copy of the
+/// envelopes, before tar and age overhead: the real generator, run into a sink
+/// ([`crate::volume::index::measure`]), so every listed version's paths are
+/// read once but nothing is written to disk.
+///
+/// **An estimate**, three ways: there is no volume yet, so this tape's row is
+/// written with a typical label, uuid and serial; every staged set is counted
+/// as if it were on one tape (`volume write` would put them on as many as the
+/// plan says); and the index is as of this moment, growing with the archive.
+fn planned_index_bytes(
+    conn: &Connection,
+    config: &Config,
+    generation: Option<&str>,
+    device: Option<&str>,
+) -> Result<i64> {
+    let stage_sets: Vec<i64> = conn
+        .prepare("SELECT id FROM stage_sets WHERE status = 'staged' ORDER BY id")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    // The medium it would be written to names the generation File 0 says;
+    // fall back to a typical figure when no drive is configured to ask.
+    let generation = generation
+        .map(str::to_string)
+        .or_else(|| {
+            crate::config::resolve_lto_backend(config, device)
+                .ok()
+                .map(|b| b.generation.clone())
+        })
+        .unwrap_or_else(|| "LTO-6".to_string());
+    let measured = crate::volume::index::measure(
+        conn,
+        &crate::policy::coverage::IndexThisTape {
+            label: "L6-0000",
+            uuid: "00000000-0000-0000-0000-000000000000",
+            cartridge_serial: "00000000",
+            generation: &generation,
+        },
+        &stage_sets,
+    )?;
+    Ok(measured.total_bytes() as i64)
+}
+
 fn staged_plan_rows(
     conn: &Connection,
     config: &Config,

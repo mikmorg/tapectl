@@ -1,7 +1,8 @@
 //! Reading a volume envelope back off tape.
 //!
 //! Envelopes are written by [`crate::volume::build`] as
-//! `age(tar{MANIFEST.toml, RECOVERY.md, catalog-*.sql, PLAN.toml?, catalog.db?})`.
+//! `age(tar{MANIFEST.toml, RECOVERY.md, catalog-*.sql, PLAN.toml?, catalog.db?,
+//! index/units.tsv?})`.
 //! Until `catalog rebuild` (#136) nothing in Rust ever read one back — the
 //! write path packed them and `RESTORE.sh` (bash) unpacked them, so the two
 //! halves had never met in one language. This module is that other half.
@@ -93,6 +94,12 @@ pub struct OpenedEnvelope {
     /// (`build::catalogs_for_all`), so reading the tenants' copies as well
     /// would only double the scratch footprint of a rebuild.
     pub catalogues: Vec<ExtractedCatalogue>,
+    /// The operator envelope's cross-volume `index/units.tsv` (§1.5, #418
+    /// R4), extracted to disk. `None` for a tenant envelope (whose index
+    /// files `catalog rebuild` does not need: the operator map covers every
+    /// tenant, and a tenant's `paths.tsv` is as large as its files) and for
+    /// an operator envelope from before 1.3.0.
+    pub index_units: Option<PathBuf>,
 }
 
 /// One dar catalogue file taken out of an operator envelope.
@@ -267,6 +274,7 @@ fn unpack_envelope(
 
     let mut manifest_text: Option<String> = None;
     let mut catalog_db: Option<PathBuf> = None;
+    let mut index_units: Option<PathBuf> = None;
     let mut catalogues: Vec<ExtractedCatalogue> = Vec::new();
     let from_operator = matches!(
         crate::volume::layout_model::ZoneKind::from_type_label(&entry.type_label),
@@ -298,6 +306,16 @@ fn unpack_envelope(
                 let mut out = BufWriter::new(File::create(&path).map_err(TapectlError::from)?);
                 std::io::copy(&mut member, &mut out).map_err(TapectlError::from)?;
                 catalog_db = Some(path);
+            }
+            // The cross-volume index's unit map (§1.5), operator envelope
+            // only: a rebuild reads it as a to-do list of tapes the catalog
+            // lacks. Streamed to disk like `catalog.db`.
+            crate::volume::index::UNITS_MEMBER if from_operator => {
+                let path = scratch.join(format!("{:04}_index_units.tsv", entry.position));
+                let mut out = BufWriter::new(File::create(&path).map_err(TapectlError::from)?);
+                std::io::copy(&mut member, &mut out).map_err(TapectlError::from)?;
+                out.flush().map_err(TapectlError::from)?;
+                index_units = Some(path);
             }
             // The unit's dar catalogue (issue #473), operator envelope only:
             // `catalog rebuild` puts it back where `stage create` would have,
@@ -342,6 +360,7 @@ fn unpack_envelope(
         manifest,
         catalog_db,
         catalogues,
+        index_units,
     })
 }
 
@@ -404,6 +423,7 @@ mod tests {
             manifest: parse_manifest(&generated_manifest(tenant)).unwrap(),
             catalog_db: None,
             catalogues: Vec::new(),
+            index_units: None,
         };
         assert!(opened("operator_envelope", "operator").is_operator());
         assert!(opened("operator_envelope_backup", "operator").is_operator());

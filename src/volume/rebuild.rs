@@ -334,6 +334,50 @@ pub struct RebuildReport {
     /// is refused); `volume write` says so too. Whole-unit restore is
     /// unaffected.
     pub sets_without_catalogue: Vec<String>,
+
+    // --- the cross-volume index (#418 R4, `volume-format-v2.md` §1.5) -------
+    //
+    // A to-do list, never a source of rows: ADR-0001 has a claim about a tape
+    // need contact with that tape, and this tape's index is a claim about
+    // other tapes. Nothing below creates or changes a catalog row.
+    /// True when the operator envelope carried the index's `index/units.tsv`
+    /// (a tape written by 1.3.0 or later). A tape without it is read as it
+    /// always was.
+    pub had_index: bool,
+    /// Why the index could not be used, when it was there and unreadable. The
+    /// rebuild itself is not affected: the index is an aid, and a damaged
+    /// aid must not stop the recovery it exists to speed.
+    pub index_problem: Option<String>,
+    /// The volumes the index names (other than this tape) that the catalog
+    /// has no row for, after this rebuild: each is a tape to bring in and
+    /// rebuild from. Sorted by label.
+    pub index_volumes_missing: Vec<IndexedVolume>,
+}
+
+/// A volume a tape's cross-volume index names that the catalog lacks, with
+/// what the index says it holds: a line of a disaster-recovery to-do list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedVolume {
+    pub label: String,
+    pub uuid: String,
+    /// The chip serial of its cartridge; empty when none was read.
+    pub cartridge_serial: String,
+    /// Its medium's generation, so the reader knows which drives read it.
+    pub generation: String,
+    /// `sealed` or `quarantined`, as the index marked it.
+    pub state: String,
+    /// When it sealed (RFC 3339 UTC), as the index says; empty when unknown.
+    pub sealed_at: String,
+    /// The units and versions it holds, by tenant and unit.
+    pub units: Vec<IndexedUnit>,
+}
+
+/// One unit's versions on an [`IndexedVolume`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedUnit {
+    pub tenant: String,
+    pub unit: String,
+    pub versions: Vec<i64>,
 }
 
 /// One unit with a completed write on a volume this rebuild displaced, and
@@ -744,6 +788,10 @@ fn rebuild_contacted(
     // cannot get its catalogue is named in the report, never a failed rebuild.
     restore_catalogues(conn, operator, &inserted.sets, &mut report);
 
+    // The cross-volume index (§1.5): after the rows above are committed, so
+    // this tape itself is never listed as missing. Read-only on the catalog.
+    index_to_do(conn, operator, &ident.label, &ident.uuid, &mut report);
+
     // The rows above are committed, so the provenance event is recorded even
     // when attestation fails partway (a busy catalog, say); its error is
     // returned after. Re-running the rebuild attests what is left.
@@ -762,6 +810,116 @@ fn rebuild_contacted(
 
     attested?;
     Ok(report)
+}
+
+/// Fill the report's cross-volume index fields from the operator envelope's
+/// `index/units.tsv`: the volumes it names that the catalog has no row for.
+///
+/// **Reads the catalog, never writes it** (ADR-0001; §1.5): an index row is
+/// one tape's claim about another, and a claim about a tape needs contact
+/// with that tape, which only `catalog rebuild --from-volume` on that tape
+/// has. A volume is known to the catalog by its uuid, or, for a catalog row
+/// that never recorded one, by its label. An index that cannot be read is
+/// reported and set aside: the rebuild it accompanies has already succeeded.
+fn index_to_do(
+    conn: &Connection,
+    operator: &OpenedEnvelope,
+    this_label: &str,
+    this_uuid: &str,
+    report: &mut RebuildReport,
+) {
+    let Some(path) = &operator.index_units else {
+        return;
+    };
+    report.had_index = true;
+    let rows = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read the extracted index/units.tsv: {e}"))
+        .and_then(|text| crate::volume::index::parse_units(&text).map_err(|e| e.to_string()));
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(why) => {
+            tracing::warn!("rebuild: this tape's cross-volume index is unusable: {why}");
+            report.index_problem = Some(why);
+            return;
+        }
+    };
+
+    // The state this tape's own rows carry is `this-tape`: that is this
+    // volume, rebuilt above. Anything else is another tape.
+    let mut by_volume: std::collections::BTreeMap<(String, String), IndexedVolume> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let is_this = row.state == "this-tape"
+            || row.volume == this_label
+            || (!row.volume_uuid.is_empty() && row.volume_uuid == this_uuid);
+        if is_this || row.volume.is_empty() {
+            continue;
+        }
+        let volume = by_volume
+            .entry((row.volume.clone(), row.volume_uuid.clone()))
+            .or_insert_with(|| IndexedVolume {
+                label: row.volume.clone(),
+                uuid: row.volume_uuid.clone(),
+                cartridge_serial: row.cartridge_serial.clone(),
+                generation: row.generation.clone(),
+                state: row.state.clone(),
+                sealed_at: row.sealed_at.clone(),
+                units: Vec::new(),
+            });
+        let unit = match volume
+            .units
+            .iter_mut()
+            .position(|u| u.tenant == row.tenant && u.unit == row.unit)
+        {
+            Some(i) => &mut volume.units[i],
+            None => {
+                volume.units.push(IndexedUnit {
+                    tenant: row.tenant.clone(),
+                    unit: row.unit.clone(),
+                    versions: Vec::new(),
+                });
+                volume.units.last_mut().expect("just pushed")
+            }
+        };
+        if !unit.versions.contains(&row.version) {
+            unit.versions.push(row.version);
+        }
+    }
+
+    let known = |v: &IndexedVolume| -> Result<bool> {
+        Ok(if v.uuid.is_empty() {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM volumes WHERE label = ?1)",
+                params![v.label],
+                |r| r.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM volumes
+                  WHERE uuid = ?1 OR (uuid IS NULL AND label = ?2))",
+                params![v.uuid, v.label],
+                |r| r.get(0),
+            )?
+        })
+    };
+    for (_, mut volume) in by_volume {
+        match known(&volume) {
+            Ok(true) => {}
+            Ok(false) => {
+                volume.units.sort_by(|a, b| (&a.tenant, &a.unit).cmp(&(&b.tenant, &b.unit)));
+                for u in &mut volume.units {
+                    u.versions.sort_unstable();
+                }
+                report.index_volumes_missing.push(volume);
+            }
+            Err(e) => {
+                tracing::warn!("rebuild: cannot check the index's volumes against the catalog: {e}");
+                report.index_problem = Some(format!("cannot check the catalog: {e}"));
+                report.index_volumes_missing.clear();
+                return;
+            }
+        }
+    }
 }
 
 /// How much of a slice to read for attestation. An age header is a few

@@ -762,6 +762,9 @@ fn dispatch(
                 // operator envelope, and the stage sets still without one.
                 obj["catalogues_restored"] = serde_json::json!(report.catalogues_restored);
                 obj["sets_without_catalogue"] = serde_json::json!(report.sets_without_catalogue);
+                // #418 R4: additive. The tapes this tape's cross-volume index
+                // names that the catalog lacks: a to-do list, nothing added.
+                obj["cross_volume_index"] = index_json(&report);
                 println!("{obj}");
             } else {
                 println!(
@@ -922,6 +925,9 @@ fn dispatch(
                     println!("{line}");
                 }
                 for line in catalogue_lines(&report) {
+                    println!("{line}");
+                }
+                for line in index_lines(&report) {
                     println!("{line}");
                 }
                 if !report.units_without_tenant_envelope.is_empty() {
@@ -1236,6 +1242,88 @@ fn unsealed_tape_lines(report: &RebuildReport) -> Vec<String> {
          file 2."
     ));
     lines
+}
+
+/// What `catalog rebuild` says of the tape's cross-volume index (`volume-
+/// format-v2.md` §1.5, #418 R4): the volumes it names that this catalog has no
+/// row for, as a to-do list. Empty for a tape without an index (written before
+/// 1.3.0), which is read as it always was.
+///
+/// It lists; it never adds. A row built from it would be one tape's claim
+/// about another, and ADR-0001 has a claim about a tape wait for contact with
+/// that tape.
+fn index_lines(report: &RebuildReport) -> Vec<String> {
+    if let Some(why) = &report.index_problem {
+        return vec![format!(
+            "  note: this tape's cross-volume index could not be used ({why}); the rebuild \
+             above is complete without it"
+        )];
+    }
+    if !report.had_index {
+        return Vec::new();
+    }
+    if report.index_volumes_missing.is_empty() {
+        return vec![
+            "  cross-volume index: names no other volume that this catalog lacks".to_string(),
+        ];
+    }
+    let n = report.index_volumes_missing.len();
+    let mut lines = vec![format!(
+        "  cross-volume index: this tape names {n} other volume(s) this catalog has no row \
+         for. Nothing was added from it (a tape's claim about another tape needs that tape); \
+         load each and run `tapectl catalog rebuild --from-volume --key <key>`:"
+    )];
+    for v in &report.index_volumes_missing {
+        let mut facts = vec![format!("uuid {}", v.uuid)];
+        if !v.cartridge_serial.is_empty() {
+            facts.push(format!("cartridge serial {}", v.cartridge_serial));
+        }
+        if !v.generation.is_empty() {
+            facts.push(v.generation.clone());
+        }
+        facts.push(if v.sealed_at.is_empty() {
+            v.state.clone()
+        } else {
+            format!("{} {}", v.state, v.sealed_at)
+        });
+        lines.push(format!("    {}  ({})", v.label, facts.join("; ")));
+        for u in &v.units {
+            let versions = u
+                .versions
+                .iter()
+                .map(|n| format!("v{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let owner = if u.tenant.is_empty() {
+                String::new()
+            } else {
+                format!("{}: ", u.tenant)
+            };
+            lines.push(format!("      {owner}{} {versions}", u.unit));
+        }
+    }
+    lines
+}
+
+/// [`index_lines`] for `--json`: one object under `cross_volume_index`.
+fn index_json(report: &RebuildReport) -> serde_json::Value {
+    serde_json::json!({
+        "present": report.had_index,
+        "problem": report.index_problem,
+        "volumes_missing": report.index_volumes_missing.iter().map(|v| serde_json::json!({
+            "label": v.label,
+            "uuid": v.uuid,
+            "cartridge_serial": v.cartridge_serial,
+            "generation": v.generation,
+            "state": v.state,
+            "sealed_at": v.sealed_at,
+            "units": v.units.iter().map(|u| serde_json::json!({
+                "tenant": u.tenant,
+                "unit": u.unit,
+                "versions": u.versions,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// What `catalog rebuild` says when it went on without tenant envelopes that
