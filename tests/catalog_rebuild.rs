@@ -164,6 +164,33 @@ fn catalogue_bytes(unit_name: &str) -> Vec<u8> {
     format!("dar catalogue of {unit_name}").into_bytes()
 }
 
+/// How the next fixture tape's cross-volume index (§1.5, #418 R4) is made.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexKind {
+    /// None: a tape written before 1.3.0.
+    None,
+    /// The catalog also holds two OTHER sealed tapes, `HIST-A` (a later
+    /// version of one alpha unit and one bravo unit) and `HIST-Q`
+    /// (quarantined, a still later version of the alpha unit); the index
+    /// names both beside this tape.
+    History,
+    /// `History`, but the operator's `units.tsv` is overwritten with a file
+    /// that has no `volume` column.
+    Unreadable,
+}
+
+thread_local! {
+    static INDEX_KIND: std::cell::Cell<IndexKind> = const { std::cell::Cell::new(IndexKind::None) };
+}
+
+/// [`build_sealed_volume_with`] with `kind`'s cross-volume index.
+fn build_sealed_volume_with_index(kind: IndexKind) -> SealedVolume {
+    INDEX_KIND.with(|k| k.set(kind));
+    let vol = build_sealed_volume_with(CatalogDb::New);
+    INDEX_KIND.with(|k| k.set(IndexKind::None));
+    vol
+}
+
 thread_local! {
     /// When set, the first unit's version also holds a symlink and a special
     /// file ([`link_and_special`]), as the walk records them.
@@ -355,6 +382,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
     let mut build_units = Vec::new();
     let mut stage_set_ids = Vec::new();
     let mut expected_plain_hashes = Vec::new();
+    let mut unit_ids = Vec::new();
 
     for (i, (unit_name, tenant_name, content)) in UNITS.iter().enumerate() {
         let tenant = if *tenant_name == "alpha" {
@@ -374,6 +402,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         )
         .unwrap();
         let unit_id = conn.last_insert_rowid();
+        unit_ids.push(unit_id);
 
         conn.execute(
             "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
@@ -527,6 +556,73 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         }
     };
 
+    // The cross-volume index, generated where `volume write` generates it.
+    let index_kind = INDEX_KIND.with(|k| k.get());
+    let index_work = tempfile::tempdir().unwrap();
+    let index = (index_kind != IndexKind::None).then(|| {
+        // Two other sealed tapes the catalog knows about. Versions 8 and 9
+        // are later than the 7 this tape carries.
+        let history = |label: &str, condition: &str, unit: usize, version: i64| {
+            conn.execute(
+                "INSERT OR IGNORE INTO volumes (label, backend_type, backend_name, media_type,
+                                                capacity_bytes, status, observed_condition, uuid,
+                                                sealed_at)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'sealed', ?2, ?3,
+                         '2026-09-01 12:00:00')",
+                rusqlite::params![label, condition, format!("hist-uuid-{label}")],
+            )
+            .unwrap();
+            let hist_volume: i64 = conn
+                .query_row("SELECT id FROM volumes WHERE label = ?1", [label], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path)
+                 VALUES (?1, ?2, 'current', '/hist')",
+                rusqlite::params![unit_ids[unit], version],
+            )
+            .unwrap();
+            let snapshot = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'cleaned', 1)",
+                [snapshot],
+            )
+            .unwrap();
+            let set = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                           sha256_plain, sha256_encrypted)
+                 VALUES (?1, 1, 7, 7, 'p', 'e')",
+                [set],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (?1, ?2, ?3, 'completed')",
+                rusqlite::params![set, snapshot, hist_volume],
+            )
+            .unwrap();
+        };
+        history("HIST-A", "ok", 0, 8);
+        history("HIST-A", "ok", 2, 8);
+        history("HIST-Q", "quarantined", 0, 9);
+        let files = tapectl::volume::index::generate_files(
+            &conn,
+            &tapectl::policy::coverage::IndexThisTape {
+                label,
+                uuid: volume_uuid,
+                cartridge_serial: mam_serial,
+                generation: "LTO-6",
+            },
+            &stage_set_ids,
+            &index_work.path().join("index"),
+        )
+        .unwrap();
+        if index_kind == IndexKind::Unreadable {
+            std::fs::write(&files.operator_units, "unit\tversion\nphotos/2019\t1\n").unwrap();
+        }
+        files
+    });
+
     let tenants = [alpha, bravo];
     let inputs = BuildInputs {
         label: label.to_string(),
@@ -556,7 +652,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
         operator_public_keys: vec![operator.public_key.clone()],
         escrow_public_key: Some(escrow.public_key.clone()),
         catalog_db_path,
-        index: None,
+        index,
     };
 
     let session_dir = tempfile::tempdir().unwrap();
@@ -5210,4 +5306,257 @@ fn a_copy_written_after_a_rebuild_and_read_slices_carries_the_dar_catalogues() {
         }
     }
     assert_eq!(seen, 1, "exactly one tenant envelope is alpha's");
+}
+
+// ── the cross-volume index (§1.5, #418 R4) ──
+
+/// Row counts of every table a rebuild writes, for comparing two catalogs.
+fn rebuild_table_counts(conn: &rusqlite::Connection) -> Vec<(&'static str, i64)> {
+    [
+        "tenants",
+        "units",
+        "snapshots",
+        "stage_sets",
+        "stage_slices",
+        "writes",
+        "write_positions",
+        "volumes",
+        "cartridges",
+        "cartridge_volumes",
+        "paths",
+        "file_versions",
+    ]
+    .into_iter()
+    .map(|t| {
+        (
+            t,
+            conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap(),
+        )
+    })
+    .collect()
+}
+
+/// `catalog rebuild` reads the operator envelope's `units.tsv` and lists the
+/// volumes it names that the catalog lacks, with what the index says of each;
+/// and creates nothing from it. The control is the same tape without an index,
+/// rebuilt into its own fresh catalog: every table the rebuild writes ends with
+/// the same number of rows, so the index added no row of any kind.
+#[test]
+fn the_rebuild_lists_the_tapes_the_index_names_and_creates_no_row_for_them() {
+    let mut with = build_sealed_volume_with_index(IndexKind::History);
+    let mut without = build_sealed_volume_with_index(IndexKind::None);
+    let secret = with.operator_secret.clone();
+    let scratch = tempfile::tempdir().unwrap();
+
+    let with_dir = tempfile::tempdir().unwrap();
+    let with_conn = fresh_db(with_dir.path());
+    let report = rebuild(&with_conn, &mut with, &secret, scratch.path()).unwrap();
+    assert!(
+        report.had_index && report.index_problem.is_none(),
+        "{report:?}"
+    );
+
+    let missing: Vec<(&str, &str, &str, &str)> = report
+        .index_volumes_missing
+        .iter()
+        .map(|v| {
+            (
+                v.label.as_str(),
+                v.uuid.as_str(),
+                v.state.as_str(),
+                v.generation.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        missing,
+        vec![
+            ("HIST-A", "hist-uuid-HIST-A", "sealed", "LTO-6"),
+            ("HIST-Q", "hist-uuid-HIST-Q", "quarantined", "LTO-6"),
+        ],
+        "the two other tapes, and not this one"
+    );
+    let a = &report.index_volumes_missing[0];
+    assert_eq!(a.sealed_at, "2026-09-01T12:00:00Z");
+    assert_eq!(
+        a.cartridge_serial, "",
+        "the history tapes have no cartridge bound"
+    );
+    let held: Vec<(&str, &str, &[i64])> = a
+        .units
+        .iter()
+        .map(|u| (u.tenant.as_str(), u.unit.as_str(), u.versions.as_slice()))
+        .collect();
+    assert_eq!(
+        held,
+        vec![
+            ("alpha", "photos/2019", &[8][..]),
+            ("bravo", "ledgers/fy24", &[8][..])
+        ]
+    );
+    let q = &report.index_volumes_missing[1];
+    assert_eq!(q.units.len(), 1);
+    assert_eq!(q.units[0].versions, vec![9]);
+
+    // Nothing was created from the index: only this tape's volume is in the
+    // catalog, no version 8 or 9, and every table the rebuild writes is the
+    // size it is when the same tape carries no index.
+    let labels: Vec<String> = with_conn
+        .prepare("SELECT label FROM volumes ORDER BY label")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(labels, vec![LABEL.to_string()]);
+    let later: i64 = with_conn
+        .query_row(
+            "SELECT COUNT(*) FROM snapshots WHERE version > 7",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(later, 0);
+
+    let without_dir = tempfile::tempdir().unwrap();
+    let without_conn = fresh_db(without_dir.path());
+    let secret = without.operator_secret.clone();
+    let control = rebuild(&without_conn, &mut without, &secret, scratch.path()).unwrap();
+    assert!(!control.had_index && control.index_volumes_missing.is_empty());
+    assert_eq!(
+        rebuild_table_counts(&with_conn),
+        rebuild_table_counts(&without_conn),
+        "the index added rows to the catalog"
+    );
+    assert!(
+        rebuild_table_counts(&with_conn).contains(&("units", 3)),
+        "the control compares populated catalogs"
+    );
+}
+
+/// The to-do list is "volumes the catalog lacks": one it has is not on it. A
+/// volume is the catalog's by uuid, or by label when the catalog's row never
+/// recorded a uuid; a label held by a different uuid is another volume.
+#[test]
+fn a_volume_the_catalog_has_is_not_on_the_list() {
+    let mut vol = build_sealed_volume_with_index(IndexKind::History);
+    let secret = vol.operator_secret.clone();
+    let scratch = tempfile::tempdir().unwrap();
+    // One tape, read again into a fresh catalog each time (a `MemStore` reads
+    // the same bytes as often as it is asked).
+    let mut missing_after = |setup: &dyn Fn(&rusqlite::Connection)| -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = fresh_db(dir.path());
+        setup(&conn);
+        let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+        report
+            .index_volumes_missing
+            .into_iter()
+            .map(|v| v.label)
+            .collect()
+    };
+    let insert = |conn: &rusqlite::Connection, label: &str, uuid: Option<&str>| {
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                  status, uuid)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'sealed', ?2)",
+            rusqlite::params![label, uuid],
+        )
+        .unwrap();
+    };
+    // Positive control: an empty catalog lacks both.
+    assert_eq!(missing_after(&|_| {}), ["HIST-A", "HIST-Q"]);
+    // Known by uuid.
+    assert_eq!(
+        missing_after(&|c| insert(c, "HIST-A", Some("hist-uuid-HIST-A"))),
+        ["HIST-Q"]
+    );
+    // Known by label, the catalog's row having never recorded a uuid.
+    assert_eq!(missing_after(&|c| insert(c, "HIST-Q", None)), ["HIST-A"]);
+    // Known by uuid under another label (a relabelled tape): still known.
+    assert_eq!(
+        missing_after(&|c| insert(c, "RELABELLED", Some("hist-uuid-HIST-A"))),
+        ["HIST-Q"]
+    );
+    // The label held by a DIFFERENT uuid is a different volume: still listed.
+    assert_eq!(
+        missing_after(&|c| insert(c, "HIST-Q", Some("another-uuid"))),
+        ["HIST-A", "HIST-Q"]
+    );
+}
+
+/// A tape written before 1.3.0 has no index: read exactly as before, with
+/// nothing to say about it.
+#[test]
+fn a_tape_without_an_index_is_read_as_before() {
+    let mut vol = build_sealed_volume_with_index(IndexKind::None);
+    let secret = vol.operator_secret.clone();
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(!report.had_index);
+    assert!(report.index_problem.is_none());
+    assert!(report.index_volumes_missing.is_empty());
+    assert_eq!(report.units, 3, "{report:?}");
+}
+
+/// A damaged aid does not stop the recovery it exists to speed: the rebuild
+/// completes, and says the index could not be used, and why.
+#[test]
+fn an_unreadable_index_is_reported_and_the_rebuild_goes_on() {
+    let mut vol = build_sealed_volume_with_index(IndexKind::Unreadable);
+    let secret = vol.operator_secret.clone();
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let report = rebuild(&conn, &mut vol, &secret, scratch.path()).unwrap();
+    assert!(report.had_index);
+    let why = report
+        .index_problem
+        .as_deref()
+        .expect("the problem is named");
+    assert!(why.contains("no `volume` column"), "{why}");
+    assert!(report.index_volumes_missing.is_empty());
+    assert_eq!(
+        report.units, 3,
+        "the rebuild itself is complete: {report:?}"
+    );
+}
+
+/// Rebuilding the tapes the index named, one after another, empties the list:
+/// the to-do list a disaster recovery works through.
+#[test]
+fn rebuilding_a_listed_tape_takes_it_off_the_list() {
+    let mut newest = build_sealed_volume_with_index(IndexKind::History);
+    let secret = newest.operator_secret.clone();
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let conn = fresh_db(dir.path());
+    let first = rebuild(&conn, &mut newest, &secret, scratch.path()).unwrap();
+    assert_eq!(first.index_volumes_missing.len(), 2);
+
+    // The same tape again: the catalog now has it, and the list is unchanged
+    // (the history tapes are still not in the catalog).
+    let again = rebuild(&conn, &mut newest, &secret, scratch.path()).unwrap();
+    assert!(again.is_noop(), "{again:?}");
+    assert_eq!(again.index_volumes_missing.len(), 2);
+
+    // Bring one of the listed tapes into the catalog (its row, as a rebuild of
+    // that tape would insert it) and it leaves the list.
+    conn.execute(
+        "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                              status, uuid)
+         VALUES ('HIST-A', 'lto', 'lto0', 'LTO-6', 2500000000, 'sealed', 'hist-uuid-HIST-A')",
+        [],
+    )
+    .unwrap();
+    let after = rebuild(&conn, &mut newest, &secret, scratch.path()).unwrap();
+    let labels: Vec<&str> = after
+        .index_volumes_missing
+        .iter()
+        .map(|v| v.label.as_str())
+        .collect();
+    assert_eq!(labels, ["HIST-Q"]);
 }
