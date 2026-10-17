@@ -1054,9 +1054,9 @@ the seal marker.
 /// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE,
-        AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
-        AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
+        AWK_CHECK_FILE_LIST, AWK_DAR_DAMAGED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
+        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
+        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
     let script = r#"#!/usr/bin/env bash
@@ -1076,6 +1076,9 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #   ./RESTORE.sh --restore --key KEYFILE --to DIR --unit U --path P [--path P2 ...]
 #                [--version N] [--scratch DIR]                One file or folder
 #   ./RESTORE.sh --list --key KEYFILE [--unit U] [--version N]  A unit's files
+#   ./RESTORE.sh --restore ... [--slices-from DIR ...] [--swap-tapes]   A bad slice from another copy
+#   ./RESTORE.sh --restore --key KEYFILE --to DIR --unit U --fill-from LIST   Files a restore could not restore
+#   ./RESTORE.sh --verify [--slices-from DIR ...] [--swap-tapes]
 #   ./RESTORE.sh --where UNIT --key KEYFILE [--key K2 ...]       Which tapes hold UNIT
 #   ./RESTORE.sh --find TEXT --key KEYFILE [--key K2 ...]        Which unit and tape hold a path
 #
@@ -1098,6 +1101,20 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #
 # --key may be repeated. An envelope and the slices it describes can need
 # different keys after a key rotation, so every key is tried independently.
+#
+# A slice that fails its hash, or will not read, can be taken from another copy
+# of the unit (ADR-0012 item 101). The copy's slice has the same sha256 in its
+# front index, and that is the only way one is matched: --slices-from DIR names
+# a directory of slice files copied off another tape (any names), and
+# --swap-tapes asks for another cartridge after this one has been read. Either
+# one restores the way an older dar does, slice by slice onto disk (about twice
+# the unit's size), because a stream cannot take a slice back from dar.
+#
+# A restore whose dar run names files it could not restore (a failed CRC, a
+# damaged slice) writes their paths to .tapectl-damaged-files.txt in the unit's
+# directory (ADR-0012 item 102) and ends RESTORE INCOMPLETE. Another tape that
+# holds the same unit at the same version fills exactly those files:
+#   ./RESTORE.sh --restore --key KEYFILE --unit U --fill-from LIST --to DIR
 #
 # Disk space: --restore streams each slice from the tape through age into dar,
 # so nothing decrypted is written to disk but the restored files themselves:
@@ -1153,6 +1170,12 @@ SCRATCH=""
 SCRATCH_PARENT=""
 SKIP_SPACE_CHECK=0
 OVERWRITE=0
+# --slices-from DIR (repeatable), --swap-tapes and --fill-from LIST (1.3.0).
+# SALVAGE is 1 when either of the first two was given.
+SLICES_FROM=()
+SWAP_TAPES=0
+SALVAGE=0
+FILL_FROM=""
 
 umask 077 # decrypted plaintext and temp files must not be world-readable
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tapectl-restore.XXXXXX")" ||
@@ -1370,12 +1393,9 @@ check_space() { # <destination> <scratch dir> <bytes of files> <bytes of scratch
 # full disk, a power cut, Ctrl-C) used to report RESTORE COMPLETE over the
 # truncated files it left. And a scratch directory left by a killed restore
 # may hold decrypted data, so it is named and never silently reused.
-check_destination() { # <destination> <scratch parent>
-  local dest=$1 scr=$2 d stale
-  if [ -e "$dest" ] && [ ! -d "$dest" ]; then
-    die "--to $dest exists and is not a directory. Nothing has been read from tape."
-  fi
-  for d in "$dest" "$scr"; do
+check_stale_scratch() { # <directory>...
+  local d stale
+  for d in "$@"; do
     [ -d "$d" ] || continue
     for stale in "$d"/.tapectl-restore.*; do
       [ -e "$stale" ] || continue
@@ -1385,6 +1405,14 @@ check_destination() { # <destination> <scratch parent>
        Nothing has been read from tape."
     done
   done
+}
+
+check_destination() { # <destination> <scratch parent>
+  local dest=$1 scr=$2
+  if [ -e "$dest" ] && [ ! -d "$dest" ]; then
+    die "--to $dest exists and is not a directory. Nothing has been read from tape."
+  fi
+  check_stale_scratch "$dest" "$scr"
   [ -d "$dest" ] || return 0
   [ -n "$(ls -A "$dest")" ] || return 0
   if [ "$OVERWRITE" = 1 ]; then
@@ -1830,6 +1858,8 @@ check_requires() { # <what> <toml file>
 check_tape_identity() {
   info "Tape device:      $DEVICE${TAPE_DEVICE:+ (from TAPE_DEVICE)}"
   info "Tape identifies as: ${TAPE_LABEL:-<unreadable>}"
+  # The second cartridge of --swap-tapes is a different tape on purpose.
+  [ "${OTHER_TAPE:-0}" = 0 ] || return 0
   if [ -n "$TAPE_LABEL" ] && [ "$TAPE_LABEL" != "$LABEL" ]; then
     echo "" >&2
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
@@ -2075,8 +2105,38 @@ do_info() {
 
 # ---- --verify ----
 
+# A file that failed the walk. A data slice also says whether a copy of it is
+# in a --slices-from directory (matched by its sha256 alone); one that is not
+# is remembered for the second cartridge --swap-tapes asks for.
+VERIFY_BAD=()
+VERIFY_COVERED=0
+VERIFY_OTHER=0
+verify_failed() { # <position> <type> <bytes> <sha256> <what>
+  local pos=$1 type=$2 size=$3 hash=$4 what=$5 extra=""
+  if [ "$type" = data_slice ] && [ -n "$size" ]; then
+    if dir_find "$pos" "$size" "$hash"; then
+      extra="; a copy whose sha256 matches is $DIR_HIT"
+      VERIFY_COVERED=$((VERIFY_COVERED + 1))
+    else
+      VERIFY_BAD+=("$pos|$size|$hash")
+    fi
+  else
+    VERIFY_OTHER=$((VERIFY_OTHER + 1))
+  fi
+  printf "FAIL  file %3d  %-24s  (%s%s)\n" "$pos" "$type" "$what" "$extra"
+}
+
+verify_needed() { # job|number|bytes|sha256|label, for each failed slice with no copy yet
+  local e pos size hash
+  for e in ${VERIFY_BAD[@]+"${VERIFY_BAD[@]}"}; do
+    IFS='|' read -r pos size hash <<<"$e"
+    echo "v|$pos|$size|$hash|tape file $pos"
+  done
+}
+
 do_verify() {
   bootstrap_thunk
+  [ "$SALVAGE" = 0 ] || salvage_init
 
   # One pass, ascending, from a single rewind (#396). Files 1 and 2 lie
   # between File 0 and the front index, so their bytes are kept as the head
@@ -2101,6 +2161,8 @@ do_verify() {
     zero_strip_instructions >&2
     exit 1
   fi
+  FILES_TXT=$files_file
+  FILES_SOURCE=verify
 
   echo "=== keyless integrity walk: $LABEL ==="
   echo ""
@@ -2121,7 +2183,7 @@ do_verify() {
       if hash_tape_file "$pos" "$size"; then
         actual=$TAPE_SHA
       else
-        printf "FAIL  file %3d  %-24s  (unreadable)\n" "$pos" "$type"
+        verify_failed "$pos" "$type" "$size" "$hash" "unreadable"
         overall_ok=0
         continue
       fi
@@ -2130,7 +2192,7 @@ do_verify() {
     if [ "$actual" = "$hash" ]; then
       printf "PASS  file %3d  %-24s\n" "$pos" "$type"
     else
-      printf "FAIL  file %3d  %-24s  (hash mismatch)\n" "$pos" "$type"
+      verify_failed "$pos" "$type" "$size" "$hash" "hash mismatch"
       overall_ok=0
     fi
   done <"$files_file"
@@ -2159,7 +2221,19 @@ do_verify() {
   if [ "$overall_ok" -eq 1 ]; then
     echo "VERIFY: PASS — every file matches the front index."
   else
+    if [ "$SWAP_TAPES" = 1 ] && [ ${#VERIFY_BAD[@]} -gt 0 ]; then
+      VERIFY_ONLY=1
+      swap_loop
+    fi
     echo "VERIFY: FAIL — one or more files do not match. See FAIL lines above." >&2
+    if [ "$SALVAGE" = 1 ]; then
+      if [ "$VERIFY_OTHER" -eq 0 ] && [ ${#VERIFY_BAD[@]} -eq 0 ]; then
+        echo "        Every file that failed is a data slice, and a copy of each was found (in a --slices-from" >&2
+        echo "        directory or on a cartridge you loaded): --restore with the same options takes them from there." >&2
+      else
+        echo "        $VERIFY_OTHER failed file(s) are not data slices, and ${#VERIFY_BAD[@]} failed data slice(s) have no copy yet." >&2
+      fi
+    fi
     exit 1
   fi
 }
@@ -2438,11 +2512,19 @@ set_age_ids() {
 }
 
 # Decrypt one slice file to another (--path, which keeps the few slices it
-# needs on disk). A full disk is named as one, never as a key problem.
-decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number>
-  local in=$1 out=$2 num=$3
-  if age -d "${AGE_IDS[@]}" <"$in" >"$out" 2>"$WORK/age.err"; then
-    return 0
+# needs on disk). A full disk is named as one, never as a key problem. With a
+# size, only the first that many bytes of the file are the slice (a copy made
+# with dd carries the tape's block padding after them).
+decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number> [bytes]
+  local in=$1 out=$2 num=$3 size=${4:-}
+  if [ -z "$size" ]; then
+    if age -d "${AGE_IDS[@]}" <"$in" >"$out" 2>"$WORK/age.err"; then
+      return 0
+    fi
+  else
+    if head -c "$size" -- "$in" | age -d "${AGE_IDS[@]}" >"$out" 2>"$WORK/age.err"; then
+      return 0
+    fi
   fi
   cat "$WORK/age.err" >&2 || true
   if grep -i 'no space left' "$WORK/age.err" >/dev/null 2>&1; then
@@ -2522,7 +2604,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
   # that runs into the last slice, for most slice sizes; with it the restore
   # is exact (measured with #411; fixed in dar 2.7.21).
   [ -z "$cat" ] || dar_opts+=(-A "$cat")
-  dar -x "$fifos/restore" -R "$destdir" "${dar_opts[@]}" >"$WORK/extract.log" 2>&1 </dev/null &
+  dar -x "$fifos/restore" -R "$(abs_dir "$destdir")" "${dar_opts[@]}" >"$WORK/extract.log" 2>&1 </dev/null &
   DAR_PID=$!
   BG_PIDS+=("$DAR_PID")
 
@@ -2571,6 +2653,7 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
     read -r -a st <"$WORK/feed.status" || true
     # st: dd, the head/drain group, tee, age.
     if [ "${st[0]:-1}" != 0 ]; then
+      echo "NOTE: a slice that will not read can come from another copy of the unit: see --slices-from and --swap-tapes in --help." >&2
       die_io "reading tape file $tpos failed" "$WORK/dd.err" "$WORK"
     fi
     if [ "${st[3]:-1}" != 0 ]; then
@@ -2583,7 +2666,8 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
         die_slice_keys "$num"
       fi
       die "slice $num (tape file $tpos) did not decrypt: a key matched it, so its bytes are
-       damaged. Files already restored to $destdir from this unit may be incomplete."
+       damaged. Files already restored to $destdir from this unit may be incomplete.
+$(replace_hint)"
     fi
     if [ "${st[1]:-1}" != 0 ] || [ "${st[2]:-1}" != 0 ]; then
       if ! kill -0 "$DAR_PID" 2>/dev/null; then
@@ -2597,7 +2681,8 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
     if [ "$got" != "$sha" ]; then
       die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${got:0:16}…)
        The slice does not match the front index. dar has already taken what
-       decrypted of it: do not trust the files restored to $destdir."
+       decrypted of it: do not trust the files restored to $destdir.
+$(replace_hint)"
     fi
     info "  checksum verified against front index"
   done
@@ -2609,33 +2694,49 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
     STREAM_REFUSED=1
     return 0
   fi
-  cat "$WORK/extract.log"
-  if [ "$rc" != 0 ]; then
-    if grep -i 'no space left' "$WORK/extract.log" >/dev/null 2>&1; then
-      die_io "dar extraction failed" "$WORK/extract.log" "$destdir"
-    fi
-    die "dar extraction failed (exit $rc) — dar's own message is above"
-  fi
-  die_if_dar_skipped "$WORK/extract.log" "$destdir"
+  dar_result "$WORK/extract.log" "$rc" "$destdir"
 }
 
-# Read, check and decrypt the slices listed in $1 into SCRATCH, as
-# restore.N.dar, one encrypted slice on disk at a time.
-spool_slices() { # <slices file>
-  local num tpos size sha actual i=0 n
-  n=$(wc -l <"$1")
+# Read, check and decrypt the slices listed in $1 as restore.N.dar, one
+# encrypted slice on disk at a time, into directory $2 (default SCRATCH). A
+# slice that fails stops the run, unless a replacement was asked for
+# (SALVAGE): then it is looked for, by its sha256, in the --slices-from
+# directories, and one not found is written to the file $3 (number | tape file
+# | bytes | sha256) for the second tape, and the rest are read on.
+spool_slices() { # <slices file> [<directory> [<file for the slices not found>]]
+  local list=$1 into=${2:-$SCRATCH} missing=${3:-} num tpos size sha actual i=0 n
+  [ -z "$missing" ] || : >"$missing"
+  n=$(wc -l <"$list")
   while IFS='|' read -r num tpos size sha; do
     i=$((i + 1))
     info "Slice $num ($i/$n) — tape file $tpos"
+    if [ "$SALVAGE" = 1 ]; then
+      if read_slice_checked "$tpos" "$size" "$sha" "$SCRATCH/slice.enc"; then
+        info "  checksum verified against front index"
+        decrypt_slice "$SCRATCH/slice.enc" "$into/restore.$num.dar" "$num"
+        rm -f "$SCRATCH/slice.enc"
+      else
+        info "  slice $num (tape file $tpos) $SLICE_WHY"
+        if dir_find "$num" "$size" "$sha"; then
+          info "  taking slice $num from $DIR_HIT (its sha256 is the one the front index lists)"
+          decrypt_slice "$DIR_HIT" "$into/restore.$num.dar" "$num" "$size"
+        else
+          echo "$num|$tpos|$size|$sha" >>"$missing"
+          info "  no copy of slice $num in the --slices-from directories"
+        fi
+      fi
+      continue
+    fi
     read_tape_raw "$tpos" "$SCRATCH/slice.enc"
     truncate -s "$size" "$SCRATCH/slice.enc"
     actual=$(sha256sum "$SCRATCH/slice.enc" | awk '{print $1}')
     [ "$actual" = "$sha" ] ||
-      die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${actual:0:16}…)"
+      die "slice $num checksum MISMATCH (expected ${sha:0:16}…, got ${actual:0:16}…)
+$(replace_hint)"
     info "  checksum verified against front index"
-    decrypt_slice "$SCRATCH/slice.enc" "$SCRATCH/restore.$num.dar" "$num"
+    decrypt_slice "$SCRATCH/slice.enc" "$into/restore.$num.dar" "$num"
     rm -f "$SCRATCH/slice.enc"
-  done <"$1"
+  done <"$list"
 }
 
 # The way 1.0.x restored, for a dar that cannot stream a unit safely: every
@@ -2652,12 +2753,12 @@ spool_unit() { # <slices file> <destination>
     die "cannot create a scratch directory in $SCRATCH_PARENT"
   spool_slices "$list"
   local -a dar_opts=(-O -Q -N)
+  local rc=0
   [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
-  dar -x "$SCRATCH/restore" -R "$destdir" "${dar_opts[@]}" 2>&1 | tee "$WORK/extract.log" ||
-    die "dar extraction failed — dar's own message is above (No space left on device means $destdir is full)"
-  die_if_dar_skipped "$WORK/extract.log" "$destdir"
+  dar -x "$SCRATCH/restore" -R "$(abs_dir "$destdir")" "${dar_opts[@]}" >"$WORK/extract.log" 2>&1 </dev/null || rc=$?
   rm -rf "$SCRATCH"
   SCRATCH=""
+  dar_result "$WORK/extract.log" "$rc" "$destdir"
 }
 
 # Restore one unit the best way this dar allows. Streaming needs the unit's
@@ -2666,7 +2767,7 @@ spool_unit() { # <slices file> <destination>
 # dar 2.7.21 or later (which fixed reading without one). A catalogue dar
 # refuses (#419) is dropped, and anything else is restored from slices
 # decrypted to disk first.
-restore_unit() { # <slices file> <destination> <unit> <version>
+restore_unit_plain() { # <slices file> <destination> <unit> <version>
   local list=$1 destdir=$2 unit=$3 ver=$4 cat
   cat=$(catalogue_path "$CHOSEN_ENV" "$unit" "$ver")
   if [ -n "$cat" ] && dar_at_least 2.7.9; then
@@ -2684,6 +2785,25 @@ restore_unit() { # <slices file> <destination> <unit> <version>
   info "dar ${DAR_VERSION:-(unknown version)} cannot stream '$unit' safely without its catalogue;"
   info "  decrypting the slices to disk first (dar 2.7.21 or later would stream it)"
   spool_unit "$list" "$destdir"
+}
+
+# One unit, whichever way: streamed, from slices on disk, or (when a
+# replacement slice was asked for) from slices on disk with the bad ones
+# replaced. UNIT_OK says whether dar named files it could not restore.
+restore_unit() { # <slices file> <destination> <unit> <version>
+  local list=$1 destdir=$2 unit=$3 ver=$4
+  UNIT_NAME=$unit
+  UNIT_VER=$ver
+  UNIT_OK=1
+  UNIT_UUID=$(unit_uuid_of "$CHOSEN_ENV" "$unit" "$ver")
+  if [ "$SALVAGE" = 1 ]; then
+    salvage_unit "$list" "$destdir" "$unit" "$ver"
+    return 0
+  fi
+  restore_unit_plain "$list" "$destdir" "$unit" "$ver"
+  if [ "$UNIT_OK" = 1 ]; then
+    DONE_LINES+=("Unit '$unit' restored to: $destdir")
+  fi
 }
 
 # The envelope --restore uses (walk_envelopes calls this for each that
@@ -2832,9 +2952,11 @@ do_restore() {
   dar_check
   mkdir -p "$destdir" "$scratch_parent"
   SCRATCH_PARENT=$scratch_parent
+  RESTORE_TO=$destdir
   set_age_ids
 
   establish_files
+  [ "$SALVAGE" = 0 ] || salvage_init
 
   # Step 1: the envelope (see pick_for_restore). Each key is tried on its own
   # at each position (#288).
@@ -2875,10 +2997,7 @@ do_restore() {
     pick_slices "$manifest" "${targets[0]}" "$WORK/slices.0" "$want_version"
     info "Restoring from '${targets[0]}' snapshot version ${PICKED_VERSION:-unknown}"
     restore_paths "$WORK/slices.0" "$CHOSEN_ENV" "${targets[0]}" "$PICKED_VERSION" "$destdir" "$scratch_parent"
-    note_other_units
-    echo ""
-    info "RESTORE COMPLETE"
-    info "${RESTORE_PATHS[*]} of '${targets[0]}' restored to: $destdir"
+    restore_end
     return 0
   fi
 
@@ -2903,7 +3022,6 @@ do_restore() {
   # Step 5: the units in tape order, one forward pass. One unit goes straight
   # into --to; several go to --to/UNIT each.
   local line dest_i
-  local -a done_lines=()
   while IFS= read -r line; do
     i=${line#*|}
     if [ ${#targets[@]} -eq 1 ]; then
@@ -2914,15 +3032,10 @@ do_restore() {
     fi
     info "Extracting '${targets[$i]}' to $dest_i ..."
     restore_unit "$WORK/slices.$i" "$dest_i" "${targets[$i]}" "${versions[$i]}"
-    done_lines+=("Unit '${targets[$i]}' restored to: $dest_i")
   done < <(printf '%s\n' "${order_lines[@]}" | sort -t'|' -k1,1n)
 
-  note_other_units
-  echo ""
-  info "RESTORE COMPLETE"
-  for line in "${done_lines[@]}"; do
-    info "$line"
-  done
+  finish_pending
+  restore_end
 }
 
 # ---- the envelope's dar catalogues (--list, --path; #418) ----
@@ -3031,17 +3144,845 @@ restore_paths() { # <slices file> <envelope dir> <unit> <version> <destination> 
   done <"$WORK/path.slices"
   info "'${RESTORE_PATHS[*]}' is in slice(s) $lo-$hi of $last; reading $n of them"
   check_space "$destdir" "$scr" "$total" "$total"
+  UNIT_NAME=$unit
+  UNIT_VER=$ver
+  UNIT_OK=1
+  UNIT_UUID=$(unit_uuid_of "$env" "$unit" "$ver")
+  if [ "$SALVAGE" = 1 ]; then
+    # The same slices, in a job of their own, with a bad one replaced.
+    ensure_scratch
+    local j=$JOB_N
+    JOB_N=$((JOB_N + 1))
+    JOB_KIND[$j]=unit
+    JOB_DEST[$j]=$destdir
+    JOB_UNIT[$j]=$unit
+    JOB_VER[$j]=$ver
+    JOB_UUID[$j]=$UNIT_UUID
+    EXTRACT_G=("${g[@]}")
+    mkdir -p "$SCRATCH/job.$j"
+    spool_slices "$WORK/path.slices" "$SCRATCH/job.$j" "$WORK/job.$j.missing"
+    if [ -s "$WORK/job.$j.missing" ] && [ "$SWAP_TAPES" = 1 ]; then
+      PENDING+=("$j")
+      finish_pending
+    else
+      job_run "$j"
+    fi
+    return 0
+  fi
   SCRATCH="$(mktemp -d "$scr/.tapectl-restore.XXXXXX")" ||
     die "cannot create a scratch directory in $scr"
   spool_slices "$WORK/path.slices"
   local -a dar_opts=(-O -Q -N)
+  local rc=0
   [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
   info "Extracting ${RESTORE_PATHS[*]} to $destdir ..."
-  dar -x "$SCRATCH/restore" -R "$destdir" "${g[@]}" "${dar_opts[@]}" 2>&1 | tee "$WORK/extract.log" ||
-    die "dar extraction failed — dar's own message is above"
-  die_if_dar_skipped "$WORK/extract.log" "$destdir"
+  dar -x "$SCRATCH/restore" -R "$(abs_dir "$destdir")" "${g[@]}" "${dar_opts[@]}" >"$WORK/extract.log" 2>&1 </dev/null || rc=$?
   rm -rf "$SCRATCH"
   SCRATCH=""
+  dar_result "$WORK/extract.log" "$rc" "$destdir"
+  if [ "$UNIT_OK" = 1 ]; then
+    DONE_LINES+=("${RESTORE_PATHS[*]} of '$unit' restored to: $destdir")
+  fi
+}
+
+# ---- replacement slices and the damaged-file list (1.3.0; ADR-0012 items 101, 102) ----
+
+# A slice that fails its ciphertext hash, or will not read, can be taken from
+# another copy of the same unit. Copies are written from one staging, so the
+# copy's slice has the same sha256_encrypted in its own front index, and that
+# hash is the only thing a replacement is matched by: not its position, not its
+# file name. --slices-from DIR offers slice files copied off another tape;
+# --swap-tapes asks for another cartridge once this one has been read. Either
+# one makes the restore keep each slice on disk in the scratch area, decrypted
+# (as the older-dar fallback does), because a stream cannot take back a slice
+# dar has already consumed.
+
+# The absolute form of directory $1, with no trailing slash. dar prints the -R
+# it was given word for word in its messages, so the damaged-file list is cut
+# from an absolute root this script chose.
+abs_dir() { # <directory>
+  local d=$1
+  case "$d" in
+  /*) ;;
+  *) d="$PWD/$d" ;;
+  esac
+  while [ "${#d}" -gt 1 ] && [ "${d%/}" != "$d" ]; do
+    d=${d%/}
+  done
+  printf '%s' "$d"
+}
+
+# A text as sec 1.5 of the format escapes a path: a backslash is written as
+# two, a TAB as \t, a newline as \n, a carriage return as \r, and nothing else
+# changes. Character by character, so no escape is escaped twice.
+escape_text() { # <text>
+  local s=$1 out="" c
+  while [ -n "$s" ]; do
+    c=${s:0:1}
+    s=${s:1}
+    case "$c" in
+    "\\") out="$out\\\\" ;;
+    $'\t') out="$out\\t" ;;
+    $'\n') out="$out\\n" ;;
+    $'\r') out="$out\\r" ;;
+    *) out="$out$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# The reverse, in one left-to-right scan (chained substitutions would turn the
+# text of a backslash followed by t into a TAB). The result is in UNESC, not
+# printed, because a path may end in a newline that $(...) would drop.
+UNESC=""
+unesc_line() { # <escaped text>
+  local s=$1 out="" d
+  while [[ $s == *\\* ]]; do
+    out="$out${s%%\\*}"
+    s=${s#*\\}
+    d=${s:0:1}
+    s=${s:1}
+    case "$d" in
+    t) out="$out"$'\t' ;;
+    n) out="$out"$'\n' ;;
+    r) out="$out"$'\r' ;;
+    "\\") out="$out\\" ;;
+    *) out="$out\\$d" ;;
+    esac
+  done
+  UNESC="$out$s"
+}
+
+# The directories named by --slices-from must exist before any tape is read;
+# asking for a replacement turns SALVAGE on.
+check_slices_from() {
+  local d
+  for d in ${SLICES_FROM[@]+"${SLICES_FROM[@]}"}; do
+    [ -d "$d" ] || die "--slices-from $d: not a directory. Nothing has been read from tape."
+  done
+  if [ ${#SLICES_FROM[@]} -gt 0 ] || [ "$SWAP_TAPES" = 1 ]; then
+    SALVAGE=1
+  fi
+}
+
+# What a failure of a slice says when no replacement was offered.
+replace_hint() {
+  cat <<'HINTEOF'
+       Another copy of this unit holds the same slice, byte for byte: the front
+       index of its tape lists the same sha256 for it. Run the same command
+       again, with --overwrite if --to now holds part of the unit, and
+         --slices-from DIR   a directory of slice files copied off another tape
+                             (any names: a file is used only if its sha256 is the
+                             one the front index here lists), or
+         --swap-tapes        this script asks for another cartridge, once it has
+                             read this one, and reads just the slices it needs.
+       --help and File 1 say more.
+HINTEOF
+}
+
+# The sha256 of the first $2 bytes of file $1, remembered for the run: the
+# slices of one unit share a size, so every file in a directory is a candidate
+# for each of them and is hashed once, not once per slice.
+dir_sum() { # <file> <bytes>
+  local key="$1|$2" sum
+  sum=$(K="$key" awk -F'\t' '$1 == ENVIRON["K"] { print $2; exit }' "$WORK/dir.sums" 2>/dev/null || true)
+  if [ -z "$sum" ]; then
+    sum=$(head -c "$2" -- "$1" | sha256sum | awk '{print $1}')
+    printf '%s\t%s\n' "$key" "$sum" >>"$WORK/dir.sums"
+  fi
+  printf '%s' "$sum"
+}
+
+# Is a slice with this sha256 in one of the --slices-from directories? A file
+# is a candidate by its size alone (the slice's exact size, or that rounded up
+# to the tape block as dd copies it off a tape) and is USED only if the sha256
+# of its first <bytes> bytes is the one wanted. The file is left in DIR_HIT.
+DIR_HIT=""
+DIR_NOTED=""
+dir_find() { # <slice number> <bytes> <sha256>
+  local num=$1 size=$2 sha=$3 padded d f fsz
+  DIR_HIT=""
+  [ ${#SLICES_FROM[@]} -gt 0 ] || return 1
+  padded=$(((size + BLOCK - 1) / BLOCK * BLOCK))
+  for d in "${SLICES_FROM[@]}"; do
+    for f in "$d"/* "$d"/.[!.]*; do
+      [ -f "$f" ] || continue
+      fsz=$(stat -c %s -- "$f" 2>/dev/null || true)
+      [ "$fsz" = "$size" ] || [ "$fsz" = "$padded" ] || continue
+      if [ "$(dir_sum "$f" "$size")" = "$sha" ]; then
+        DIR_HIT=$f
+        return 0
+      fi
+      case "$DIR_NOTED" in
+      *"|$f|"*) ;;
+      *)
+        DIR_NOTED="$DIR_NOTED|$f|"
+        echo "NOTE: $f has the size of slice $num but not its sha256: it is not used." >&2
+        ;;
+      esac
+    done
+  done
+  return 1
+}
+
+# Read the slice at tape file $1 into $4, trimmed to its $2 bytes, and check it
+# against the sha256 $3 the front index states. Never exits on a bad slice:
+# returns 1 and says why in SLICE_WHY (a full disk still stops the run).
+SLICE_WHY=""
+read_slice_checked() { # <tape file> <bytes> <sha256> <out>
+  local pos=$1 size=$2 sha=$3 out=$4 actual
+  SLICE_WHY=""
+  : >"$WORK/dd.err"
+  if ! try_read_tape_raw "$pos" "$out"; then
+    if grep -i 'no space left' "$WORK/dd.err" >/dev/null 2>&1; then
+      die_io "reading tape file $pos failed" "$WORK/dd.err" "$(dirname "$out")"
+    fi
+    rm -f "$out"
+    SLICE_WHY="would not read"
+    return 1
+  fi
+  truncate -s "$size" "$out"
+  actual=$(sha256sum "$out" | awk '{print $1}')
+  if [ "$actual" != "$sha" ]; then
+    rm -f "$out"
+    SLICE_WHY="does not match the front index (sha256 ${actual:0:16}..., the index says ${sha:0:16}...)"
+    return 1
+  fi
+}
+
+# ---- the unit being restored, and what became of it ----
+
+UNIT_NAME=""
+UNIT_VER=""
+UNIT_UUID=""
+UNIT_OK=1
+INCOMPLETE=()
+DONE_LINES=()
+RESTORE_TO=""
+DAMAGED_NAME=.tapectl-damaged-files.txt
+
+# The uuid of one version of a unit, from its envelope's manifest.
+unit_uuid_of() { # <envelope dir> <unit> <version>
+  awk -v unit="$2" -v want="$3" '__AWK_UNIT_UUID__' "$1/MANIFEST.toml"
+}
+
+# The first line of a damaged-file list: its magic, its format (1), then the
+# unit's name (escaped as a path is), its uuid and its version, TAB-separated.
+# A fill run uses a tape only if it lists the same unit uuid AND version.
+damaged_header() { # <unit> <uuid> <version>
+  printf '%s\t%s\tunit=%s\tuuid=%s\tversion=%s\n' '#tapectl-damaged-files' 1 "$(escape_text "$1")" "$2" "$3"
+}
+
+# One unit's note for the end of a run that did not get everything: how many
+# files, where the list is, and the command that fills them from another copy.
+damage_note() { # <count> <list file> <slices not available, or empty>
+  local n=$1 list=$2 gone=${3:-} to=${RESTORE_TO:-DIR}
+  echo "Unit '$UNIT_NAME' (version $UNIT_VER): $n file(s) were not restored."
+  if [ -n "$gone" ]; then
+    echo "  Slice(s) not available: $gone. The files in them are among those listed."
+  fi
+  echo "  They are listed, one path per line, in"
+  echo "    $list"
+  echo "  Another copy of this same unit and version holds them. Load that tape and run ITS"
+  echo "  RESTORE.sh (File 2 of that tape), which restores only those files and overwrites only them:"
+  echo "    ./RESTORE.sh --restore $(keys_args) --unit $(printf '%q' "$UNIT_NAME") --fill-from $(printf '%q' "$list") --to $(printf '%q' "$to")"
+  echo "  A tape that does not hold this unit at this version is refused: no other version is used."
+}
+
+# Write the list of files dar could not restore into the unit's directory and
+# note the unit as incomplete.
+record_damage() { # <destination> <file of escaped paths> <slices not available, or empty>
+  local destdir=$1 paths=$2 gone=${3:-} n list
+  list="$destdir/$DAMAGED_NAME"
+  n=$(wc -l <"$paths")
+  {
+    damaged_header "$UNIT_NAME" "$UNIT_UUID" "$UNIT_VER"
+    cat "$paths"
+  } >"$list"
+  UNIT_OK=0
+  INCOMPLETE+=("$(damage_note "$n" "$list" "$gone")")
+}
+
+# A list left by an earlier run of this very unit and version is out of date
+# once the unit restores whole: drop it, so a clean directory has no list.
+clear_stale_list() { # <destination>
+  local list="$1/$DAMAGED_NAME" first=""
+  [ -f "$list" ] || return 0
+  IFS= read -r first <"$list" || true
+  case "$first" in
+  *$'\t'"uuid=$UNIT_UUID"$'\t'"version=$UNIT_VER")
+    rm -f "$list"
+    info "Removed $list: this restore of '$UNIT_NAME' left nothing damaged"
+    ;;
+  esac
+}
+
+# What a finished dar extraction (log $1, exit status $2, into $3) means.
+# Complete: status 0 and nothing skipped. Damage: status 5, which dar uses when
+# a file could not be restored, and it named the files (a failed CRC, a slice
+# cut short): they go in the unit's list and the run goes on to the next unit,
+# ending INCOMPLETE. $4 is the slices that were not available: with a slice
+# missing, a file dar skipped (user choice) is a file that was in it, not one
+# that was already there. Anything else is fatal, as it has always been.
+dar_result() { # <log> <status> <destination> [slices not available]
+  local log=$1 rc=$2 destdir=$3 gone=${4:-} errs=0 skipped=0 unmapped=0 failed=0 skips=0 n
+  UNIT_OK=1
+  cat "$log"
+  if [ "$rc" != 0 ] && grep -i 'no space left' "$log" >/dev/null 2>&1; then
+    die_io "dar extraction failed" "$log" "$destdir"
+  fi
+  [ -z "$gone" ] || skips=1
+  if [ "$rc" = 0 ] && [ "$skips" = 0 ]; then
+    die_if_dar_skipped "$log" "$destdir"
+    clear_stale_list "$destdir"
+    return 0
+  fi
+  if [ "$rc" != 0 ] && [ "$rc" != 5 ]; then
+    die "dar extraction failed (exit $rc) — dar's own message is above"
+  fi
+  # Status 5 is also what dar says when the disk, not the archive, refused a
+  # file. Those are not damaged files: a fill from another tape would meet the
+  # same refusal. They stop the run, as ever.
+  if [ "$rc" = 5 ] && grep -E ' : (Permission denied|Operation not permitted|Read-only file system|No such file or directory|Not a directory|Is a directory|File name too long|Too many open files|Too many levels of symbolic links|Disk quota exceeded|File exists|Input/output error|Cannot allocate memory)$' "$log" >/dev/null 2>&1; then
+    die "dar extraction failed (exit $rc): the file system refused a file — dar's own message is above.
+       This is not a damaged archive, so no list of damaged files is written."
+  fi
+  DAMAGED_ROOT="$(abs_dir "$destdir")" DAMAGED_SKIPS="$skips" DAMAGED_COUNTS="$WORK/damaged.counts" \
+    awk '__AWK_DAR_DAMAGED__' "$log" >"$WORK/damaged.new"
+  read -r errs skipped unmapped failed <"$WORK/damaged.counts" || true
+  n=$(wc -l <"$WORK/damaged.new")
+  if [ "$n" -eq 0 ]; then
+    if [ "$rc" != 0 ]; then
+      die "dar extraction failed (exit $rc) — dar's own message is above"
+    fi
+    echo "NOTE: slice(s) $gone were not available, yet dar names no file it could not restore." >&2
+    clear_stale_list "$destdir"
+    return 0
+  fi
+  if [ "$unmapped" -gt 0 ] || { [ "$rc" = 5 ] && [ "$errs" -ne "$failed" ]; }; then
+    echo "WARNING: dar reported $failed file(s) failed and $skipped skipped, and this script could name" >&2
+    echo "         $((errs + skipped - unmapped)) of them; the list written below may be short. Read dar's messages above." >&2
+  fi
+  record_damage "$destdir" "$WORK/damaged.new" "$gone"
+}
+
+# ---- salvage mode: a unit's slices on disk, bad ones replaced ----
+
+JOB_N=0
+JOB_KIND=()
+JOB_DEST=()
+JOB_UNIT=()
+JOB_VER=()
+JOB_UUID=()
+PENDING=()
+EXTRACT_G=()
+TAPE1_UUID=""
+VERIFY_ONLY=0
+
+ensure_scratch() {
+  if [ -z "$SCRATCH" ]; then
+    SCRATCH="$(mktemp -d "$SCRATCH_PARENT/.tapectl-restore.XXXXXX")" ||
+      die "cannot create a scratch directory in $SCRATCH_PARENT"
+  fi
+}
+
+# Called once the first tape's File 0 has been read: remember which cartridge
+# it was, so a second tape that is the same one can be told apart.
+salvage_init() {
+  TAPE1_UUID=$(toml_val "$WORK/thunk.toml" uuid)
+}
+
+# The numbers of the slices job $1 still lacks, for a message.
+missing_numbers() { # <job>
+  awk -F'|' '{ printf "%s%s", sep, $1; sep = ", " }' "$WORK/job.$1.missing"
+}
+
+# A unit, in salvage mode. Its slices come off this tape one at a time into a
+# directory of its own in the scratch area; a slice that fails is looked for in
+# the --slices-from directories. With --swap-tapes a unit still short of slices
+# waits for the second cartridge while the next units are read; without it dar
+# is given what there is.
+salvage_unit() { # <slices file> <destination> <unit> <version>
+  local list=$1 destdir=$2 unit=$3 ver=$4 j bytes=0 num tpos size sha
+  while IFS='|' read -r num tpos size sha; do
+    bytes=$((bytes + size))
+  done <"$list"
+  check_space "$destdir" "$SCRATCH_PARENT" "$bytes" "$((bytes + BLOCK))"
+  ensure_scratch
+  j=$JOB_N
+  JOB_N=$((JOB_N + 1))
+  JOB_KIND[$j]=unit
+  JOB_DEST[$j]=$destdir
+  JOB_UNIT[$j]=$unit
+  JOB_VER[$j]=$ver
+  JOB_UUID[$j]=$UNIT_UUID
+  mkdir -p "$SCRATCH/job.$j"
+  spool_slices "$list" "$SCRATCH/job.$j" "$WORK/job.$j.missing"
+  if [ -s "$WORK/job.$j.missing" ] && [ "$SWAP_TAPES" = 1 ]; then
+    PENDING+=("$j")
+    info "'$unit' is still short of slice(s) $(missing_numbers "$j"); it waits for the second cartridge"
+    return 0
+  fi
+  job_run "$j"
+}
+
+job_run() { # <job>
+  case "${JOB_KIND[$1]}" in
+  fill) fill_extract "$1" ;;
+  *) job_extract "$1" ;;
+  esac
+}
+
+# dar reads a unit's decrypted slices from its directory in the scratch area.
+job_extract() { # <job>
+  local j=$1 destdir unit gone="" rc=0
+  destdir=${JOB_DEST[$j]}
+  unit=${JOB_UNIT[$j]}
+  UNIT_NAME=$unit UNIT_VER=${JOB_VER[$j]} UNIT_UUID=${JOB_UUID[$j]}
+  if [ -s "$WORK/job.$j.missing" ]; then
+    gone=$(missing_numbers "$j")
+    print_needs "$j"
+    echo "NOTE: restoring '$unit' without slice(s) $gone: the files in them will be listed, not restored." >&2
+  fi
+  local -a dar_opts=(-O -Q -N)
+  [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
+  info "Extracting '$unit' to $destdir ..."
+  dar -x "$SCRATCH/job.$j/restore" -R "$(abs_dir "$destdir")" "${dar_opts[@]}" ${EXTRACT_G[@]+"${EXTRACT_G[@]}"} >"$WORK/extract.log" 2>&1 </dev/null || rc=$?
+  rm -rf "$SCRATCH/job.$j"
+  if [ -n "$gone" ] && [ "$rc" != 0 ] && [ "$rc" != 5 ]; then
+    cat "$WORK/extract.log" >&2
+    die "dar could not restore '$unit' without slice(s) $gone (exit $rc). The first and the last slice of a
+       unit cannot be left out: they hold the archive's header and its catalogue."
+  fi
+  dar_result "$WORK/extract.log" "$rc" "$destdir" "$gone"
+  if [ "$UNIT_OK" = 1 ]; then
+    if [ ${#RESTORE_PATHS[@]} -gt 0 ]; then
+      DONE_LINES+=("${RESTORE_PATHS[*]} of '$unit' restored to: $destdir")
+    else
+      DONE_LINES+=("Unit '$unit' restored to: $destdir")
+    fi
+  fi
+}
+
+# The slices a pending job is still short of: job|number|bytes|sha256|label.
+needed_slices() {
+  local j
+  for j in ${PENDING[@]+"${PENDING[@]}"}; do
+    U="${JOB_UNIT[$j]}" awk -F'|' -v j="$j" -v q="'" '{ print j "|" $1 "|" $3 "|" $4 "|unit " q ENVIRON["U"] q " slice " $1 }' "$WORK/job.$j.missing"
+  done
+}
+
+# What is still needed, by sha256: the figure to look for in another tape's
+# front index, and the number to find it by in this unit.
+print_needs() { # <job: its missing file is read, or - to print $WORK/needed.txt>
+  local job num size sha label
+  echo ""
+  info "Slices still needed. Another copy holds each one as the same bytes, listed under the same sha256"
+  info "in its front index (the number is only this tape's numbering of the unit):"
+  if [ "$1" = - ]; then
+    while IFS='|' read -r job num size sha label; do
+      info "  $label, $size bytes, sha256 $sha"
+    done <"$WORK/needed.txt"
+  else
+    while IFS='|' read -r num _ size sha; do
+      info "  unit '${JOB_UNIT[$1]}' slice $num, $size bytes, sha256 $sha"
+    done <"$WORK/job.$1.missing"
+  fi
+}
+
+# The cartridge now in the drive, as far as this script needs it: its label,
+# and its file map in $WORK/other.files (position|type|size|sha256 per line).
+# Everything the first tape established is put back afterwards.
+OTHER_TAPE=0
+OTHER_LABEL=""
+other_tape_map() {
+  local k_fi=$FRONT_INDEX k_seal=$SEAL_MARKER k_total=$TOTAL_FILES k_label=$TAPE_LABEL
+  local k_created=${CREATED:-} k_files=$FILES_TXT k_src=${FILES_SOURCE:-} uuid ok=0
+  cp "$FILES_TXT" "$WORK/tape1.files"
+  OTHER_TAPE=1
+  CUR=""
+  bootstrap_thunk
+  OTHER_TAPE=0
+  OTHER_LABEL=$TAPE_LABEL
+  uuid=$(toml_val "$WORK/thunk.toml" uuid)
+  if [ -n "$uuid" ] && [ "$uuid" = "$TAPE1_UUID" ]; then
+    info "That is the cartridge this run started with (volume uuid $(safe_str "$uuid")). It cannot hold a good copy of its own bad slices."
+  elif try_front_index; then
+    cp "$WORK/files_from_index.txt" "$WORK/other.files"
+    ok=1
+  elif try_seal_copy; then
+    echo "WARNING: the front index of this cartridge is unreadable: using the seal marker's copy of it." >&2
+    cp "$WORK/files_from_seal.txt" "$WORK/other.files"
+    ok=1
+  else
+    info "Neither the front index of this cartridge nor the seal marker's copy of it can be read."
+  fi
+  FRONT_INDEX=$k_fi SEAL_MARKER=$k_seal TOTAL_FILES=$k_total TAPE_LABEL=$k_label CREATED=$k_created
+  FILES_SOURCE=$k_src
+  cp "$WORK/tape1.files" "$k_files"
+  [ "$ok" = 1 ]
+}
+
+# Read the cartridge now in the drive for the slices still needed (the file
+# $WORK/needed.txt), by sha256 only, in the order they lie on it: one rewind,
+# then forward. In restore mode each is read into the scratch area, checked
+# against the sha256 the first tape's front index gave, and decrypted into the
+# slice directory of every job short of it; in verify mode it is only hashed.
+swap_fetch() {
+  local pos sha size job num rest
+  if ! (tape_init) 2>"$WORK/swap.err"; then
+    echo "NOTE: the drive is not ready: $(head -n 1 "$WORK/swap.err" 2>/dev/null)" >&2
+    echo "      Wait until the cartridge is loaded, then press ENTER again." >&2
+    return 1
+  fi
+  other_tape_map || return 1
+  info "This cartridge identifies as: $(safe_str "${OTHER_LABEL:-<unreadable>}")"
+  awk -F'|' '
+    FILENAME == ARGV[1] { need[$4] = $3; next }
+    $2 == "data_slice" && ($4 in need) && $3 == need[$4] && !($4 in seen) { seen[$4] = 1; print $1 "|" $4 "|" $3 }
+  ' "$WORK/needed.txt" "$WORK/other.files" >"$WORK/fetch.plan"
+  if [ ! -s "$WORK/fetch.plan" ]; then
+    info "No file in the front index of this cartridge has the sha256 of a slice still needed."
+    return 1
+  fi
+  : >"$WORK/fetched.txt"
+  while IFS='|' read -r pos sha size; do
+    require_uint position "$pos"
+    require_uint size_bytes "$size"
+    info "Tape file $pos of this cartridge lists sha256 ${sha:0:16}..., a slice still needed"
+    if [ "$VERIFY_ONLY" = 1 ]; then
+      if hash_tape_file "$pos" "$size" && [ "$TAPE_SHA" = "$sha" ]; then
+        info "  checksum verified: a good copy"
+        echo "$sha" >>"$WORK/fetched.txt"
+      else
+        echo "NOTE: tape file $pos of this cartridge does not hash to that sha256 either." >&2
+      fi
+      continue
+    fi
+    if read_slice_checked "$pos" "$size" "$sha" "$SCRATCH/fetch.enc"; then
+      info "  checksum verified against the first tape's front index"
+      while IFS='|' read -r job num _ rest; do
+        [ "${rest%%|*}" = "$sha" ] || continue
+        decrypt_slice "$SCRATCH/fetch.enc" "$SCRATCH/job.$job/restore.$num.dar" "$num"
+      done <"$WORK/needed.txt"
+      rm -f "$SCRATCH/fetch.enc"
+      echo "$sha" >>"$WORK/fetched.txt"
+    else
+      echo "NOTE: tape file $pos of this cartridge $SLICE_WHY: it is not used." >&2
+    fi
+  done <"$WORK/fetch.plan"
+  for job in ${PENDING[@]+"${PENDING[@]}"}; do
+    awk -F'|' 'FILENAME == ARGV[1] { got[$1] = 1; next } !($4 in got)' "$WORK/fetched.txt" "$WORK/job.$job.missing" >"$WORK/job.$job.missing.new"
+    mv "$WORK/job.$job.missing.new" "$WORK/job.$job.missing"
+  done
+  if [ "$VERIFY_ONLY" = 1 ]; then
+    local e
+    local -a keep=()
+    for e in ${VERIFY_BAD[@]+"${VERIFY_BAD[@]}"}; do
+      grep -qxF -- "${e##*|}" "$WORK/fetched.txt" || keep+=("$e")
+    done
+    VERIFY_BAD=(${keep[@]+"${keep[@]}"})
+  fi
+}
+
+# Ask for cartridges until nothing pending is still short or the heir says to
+# go on without. The first tape has been read to its end by now; nothing here
+# moves it back.
+swap_loop() {
+  local reply
+  while true; do
+    if [ "$VERIFY_ONLY" = 1 ]; then
+      verify_needed >"$WORK/needed.txt"
+    else
+      needed_slices >"$WORK/needed.txt"
+    fi
+    [ -s "$WORK/needed.txt" ] || return 0
+    print_needs -
+    info "Load a cartridge that holds copies of these slices into $DEVICE (any tape whose front index lists"
+    info "the sha256 values above; it need not be a copy of the whole tape), wait until the drive is ready,"
+    info "then press ENTER. Type done and ENTER (or end the input) to go on without them."
+    reply=done
+    IFS= read -r reply || reply=done
+    case "$reply" in
+    [dD]one | DONE | q | quit)
+      info "Going on without them."
+      return 0
+      ;;
+    esac
+    swap_fetch || true
+  done
+}
+
+# After the last unit has been read from the first tape: the second cartridge
+# for the units still short, then dar for each of them.
+finish_pending() {
+  local j
+  [ ${#PENDING[@]} -gt 0 ] || return 0
+  swap_loop
+  for j in "${PENDING[@]}"; do
+    job_run "$j"
+  done
+  PENDING=()
+}
+
+# The end of a restore: COMPLETE only when no unit came back short.
+restore_end() {
+  local line
+  note_other_units
+  echo ""
+  if [ ${#INCOMPLETE[@]} -gt 0 ]; then
+    info "RESTORE INCOMPLETE"
+    for line in "${INCOMPLETE[@]}"; do
+      printf '%s\n' "$line" | sed 's/^/>>> /'
+    done
+    for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"}; do
+      info "$line"
+    done
+    exit 1
+  fi
+  info "RESTORE COMPLETE"
+  for line in ${DONE_LINES[@]+"${DONE_LINES[@]}"}; do
+    info "$line"
+  done
+}
+
+# ---- --restore --fill-from LIST: the files an earlier restore could not restore ----
+
+# Restore, from the tape in the drive, exactly the files a damaged-file list
+# names, over the damaged or missing copies in the directory the list sits in,
+# and nothing else there. The tape is used only if its envelope lists the same
+# unit with the same uuid at the same version as the list's header; dar's own
+# checks confirm each file it restores. The list is rewritten with whatever is
+# still damaged, and removed when nothing is.
+FILL_ESC=()
+FILL_PATH=()
+do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
+  local destdir=$1 want_version=${2:-} scr=${3:-} list=$FILL_FROM
+  local first magic fmt f_unit f_uuid f_ver unit uuid ver line p root listdir todir sub
+  [ -f "$list" ] || die "--fill-from: no such file: $list"
+  [ -d "$destdir" ] || die "--to $destdir does not exist: a fill restores into the directory the earlier restore wrote"
+  first=""
+  IFS= read -r first <"$list" || true
+  magic="" fmt="" f_unit="" f_uuid="" f_ver=""
+  IFS=$'\t' read -r magic fmt f_unit f_uuid f_ver _ <<<"$first" || true
+  [ "$magic" = '#tapectl-damaged-files' ] ||
+    die "$list is not a list of damaged files written by this script: its first line is not the header"
+  [ "$fmt" = 1 ] || die "$list is a list of format $(safe_str "$fmt"); this script reads format 1"
+  case "$f_unit:$f_uuid:$f_ver" in
+  unit=*:uuid=?*:version=?*) ;;
+  *) die "$list: the header does not name a unit, its uuid and its version" ;;
+  esac
+  unesc_line "${f_unit#unit=}"
+  unit=$UNESC
+  uuid=${f_uuid#uuid=}
+  ver=${f_ver#version=}
+  require_uint version "$ver"
+  case "$uuid" in
+  *[!0-9a-fA-F-]*) die "$list: the unit uuid in the header is not a uuid" ;;
+  esac
+  if [ ${#RESTORE_UNITS[@]} -ne 1 ] || [ "${RESTORE_UNITS[0]}" != "$unit" ]; then
+    die "this list is for unit '$(visible_text "$unit")', version $ver: give --unit '$(visible_text "$unit")' (and only that unit)"
+  fi
+  if [ -n "$want_version" ] && [ "$want_version" != "$ver" ]; then
+    die "this list is for version $ver of '$(visible_text "$unit")', and --version says $want_version: a fill uses the list's version only"
+  fi
+
+  # The directory the list sits in is the unit's directory: --to itself for a
+  # restore of one unit, --to/UNIT for several.
+  listdir=$(cd "$(dirname -- "$list")" && pwd -P) || die "cannot enter the directory of $list"
+  todir=$(cd "$destdir" && pwd -P) || die "cannot enter --to $destdir"
+  root=""
+  if [ "$listdir" = "$todir" ]; then
+    root=$todir
+  else
+    sub=$(cd "$todir/$unit" 2>/dev/null && pwd -P || true)
+    if [ -n "$sub" ] && [ "$listdir" = "$sub" ]; then
+      root=$sub
+    fi
+  fi
+  [ -n "$root" ] ||
+    die "$list is not in --to ($todir) or in --to/UNIT: keep the list where the restore wrote it,
+       in the unit's own directory, and give the same --to"
+  [ "$(basename -- "$list")" = "$DAMAGED_NAME" ] || echo "NOTE: the list is named $(basename -- "$list"), not $DAMAGED_NAME; it is rewritten under the name it has." >&2
+
+  FILL_ESC=()
+  FILL_PATH=()
+  : >"$WORK/fill.wanted"
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    unesc_line "$line"
+    p=$UNESC
+    case "$p" in
+    /*) die "$list names an absolute path ($(visible_text "$p")): a list names paths inside the unit" ;;
+    esac
+    case "/$p/" in
+    */../*) die "$list names a path with .. in it ($(visible_text "$p")): a list names paths inside the unit" ;;
+    esac
+    if [ -d "$root/$p" ] && [ ! -L "$root/$p" ]; then
+      die "$list names a directory ($(visible_text "$p")): a fill restores files, and restoring a directory
+       would overwrite everything under it. Remove the line from the list."
+    fi
+    FILL_ESC+=("$line")
+    FILL_PATH+=("$p")
+    printf '%s\n' "$line" >>"$WORK/fill.wanted"
+  done < <(tail -n +2 "$list")
+  [ ${#FILL_PATH[@]} -gt 0 ] || die "$list names no file"
+  info "Filling ${#FILL_PATH[@]} file(s) of unit '$(visible_text "$unit")', version $ver, in $root"
+
+  SCRATCH_PARENT=${scr:-$root}
+  mkdir -p "$SCRATCH_PARENT"
+  check_stale_scratch "$root" "$SCRATCH_PARENT"
+  dar_check
+  set_age_ids
+  establish_files
+  [ "$SALVAGE" = 0 ] || salvage_init
+
+  walk_envelopes pick_for_restore
+  [ -n "$CHOSEN_ENV" ] || die_no_envelope "$(visible_text "$unit")"
+  info "Decrypted envelope at file $CHOSEN_POS"
+  info "  opened with key $CHOSEN_KEY"
+  local manifest="$CHOSEN_ENV/MANIFEST.toml" here
+  [ -f "$manifest" ] || die "envelope missing MANIFEST.toml"
+  here=$(unit_uuid_of "$CHOSEN_ENV" "$unit" "$ver")
+  if [ -z "$here" ]; then
+    echo "This tape lists the unit '$(visible_text "$unit")' as:" >&2
+    units_table "$manifest" >&2
+    die "this tape holds no version $ver of unit '$(visible_text "$unit")'. A fill uses the same unit at the same version
+       only (another version may differ in the very files that are damaged). Nothing was changed."
+  fi
+  if [ "$here" != "$uuid" ]; then
+    die "this tape's version $ver of '$(visible_text "$unit")' has unit uuid $(safe_str "$here"), and the list says $(safe_str "$uuid"):
+       it is not the same unit. Nothing was changed."
+  fi
+  local base
+  base=$(catalogue_path "$CHOSEN_ENV" "$unit" "$ver")
+  [ -n "$base" ] || die "this tape's envelope carries no dar catalogue for '$(visible_text "$unit")' version $ver, so a fill cannot
+       tell which slices hold the files. Restore the whole unit into another directory instead
+       (--restore --unit NAME --to NEWDIR) and copy the files from there."
+
+  # Which of the files this version's catalogue holds, and in which slices.
+  dar -l "$base" -N -Q -Tslice 2>"$WORK/fill.dar.err" |
+    FILL_WANTED="$WORK/fill.wanted" awk '__AWK_FILL_LISTING__' >"$WORK/fill.found" ||
+    die "dar could not read the catalogue of '$(visible_text "$unit")': $(tail -n 3 "$WORK/fill.dar.err")"
+  awk -F'\t' '$1 == "P" { print $2 }' "$WORK/fill.found" >"$WORK/fill.present"
+  awk -F'\t' '$1 == "S" { print $2 }' "$WORK/fill.found" | sort -n >"$WORK/fill.slices"
+  awk 'FILENAME == ARGV[1] { a[$0] = 1; next } !($0 in a)' "$WORK/fill.present" "$WORK/fill.wanted" >"$WORK/fill.absent"
+  if [ -s "$WORK/fill.absent" ]; then
+    echo "NOTE: $(wc -l <"$WORK/fill.absent") listed path(s) are not in this tape's catalogue of the version; they stay in the list:" >&2
+    sed 's/^/        /' "$WORK/fill.absent" | head -n 20 >&2
+  fi
+  if [ ! -s "$WORK/fill.present" ]; then
+    die "none of the listed files is in this tape's version $ver of '$(visible_text "$unit")'. The list is unchanged."
+  fi
+
+  pick_slices "$manifest" "$unit" "$WORK/slices.0" "$ver"
+  local last
+  last=$(tail -n 1 "$WORK/slices.0" | cut -d'|' -f1)
+  awk -F'|' -v last="$last" 'FILENAME == ARGV[1] { need[$1] = 1; next } ($1 in need) || $1 == last' "$WORK/fill.slices" "$WORK/slices.0" >"$WORK/fill.slice.list"
+  local total=0 n num tpos size sha
+  n=$(wc -l <"$WORK/fill.slice.list")
+  while IFS='|' read -r num tpos size sha; do
+    total=$((total + size))
+  done <"$WORK/fill.slice.list"
+  info "The files lie in $((n - 1)) slice(s) of $last; reading those and the last"
+  check_space "$root" "$SCRATCH_PARENT" "$total" "$total"
+  ensure_scratch
+
+  local j=$JOB_N
+  JOB_N=$((JOB_N + 1))
+  JOB_KIND[$j]=fill
+  JOB_DEST[$j]=$root
+  JOB_UNIT[$j]=$unit
+  JOB_VER[$j]=$ver
+  JOB_UUID[$j]=$uuid
+  mkdir -p "$SCRATCH/job.$j"
+  FILL_HEADER=$first
+  spool_slices "$WORK/fill.slice.list" "$SCRATCH/job.$j" "$WORK/job.$j.missing"
+  if [ -s "$WORK/job.$j.missing" ] && [ "$SWAP_TAPES" = 1 ]; then
+    PENDING+=("$j")
+    finish_pending
+  else
+    job_run "$j"
+  fi
+  fill_end "$list" "$root"
+}
+
+FILL_HEADER=""
+FILL_BAD="$WORK/fill.bad"
+
+# dar over the files of a fill, 500 paths to a run, always overwriting (these
+# are the files to replace) and never anything else: -g names a path and
+# takes no pattern. What dar reports it could not restore, and every path it
+# was never asked for because it is not in the catalogue, is still damaged.
+fill_extract() { # <job>
+  local j=$1 root i k rc run=0 errs skipped unmapped failed
+  root=$(abs_dir "${JOB_DEST[$j]}")
+  UNIT_NAME=${JOB_UNIT[$j]} UNIT_VER=${JOB_VER[$j]} UNIT_UUID=${JOB_UUID[$j]}
+  : >"$FILL_BAD"
+  local gone=""
+  if [ -s "$WORK/job.$j.missing" ]; then
+    gone=$(missing_numbers "$j")
+    print_needs "$j"
+    echo "NOTE: filling without slice(s) $gone: the files in them stay in the list." >&2
+  fi
+  awk 'FILENAME == ARGV[1] { a[$0] = 1; next } ($0 in a) { print FNR }' "$WORK/fill.present" "$WORK/fill.wanted" >"$WORK/fill.rows"
+  local -a g=()
+  local row
+  k=0
+  while true; do
+    g=()
+    while [ ${#g[@]} -lt 1000 ] && IFS= read -r row <&3; do
+      g+=(-g "${FILL_PATH[$((row - 1))]}")
+    done
+    [ ${#g[@]} -gt 0 ] || break
+    run=$((run + 1))
+    rc=0
+    info "Restoring $((${#g[@]} / 2)) file(s) over their damaged copies ..."
+    dar -x "$SCRATCH/job.$j/restore" -R "$root" -O -Q -N -w "${g[@]}" >"$WORK/fill.$run.log" 2>&1 </dev/null || rc=$?
+    cat "$WORK/fill.$run.log"
+    if [ "$rc" != 0 ] && grep -i 'no space left' "$WORK/fill.$run.log" >/dev/null 2>&1; then
+      die_io "dar extraction failed" "$WORK/fill.$run.log" "$root"
+    fi
+    if [ "$rc" != 0 ] && [ "$rc" != 5 ]; then
+      die "dar extraction failed (exit $rc) — dar's own message is above. The list is unchanged."
+    fi
+    DAMAGED_ROOT=$root DAMAGED_SKIPS=1 DAMAGED_COUNTS="$WORK/damaged.counts" \
+      awk '__AWK_DAR_DAMAGED__' "$WORK/fill.$run.log" >>"$FILL_BAD"
+    errs=0 skipped=0 unmapped=0 failed=0
+    read -r errs skipped unmapped failed <"$WORK/damaged.counts" || true
+    if [ "$unmapped" -gt 0 ] || [ "$failed" -ne "$errs" ]; then
+      echo "WARNING: dar reported $failed file(s) failed and this script could name $errs; a file it could not" >&2
+      echo "         name is missing from the rewritten list. Read dar's messages above." >&2
+    fi
+  done 3<"$WORK/fill.rows"
+  rm -rf "$SCRATCH/job.$j"
+}
+
+# After the fill: the list now holds the files still damaged, or is gone.
+fill_end() { # <list> <root>
+  local list=$1 root=$2 n
+  awk '
+    FILENAME == ARGV[1] { bad[$0] = 1; ord[++k] = $0; next }
+    FILENAME == ARGV[2] { if (!($0 in bad)) { bad[$0] = 1; ord[++k] = $0 } next }
+    { w[$0] = 1; if (($0 in bad) && !($0 in out)) { out[$0] = 1; print } }
+    END { for (i = 1; i <= k; i++) if (!(ord[i] in out)) { out[ord[i]] = 1; print ord[i] } }
+  ' "$WORK/fill.absent" "$FILL_BAD" "$WORK/fill.wanted" >"$WORK/fill.still"
+  n=$(wc -l <"$WORK/fill.still")
+  echo ""
+  if [ "$n" -eq 0 ]; then
+    rm -f "$list"
+    info "FILL COMPLETE: every listed file of '$(visible_text "$UNIT_NAME")' was restored from this tape into $root"
+    info "  (dar checked each one). $list is removed."
+    return 0
+  fi
+  {
+    printf '%s\n' "$FILL_HEADER"
+    cat "$WORK/fill.still"
+  } >"$list"
+  info "FILL INCOMPLETE: $n file(s) of '$(visible_text "$UNIT_NAME")' are still damaged or missing. The list now holds only those:"
+  info "  $list"
+  info "Fill them from another tape holding this unit at version $UNIT_VER, the same way."
+  exit 1
 }
 
 # ---- the cross-volume index (--where, --find; volume-format-v2.md 1.5) ----
@@ -3233,6 +4174,26 @@ case "${1:-}" in
   do_info
   ;;
 --verify)
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --slices-from)
+      [ $# -ge 2 ] || die "--slices-from needs a directory
+
+       usage: $0 --verify [--slices-from DIR ...] [--swap-tapes]"
+      SLICES_FROM+=("$2")
+      shift 2
+      ;;
+    --swap-tapes)
+      SWAP_TAPES=1
+      shift
+      ;;
+    *) die "unknown option: $1
+
+       usage: $0 --verify [--slices-from DIR ...] [--swap-tapes]" ;;
+    esac
+  done
+  check_slices_from
   require_tools "${TOOLS_READ[@]}"
   do_verify
   ;;
@@ -3265,7 +4226,7 @@ case "${1:-}" in
   # arity first and say which flag was short (#133).
   while [ $# -gt 0 ]; do
     case "$1" in
-    --key | --to | --unit | --version | --scratch | --path)
+    --key | --to | --unit | --version | --scratch | --path | --slices-from | --fill-from)
       [ $# -ge 2 ] || die "$1 needs a value
 
        usage: $0 --restore --key KEYFILE --to DIR [--unit U | --all] [--version N]"
@@ -3276,11 +4237,17 @@ case "${1:-}" in
       --version) want=$2 ;;
       --scratch) scratch=$2 ;;
       --path) RESTORE_PATHS+=("$2") ;;
+      --slices-from) SLICES_FROM+=("$2") ;;
+      --fill-from) FILL_FROM=$2 ;;
       esac
       shift 2
       ;;
     --all)
       RESTORE_ALL=1
+      shift
+      ;;
+    --swap-tapes)
+      SWAP_TAPES=1
       shift
       ;;
     --no-space-check)
@@ -3299,6 +4266,12 @@ case "${1:-}" in
   if [ "$RESTORE_ALL" = 1 ] && [ ${#RESTORE_UNITS[@]} -gt 0 ]; then
     die "--all restores every unit; give it without --unit"
   fi
+  check_slices_from
+  if [ -n "$FILL_FROM" ]; then
+    [ "$RESTORE_ALL" = 0 ] || die "--fill-from fills the files of one unit: give --unit U, not --all"
+    [ ${#RESTORE_PATHS[@]} -eq 0 ] || die "--fill-from restores the files its list names: it takes no --path"
+    [ ${#RESTORE_UNITS[@]} -eq 1 ] || die "--fill-from needs the unit its list is for: give --unit U (once)"
+  fi
   if [ ${#RESTORE_PATHS[@]} -gt 0 ]; then
     require_tools "${TOOLS_PATH[@]}"
   else
@@ -3306,7 +4279,11 @@ case "${1:-}" in
   fi
   require_key_files
   [ -z "$want" ] || require_uint version "$want"
-  do_restore "$dest" "$want" "$scratch"
+  if [ -n "$FILL_FROM" ]; then
+    do_fill "$dest" "$want" "$scratch"
+  else
+    do_restore "$dest" "$want" "$scratch"
+  fi
   ;;
 --list)
   shift
@@ -3394,11 +4371,11 @@ case "${1:-}" in
   echo ""
   echo "Usage:"
   echo "  $0 --info                                       Show tape layout + seal verdict"
-  echo "  $0 --verify                                     Keyless integrity check"
+  echo "  $0 --verify [--slices-from DIR ...] [--swap-tapes]   Keyless integrity check"
   echo "  $0 --find-envelope --key KEYFILE [--key K2 ...]  Decrypt your envelope"
   echo "  $0 --restore --key KEYFILE [--key K2 ...] --to DIR"
   echo "               [--unit U [--unit U2 ...] | --all] [--version N]"
-  echo "               [--no-space-check] [--overwrite]"
+  echo "               [--no-space-check] [--overwrite] [--slices-from DIR ...] [--swap-tapes]"
   echo "      Full restore. Without --version the NEWEST version of the unit on"
   echo "      this volume is restored. To see which versions this tape holds,"
   echo "      run --find-envelope --key KEYFILE: snapshot_version lives in the"
@@ -3444,6 +4421,31 @@ case "${1:-}" in
   echo "      dar older than 2.7.21, or dar older than 2.7.9) its slices are"
   echo "      decrypted to disk first, in --scratch DIR (default: inside --to)."
   echo "  A dar built with GPG support needs gpg (package gnupg) to start."
+  echo "  --slices-from DIR   (--restore, --verify; repeat it for more directories) A directory of"
+  echo "      slice files copied off another tape that holds a copy of the unit, under any names."
+  echo "      When a slice of this tape fails its sha256 or will not read, a file in DIR is used in"
+  echo "      its place only if the sha256 of its first bytes is the one this tape's front index"
+  echo "      lists for that slice: never by position or by name. A copy made with dd, still"
+  echo "      padded to the tape block, will do. A file of the right size but another hash is"
+  echo "      named and not used."
+  echo "  --swap-tapes   (--restore, --verify) When slices are still missing after this tape has"
+  echo "      been read, say which (their number and sha256), wait for ENTER with another cartridge"
+  echo "      in the drive, and read just those slices from it: any tape whose front index lists the"
+  echo "      same sha256 values. Each tape is read forward from one rewind. Type done and ENTER to"
+  echo "      go on without them. Needs the input to be a terminal, or a line of input per swap."
+  echo "      Either option restores the way an older dar does, a slice at a time onto disk, so --to"
+  echo "      needs about twice the unit's size (--scratch DIR puts the slices on another disk)."
+  echo "      Without them a slice that fails stops the restore, and says so."
+  echo "  A restore in which dar names files it could not restore (a failed CRC, a slice it was"
+  echo "      not given) writes their paths, one per line, to .tapectl-damaged-files.txt in the"
+  echo "      unit's directory, restores the rest, and ends RESTORE INCOMPLETE with exit status 1."
+  echo "  $0 --restore --key KEYFILE --to DIR --unit U --fill-from LIST"
+  echo "      With another tape that holds the SAME unit AT THE SAME VERSION: restore only the"
+  echo "      files LIST names, over their damaged copies, and nothing else in the directory. The"
+  echo "      first line of the list records the unit, its uuid and its version, and a tape that"
+  echo "      lists another is refused; no other version is ever used. dar checks each file. The"
+  echo "      list is rewritten with what is still damaged and removed when nothing is. Give --to"
+  echo "      the same directory as the restore (the list is in it, or in --to/UNIT)."
   echo "  --no-space-check   Skip that check (a compressed or thin-provisioned"
   echo "      filesystem can hold more than df reports)."
   echo "  --overwrite   --to must otherwise be empty or new: dar keeps a file"
@@ -3487,6 +4489,8 @@ esac
         .replace("__AWK_INDEX_COMMON__", AWK_INDEX_COMMON)
         .replace("__AWK_INDEX_WHERE__", AWK_INDEX_WHERE)
         .replace("__AWK_INDEX_FIND__", AWK_INDEX_FIND)
+        .replace("__AWK_DAR_DAMAGED__", AWK_DAR_DAMAGED)
+        .replace("__AWK_FILL_LISTING__", AWK_FILL_LISTING)
         .replace("__TOOLS_READ__", &tools_for(MODE_READ).join(" "))
         .replace("__TOOLS_ENVELOPE__", &tools_for(MODE_ENVELOPE).join(" "))
         .replace("__TOOLS_LIST__", &tools_for(MODE_LIST).join(" "))
@@ -3945,9 +4949,9 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE,
-        AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
-        AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
+        AWK_CHECK_FILE_LIST, AWK_DAR_DAMAGED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
+        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
+        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
     #[test]
@@ -5060,12 +6064,194 @@ sha256_encrypted = \"bbb\"
             ("AWK_INDEX_COMMON", AWK_INDEX_COMMON),
             ("AWK_INDEX_WHERE", AWK_INDEX_WHERE),
             ("AWK_INDEX_FIND", AWK_INDEX_FIND),
+            ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
+            ("AWK_FILL_LISTING", AWK_FILL_LISTING),
         ] {
             assert!(
                 script.contains(fragment),
                 "{name} is not a verbatim substring of the assembled script"
             );
         }
+    }
+
+    /// ADR-0012 item 102: the fragment that reads dar's messages, on dar's
+    /// REAL output for names that break a line-by-line reading: a name holding
+    /// the very separator dar prints, a newline, a TAB and a backslash. Each
+    /// comes out once, escaped as sec 1.5 escapes a path; the count it names
+    /// equals the one in dar's own summary. Needs `dar` and `awk` (issue #43).
+    #[test]
+    fn the_damaged_file_reader_names_every_file_dar_could_not_restore() {
+        use std::process::Command;
+        let work = tempfile::tempdir().unwrap();
+        let dir = work.path();
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let names = [
+            "plain.bin",
+            "we ird : name.bin",
+            "nl\nline.bin",
+            "tab\there.bin",
+            "back\\slash.bin",
+        ];
+        for (i, n) in names.iter().enumerate() {
+            let body: Vec<u8> = (0..50_000u32)
+                .map(|k| (k.wrapping_mul(2654435761).wrapping_add(i as u32 * 97) >> 13) as u8)
+                .collect();
+            std::fs::write(src.join(n), body).unwrap();
+        }
+        let dar = |args: &[&str]| {
+            Command::new("dar")
+                .args(args)
+                .env("HOME", "/nonexistent")
+                .output()
+                .expect("dar must be on PATH (issue #43)")
+        };
+        let arch = dir.join("arch");
+        let o = dar(&[
+            "-c",
+            arch.to_str().unwrap(),
+            "-R",
+            src.to_str().unwrap(),
+            "-s",
+            "50k",
+            "-Q",
+            "-N",
+        ]);
+        assert!(o.status.success());
+        // Damage every slice but the last (it holds the catalogue), in
+        // several places.
+        let mut n = 1;
+        while dir.join(format!("arch.{}.dar", n + 1)).exists() {
+            let p = dir.join(format!("arch.{n}.dar"));
+            let mut b = std::fs::read(&p).unwrap();
+            for off in [1_000usize, 10_007, 20_015, 30_031, 40_063] {
+                b[off] ^= 0xff;
+            }
+            std::fs::write(&p, b).unwrap();
+            n += 1;
+        }
+        assert!(n > 2, "positive control: several slices were damaged");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let o = dar(&[
+            "-x",
+            arch.to_str().unwrap(),
+            "-R",
+            out.to_str().unwrap(),
+            "-O",
+            "-Q",
+            "-N",
+        ]);
+        assert_eq!(o.status.code(), Some(5), "dar says some files failed");
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let log_path = dir.join("dar.log");
+        std::fs::write(&log_path, &log).unwrap();
+        let counts = dir.join("counts");
+        let o = Command::new("awk")
+            .arg(AWK_DAR_DAMAGED)
+            .arg(&log_path)
+            .env("DAMAGED_ROOT", &out)
+            .env("DAMAGED_SKIPS", "0")
+            .env("DAMAGED_COUNTS", &counts)
+            .output()
+            .expect("awk");
+        assert!(o.status.success());
+        let mut listed: Vec<String> = String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let esc = |s: &str| {
+            s.replace('\\', "\\\\")
+                .replace('\t', "\\t")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+        };
+        let mut want: Vec<String> = names
+            .iter()
+            .filter(|n| std::fs::read(out.join(n)).ok() != std::fs::read(src.join(n)).ok())
+            .map(|n| esc(n))
+            .collect();
+        assert!(want.len() >= 3, "positive control: {want:?}\n{log}");
+        listed.sort();
+        want.sort();
+        assert_eq!(listed, want, "{log}");
+        let c = std::fs::read_to_string(&counts).unwrap();
+        let nums: Vec<usize> = c.split_whitespace().map(|x| x.parse().unwrap()).collect();
+        assert_eq!(nums[0], listed.len(), "errors named: {c}");
+        assert_eq!(nums[2], 0, "none left unnamed: {c}");
+        assert_eq!(nums[3], listed.len(), "dar's own failed count: {c}");
+        assert!(
+            listed.iter().any(|l| l == "we ird : name.bin"),
+            "a name holding the separator keeps its whole name: {listed:?}"
+        );
+
+        // The other form dar prints: a slice that was never there.
+        let clean = dir.join("clean");
+        std::fs::create_dir_all(&clean).unwrap();
+        let o = dar(&[
+            "-c",
+            clean.join("arch").to_str().unwrap(),
+            "-R",
+            src.to_str().unwrap(),
+            "-s",
+            "50k",
+            "-Q",
+            "-N",
+        ]);
+        assert!(o.status.success());
+        std::fs::remove_file(clean.join("arch.2.dar")).unwrap();
+        let out2 = dir.join("out2");
+        std::fs::create_dir_all(&out2).unwrap();
+        let o = dar(&[
+            "-x",
+            clean.join("arch").to_str().unwrap(),
+            "-R",
+            out2.to_str().unwrap(),
+            "-O",
+            "-Q",
+            "-N",
+        ]);
+        let log2 = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        std::fs::write(&log_path, &log2).unwrap();
+        let run = |skips: &str| -> Vec<String> {
+            let o = Command::new("awk")
+                .arg(AWK_DAR_DAMAGED)
+                .arg(&log_path)
+                .env("DAMAGED_ROOT", &out2)
+                .env("DAMAGED_SKIPS", skips)
+                .env("DAMAGED_COUNTS", &counts)
+                .output()
+                .expect("awk");
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let mut skipped = run("1");
+        let mut want2: Vec<String> = names
+            .iter()
+            .filter(|n| std::fs::read(out2.join(n)).ok() != std::fs::read(src.join(n)).ok())
+            .map(|n| esc(n))
+            .collect();
+        assert!(
+            !want2.is_empty(),
+            "positive control: a slice's files are missing\n{log2}"
+        );
+        skipped.sort();
+        want2.sort();
+        assert_eq!(skipped, want2, "{log2}");
+        assert!(
+            run("0").is_empty(),
+            "without a missing slice, 'user choice' means a file that was already there"
+        );
     }
 
     /// The template substitutes each `__AWK_*__` placeholder for its named
@@ -5100,6 +6286,8 @@ sha256_encrypted = \"bbb\"
             ("AWK_INDEX_COMMON", AWK_INDEX_COMMON),
             ("AWK_INDEX_WHERE", AWK_INDEX_WHERE),
             ("AWK_INDEX_FIND", AWK_INDEX_FIND),
+            ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
+            ("AWK_FILL_LISTING", AWK_FILL_LISTING),
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");
         }

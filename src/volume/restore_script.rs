@@ -459,3 +459,144 @@ pub(crate) const AWK_INDEX_FIND: &str = r##"
       close(cf)
     }
   "##;
+
+/// The files dar could not restore, from the log of one extraction (ADR-0012
+/// item 102). dar prints `Error while restoring PATH : REASON` for a file whose
+/// data failed its CRC or whose slice was cut short, and, when a slice was not
+/// there at all, `PATH not restored (user choice)` (the form `DAMAGED_SKIPS=1`
+/// adds: with every slice present the same words mean a file that already
+/// existed). PATH is absolute: dar prints the `-R` it was given verbatim, so
+/// `DAMAGED_ROOT` (that directory, without a trailing slash) is cut from the
+/// front. A path may hold a newline, so a message continues over lines until
+/// it ends: the REASON follows the LAST ` : ` of the message (a name may hold
+/// one), and a skip ends with its fixed words.
+///
+/// Prints one path per line, relative to the unit root and escaped as the
+/// index is (`volume-format-v2.md` sec 1.5: backslash, TAB, LF and CR only),
+/// each once. Writes `ERRORS SKIPPED UNMAPPED FAILED` to the file
+/// `DAMAGED_COUNTS`: the messages of each kind, the ones that could not be
+/// turned into a path (so the list is short of them), and the figure dar
+/// itself gave for `inode(s) failed to restore`.
+pub(crate) const AWK_DAR_DAMAGED: &str = r##"
+    function esc(s,    out, i, n, c) {
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") out = out "\\\\"
+        else if (c == "\t") out = out "\\t"
+        else if (c == "\n") out = out "\\n"
+        else if (c == "\r") out = out "\\r"
+        else out = out c
+      }
+      return out
+    }
+    function lastsep(s,    p, q) {
+      p = 0
+      while ((q = index(substr(s, p + 1), " : ")) > 0) p = p + q
+      return p
+    }
+    function emit(path,    e) {
+      if (index(path, root) != 1 || length(path) <= rl) { unmapped++; return }
+      e = esc(substr(path, rl + 1))
+      if (!(e in seen)) { seen[e] = 1; print e }
+    }
+    BEGIN {
+      root = ENVIRON["DAMAGED_ROOT"] "/"
+      rl = length(root)
+      skips = (ENVIRON["DAMAGED_SKIPS"] == "1")
+      counts = ENVIRON["DAMAGED_COUNTS"]
+      tail = " not restored (user choice)"
+      tl = length(tail)
+    }
+    {
+      if (acc != "" && (index($0, "Error while restoring ") == 1 || $0 ~ /^ -----/ || (kind == "S" && index($0, root) == 1))) {
+        unmapped++; acc = ""; kind = ""
+      }
+      if (acc == "") {
+        if (index($0, "Error while restoring ") == 1) { acc = substr($0, 23); kind = "E" }
+        else if (skips && index($0, root) == 1) { acc = $0; kind = "S" }
+        else {
+          if ($0 ~ /^ [0-9]+ inode\(s\) failed to restore/) failed = $1 + 0
+          next
+        }
+      } else {
+        acc = acc "\n" $0
+      }
+      if (kind == "E") {
+        p = lastsep(acc)
+        if (p > 0) { emit(substr(acc, 1, p - 1)); errs++; acc = ""; kind = "" }
+      } else {
+        n = length(acc)
+        if (n >= tl && substr(acc, n - tl + 1) == tail) { emit(substr(acc, 1, n - tl)); skipped++; acc = ""; kind = "" }
+      }
+    }
+    END {
+      if (acc != "") unmapped++
+      print errs + 0, skipped + 0, unmapped + 0, failed + 0 > counts
+      close(counts)
+    }
+  "##;
+
+/// Which of the wanted paths a unit version's dar catalogue holds, and in
+/// which slices (`--fill-from`, ADR-0012 item 102). The input is
+/// `dar -l CATALOGUE -N -Q -Tslice`, whose entry lines are the slice number or
+/// range, a TAB, flag brackets, the ten-character permission string and the
+/// path (which runs on over further lines when it holds a newline). The
+/// wanted paths come from the file named by `FILL_WANTED`, one per line,
+/// escaped as sec 1.5 escapes a path; an entry is matched when its path, so
+/// escaped, equals one of them exactly.
+///
+/// Prints `P TAB escaped path` for each wanted path the catalogue holds and
+/// `S TAB n` once for each slice holding data of one of them: a file in
+/// slices 3-5 needs all three, and a slice that holds only other files is not
+/// asked for.
+pub(crate) const AWK_FILL_LISTING: &str = r##"
+    function esc(s,    out, i, n, c) {
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") out = out "\\\\"
+        else if (c == "\t") out = out "\\t"
+        else if (c == "\n") out = out "\\n"
+        else if (c == "\r") out = out "\\r"
+        else out = out c
+      }
+      return out
+    }
+    function flush(    e, a, k, lo, hi, i) {
+      if (!open) return
+      open = 0
+      e = esc(path)
+      if ((e in want) && !(e in done)) {
+        done[e] = 1
+        print "P\t" e
+        k = split(slices, a, "-")
+        lo = a[1] + 0
+        hi = (k > 1) ? a[2] + 0 : lo
+        for (i = lo; i <= hi; i++) if (!(i in mark)) { mark[i] = 1; print "S\t" i }
+      }
+    }
+    BEGIN {
+      wf = ENVIRON["FILL_WANTED"]
+      while ((getline line < wf) > 0) want[line] = 1
+      close(wf)
+      perm = " [^ ][-rwxsStT][-rwxsStT][-rwxsStT][-rwxsStT][-rwxsStT][-rwxsStT][-rwxsStT][-rwxsStT][-rwxsStT] "
+    }
+    $0 == "-----" { flush(); stopped = 1 }
+    stopped { next }
+    /^[0-9]+(-[0-9]+)?\t / {
+      flush()
+      t = index($0, "\t")
+      rest = substr($0, t + 1)
+      if (match(rest, perm)) {
+        slices = substr($0, 1, t - 1)
+        path = substr(rest, RSTART + RLENGTH)
+        open = 1
+      }
+      next
+    }
+    open { path = path "\n" $0 }
+    END { flush() }
+  "##;

@@ -94,7 +94,11 @@ fn write_exec(path: &Path, body: &str) {
 /// `mt`: rewind, fsf N, status, setblk, --version. `FAKE_MT_GNU=1` makes it
 /// GNU cpio's mt (no setblk, its own status wording); `FAKE_MT_STATUS_LIE=1`
 /// makes `status` report one file further on than the head really is, as if
-/// something else had moved the tape.
+/// something else had moved the tape. `FAKE_SWAP_ON_SETBLK=N` puts another
+/// cartridge in the drive at the Nth `setblk`: the directory `tape2` becomes
+/// `tape`, the head is at the start, and a line `swap` is logged to `ops`
+/// (what follows it is the second tape's). A script asking for another
+/// cartridge sets the block size again once it has one.
 const FAKE_MT: &str = r#"#!/bin/sh
 T="$FAKE_TAPE"
 op=""; n=""
@@ -154,6 +158,17 @@ case "$op" in
     if [ -n "${FAKE_MT_GNU:-}" ]; then
       echo "mt: invalid argument 'setblk' for 'operation'" >&2
       exit 2
+    fi
+    if [ -n "${FAKE_SWAP_ON_SETBLK:-}" ]; then
+      c=$(cat "$T/setblk.count" 2>/dev/null || echo 0)
+      c=$((c + 1))
+      echo "$c" >"$T/setblk.count"
+      if [ "$c" = "$FAKE_SWAP_ON_SETBLK" ]; then
+        mv "$T/tape" "$T/tape.first"
+        mv "$T/tape2" "$T/tape"
+        echo 0 >"$T/pos"
+        echo swap >>"$T/ops"
+      fi
     fi ;;
 esac
 exit 0
@@ -261,6 +276,13 @@ struct UnitSpec {
     seed: u64,
     files: usize,
     file_len: usize,
+    /// File names, when the unit's files are not `file{i}.bin`.
+    names: &'static [&'static str],
+    /// Byte flips made in a slice's plaintext BEFORE it is encrypted and
+    /// hashed, as (slice index, offset): the damage is in the archive as
+    /// staged, so the tape's hashes agree with it and only dar's own CRC
+    /// per file sees it.
+    corrupt: &'static [(usize, usize)],
 }
 
 struct TenantSpec {
@@ -274,6 +296,10 @@ pub struct UnitOnTape {
     pub name: String,
     pub src: PathBuf,
     pub positions: Vec<i64>,
+    /// Each slice's exact size on tape (before the block padding), and the
+    /// sha256 of those bytes.
+    pub sizes: Vec<usize>,
+    pub hashes: Vec<String>,
 }
 
 /// A built fake volume, kept as a template and copied per test.
@@ -315,6 +341,8 @@ fn template() -> &'static Template {
                         seed: 1,
                         files: 5,
                         file_len: 150_000,
+                        names: &[],
+                        corrupt: &[],
                     },
                     UnitSpec {
                         name: "docs",
@@ -324,6 +352,8 @@ fn template() -> &'static Template {
                         seed: 2,
                         files: 2,
                         file_len: 140_000,
+                        names: &[],
+                        corrupt: &[],
                     },
                 ],
             },
@@ -337,6 +367,8 @@ fn template() -> &'static Template {
                     seed: 3,
                     files: 2,
                     file_len: 130_000,
+                    names: &[],
+                    corrupt: &[],
                 }],
             },
             TenantSpec {
@@ -350,6 +382,8 @@ fn template() -> &'static Template {
                         seed: 4,
                         files: 3,
                         file_len: 120_000,
+                        names: &[],
+                        corrupt: &[],
                     },
                     UnitSpec {
                         name: "nocat",
@@ -359,6 +393,8 @@ fn template() -> &'static Template {
                         seed: 5,
                         files: 3,
                         file_len: 110_000,
+                        names: &[],
+                        corrupt: &[],
                     },
                 ],
             },
@@ -382,6 +418,8 @@ fn lone_template() -> &'static Template {
             seed,
             files: 2,
             file_len: 110_000,
+            names: &[],
+            corrupt: &[],
         };
         let tenants = vec![
             TenantSpec {
@@ -420,6 +458,8 @@ fn solo_template() -> &'static Template {
                 seed: 13,
                 files: 2,
                 file_len: 110_000,
+                names: &[],
+                corrupt: &[],
             }],
         }];
         build_template("solo", &tenants, false)
@@ -699,11 +739,13 @@ fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Templa
             let src = dir.join("src").join(u.name);
             std::fs::create_dir_all(&src).unwrap();
             for i in 0..u.files {
-                std::fs::write(
-                    src.join(format!("file{i}.bin")),
-                    content(u.seed * 100 + i as u64, u.file_len),
-                )
-                .unwrap();
+                let name = if u.names.is_empty() {
+                    format!("file{i}.bin")
+                } else {
+                    u.names[i].to_string()
+                };
+                std::fs::write(src.join(name), content(u.seed * 100 + i as u64, u.file_len))
+                    .unwrap();
             }
             std::fs::create_dir_all(src.join("sub")).unwrap();
             std::fs::write(
@@ -759,6 +801,9 @@ fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Templa
                     break;
                 }
                 slices.push(std::fs::read(p).unwrap());
+            }
+            for &(idx, off) in u.corrupt {
+                slices[idx][off] ^= 0xff;
             }
             let catalogue = (u.cat != Cat::Absent).then(|| {
                 std::fs::read(work.join(format!("{}_v{}.1.dar", &u.uuid[..8], u.version))).unwrap()
@@ -966,6 +1011,18 @@ fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Templa
             name: s.unit.name.clone(),
             src: s.src.clone(),
             positions: s.unit.slices.iter().map(|sl| sl.tape_position).collect(),
+            sizes: s
+                .unit
+                .slices
+                .iter()
+                .map(|sl| sl.encrypted_bytes as usize)
+                .collect(),
+            hashes: s
+                .unit
+                .slices
+                .iter()
+                .map(|sl| sl.sha256_encrypted.clone())
+                .collect(),
         })
         .collect();
     Template {
@@ -1141,7 +1198,22 @@ impl Heir {
     }
 
     fn run_env(&self, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
+        self.run_input(args, env, "")
+    }
+
+    /// Run the script with `input` on its standard input (the ENTERs a
+    /// `--swap-tapes` run waits for).
+    fn run_input(&self, args: &[&str], env: &[(&str, &str)], input: &str) -> (i32, String) {
+        use std::io::Write;
+        use std::process::Stdio;
         std::fs::write(self.dir.join("ops"), "").unwrap();
+        // A second cartridge swapped in by an earlier run goes back first.
+        let first = self.dir.join("tape.first");
+        if first.exists() {
+            std::fs::rename(self.dir.join("tape"), self.dir.join("tape2")).unwrap();
+            std::fs::rename(first, self.dir.join("tape")).unwrap();
+        }
+        let _ = std::fs::remove_file(self.dir.join("setblk.count"));
         let mut cmd = Command::new("timeout");
         cmd.args(["-k", "10", "300", "bash"])
             .arg(self.dir.join("RESTORE.sh"))
@@ -1151,11 +1223,19 @@ impl Heir {
             .env("FAKE_TAPE", &self.dir)
             .env("TAPE_DEVICE", "/dev/nst-fake")
             .env("TMPDIR", self.dir.join("tmp"))
-            .env("HOME", self.dir.join("home"));
+            .env("HOME", self.dir.join("home"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         for (k, v) in env {
             cmd.env(k, v);
         }
-        let o = cmd.output().expect("spawn RESTORE.sh");
+        let mut child = cmd.spawn().expect("spawn RESTORE.sh");
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        let o = child.wait_with_output().expect("wait for RESTORE.sh");
         let mut text = String::from_utf8_lossy(&o.stdout).to_string();
         text.push_str(&String::from_utf8_lossy(&o.stderr));
         let code = o.status.code().unwrap_or(-1);
@@ -3906,4 +3986,1384 @@ fn the_completeness_check_in_file_1_counts_what_dar_restored() {
         restored.to_string(),
         "grep -c -E agrees"
     );
+}
+
+// ---- replacement slices and the damaged-file list (ADR-0012 items 101, 102) ----
+
+/// Every file under `dir`, as paths relative to it.
+fn rel_files(dir: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, at: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(at).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                walk(root, &e.path(), out);
+            } else {
+                out.push(e.path().strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// The files of `src` that `dest` does not hold byte for byte (missing, or
+/// different), relative to the roots, sorted.
+fn damaged_by_diff(src: &Path, dest: &Path) -> Vec<String> {
+    rel_files(src)
+        .into_iter()
+        .filter(|rel| std::fs::read(dest.join(rel)).ok() != std::fs::read(src.join(rel)).ok())
+        .map(|rel| rel.to_string_lossy().to_string())
+        .collect()
+}
+
+/// The slice at index `idx` of `u`, as another tape holds it: its exact bytes.
+fn good_slice(t: &Template, u: &UnitOnTape, idx: usize) -> Vec<u8> {
+    let mut bytes = std::fs::read(t.dir.join("tape").join(u.positions[idx].to_string())).unwrap();
+    bytes.truncate(u.sizes[idx]);
+    assert_eq!(
+        sha256_hex(&bytes),
+        u.hashes[idx],
+        "the template's own slice"
+    );
+    bytes
+}
+
+/// Flip a byte inside the slice at tape file `pos` of this heir's tape. The
+/// stub age does not authenticate, so the damage gets through it and meets
+/// the front index's hash.
+fn flip_in_tape(h: &Heir, pos: i64) {
+    let f = h.dir.join("tape").join(pos.to_string());
+    let mut bytes = std::fs::read(&f).unwrap();
+    bytes[100] ^= 0xff;
+    std::fs::write(&f, bytes).unwrap();
+}
+
+/// A directory of slice files under names that say nothing about the slice.
+fn slices_dir(h: &Heir, name: &str, files: &[(&str, Vec<u8>)]) -> String {
+    let d = h.dir.join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    for (n, bytes) in files {
+        std::fs::write(d.join(n), bytes).unwrap();
+    }
+    d.display().to_string()
+}
+
+fn restore_args<'a>(h: &'a Heir, unit: &'a str, dest: &'a str) -> Vec<String> {
+    vec![
+        "--restore".to_string(),
+        "--key".to_string(),
+        h.key("alice"),
+        "--unit".to_string(),
+        unit.to_string(),
+        "--to".to_string(),
+        dest.to_string(),
+    ]
+}
+
+fn runv(h: &Heir, args: &[String]) -> (i32, String) {
+    let all: Vec<&str> = args.iter().map(String::as_str).collect();
+    h.run_input(&all, &[], "")
+}
+
+fn run_with(
+    h: &Heir,
+    args: &[String],
+    extra: &[&str],
+    input: &str,
+    env: &[(&str, &str)],
+) -> (i32, String) {
+    let mut all: Vec<&str> = args.iter().map(String::as_str).collect();
+    all.extend_from_slice(extra);
+    h.run_input(&all, env, input)
+}
+
+/// A second cartridge in `h`'s `tape2`: copies of `slices` laid out as another
+/// copy of the unit would lay them, after a decoy slice and in reverse order,
+/// under its own label and volume uuid. Its front index lists every file with
+/// its hash, so the script can find a slice by hash and by nothing else.
+fn second_tape(h: &Heir, label: &str, uuid: &str, slices: &[Vec<u8>]) {
+    let mut files: Vec<(i64, &'static str, Vec<u8>)> = Vec::new();
+    let decoy = stub_encrypt("alice,op,esc", "", &content(999, 40_000));
+    let mut next = 4i64;
+    let mut data: Vec<(i64, &'static str, Vec<u8>)> = vec![(next, "data_slice", decoy)];
+    next += 1;
+    for s in slices.iter().rev() {
+        data.push((next, "data_slice", s.clone()));
+        next += 1;
+    }
+    let seal_pos = next;
+    let total_files = (seal_pos + 1) as i32;
+    files.push((
+        0,
+        "id_thunk",
+        generate_id_thunk_v2(&IdThunkV2Params {
+            label,
+            uuid,
+            media_type: "LTO-6",
+            tapectl_version: "1.3.0",
+            nominal_capacity: 2_500_000_000_000,
+            mam_capacity: 2_500_000_000_000,
+            total_files,
+            mam_manufacturer: "HP",
+            mam_serial: "SERIAL02",
+            mam_length: 846,
+            mam_loads: 1,
+            created_at: "2026-10-06T00:00:00Z",
+            cartridge_identity_source: Some("mam"),
+        })
+        .into_bytes(),
+    ));
+    files.push((
+        1,
+        "system_guide",
+        generate_system_guide_v2(label, total_files).into_bytes(),
+    ));
+    files.push((
+        2,
+        "restore_sh",
+        generate_restore_script_v2(label, total_files).into_bytes(),
+    ));
+    files.extend(data);
+    let mut fi: Vec<FrontIndexFile> = vec![];
+    for pos in 0..total_files as i64 {
+        if pos == 3 || pos == seal_pos {
+            fi.push(FrontIndexFile {
+                position: pos as i32,
+                type_label: if pos == 3 {
+                    "front_index"
+                } else {
+                    "seal_marker"
+                },
+                size_bytes: None,
+                sha256_encrypted: None,
+            });
+        } else {
+            let (_, ty, bytes) = files.iter().find(|(p, _, _)| *p == pos).unwrap();
+            fi.push(FrontIndexFile {
+                position: pos as i32,
+                type_label: ty,
+                size_bytes: Some(bytes.len() as u64),
+                sha256_encrypted: Some(sha256_hex(bytes)),
+            });
+        }
+    }
+    let front = generate_front_index(label, &fi).into_bytes();
+    let front_sha = sha256_hex(&front);
+    let mut sealed = fi.clone();
+    sealed[3].size_bytes = Some(front.len() as u64);
+    sealed[3].sha256_encrypted = Some(front_sha.clone());
+    let seal = generate_seal_marker(label, total_files, &front_sha, &sealed).into_bytes();
+    files.push((3, "front_index", front));
+    files.push((seal_pos, "seal_marker", seal));
+    let dir = h.dir.join("tape2");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (pos, _, bytes) in files {
+        std::fs::write(dir.join(pos.to_string()), padded(bytes)).unwrap();
+    }
+}
+
+/// The reads (`dd N`) and rewinds of the ops from `from` to `to` (exclusive).
+fn segment(ops: &[String], from: usize, to: usize) -> (Vec<i64>, usize) {
+    let seg = &ops[from..to];
+    let reads = seg
+        .iter()
+        .filter_map(|l| l.strip_prefix("dd "))
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let rewinds = seg.iter().filter(|l| l.as_str() == "mt rewind").count();
+    (reads, rewinds)
+}
+
+/// The ops of a `--swap-tapes` run, split where the cartridge changed: the
+/// first tape's, and the second's.
+fn tapes_of(h: &Heir) -> ((Vec<i64>, usize), (Vec<i64>, usize)) {
+    let ops = h.ops();
+    let at = ops
+        .iter()
+        .position(|l| l == "swap")
+        .unwrap_or_else(|| panic!("no swap in the ops:\n{ops:#?}"));
+    (segment(&ops, 0, at), segment(&ops, at, ops.len()))
+}
+
+fn ascending(reads: &[i64]) -> bool {
+    reads.windows(2).all(|w| w[0] < w[1])
+}
+
+/// A bad slice on the tape is taken from a directory of slice files, matched
+/// by the sha256 the front index lists and by nothing else: under a name that
+/// belongs to another slice, block-padded as `dd` copies it, with a file of
+/// exactly the right size and the wrong bytes passed over by name.
+#[test]
+fn a_bad_slice_is_replaced_from_a_directory_by_its_hash() {
+    let h = Heir::new();
+    let t = template();
+    let photos = unit("photos/2019");
+    flip_in_tape(&h, photos.positions[2]);
+    let good = good_slice(t, &photos, 2);
+    let mut liar = good.clone();
+    liar[7] ^= 1;
+    let mut padded_copy = good.clone();
+    padded_copy.resize(good.len().div_ceil(BLOCK) * BLOCK, 0);
+    let dir = slices_dir(
+        &h,
+        "copies",
+        &[
+            ("a-liar.bin", liar),
+            ("slice-1.enc", padded_copy),
+            ("notes.txt", b"not a slice".to_vec()),
+        ],
+    );
+    let dest = h.sub("restored");
+    let (code, text) = run_with(
+        &h,
+        &restore_args(&h, "photos/2019", &dest),
+        &["--slices-from", &dir],
+        "",
+        &[],
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(
+        text.contains("slice 3 (tape file") && text.contains("does not match the front index"),
+        "the bad slice is named:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("taking slice 3 from {dir}/slice-1.enc")),
+        "the copy is chosen by its hash, whatever its name:\n{text}"
+    );
+    assert!(
+        text.contains("a-liar.bin has the size of slice 3 but not its sha256"),
+        "the wrong bytes of the right size are named and not used:\n{text}"
+    );
+    assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
+    assert_eq!(h.count("mt rewind"), 1, "one rewind:\n{:#?}", h.ops());
+    // The positive control: the same bad tape, no directory, stops, and says
+    // what would have helped.
+    let h2 = Heir::new();
+    flip_in_tape(&h2, photos.positions[2]);
+    let (code, text) = run_with(
+        &h2,
+        &restore_args(&h2, "photos/2019", &h2.sub("r")),
+        &[],
+        "",
+        &[],
+    );
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("slice 3 checksum MISMATCH"), "{text}");
+    assert!(text.contains("--slices-from DIR"), "{text}");
+    assert!(text.contains("--swap-tapes"), "{text}");
+}
+
+/// A directory with nothing that matches does not replace the slice: the files
+/// the slice held are not restored, are listed, and the run ends INCOMPLETE
+/// with the other files restored.
+#[test]
+fn a_directory_with_no_matching_file_leaves_the_files_of_the_slice_listed() {
+    let h = Heir::new();
+    let t = template();
+    let photos = unit("photos/2019");
+    flip_in_tape(&h, photos.positions[1]);
+    let mut liar = good_slice(t, &photos, 1);
+    liar[7] ^= 1;
+    let dir = slices_dir(&h, "copies", &[("liar.bin", liar)]);
+    let dest = h.sub("restored");
+    let (code, text) = run_with(
+        &h,
+        &restore_args(&h, "photos/2019", &dest),
+        &["--slices-from", &dir],
+        "",
+        &[],
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    assert!(!text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(
+        text.contains("has the size of slice 2 but not its sha256"),
+        "{text}"
+    );
+    let list =
+        std::fs::read_to_string(Path::new(&dest).join(".tapectl-damaged-files.txt")).unwrap();
+    let mut lines = list.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        "#tapectl-damaged-files\t1\tunit=photos/2019\tuuid=11111111-2222-3333-4444-555555555555\tversion=2"
+    );
+    let listed: Vec<String> = lines.map(str::to_string).collect();
+    let mut want = damaged_by_diff(&photos.src, Path::new(&dest));
+    want.retain(|p| p != ".tapectl-damaged-files.txt");
+    assert!(
+        !want.is_empty(),
+        "positive control: the bad slice cost some file"
+    );
+    let (mut listed, mut want) = (listed, want);
+    listed.sort();
+    want.sort();
+    assert_eq!(
+        listed, want,
+        "the list is the files that did not come back:\n{text}"
+    );
+    assert!(
+        text.contains("--fill-from"),
+        "the fill command is named:\n{text}"
+    );
+    // Everything else came back.
+    assert!(
+        rel_files(&photos.src).len() > want.len(),
+        "some files were restored"
+    );
+}
+
+/// A bad slice is read from a second cartridge: --swap-tapes names what it
+/// still needs (number and sha256), waits for ENTER, reads just those slices
+/// (found by hash, though they lie at other positions and in another order),
+/// and goes on. Each tape is read forward from one rewind.
+#[test]
+fn a_bad_slice_is_replaced_from_a_second_tape_forward_only_on_both() {
+    let h = Heir::new();
+    let t = template();
+    let photos = unit("photos/2019");
+    flip_in_tape(&h, photos.positions[1]);
+    flip_in_tape(&h, photos.positions[3]);
+    let all: Vec<Vec<u8>> = (0..photos.positions.len())
+        .map(|i| good_slice(t, &photos, i))
+        .collect();
+    second_tape(&h, "COPY02", "c0c0c0c0-0002-4000-8000-000000000002", &all);
+    let dest = h.sub("restored");
+    let (code, text) = run_with(
+        &h,
+        &restore_args(&h, "photos/2019", &dest),
+        &["--swap-tapes"],
+        "\n",
+        &[("FAKE_SWAP_ON_SETBLK", "2")],
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    for i in [1usize, 3] {
+        assert!(
+            text.contains(&format!(
+                "unit 'photos/2019' slice {}, {} bytes, sha256 {}",
+                i + 1,
+                photos.sizes[i],
+                photos.hashes[i]
+            )),
+            "slice {} is named with its sha256:\n{text}",
+            i + 1
+        );
+    }
+    assert!(
+        text.contains("Load a cartridge that holds copies"),
+        "{text}"
+    );
+    assert!(
+        text.contains("This cartridge identifies as: COPY02"),
+        "{text}"
+    );
+    assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
+    let ((first, first_rewinds), (second, second_rewinds)) = tapes_of(&h);
+    assert_eq!(first_rewinds, 1, "tape 1: one rewind:\n{:#?}", h.ops());
+    assert!(ascending(&first), "tape 1 is read forward: {first:?}");
+    assert_eq!(second_rewinds, 1, "tape 2: one rewind:\n{:#?}", h.ops());
+    assert!(ascending(&second), "tape 2 is read forward: {second:?}");
+    // File 0, the front index, and just the two slices needed.
+    assert_eq!(
+        second.len(),
+        4,
+        "tape 2 reads only what it needs: {second:?}"
+    );
+    assert_eq!(&second[..2], &[0, 3], "{second:?}");
+}
+
+/// The cartridge that was loaded again is told apart from a copy, and
+/// "done" goes on without: the files in the missing slice are listed.
+#[test]
+fn the_same_cartridge_is_not_a_copy_and_done_goes_on_without() {
+    let h = Heir::new();
+    let t = template();
+    let photos = unit("photos/2019");
+    flip_in_tape(&h, photos.positions[1]);
+    let all: Vec<Vec<u8>> = (0..photos.positions.len())
+        .map(|i| good_slice(t, &photos, i))
+        .collect();
+    // The same volume uuid as the tape being restored.
+    second_tape(&h, LABEL, THIS_UUID, &all);
+    let dest = h.sub("restored");
+    let (code, text) = run_with(
+        &h,
+        &restore_args(&h, "photos/2019", &dest),
+        &["--swap-tapes"],
+        "\ndone\n",
+        &[("FAKE_SWAP_ON_SETBLK", "2")],
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("That is the cartridge this run started with"),
+        "{text}"
+    );
+    assert!(text.contains("Going on without them."), "{text}");
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    assert!(Path::new(&dest).join(".tapectl-damaged-files.txt").exists());
+    // And with no input at all the run goes on without the second tape too.
+    let h2 = Heir::new();
+    flip_in_tape(&h2, photos.positions[1]);
+    let (code, text) = run_with(
+        &h2,
+        &restore_args(&h2, "photos/2019", &h2.sub("r")),
+        &["--swap-tapes"],
+        "",
+        &[],
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("Going on without them."), "{text}");
+}
+
+/// With --all, every unit that came back short waits for the one pause: a
+/// single request for a cartridge covers all of them.
+#[test]
+fn all_asks_for_the_second_cartridge_once_for_every_unit_short_of_slices() {
+    let h = Heir::new();
+    let t = template();
+    let photos = unit("photos/2019");
+    let docs = unit("docs");
+    flip_in_tape(&h, photos.positions[2]);
+    flip_in_tape(&h, docs.positions[0]);
+    let mut slices: Vec<Vec<u8>> = Vec::new();
+    for i in 0..photos.positions.len() {
+        slices.push(good_slice(t, &photos, i));
+    }
+    for i in 0..docs.positions.len() {
+        slices.push(good_slice(t, &docs, i));
+    }
+    second_tape(
+        &h,
+        "COPY02",
+        "c0c0c0c0-0002-4000-8000-000000000002",
+        &slices,
+    );
+    let dest = h.sub("restored");
+    let (code, text) = h.run_input(
+        &[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--all",
+            "--to",
+            &dest,
+            "--swap-tapes",
+        ],
+        &[("FAKE_SWAP_ON_SETBLK", "2")],
+        "\n",
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert_eq!(
+        text.matches("Load a cartridge that holds copies").count(),
+        1,
+        "one pause for both units:\n{text}"
+    );
+    assert!(text.contains("unit 'photos/2019' slice 3"), "{text}");
+    assert!(text.contains("unit 'docs' slice 1"), "{text}");
+    assert!(
+        same_tree(&photos.src, &Path::new(&dest).join("photos/2019")),
+        "{text}"
+    );
+    assert!(
+        same_tree(&docs.src, &Path::new(&dest).join("docs")),
+        "{text}"
+    );
+    let ((first, first_rewinds), (second, second_rewinds)) = tapes_of(&h);
+    assert!(ascending(&first) && first_rewinds == 1, "{first:?}");
+    assert!(ascending(&second) && second_rewinds == 1, "{second:?}");
+}
+
+/// --path takes a replacement too: the slices that hold the file are read
+/// with the bad one taken from the directory.
+#[test]
+fn a_path_restore_takes_a_replacement_slice_too() {
+    let h = Heir::new();
+    let t = template();
+    let photos = unit("photos/2019");
+    // Every slice but the last, which carries the catalogue.
+    for pos in &photos.positions[..photos.positions.len() - 1] {
+        flip_in_tape(&h, *pos);
+    }
+    let copies: Vec<(String, Vec<u8>)> = (0..photos.positions.len() - 1)
+        .map(|i| (format!("c{i}"), good_slice(t, &photos, i)))
+        .collect();
+    let files: Vec<(&str, Vec<u8>)> = copies
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.clone()))
+        .collect();
+    let dir = slices_dir(&h, "copies", &files);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--path",
+        "file0.bin",
+        "--to",
+        &dest,
+        "--slices-from",
+        &dir,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert_eq!(
+        std::fs::read(Path::new(&dest).join("file0.bin")).unwrap(),
+        std::fs::read(photos.src.join("file0.bin")).unwrap(),
+        "{text}"
+    );
+}
+
+/// --verify reports, for a slice that fails, whether a directory holds a copy
+/// whose sha256 matches; and with --swap-tapes whether a second cartridge
+/// does. The tape itself still fails: its own bytes are damaged.
+#[test]
+fn verify_says_where_a_good_copy_of_a_failed_slice_is() {
+    let h = Heir::new();
+    let t = template();
+    let photos = unit("photos/2019");
+    flip_in_tape(&h, photos.positions[2]);
+    let good = good_slice(t, &photos, 2);
+    let dir = slices_dir(&h, "copies", &[("whatever.bin", good)]);
+    let (code, text) = h.run(&["--verify", "--slices-from", &dir]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains(&format!(
+            "FAIL  file {:3}  data_slice                (hash mismatch; a copy whose sha256 matches is {dir}/whatever.bin)",
+            photos.positions[2]
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("Every file that failed is a data slice, and a copy of each was found"),
+        "{text}"
+    );
+    // The control: without the directory the same line has no such note.
+    let (code, text) = h.run(&["--verify"]);
+    assert_eq!(code, 1, "{text}");
+    assert!(!text.contains("a copy whose sha256 matches"), "{text}");
+    assert!(text.contains("(hash mismatch)"), "{text}");
+    // A second cartridge.
+    let all: Vec<Vec<u8>> = (0..photos.positions.len())
+        .map(|i| good_slice(t, &photos, i))
+        .collect();
+    second_tape(&h, "COPY02", "c0c0c0c0-0002-4000-8000-000000000002", &all);
+    let (code, text) = h.run_input(
+        &["--verify", "--swap-tapes"],
+        &[("FAKE_SWAP_ON_SETBLK", "2")],
+        "\n",
+    );
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("checksum verified: a good copy"), "{text}");
+    assert!(
+        text.contains("Every file that failed is a data slice, and a copy of each was found"),
+        "{text}"
+    );
+    let ((first, first_rewinds), (second, second_rewinds)) = tapes_of(&h);
+    assert!(ascending(&first) && first_rewinds == 1, "{first:?}");
+    assert!(ascending(&second) && second_rewinds == 1, "{second:?}");
+}
+
+#[test]
+fn a_missing_slices_from_directory_is_refused_before_the_tape_is_read() {
+    let h = Heir::new();
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "docs",
+        "--to",
+        &h.sub("restored"),
+        "--slices-from",
+        &h.sub("no-such-dir"),
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("not a directory"), "{text}");
+    assert!(text.contains("Nothing has been read from tape"), "{text}");
+    assert!(
+        !h.ops().iter().any(|l| l.starts_with("dd ")),
+        "no tape read:\n{:#?}",
+        h.ops()
+    );
+    let (code, text) = h.run(&["--verify", "--bogus"]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("unknown option: --bogus"), "{text}");
+}
+
+// ---- the damaged-file list and the fill ----
+
+const DMG_UUID: &str = "77777777-8888-9999-aaaa-bbbbbbbbbbbb";
+
+fn dmg_tenants(
+    version: i64,
+    uuid: &'static str,
+    corrupt: &'static [(usize, usize)],
+) -> Vec<TenantSpec> {
+    vec![TenantSpec {
+        name: "alice",
+        units: vec![UnitSpec {
+            cat: Cat::Matched,
+            name: "ledger",
+            uuid,
+            version,
+            seed: 21,
+            files: 5,
+            file_len: 150_000,
+            names: &[],
+            corrupt,
+        }],
+    }]
+}
+
+/// The unit "ledger" version 2 as staged with a byte flipped in its third
+/// slice before encryption: the tape's hashes agree with it, so only dar's CRC
+/// of a file sees it.
+fn dmg_bad() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template("dmg-bad", &dmg_tenants(2, DMG_UUID, &[(2, 50_000)]), false))
+}
+
+/// Another staging of the same unit and version, damaged in another slice.
+fn dmg_other_bad() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        build_template(
+            "dmg-other",
+            &dmg_tenants(2, DMG_UUID, &[(6, 50_000)]),
+            false,
+        )
+    })
+}
+
+fn dmg_good() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template("dmg-good", &dmg_tenants(2, DMG_UUID, &[]), false))
+}
+
+fn dmg_v3() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template("dmg-v3", &dmg_tenants(3, DMG_UUID, &[]), false))
+}
+
+fn dmg_other_unit() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        build_template(
+            "dmg-uuid",
+            &dmg_tenants(2, "88888888-9999-aaaa-bbbb-cccccccccccc", &[]),
+            false,
+        )
+    })
+}
+
+const ODD_NAMES: &[&str] = &[
+    "plain.bin",
+    "we ird : name.bin",
+    "nl\nline.bin",
+    "tab\there.bin",
+    "back\\slash.bin",
+];
+/// Byte flips in the first three slices, at offsets that differ in their low
+/// bits: dar's per-file check is a width-limited XOR fold, so two flips of the
+/// same value a multiple of that width apart cancel and go unseen.
+const ODD_FLIPS: &[(usize, usize)] = &[
+    (0, 1_000),
+    (0, 21_019),
+    (0, 41_037),
+    (0, 61_055),
+    (0, 81_073),
+    (1, 1_005),
+    (1, 21_024),
+    (1, 41_042),
+    (1, 61_060),
+    (1, 81_078),
+    (2, 1_011),
+    (2, 21_030),
+    (2, 41_048),
+    (2, 61_066),
+    (2, 81_084),
+];
+
+fn odd_tenants(corrupt: &'static [(usize, usize)]) -> Vec<TenantSpec> {
+    vec![TenantSpec {
+        name: "alice",
+        units: vec![UnitSpec {
+            cat: Cat::Matched,
+            name: "oddly",
+            uuid: "99999999-aaaa-bbbb-cccc-dddddddddddd",
+            version: 1,
+            seed: 31,
+            files: 5,
+            file_len: 80_000,
+            names: ODD_NAMES,
+            corrupt,
+        }],
+    }]
+}
+
+fn odd_bad() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template("odd-bad", &odd_tenants(ODD_FLIPS), false))
+}
+
+fn odd_good() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template("odd-good", &odd_tenants(&[]), false))
+}
+
+fn unit_of(t: &Template, name: &str) -> UnitOnTape {
+    t.units.iter().find(|u| u.name == name).unwrap().clone()
+}
+
+fn fill_args(h: &Heir, unit: &str, list: &Path, to: &str) -> Vec<String> {
+    vec![
+        "--restore".to_string(),
+        "--key".to_string(),
+        h.key("alice"),
+        "--unit".to_string(),
+        unit.to_string(),
+        "--fill-from".to_string(),
+        list.display().to_string(),
+        "--to".to_string(),
+        to.to_string(),
+    ]
+}
+
+/// A restore in which dar names files it could not restore (the archive as
+/// staged was damaged: the tape's hashes are right) restores the rest, writes
+/// the files it could not restore to a list in the unit's directory, and ends
+/// INCOMPLETE, naming the fill command.
+#[test]
+fn a_restore_with_a_damaged_file_writes_the_list_and_is_incomplete() {
+    let h = Heir::of(dmg_bad(), &[]);
+    let ledger = unit_of(dmg_bad(), "ledger");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("Bad CRC"),
+        "dar's own words stay visible:\n{text}"
+    );
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    assert!(!text.contains("RESTORE COMPLETE"), "{text}");
+    let list_path = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let list = std::fs::read_to_string(&list_path).unwrap();
+    let mut lines = list.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        format!("#tapectl-damaged-files\t1\tunit=ledger\tuuid={DMG_UUID}\tversion=2")
+    );
+    let listed: Vec<String> = lines.map(str::to_string).collect();
+    let mut want = damaged_by_diff(&ledger.src, Path::new(&dest));
+    want.retain(|p| p != ".tapectl-damaged-files.txt");
+    assert!(!want.is_empty(), "positive control: some file is damaged");
+    assert!(want.len() < 5, "and some came back whole: {want:?}");
+    assert_eq!(listed, want, "the list is exactly the damaged files");
+    assert!(
+        text.contains(&format!(
+            "--unit ledger --fill-from {} --to {dest}",
+            list_path.display()
+        )),
+        "the fill command is named:\n{text}"
+    );
+    assert!(text.contains("same unit and version"), "{text}");
+}
+
+/// The positive control: a restore with nothing damaged writes no list.
+#[test]
+fn a_clean_restore_writes_no_list() {
+    let h = Heir::of(dmg_good(), &[]);
+    let ledger = unit_of(dmg_good(), "ledger");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(!text.contains("INCOMPLETE"), "{text}");
+    assert!(same_tree(&ledger.src, Path::new(&dest)), "{text}");
+    assert!(!Path::new(&dest).join(".tapectl-damaged-files.txt").exists());
+    // And with a replacement asked for, though nothing needed one.
+    let empty = h.sub("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let dest2 = h.sub("restored2");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest2,
+        "--slices-from",
+        &empty,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(same_tree(&ledger.src, Path::new(&dest2)), "{text}");
+    assert!(!Path::new(&dest2)
+        .join(".tapectl-damaged-files.txt")
+        .exists());
+}
+
+/// A second tape holding the same unit and version fills exactly the files in
+/// the list, over their damaged copies, and nothing else in the directory: a
+/// local edit to another file is still there. The list is removed.
+#[test]
+fn a_fill_from_another_copy_restores_exactly_the_listed_files() {
+    let a = Heir::of(dmg_bad(), &[]);
+    let ledger = unit_of(dmg_bad(), "ledger");
+    let dest = a.sub("restored");
+    let (code, text) = a.run(&[
+        "--restore",
+        "--key",
+        &a.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let damaged = damaged_by_diff(&ledger.src, Path::new(&dest));
+    let whole: Vec<String> = rel_files(&ledger.src)
+        .into_iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| !damaged.contains(p))
+        .collect();
+    assert!(!whole.is_empty() && !damaged.is_empty());
+    // A file the restore got right, edited since: a fill must not touch it.
+    let edited = Path::new(&dest).join(&whole[0]);
+    std::fs::write(&edited, b"edited since the restore").unwrap();
+
+    let b = Heir::of(dmg_good(), &[]);
+    let (code, text) = runv(&b, &fill_args(&b, "ledger", &list, &dest));
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("FILL COMPLETE"), "{text}");
+    assert!(!list.exists(), "the list is removed when nothing is left");
+    for p in &damaged {
+        assert_eq!(
+            std::fs::read(Path::new(&dest).join(p)).unwrap(),
+            std::fs::read(ledger.src.join(p)).unwrap(),
+            "{p} was filled"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&edited).unwrap(),
+        b"edited since the restore",
+        "a file not in the list is left alone"
+    );
+    // Only the listed files were extracted: the tape read what holds them.
+    assert!(text.contains("Restoring"), "{text}");
+    assert_forward_only(&b, "the fill");
+}
+
+/// Two copies from different stagings, each damaged in different files,
+/// restore whole through two runs: the restore from one, the fill from the
+/// other.
+#[test]
+fn two_copies_each_damaged_in_different_files_restore_whole_in_two_runs() {
+    let a = Heir::of(dmg_bad(), &[]);
+    let ledger = unit_of(dmg_bad(), "ledger");
+    let dest = a.sub("restored");
+    let (code, _) = a.run(&[
+        "--restore",
+        "--key",
+        &a.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1);
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let first_damage = damaged_by_diff(&ledger.src, Path::new(&dest));
+
+    // The other copy is damaged too, in other files: restored alone it fails.
+    let b = Heir::of(dmg_other_bad(), &[]);
+    let alone = b.sub("alone");
+    let (code, _) = b.run(&[
+        "--restore",
+        "--key",
+        &b.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &alone,
+    ]);
+    assert_eq!(code, 1);
+    let second_damage = damaged_by_diff(&ledger.src, Path::new(&alone));
+    assert!(
+        first_damage
+            .iter()
+            .all(|f| f == ".tapectl-damaged-files.txt" || !second_damage.contains(f)),
+        "the two copies are damaged in different files: {first_damage:?} / {second_damage:?}"
+    );
+
+    let (code, text) = runv(&b, &fill_args(&b, "ledger", &list, &dest));
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("FILL COMPLETE"), "{text}");
+    assert!(same_tree(&ledger.src, Path::new(&dest)), "{text}");
+}
+
+/// A tape holding the unit at another version, or another unit under the
+/// same name, is refused by name, and nothing in the directory changes.
+#[test]
+fn a_fill_refuses_a_tape_with_another_version_or_another_unit() {
+    let a = Heir::of(dmg_bad(), &[]);
+    let dest = a.sub("restored");
+    let (code, _) = a.run(&[
+        "--restore",
+        "--key",
+        &a.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1);
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let before_list = std::fs::read(&list).unwrap();
+    let ledger = unit_of(dmg_bad(), "ledger");
+    let before_tree: Vec<Vec<u8>> = rel_files(Path::new(&dest))
+        .iter()
+        .map(|p| std::fs::read(Path::new(&dest).join(p)).unwrap())
+        .collect();
+
+    let v3 = Heir::of(dmg_v3(), &[]);
+    let (code, text) = runv(&v3, &fill_args(&v3, "ledger", &list, &dest));
+    assert_ne!(code, 0, "{text}");
+    assert!(
+        text.contains("holds no version 2 of unit 'ledger'"),
+        "{text}"
+    );
+    assert!(text.contains("same version"), "{text}");
+
+    let other = Heir::of(dmg_other_unit(), &[]);
+    let (code, text) = runv(&other, &fill_args(&other, "ledger", &list, &dest));
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("it is not the same unit"), "{text}");
+    assert!(
+        text.contains("77777777-8888-9999-aaaa-bbbbbbbbbbbb"),
+        "{text}"
+    );
+
+    // The control: the right tape fills it.
+    assert_eq!(std::fs::read(&list).unwrap(), before_list);
+    let after_tree: Vec<Vec<u8>> = rel_files(Path::new(&dest))
+        .iter()
+        .map(|p| std::fs::read(Path::new(&dest).join(p)).unwrap())
+        .collect();
+    assert_eq!(before_tree, after_tree, "nothing changed");
+    let good = Heir::of(dmg_good(), &[]);
+    let (code, text) = runv(&good, &fill_args(&good, "ledger", &list, &dest));
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&ledger.src, Path::new(&dest)), "{text}");
+}
+
+/// Names that need the escapes of sec 1.5 (a TAB, a newline, a backslash, and
+/// a name holding the very separator dar prints) survive the list and the
+/// fill: the list holds each once, escaped, and the fill reads them back.
+#[test]
+fn the_list_escapes_paths_as_the_index_does_and_the_fill_reads_them_back() {
+    let a = Heir::of(odd_bad(), &[]);
+    let oddly = unit_of(odd_bad(), "oddly");
+    let dest = a.sub("restored");
+    let (code, text) = a.run(&[
+        "--restore",
+        "--key",
+        &a.key("alice"),
+        "--unit",
+        "oddly",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let text_list = std::fs::read_to_string(&list).unwrap();
+    let listed: Vec<String> = text_list.lines().skip(1).map(str::to_string).collect();
+    let mut want: Vec<String> = damaged_by_diff(&oddly.src, Path::new(&dest))
+        .into_iter()
+        .filter(|p| p != ".tapectl-damaged-files.txt")
+        .map(|p| idx_esc(&p))
+        .collect();
+    want.sort();
+    let mut got = listed.clone();
+    got.sort();
+    assert_eq!(got, want, "{text_list}\n{text}");
+    assert!(
+        want.len() >= 3,
+        "positive control: several are damaged: {want:?}"
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|l| l.contains("\\n") || l.contains("\\t") || l.contains("\\\\")),
+        "an escaped name is in the list: {listed:?}"
+    );
+    for l in &listed {
+        assert!(
+            !l.contains('\n') && !l.contains('\t'),
+            "one line per path: {l:?}"
+        );
+    }
+
+    let b = Heir::of(odd_good(), &[]);
+    let (code, text) = runv(&b, &fill_args(&b, "oddly", &list, &dest));
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("FILL COMPLETE"), "{text}");
+    assert!(same_tree(&oddly.src, Path::new(&dest)), "{text}");
+}
+
+/// The end to end of item 101 and 102 together: a bad slice with no copy at
+/// hand leaves a list; another copy of the unit fills it.
+#[test]
+fn a_slice_with_no_copy_leaves_a_list_that_another_copy_fills() {
+    let a = Heir::of(dmg_good(), &[]);
+    let ledger = unit_of(dmg_good(), "ledger");
+    flip_in_tape(&a, ledger.positions[1]);
+    let empty = a.sub("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let dest = a.sub("restored");
+    let (code, text) = a.run(&[
+        "--restore",
+        "--key",
+        &a.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+        "--slices-from",
+        &empty,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    assert!(text.contains("Slice(s) not available: 2"), "{text}");
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    assert!(list.exists(), "{text}");
+
+    let b = Heir::of(dmg_other_bad(), &[]);
+    let (code, text) = runv(&b, &fill_args(&b, "ledger", &list, &dest));
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&ledger.src, Path::new(&dest)), "{text}");
+    assert!(!list.exists());
+}
+
+/// A fill takes only a unit's own list: no --path, no --all, one --unit that
+/// is the list's own, and the list must sit where the restore wrote it.
+#[test]
+fn a_fill_is_refused_for_a_list_that_is_not_the_units_own() {
+    let a = Heir::of(dmg_bad(), &[]);
+    let dest = a.sub("restored");
+    let (code, _) = a.run(&[
+        "--restore",
+        "--key",
+        &a.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1);
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let g = Heir::of(dmg_good(), &[]);
+    let (code, text) = g.run(&[
+        "--restore",
+        "--key",
+        &g.key("alice"),
+        "--fill-from",
+        &list.display().to_string(),
+        "--to",
+        &dest,
+    ]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("give --unit U (once)"), "{text}");
+    let (code, text) = runv(&g, &fill_args(&g, "other", &list, &dest));
+    assert_ne!(code, 0, "{text}");
+    assert!(
+        text.contains("this list is for unit 'ledger', version 2"),
+        "{text}"
+    );
+    // A list moved out of the directory it describes.
+    let moved = g.dir.join("moved.txt");
+    std::fs::copy(&list, &moved).unwrap();
+    let (code, text) = runv(&g, &fill_args(&g, "ledger", &moved, &dest));
+    assert_ne!(code, 0, "{text}");
+    assert!(
+        text.contains("keep the list where the restore wrote it"),
+        "{text}"
+    );
+    // A directory in the list is refused, not restored over.
+    std::fs::create_dir_all(Path::new(&dest).join("subdir")).unwrap();
+    let mut body = std::fs::read_to_string(&list).unwrap();
+    body.push_str("subdir\n");
+    std::fs::write(&list, body).unwrap();
+    let (code, text) = runv(&g, &fill_args(&g, "ledger", &list, &dest));
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("names a directory (subdir)"), "{text}");
+    // A path that leaves the unit is refused.
+    let mut body = std::fs::read_to_string(&list).unwrap();
+    body = body.replace("subdir\n", "../escape\n");
+    std::fs::write(&list, body).unwrap();
+    let (code, text) = runv(&g, &fill_args(&g, "ledger", &list, &dest));
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("names a path with .. in it"), "{text}");
+}
+
+/// The escapes the list uses are the index's, decoded in one scan: a name
+/// holding a backslash followed by the letter t comes back as that, not as a
+/// TAB.
+#[test]
+fn the_list_escape_functions_round_trip_the_sec_1_5_escapes() {
+    let h = Heir::new();
+    let script = h.dir.join("RESTORE.sh");
+    let probe = format!(
+        r#"source "{}" >/dev/null
+for t in 'plain' 'a b : c' $'tab\there' $'nl\nhere' $'cr\rhere' 'back\slash' 'lit\tera' 'two\\slashes' $'mix\\\t\n'; do
+  e=$(escape_text "$t")
+  unesc_line "$e"
+  [ "$UNESC" = "$t" ] || {{ echo "ROUNDTRIP-FAIL [$t] [$e]"; exit 1; }}
+  case "$e" in *$'\t'* | *$'\n'* | *$'\r'*) echo "RAW-CONTROL [$e]"; exit 1 ;; esac
+done
+unesc_line 'lit\\tera'
+[ "$UNESC" = 'lit\tera' ] || {{ echo "SCAN-FAIL [$UNESC]"; exit 1; }}
+unesc_line 'a\tb'
+[ "$UNESC" = $'a\tb' ] || {{ echo "TAB-FAIL"; exit 1; }}
+unesc_line 'odd\qescape'
+[ "$UNESC" = 'odd\qescape' ] || {{ echo "UNKNOWN-FAIL [$UNESC]"; exit 1; }}
+echo ROUNDTRIP-OK
+"#,
+        script.display()
+    );
+    let o = Command::new("bash")
+        .args(["-c", &probe])
+        .env("PATH", &h.path)
+        .env("FAKE_TAPE", &h.dir)
+        .env("TMPDIR", h.dir.join("tmp"))
+        .env("HOME", h.dir.join("home"))
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(text.contains("ROUNDTRIP-OK"), "{text}");
+}
+
+/// The help names the options, and the default failure names them.
+#[test]
+fn help_names_the_replacement_and_fill_options() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--help"]);
+    assert_eq!(code, 0, "{text}");
+    let flat = flat(&text);
+    for want in [
+        "--slices-from DIR",
+        "--swap-tapes",
+        "--fill-from LIST",
+        "never by position or by name",
+        "about twice the unit's size",
+        ".tapectl-damaged-files.txt",
+        "RESTORE INCOMPLETE",
+        "SAME unit AT THE SAME VERSION",
+    ] {
+        assert!(flat.contains(want), "--help lacks {want:?}:\n{text}");
+    }
+}
+
+/// The same damaged unit staged without an envelope catalogue: on this dar it
+/// restores from slices on disk, and that path ends the same way.
+fn dmg_nocat_bad() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = dmg_tenants(2, DMG_UUID, &[(2, 50_000)]);
+        t[0].units[0].cat = Cat::Absent;
+        build_template("dmg-nocat", &t, false)
+    })
+}
+
+#[test]
+fn a_restore_from_slices_on_disk_writes_the_list_too() {
+    let h = Heir::of(dmg_nocat_bad(), &[]);
+    let ledger = unit_of(dmg_nocat_bad(), "ledger");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("decrypting the slices to disk"), "{text}");
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    let list =
+        std::fs::read_to_string(Path::new(&dest).join(".tapectl-damaged-files.txt")).unwrap();
+    let mut listed: Vec<String> = list.lines().skip(1).map(str::to_string).collect();
+    let mut want = damaged_by_diff(&ledger.src, Path::new(&dest));
+    want.retain(|p| p != ".tapectl-damaged-files.txt");
+    listed.sort();
+    want.sort();
+    assert!(!want.is_empty());
+    assert_eq!(listed, want, "{text}");
+}
+
+/// A list from an earlier run is out of date once the unit restores whole:
+/// the same restore, over its directory with --overwrite, from a good copy
+/// removes it. (A list for another version or unit is left alone.)
+#[test]
+fn a_clean_restore_over_a_damaged_one_removes_the_stale_list() {
+    let a = Heir::of(dmg_bad(), &[]);
+    let ledger = unit_of(dmg_bad(), "ledger");
+    let dest = a.sub("restored");
+    let (code, _) = a.run(&[
+        "--restore",
+        "--key",
+        &a.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1);
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    assert!(list.exists());
+    let g = Heir::of(dmg_good(), &[]);
+    let (code, text) = g.run(&[
+        "--restore",
+        "--key",
+        &g.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+        "--overwrite",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(text.contains("left nothing damaged"), "{text}");
+    assert!(!list.exists());
+    assert!(same_tree(&ledger.src, Path::new(&dest)), "{text}");
+}
+
+/// What the disk refuses is not a damaged archive: dar's status 5 for a
+/// directory that cannot be written ends the run as it always did, with no
+/// list, whichever way the unit is restored.
+#[test]
+fn a_file_system_refusal_is_not_listed_as_damage() {
+    use std::os::unix::fs::PermissionsExt;
+    for (t, via) in [(dmg_good(), "streamed"), (dmg_nocat_bad(), "from disk")] {
+        let h = Heir::of(t, &[]);
+        let dest = h.dir.join("readonly");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(dest.join("probe")).is_ok() {
+            // Running as root: a read-only directory is no obstacle.
+            return;
+        }
+        let scratch = h.sub("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let (code, text) = h.run(&[
+            "--restore",
+            "--key",
+            &h.key("alice"),
+            "--unit",
+            "ledger",
+            "--to",
+            &dest.display().to_string(),
+            "--overwrite",
+            "--scratch",
+            &scratch,
+        ]);
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(code, 0, "{via}: {text}");
+        assert!(
+            text.contains("dar extraction failed (exit 5)"),
+            "{via}: {text}"
+        );
+        assert!(text.contains("Permission denied"), "{via}: {text}");
+        assert!(!text.contains("RESTORE INCOMPLETE"), "{via}: {text}");
+        assert!(!dest.join(".tapectl-damaged-files.txt").exists(), "{via}");
+        if via == "from disk" {
+            assert!(
+                text.contains("the file system refused a file"),
+                "{via}: {text}"
+            );
+        }
+    }
+}
+
+/// A fill that finds the slices it needs bad on its own tape takes them from
+/// a second cartridge, like a restore: the list, the first tape, then the
+/// swap.
+#[test]
+fn a_fill_takes_a_replacement_slice_from_a_second_tape() {
+    let a = Heir::of(dmg_bad(), &[]);
+    let ledger = unit_of(dmg_bad(), "ledger");
+    let dest = a.sub("restored");
+    let (code, _) = a.run(&[
+        "--restore",
+        "--key",
+        &a.key("alice"),
+        "--unit",
+        "ledger",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1);
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+
+    let good = dmg_good();
+    let gl = unit_of(good, "ledger");
+    let b = Heir::of(good, &[]);
+    // Every data slice but the last is bad on this tape...
+    for pos in &gl.positions[..gl.positions.len() - 1] {
+        flip_in_tape(&b, *pos);
+    }
+    // ...and the second cartridge holds good ones.
+    let all: Vec<Vec<u8>> = (0..gl.positions.len())
+        .map(|i| good_slice(good, &gl, i))
+        .collect();
+    second_tape(&b, "COPY02", "c0c0c0c0-0002-4000-8000-000000000002", &all);
+    let args = fill_args(&b, "ledger", &list, &dest);
+    let (code, text) = run_with(
+        &b,
+        &args,
+        &["--swap-tapes"],
+        "\n",
+        &[("FAKE_SWAP_ON_SETBLK", "2")],
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("FILL COMPLETE"), "{text}");
+    assert!(
+        text.contains("Load a cartridge that holds copies"),
+        "{text}"
+    );
+    assert!(same_tree(&ledger.src, Path::new(&dest)), "{text}");
+    let ((first, first_rewinds), (second, second_rewinds)) = tapes_of(&b);
+    assert!(ascending(&first) && first_rewinds == 1, "{first:?}");
+    assert!(ascending(&second) && second_rewinds == 1, "{second:?}");
 }
