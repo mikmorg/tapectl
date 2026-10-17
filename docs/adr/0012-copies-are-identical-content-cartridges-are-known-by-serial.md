@@ -1686,3 +1686,29 @@ Ruled 2026-10-17, refining spanning:
 95. **A spannable unit that fits on one tape keeps item 83's place**: whole units fill to the
     ceiling, it goes last and spans, so the tape fills to early warning. The early start of item
     94 is only for a unit larger than one tape.
+
+Ruled 2026-10-17, measuring drives instead of assuming them:
+
+96. **A profiling toolkit is built, as scripts.** One generation-agnostic script under `scripts/`,
+    absorbing `scripts/lto6-measure.sh` and the past-warning fill (#420), run on a named test
+    cartridge under the same serial-checked consent, writes a report and emits a
+    `[[backends.lto]]` block that `config check` accepts, each derived value naming the run it
+    came from. This amends the 2026-09-14 ruling "`volume calibrate` is not built; capacity is
+    settled by rehearsal": its reasoning, that a measured constant buys accuracy and not safety,
+    held while every write stopped at the fill ceiling, but spanning cuts at the drive's early
+    warning and #420's short seal needs measured room past it, so measured figures now buy tape.
+    It stays a script, not a tapectl command, so a measurement change needs no release.
+97. **A profile is keyed by the drive and the generation**: the drive's vendor, product and
+    firmware (`sg_inq`) and the medium's generation. The media maker (MAM; only Fujifilm and Sony
+    make LTO tape, whatever the label) is recorded in every run but is not a key, so the data can
+    show later whether it matters. The emitted block sets drive-level keys only (`fill_ceiling`
+    now; the post-warning room and the LBP method as #420 and #388 are built): capacity stays a
+    property of the cartridge (ADR-0010), and vendor facts such as MAM's capacity unit go into
+    `src/media.rs` by code review, with the run report as evidence.
+98. **Wear is recorded now and fitted with data.** The default fill ceiling stays conservative
+    (97%; a fresh cartridge delivered 100.08% of its nominal capacity before early warning on
+    2026-09-23). Every profiling run, and once spanning is built every tape that ends in a span
+    (cut at its real early warning), records the real end-of-tape point beside the cartridge's
+    MAM wear (loads, lifetime writes, the per-use error history) and the drive's rewrite counters.
+    When the data supports it, a fitted per-cartridge wear allowance is put to the CTO; until then
+    item 11 of 2026-10-06 stands (a worn-cartridge warning, no formula).
