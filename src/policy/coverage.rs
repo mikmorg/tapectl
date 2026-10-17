@@ -1678,6 +1678,9 @@ pub fn index_versions(
          JOIN units u ON u.id = s.unit_id
          JOIN tenants t ON t.id = u.tenant_id
          JOIN volumes v ON v.id = w.volume_id
+         -- The cartridge the volume was written on, mounted or no (a volume
+         -- has one cartridge_volumes row): not `unmounted_at IS NULL`, which
+         -- would drop the serial of a sealed volume whose mount has closed.
          LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
          LEFT JOIN cartridges c ON c.id = cv.cartridge_id
          WHERE w.status = 'completed' AND {holder} AND v.label <> ?1

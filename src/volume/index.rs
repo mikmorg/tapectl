@@ -185,13 +185,17 @@ fn write_units_row<W: Write + ?Sized>(
     field(w, &r.unit_uuid)?;
     write!(w, "{}\t", r.version)?;
     // A whole version holds slices 1..=num_slices; a stage set with none
-    // recorded has no range to state (an empty field is "not known").
+    // recorded has no range and no size to state (an empty field is "not
+    // known").
     if r.num_slices > 0 {
-        write!(w, "{}\t1\t{}\t", r.num_slices, r.num_slices)?;
+        write!(
+            w,
+            "{}\t1\t{}\t{}\t",
+            r.num_slices, r.num_slices, r.version_bytes
+        )?;
     } else {
-        w.write_all(b"\t\t\t")?;
+        w.write_all(b"\t\t\t\t")?;
     }
-    write!(w, "{}\t", r.version_bytes)?;
     field(w, &r.volume)?;
     field(w, &r.volume_uuid)?;
     field(w, &r.cartridge_serial)?;
@@ -421,6 +425,9 @@ pub fn generate_files(
     dir: &Path,
 ) -> Result<IndexFiles> {
     std::fs::create_dir_all(dir)?;
+    // Every path of the archive, in plaintext: private to this user, as the
+    // work directory it sits in already is.
+    crate::config::secure_path(dir, 0o700);
     let mut paths: BTreeMap<Member, PathBuf> = BTreeMap::new();
     let generated = generate(conn, this, write_stage_sets, &mut |member| {
         let name = match member {
@@ -781,6 +788,32 @@ mod tests {
         let line = String::from_utf8(line).unwrap();
         assert!(line.ends_with("\tthis-tape\t\n"), "{line:?}");
         assert_eq!(line.matches('\t').count(), 12);
+    }
+
+    #[test]
+    fn a_stage_set_with_no_slices_recorded_states_no_range_and_no_size() {
+        let mut r = row("docs", 3, "L6-0002", coverage::IndexHolderState::Sealed);
+        r.num_slices = 0;
+        r.version_bytes = 0;
+        let mut line = Vec::new();
+        write_units_row(&mut line, false, &r).unwrap();
+        let line = String::from_utf8(line).unwrap();
+        assert_eq!(
+            line.matches('\t').count(),
+            12,
+            "still thirteen fields: {line:?}"
+        );
+        let parsed = parse_units(&format!("{}\n{line}", UNITS_COLUMNS.join("\t"))).unwrap();
+        assert_eq!(
+            (
+                parsed[0].num_slices,
+                parsed[0].first_slice,
+                parsed[0].last_slice,
+                parsed[0].version_bytes
+            ),
+            (None, None, None, None)
+        );
+        assert_eq!(parsed[0].volume, "L6-0002");
     }
 
     #[test]
