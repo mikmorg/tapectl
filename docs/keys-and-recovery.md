@@ -1144,12 +1144,20 @@ tapectl, needs to know this:
   generations on the tapes it knew (#448). The drive connects by SAS (some models
   Fibre Channel), so the reading computer needs a matching host adapter (HBA);
   there is no USB or SATA tape drive. A data-recovery firm can read a cartridge
-  if you cannot find a drive.
+  if you cannot find a drive; it needs no key to copy the tape, but whoever hands it
+  the escrow or operator key lets it read everything on every tape, so give a firm the
+  raw tape files and decrypt them yourself, or one tenant's key only.
 - **Find the drive's device name.** The cover sheet and every tape print their
   commands with `/dev/nst0`, and say that is only an example.
   `ls -l /dev/tape/by-id/` lists the tape drives. Use the entry ending in `-nst`
-  wherever those commands say `/dev/nst0`. A wrong device reads a different tape,
-  or fails.
+  wherever those commands say `/dev/nst0` (non-rewinding; a rewinding entry restarts
+  at File 0 after every command). RESTORE.sh takes the device as an environment
+  prefix: `TAPE_DEVICE=/dev/nst1 ./RESTORE.sh --info`. A wrong device reads a
+  different tape, or fails.
+- **Other tapes:** a tape written by 1.3.0 or later carries an index of the other
+  tapes. `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` lists every version of a
+  unit and the tapes holding it; `--find TEXT` finds a path. The newest tape's index
+  is the most complete.
 - **Tools:** `mt` (package `mt-st`), `dd`, `head`, `truncate`, `tar`, `mkfifo`,
   `tee`, `sha256sum`, `age` and `age-keygen` ([age-encryption.org](https://age-encryption.org);
   the files are age v1 format, which `rage` reads too, but RESTORE.sh runs a

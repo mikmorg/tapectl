@@ -326,6 +326,7 @@ volume write plan (2 copy/copies):
 
 total: 4 slices, 1.7 MiB x 2 = 3.4 MiB
 estimated tapes: 1 (at the 97% fill ceiling)
+cross-volume index: about 1.1 KiB per tape, 2.2 KiB on it with the envelope backups (an estimate: all of the above on one tape, as the catalog stands now)
 
 $ tapectl volume init L8-0001
 cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)

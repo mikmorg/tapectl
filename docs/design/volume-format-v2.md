@@ -302,7 +302,8 @@ built**: which volumes hold which version of each unit, and, for a tenant, every
 | each tenant envelope | `index/units.tsv` (that tenant's units only) and `index/paths.tsv` |
 | the operator envelope | `index/units.tsv` (every tenant's units, with a `tenant` column); no `paths.tsv` |
 
-The members follow `catalogs/` in the tar. A tenant learns the labels of the tapes holding its
+The members are the last in the tar, after `catalogs/` and, in the operator envelope,
+`catalog.db`. A tenant gets its two files only when it has an envelope on that tape. A tenant learns the labels of the tapes holding its
 own units and nothing of another tenant's (§2); the operator and escrow keys see the
 cross-tenant map.
 
@@ -333,6 +334,10 @@ catalog.
 | `state` | `sealed`, `quarantined` (sealed, but a verify proved the medium bad; it may still partly read), or `this-tape` (the tape this index is on) |
 | `sealed_at` | when that volume sealed (RFC 3339, UTC); empty for `this-tape` |
 
+A stage set with no slices recorded states `num_slices`, `first_slice`, `last_slice` and
+`version_bytes` as empty fields. A version with two stage sets on one volume has one row, the
+lower stage set's.
+
 **Which versions and holders** (item 80): every current version with at least one completed
 write on a sealed, unretired volume, plus every version this write carries. Its holders are the
 sealed, unretired volumes holding a completed write of it, quarantined ones included and marked,
@@ -357,7 +362,9 @@ complete; RESTORE.sh and File 1 say so.
 
 **Size.** Uncapped: `paths.tsv` grows with the files of the listed versions (about 100 MB per
 million paths, written twice per tape with the backup). The capacity gate counts envelopes as it
-counts every file, and `volume plan` prints the index's size.
+counts every file. `volume plan` prints an estimate of it: no this-tape volume exists yet,
+everything staged is counted as one tape, and the figure is plaintext before tar and age (the
+tape carries it twice, §1.3).
 
 **Who reads it.**
 - RESTORE.sh: `--where UNIT` prints the rows of `units.tsv` for a unit (every version and the
@@ -685,6 +692,18 @@ written before 1.2.0 carries the earlier script:
 - **Fixed points (item 73).** RESTORE.sh's "this tape needs tapectl ≥" text stays
   "tapectl 1.1.0" and `requires` stays empty, so a 1.1.x RESTORE.sh reads a 1.2.0
   tape and a 1.2.0 one reads a 1.1.x tape.
+
+**Since 1.3.0** (ADR-0012 2026-10-16/17 items 78-81, 101-102; the golden pin of RESTORE.sh
+moved, MANIFEST.toml's did not). Two modes read the cross-volume index of §1.5: `--where UNIT`
+and `--find TEXT`. Both take the `--find-envelope` tool set (one new row of `RESTORE_TOOLS`,
+`TOOLS_INDEX`), read forward from one rewind, and exit 1 on a tape with no index. A tenant key
+reads that tenant's `index/`, an operator or escrow key the operator envelope's `units.tsv`.
+`--find` prints at most 50 matches and counts the rest. RECOVERY.md gained a section on
+`index/`. File 1 was rewritten for #477's eleven findings: a glossary and one key placeholder
+(`YOUR_KEY.age.key`), the non-rewinding device, `TAPE_DEVICE` as an environment prefix, commands
+for every manual step, the UNSEALED and DAMAGED sections, a completeness check, "The rest of the
+box", hardware, and rung 3's stopping point. Fixed points (item 81): `requires` stays empty and
+`die_newer_needed` stays "tapectl 1.1.0".
 
 ## 7. Block mode
 
