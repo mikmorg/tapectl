@@ -271,11 +271,22 @@ impl Fixture {
     /// One staging of `files` (a real dar run, slices of `slice_size`, each
     /// encrypted to the tenant), as `stage create` records it.
     fn stage(&self, files: &[(String, Vec<u8>)], slice_size: &str, catalogue: bool) -> Staging {
+        self.stage_in(self.snapshot_id, files, slice_size, catalogue)
+    }
+
+    /// [`Self::stage`] for another snapshot (another version) of the unit.
+    fn stage_in(
+        &self,
+        snapshot_id: i64,
+        files: &[(String, Vec<u8>)],
+        slice_size: &str,
+        catalogue: bool,
+    ) -> Staging {
         self.conn
             .execute(
                 "INSERT INTO stage_sets (snapshot_id, status, slice_size)
                  VALUES (?1, 'staged', 524288)",
-                params![self.snapshot_id],
+                params![snapshot_id],
             )
             .unwrap();
         let stage_set_id = self.conn.last_insert_rowid();
@@ -352,12 +363,16 @@ impl Fixture {
     /// Write the staging's slices to cartridge `label` and record the copy:
     /// a completed write with a position per slice.
     fn write(&mut self, st: &Staging, label: &str) {
+        self.write_in(self.snapshot_id, st, label);
+    }
+
+    fn write_in(&mut self, snapshot_id: i64, st: &Staging, label: &str) {
         let volume_id = self.volume_ids[label];
         self.conn
             .execute(
                 "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
                  VALUES (?1, ?2, ?3, 'completed')",
-                params![st.stage_set_id, self.snapshot_id, volume_id],
+                params![st.stage_set_id, snapshot_id, volume_id],
             )
             .unwrap();
         let write_id = self.conn.last_insert_rowid();
@@ -385,6 +400,38 @@ impl Fixture {
                 )
                 .unwrap();
         }
+    }
+
+    /// Version `version` of the unit, with the same file list (checksums
+    /// and all) — a different Version of the same unit.
+    fn new_version(&self, version: i64) -> i64 {
+        let unit_id: i64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM units WHERE name = ?1",
+                params![self.unit],
+                |r| r.get(0),
+            )
+            .unwrap();
+        self.conn
+            .execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, ?2, 'staged', '/tmp', 1, 16)",
+                params![unit_id, version],
+            )
+            .unwrap();
+        let snapshot_id = self.conn.last_insert_rowid();
+        for (path, bytes) in &self.files {
+            crate::db::files::fixture::insert(
+                &self.conn,
+                snapshot_id,
+                path,
+                bytes.len() as i64,
+                "regular",
+                Some(&sha_hex(bytes)),
+            );
+        }
+        snapshot_id
     }
 
     /// Flip one byte inside chunk `chunk` of slice `slice` as cartridge
@@ -886,4 +933,343 @@ fn a_substitute_must_pass_the_identity_check_too() {
             .contains("unknown-feature"),
         "{contacts:?}"
     );
+}
+
+// ── item 102: a lost file is filled from another copy of the same version ──
+
+/// The tree with one byte changed in every file: the same names, other bytes.
+fn tampered(files: &[(String, Vec<u8>)]) -> Vec<(String, Vec<u8>)> {
+    files
+        .iter()
+        .map(|(p, b)| {
+            let mut b = b.clone();
+            b[777] ^= 0x55;
+            (p.clone(), b)
+        })
+        .collect()
+}
+
+/// Two stagings of one version (two stage sets, so slices of different sizes
+/// and different hashes: slice substitution matches none of them), one on A
+/// and one on B. A's is damaged in the middle of a slice.
+fn two_stagings(catalogue: bool) -> (Fixture, Staging, Staging) {
+    let mut fx = Fixture::new(&[A, B], tree());
+    let one = fx.stage(&tree(), "150k", catalogue);
+    let two = fx.stage(&tree(), "90k", catalogue);
+    assert_ne!(one.slices(), two.slices(), "different slicing");
+    fx.write(&one, A);
+    fx.write(&two, B);
+    (fx, one, two)
+}
+
+/// THE acceptance test of item 102: the only copy of a stage set is damaged
+/// where no slice of it can be had, and the lost files come whole from the
+/// other staging of the same version — asked for by label and serial,
+/// verified against the recorded checksums, and the restore is whole.
+#[test]
+fn files_lost_to_a_damaged_slice_are_filled_from_another_staging_of_the_version() {
+    for catalogue in [true, false] {
+        let (mut fx, one, _two) = two_stagings(catalogue);
+        fx.corrupt(A, &one, 3, 1);
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let report = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("catalogue={catalogue}: {e}"));
+        fx.assert_restored(dest.path());
+        assert_eq!(bay.asked_labels(), [B], "catalogue={catalogue}");
+        assert!(
+            bay.asked[0].1.contains("damaged or missing")
+                && bay.asked[0].1.contains("the same files"),
+            "{:?}",
+            bay.asked
+        );
+        assert!(!report.filled.is_empty(), "{report:?}");
+        for (path, from) in &report.filled {
+            assert!(
+                from.starts_with(B) && from.contains("sha256 matches"),
+                "{path}: {from}"
+            );
+        }
+        // A's slices had no other copy, so none was substituted.
+        assert!(report.substitutions.is_empty());
+        let contacts = fx.contacts();
+        assert_eq!(contacts.len(), 2, "{contacts:?}");
+        assert!(
+            contacts[1].2.as_deref().unwrap_or("").contains("supplied"),
+            "the copy's contact says what it supplied: {contacts:?}"
+        );
+        // And nothing of the fill is left behind.
+        assert!(!dest.path().join(SCRATCH_NAME).exists());
+    }
+}
+
+/// With the other staging on the cartridge already in the drive there is no
+/// swap at all; and with a catalogue only the slices that hold the lost files
+/// (and the last) are read from it.
+#[test]
+fn a_fill_from_the_cartridge_in_the_drive_asks_nobody_and_reads_only_what_holds_the_files() {
+    let mut fx = Fixture::new(&[A], tree());
+    // The later stage set of a version is the one a restore reads; the
+    // earlier is the other copy.
+    let two = fx.stage(&tree(), "50k", true);
+    let one = fx.stage(&tree(), "150k", true);
+    fx.write(&two, A);
+    fx.write(&one, A);
+    fx.corrupt(A, &one, 3, 1);
+    let (mut bay, fakes) = fx.fake_bay(A, &[]);
+    let dest = TempDir::new().unwrap();
+    let report = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap();
+    fx.assert_restored(dest.path());
+    assert!(bay.asked.is_empty());
+    assert!(!report.filled.is_empty(), "{report:?}");
+    let two_first = fx.first_position[&(A.to_string(), two.stage_set_id)];
+    let reads: Vec<usize> = fakes[A]
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            crate::tape::fake::Op::Read(n)
+                if (*n as usize) >= two_first && (*n as usize) < two_first + two.slices() =>
+            {
+                Some(*n as usize - two_first + 1)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !reads.is_empty() && reads.len() < two.slices(),
+        "only some of the other staging's {} slices are read: {reads:?}",
+        two.slices()
+    );
+    assert!(
+        reads.contains(&two.slices()),
+        "dar's catalogue slice is read: {reads:?}"
+    );
+}
+
+/// A file whose only other copy has different bytes than the version
+/// recorded is reported, not written: the checksum is the arbiter.
+#[test]
+fn a_copy_that_does_not_match_the_recorded_checksum_is_refused_and_said() {
+    let mut fx = Fixture::new(&[A, B], tree());
+    let one = fx.stage(&tree(), "150k", true);
+    let two = fx.stage(&tampered(&tree()), "90k", true);
+    fx.write(&one, A);
+    fx.write(&two, B);
+    fx.corrupt(A, &one, 3, 1);
+    let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    let err = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
+    assert!(
+        err.contains("does not match the version's recorded checksum"),
+        "{err}"
+    );
+    assert!(err.contains("not kept"), "{err}");
+    let lost = fx.differing(dest.path());
+    assert!(!lost.is_empty());
+    for path in &lost {
+        assert!(err.contains(path.as_str()), "{path} is named: {err}");
+        // Not the tampered copy's bytes: the bad file is as dar left it.
+        let bytes = fs::read(dest.path().join(path)).unwrap();
+        let wrong = &tampered(&tree())
+            .into_iter()
+            .find(|(p, _)| p == path)
+            .unwrap()
+            .1;
+        assert_ne!(&bytes, wrong, "{path}: the refused copy was written");
+    }
+}
+
+/// Without a person at the terminal the fill refuses by name too, listing the
+/// holders of the other staging.
+#[test]
+fn an_unattended_fill_refuses_by_name_listing_the_holders() {
+    let (mut fx, one, _two) = two_stagings(true);
+    fx.corrupt(A, &one, 3, 1);
+    let mut bay = fx.bay(A, false, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    let err = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
+    assert!(err.contains(B), "the holder is named: {err}");
+    assert!(err.contains("swaps no cartridge without a person"), "{err}");
+    assert!(bay.asked.is_empty());
+}
+
+/// Another VERSION is never a source, even where the file is unchanged.
+#[test]
+fn another_version_is_never_a_source() {
+    let mut fx = Fixture::new(&[A, B], tree());
+    let one = fx.stage(&tree(), "150k", true);
+    fx.write(&one, A);
+    let v2 = fx.new_version(2);
+    let other = fx.stage_in(v2, &tree(), "90k", true);
+    fx.write_in(v2, &other, B);
+    fx.corrupt(A, &one, 3, 1);
+    let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    let err = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("INCOMPLETE"), "{err}");
+    assert!(
+        bay.asked.is_empty(),
+        "nothing of another version is asked for"
+    );
+}
+
+/// `restore file` fills its one file from the other staging too, and places
+/// it only once it is whole.
+#[test]
+fn restore_file_is_filled_from_another_staging_and_placed_whole() {
+    let (mut fx, one, _two) = two_stagings(true);
+    fx.corrupt(A, &one, 3, 1);
+    // A file the damaged chunk falls in: found by restoring the unit once.
+    let probe = TempDir::new().unwrap();
+    let mut bay = fx.bay(A, true, &[]);
+    fx.restore(A, &mut bay, probe.path(), &RestoreOptions::default())
+        .unwrap_err();
+    let damaged = fx.differing(probe.path());
+    let file = damaged.first().expect("a file lost to the chunk").clone();
+
+    let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    let dest_str = dest.path().to_string_lossy().into_owned();
+    let report = restore_unit_from_bay(
+        &fx.conn,
+        &fx.paths,
+        &Config::default(),
+        &fx.unit,
+        A,
+        1,
+        RestoreTarget::File {
+            file_path: &file,
+            dest_dir: &dest_str,
+        },
+        &RestoreOptions::default(),
+        &mut bay,
+        site(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let want = &fx.files.iter().find(|(p, _)| *p == file).unwrap().1;
+    assert_eq!(&fs::read(dest.path().join(&file)).unwrap(), want);
+    assert_eq!(report.filled.len(), 1);
+    assert_eq!(bay.asked_labels(), [B]);
+}
+
+// ── cost: what a swap costs the tapes (issue #416's discipline, #480) ──
+
+/// The pin for a one-swap restore, next to the clean restore's (the
+/// `FIRST`/`Space`/`Read` vector in `contact`'s tests, unchanged): the first
+/// cartridge is read forward to the slice that fails and that slice to its
+/// end — one rewind, none after — then released; the second is opened at BOT,
+/// its File 0 looked at once for the identity check, and read forward from
+/// the failed slice to the end. No cartridge is rewound twice, no file is
+/// read twice, and the first is not asked for again.
+#[test]
+fn a_one_swap_restore_moves_each_tape_once_and_forward_only() {
+    let (mut fx, st) = two_copies(false);
+    fx.corrupt(A, &st, 3, 0);
+    let slices = st.slices();
+    let (mut bay, fakes) = fx.fake_bay(A, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    fx.restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap();
+    fx.assert_restored(dest.path());
+    assert_eq!(bay.asked_labels(), [B]);
+    assert_eq!(bay.releases, 1, "the first cartridge was released once");
+
+    use crate::tape::fake::Op;
+    let first = FIRST as u32;
+    // A: File 0 (the contact check), then slices 1..=3 — the third bad, read
+    // through to the filemark for its hash.
+    let mut want_a = vec![Op::Rewind, Op::ReadHead(0), Op::Space(first - 1)];
+    want_a.extend((0..3).map(|i| Op::Read(first + i)));
+    assert_eq!(fakes[A].ops(), want_a, "the first cartridge");
+    // B: opened at BOT, File 0 once, then slice 3 on to the last.
+    let ops_b = fakes[B].ops();
+    assert_eq!(ops_b[..2], [Op::Rewind, Op::ReadHead(0)], "{ops_b:?}");
+    let reads_b: Vec<u32> = ops_b
+        .iter()
+        .filter_map(|op| match op {
+            Op::Read(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reads_b,
+        (2..slices as u32).map(|i| first + i).collect::<Vec<_>>(),
+        "B is read from the failed slice to the last, each once: {ops_b:?}"
+    );
+    assert_eq!(fakes[B].rewinds(), 1, "{ops_b:?}");
+    assert_eq!(fakes[A].rewinds(), 1);
+}
+
+/// `restore volume` reads through the same supply: a bad slice of one of its
+/// units is read from the other copy, and the cartridge that served stays in
+/// the drive for the units after it.
+#[test]
+fn restore_volume_substitutes_a_slice_too() {
+    let (mut fx, st) = two_copies(false);
+    fx.corrupt(A, &st, 3, 0);
+    let dest = TempDir::new().unwrap();
+    let root = dest.path().to_string_lossy().into_owned();
+    let requests = unit_requests(&[fx.unit.clone()], &root).unwrap();
+    let config = Config::default();
+    let options = RestoreOptions::default();
+    let planned = plan_units(&fx.conn, &config, A, &requests, &options).unwrap();
+    let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+    let report = restore_units_from_bay(
+        &fx.conn,
+        &fx.paths,
+        &config,
+        A,
+        &planned,
+        &options,
+        false,
+        &mut bay,
+        site(),
+    )
+    .unwrap();
+    assert_eq!(report.failed(), 0, "{report:?}");
+    fx.assert_restored(&dest.path().join(&fx.unit));
+    assert_eq!(bay.asked_labels(), [B]);
+    assert_eq!(fx.contacts().len(), 2);
+    let rows = crate::volume::restore_record::rows(&fx.conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, "ok");
+}
+
+/// A restore the operator stops at the prompt leaves what it restored and
+/// says so, and the contact of the cartridge that was in the drive is closed.
+#[test]
+fn stopping_at_the_prompt_ends_the_restore_by_name() {
+    let (mut fx, st) = two_copies(true);
+    fx.corrupt(A, &st, 3, 0);
+    let mut bay = fx.bay(A, true, &[Reply::Stop]);
+    let dest = TempDir::new().unwrap();
+    let err = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("stopped at the operator's request"), "{err}");
+    assert!(err.contains(B), "{err}");
+    let contacts = fx.contacts();
+    assert_eq!(contacts.len(), 1, "{contacts:?}");
+    assert_eq!(
+        contacts[0].1, "ok",
+        "A left the drive normally: {contacts:?}"
+    );
+    let rows = crate::volume::restore_record::rows(&fx.conn).unwrap();
+    assert_eq!(rows[0].outcome, "failed");
+    assert!(!dest.path().join(SCRATCH_NAME).exists());
 }

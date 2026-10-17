@@ -505,6 +505,10 @@ fn fill_from(
         match verified(&source, by_path.get(path.as_str()).copied()) {
             Ok(how) => {
                 install(&source, &ex.root.join(path))?;
+                supply.note_here(format!(
+                    "supplied {path} of unit \"{}\" v{} for the restore",
+                    ctx.unit_name, ctx.version
+                ));
                 info!(file = %path, stage_set = copy.stage_set_id, volume = %holder.label, "file filled from another copy ({how})");
                 lost.remove(path);
                 notes
