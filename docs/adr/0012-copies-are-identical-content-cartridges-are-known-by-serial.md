@@ -1647,3 +1647,12 @@ Ruled the same night, after discussion (Round 1 question 1 and its consequences)
     fill opt-in spanning gives. This replaces item 77's trigger (a unit past half a cartridge);
     the rest of item 77 stands (1.3.0 ships R4 alone; spanning is its own minor release, and only
     tapes carrying a range of a spanning version are fenced by `requires`).
+91. **#409 closes as an accepted cost, to be revisited with data.** A failed stage restarts its
+    unit, spannable units included: one dar archive per version cannot resume (item 11 of
+    2026-10-07), and the only resumable shape, a version divided into separately archived parts,
+    was not chosen (item 82). The cost is bounded by the staging area (item 85); the shipped
+    mitigations stay (every slice synced, in-flight space accounting, the refusal of a source
+    changed during the read, item 75's snapshot hook). Spanning's build includes a report of
+    failed stages and the hours each lost, derived from the facts the catalog already keeps. Once
+    spanning has run, that data is reviewed with the CTO, who names the threshold at which the
+    parts question reopens; none is set before the data exists.
