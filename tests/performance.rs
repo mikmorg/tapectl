@@ -439,6 +439,35 @@ fn perf_fresh_catalog_takes_a_184k_file_version() {
         start.elapsed(),
     );
 
+    // #418 R4: the cross-volume index (units.tsv and paths.tsv) the tape of
+    // this version would carry, built from the same catalog the way `volume
+    // write` builds it (here into a sink: every row read, sorted by the
+    // index and formatted, none stored). Reported against the `catalog.db`
+    // build above, which reads the same rows; the ceiling is the catalog's
+    // own (a row-by-row or sorted-in-memory build would show here).
+    let start = Instant::now();
+    let index = tapectl::volume::index::measure(
+        &conn,
+        &tapectl::policy::coverage::IndexThisTape {
+            label: "L6-0001",
+            uuid: "uuid-perf",
+            cartridge_serial: "PERF",
+            generation: "LTO-6",
+        },
+        &[1],
+    )
+    .unwrap();
+    let index_time = start.elapsed();
+    report(
+        "cross-volume index",
+        &format!("{files} rows, {} bytes", index.total_bytes()),
+        index_time,
+    );
+    assert!(
+        index.total_bytes() > files as u64 * 20,
+        "the index holds a row per path: {index:?}"
+    );
+
     assert!(
         files > 184_552 || insert < Duration::from_secs(10),
         "a {files}-file version into a fresh catalog took {insert:?}: issue #413's \
