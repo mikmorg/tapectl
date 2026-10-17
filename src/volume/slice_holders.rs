@@ -87,6 +87,32 @@ pub fn holders_of(conn: &Connection, sha256_encrypted: &str) -> Result<Vec<Holde
     Ok(holders)
 }
 
+/// Whether any live volume other than `volume_id` holds a completed copy of
+/// any slice of `stage_set_id` (by ciphertext hash): the question a restore
+/// asks once, before it reads, to know whether a damaged slice has anywhere
+/// else to come from. When nothing does, it can take what authenticates in
+/// the one pass; when something does, it reads strictly so the swap can be
+/// offered.
+pub fn other_copies_exist(conn: &Connection, stage_set_id: i64, volume_id: i64) -> Result<bool> {
+    let in_service = coverage::in_service("v");
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM stage_slices mine
+                   JOIN stage_slices theirs ON theirs.sha256_encrypted = mine.sha256_encrypted
+                   JOIN write_positions wp ON wp.stage_slice_id = theirs.id
+                   JOIN writes w ON w.id = wp.write_id
+                   JOIN volumes v ON v.id = w.volume_id
+                  WHERE mine.stage_set_id = ?1 AND w.volume_id <> ?2
+                    AND w.status = 'completed' AND wp.status = 'written'
+                    AND ({in_service} OR {bytes}))",
+            bytes = coverage::holds_bytes_to_verify("v"),
+        ),
+        params![stage_set_id, volume_id],
+        |r| r.get(0),
+    )?)
+}
+
 /// What the operator needs to pick a cartridge off the shelf: the sticker
 /// (the barcode, which `cartridge relabel` may have changed) and the chip
 /// serial, either of which the catalog may not know.
@@ -330,6 +356,26 @@ mod tests {
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].stage_set_id, 1);
         assert_eq!(copies[0].holders.len(), 2);
+    }
+
+    #[test]
+    fn other_copies_exist_only_where_another_live_volume_wrote_the_hash() {
+        let conn = catalog();
+        // Stage set 1 is on V1 and V2: from V1 there is another, and from a
+        // volume that is not one of them, both.
+        assert!(other_copies_exist(&conn, 1, 1).unwrap());
+        assert!(other_copies_exist(&conn, 1, 2).unwrap());
+        // Stage set 2 is on V3 alone.
+        assert!(!other_copies_exist(&conn, 2, 3).unwrap());
+        conn.execute(
+            "UPDATE volumes SET status = 'retired' WHERE label = 'V2'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !other_copies_exist(&conn, 1, 1).unwrap(),
+            "retired holds nothing"
+        );
     }
 
     #[test]

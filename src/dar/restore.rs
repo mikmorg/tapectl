@@ -415,6 +415,130 @@ fn parse_slicing_listing(text: &str, file_path: &str) -> Option<std::collections
     named.then_some(slices)
 }
 
+/// Every entry's slices in an isolated catalogue's listing (`dar -l
+/// -Tslicing`, all entries), for the entries named in `paths` and the
+/// directories above them, as [`entry_slices`] reads one — WITHOUT the
+/// archive's last slice, which the caller adds. One `dar` run for any number
+/// of paths (the fill of ADR-0012 item 102 asks for as many as a unit lost).
+///
+/// `Ok(None)` when the listing does not name every path, or carries a range
+/// this cannot read: the caller then reads every slice.
+pub fn entries_slices(
+    dar_binary: &str,
+    catalogue: &Path,
+    paths: &[String],
+) -> Result<Option<std::collections::BTreeSet<i64>>> {
+    let output = super::command(dar_binary)
+        .arg("-l")
+        .arg(catalogue)
+        .arg("-Tslicing")
+        .arg("-Q")
+        .arg("-N") // no darrc (#412 item 9)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| TapectlError::Dar(e.to_string()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(slices_of_paths(
+        &String::from_utf8_lossy(&output.stdout),
+        paths,
+    ))
+}
+
+/// [`entries_slices`]'s parser: every row's path (the text after the flag
+/// groups and the permission string) mapped to its slices, then the union
+/// over `paths` and each one's ancestors.
+fn slices_of_paths(text: &str, paths: &[String]) -> Option<std::collections::BTreeSet<i64>> {
+    let mut by_path: std::collections::HashMap<&str, std::collections::BTreeSet<i64>> =
+        std::collections::HashMap::new();
+    for line in text.lines() {
+        let Some((field, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        if !field
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == ',')
+        {
+            continue;
+        }
+        // `[Saved][ ]       [-L-][     ][ ] -rw-rw-r-- a/b`: skip the bracketed
+        // groups, then the 10-character permission string and its space.
+        let mut rest = rest.trim_start();
+        while rest.starts_with('[') {
+            let end = rest.find(']')?;
+            rest = rest[end + 1..].trim_start();
+        }
+        let path = rest.get(11..)?;
+        let mut slices = std::collections::BTreeSet::new();
+        for piece in field.split(',').filter(|p| !p.is_empty()) {
+            let (lo, hi) = match piece.split_once('-') {
+                Some((lo, hi)) => (lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?),
+                None => {
+                    let n = piece.parse::<i64>().ok()?;
+                    (n, n)
+                }
+            };
+            if lo < 1 || hi < lo {
+                return None;
+            }
+            slices.extend(lo..=hi);
+        }
+        by_path.insert(path, slices);
+    }
+    let mut needed = std::collections::BTreeSet::new();
+    for path in paths {
+        needed.extend(by_path.get(path.as_str())?.iter().copied());
+        let mut ancestor = path.as_str();
+        while let Some((parent, _)) = ancestor.rsplit_once('/') {
+            if let Some(s) = by_path.get(parent) {
+                needed.extend(s.iter().copied());
+            }
+            ancestor = parent;
+        }
+    }
+    Some(needed)
+}
+
+/// The files dar's report says it could not restore intact: the
+/// `Error while restoring <path> : <reason>` lines it prints to standard
+/// output (measured on dar 2.7.13: `Bad CRC, data corruption occurred`, exit
+/// code 5, every other file still restored). `path` is as dar printed it,
+/// under the `-R` root.
+pub fn failed_entries(stdout: &str) -> Vec<(String, String)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("Error while restoring ")?;
+            let (path, reason) = rest.rsplit_once(" : ")?;
+            Some((path.trim().to_string(), reason.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Extract several entries of a dar archive: `dar -x -g <path>...`, the
+/// direct-mode read [`extract_file_reported`] makes for one. dar reads only
+/// the slices they and the directories above them are in.
+pub fn extract_files_reported(
+    dar_binary: &str,
+    archive_base: &Path,
+    file_paths: &[String],
+    dest: &Path,
+) -> (Option<DarReport>, Result<()>) {
+    if let Err(e) = std::fs::create_dir_all(dest) {
+        return (None, Err(e.into()));
+    }
+    warn_if_non_root();
+    let mut args: Vec<std::ffi::OsString> =
+        vec!["-x".into(), archive_base.into(), "-R".into(), dest.into()];
+    for path in file_paths {
+        args.push("-g".into());
+        args.push(path.into());
+    }
+    args.extend(["-O".into(), "-Q".into(), "-N".into()]);
+    run_extract(dar_binary, "dar -x -g", &args, dest)
+}
+
 /// Extract a dar archive to a destination directory.
 ///
 /// Fails if dar skipped any file rather than overwriting it — see

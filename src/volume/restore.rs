@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -12,11 +12,15 @@ use crate::dar::restore::DarReport;
 use crate::db::queries;
 use crate::error::{Result, TapectlError};
 use crate::progress;
-use crate::store::{Store, TapeStore};
-use crate::tape::contact::{self, ContactSite, Medium, Operation};
-use crate::tape::mam_journal::MamReads;
-use crate::util::{HashingWriter, TruncatingWriter};
+use crate::store::Store;
+use crate::tape::contact::{self, ContactSite, Operation};
 use crate::volume::restore_record::{self, RestoreRecord};
+
+mod fill;
+mod supply;
+#[cfg(test)]
+use supply::FixedBay;
+use supply::{Bay, DeviceBay, SliceSink, Supply};
 
 /// What a restore through `restore unit`'s one drive path is FOR — the whole
 /// unit, or one file out of it (issue #306).
@@ -122,6 +126,9 @@ struct RestoreTrace {
     dar_version: Option<String>,
     /// [`RestoreTarget::File`] only: the one entry was placed.
     placed: bool,
+    /// Files that came back damaged or missing and were filled from another
+    /// copy of the same version: the path, and the volume and check.
+    filled: Vec<(String, String)>,
 }
 
 /// Removes the restore scratch directory when it goes out of scope, on every
@@ -246,6 +253,8 @@ fn restore_through_drive(
             destination: target.destination().to_string(),
             dry_run: true,
             success: true,
+            substitutions: Vec::new(),
+            filled: Vec::new(),
         });
     }
 
@@ -255,37 +264,32 @@ fn restore_through_drive(
     // yet (ADR-0005), same leniency as the MAM read just below.
     //
     // Both MAM reads are held and journalled when the contact opens (issue
-    // #297).
-    let reads = MamReads::new(conn, Operation::RestoreUnit);
-    reads.check_read_contact(config, device)?;
-
-    // Before `TapeStore::open_read`: reading the MAM opens the device
-    // read-only and drops the fd, and the st driver refuses a second
-    // concurrent open. LENIENT — no configured backend yields `None`, an
-    // absence, which is the DR machine with keys and no `backend add`.
-    let observed = crate::volume::binding::loaded_medium(config, device, &reads);
-    // Open the store read-only, positioned at BOT.
-    let phase = progress::phase("drive-open", None);
-    let mut store = TapeStore::open_read(device, block_size)?;
-    phase.done();
-    restore_unit_from_store(
-        conn,
-        paths,
-        config,
-        unit_name,
-        volume_label,
-        selection.version,
-        target,
-        options,
-        &mut store,
-        ContactSite::new(
+    // #297). `DeviceBay::load` takes them, then opens the store read-only,
+    // positioned at BOT: reading the MAM opens the device read-only and drops
+    // the fd, and the st driver refuses a second concurrent open, so they
+    // come first. LENIENT — no configured backend yields an absence, which is
+    // the DR machine.
+    let mut bay = DeviceBay {
+        device,
+        block_size,
+        operation: Operation::RestoreUnit,
+        store: None,
+    };
+    let arrival = bay.load(conn, config)?;
+    arrival.with_site(config, Operation::RestoreUnit, device, |site| {
+        restore_unit_from_bay(
+            conn,
+            paths,
             config,
-            Operation::RestoreUnit,
-            device,
-            Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+            unit_name,
+            volume_label,
+            selection.version,
+            target,
+            options,
+            &mut bay,
+            *site,
         )
-        .with_mam_reads(&reads),
-    )
+    })
 }
 
 /// Everything a `restore unit` / `restore file` settles from the catalog
@@ -336,7 +340,7 @@ fn plan_before_tape(
 }
 
 /// Open the drive for a restore that names no volume (issue #435) and hand
-/// `body` the store and the contact site: the same four steps, in the same
+/// `body` the bay and the contact site: the same four steps, in the same
 /// order, as [`restore_through_drive`] and [`restore_units`] take for a
 /// named volume — the no-medium check first, both MAM reads held for the
 /// contact, then the read-only store. One function so `restore unit`,
@@ -347,24 +351,16 @@ fn with_loaded_drive<R>(
     device: &str,
     block_size: usize,
     operation: Operation,
-    body: impl FnOnce(&mut dyn Store, ContactSite<'_>) -> Result<R>,
+    body: impl FnOnce(&mut dyn Bay, ContactSite<'_>) -> Result<R>,
 ) -> Result<R> {
-    let reads = MamReads::new(conn, operation);
-    reads.check_read_contact(config, device)?;
-    let observed = crate::volume::binding::loaded_medium(config, device, &reads);
-    let phase = progress::phase("drive-open", None);
-    let mut store = TapeStore::open_read(device, block_size)?;
-    phase.done();
-    body(
-        &mut store,
-        ContactSite::new(
-            config,
-            operation,
-            device,
-            Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
-        )
-        .with_mam_reads(&reads),
-    )
+    let mut bay = DeviceBay {
+        device,
+        block_size,
+        operation,
+        store: None,
+    };
+    let arrival = bay.load(conn, config)?;
+    arrival.with_site(config, operation, device, |site| body(&mut bay, *site))
 }
 
 /// [`restore_unit`] for the tape that is loaded, named by no `--from` (issue
@@ -389,8 +385,8 @@ pub fn restore_unit_from_loaded(
         device,
         block_size,
         Operation::RestoreUnit,
-        |store, site| {
-            restore_unit_from_loaded_store(
+        |bay, site| {
+            restore_unit_from_loaded_bay(
                 conn,
                 paths,
                 config,
@@ -398,7 +394,7 @@ pub fn restore_unit_from_loaded(
                 RestoreTarget::Unit { dest_dir },
                 options,
                 version,
-                store,
+                bay,
                 site,
             )
         },
@@ -427,8 +423,8 @@ pub fn restore_file_from_loaded(
         device,
         block_size,
         Operation::RestoreUnit,
-        |store, site| {
-            restore_unit_from_loaded_store(
+        |bay, site| {
+            restore_unit_from_loaded_bay(
                 conn,
                 paths,
                 config,
@@ -439,7 +435,7 @@ pub fn restore_file_from_loaded(
                 },
                 options,
                 version,
-                store,
+                bay,
                 site,
             )
         },
@@ -467,6 +463,7 @@ pub fn restore_file_from_loaded(
 /// ([`restore_unit_in_contact`]), not a second one. A refusal writes no
 /// `restores` row: the restore never began, as a named volume's refusals
 /// before the drive write none.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn restore_unit_from_loaded_store(
     conn: &Connection,
@@ -479,13 +476,40 @@ pub(crate) fn restore_unit_from_loaded_store(
     store: &mut dyn Store,
     site: ContactSite<'_>,
 ) -> Result<RestoreReport> {
+    restore_unit_from_loaded_bay(
+        conn,
+        paths,
+        config,
+        unit_name,
+        target,
+        options,
+        version,
+        &mut FixedBay(store),
+        site,
+    )
+}
+
+/// [`restore_unit_from_loaded_store`] over a [`Bay`]: the drive that can
+/// also be asked for another cartridge.
+#[allow(clippy::too_many_arguments)]
+fn restore_unit_from_loaded_bay(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    target: RestoreTarget<'_>,
+    options: &RestoreOptions,
+    version: Option<i64>,
+    bay: &mut dyn Bay,
+    site: ContactSite<'_>,
+) -> Result<RestoreReport> {
     let started_at = restore_record::now_sqlite();
     let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, None);
     phase.done();
     let kind = target.kind();
-    let (found, mut peeked) = match crate::volume::loaded::identify(conn, store) {
-        Ok(identified) => identified,
+    let (found, primed) = match crate::volume::loaded::identify(conn, bay.store()) {
+        Ok((found, peeked)) => (found, peeked.into_file0()),
         Err(e) => return refuse_loaded_contact(conn, guard, &site, None, kind, e),
     };
     guard.record_volume(found.volume_id);
@@ -514,7 +538,8 @@ pub(crate) fn restore_unit_from_loaded_store(
         selection.version,
         target,
         options,
-        &mut peeked,
+        bay,
+        primed,
         &site,
     )
 }
@@ -1091,6 +1116,7 @@ pub fn restore_raw_volume_selected(
 /// on every outcome — this seam is where the contact opens, so it is where
 /// "after the contact opened" begins. Nothing before `site.open` records a
 /// restore: a refusal upstream of the drive is not one.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn restore_unit_from_store(
     conn: &Connection,
@@ -1102,6 +1128,35 @@ pub(crate) fn restore_unit_from_store(
     target: RestoreTarget<'_>,
     options: &RestoreOptions,
     store: &mut dyn Store,
+    site: ContactSite<'_>,
+) -> Result<RestoreReport> {
+    restore_unit_from_bay(
+        conn,
+        paths,
+        config,
+        unit_name,
+        volume_label,
+        version,
+        target,
+        options,
+        &mut FixedBay(store),
+        site,
+    )
+}
+
+/// [`restore_unit_from_store`] over a [`Bay`] — the drive that can also be
+/// asked for another cartridge when a slice is damaged (issue #480).
+#[allow(clippy::too_many_arguments)]
+fn restore_unit_from_bay(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_name: &str,
+    volume_label: &str,
+    version: i64,
+    target: RestoreTarget<'_>,
+    options: &RestoreOptions,
+    bay: &mut dyn Bay,
     site: ContactSite<'_>,
 ) -> Result<RestoreReport> {
     // The volume the restore names, looked up here only so the contact can
@@ -1131,7 +1186,8 @@ pub(crate) fn restore_unit_from_store(
         version,
         target,
         options,
-        store,
+        bay,
+        None,
         &site,
     )
 }
@@ -1140,6 +1196,10 @@ pub(crate) fn restore_unit_from_store(
 /// restore itself, the `restores` row, the one post-command reading and the
 /// phase timings. Split out for issue #442 — the loaded-tape restore opens
 /// the same contact before it can know the volume, and ends in this.
+///
+/// `primed` is File 0's head, when the loaded-tape path has already read it
+/// to identify the volume: lent to the first contact check so the tape is
+/// asked for File 0 once.
 #[allow(clippy::too_many_arguments)]
 fn restore_unit_in_contact(
     conn: &Connection,
@@ -1153,12 +1213,16 @@ fn restore_unit_in_contact(
     version: i64,
     target: RestoreTarget<'_>,
     options: &RestoreOptions,
-    store: &mut dyn Store,
+    bay: &mut dyn Bay,
+    primed: Option<Vec<u8>>,
     site: &ContactSite<'_>,
 ) -> Result<RestoreReport> {
     let contact_id = guard.id();
     let mut trace = RestoreTrace::default();
-    let r = guard.finish_result(restore_unit_contacted(
+    let mut supply = Supply::start(conn, bay, guard, volume_id, volume_label, *site);
+    supply.prime(primed);
+    supply.set_subject(format!("unit \"{unit_name}\" v{version}"));
+    let r = restore_unit_contacted(
         conn,
         paths,
         config,
@@ -1167,10 +1231,15 @@ fn restore_unit_in_contact(
         version,
         target,
         options,
-        store,
-        site.medium_serial(),
+        &mut supply,
         &mut trace,
-    ));
+    );
+    // The last cartridge's contact closes with the outcome and takes its one
+    // post-command health reading (issue #320): a restore that failed on a
+    // read error is precisely the contact whose counters matter. A swap
+    // closed the earlier cartridges' contacts the same way, each with its own
+    // reading, so no contact has two and none has none.
+    supply.finish(r.as_ref().err());
     record_restore(
         conn,
         RecordAt {
@@ -1185,14 +1254,6 @@ fn restore_unit_in_contact(
         r.as_ref().err(),
         &trace,
     );
-    // ONE post-command health reading for this contact (issue #320), on
-    // every outcome, naming the volume the contact names. This is the only
-    // place `restore unit` — and `restore file`, which reaches the drive
-    // through it — takes one for a contact that reached the restore, so a
-    // contact cannot get two.
-    let phase = progress::phase("health-sweep", None);
-    crate::volume::write::health_after_read_contact(conn, site, volume_id, contact_id);
-    phase.done();
     // Issue #386: this restore's phases, on every outcome.
     if let Some(id) = volume_id {
         crate::db::phase_timings::record_drained(
@@ -1217,8 +1278,7 @@ fn restore_unit_contacted(
     version: i64,
     target: RestoreTarget<'_>,
     options: &RestoreOptions,
-    store: &mut dyn Store,
-    medium_serial: Option<&str>,
+    supply: &mut Supply<'_, '_, '_>,
     trace: &mut RestoreTrace,
 ) -> Result<RestoreReport> {
     let unit = queries::get_unit_by_name(conn, unit_name)?
@@ -1230,7 +1290,7 @@ fn restore_unit_contacted(
     // concretely, so the version counted and the version read are the same.
     let selection = select_write_positions(conn, unit_name, volume_label, Some(version))?;
 
-    corroborate_at_contact(conn, volume_label, store, medium_serial)?;
+    supply.corroborate_first(volume_label)?;
 
     // ONE plan, decided again exactly as `restore_through_drive`'s preflight
     // decided it before the drive opened: whether the slices stream into dar
@@ -1239,15 +1299,18 @@ fn restore_unit_contacted(
     let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
 
     let identities = load_identities(conn, paths, &tenant)?;
+    let substitutions_before = supply.substitutions.len();
     restore_planned(
+        conn,
         config,
         unit_name,
+        version,
         &plan,
         target,
         options,
         &scratch,
         &identities,
-        store,
+        supply,
         trace,
     )?;
 
@@ -1261,6 +1324,8 @@ fn restore_unit_contacted(
         destination: target.destination().to_string(),
         dry_run: false,
         success: true,
+        substitutions: supply.substitutions[substitutions_before..].to_vec(),
+        filled: trace.filled.clone(),
     })
 }
 
@@ -1571,14 +1636,16 @@ fn takes_a_named_pipe(scratch: &Path) -> bool {
 /// spooled — and, for `restore file`, place the one entry.
 #[allow(clippy::too_many_arguments)]
 fn restore_planned(
+    conn: &Connection,
     config: &Config,
     unit_name: &str,
+    version: i64,
     plan: &RestorePlan,
     target: RestoreTarget<'_>,
     options: &RestoreOptions,
     scratch: &Path,
     identities: &[age::x25519::Identity],
-    store: &mut dyn Store,
+    supply: &mut Supply<'_, '_, '_>,
     trace: &mut RestoreTrace,
 ) -> Result<()> {
     // Scratch: inside the destination or `--scratch`, never $TMPDIR
@@ -1592,23 +1659,100 @@ fn restore_planned(
     })?;
     let _scratch = RestoreScratch(scratch.to_path_buf());
     let archive_base = scratch.join("restore");
+    // The holes this restore writes are the supply's from here on.
+    let damage_before = supply.damage.len();
+    let extracted = scratch.join("extract");
 
-    if let (Some(catalogue), RestoreTarget::Unit { dest_dir }) = (&plan.stream, target) {
-        info!(scratch = %scratch.display(), "slices stream to dar through named pipes here");
-        return stream_into_dar(
+    let streamed =
+        if let (Some(catalogue), RestoreTarget::Unit { dest_dir }) = (&plan.stream, target) {
+            info!(scratch = %scratch.display(), "slices stream to dar through named pipes here");
+            Some((
+                stream_into_dar(
+                    config,
+                    unit_name,
+                    &plan.positions,
+                    catalogue,
+                    &archive_base,
+                    Path::new(dest_dir),
+                    options,
+                    identities,
+                    supply,
+                    trace,
+                )?,
+                PathBuf::from(dest_dir),
+            ))
+        } else {
+            None
+        };
+
+    let (verdict, root) = match streamed {
+        Some(streamed) => streamed,
+        None => spool_and_extract(
             config,
             unit_name,
-            &plan.positions,
-            catalogue,
-            &archive_base,
-            Path::new(dest_dir),
+            plan,
+            target,
             options,
+            scratch,
+            &archive_base,
+            &extracted,
             identities,
-            store,
+            supply,
             trace,
-        );
-    }
+        )?,
+    };
 
+    // What dar left, what it could not make of the holes, and — when a copy
+    // of the same version holds the rest — the files filled from it
+    // (issue #480, ADR-0012 items 101 and 102).
+    let holes = supply.damage[damage_before..].to_vec();
+    let ex = fill::judge(trace, verdict, root, holes)?;
+    let ctx = fill::Finish {
+        conn,
+        config,
+        identities,
+        unit_name,
+        version,
+        stage_set_id: plan
+            .positions
+            .first()
+            .map(|wp| wp.stage_set_id)
+            .unwrap_or_default(),
+        target,
+        scratch,
+    };
+    trace.filled = fill::finish(&ctx, supply, &ex)?;
+
+    // `restore file`: place the one requested entry, inside the recorded
+    // span (see `RestoreTarget`).
+    if let RestoreTarget::File {
+        file_path,
+        dest_dir: file_dest,
+    } = target
+    {
+        place_one_entry(&extracted, file_path, Path::new(file_dest))?;
+        trace.placed = true;
+    }
+    Ok(())
+}
+
+/// The spooled half of [`restore_planned`]: every slice to a file in
+/// scratch, then dar's extract from them. Returns dar's verdict and where it
+/// wrote.
+#[allow(clippy::too_many_arguments)]
+fn spool_and_extract(
+    config: &Config,
+    unit_name: &str,
+    plan: &RestorePlan,
+    target: RestoreTarget<'_>,
+    options: &RestoreOptions,
+    scratch: &Path,
+    archive_base: &Path,
+    extracted: &Path,
+    identities: &[age::x25519::Identity],
+    supply: &mut Supply<'_, '_, '_>,
+    trace: &mut RestoreTrace,
+) -> Result<(Result<()>, PathBuf)> {
     info!(scratch = %scratch.display(), "decrypted slices wait for dar here");
     // Issue #386: the tape read and decrypt, counted as ciphertext off the
     // tape, then dar's extract as a phase of its own.
@@ -1626,9 +1770,9 @@ fn restore_planned(
         })?;
         // dar expects: basename.N.dar
         let slice_path = scratch.join(format!("restore.{}.dar", wp.slice_number));
-        let plain_size = read_slice(store, wp, identities, SliceSink::File(&slice_path))?;
+        let read = supply.read_slice(wp, identities, SliceSink::File(&slice_path))?;
         trace.slices_read += 1;
-        trace.bytes_decrypted += plain_size as i64;
+        trace.bytes_decrypted += read.authentic_bytes as i64;
     }
     phase.done();
 
@@ -1639,14 +1783,13 @@ fn restore_planned(
     phase.item(unit_name.to_string());
     // `restore unit` extracts the whole archive into the destination;
     // `restore file` asks dar for its one entry (`-g`, issue #406) into
-    // scratch, and places it below.
-    let extracted = scratch.join("extract");
+    // scratch, and places it after the fill.
     let (report, verdict) = match target {
         RestoreTarget::Unit { dest_dir } => {
             info!("extracting dar archive to {dest_dir}");
             dar::restore::extract_reported(
                 &config.dar.binary,
-                &archive_base,
+                archive_base,
                 Path::new(dest_dir),
                 options.overwrite,
             )
@@ -1655,27 +1798,19 @@ fn restore_planned(
             info!("extracting \"{file_path}\" from the dar archive");
             dar::restore::extract_file_reported(
                 &config.dar.binary,
-                &archive_base,
+                archive_base,
                 file_path,
-                &extracted,
+                extracted,
             )
         }
     };
     record_dar(config, trace, report);
-    verdict?;
     phase.done();
-
-    // `restore file`: place the one requested entry, inside the recorded
-    // span (see `RestoreTarget`).
-    if let RestoreTarget::File {
-        file_path,
-        dest_dir: file_dest,
-    } = target
-    {
-        place_one_entry(&extracted, file_path, Path::new(file_dest))?;
-        trace.placed = true;
-    }
-    Ok(())
+    let root = match target {
+        RestoreTarget::Unit { dest_dir } => PathBuf::from(dest_dir),
+        RestoreTarget::File { .. } => extracted.to_path_buf(),
+    };
+    Ok((verdict, root))
 }
 
 fn ciphertext_bytes(positions: &[WritePositionInfo]) -> u64 {
@@ -1736,9 +1871,9 @@ fn stream_into_dar(
     dest: &Path,
     options: &RestoreOptions,
     identities: &[age::x25519::Identity],
-    store: &mut dyn Store,
+    supply: &mut Supply<'_, '_, '_>,
     trace: &mut RestoreTrace,
-) -> Result<()> {
+) -> Result<Result<()>> {
     // Every pipe exists before dar starts: dar opens slice 1, then each
     // next slice as it finishes the one before.
     let pipes: Vec<PathBuf> = positions
@@ -1794,10 +1929,10 @@ fn stream_into_dar(
             path: pipe,
             dar: &darx,
         };
-        match read_slice(store, wp, identities, sink) {
-            Ok(plain_size) => {
+        match supply.read_slice(wp, identities, sink) {
+            Ok(read) => {
                 trace.slices_read += 1;
-                trace.bytes_decrypted += plain_size as i64;
+                trace.bytes_decrypted += read.authentic_bytes as i64;
             }
             Err(e) => {
                 failure = Some(e);
@@ -1829,131 +1964,7 @@ fn stream_into_dar(
             other => TapectlError::Other(partial(other.to_string())),
         });
     }
-    verdict
-}
-
-/// Where one slice's plaintext goes.
-enum SliceSink<'a> {
-    /// A file in scratch — the spooled restore.
-    File(&'a Path),
-    /// The named pipe `dar` reads this slice from — the streamed restore.
-    Pipe {
-        path: &'a Path,
-        dar: &'a dar::restore::SequentialExtract,
-    },
-}
-
-/// Read one slice off `store` and decrypt it into `sink`, in ONE pass
-/// (issue #411). Returns the plaintext byte count.
-///
-/// The slice streams off the store (`Store::read_file` is push-based, its
-/// tape read on a thread of its own up to `pipeline::QUEUE_BYTES` ahead,
-/// issue #390) through a [`TruncatingWriter`] that trims the block padding
-/// to `wp.encrypted_bytes` (the DB-recorded true length) and a
-/// [`HashingWriter`] for the ciphertext hash, into an OS pipe; a decrypt
-/// thread pulls from the pipe (`age::Decryptor` needs a `Read`) and writes
-/// the plaintext to `sink`. The store never leaves this thread.
-///
-/// The ciphertext hash is checked against `wp.sha256_encrypted` once the
-/// slice has been read, as before. Plaintext no longer waits for it: age's
-/// STREAM authenticates every 64 KiB chunk before releasing it, so a
-/// corrupted byte stops the decrypt at its chunk, and what reached `sink`
-/// was authentic. The plaintext sha256 is not checked any more — the
-/// ciphertext hash and age's authentication already prove it (issue #411).
-///
-/// A decrypt that stops early (a corrupted chunk, a dar that stopped
-/// reading) does not stop the tape read: the rest of the slice is still read
-/// and hashed, so the verdict on a damaged slice is the checksum's, naming
-/// it, and the head ends the slice at the next file as on success — the
-/// next read is a forward space, never a rewind.
-///
-/// Trial-decryption is ONE `decrypt()` call carrying every identity —
-/// `age` tries each against the header's stanzas before reading the body.
-///
-/// A spooled slice that fails is removed rather than left behind.
-fn read_slice(
-    store: &mut dyn Store,
-    wp: &WritePositionInfo,
-    identities: &[age::x25519::Identity],
-    sink: SliceSink<'_>,
-) -> Result<u64> {
-    let spooled = match &sink {
-        SliceSink::File(path) => Some(path.to_path_buf()),
-        SliceSink::Pipe { .. } => None,
-    };
-    let result = read_slice_inner(store, wp, identities, sink);
-    if let (Err(_), Some(path)) = (&result, spooled) {
-        let _ = fs::remove_file(path);
-    }
-    result
-}
-
-fn read_slice_inner(
-    store: &mut dyn Store,
-    wp: &WritePositionInfo,
-    identities: &[age::x25519::Identity],
-    sink: SliceSink<'_>,
-) -> Result<u64> {
-    let position: u32 = wp.position.parse().map_err(|_| {
-        TapectlError::Other(format!(
-            "slice {} has no tape position the catalog can read (\"{}\")",
-            wp.slice_number, wp.position
-        ))
-    })?;
-    let (pipe_reader, pipe_writer) = std::io::pipe()?;
-    let slice_number = wp.slice_number;
-    let (read, actual_hash, decrypted) = std::thread::scope(|s| {
-        let decrypt = s.spawn(move || decrypt_into(pipe_reader, identities, sink, slice_number));
-        let mut bounded = TruncatingWriter::new(
-            HashingWriter::new(Detachable::new(pipe_writer)),
-            wp.encrypted_bytes.max(0) as u64,
-        );
-        let read = store.read_file(position, &mut progress::CountingWriter(&mut bounded));
-        let hashing = bounded.into_inner();
-        let actual_hash = hashing.finalize_hex();
-        // Closes the pipe: the decrypt thread sees the end of the slice.
-        drop(hashing);
-        let decrypted = decrypt.join();
-        (read, actual_hash, decrypted)
-    });
-    read?;
-    if actual_hash != wp.sha256_encrypted {
-        return Err(TapectlError::Other(format!(
-            "slice {} checksum mismatch on tape: expected {}..., got {}...",
-            wp.slice_number,
-            &wp.sha256_encrypted[..wp.sha256_encrypted.len().min(16)],
-            &actual_hash[..16],
-        )));
-    }
-    decrypted.map_err(|_| {
-        TapectlError::Other(format!(
-            "slice {}: the decrypt thread panicked",
-            wp.slice_number
-        ))
-    })?
-}
-
-/// The decrypt thread of [`read_slice`]: ciphertext from `src`, plaintext
-/// to `sink`.
-fn decrypt_into(
-    src: std::io::PipeReader,
-    identities: &[age::x25519::Identity],
-    sink: SliceSink<'_>,
-    slice_number: i64,
-) -> Result<u64> {
-    let decryptor = age::Decryptor::new(src)
-        .map_err(|e| TapectlError::Encryption(format!("decryptor: {e}")))?;
-    let mut reader = decryptor
-        .decrypt(identities.iter().map(|id| id as &dyn age::Identity))
-        .map_err(|e| TapectlError::Encryption(format!("decrypt: {e}")))?;
-    let mut out = match sink {
-        SliceSink::File(path) => fs::File::create(path)?,
-        SliceSink::Pipe { path, dar } => open_pipe_for_dar(path, dar, slice_number)?,
-    };
-    let copied = stream_copy(&mut reader, &mut out)
-        .map_err(|e| TapectlError::Other(format!("slice {slice_number}: {e}")))?;
-    out.flush()?;
-    Ok(copied)
+    Ok(verdict)
 }
 
 /// Open the named pipe dar will read a slice from, for writing — once dar
@@ -2031,36 +2042,6 @@ impl<W: Write> Write for Detachable<W> {
         }
         Ok(())
     }
-}
-
-/// Fixed-size copy buffer for streaming slice decryption (H9 fix, issue
-/// #85) — same 128 KiB convention as `staging::encrypt_file_streaming`'s
-/// `STREAM_COPY_BUFFER`, `staging::validate`'s `VALIDATE_STREAM_BUFFER`, and
-/// `volume::layout_model::hash_file`. Peak RAM for the decrypt pass this
-/// feeds is this buffer plus age's own constant ~64 KiB STREAM chunk buffer,
-/// never the size of the slice being restored.
-const RESTORE_STREAM_BUFFER: usize = 128 * 1024;
-
-/// Copy every byte from `reader` to `writer` through a fixed-size buffer —
-/// never allocates more than `RESTORE_STREAM_BUFFER`, regardless of how much
-/// data flows through. Returns the total bytes copied. Same shape as
-/// `staging::mod`'s private `stream_copy`; kept as an independently-named
-/// copy here rather than shared, matching this codebase's existing
-/// convention of one streaming-copy helper per site (see
-/// `staging::validate`'s `VALIDATE_STREAM_BUFFER` doc comment for the same
-/// precedent).
-fn stream_copy<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<u64> {
-    let mut buf = [0u8; RESTORE_STREAM_BUFFER];
-    let mut total = 0u64;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n])?;
-        total += n as u64;
-    }
-    Ok(total)
 }
 
 /// Restore a single file from a unit on a volume.
@@ -2190,29 +2171,26 @@ pub fn restore_units(
     }
     // The drive, as `restore_through_drive` opens it: both MAM reads, then
     // the store, once for the whole set.
-    let reads = MamReads::new(conn, Operation::RestoreVolume);
-    reads.check_read_contact(config, device)?;
-    let observed = crate::volume::binding::loaded_medium(config, device, &reads);
-    let phase = progress::phase("drive-open", None);
-    let mut store = TapeStore::open_read(device, block_size)?;
-    phase.done();
-    restore_units_from_store(
-        conn,
-        paths,
-        config,
-        volume_label,
-        &planned,
-        options,
-        fail_fast,
-        &mut store,
-        ContactSite::new(
+    let mut bay = DeviceBay {
+        device,
+        block_size,
+        operation: Operation::RestoreVolume,
+        store: None,
+    };
+    let arrival = bay.load(conn, config)?;
+    arrival.with_site(config, Operation::RestoreVolume, device, |site| {
+        restore_units_from_bay(
+            conn,
+            paths,
             config,
-            Operation::RestoreVolume,
-            device,
-            Medium::from_read(observed.as_ref().map(|(b, m)| (*b, m))),
+            volume_label,
+            &planned,
+            options,
+            fail_fast,
+            &mut bay,
+            *site,
         )
-        .with_mam_reads(&reads),
-    )
+    })
 }
 
 /// The [`UnitRequest`]s for `names`, each restored to `<dest_root>/<name>`
@@ -2257,9 +2235,9 @@ pub fn restore_units_from_loaded(
         device,
         block_size,
         Operation::RestoreVolume,
-        |store, site| {
-            restore_units_from_loaded_store(
-                conn, paths, config, unit_names, dest_root, options, fail_fast, store, site,
+        |bay, site| {
+            restore_units_from_loaded_bay(
+                conn, paths, config, unit_names, dest_root, options, fail_fast, bay, site,
             )
         },
     )
@@ -2273,6 +2251,7 @@ pub fn restore_units_from_loaded(
 /// resolved, closed `failed` by [`refuse_loaded_contact`] on any refusal
 /// before the set is restored, and handed on to
 /// [`restore_units_in_contact`] when there is none.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn restore_units_from_loaded_store(
     conn: &Connection,
@@ -2285,11 +2264,37 @@ pub(crate) fn restore_units_from_loaded_store(
     store: &mut dyn Store,
     site: ContactSite<'_>,
 ) -> Result<UnitsReport> {
+    restore_units_from_loaded_bay(
+        conn,
+        paths,
+        config,
+        unit_names,
+        dest_root,
+        options,
+        fail_fast,
+        &mut FixedBay(store),
+        site,
+    )
+}
+
+/// [`restore_units_from_loaded_store`] over a [`Bay`].
+#[allow(clippy::too_many_arguments)]
+fn restore_units_from_loaded_bay(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    unit_names: &[String],
+    dest_root: &str,
+    options: &RestoreOptions,
+    fail_fast: bool,
+    bay: &mut dyn Bay,
+    site: ContactSite<'_>,
+) -> Result<UnitsReport> {
     let phase = progress::phase("contact-open", None);
     let guard = site.open(conn, None);
     phase.done();
-    let (found, mut peeked) = match crate::volume::loaded::identify(conn, store) {
-        Ok(identified) => identified,
+    let (found, primed) = match crate::volume::loaded::identify(conn, bay.store()) {
+        Ok((found, peeked)) => (found, peeked.into_file0()),
         Err(e) => return refuse_loaded_contact(conn, guard, &site, None, "volume", e),
     };
     guard.record_volume(found.volume_id);
@@ -2319,7 +2324,8 @@ pub(crate) fn restore_units_from_loaded_store(
         &planned,
         options,
         fail_fast,
-        &mut peeked,
+        bay,
+        primed,
         &site,
     )
 }
@@ -2449,6 +2455,7 @@ fn plan_units(
 /// [`restore_units`] minus the tape device: ONE contact, ONE corroboration
 /// of File 0, then each planned unit in turn over the same store, each with
 /// its own `restores` row, then ONE health reading.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn restore_units_from_store(
     conn: &Connection,
@@ -2459,6 +2466,32 @@ fn restore_units_from_store(
     options: &RestoreOptions,
     fail_fast: bool,
     store: &mut dyn Store,
+    site: ContactSite<'_>,
+) -> Result<UnitsReport> {
+    restore_units_from_bay(
+        conn,
+        paths,
+        config,
+        volume_label,
+        planned,
+        options,
+        fail_fast,
+        &mut FixedBay(store),
+        site,
+    )
+}
+
+/// [`restore_units_from_store`] over a [`Bay`].
+#[allow(clippy::too_many_arguments)]
+fn restore_units_from_bay(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    volume_label: &str,
+    planned: &[PlannedUnit],
+    options: &RestoreOptions,
+    fail_fast: bool,
+    bay: &mut dyn Bay,
     site: ContactSite<'_>,
 ) -> Result<UnitsReport> {
     let volume_id: Option<i64> = conn
@@ -2481,7 +2514,8 @@ fn restore_units_from_store(
         planned,
         options,
         fail_fast,
-        store,
+        bay,
+        None,
         &site,
     )
 }
@@ -2500,12 +2534,15 @@ fn restore_units_in_contact(
     planned: &[PlannedUnit],
     options: &RestoreOptions,
     fail_fast: bool,
-    store: &mut dyn Store,
+    bay: &mut dyn Bay,
+    primed: Option<Vec<u8>>,
     site: &ContactSite<'_>,
 ) -> Result<UnitsReport> {
     let contact_id = guard.id();
 
-    let corroborated = corroborate_at_contact(conn, volume_label, store, site.medium_serial());
+    let mut supply = Supply::start(conn, bay, guard, volume_id, volume_label, *site);
+    supply.prime(primed);
+    let corroborated = supply.corroborate_first(volume_label);
     let mut units = Vec::with_capacity(planned.len());
     let mut stopped = false;
     for p in planned {
@@ -2518,7 +2555,10 @@ fn restore_units_in_contact(
         let r = match &corroborated {
             // The wrong tape: every unit is refused for the same reason.
             Err(e) => Err(TapectlError::Other(e.to_string())),
-            Ok(()) => restore_planned_unit(conn, paths, config, p, options, store, &mut trace),
+            Ok(()) => {
+                supply.set_subject(format!("unit \"{}\" v{}", p.unit, p.version));
+                restore_planned_unit(conn, paths, config, p, options, &mut supply, &mut trace)
+            }
         };
         record_restore(
             conn,
@@ -2548,18 +2588,11 @@ fn restore_units_in_contact(
         .iter()
         .filter(|u| u.error.is_some() || !u.attempted)
         .count();
-    let detail = (failed > 0).then(|| format!("{failed} of {} units not restored", units.len()));
-    guard.finish(
-        if failed == 0 {
-            contact::OUTCOME_OK
-        } else {
-            contact::OUTCOME_FAILED
-        },
-        detail.as_deref(),
-    );
-    let phase = progress::phase("health-sweep", None);
-    crate::volume::write::health_after_read_contact(conn, site, volume_id, contact_id);
-    phase.done();
+    let detail = (failed > 0)
+        .then(|| TapectlError::Other(format!("{failed} of {} units not restored", units.len())));
+    // The last cartridge's contact closes with the set's outcome and takes
+    // its one health reading; a swap closed the earlier ones.
+    supply.finish(detail.as_ref());
     if let Some(id) = volume_id {
         crate::db::phase_timings::record_drained(
             conn,
@@ -2582,7 +2615,7 @@ fn restore_planned_unit(
     config: &Config,
     p: &PlannedUnit,
     options: &RestoreOptions,
-    store: &mut dyn Store,
+    supply: &mut Supply<'_, '_, '_>,
     trace: &mut RestoreTrace,
 ) -> Result<()> {
     let unit = queries::get_unit_by_name(conn, &p.unit)?
@@ -2591,14 +2624,16 @@ fn restore_planned_unit(
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
     let identities = load_identities(conn, paths, &tenant)?;
     restore_planned(
+        conn,
         config,
         &p.unit,
+        p.version,
         &p.plan,
         p.target(),
         options,
         &p.scratch,
         &identities,
-        store,
+        supply,
         trace,
     )
 }
@@ -2668,6 +2703,12 @@ pub struct RestoreReport {
     pub dry_run: bool,
     #[allow(dead_code)]
     pub success: bool,
+    /// Slices read from another copy because the volume's own was damaged
+    /// (ADR-0012 item 101, issue #480).
+    pub substitutions: Vec<supply::Substitution>,
+    /// Files that came back damaged or missing and were filled from another
+    /// copy of the same version (item 102): the path, and where from.
+    pub filled: Vec<(String, String)>,
 }
 
 /// One slice of the selected version, as restore reads it off the volume.
@@ -2676,6 +2717,8 @@ pub struct WritePositionInfo {
     /// The stage set this slice belongs to — one stage set is one snapshot
     /// version's complete dar archive (issue #315).
     pub stage_set_id: i64,
+    /// The volume `position` is a tape file of.
+    pub volume_id: i64,
     pub slice_number: i64,
     /// `write_positions.position` — the tape file number, not the slice
     /// number.
@@ -2857,7 +2900,7 @@ fn get_write_positions(
 ) -> Result<Vec<WritePositionInfo>> {
     let mut stmt = conn.prepare(
         "SELECT sl.slice_number, wp.position, sl.sha256_plain, sl.sha256_encrypted, sl.encrypted_bytes,
-                sl.stage_set_id
+                sl.stage_set_id, v.id
          FROM write_positions wp
          JOIN writes w ON w.id = wp.write_id
          JOIN stage_slices sl ON sl.id = wp.stage_slice_id
@@ -2875,6 +2918,7 @@ fn get_write_positions(
                 sha256_encrypted: row.get(3)?,
                 encrypted_bytes: row.get(4)?,
                 stage_set_id: row.get(5)?,
+                volume_id: row.get(6)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2899,7 +2943,8 @@ mod tests {
     //! it's now shared with `store.rs` and `volume/write.rs` too) cover that
     //! directly.
     use super::*;
-    use crate::store::MemStore;
+    use crate::store::{MemStore, TapeStore};
+    use crate::tape::contact::Medium;
     use sha2::{Digest, Sha256};
     use std::io::Cursor;
     use tempfile::TempDir;
@@ -2963,6 +3008,7 @@ mod tests {
 
         let wp = WritePositionInfo {
             stage_set_id: 1,
+            volume_id: 1,
             slice_number: 1,
             position: "0".to_string(),
             sha256_plain,
@@ -2971,6 +3017,27 @@ mod tests {
         };
 
         (store, wp)
+    }
+
+    /// One slice read through a [`Supply`] over a single store: the cartridge
+    /// in the drive is the only one there is, so nothing can be substituted
+    /// (and this is the path every restore took before issue #480).
+    fn read_slice(
+        store: &mut dyn Store,
+        wp: &WritePositionInfo,
+        identities: &[age::x25519::Identity],
+        sink: SliceSink<'_>,
+    ) -> Result<u64> {
+        let conn = crate::db::open_memory().unwrap();
+        let site = site(Operation::RestoreUnit);
+        let guard = site.open(&conn, None);
+        let mut bay = FixedBay(store);
+        let mut supply = Supply::start(&conn, &mut bay, guard, None, "TEST", site);
+        let r = supply
+            .read_slice(wp, identities, sink)
+            .map(|read| read.authentic_bytes);
+        supply.finish(r.as_ref().err());
+        r
     }
 
     // --- RestoreScratch (issue #102) -------------------------------------
@@ -3243,13 +3310,13 @@ mod tests {
     }
 
     #[test]
-    fn copy_buffer_is_a_small_fixed_constant_independent_of_input_length() {
-        // Structural guarantee behind the constant-memory claim, matching
-        // `staging::mod`'s `copy_buffer_is_a_small_fixed_constant_
-        // independent_of_input_length` — pinning the exact value means any
-        // future drift back toward whole-slice buffering is a deliberate,
-        // visible edit to this test.
-        assert_eq!(RESTORE_STREAM_BUFFER, 128 * 1024);
+    fn the_decrypt_buffer_is_one_age_chunk_independent_of_input_length() {
+        // Structural guarantee behind the constant-memory claim: the decrypt
+        // path holds one age chunk (64 KiB plus its tag) and the chunk it
+        // returns, never the slice. Pinning the value means any future drift
+        // toward whole-slice buffering is a deliberate, visible edit.
+        assert_eq!(crate::crypto::chunks::CHUNK, 64 * 1024);
+        assert_eq!(crate::crypto::chunks::ENCRYPTED_CHUNK, 64 * 1024 + 16);
     }
 
     /// A symlink in a unit must come back as a symlink from `restore file`,
@@ -4791,12 +4858,12 @@ mod tests {
                 "positive control"
             );
             let drive = body("fn restore_through_drive(");
-            assert_eq!(drive.matches("restore_unit_from_store(").count(), 1);
+            assert_eq!(drive.matches("restore_unit_from_bay(").count(), 1);
             // Issue #442: the seam opens the contact and ends in ONE tail,
             // `restore_unit_in_contact`, which the no-label restore ends in
             // too; the tail takes the reading.
             let seam = body("fn restore_unit_in_contact(");
-            let opener = body("pub(crate) fn restore_unit_from_store(");
+            let opener = body("fn restore_unit_from_bay(");
             assert_eq!(opener.matches(".open(conn").count(), 1);
             assert_eq!(opener.matches("restore_unit_in_contact(").count(), 1);
             assert!(!opener.contains("health_after_read_contact("));
@@ -4817,16 +4884,23 @@ mod tests {
                     );
                 }
             }
+            // Issue #480: the reading is taken where a cartridge's contact
+            // is closed (`Presence::close` in supply.rs), so a cartridge
+            // swapped in mid-restore has its own contact and its own reading
+            // and none has two. The tail closes the last one, once.
             assert_eq!(
-                seam.matches("health_after_read_contact(").count(),
+                seam.matches("supply.finish(").count(),
                 1,
-                "the tail of the seam that opens the contact takes its one reading"
+                "the tail of the seam that opens the contact closes the last cartridge's \
+                 contact, which takes its one reading"
             );
+            assert!(!seam.contains("health_after_read_contact("));
             // Issue #398: a multi-unit restore is ONE contact, so its seam
-            // takes ONE reading for the whole set — never one per unit.
+            // closes ONE for the whole set — never one per unit.
             let units = body("fn restore_units_in_contact(");
-            assert_eq!(units.matches("health_after_read_contact(").count(), 1);
-            let units_opener = body("fn restore_units_from_store(");
+            assert_eq!(units.matches("supply.finish(").count(), 1);
+            assert!(!units.contains("health_after_read_contact("));
+            let units_opener = body("fn restore_units_from_bay(");
             assert_eq!(units_opener.matches(".open(conn").count(), 1);
             assert_eq!(units_opener.matches("restore_units_in_contact(").count(), 1);
             assert!(!units_opener.contains("health_after_read_contact("));
@@ -4841,11 +4915,11 @@ mod tests {
             // ends in a tail or in the closer, never both.
             for (opener, tail) in [
                 (
-                    "pub(crate) fn restore_unit_from_loaded_store(",
+                    "fn restore_unit_from_loaded_bay(",
                     "restore_unit_in_contact(",
                 ),
                 (
-                    "pub(crate) fn restore_units_from_loaded_store(",
+                    "fn restore_units_from_loaded_bay(",
                     "restore_units_in_contact(",
                 ),
             ] {
@@ -4859,10 +4933,23 @@ mod tests {
             assert_eq!(closer.matches("health_after_read_contact(").count(), 1);
             assert_eq!(
                 prod.matches("health_after_read_contact(").count(),
-                4,
-                "restore.rs takes readings in exactly four places: restore unit's tail, the \
-                 multi-unit restore's tail, raw-volume's, and the refusal of a no-label \
-                 restore's contact"
+                2,
+                "restore.rs takes readings in exactly two places: raw-volume's, and the refusal \
+                 of a no-label restore's contact; every other contact closes through the \
+                 supply"
+            );
+            const SUPPLY: &str = include_str!("restore/supply.rs");
+            let supply = SUPPLY.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert_eq!(
+                supply.matches("health_after_read_contact(").count(),
+                1,
+                "the supply takes a cartridge's reading in one place, where its contact closes"
+            );
+            assert_eq!(
+                supply.matches(".close(").count(),
+                3,
+                "a contact is closed by the last cartridge's finish, by a cartridge leaving, or \
+                 by one that failed its identity check on arrival"
             );
         }
 

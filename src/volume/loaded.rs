@@ -300,6 +300,20 @@ impl<'s> Peeked<'s> {
             file0: Some(file0),
         }
     }
+
+    /// `inner` with File 0's head already in hand (what [`Self::into_file0`]
+    /// gave back): the restore keeps those bytes while its bay may swap
+    /// the store under it, and lends them to the first contact check.
+    ///
+    pub(crate) fn primed(inner: &'s mut dyn Store, file0: Vec<u8>) -> Self {
+        Self::new(inner, file0)
+    }
+
+    /// The File 0 bytes not yet served, so they can outlive the borrow of
+    /// the store this wraps.
+    pub(crate) fn into_file0(self) -> Option<Vec<u8>> {
+        self.file0
+    }
 }
 
 impl Store for Peeked<'_> {
