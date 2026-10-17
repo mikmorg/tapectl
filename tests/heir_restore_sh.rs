@@ -3586,7 +3586,7 @@ fn the_index_modes_check_the_tools_they_run_and_no_others() {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let (code, text) = h.run(&args);
         assert!(!text.contains("missing required tool"), "{args:?}: {text}");
-        assert_ne!(code, 99, "{text}");
+        assert_eq!(code, 0, "{args:?} runs without dar, tee or mkfifo: {text}");
     }
 }
 
