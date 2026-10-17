@@ -30,10 +30,12 @@ use sha2::{Digest, Sha256};
 use common::{generate_collection, MicroSpec, UnitFixture, MICRO_BLOCK};
 use tapectl::crypto::keys::{generate_keypair, GeneratedKeypair};
 use tapectl::db;
+use tapectl::policy::coverage::IndexThisTape;
 use tapectl::staging;
 use tapectl::store::{MemStore, MismatchKind, Store, Tier};
 use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, BuiltLayout, TenantInfo};
 use tapectl::volume::format;
+use tapectl::volume::index;
 use tapectl::volume::layout_model::{KeyAvailability, Layout, SliceCheck, ZoneKind};
 use tapectl::volume::session::{ConfirmOutcome, ExecuteOutcome};
 
@@ -72,6 +74,8 @@ struct UnitPlain {
     unit_name: String,
     unit_uuid: String,
     tenant_id: i64,
+    /// The unit's files as the catalog's `paths` record them.
+    file_names: Vec<String>,
     plaintext: Vec<u8>,
     /// The `sha256_plain` the catalog recorded for the unit's one slice: the
     /// real hash of `plaintext` when the build asked for it
@@ -98,6 +102,11 @@ struct HarnessSpec<'a> {
     /// Register an escrow recipient: slices and envelopes are then also
     /// encrypted to it (`volume-format-v2.md` §1: enc(t+op+esc)).
     escrow: bool,
+    /// The labels of two OTHER sealed volumes, each holding a later version
+    /// of one tenant's unit (the first volume the first tenant's first unit,
+    /// the second the second tenant's last): what the cross-volume index
+    /// (§1.5) lists beyond this tape, and what must not cross tenants.
+    history: [&'a str; 2],
 }
 
 impl Default for HarnessSpec<'_> {
@@ -107,6 +116,7 @@ impl Default for HarnessSpec<'_> {
             tenants: ["alpha", "bravo"],
             real_plaintext_hash: false,
             escrow: false,
+            history: ["T7HIST-ALPHA", "T7HIST-BRAVO"],
         }
     }
 }
@@ -128,6 +138,9 @@ struct Harness {
     store: MemStore,
     tenants: Vec<TenantFixture>,
     units: Vec<UnitPlain>,
+    /// The two history volumes of [`HarnessSpec::history`], as `(label,
+    /// tenant_id, the unit it holds a later version of)`.
+    history: Vec<(String, i64, String)>,
 }
 
 /// Concatenate a fixture unit's files (in the generator's own order) into one
@@ -168,6 +181,82 @@ fn insert_tenant(conn: &rusqlite::Connection, name: &str, is_operator: bool) -> 
         fingerprint: kp.fingerprint,
         secret_key: kp.secret_key,
     }
+}
+
+/// `files` (and one `extra`) as the paths of `snapshot_id`, regular files.
+fn insert_paths(
+    conn: &rusqlite::Connection,
+    snapshot_id: i64,
+    files: &[(String, u64)],
+    extra: Option<(&str, u64)>,
+) {
+    let entries = files
+        .iter()
+        .map(|(n, size)| (n.clone(), *size))
+        .chain(extra.map(|(n, size)| (n.to_string(), size)));
+    db::files::insert_version(
+        conn,
+        snapshot_id,
+        entries.map(|(path, size)| {
+            Ok(db::files::FileEntry {
+                path,
+                kind: db::files::FileKind::Regular,
+                size_bytes: size as i64,
+                mtime_ns: None,
+                sha256: None,
+                link_target: None,
+            })
+        }),
+    )
+    .unwrap();
+}
+
+/// Nothing in `dir` (recursively) is, or holds, the index's plaintext: no
+/// `units.tsv`/`paths.tsv` by name, and none of their header lines in any
+/// file's bytes. The routine the positive control below runs too.
+fn index_plaintext_in(dir: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let bytes = std::fs::read(&path).unwrap();
+            let has = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+            if name.ends_with("units.tsv")
+                || name.ends_with("paths.tsv")
+                || has(&index::UNITS_COLUMNS.join("\t"))
+                || has(&index::PATHS_COLUMNS.join("\t"))
+            {
+                found.push(path.display().to_string());
+            }
+        }
+    }
+    found
+}
+
+fn assert_no_index_plaintext(dir: &std::path::Path) {
+    // Positive control: the same scan finds a planted index file.
+    let control = tempfile::tempdir().unwrap();
+    std::fs::write(
+        control.path().join("anything"),
+        format!("{}\n", index::PATHS_COLUMNS.join("\t")),
+    )
+    .unwrap();
+    assert_eq!(
+        index_plaintext_in(control.path()).len(),
+        1,
+        "the scan sees a header"
+    );
+    let found = index_plaintext_in(dir);
+    assert!(
+        found.is_empty(),
+        "index plaintext outside an envelope: {found:?}"
+    );
 }
 
 /// Build a microcosm batch of `n_units` split across 2 tenants, run the
@@ -220,6 +309,7 @@ fn build_sealed_harness_from(
     let half = fixtures.len() / 2;
     let mut build_units = Vec::with_capacity(fixtures.len());
     let mut units_plain = Vec::with_capacity(fixtures.len());
+    let mut unit_rows: Vec<(i64, Vec<(String, u64)>)> = Vec::with_capacity(fixtures.len());
 
     for (i, fixture) in fixtures.iter().enumerate() {
         let tenant = if i < half { &tenants[0] } else { &tenants[1] };
@@ -250,6 +340,8 @@ fn build_sealed_harness_from(
         )
         .unwrap();
         let snapshot_id = conn.last_insert_rowid();
+        insert_paths(&conn, snapshot_id, &fixture.files, None);
+        unit_rows.push((unit_id, fixture.files.clone()));
         conn.execute(
             "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 10485760)",
             rusqlite::params![snapshot_id],
@@ -325,10 +417,83 @@ fn build_sealed_harness_from(
             unit_name: fixture.folder_name.clone(),
             unit_uuid,
             tenant_id: tenant.tenant_id,
+            file_names: fixture.files.iter().map(|(n, _)| n.clone()).collect(),
             plaintext,
             sha256_plain: sha_plain,
         });
     }
+
+    // The archive's other tapes (§1.5): two sealed volumes, each holding a
+    // later, current version of one tenant's unit: the first tenant's first
+    // unit, the second tenant's last. The index lists them next to this tape,
+    // and each belongs to one tenant alone.
+    let mut history = Vec::new();
+    for (label, which) in spec.history.iter().zip([0, fixtures.len() - 1]) {
+        conn.execute(
+            "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                  status, uuid, sealed_at)
+             VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000, 'sealed', ?2, '2026-09-01 12:00:00')",
+            rusqlite::params![label, format!("hist-uuid-{label}")],
+        )
+        .unwrap();
+        let hist_volume = conn.last_insert_rowid();
+        let (unit_id, files) = &unit_rows[which];
+        conn.execute(
+            "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+             VALUES (?1, 2, 'current', '/hist', ?2, 1)",
+            rusqlite::params![unit_id, files.len() as i64 + 1],
+        )
+        .unwrap();
+        let hist_snapshot = conn.last_insert_rowid();
+        insert_paths(
+            &conn,
+            hist_snapshot,
+            files,
+            Some(("history-only.dat", 4242)),
+        );
+        conn.execute(
+            "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'cleaned', 1)",
+            rusqlite::params![hist_snapshot],
+        )
+        .unwrap();
+        let hist_set = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                       sha256_plain, sha256_encrypted)
+             VALUES (?1, 1, 7, 7, 'p', 'e')",
+            rusqlite::params![hist_set],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+             VALUES (?1, ?2, ?3, 'completed')",
+            rusqlite::params![hist_set, hist_snapshot, hist_volume],
+        )
+        .unwrap();
+        history.push((
+            label.to_string(),
+            units_plain[which].tenant_id,
+            units_plain[which].unit_name.clone(),
+        ));
+    }
+
+    // The cross-volume index, generated where `volume write` generates it: in
+    // a work directory of its own, never in the session directory `build()`
+    // fills (which stands in for staging here).
+    let stage_set_ids: Vec<i64> = build_units.iter().map(|u| u.stage_set_id).collect();
+    let index_work = tempfile::tempdir().unwrap();
+    let index_files = index::generate_files(
+        &conn,
+        &IndexThisTape {
+            label: "T7MICRO",
+            uuid: volume_uuid,
+            cartridge_serial: "T7SERIAL",
+            generation: "LTO-6",
+        },
+        &stage_set_ids,
+        &index_work.path().join("index"),
+    )
+    .unwrap();
 
     let inputs = BuildInputs {
         label: "T7MICRO".to_string(),
@@ -363,11 +528,14 @@ fn build_sealed_harness_from(
         operator_public_keys: vec![operator.public_key.clone()],
         escrow_public_key: escrow_public_key.clone(),
         catalog_db_path: None,
-        index: None,
+        index: Some(index_files),
     };
 
     let session_dir = tempfile::tempdir().unwrap();
     let built = build::build(&inputs, session_dir.path()).expect("build succeeds");
+    // The index is plaintext until it is in an envelope: none of it may be in
+    // the directory `build()` fills (staging's stand-in), under any name.
+    assert_no_index_plaintext(session_dir.path());
     // Snapshot BEFORE the typestate chain below consumes `built` — see the
     // `Harness::layout` doc comment; `confirm`'s success arm does not hand
     // the Layout back.
@@ -420,6 +588,7 @@ fn build_sealed_harness_from(
         store,
         tenants,
         units: units_plain,
+        history,
     }
 }
 
@@ -1446,6 +1615,8 @@ const NEEDLE_TENANT_A: &str = "tnt-alpha-q7x2k";
 const NEEDLE_TENANT_B: &str = "tnt-bravo-m4k9p";
 const NEEDLE_UNIT_A: &str = "unit-alpha-q7x2k";
 const NEEDLE_UNIT_B: &str = "unit-bravo-m4k9p";
+const NEEDLE_VOLUME_A: &str = "vol-alpha-q7x2k";
+const NEEDLE_VOLUME_B: &str = "vol-bravo-m4k9p";
 const NEEDLE_FILES_A: [&str; 2] = ["secret-report-q7x2k-alpha.pdf", "diary-q7x2k-alpha.txt"];
 const NEEDLE_FILES_B: [&str; 1] = ["secret-report-m4k9p-bravo.pdf"];
 
@@ -1515,6 +1686,9 @@ fn plaintext_zone_needles(h: &Harness, fixtures: &[UnitFixture]) -> Vec<String> 
         }
     }
     needles.extend(h.units.iter().map(|u| u.sha256_plain.clone()));
+    // The labels of the OTHER volumes the cross-volume index names (§1.5):
+    // encrypted in the envelopes, and nowhere in the clear.
+    needles.extend(h.history.iter().map(|(label, _, _)| label.clone()));
     needles.sort();
     needles.dedup();
     needles
@@ -1544,6 +1718,7 @@ fn no_plaintext_zone_reveals_a_tenant_unit_file_hash_or_key() {
         tenants: [NEEDLE_TENANT_A, NEEDLE_TENANT_B],
         real_plaintext_hash: true,
         escrow: true,
+        history: [NEEDLE_VOLUME_A, NEEDLE_VOLUME_B],
     };
     let h = build_sealed_harness_from(&fixtures, &spec, VOLUME_UUID_NEEDLES);
     let needles = plaintext_zone_needles(&h, &fixtures);
@@ -1565,6 +1740,8 @@ fn no_plaintext_zone_reveals_a_tenant_unit_file_hash_or_key() {
         NEEDLE_UNIT_A,
         NEEDLE_FILES_A[1],
         NEEDLE_FILES_B[0],
+        NEEDLE_VOLUME_A,
+        NEEDLE_VOLUME_B,
     ] {
         assert!(needles.iter().any(|n| n == want), "{want} is not a needle");
     }
@@ -1646,4 +1823,442 @@ fn no_plaintext_zone_reveals_a_tenant_unit_file_hash_or_key() {
         files.len() > plaintext_zones.len(),
         "no encrypted file scanned"
     );
+}
+
+// ── the cross-volume index (§1.5, #418 R4) ──
+
+/// An envelope's tar members, in tar order, from RECORDED bytes: `(name,
+/// bytes)`. `None` when `identity` is not a recipient or the bytes do not
+/// match File 3's hash.
+fn envelope_members(
+    files: &[Vec<u8>],
+    entry: &format::ParsedIndexEntry,
+    identity: &age::x25519::Identity,
+) -> Option<Vec<(String, Vec<u8>)>> {
+    let tar_bytes = open_recorded_envelope(files, entry, identity)?;
+    let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+    let mut members = Vec::new();
+    for member in archive.entries().unwrap() {
+        let mut member = member.unwrap();
+        let name = member.path().unwrap().to_string_lossy().to_string();
+        let mut bytes = Vec::new();
+        member.read_to_end(&mut bytes).unwrap();
+        members.push((name, bytes));
+    }
+    Some(members)
+}
+
+fn member<'a>(members: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a str> {
+    members
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, b)| std::str::from_utf8(b).unwrap())
+}
+
+fn names(members: &[(String, Vec<u8>)]) -> Vec<&str> {
+    members.iter().map(|(n, _)| n.as_str()).collect()
+}
+
+/// The harness tape's File 3 entries, by recorded bytes.
+fn recorded_entries(h: &Harness) -> Vec<format::ParsedIndexEntry> {
+    let (fi_pos, fi_true_len) = front_index_position_and_true_len(&h.layout);
+    parse_front_index_from_recorded_bytes(&h.store.files, fi_pos, fi_true_len)
+}
+
+/// Every envelope of the tape, both copies, opens with the keys that should
+/// open it and carries the index members §1.5 gives it, after everything
+/// else in the tar: the tenant's `units.tsv` and `paths.tsv` in each of its
+/// two copies, the operator's `units.tsv` alone in its two. Each backup is
+/// its primary's bytes, so the index in it is the same index.
+#[test]
+fn every_envelope_carries_its_index_members_and_the_backups_are_byte_copies() {
+    let h = shared_harness();
+    let entries = recorded_entries(h);
+    let files = &h.store.files;
+
+    for t in &h.tenants {
+        let identity: age::x25519::Identity = t.secret_key.parse().unwrap();
+        let primary = entries
+            .iter()
+            .filter(|e| e.type_label == "tenant_envelope")
+            .find(|e| open_recorded_envelope(files, e, &identity).is_some())
+            .expect("the tenant's primary opens with its own key");
+        let backup = entries
+            .iter()
+            .find(|e| {
+                e.type_label == "tenant_envelope_backup"
+                    && e.sha256_encrypted == primary.sha256_encrypted
+            })
+            .expect("and has a backup with its hash");
+        // A backup is its primary's bytes (§1.3), so the sizes and the
+        // ciphertexts are equal, not just the plaintexts.
+        let size = primary.size_bytes.unwrap() as usize;
+        assert_eq!(backup.size_bytes, primary.size_bytes);
+        assert_eq!(
+            files[primary.position as usize][..size],
+            files[backup.position as usize][..size],
+            "the tenant backup is not a byte copy of its primary"
+        );
+        for entry in [primary, backup] {
+            let members = envelope_members(files, entry, &identity).unwrap();
+            assert_eq!(
+                names(&members),
+                [
+                    "MANIFEST.toml",
+                    "RECOVERY.md",
+                    "index/units.tsv",
+                    "index/paths.tsv"
+                ],
+                "{} at {}: the index follows everything else",
+                entry.type_label,
+                entry.position
+            );
+            let units = member(&members, "index/units.tsv").unwrap();
+            assert_eq!(
+                units.lines().next().unwrap(),
+                index::UNITS_COLUMNS.join("\t")
+            );
+            let paths = member(&members, "index/paths.tsv").unwrap();
+            assert_eq!(
+                paths.lines().next().unwrap(),
+                index::PATHS_COLUMNS.join("\t")
+            );
+        }
+    }
+
+    let op: age::x25519::Identity = h.operator.secret_key.parse().unwrap();
+    let primary = entries
+        .iter()
+        .find(|e| e.type_label == "operator_envelope")
+        .unwrap();
+    let backup = entries
+        .iter()
+        .find(|e| e.type_label == "operator_envelope_backup")
+        .unwrap();
+    let size = primary.size_bytes.unwrap() as usize;
+    assert_eq!(
+        files[primary.position as usize][..size],
+        files[backup.position as usize][..size],
+        "the operator backup is not a byte copy of its primary"
+    );
+    for entry in [primary, backup] {
+        let members = envelope_members(files, entry, &op).unwrap();
+        assert_eq!(
+            names(&members),
+            [
+                "MANIFEST.toml",
+                "RECOVERY.md",
+                "PLAN.toml",
+                "index/units.tsv"
+            ],
+            "{} at {}: the operator map, and no paths.tsv",
+            entry.type_label,
+            entry.position
+        );
+        let units = member(&members, "index/units.tsv").unwrap();
+        assert_eq!(
+            units.lines().next().unwrap(),
+            format!("tenant\t{}", index::UNITS_COLUMNS.join("\t"))
+        );
+    }
+}
+
+/// What the index says of the tape it is on matches File 0 and the write:
+/// this tape's label, uuid, serial and generation, `this-tape`, no
+/// `sealed_at`, and the version's real slice count and ciphertext bytes.
+#[test]
+fn the_index_names_this_tape_as_file_0_does() {
+    let h = shared_harness();
+    let entries = recorded_entries(h);
+    let op: age::x25519::Identity = h.operator.secret_key.parse().unwrap();
+    let primary = entries
+        .iter()
+        .find(|e| e.type_label == "operator_envelope")
+        .unwrap();
+    let members = envelope_members(&h.store.files, primary, &op).unwrap();
+    let rows = index::parse_units(member(&members, "index/units.tsv").unwrap()).unwrap();
+
+    let file0 = String::from_utf8_lossy(&h.store.files[0]).to_string();
+    let this: Vec<_> = rows.iter().filter(|r| r.state == "this-tape").collect();
+    assert_eq!(this.len(), h.units.len(), "every unit of this write, once");
+    for r in &this {
+        assert_eq!(r.volume, "T7MICRO");
+        assert_eq!(r.volume_uuid, VOLUME_UUID_MAIN);
+        assert!(file0.contains(&r.volume) && file0.contains(&r.volume_uuid));
+        assert_eq!(r.cartridge_serial, "T7SERIAL");
+        assert!(file0.contains(&r.cartridge_serial));
+        assert_eq!(r.generation, "LTO-6");
+        assert_eq!(r.sealed_at, "");
+        assert_eq!(
+            (r.num_slices, r.first_slice, r.last_slice),
+            (Some(1), Some(1), Some(1))
+        );
+        assert_eq!(r.version, 1);
+    }
+    // The history volumes hold version 2, sealed, with the catalog's facts.
+    for (label, tenant_id, unit) in &h.history {
+        let r = rows.iter().find(|r| &r.volume == label).unwrap();
+        assert_eq!(
+            (r.unit.as_str(), r.version, r.state.as_str()),
+            (unit.as_str(), 2, "sealed")
+        );
+        assert_eq!(r.sealed_at, "2026-09-01T12:00:00Z");
+        assert_eq!(r.volume_uuid, format!("hist-uuid-{label}"));
+        let tenant = h
+            .tenants
+            .iter()
+            .find(|t| t.tenant_id == *tenant_id)
+            .unwrap();
+        assert_eq!(r.tenant, tenant.name);
+    }
+}
+
+/// Tenant isolation, on the decrypted index (§1.5, §2): a tenant's envelope
+/// holds that tenant's units, files and the tapes holding them and nothing of
+/// the other tenant; the operator map holds both. The other tenant's key does
+/// not open this tenant's envelope at all, and the escrow-less operator key
+/// reads the cross-tenant map from the operator envelope alone.
+#[test]
+fn a_tenants_index_holds_none_of_another_tenants_units_paths_or_tapes() {
+    let h = shared_harness();
+    let entries = recorded_entries(h);
+    let files = &h.store.files;
+    let op: age::x25519::Identity = h.operator.secret_key.parse().unwrap();
+
+    for (mine, theirs) in [(0usize, 1usize), (1, 0)] {
+        let (me, other) = (&h.tenants[mine], &h.tenants[theirs]);
+        let identity: age::x25519::Identity = me.secret_key.parse().unwrap();
+        let other_identity: age::x25519::Identity = other.secret_key.parse().unwrap();
+        let primary = entries
+            .iter()
+            .filter(|e| e.type_label == "tenant_envelope")
+            .find(|e| open_recorded_envelope(files, e, &identity).is_some())
+            .unwrap();
+        assert!(
+            open_recorded_envelope(files, primary, &other_identity).is_none(),
+            "the other tenant's key opens {}'s envelope",
+            me.name
+        );
+        let members = envelope_members(files, primary, &identity).unwrap();
+        let units = member(&members, "index/units.tsv").unwrap();
+        let paths = member(&members, "index/paths.tsv").unwrap();
+
+        let mine_units: Vec<&UnitPlain> = h
+            .units
+            .iter()
+            .filter(|u| u.tenant_id == me.tenant_id)
+            .collect();
+        let other_units: Vec<&UnitPlain> = h
+            .units
+            .iter()
+            .filter(|u| u.tenant_id == other.tenant_id)
+            .collect();
+        let my_history: Vec<_> = h
+            .history
+            .iter()
+            .filter(|(_, t, _)| *t == me.tenant_id)
+            .collect();
+        let other_history: Vec<_> = h
+            .history
+            .iter()
+            .filter(|(_, t, _)| *t == other.tenant_id)
+            .collect();
+        assert_eq!(my_history.len(), 1);
+        assert_eq!(other_history.len(), 1);
+
+        // Everything of mine is there.
+        for u in &mine_units {
+            assert!(units.contains(&u.unit_name) && units.contains(&u.unit_uuid));
+            for f in &u.file_names {
+                assert!(
+                    paths.contains(f.as_str()),
+                    "{f} missing from {}'s paths",
+                    me.name
+                );
+            }
+        }
+        for (label, _, unit) in &my_history {
+            assert!(units.contains(label.as_str()) && units.contains(unit.as_str()));
+        }
+        // Nothing of the other tenant's is, in either file.
+        for text in [units, paths] {
+            for u in &other_units {
+                assert!(
+                    !text.contains(&u.unit_name),
+                    "{} leaked into {}'s index",
+                    u.unit_name,
+                    me.name
+                );
+                assert!(!text.contains(&u.unit_uuid));
+                // File names are checked on the needle fixture below: this
+                // generator repeats them from unit to unit.
+            }
+            for (label, _, _) in &other_history {
+                assert!(
+                    !text.contains(label.as_str()),
+                    "{label} leaked into {}'s index",
+                    me.name
+                );
+            }
+            assert!(!text.contains(&other.name));
+        }
+    }
+
+    // The operator map has both tenants, every tape, and no path at all.
+    let primary = entries
+        .iter()
+        .find(|e| e.type_label == "operator_envelope")
+        .unwrap();
+    let members = envelope_members(files, primary, &op).unwrap();
+    let text = member(&members, "index/units.tsv").unwrap();
+    for t in &h.tenants {
+        assert!(text.contains(&t.name));
+    }
+    for u in &h.units {
+        assert!(text.contains(&u.unit_name));
+    }
+    for (label, _, _) in &h.history {
+        assert!(text.contains(label.as_str()));
+    }
+    assert!(member(&members, "index/paths.tsv").is_none());
+}
+
+/// `paths.tsv` lists every path of every version listed in the tenant's
+/// `units.tsv`: this write's version 1 (the unit's files) and, for the unit
+/// with a history tape, version 2 (the same files and `history-only.dat`).
+#[test]
+fn a_tenants_paths_cover_every_listed_version() {
+    let h = shared_harness();
+    let entries = recorded_entries(h);
+    let tenant = &h.tenants[0];
+    let identity: age::x25519::Identity = tenant.secret_key.parse().unwrap();
+    let primary = entries
+        .iter()
+        .filter(|e| e.type_label == "tenant_envelope")
+        .find(|e| open_recorded_envelope(&h.store.files, e, &identity).is_some())
+        .unwrap();
+    let members = envelope_members(&h.store.files, primary, &identity).unwrap();
+    let rows = index::parse_paths(member(&members, "index/paths.tsv").unwrap()).unwrap();
+
+    let (_, _, history_unit) = h
+        .history
+        .iter()
+        .find(|(_, t, _)| *t == tenant.tenant_id)
+        .unwrap();
+    for u in h.units.iter().filter(|u| u.tenant_id == tenant.tenant_id) {
+        let v1: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.unit == u.unit_name && r.version == 1)
+            .map(|r| r.path.as_str())
+            .collect();
+        let mut want: Vec<&str> = u.file_names.iter().map(String::as_str).collect();
+        want.sort_unstable();
+        assert_eq!(v1, want, "{} v1: sorted, every file, once", u.unit_name);
+        let v2: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.unit == u.unit_name && r.version == 2)
+            .map(|r| r.path.as_str())
+            .collect();
+        if &u.unit_name == history_unit {
+            want.push("history-only.dat");
+            want.sort_unstable();
+            assert_eq!(v2, want, "{} v2", u.unit_name);
+        } else {
+            assert!(
+                v2.is_empty(),
+                "{} has no second version listed",
+                u.unit_name
+            );
+        }
+    }
+    assert!(rows.iter().all(|r| r.kind == "f"));
+}
+
+/// The index reaches the leak scan's three claims at once: it is in the
+/// operator envelope, in the clear nowhere, and a scan of the plaintext zones
+/// for the labels it names (the history volumes' needles, planted in the
+/// catalog) finds nothing there. The scan itself is
+/// `no_plaintext_zone_reveals_a_tenant_unit_file_hash_or_key`'s; this is its
+/// positive control that the needles ARE on the tape, encrypted.
+#[test]
+fn the_history_labels_are_on_the_tape_only_inside_the_operator_envelope() {
+    let root = tempfile::tempdir().unwrap();
+    let fixtures = vec![
+        needle_unit(root.path(), NEEDLE_UNIT_A, &NEEDLE_FILES_A),
+        needle_unit(root.path(), NEEDLE_UNIT_B, &NEEDLE_FILES_B),
+    ];
+    let spec = HarnessSpec {
+        operator: NEEDLE_OPERATOR,
+        tenants: [NEEDLE_TENANT_A, NEEDLE_TENANT_B],
+        real_plaintext_hash: false,
+        escrow: true,
+        history: [NEEDLE_VOLUME_A, NEEDLE_VOLUME_B],
+    };
+    let h = build_sealed_harness_from(&fixtures, &spec, VOLUME_UUID_NEEDLES);
+    let labels = [NEEDLE_VOLUME_A.to_string(), NEEDLE_VOLUME_B.to_string()];
+
+    // Not a byte of any file holds a label in the clear...
+    for (pos, data) in h.store.files.iter().enumerate() {
+        assert!(
+            find_needles(data, &labels).is_empty(),
+            "File {pos} holds a label in the clear"
+        );
+    }
+    // ...and decrypted, the operator's map holds both, each tenant's own one.
+    let entries = recorded_entries(&h);
+    let op: age::x25519::Identity = h.operator.secret_key.parse().unwrap();
+    let primary = entries
+        .iter()
+        .find(|e| e.type_label == "operator_envelope")
+        .unwrap();
+    let members = envelope_members(&h.store.files, primary, &op).unwrap();
+    let map = member(&members, "index/units.tsv").unwrap();
+    assert_eq!(find_needles(map.as_bytes(), &labels).len(), 2);
+    // Names unique to one tenant (this fixture's files and units are):
+    // tenant A's paths hold A's files and none of B's, and the other way
+    // round, and the operator's map holds no path at all.
+    let files_a: Vec<String> = NEEDLE_FILES_A.iter().map(|f| f.to_string()).collect();
+    let files_b: Vec<String> = NEEDLE_FILES_B.iter().map(|f| f.to_string()).collect();
+    let units_ab = [NEEDLE_UNIT_A.to_string(), NEEDLE_UNIT_B.to_string()];
+    for (i, t) in h.tenants.iter().enumerate() {
+        let identity: age::x25519::Identity = t.secret_key.parse().unwrap();
+        let primary = entries
+            .iter()
+            .filter(|e| e.type_label == "tenant_envelope")
+            .find(|e| open_recorded_envelope(&h.store.files, e, &identity).is_some())
+            .unwrap();
+        let members = envelope_members(&h.store.files, primary, &identity).unwrap();
+        let units = member(&members, "index/units.tsv").unwrap();
+        let paths = member(&members, "index/paths.tsv").unwrap();
+        assert_eq!(
+            find_needles(units.as_bytes(), &labels),
+            [labels[i].as_str()],
+            "{}'s index names exactly its own history tape",
+            t.name
+        );
+        let (mine, theirs) = if i == 0 {
+            (&files_a, &files_b)
+        } else {
+            (&files_b, &files_a)
+        };
+        assert_eq!(find_needles(paths.as_bytes(), mine).len(), mine.len());
+        assert!(
+            find_needles(paths.as_bytes(), theirs).is_empty(),
+            "{}'s paths",
+            t.name
+        );
+        assert_eq!(
+            find_needles(units.as_bytes(), &units_ab),
+            [units_ab[i].as_str()],
+            "{}'s units",
+            t.name
+        );
+        assert!(find_needles(paths.as_bytes(), &units_ab[1 - i..2 - i]).is_empty());
+    }
+    let all_files: Vec<String> = files_a.iter().chain(&files_b).cloned().collect();
+    assert!(
+        find_needles(map.as_bytes(), &all_files).is_empty(),
+        "the operator's map names a path"
+    );
+    assert_eq!(find_needles(map.as_bytes(), &units_ab).len(), 2);
 }

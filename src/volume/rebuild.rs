@@ -906,14 +906,18 @@ fn index_to_do(
         match known(&volume) {
             Ok(true) => {}
             Ok(false) => {
-                volume.units.sort_by(|a, b| (&a.tenant, &a.unit).cmp(&(&b.tenant, &b.unit)));
+                volume
+                    .units
+                    .sort_by(|a, b| (&a.tenant, &a.unit).cmp(&(&b.tenant, &b.unit)));
                 for u in &mut volume.units {
                     u.versions.sort_unstable();
                 }
                 report.index_volumes_missing.push(volume);
             }
             Err(e) => {
-                tracing::warn!("rebuild: cannot check the index's volumes against the catalog: {e}");
+                tracing::warn!(
+                    "rebuild: cannot check the index's volumes against the catalog: {e}"
+                );
                 report.index_problem = Some(format!("cannot check the catalog: {e}"));
                 report.index_volumes_missing.clear();
                 return;

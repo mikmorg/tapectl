@@ -2099,7 +2099,12 @@ pub fn run(
             let index = if rows.is_empty() {
                 None
             } else {
-                Some(planned_index_bytes(conn, config, generation.as_deref(), device.as_deref())?)
+                Some(planned_index_bytes(
+                    conn,
+                    config,
+                    generation.as_deref(),
+                    device.as_deref(),
+                )?)
             };
 
             // Issue #271: `--json` must be checked BEFORE the `is_empty`
