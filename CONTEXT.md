@@ -105,6 +105,33 @@ differs from its latest current snapshot. Two Versions of a unit therefore
 never hold identical content: a version number names content, not a moment.
 _Avoid_: revision, generation (reserved for LTO media)
 
+**Stage set**:
+One staging of one Version: a single dar archive of the unit's files, cut into
+Slices and age-encrypted, recorded with each slice's size and hash. It is
+staged once and written unchanged to every volume that carries a copy, which is
+why copies are identical content.
+_Avoid_: archive set (a policy grouping), backup set
+
+**Slice**:
+A fixed-size byte range of a stage set's dar archive (dar's own word, its `-s`;
+1 GiB by default), age-encrypted and written as one tape file. Slices cut bytes,
+not files: a file may straddle two slices, and a slice is never restored alone
+(dar reads a run of slices, using the archive's catalogue to pick the ones a
+path needs).
+_Avoid_: chunk (age encrypts in 64 KiB chunks), block (the tape's 512 KiB unit),
+part
+
+**Spanning**:
+A Version whose slices run across more than one volume (ADR-0012 items 82-87:
+designed 2026-10-16, not built; it waits for #420's short seal). Only a unit
+that allows it may span; it is packed last on a volume and cut where the drive
+reports early warning, the slice in flight finishing first, and its remaining
+slices continue on the next cartridge of the same generation. A spanning
+version is as covered as its least-covered range of slices.
+_Avoid_: partition (LTO cartridges have partitions), member (envelopes have tar
+members), volume set (tapectl has stage sets and archive sets), split (a unit
+is never split by hand)
+
 **Current**:
 A snapshot that has been sealed onto a volume and still counts. **More than one
 snapshot of a unit may be current at once** — archiving a new version does not

@@ -1601,3 +1601,34 @@ Ruled the same evening, Round 2 (R4 and #477):
     these (items 78-81), bounded as item 72 was: it ends when v1.3.0 is installed. `requires`
     stays empty (R4 adds envelope members, which older readers ignore), so RESTORE.sh's "this
     tape needs tapectl" text stays "tapectl 1.1.0" (item 20 of 2026-10-06).
+
+Ruled the same night, after discussion (Round 1 question 1 and its consequences):
+
+82. **A unit may span tapes by its slices, if it allows it.** Spanning is shape A of the draft:
+    one dar archive whose slices run across more than one tape. It is allowed only for a unit that
+    opts in, through a policy key resolved like the others (dotfile, then archive set, then
+    `[defaults]`), off by default. A unit larger than one cartridge is still refused (item 17 of
+    2026-10-06) unless it allows spanning, and the refusal names the key. The files-divided shape
+    (parts) was considered and not chosen.
+83. **Whole units are packed first, spannable units last.** A volume is filled with units that may
+    not span, with priority, up to the configured fill ceiling (`[[backends.lto]] fill_ceiling`,
+    `--fill-ceiling`); spannable units go after them, so that whatever ends the tape cuts a unit
+    that allows it.
+84. **A spannable unit is cut by the drive's early warning, not by the plan.** It keeps writing
+    past the fill ceiling until the drive reports early warning; the slice being streamed then is
+    allowed to finish, and the short seal (#420) is written after it. Its remaining slices
+    continue on the next cartridge. This amends item 9 for spannable units only: their split
+    follows the drive. Every other unit keeps item 9 (never split; a whole unit cut by an early
+    end of tape is written whole on the next cartridge). Spanning therefore depends on #420's
+    short seal and the real-drive measurement past early warning; it is built on them, never
+    before. Item 10's 1 GiB slices are what finish inside that zone.
+85. **A spannable unit is staged whole** before its first tape is written. Its slices are released
+    as each range meets its copy floor (item 76, per piece). A spannable unit larger than the
+    staging area is refused by name until staging grows.
+86. **One copy's span stays on one LTO generation**: the planner refuses to continue a span onto a
+    cartridge of another generation, so one drive reads every tape of it.
+87. **Vocabulary** (CONTEXT.md): Stage set, Slice and Spanning are defined; "partition" (LTO
+    cartridges have partitions), "member" (envelopes are tar archives with members), "chunk"
+    (age's 64 KiB chunks) and "volume set" (tapectl has stage sets and archive sets) are kept away
+    from spanning. "Part" was proposed for the shape not chosen and is not adopted. A piece in
+    item 76 is, under spanning, the range of a version's slices on one volume.

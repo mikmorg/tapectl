@@ -1,8 +1,11 @@
 # Spanning and the cross-volume index (R4): a design draft for the CTO's grilling
 
-**Status: DRAFT, decisions partly ruled.** Round 1 (§10) was answered on 2026-10-16: D2 (a),
-D3 (b) and I1 (c) are ratified as ADR-0012 items 76-78; D1 (what is divided) is open, under
-discussion with the CTO. Nothing is built on it yet. Rulings will be
+**Status: superseded where ruled.** The CTO ruled on 2026-10-16 (ADR-0012 items 76-87): D2 (a),
+D3 (b), I1 (c), I2 (b, units and every path), I3 (b); and, after discussion, D1 is **shape A, opt-in
+per unit** (items 82-87): spannable units are packed last and cut at the drive's early warning,
+the slice in flight finishing, then the short seal (#420). Shape B (parts), D4 and D5's B branches,
+D7 and the parts-specific parts of D8-D14 below were not chosen; read them as history. The ADR is
+the authority; this note is the reasoning. Rulings will be
 recorded in ADR-0012 and the normative format docs, as the plaintext-free-staging note's were.
 Issues: #409 (spanning), #418 R4 (the cross-volume index).
 
