@@ -1712,3 +1712,12 @@ Ruled 2026-10-17, measuring drives instead of assuming them:
     MAM wear (loads, lifetime writes, the per-use error history) and the drive's rewrite counters.
     When the data supports it, a fitted per-cartridge wear allowance is put to the CTO; until then
     item 11 of 2026-10-06 stands (a worn-cartridge warning, no formula).
+99. **With no spannable unit queued, whole units are planned past the fill ceiling and count.**
+    The units staged when a write session starts are listed in the front index beyond the fill
+    ceiling (the tape "may end early", #420), and the session writes until the drive's early
+    warning. Every whole unit finished before the cut counts as a copy (item 9); the one the cut
+    interrupts counts as nothing on that tape and is written whole on the next. The front index
+    overstates by at most that one unit, and the short seal says where the tape really ended.
+    Units staged after the session began are not written onto it; they wait for the next tape.
+    Considered and not chosen: writing whole units past the ceiling without listing them, never
+    counted, known only to the catalog.
