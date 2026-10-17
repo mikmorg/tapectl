@@ -1674,3 +1674,15 @@ Ruled 2026-10-17, refining spanning:
     together are the other, so losing any one tape leaves a restorable copy. This amends items 83
     and 84 for those tapes only: copy k+1's head is placed first and ends at K. Copies bound for
     different locations never share a cartridge, so this applies within one location.
+94. **A spannable unit larger than one tape is admitted after all, starting early** (amends item
+    92, ruled the same day). A unit that allows spanning and is larger than one tape may span. It
+    does not wait behind whole units: it starts as early on its first tape as it needs to touch
+    the fewest tapes (with early warning at about 2.5 TB on LTO-6, a 3.5 TB unit touches two
+    tapes instead of three), and the whole units it displaces fill in after its tail on its last
+    tape, so tape fill is unchanged. It is still refused if larger than the staging area (item
+    85), which on home2 today is below one LTO-6 budget, so nothing changes there until staging
+    grows. Item 93's whole-tape copy cannot exist for such a unit; its copies still combine slice
+    by slice (item 76). A unit that does not allow spanning is still refused above one tape.
+95. **A spannable unit that fits on one tape keeps item 83's place**: whole units fill to the
+    ceiling, it goes last and spans, so the tape fills to early warning. The early start of item
+    94 is only for a unit larger than one tape.
