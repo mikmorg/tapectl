@@ -1745,3 +1745,15 @@ Ruled 2026-10-17, measuring drives instead of assuming them:
      program, cannot do (b). Item 81's 1.3.0 re-pin widens to carry RESTORE.sh's half of (a),
      still ending when v1.3.0 is installed. Item 13 (no parity) stands: copies remain the defence,
      now at a finer grain.
+102. **A damaged or missing file is filled from another copy of the same version** (1.3.0, with
+     item 101). Two copies of one version may come from different stagings (written at different
+     times to different places), so their slices differ while their files do not: staging
+     records every file's sha256 for the version and refuses a re-stage whose hashes disagree.
+     After a restore from one copy, the files that came back damaged or missing are restored from
+     another copy of the same unit and version, whatever staging it came from, reading only the
+     slices that hold them through that copy's dar catalogue, repeated across copies until the
+     unit is whole or none is left. tapectl checks each filled file against the version's
+     recorded sha256; RESTORE.sh writes the list of files it could not restore into `--to`, and a
+     second run against another tape restores only those paths, overwriting only them, matched
+     by unit and version and confirmed by dar's own per-file checks. Other versions are not used
+     as sources, even where a file is unchanged. Item 81's 1.3.0 re-pin covers RESTORE.sh's half.
