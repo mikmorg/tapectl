@@ -262,3 +262,200 @@ pub(crate) const AWK_UNIT_UUID: &str = r##"
     in_head && /^snapshot_version = / { v = $3 + 0 }
     END { if (in_head && !found) done_head() }
   "##;
+
+/// The functions both index programs share (`--where`, `--find`;
+/// `docs/design/volume-format-v2.md` sec 1.5): the sec 1.5 escapes decoded by
+/// ONE left-to-right scan (never chained substitutions, which turn the escaped
+/// text of a backslash followed by `t` into a TAB), a printable form of a
+/// decoded value, a human size, and the header-name column lookup. Columns are
+/// found by the header line's names and an unknown column is ignored, so the
+/// index can gain columns without a `requires` entry.
+///
+/// A decoded value is shown with TAB, LF and CR written as `\t`, `\n` and `\r`
+/// and any other control byte as `?`: a path may hold a real newline, which
+/// would break one-row-per-line output and could forge a row. The match is on
+/// the decoded text; only what is printed is made visible.
+pub(crate) const AWK_INDEX_COMMON: &str = r##"
+    function unesc(s,    out, i, n, c, d) {
+      if (index(s, "\\") == 0) return s
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\\" && i < n) {
+          d = substr(s, i + 1, 1)
+          if (d == "t")  { out = out "\t"; i++; continue }
+          if (d == "n")  { out = out "\n"; i++; continue }
+          if (d == "r")  { out = out "\r"; i++; continue }
+          if (d == "\\") { out = out "\\"; i++; continue }
+        }
+        out = out c
+      }
+      return out
+    }
+    function show(s,    out, i, n, c) {
+      s = unesc(s)
+      if (s !~ /[[:cntrl:]]/) return s
+      out = ""
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "\t") out = out "\\t"
+        else if (c == "\n") out = out "\\n"
+        else if (c == "\r") out = out "\\r"
+        else if (c ~ /[[:cntrl:]]/) out = out "?"
+        else out = out c
+      }
+      return out
+    }
+    function human(b) {
+      if (b !~ /^[0-9]+$/) return "size not known"
+      if (b + 0 >= 1073741824) return sprintf("%.1f GiB", b / 1073741824)
+      if (b + 0 >= 1048576) return sprintf("%.1f MiB", b / 1048576)
+      return sprintf("%.1f KiB", b / 1024)
+    }
+    function header(line, names,    n, f, i) {
+      n = split(line, f, "\t")
+      for (i = 1; i <= n; i++) names[f[i]] = i
+      return n
+    }
+    function val(f, names, key) {
+      if (!(key in names)) return ""
+      return f[names[key]]
+    }
+    function nk(s) {
+      return (s == "") ? "not known" : s
+    }
+    function holder(row, names,    state, sealed, first, last, count, st, s) {
+      state = show(val(row, names, "state"))
+      sealed = show(val(row, names, "sealed_at"))
+      first = show(val(row, names, "first_slice"))
+      last = show(val(row, names, "last_slice"))
+      count = show(val(row, names, "num_slices"))
+      if (state == "this-tape") st = "this tape"
+      else if (state == "sealed") st = (sealed == "") ? "sealed" : "sealed " sealed
+      else if (state == "quarantined") {
+        st = "QUARANTINED: a verify proved this medium bad, it may still read in part"
+        if (sealed != "") st = st "; sealed " sealed
+      }
+      else st = (state == "") ? "state not known" : "state " state
+      s = "    tape " nk(show(val(row, names, "volume"))) "  (" st ")"
+      if (first != "" && last != "") s = s "  slices " first "-" last (count == "" ? "" : " of " count)
+      s = s "\n        volume uuid " nk(show(val(row, names, "volume_uuid")))
+      s = s "; cartridge serial " nk(show(val(row, names, "cartridge_serial")))
+      s = s "; generation " nk(show(val(row, names, "generation")))
+      return s
+    }
+  "##;
+
+/// `--where UNIT` over one `index/units.tsv` (an envelope member,
+/// `volume-format-v2.md` sec 1.5): every row for the unit, grouped by version,
+/// with the slice range and count, the bytes, and each holding tape. The unit
+/// name comes in through `WHERE_UNIT` in the environment, never `-v`, which
+/// would process the backslashes of an escaped name; it is compared with the
+/// DECODED `unit` column. Every unit name seen is appended to the file
+/// `WHERE_KNOWN`, so a miss can list what the index does hold. `WHERE_TENANT`
+/// names the tenant of a tenant envelope, whose rows carry no `tenant` column.
+/// Exit status 0 when the unit has rows, 1 when it has none, 2 when the file
+/// lacks the `unit` or `version` column.
+pub(crate) const AWK_INDEX_WHERE: &str = r##"
+    BEGIN {
+      FS = "\t"
+      want = ENVIRON["WHERE_UNIT"]
+      known = ENVIRON["WHERE_KNOWN"]
+      tenant = ENVIRON["WHERE_TENANT"]
+    }
+    NR == 1 {
+      header($0, h)
+      if (!("unit" in h) || !("version" in h)) { bad = 1; exit 2 }
+      next
+    }
+    {
+      split($0, f, "\t")
+      u = unesc(val(f, h, "unit"))
+      if (!(u in seen)) { seen[u] = 1; print show(val(f, h, "unit")) >> known }
+      if (u != want) next
+      found = 1
+      t = ("tenant" in h) ? val(f, h, "tenant") : tenant
+      if (!started || t != lastt) {
+        if (started) print ""
+        print "Unit " show(val(f, h, "unit")) (t == "" ? "" : " (tenant " show(t) ")") ":"
+        started = 1; lastt = t; lastv = ""; vseen = 0
+      }
+      v = val(f, h, "version")
+      if (!vseen || v != lastv) {
+        print ""
+        print "  Version " show(v) ": " show(val(f, h, "num_slices")) " slice(s), " human(val(f, h, "version_bytes")) " (" show(val(f, h, "version_bytes")) " bytes); unit uuid " nk(show(val(f, h, "unit_uuid")))
+        lastv = v; vseen = 1
+      }
+      print holder(f, h)
+    }
+    END {
+      if (bad) exit 2
+      exit(found ? 0 : 1)
+    }
+  "##;
+
+/// `--find TEXT` over one tenant envelope: `FIND_UNITS` is its
+/// `index/units.tsv` (or `/dev/null`), the program's input its
+/// `index/paths.tsv`. Prints the rows whose DECODED path contains the
+/// literal text in `FIND_TEXT` (`index()`, not a pattern), at most
+/// `FIND_LIMIT` of them, each as unit, version, kind, size and path, then the
+/// tapes holding each printed version. `FIND_WHO` names the envelope. The
+/// numbers printed and the numbers matched are written to the file
+/// `FIND_COUNTS`, so the caller can say how many matches it did not print and
+/// share one limit across envelopes. Exit status 2 when `paths.tsv` lacks a
+/// `unit`, `version` or `path` column.
+pub(crate) const AWK_INDEX_FIND: &str = r##"
+    BEGIN {
+      FS = "\t"
+      needle = ENVIRON["FIND_TEXT"]
+      limit = ENVIRON["FIND_LIMIT"] + 0
+      uf = ENVIRON["FIND_UNITS"]
+      cf = ENVIRON["FIND_COUNTS"]
+      who = ENVIRON["FIND_WHO"]
+      if ((getline line < uf) > 0) {
+        header(line, uh)
+        while ((getline line < uf) > 0) {
+          split(line, r, "\t")
+          k = unesc(val(r, uh, "unit")) SUBSEP val(r, uh, "version")
+          nh[k]++
+          hold[k, nh[k]] = line
+        }
+      }
+      close(uf)
+    }
+    NR == 1 {
+      header($0, ph)
+      if (!("unit" in ph) || !("version" in ph) || !("path" in ph)) { bad = 1; exit 2 }
+      next
+    }
+    {
+      p = $(ph["path"])
+      if (index(unesc(p), needle) == 0) next
+      total++
+      if (shown >= limit) next
+      shown++
+      if (shown == 1) print "In the index of " who ":"
+      us = $(ph["unit"])
+      vs = $(ph["version"])
+      printf "  %s  v%s  %s  %s bytes  %s\n", show(us), show(vs), (("kind" in ph) ? show($(ph["kind"])) : "?"), (("size_bytes" in ph) ? show($(ph["size_bytes"])) : "?"), show(p)
+      k = unesc(us) SUBSEP vs
+      if (!(k in want)) { want[k] = 1; order[++nord] = k; dunit[k] = show(us); dver[k] = show(vs) }
+    }
+    END {
+      if (bad) exit 2
+      for (i = 1; i <= nord; i++) {
+        k = order[i]
+        print ""
+        print "  Tapes holding " dunit[k] " version " dver[k] ":"
+        if (nh[k] + 0 == 0) print "    none is listed in this envelope"
+        for (j = 1; j <= nh[k]; j++) {
+          split(hold[k, j], r, "\t")
+          print holder(r, uh)
+        }
+      }
+      print shown + 0, total + 0 > cf
+      close(cf)
+    }
+  "##;

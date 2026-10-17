@@ -363,7 +363,7 @@ fn template() -> &'static Template {
                 ],
             },
         ];
-        build_template("main", &tenants)
+        build_template("main", &tenants, true)
     })
 }
 
@@ -402,7 +402,7 @@ fn lone_template() -> &'static Template {
                 ],
             },
         ];
-        build_template("lone", &tenants)
+        build_template("lone", &tenants, false)
     })
 }
 
@@ -422,11 +422,257 @@ fn solo_template() -> &'static Template {
                 file_len: 110_000,
             }],
         }];
-        build_template("solo", &tenants)
+        build_template("solo", &tenants, false)
     })
 }
 
-fn build_template(tag: &str, tenants: &[TenantSpec]) -> Template {
+// ---- the cross-volume index (volume-format-v2.md 1.5), built from the spec ----
+
+/// One `index/units.tsv` row: a (version, holding volume) pair.
+struct IdxRow {
+    tenant: &'static str,
+    unit: String,
+    unit_uuid: String,
+    version: i64,
+    num_slices: i64,
+    first: i64,
+    last: i64,
+    bytes: i64,
+    volume: &'static str,
+    volume_uuid: &'static str,
+    serial: &'static str,
+    generation: &'static str,
+    state: &'static str,
+    sealed_at: &'static str,
+}
+
+/// sec 1.5's escapes, and nothing else: backslash, TAB, LF, CR.
+fn idx_esc(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+impl IdxRow {
+    fn field(&self, col: &str) -> String {
+        match col {
+            "tenant" => self.tenant.to_string(),
+            "unit" => self.unit.clone(),
+            "unit_uuid" => self.unit_uuid.clone(),
+            "version" => self.version.to_string(),
+            "num_slices" => self.num_slices.to_string(),
+            "first_slice" => self.first.to_string(),
+            "last_slice" => self.last.to_string(),
+            "version_bytes" => self.bytes.to_string(),
+            "volume" => self.volume.to_string(),
+            "volume_uuid" => self.volume_uuid.to_string(),
+            "cartridge_serial" => self.serial.to_string(),
+            "generation" => self.generation.to_string(),
+            "state" => self.state.to_string(),
+            "sealed_at" => self.sealed_at.to_string(),
+            // A column a later tapectl might add: a reader must ignore it.
+            "zz_future" => "ignored".to_string(),
+            other => panic!("no such column {other}"),
+        }
+    }
+}
+
+/// sec 1.5's column order for `units.tsv` (with `tenant` for the operator's).
+const UNITS_COLUMNS: &[&str] = &[
+    "tenant",
+    "unit",
+    "unit_uuid",
+    "version",
+    "num_slices",
+    "first_slice",
+    "last_slice",
+    "version_bytes",
+    "volume",
+    "volume_uuid",
+    "cartridge_serial",
+    "generation",
+    "state",
+    "sealed_at",
+];
+/// The same columns reversed, with an unknown one in the middle: a reader
+/// finds columns by header name, so this must read exactly the same.
+const UNITS_COLUMNS_PERMUTED: &[&str] = &[
+    "sealed_at",
+    "state",
+    "generation",
+    "cartridge_serial",
+    "volume_uuid",
+    "zz_future",
+    "volume",
+    "version_bytes",
+    "last_slice",
+    "first_slice",
+    "num_slices",
+    "version",
+    "unit_uuid",
+    "unit",
+];
+
+const OTHER_UUID: &str = "bbbbbbbb-1111-4222-8333-444444444444";
+const QUAR_UUID: &str = "cccccccc-5555-4666-8777-888888888888";
+const THIS_UUID: &str = "a1b2c3d4-e5f6-4789-a123-456789abcdef";
+
+/// Render rows in sec 1.5's sort order (`tenant`, `unit`, `version`,
+/// `volume`; bytewise) under the given column order.
+fn render_units(mut rows: Vec<IdxRow>, columns: &[&str]) -> String {
+    rows.sort_by(|a, b| {
+        (a.tenant, &a.unit, a.version, a.volume).cmp(&(b.tenant, &b.unit, b.version, b.volume))
+    });
+    let mut out = columns.join("\t");
+    out.push('\n');
+    for r in &rows {
+        let cells: Vec<String> = columns.iter().map(|c| idx_esc(&r.field(c))).collect();
+        out.push_str(&cells.join("\t"));
+        out.push('\n');
+    }
+    out
+}
+
+/// The holders the fixture gives a unit's version: this tape always (`this-tape`,
+/// no `sealed_at`); `photos/2019` also on a sealed tape (with an older version
+/// only that tape holds) and on a quarantined one with no serial read;
+/// `docs` also on the sealed tape.
+fn idx_rows_for(
+    tenant: &'static str,
+    unit: &str,
+    uuid: &str,
+    version: i64,
+    slices: i64,
+    bytes: i64,
+) -> Vec<IdxRow> {
+    let row = |version: i64,
+               slices: i64,
+               bytes: i64,
+               volume: &'static str,
+               volume_uuid: &'static str,
+               serial: &'static str,
+               generation: &'static str,
+               state: &'static str,
+               sealed_at: &'static str| IdxRow {
+        tenant,
+        unit: unit.to_string(),
+        unit_uuid: uuid.to_string(),
+        version,
+        num_slices: slices,
+        first: 1,
+        last: slices,
+        bytes,
+        volume,
+        volume_uuid,
+        serial,
+        generation,
+        state,
+        sealed_at,
+    };
+    let mut rows = vec![row(
+        version,
+        slices,
+        bytes,
+        LABEL,
+        THIS_UUID,
+        "SERIAL01",
+        "LTO-6",
+        "this-tape",
+        "",
+    )];
+    let other = |version, slices, bytes| {
+        row(
+            version,
+            slices,
+            bytes,
+            "OTHER02",
+            OTHER_UUID,
+            "OTHERSER02",
+            "LTO-6",
+            "sealed",
+            "2026-09-01T10:00:00Z",
+        )
+    };
+    if unit == "photos/2019" {
+        rows.push(other(version, slices, bytes));
+        rows.push(row(
+            version,
+            slices,
+            bytes,
+            "QUAR03",
+            QUAR_UUID,
+            "",
+            "LTO-5",
+            "quarantined",
+            "2026-08-15T09:30:00Z",
+        ));
+        // An older version of the same unit, on the other tape only.
+        rows.push(other(1, 3, 3_000_000));
+    }
+    if unit == "docs" {
+        rows.push(other(version, slices, bytes));
+    }
+    rows
+}
+
+/// One `index/paths.tsv` row: (kind, size, path as the unit holds it).
+type PathRow = (&'static str, u64, String);
+
+/// A tenant's paths for a unit: what is really in its source tree, and the
+/// paths the tests look for. A path with a TAB, an LF and a backslash; one
+/// with a literal backslash followed by `t` (never a TAB); and, in `docs`,
+/// enough matching paths to pass the print limit.
+fn idx_paths_for(unit: &str, src: &Path) -> Vec<PathRow> {
+    let mut rows: Vec<PathRow> = Vec::new();
+    for e in std::fs::read_dir(src).unwrap() {
+        let e = e.unwrap();
+        let name = e.file_name().to_string_lossy().to_string();
+        if e.file_type().unwrap().is_dir() {
+            rows.push(("d", 0, name.clone()));
+            for f in std::fs::read_dir(e.path()).unwrap() {
+                let f = f.unwrap();
+                rows.push((
+                    "f",
+                    f.metadata().unwrap().len(),
+                    format!("{name}/{}", f.file_name().to_string_lossy()),
+                ));
+            }
+        } else {
+            rows.push(("f", e.metadata().unwrap().len(), name));
+        }
+    }
+    if unit == "photos/2019" {
+        rows.push(("f", 11, "weird\ttab\nnew\\back.txt".to_string()));
+        rows.push(("f", 12, "lit\\tera.txt".to_string()));
+        rows.push(("l", 0, "link-to-file0".to_string()));
+    }
+    if unit == "docs" {
+        for i in 1..=120 {
+            rows.push(("f", 100 + i, format!("bulk/item-{i:03}.dat")));
+        }
+    }
+    rows
+}
+
+/// `paths.tsv`: sorted by unit, version, then path (bytewise).
+fn render_paths(mut units: Vec<(String, i64, Vec<PathRow>)>) -> String {
+    units.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    let mut out = String::from("unit\tversion\tkind\tsize_bytes\tpath\n");
+    for (unit, version, mut rows) in units {
+        rows.sort_by(|a, b| a.2.as_bytes().cmp(b.2.as_bytes()));
+        for (kind, size, path) in rows {
+            out.push_str(&format!(
+                "{}\t{version}\t{kind}\t{size}\t{}\n",
+                idx_esc(&unit),
+                idx_esc(&path)
+            ));
+        }
+    }
+    out
+}
+
+fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Template {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "heir-restore-sh-template-{tag}-{}",
         std::process::id()
@@ -591,6 +837,40 @@ fn build_template(tag: &str, tenants: &[TenantSpec]) -> Template {
                     ),
                     cat,
                 );
+            }
+        }
+        if with_index {
+            // The members follow `catalogs/` (sec 1.5). A tenant's `units.tsv`
+            // is in the permuted column order with an unknown column; the
+            // operator's is in sec 1.5's order, with `tenant`.
+            let mut unit_rows = Vec::new();
+            let mut path_rows = Vec::new();
+            for s in which {
+                let bytes: i64 = s.unit.slices.iter().map(|x| x.encrypted_bytes).sum();
+                unit_rows.extend(idx_rows_for(
+                    s.tenant,
+                    &s.unit.name,
+                    &s.unit.uuid,
+                    s.unit.snapshot_version,
+                    s.unit.slices.len() as i64,
+                    bytes,
+                ));
+                path_rows.push((
+                    s.unit.name.clone(),
+                    s.unit.snapshot_version,
+                    idx_paths_for(&s.unit.name, &s.src),
+                ));
+            }
+            if tenant == "operator" {
+                let mut cols = UNITS_COLUMNS.to_vec();
+                cols.push("zz_future");
+                add("index/units.tsv", render_units(unit_rows, &cols).as_bytes());
+            } else {
+                add(
+                    "index/units.tsv",
+                    render_units(unit_rows, UNITS_COLUMNS_PERMUTED).as_bytes(),
+                );
+                add("index/paths.tsv", render_paths(path_rows).as_bytes());
             }
         }
         stub_encrypt(recipients, "", &tar.into_inner().unwrap())
@@ -2807,5 +3087,544 @@ fn the_survey_is_skipped_where_the_work_directory_could_not_hold_it() {
         vec![4],
         "only the envelope used was read:\n{:#?}",
         h2.ops()
+    );
+}
+
+// ---- 1.3.0: --where and --find, the cross-volume index (sec 1.5) ----
+
+/// Whitespace-flattened, with the `>>>` that prefixes the script's notices
+/// dropped, so a sentence the script wraps over several lines matches whole.
+fn flat(s: &str) -> String {
+    s.split_whitespace()
+        .filter(|w| *w != ">>>")
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The lines of `text` from the first one containing `from` up to the next
+/// blank line: one block of the printed answer.
+fn block<'a>(text: &'a str, from: &str) -> Vec<&'a str> {
+    text.lines()
+        .skip_while(|l| !l.contains(from))
+        .take_while(|l| !l.trim().is_empty())
+        .collect()
+}
+
+/// The files read are strictly ascending and the tape was rewound once: the
+/// forward-only rule every mode keeps (#396).
+fn assert_forward_only(h: &Heir, what: &str) {
+    let ops = h.ops();
+    assert_eq!(h.count("mt rewind"), 1, "{what}: one rewind:\n{ops:#?}");
+    let got = reads(h);
+    let mut sorted = got.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(got, sorted, "{what}: each file once, ascending:\n{ops:#?}");
+}
+
+/// A tenant key reads that tenant's index: every version of the unit, with
+/// its slices and bytes, and every tape holding it, decoded from sec 1.5's
+/// columns (found by name, whatever their order).
+#[test]
+fn where_prints_every_version_and_holder_of_a_unit_from_a_tenant_key() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--where", "photos/2019", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    eprintln!("---- --where photos/2019 --key alice ----\n{text}----");
+    // Which tape's index, and the staleness rule.
+    assert!(
+        text.contains("Index read from tape: HEIR01 (written "),
+        "{text}"
+    );
+    let flat_text = flat(&text);
+    assert!(
+        flat_text.contains("as of the moment its own tape was written"),
+        "{flat_text}"
+    );
+    assert!(
+        flat_text.contains("The newest tape you hold has the most complete index"),
+        "{flat_text}"
+    );
+
+    assert!(text.contains("Unit photos/2019 (tenant alice):"), "{text}");
+    // Both versions, the older one held by the other tape only.
+    let photos = unit("photos/2019");
+    let n = photos.positions.len();
+    assert!(text.contains("  Version 1: 3 slice(s), 2.9 MiB (3000000 bytes); unit uuid 11111111-2222-3333-4444-555555555555"), "{text}");
+    assert!(
+        text.contains(&format!("  Version 2: {n} slice(s), ")),
+        "{text}"
+    );
+    let v2 = block(&text, "Version 2:");
+    let v1 = block(&text, "Version 1:");
+    // Version 1: one holder.
+    assert_eq!(
+        v1.iter().filter(|l| l.contains("    tape ")).count(),
+        1,
+        "{v1:#?}"
+    );
+    assert!(
+        v1.iter()
+            .any(|l| l.trim() == "tape OTHER02  (sealed 2026-09-01T10:00:00Z)  slices 1-3 of 3"),
+        "{v1:#?}"
+    );
+    // Version 2: this tape, the sealed one, and the quarantined one, in
+    // volume order, each with every field decoded.
+    let holders: Vec<&str> = v2
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with("    tape "))
+        .collect();
+    assert_eq!(
+        holders,
+        [
+            format!("    tape HEIR01  (this tape)  slices 1-{n} of {n}"),
+            format!("    tape OTHER02  (sealed 2026-09-01T10:00:00Z)  slices 1-{n} of {n}"),
+            format!(
+                "    tape QUAR03  (QUARANTINED: a verify proved this medium bad, it may still read in part; sealed 2026-08-15T09:30:00Z)  slices 1-{n} of {n}"
+            ),
+        ],
+        "{v2:#?}"
+    );
+    assert!(
+        v2.contains(
+            &format!(
+                "        volume uuid {THIS_UUID}; cartridge serial SERIAL01; generation LTO-6"
+            )
+            .as_str()
+        ),
+        "{v2:#?}"
+    );
+    assert!(
+        v2.contains(
+            &format!(
+                "        volume uuid {OTHER_UUID}; cartridge serial OTHERSER02; generation LTO-6"
+            )
+            .as_str()
+        ),
+        "{v2:#?}"
+    );
+    // An empty serial is "not known", not a blank.
+    assert!(
+        v2.contains(
+            &format!(
+                "        volume uuid {QUAR_UUID}; cartridge serial not known; generation LTO-5"
+            )
+            .as_str()
+        ),
+        "{v2:#?}"
+    );
+    // A tenant key lists that tenant's units only.
+    assert!(!text.contains("ledgers"), "{text}");
+    assert_forward_only(&h, "--where");
+}
+
+/// The columns are found by header name: alice's `units.tsv` has them reversed
+/// with an unknown one in the middle; the operator's is in sec 1.5's order with
+/// `tenant`. The same unit read through the two must render the same rows, or
+/// "ignored" would be indistinguishable from "never read".
+#[test]
+fn columns_are_found_by_header_name_and_an_unknown_column_is_ignored() {
+    let h = Heir::new();
+    let (code, via_tenant) = h.run(&["--where", "photos/2019", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{via_tenant}");
+    let (code, via_operator) = h.run(&["--where", "photos/2019", "--key", &h.key("op")]);
+    assert_eq!(code, 0, "{via_operator}");
+    let rows = |t: &str| -> Vec<String> {
+        t.lines()
+            .skip_while(|l| !l.starts_with("Unit photos/2019"))
+            .map(str::to_string)
+            .collect()
+    };
+    let (a, b) = (rows(&via_tenant), rows(&via_operator));
+    assert!(a.len() > 8, "a positive control needs rows: {a:#?}");
+    // Everything from the unit's heading down, but for the lines that say
+    // which key read which kind of index.
+    let strip = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .filter(|l| !l.starts_with(">>>"))
+            .cloned()
+            .collect()
+    };
+    let (a, b) = (strip(&a), strip(&b));
+    // The heading names the tenant either way; the holders are the same.
+    assert_eq!(a, b, "tenant file vs operator file");
+}
+
+/// The escrow key (and the operator key) read the operator envelope's map of
+/// every tenant's units, with a tenant column; another tenant's unit is found.
+#[test]
+fn where_with_the_escrow_key_reads_the_operator_map_of_every_tenant() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--where", "ledgers", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Unit ledgers (tenant bob):"), "{text}");
+    assert!(text.contains("  Version 3: "), "{text}");
+    assert!(
+        text.contains("    tape HEIR01  (this tape)  slices 1-"),
+        "{text}"
+    );
+    // The map is read from the operator envelope, so the walk ends there:
+    // nothing is read after it, and the tape is rewound once.
+    assert_forward_only(&h, "--where with the escrow key");
+    let last_read = reads(&h).into_iter().max().unwrap();
+    assert!(
+        last_read < template().units[0].positions[0],
+        "no data slice was read: {:#?}",
+        h.ops()
+    );
+}
+
+/// A unit the index does not list is said not to be there, and the units it
+/// does list are named; with a tenant key that is that tenant's, and the
+/// operator or escrow key is named as the one that opens every tenant's.
+#[test]
+fn where_names_the_units_the_index_lists_when_it_finds_none() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--where", "ledgers", "--key", &h.key("alice")]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("No unit named 'ledgers' is in this index."),
+        "{text}"
+    );
+    let listed: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("    ") && !l.trim().is_empty())
+        .collect();
+    assert_eq!(listed, ["    docs", "    photos/2019"], "{text}");
+    assert!(
+        text.contains("the operator or escrow key opens the"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("nocat"),
+        "another tenant's units stay unnamed: {text}"
+    );
+    // The escrow key has no such caveat.
+    let (code, text) = h.run(&["--where", "nonesuch", "--key", &h.key("esc")]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("    ledgers"), "{text}");
+    assert!(!text.contains("opens that tenant's index only"), "{text}");
+}
+
+/// A tape written before the index existed says so plainly, and says what it
+/// can still do; both modes exit 1.
+#[test]
+fn a_tape_without_an_index_says_so_for_where_and_find() {
+    let h = Heir::of(solo_template(), &[]);
+    for args in [
+        vec!["--where", "ledgers", "--key", &h.key("bob")],
+        vec!["--find", "file", "--key", &h.key("bob")],
+        vec!["--where", "ledgers", "--key", &h.key("esc")],
+    ] {
+        let (code, text) = h.run(&args);
+        assert_eq!(code, 1, "{args:?}: {text}");
+        let t = flat(&text);
+        assert!(t.contains("This tape carries no index."), "{t}");
+        assert!(
+            t.contains("Tapes written before version 1.3.0 have none"),
+            "{t}"
+        );
+        assert!(t.contains("--find-envelope"), "{t}");
+        assert!(t.contains("--list"), "{t}");
+        assert!(!text.contains("No unit named"), "not a miss: {text}");
+    }
+}
+
+/// `--find` prints each match as unit, version, kind, size and path, then the
+/// tapes holding each version printed.
+#[test]
+fn find_prints_matching_paths_with_their_holders() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--find", "note.txt", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    eprintln!("---- --find note.txt --key alice ----\n{text}----");
+    assert!(text.contains("Index read from tape: HEIR01"), "{text}");
+    assert!(text.contains("In the index of tenant alice:"), "{text}");
+    // `sub/note.txt` is in both of alice's units.
+    let matches: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("  ") && l.contains(" bytes  "))
+        .collect();
+    assert_eq!(
+        matches,
+        [
+            "  docs  v1  f  10 bytes  sub/note.txt".to_string(),
+            "  photos/2019  v2  f  17 bytes  sub/note.txt".to_string(),
+        ],
+        "{text}"
+    );
+    // Each version printed is followed by its holders.
+    let docs = block(&text, "Tapes holding docs version 1:");
+    assert!(
+        docs.iter().any(|l| l.contains("tape HEIR01  (this tape)")),
+        "{docs:#?}"
+    );
+    assert!(
+        docs.iter()
+            .any(|l| l.contains("tape OTHER02  (sealed 2026-09-01T10:00:00Z)")),
+        "{docs:#?}"
+    );
+    assert!(!docs.iter().any(|l| l.contains("QUAR03")), "{docs:#?}");
+    let photos = block(&text, "Tapes holding photos/2019 version 2:");
+    assert_eq!(
+        photos.iter().filter(|l| l.starts_with("    tape ")).count(),
+        3,
+        "{photos:#?}"
+    );
+    // A tenant key finds its own paths only.
+    let (code, text) = h.run(&["--find", "file0", "--key", &h.key("bob")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("In the index of tenant bob:"), "{text}");
+    assert!(text.contains("  ledgers  v3  f  "), "{text}");
+    assert!(!text.contains("photos/2019"), "{text}");
+    assert_forward_only(&h, "--find");
+}
+
+/// A path may hold a TAB, an LF and a backslash, which the index writes as
+/// `\t`, `\n` and `\\`. The text given is matched against the DECODED path, as
+/// a literal substring; the row is printed on one line, with TAB and LF shown
+/// as `\t` and `\n`.
+#[test]
+fn find_matches_the_decoded_path_and_prints_it_on_one_line() {
+    let h = Heir::new();
+    // A real TAB then `tab`, then a real LF: only the decoded path has them.
+    let (code, text) = h.run(&["--find", "weird\ttab\nnew", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    let shown: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("weird") && l.contains(" bytes  "))
+        .collect();
+    assert_eq!(
+        shown,
+        ["  photos/2019  v2  f  11 bytes  weird\\ttab\\nnew\\back.txt"],
+        "one line, TAB and LF made visible:\n{text}"
+    );
+    assert!(
+        !text.contains("weird\t"),
+        "no raw TAB in the output: {text:?}"
+    );
+
+    // The decoded backslash: a single one matches, the stored pair does not.
+    let (code, text) = h.run(&["--find", "new\\back", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("weird\\ttab\\nnew\\back.txt"), "{text}");
+    let (code, text) = h.run(&["--find", "new\\\\back", "--key", &h.key("alice")]);
+    assert_eq!(code, 1, "the stored form is not the name: {text}");
+    assert!(text.contains("No path in this index contains"), "{text}");
+
+    // `lit\tera.txt` is a backslash and a `t`, never a TAB: a decoder that
+    // chained its substitutions would turn the stored `\\t` into one.
+    let (code, text) = h.run(&["--find", "lit\\tera", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("  photos/2019  v2  f  12 bytes  lit\\tera.txt"),
+        "{text}"
+    );
+    let (code, text) = h.run(&["--find", "lit\tera", "--key", &h.key("alice")]);
+    assert_eq!(code, 1, "a TAB is not a backslash and a t: {text}");
+
+    // The text is literal, not a pattern.
+    let (code, text) = h.run(&["--find", "file.", "--key", &h.key("alice")]);
+    assert_eq!(code, 1, "'.' is a dot, not any character: {text}");
+    let (code, text) = h.run(&["--find", "FILE0", "--key", &h.key("alice")]);
+    assert_eq!(code, 1, "capitals matter: {text}");
+}
+
+/// At most 50 matches are printed, with a count of the rest; the holders are
+/// printed for what was printed.
+#[test]
+fn find_caps_its_matches_and_counts_the_rest() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--find", "bulk/item-", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    let printed = text
+        .lines()
+        .filter(|l| l.contains("bulk/item-") && l.contains(" bytes  "))
+        .count();
+    assert_eq!(printed, 50, "{text}");
+    assert!(
+        text.contains("  docs  v1  f  101 bytes  bulk/item-001.dat"),
+        "{text}"
+    );
+    assert!(text.contains("bulk/item-050.dat"), "{text}");
+    assert!(!text.contains("bulk/item-051.dat"), "{text}");
+    let t = flat(&text);
+    assert!(
+        t.contains("70 more match(es) are not shown: this prints the first 50."),
+        "{t}"
+    );
+    assert!(t.contains("Tapes holding docs version 1:"), "{t}");
+
+    // Under the cap there is no such line.
+    let (code, text) = h.run(&["--find", "item-11", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(
+        text.lines()
+            .filter(|l| l.contains("bulk/item-") && l.contains(" bytes  "))
+            .count(),
+        10,
+        "{text}"
+    );
+    assert!(!text.contains("more match(es)"), "{text}");
+}
+
+/// An escrow key opens every tenant's envelope, so `--find` searches every
+/// tenant, one limit shared by all.
+#[test]
+fn find_with_the_escrow_key_searches_every_tenant_under_one_limit() {
+    let h = Heir::new();
+    let (code, text) = h.run(&["--find", "file0.bin", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    for tenant in ["alice", "bob", "carol"] {
+        assert!(
+            text.contains(&format!("In the index of tenant {tenant}:")),
+            "{tenant}: {text}"
+        );
+    }
+    assert!(text.contains("  ledgers  v3  f  "), "{text}");
+    assert!(text.contains("  restaged  v4  f  "), "{text}");
+    assert_forward_only(&h, "--find with the escrow key");
+    // One limit across envelopes: 120 matches in alice's `docs` use it up, and
+    // bob's and carol's are counted, not printed.
+    let (code, text) = h.run(&["--find", "e", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    let printed = text.lines().filter(|l| l.contains(" bytes  ")).count();
+    assert_eq!(printed, 50, "{text}");
+    assert!(
+        flat(&text).contains("more match(es) are not shown: this prints the first 50."),
+        "{text}"
+    );
+}
+
+/// Both modes read the tape forward from one rewind, as every other mode does,
+/// and an unrelated key finds nothing without extra motion.
+#[test]
+fn the_index_modes_read_forward_from_one_rewind() {
+    let h = Heir::new();
+    for args in [
+        vec!["--where", "docs", "--key", &h.key("alice")],
+        vec!["--find", "item-0", "--key", &h.key("alice")],
+        vec!["--where", "docs", "--key", &h.key("op")],
+        vec!["--find", "item-0", "--key", &h.key("esc")],
+    ] {
+        let (code, text) = h.run(&args);
+        assert_eq!(code, 0, "{args:?}: {text}");
+        assert_forward_only(&h, &format!("{args:?}"));
+        // Never beyond the envelopes: no data slice, no seal marker.
+        let first_slice = template().units[0].positions[0];
+        assert!(
+            reads(&h).iter().all(|p| *p < first_slice),
+            "{args:?}: only envelopes are read:\n{:#?}",
+            h.ops()
+        );
+    }
+    // A key that opens nothing is the same refusal as every other mode.
+    let (code, text) = h.run(&["--where", "docs", "--key", &h.key("stranger")]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("no envelope matched the key provided"),
+        "{text}"
+    );
+    assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
+}
+
+/// The two modes are in the per-mode tool table: the envelope set (`age`,
+/// `truncate`, `tar`) plus the read set, no `dar`, `tee` or `mkfifo`; a host
+/// without one is refused before the tape is touched.
+#[test]
+fn the_index_modes_check_the_tools_they_run_and_no_others() {
+    for args in [
+        vec!["--where", "docs", "--key", "KEY"],
+        vec!["--find", "x", "--key", "KEY"],
+    ] {
+        for (missing, host) in [("age", false), ("tar", true), ("truncate", true)] {
+            let mut h = Heir::new();
+            h = if host {
+                h.without_host(missing)
+            } else {
+                h.without(missing)
+            };
+            let args: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if *a == "KEY" {
+                        h.key("alice")
+                    } else {
+                        a.to_string()
+                    }
+                })
+                .collect();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (code, text) = h.run(&args);
+            assert_eq!(code, 1, "{args:?} without {missing}: {text}");
+            assert!(
+                text.contains(&format!("missing required tool: {missing}")),
+                "{args:?}: {text}"
+            );
+            assert!(
+                h.ops().is_empty(),
+                "{args:?}: refused before the tape: {:#?}",
+                h.ops()
+            );
+        }
+        // No dar, tee or mkfifo is needed.
+        let h = Heir::new()
+            .without_host("dar")
+            .without_host("tee")
+            .without_host("mkfifo");
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| {
+                if *a == "KEY" {
+                    h.key("alice")
+                } else {
+                    a.to_string()
+                }
+            })
+            .collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, text) = h.run(&args);
+        assert!(!text.contains("missing required tool"), "{args:?}: {text}");
+        assert_ne!(code, 99, "{text}");
+    }
+}
+
+/// Usage errors say what was wrong and read nothing; `--help` documents both
+/// modes, the print limit and how a path is shown.
+#[test]
+fn the_index_modes_have_usage_errors_and_are_in_help() {
+    let h = Heir::new();
+    for (args, needle) in [
+        (vec!["--where"], "--where needs a unit name"),
+        (vec!["--where", "--key", "k"], "--where needs a unit name"),
+        (vec!["--find"], "--find needs the text to look for"),
+        (vec!["--find", ""], "an empty text matches every path"),
+        (vec!["--where", "docs"], "usage: "),
+        (vec!["--find", "x", "--key"], "--key needs a value"),
+        (vec!["--find", "x", "--bogus"], "unknown option: --bogus"),
+    ] {
+        let (code, text) = h.run(&args);
+        assert_eq!(code, 1, "{args:?}: {text}");
+        assert!(text.contains(needle), "{args:?}: {text}");
+        assert!(h.ops().is_empty(), "{args:?}: {:#?}", h.ops());
+    }
+    let (code, help) = h.run(&["--help"]);
+    assert_eq!(code, 0, "{help}");
+    let f = flat(&help);
+    for needle in [
+        "--where UNIT --key KEYFILE [--key K2 ...]",
+        "--find TEXT --key KEYFILE [--key K2 ...]",
+        "At most 50 matches are printed",
+        "A TAB, newline or carriage return in a path is shown as \\t, \\n or \\r.",
+        "the newest tape you hold has the most complete one",
+        "A tape written before version 1.3.0 has none",
+    ] {
+        assert!(f.contains(needle), "--help lacks {needle:?}:\n{help}");
+    }
+    let (_, info) = h.run(&["--info"]);
+    assert!(
+        info.contains("--where UNIT --key YOUR_KEY.age.key"),
+        "{info}"
     );
 }

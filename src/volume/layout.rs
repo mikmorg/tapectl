@@ -165,12 +165,15 @@ load_count_at_write = {mam_loads}
 }
 
 /// The modes of RESTORE.sh that run external tools, as bits of
-/// [`RestoreTool::modes`]. `--info` and `--verify` run the same ones.
+/// [`RestoreTool::modes`]. `--info` and `--verify` run the same ones, and so
+/// do `--where` and `--find`: they open envelopes (the `--find-envelope` set)
+/// and read plain text out of them with `awk`, which is not checked for.
 const MODE_READ: u8 = 1; // --info, --verify
 const MODE_ENVELOPE: u8 = 2; // --find-envelope
 const MODE_LIST: u8 = 4; // --list
 const MODE_PATH: u8 = 8; // --restore --path
 const MODE_RESTORE: u8 = 16; // --restore
+const MODE_INDEX: u8 = 32; // --where, --find
 
 /// A tool RESTORE.sh runs (beyond `mt`, which every mode needs, and the
 /// everyday text tools it does not check for), the modes that run it, and
@@ -187,8 +190,8 @@ struct RestoreTool {
     role: &'static str,
 }
 
-const ALL_MODES: u8 = MODE_READ | MODE_ENVELOPE | MODE_LIST | MODE_PATH | MODE_RESTORE;
-const DECRYPTING: u8 = MODE_ENVELOPE | MODE_LIST | MODE_PATH | MODE_RESTORE;
+const ALL_MODES: u8 = MODE_READ | MODE_ENVELOPE | MODE_LIST | MODE_PATH | MODE_RESTORE | MODE_INDEX;
+const DECRYPTING: u8 = MODE_ENVELOPE | MODE_LIST | MODE_PATH | MODE_RESTORE | MODE_INDEX;
 
 /// In the order RESTORE.sh's `Requirements:` lines have always listed them.
 const RESTORE_TOOLS: &[RestoreTool] = &[
@@ -704,8 +707,9 @@ padding can be defeated without knowing the exact size:
 /// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
-        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
+        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE,
+        AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
+        AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
     let script = r#"#!/usr/bin/env bash
@@ -725,6 +729,8 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #   ./RESTORE.sh --restore --key KEYFILE --to DIR --unit U --path P [--path P2 ...]
 #                [--version N] [--scratch DIR]                One file or folder
 #   ./RESTORE.sh --list --key KEYFILE [--unit U] [--version N]  A unit's files
+#   ./RESTORE.sh --where UNIT --key KEYFILE [--key K2 ...]       Which tapes hold UNIT
+#   ./RESTORE.sh --find TEXT --key KEYFILE [--key K2 ...]        Which unit and tape hold a path
 #
 # --list and --path read the dar catalogue each envelope carries
 # (catalogs/<uuid8>_v<version>.1.dar): --list reads no data slice at all, and
@@ -734,6 +740,14 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 # --overwrite replaces such files instead, to finish a restore that stopped.
 # With more than one unit (--all, or --unit repeated) each unit goes to its
 # own directory, --to/UNIT.
+#
+# --where and --find read the cross-volume index that a tape written since
+# version 1.3.0 carries in its envelopes (index/units.tsv, and index/paths.tsv
+# in each tenant envelope): --where lists every version of a unit and the tapes
+# holding it, --find lists the paths that contain a piece of text and the tapes
+# holding them. An index is as of the moment its own tape was written, so the
+# newest tape you hold has the most complete one. They read this tape only,
+# forward from one rewind, like every other mode.
 #
 # --key may be repeated. An envelope and the slices it describes can need
 # different keys after a key rotation, so every key is tried independently.
@@ -1105,6 +1119,8 @@ TOOLS_LIST=(__TOOLS_LIST__)
 TOOLS_PATH=(__TOOLS_PATH__)
 # --restore, whole units (every tool any mode may run):
 TOOLS_RESTORE=(__TOOLS_RESTORE__)
+# --where, --find (the envelopes' index, read as plain text):
+TOOLS_INDEX=(__TOOLS_INDEX__)
 
 require_tools() { # <tool>...
   local tool
@@ -1705,6 +1721,9 @@ do_info() {
   echo "  $0 --find-envelope --key YOUR_KEY.age.key"
   echo "To check tape integrity without any key:"
   echo "  $0 --verify"
+  echo "To find the other tapes that hold a unit, or the tape that holds a file:"
+  echo "  $0 --where UNIT --key YOUR_KEY.age.key"
+  echo "  $0 --find TEXT --key YOUR_KEY.age.key"
 }
 
 # ---- --verify ----
@@ -2678,6 +2697,187 @@ restore_paths() { # <slices file> <envelope dir> <unit> <version> <destination> 
   SCRATCH=""
 }
 
+# ---- the cross-volume index (--where, --find; volume-format-v2.md 1.5) ----
+
+# A tape written since version 1.3.0 carries, in each tenant envelope,
+# index/units.tsv (that tenant's units: every version and every tape holding it)
+# and index/paths.tsv (every path of those versions); the operator envelope
+# carries index/units.tsv for every tenant. Both are tab-separated text with a
+# header line naming the columns, and both are read here with awk, so they need
+# no more than the tools that open an envelope. The index is as of the moment
+# its own tape was written: it never names a tape written after it, and a tape
+# it names may since have been retired or erased.
+INDEX_OPENED=0
+INDEX_HAD=0
+
+index_banner() {
+  echo ""
+  info "Index read from tape: ${TAPE_LABEL:-<unreadable>} (written $(safe_str "${CREATED:-unknown}"))"
+  info "An index is as of the moment its own tape was written. It never names a tape written"
+  info "after it, and a tape it names may since have been retired or erased. The newest tape"
+  info "you hold has the most complete index: if this is not it, run this on that one."
+}
+
+# A tape with no index says so and points at what it can do. Exit 1: the answer
+# is not on this tape.
+die_no_index() {
+  echo ""
+  info "This tape carries no index. Tapes written before version 1.3.0 have none, and nothing"
+  info "on this tape says where a unit's other versions or copies are."
+  info "What this tape can tell you about itself:"
+  info "  $0 --find-envelope $(keys_args)     the units, versions and slices it holds"
+  info "  $0 --list $(keys_args)              the files of a unit (add --unit NAME)"
+  info "For another tape, load it and run its own RESTORE.sh the same way; a tape written"
+  info "since version 1.3.0 can answer for all the tapes written before it."
+  exit 1
+}
+
+# --where: copy out the units.tsv of each envelope a key opens, then remove the
+# envelope (an escrow key opens them all, and a paths.tsv can be large). An
+# operator envelope's units.tsv lists every tenant's units, so the walk stops
+# at it; the tenant envelopes come before it on the tape.
+WHERE_FILES=()
+WHERE_TENANTS=()
+WHERE_OPERATOR=""
+where_envelope() { # <position>
+  local pos=$1 d="$WORK/opened.$1" ty who=""
+  INDEX_OPENED=$((INDEX_OPENED + 1))
+  ty=$(file_type_at "$pos" "$FILES_TXT")
+  if [ -f "$d/index/units.tsv" ]; then
+    INDEX_HAD=$((INDEX_HAD + 1))
+    mv "$d/index/units.tsv" "$WORK/where.$pos.tsv"
+    case "$ty" in
+    operator_envelope*)
+      WHERE_OPERATOR="$WORK/where.$pos.tsv"
+      rm -rf "$d"
+      return 1
+      ;;
+    esac
+    who=$(toml_val "$d/MANIFEST.toml" tenant 2>/dev/null || true)
+    WHERE_FILES+=("$WORK/where.$pos.tsv")
+    WHERE_TENANTS+=("$(safe_str "$who")")
+  fi
+  rm -rf "$d"
+  return 0
+}
+
+do_where() { # <unit>
+  local unit=$1 i rc found=0 f
+  establish_files
+  walk_envelopes where_envelope
+  [ "$INDEX_OPENED" -gt 0 ] || die_no_envelope
+  index_banner
+  echo ""
+  if [ -n "$WHERE_OPERATOR" ]; then
+    WHERE_FILES=("$WHERE_OPERATOR")
+    WHERE_TENANTS=("")
+  fi
+  [ "$INDEX_HAD" -gt 0 ] || die_no_index
+  : >"$WORK/where.known"
+  for ((i = 0; i < ${#WHERE_FILES[@]}; i++)); do
+    f=${WHERE_FILES[$i]}
+    rc=0
+    WHERE_UNIT="$unit" WHERE_KNOWN="$WORK/where.known" WHERE_TENANT="${WHERE_TENANTS[$i]}" \
+      awk '__AWK_INDEX_COMMON__ __AWK_INDEX_WHERE__' "$f" || rc=$?
+    case "$rc" in
+    0) found=1 ;;
+    1) ;;
+    *) echo "WARNING: an index in this tape's envelopes has no unit or version column, so this script cannot read it." >&2 ;;
+    esac
+  done
+  if [ "$found" = 0 ]; then
+    echo ""
+    info "No unit named '$unit' is in this index."
+    if [ -s "$WORK/where.known" ]; then
+      info "It lists these units:"
+      sort -u "$WORK/where.known" | head -n 40 | sed 's/^/    /'
+    fi
+    if [ -z "$WHERE_OPERATOR" ]; then
+      info "A tenant's key opens that tenant's index only; the operator or escrow key opens the"
+      info "index of every tenant."
+    fi
+    exit 1
+  fi
+  echo ""
+  info "A holder marked 'this tape' is the tape you have loaded. For any other, find the cartridge"
+  info "by its label or its chip serial, load it, and use the RESTORE.sh stored on that tape."
+}
+
+# --find: the matches of each tenant envelope's paths.tsv, kept in a file so the
+# banner can come first. One limit is shared by every envelope.
+FIND_TEXT=""
+FIND_LEFT=50
+FIND_SHOWN=0
+FIND_TOTAL=0
+find_in_envelope() { # <position>
+  local pos=$1 d="$WORK/opened.$1" u who shown total
+  INDEX_OPENED=$((INDEX_OPENED + 1))
+  if [ -f "$d/index/units.tsv" ] || [ -f "$d/index/paths.tsv" ]; then
+    INDEX_HAD=$((INDEX_HAD + 1))
+  fi
+  if [ -f "$d/index/paths.tsv" ]; then
+    u="$d/index/units.tsv"
+    [ -f "$u" ] || u=/dev/null
+    who=$(toml_val "$d/MANIFEST.toml" tenant 2>/dev/null || true)
+    : >"$WORK/find.counts"
+    FIND_TEXT="$FIND_TEXT" FIND_LIMIT="$FIND_LEFT" FIND_UNITS="$u" FIND_COUNTS="$WORK/find.counts" \
+      FIND_WHO="tenant $(safe_str "$who")" \
+      awk '__AWK_INDEX_COMMON__ __AWK_INDEX_FIND__' "$d/index/paths.tsv" >>"$WORK/find.out" || {
+      echo "WARNING: the index in the envelope at file $pos has no unit, version or path column, so this script cannot read it." >&2
+      : >"$WORK/find.counts"
+    }
+    shown=0
+    total=0
+    read -r shown total <"$WORK/find.counts" || true
+    if is_uint "$shown" && is_uint "$total"; then
+      FIND_SHOWN=$((FIND_SHOWN + shown))
+      FIND_TOTAL=$((FIND_TOTAL + total))
+      FIND_LEFT=$((FIND_LEFT - shown))
+    fi
+  fi
+  rm -rf "$d"
+  return 0
+}
+
+# The text given, with a TAB, newline or carriage return written out, so a
+# message about it stays on its own line.
+visible_text() { # <text>
+  local t=$1
+  t=${t//$'\t'/\\t}
+  t=${t//$'\n'/\\n}
+  t=${t//$'\r'/\\r}
+  printf '%s' "$t"
+}
+
+do_find() { # <text>
+  FIND_TEXT=$1
+  : >"$WORK/find.out"
+  establish_files
+  walk_envelopes find_in_envelope
+  [ "$INDEX_OPENED" -gt 0 ] || die_no_envelope
+  index_banner
+  [ "$INDEX_HAD" -gt 0 ] || die_no_index
+  if [ "$FIND_TOTAL" -eq 0 ]; then
+    echo ""
+    info "No path in this index contains '$(visible_text "$FIND_TEXT")'. (The text is matched as it stands, not as a"
+    info "pattern, and capitals matter. A path is relative to its unit's root.)"
+    exit 1
+  fi
+  echo ""
+  info "Paths containing '$(visible_text "$FIND_TEXT")' (unit, version, kind, size, path; kind is d directory,"
+  info "f file, l symlink, s special). A TAB, newline or carriage return in a path is shown as"
+  info "\\t, \\n or \\r."
+  echo ""
+  cat "$WORK/find.out"
+  echo ""
+  if [ "$FIND_TOTAL" -gt "$FIND_SHOWN" ]; then
+    info "$((FIND_TOTAL - FIND_SHOWN)) more match(es) are not shown: this prints the first $FIND_SHOWN. Give more of"
+    info "the path to narrow it."
+  fi
+  info "To restore one of these from the tape that holds it:"
+  info "  $0 --restore $(keys_args) --unit UNIT --path PATH --to /your/destination"
+}
+
 # ---- main ----
 
 case "${1:-}" in
@@ -2787,6 +2987,61 @@ case "${1:-}" in
   [ -z "$want" ] || require_uint version "$want"
   do_list "$want"
   ;;
+--where)
+  shift
+  if [ $# -lt 1 ] || [ "$1" = --key ]; then
+    die "--where needs a unit name
+
+       usage: $0 --where UNIT --key KEYFILE [--key K2 ...]"
+  fi
+  where_unit=$1
+  shift
+  KEYS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --key)
+      [ $# -ge 2 ] || die "--key needs a value
+
+       usage: $0 --where UNIT --key KEYFILE [--key K2 ...]"
+      KEYS+=("$2")
+      shift 2
+      ;;
+    *) die "unknown option: $1" ;;
+    esac
+  done
+  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --where UNIT --key KEYFILE [--key K2 ...]"
+  require_tools "${TOOLS_INDEX[@]}"
+  require_key_files
+  do_where "$where_unit"
+  ;;
+--find)
+  shift
+  if [ $# -lt 1 ] || [ "$1" = --key ]; then
+    die "--find needs the text to look for
+
+       usage: $0 --find TEXT --key KEYFILE [--key K2 ...]"
+  fi
+  [ -n "$1" ] || die "--find needs the text to look for: an empty text matches every path"
+  find_text=$1
+  shift
+  KEYS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --key)
+      [ $# -ge 2 ] || die "--key needs a value
+
+       usage: $0 --find TEXT --key KEYFILE [--key K2 ...]"
+      KEYS+=("$2")
+      shift 2
+      ;;
+    *) die "unknown option: $1" ;;
+    esac
+  done
+  [ ${#KEYS[@]} -gt 0 ] || die "usage: $0 --find TEXT --key KEYFILE [--key K2 ...]"
+  require_tools "${TOOLS_INDEX[@]}"
+  require_key_files
+  do_find "$find_text"
+  ;;
 --help | -h)
   echo "RESTORE.sh — Emergency restore for tapectl volume $LABEL (layout v2)"
   echo ""
@@ -2811,6 +3066,23 @@ case "${1:-}" in
   echo "  $0 --list --key KEYFILE [--unit U] [--version N]"
   echo "      A unit's files, from the dar catalogue in the envelope: no slice"
   echo "      is read."
+  echo "  $0 --where UNIT --key KEYFILE [--key K2 ...]"
+  echo "      Which tapes hold UNIT: every version of it in the cross-volume index"
+  echo "      this tape carries, with its slices and bytes and each tape holding it"
+  echo "      (label, volume uuid, cartridge serial, generation, state, when it"
+  echo "      sealed). The operator or escrow key reads the operator envelope's"
+  echo "      map of every tenant's units; a tenant's key reads that tenant's."
+  echo "  $0 --find TEXT --key KEYFILE [--key K2 ...]"
+  echo "      Which unit, version and tape hold a file: every path in each tenant"
+  echo "      envelope's index that contains TEXT (the characters as they stand,"
+  echo "      not a pattern; capitals matter), with unit, version, kind, size, and"
+  echo "      then the tapes holding that version. At most 50 matches are printed,"
+  echo "      with a count of the rest. A TAB, newline or carriage return in a path"
+  printf '%s\n' '      is shown as \t, \n or \r.'
+  echo "      An index is as of the moment its own tape was written, so the newest"
+  echo "      tape you hold has the most complete one. A tape written before"
+  echo "      version 1.3.0 has none, and these modes say so. Both exit 1 when"
+  echo "      nothing matched or the tape has no index."
   echo ""
   echo "  --key may be repeated, and each key is tried on its own for the"
   echo "      envelope and for every slice: a key rotation between staging a"
@@ -2865,11 +3137,15 @@ esac
         .replace("__AWK_MT_POSITION__", AWK_MT_POSITION)
         .replace("__AWK_UNITS_TABLE__", AWK_UNITS_TABLE)
         .replace("__AWK_UNIT_UUID__", AWK_UNIT_UUID)
+        .replace("__AWK_INDEX_COMMON__", AWK_INDEX_COMMON)
+        .replace("__AWK_INDEX_WHERE__", AWK_INDEX_WHERE)
+        .replace("__AWK_INDEX_FIND__", AWK_INDEX_FIND)
         .replace("__TOOLS_READ__", &tools_for(MODE_READ).join(" "))
         .replace("__TOOLS_ENVELOPE__", &tools_for(MODE_ENVELOPE).join(" "))
         .replace("__TOOLS_LIST__", &tools_for(MODE_LIST).join(" "))
         .replace("__TOOLS_PATH__", &tools_for(MODE_PATH).join(" "))
         .replace("__TOOLS_RESTORE__", &tools_for(MODE_RESTORE).join(" "))
+        .replace("__TOOLS_INDEX__", &tools_for(MODE_INDEX).join(" "))
         .replace("__TOOLS_ALL__", &restore_sh_tools().join(", "))
         .replace("__LABEL__", label)
         .replace("__TOTAL_FILES__", &total_files.to_string());
@@ -3269,8 +3545,9 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
-        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
+        AWK_CHECK_FILE_LIST, AWK_FIND_ENVELOPE, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE,
+        AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION,
+        AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
     #[test]
@@ -4380,6 +4657,9 @@ sha256_encrypted = \"bbb\"
             ("AWK_MT_POSITION", AWK_MT_POSITION),
             ("AWK_UNITS_TABLE", AWK_UNITS_TABLE),
             ("AWK_UNIT_UUID", AWK_UNIT_UUID),
+            ("AWK_INDEX_COMMON", AWK_INDEX_COMMON),
+            ("AWK_INDEX_WHERE", AWK_INDEX_WHERE),
+            ("AWK_INDEX_FIND", AWK_INDEX_FIND),
         ] {
             assert!(
                 script.contains(fragment),
@@ -4417,6 +4697,9 @@ sha256_encrypted = \"bbb\"
             ("AWK_MT_POSITION", AWK_MT_POSITION),
             ("AWK_UNITS_TABLE", AWK_UNITS_TABLE),
             ("AWK_UNIT_UUID", AWK_UNIT_UUID),
+            ("AWK_INDEX_COMMON", AWK_INDEX_COMMON),
+            ("AWK_INDEX_WHERE", AWK_INDEX_WHERE),
+            ("AWK_INDEX_FIND", AWK_INDEX_FIND),
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");
         }
@@ -5117,6 +5400,9 @@ sha256_encrypted = \"bbb\"
         );
         assert!(path.contains(&"tee".to_string()) && !path.contains(&"mkfifo".to_string()));
         assert!(path.iter().all(|t| list.contains(t) || t == "tee"));
+        // --where and --find (1.3.0) open envelopes and read plain text out of
+        // them: the --find-envelope set exactly, no dar, tee or mkfifo.
+        assert_eq!(set("TOOLS_INDEX"), envelope, "the index modes' tools");
         // The two Requirements lines say the union, mt first.
         let req = format!("mt (mt-st), {}", union.join(", "));
         assert!(s.contains(&format!("# Requirements: {req}\n")));
@@ -6104,5 +6390,127 @@ sha256_encrypted = \"bbb\"
         assert!(g.contains("`$TMPDIR`"), "the work directory: {g}");
         // The pre-1.1.0 claim, from the cover sheet's first version, is not here.
         assert!(!g.contains("about twice the unit's size free"), "{g}");
+    }
+    /// Every awk an heir might have reads the index programs the same way
+    /// (1.3.0): the decoder and the visible form use no gawk extension, so the
+    /// output of `--where` and `--find` is byte-for-byte the same under every
+    /// awk this host has. A positive control: at least one awk ran, and its
+    /// output holds what the escapes must decode to.
+    #[test]
+    fn the_index_programs_read_the_same_under_every_awk_on_the_host() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Columns reversed with an unknown one, so lookup is by name; a unit
+        // name and a path with the four escapes.
+        let units = "sealed_at\tstate\tzz_future\tgeneration\tcartridge_serial\tvolume_uuid\tvolume\tversion_bytes\tlast_slice\tfirst_slice\tnum_slices\tversion\tunit_uuid\tunit\n\
+                     \tthis-tape\tx\tLTO-6\tSER1\tuuid-1\tVOL1\t4096\t3\t1\t3\t2\tu-1\tphotos\\ttab\n\
+                     2026-09-01T10:00:00Z\tquarantined\tx\tLTO-5\t\tuuid-2\tVOL2\t4096\t3\t1\t3\t2\tu-1\tphotos\\ttab\n\
+                     \tthis-tape\tx\tLTO-6\tSER1\tuuid-1\tVOL1\t1048576\t1\t1\t1\t1\tu-2\tplain\n";
+        let paths = "unit\tversion\tkind\tsize_bytes\tpath\n\
+                     photos\\ttab\t2\tf\t5\ta\\tb\\nc\\\\d\\\\te.txt\n\
+                     photos\\ttab\t2\td\t0\tdir\n\
+                     plain\t1\tf\t7\tnote.txt\n";
+        let uf = dir.path().join("units.tsv");
+        let pf = dir.path().join("paths.tsv");
+        std::fs::write(&uf, units).unwrap();
+        std::fs::write(&pf, paths).unwrap();
+        let where_prog = format!("{AWK_INDEX_COMMON} {AWK_INDEX_WHERE}");
+        let find_prog = format!("{AWK_INDEX_COMMON} {AWK_INDEX_FIND}");
+
+        let awks: &[(&str, &[&str])] = &[
+            ("awk", &[]),
+            ("gawk", &[]),
+            ("mawk", &[]),
+            ("nawk", &[]),
+            ("original-awk", &[]),
+            ("busybox", &["awk"]),
+        ];
+        let mut outputs: Vec<(String, String)> = Vec::new();
+        for (bin, pre) in awks {
+            let run =
+                |prog: &str, file: &std::path::Path, env: &[(&str, &str)]| -> Option<String> {
+                    let mut cmd = Command::new(bin);
+                    cmd.args(*pre).arg(prog).arg(file).env("LC_ALL", "C");
+                    for (k, v) in env {
+                        cmd.env(k, v);
+                    }
+                    let o = cmd.output().ok()?;
+                    Some(format!(
+                        "exit {:?}\n{}{}",
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    ))
+                };
+            let known = dir.path().join(format!("known-{bin}"));
+            let counts = dir.path().join(format!("counts-{bin}"));
+            // The escaped unit name, given as the DECODED text (a real TAB).
+            let Some(w) = run(
+                &where_prog,
+                &uf,
+                &[
+                    ("WHERE_UNIT", "photos\ttab"),
+                    ("WHERE_KNOWN", known.to_str().unwrap()),
+                    ("WHERE_TENANT", "alice"),
+                ],
+            ) else {
+                continue;
+            };
+            let f = run(
+                &find_prog,
+                &pf,
+                &[
+                    // a real TAB, then a letter, then a real LF: the decoded path
+                    ("FIND_TEXT", "a\tb\nc\\d"),
+                    ("FIND_LIMIT", "50"),
+                    ("FIND_UNITS", uf.to_str().unwrap()),
+                    ("FIND_COUNTS", counts.to_str().unwrap()),
+                    ("FIND_WHO", "tenant alice"),
+                ],
+            )
+            .unwrap();
+            let known_txt = std::fs::read_to_string(&known).unwrap_or_default();
+            let counts_txt = std::fs::read_to_string(&counts).unwrap_or_default();
+            outputs.push((
+                bin.to_string(),
+                format!("{w}--\n{f}--\n{known_txt}--\n{counts_txt}"),
+            ));
+        }
+        assert!(!outputs.is_empty(), "no awk found on this host");
+        eprintln!(
+            "index programs compared under: {:?}",
+            outputs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+        );
+        let (first_name, first) = &outputs[0];
+        // What the escapes must decode to, once, under the first awk.
+        assert!(
+            first.contains("Unit photos\\ttab (tenant alice):"),
+            "{first}"
+        );
+        assert!(
+            first.contains("  Version 2: 3 slice(s), 4.0 KiB (4096 bytes); unit uuid u-1"),
+            "{first}"
+        );
+        assert!(
+            first.contains("    tape VOL1  (this tape)  slices 1-3 of 3"),
+            "{first}"
+        );
+        assert!(first.contains("QUARANTINED"), "{first}");
+        assert!(
+            first.contains("cartridge serial not known; generation LTO-5"),
+            "{first}"
+        );
+        assert!(
+            first.contains("  photos\\ttab  v2  f  5 bytes  a\\tb\\nc\\d\\te.txt\n"),
+            "{first}"
+        );
+        assert!(
+            first.contains("1 1\n"),
+            "one match printed, one matched: {first}"
+        );
+        for (name, out) in &outputs[1..] {
+            assert_eq!(out, first, "{name} differs from {first_name}");
+        }
     }
 }
