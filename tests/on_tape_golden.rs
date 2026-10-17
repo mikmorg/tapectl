@@ -95,6 +95,28 @@
 //! `die_newer_needed`, and `requires` (empty, `KNOWN_FEATURES=""`). The
 //! MANIFEST.toml pin did not move. The previous pin was `2a09fe98…`.
 //!
+//! **RE-PINNED 2026-10-17 for tapectl 1.3.0, under the CTO's rulings in
+//! ADR-0012's 2026-10-16 amendment (items 78-81, #418 R4),** bounded by item 81:
+//! this pin only, ending when v1.3.0 is installed. RESTORE.sh gains two modes
+//! and nothing it already did changes (the diff against the previous script is
+//! additions alone): `--where UNIT` prints the rows of the cross-volume index's
+//! `index/units.tsv` for a unit (every version, its slices and bytes, and each
+//! tape holding it), from the operator envelope with an operator or escrow key
+//! and the tenant's with a tenant key; `--find TEXT` prints the paths of each
+//! tenant envelope's `index/paths.tsv` that contain a literal piece of text
+//! (matched on the decoded path, at most 50 printed, then the holders of each
+//! version printed); a tape with no index says so and exits 1. Both read
+//! forward from one rewind, take their tools from one new row of the per-mode
+//! table (`TOOLS_INDEX`, the `--find-envelope` set), use three named awk
+//! fragments (`AWK_INDEX_COMMON`, `AWK_INDEX_WHERE`, `AWK_INDEX_FIND`) that read
+//! the same under gawk, mawk, nawk and busybox awk, and are in `--help`, the
+//! header comment and `--info`'s closing hints. The `Requirements:` lines, the
+//! other four `TOOLS_*` sets and every ruled item below are byte-identical. The
+//! two fixed points of item 81 did not move and are asserted below: "tapectl
+//! 1.1.0" in `die_newer_needed` (the only "tapectl 1." in the script), and
+//! `requires` (empty, `KNOWN_FEATURES=""`). The MANIFEST.toml pin did not move.
+//! The previous pin was `6c7bb948…`.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -111,7 +133,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "6c7bb948869ea17a9872f5477adff6d9060e16fe8f72667d90941418bc511cec";
+const RESTORE_SH_SHA256: &str = "36c970aad8452c793c459bdd2650e45f5c013f82375b173ca17a38a247f633d6";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -138,6 +160,7 @@ fn restore_sh_bytes_are_pinned() {
         "# --list:\nTOOLS_LIST=(dd age dar sha256sum head truncate tar)\n",
         "# --restore --path:\nTOOLS_PATH=(dd age dar sha256sum head truncate tar tee)\n",
         "# --restore, whole units (every tool any mode may run):\nTOOLS_RESTORE=(dd age dar sha256sum head truncate tar mkfifo tee)\n",
+        "# --where, --find (the envelopes' index, read as plain text):\nTOOLS_INDEX=(dd age sha256sum head truncate tar)\n",
         "require_tools() { # <tool>...\n",
     ] {
         assert_eq!(script.matches(line).count(), 1, "the prerequisite set {line:?}");
@@ -197,6 +220,16 @@ fn restore_sh_bytes_are_pinned() {
         "check_work_space() {",
         "  info \"            (counted from the slices' encrypted size on tape; a compressed unit may need more)\"",
         "  echo \"  TMPDIR        Where the work directory is made (default: /tmp). It holds the\"",
+        // 1.3.0 (ADR-0012 2026-10-16 items 78-81, #418 R4): the cross-volume
+        // index, read by --where and --find
+        "--where)\n  shift",
+        "--find)\n  shift",
+        "  require_tools \"${TOOLS_INDEX[@]}\"\n  require_key_files\n  do_where \"$where_unit\"",
+        "  require_tools \"${TOOLS_INDEX[@]}\"\n  require_key_files\n  do_find \"$find_text\"",
+        "  walk_envelopes where_envelope\n",
+        "  walk_envelopes find_in_envelope\n",
+        "index_banner() {\n",
+        "die_no_index() {\n",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
