@@ -19,7 +19,23 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-16 (late; NEWEST) — v1.2.0 TAGGED on `347e61a`; master `4461107` adds
+- **QUEUE STATE 2026-10-17 (NEWEST) — 1.3.0 IN BUILD; SPANNING DESIGNED AND RULED.** The CTO ruled
+  ADR-0012 items 76-91 in rounds (2026-10-16/17): spanning is shape A (slices across tapes),
+  opt-in per unit, packed last, cut at the drive's early warning then the short seal; staged
+  whole; one generation per span; heir restore scratch-and-join baseline plus tape swap; built
+  right after #420 (filed as #478, blocked on #420 = real drive). #409 CLOSED (accepted cost,
+  revisit with data). R4 = tenant index (units + every path) + operator unit map, current
+  versions with a live copy (items 78-80); #477's eleven File 1 findings ride the 1.3.0 re-pin
+  (item 81, bounded to v1.3.0's install). Spec: `docs/design/volume-format-v2.md` §1.5 on branch
+  `r4-base` (4454da1, not yet on master). Workers (rules: scratchpad `w140/common.md`):
+  `w140-index` (index.rs, build.rs, coverage query, rebuild to-do, volume plan size, format_v2
+  tests) and `w140-heir` (RESTORE.sh --where/--find, RECOVERY.md, File 1 + #477, golden re-pin).
+  At integration: a cross-test of the real generator against RESTORE.sh's parser, a gate leg
+  `heir_where_find` on a real mhvtl tape (scripts/ change: whole chain), the fresh-reader read of
+  File 1 (record on #477), docs, version 1.3.0, release notes, handoff, the whole chain, tag.
+  Label `1.3.0`: #418, #477. Open after 1.3.0: only drive-bound (#444, #420, #388, #478).
+
+- **QUEUE STATE 2026-10-16 (late) — v1.2.0 TAGGED on `347e61a`; master `4461107` adds
   #476 and #364's benchmark (both closed, chain green, CI green), untagged, for 1.3.0. Open:
   #409 and #418 wait on the CTO's Round 1 spanning/R4 answers; #477 waits on the CTO's scope for
   the 1.3.0 re-pin; #444 (drive half), #420 and #388 (prototype) need the real drive.** (Below,
