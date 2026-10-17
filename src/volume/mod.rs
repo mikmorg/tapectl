@@ -18,4 +18,5 @@ pub mod restore;
 pub mod restore_record;
 pub(crate) mod restore_script;
 pub mod session;
+pub mod slice_holders;
 pub mod write;
