@@ -1632,3 +1632,18 @@ Ruled the same night, after discussion (Round 1 question 1 and its consequences)
     (age's 64 KiB chunks) and "volume set" (tapectl has stage sets and archive sets) are kept away
     from spanning. "Part" was proposed for the shape not chosen and is not adopted. A piece in
     item 76 is, under spanning, the range of a version's slices on one volume.
+88. **RESTORE.sh restores a spanning unit either way, and the reliable way must exist.** The
+    baseline reads each tape's slices of the unit into scratch space, then runs dar once over all
+    of them: the most reliable, needing scratch for the whole unit. Where the space is not there,
+    the heir may choose one dar run fed slice by slice, pausing at each tape's end for the next
+    cartridge, which is accepted only when its front index lists the next slice's ciphertext hash
+    (a keyless check). Each tape alone still restores every whole unit on it and names the
+    spanning units that continue elsewhere; R4's index says where.
+89. **tapectl's own restore prompts for each cartridge** a spanning version needs, by label and
+    chip serial, in order (tapectl drives no changer). `restore unit` refuses up front, by name,
+    a version it cannot complete from the live volumes; `restore volume` restores the whole units
+    on one tape and names the spanning units it could not finish.
+90. **Spanning is built right after #420's short seal**, whatever the unit sizes, for the tape
+    fill opt-in spanning gives. This replaces item 77's trigger (a unit past half a cartridge);
+    the rest of item 77 stands (1.3.0 ships R4 alone; spanning is its own minor release, and only
+    tapes carrying a range of a spanning version are fenced by `requires`).
