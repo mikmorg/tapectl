@@ -572,10 +572,10 @@ deleting them destroys it (see "If All Else Fails").
     dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE.sh
     chmod +x RESTORE.sh
 
-The first line sets the drive to the tape's 512 KiB blocks. It is not
-needed if you have just run File 0's commands, which set it: the drive
-keeps the setting until the tape is unloaded or the drive is reset, and
-RESTORE.sh sets it itself. Only mt-st's `mt` can do it (GNU cpio's cannot;
+The first line sets the drive to the tape's 512 KiB blocks. Repeating it
+is harmless, and it is not needed if you have just run File 0's commands,
+which set it: the drive keeps the setting until the tape is unloaded or
+the drive is reset, and RESTORE.sh sets it itself. Only mt-st's `mt` can do it (GNU cpio's cannot;
 the line then fails, and the rest still works while the drive is in its
 default mode, where `dd bs=512k` reads each 512 KiB block whole). If a
 `dd` fails, this is the first thing to try. What `dd` says:
@@ -7024,7 +7024,7 @@ sha256_encrypted = \"bbb\"
         assert!(setblk < fetch, "setblk is the first line of the fetch");
         let f = flat_text(auto);
         assert!(
-            f.contains("It is not needed if you have just run File 0's commands"),
+            f.contains("it is not needed if you have just run File 0's commands"),
             "{f}"
         );
         assert!(f.contains("Only mt-st's `mt` can do it"), "{f}");
