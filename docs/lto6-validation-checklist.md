@@ -128,6 +128,26 @@ scripts/lto6-fill.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst --i-will-lose-
       to 1.0047 for steady feeds (#323). tapectl records the ratio after every write and
       warns above 1.05 on a real drive (#338).
 
+### Past the early warning (#420; not yet run on the real drive)
+
+Since 2026-10-17 the fill does not stop at the first refusal. One python process
+(`scripts/lto6-fill-writer.py`) holds the drive open from BOT (closing st writes a filemark),
+turns hardware compression off as tapectl does, and at the first ENOSPC records what st does
+next: it writes one 1 GiB slice (2048 blocks) a block at a time, logging every return, stops
+after 8 consecutive refusals or any other error, then writes a filemark, a seal-sized block and
+a filemark, and reads the slice and the seal back by LOCATE, comparing them with what was
+written. `--stop-at-warning` keeps the old stop; `--to-hard-end` also measures the reserve past
+the warning (about 99 GB, about 12 minutes more). The script refuses while
+`tapectl-drive-poll.timer` is active, on a rewinding node, or without room for its 2 GiB
+keystream in the out dir (`/scratch/tapectl-lto6`, or `~/.cache/tapectl/lto6` where there is
+no `/scratch`). About 5 hours in all; `summary.txt` in the run directory is what to read, and
+exit 1 ("MEASUREMENT COMPLETE (readback: FAIL)") is a finding, not a failure.
+
+- [ ] Record: what st returned after the first refusal (refused once then accepted, kept
+      refusing, or short counts); whether the whole slice, the filemark and the seal block
+      were accepted; each readback check.
+- [ ] Erase the cartridge afterwards before it serves as the step-12 test cartridge again.
+
 ## After a pass
 
 - [ ] Add the run to `docs/runs/` with the numbers above re-measured.
