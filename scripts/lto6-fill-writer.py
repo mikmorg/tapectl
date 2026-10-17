@@ -39,6 +39,7 @@ import struct
 import subprocess
 import sys
 import time
+import traceback
 
 BLOCK = 524288                    # tapectl's block size
 SLICE_BLOCKS = 2048               # a 1 GiB slice (ADR-0012, 2026-10-06)
@@ -577,6 +578,13 @@ class Writer(object):
                 self.rc = 3
             if self.rc == 0 and res["stage"] not in ("stopped-at-warning",):
                 self.stage("done")
+        except Exception:
+            # A bug that only real hardware reaches must not cost a 4.5 hour fill: keep what was measured,
+            # close the device cleanly, and say so in the summary.
+            tb = traceback.format_exc()
+            res["exception"] = tb
+            self.rc = 6
+            self.log.say("UNEXPECTED ERROR in the writer; the device is closed and the partial results are kept:\n" + tb)
         finally:
             self.finish()
         return self.rc
@@ -843,7 +851,11 @@ def make_summary(run, prior):
                                                        else "PASS" if rb.get("checks") else "not run")
     else:
         word = "INCOMPLETE (stage %s)" % stage
+    if res.get("exception"):
+        word = "THE WRITER HIT AN UNEXPECTED ERROR (rc 6; see below); " + word
     p("status: %s" % word)
+    if res.get("exception"):
+        p("exception: %s" % res["exception"].strip().splitlines()[-1])
     p("stage reached: %s (started %s, finished %s)" % (stage, res.get("started"), res.get("finished")))
     p("")
     p("1. BEFORE THE FIRST REFUSAL")
@@ -1141,6 +1153,15 @@ def selftest(argv=None):
                                        fm_verdict=lambda a: "ENOSPC" if a == 1 else None)
     expect(res["filemark1"]["attempts"] == ["ENOSPC", "ok"] and res["filemark1"]["ok"], "a refused filemark is retried and logged")
 
+    # O: a bug that only hardware reaches (an unexpected exception mid-slice): rc 6, device closed, results kept
+    def boom(a, w):
+        if a == fill_n + 5:
+            raise ValueError("injected")
+        return "ENOSPC" if a == fill_n + 1 else None
+    rc, res, rd, text, tape = scenario("unexpected exception", boom)
+    expect(rc == 6 and tape.closed and "injected" in res.get("exception", "") and "UNEXPECTED ERROR" in text,
+           "an unexpected exception ends in rc 6 with the device closed and the summary saying so")
+
     # M: MTWEOF reports EIO but the mark is on the tape -- the readback must disagree with the report
     rc, res, rd, text, tape = scenario("filemark reported failed but written", lambda a, w: "ENOSPC" if a == fill_n + 1 else None,
                                        fm_verdict=lambda a: "EIO+mark" if a == 1 else None)
@@ -1192,6 +1213,9 @@ def cmd_verify(a):
     r = Reader(dev, ks, a.block_size, log)
     try:
         r.run_checks(res)
+    except Exception:
+        r.check("readback-exception", False, "the readback itself failed: " + traceback.format_exc().strip().splitlines()[-1])
+        log.say(traceback.format_exc())
     finally:
         dev.close()
     with open(os.path.join(a.run, "readback.json"), "w") as f:
@@ -1200,7 +1224,10 @@ def cmd_verify(a):
 
 
 def cmd_summary(a):
-    text = make_summary(a.run, a.reference_bytes)
+    try:
+        text = make_summary(a.run, a.reference_bytes)
+    except Exception:
+        text = "THE SUMMARY ITSELF FAILED; send the whole directory (result.json has the numbers):\n" + traceback.format_exc()
     with open(os.path.join(a.run, "summary.txt"), "w") as f:
         f.write(text)
     sys.stdout.write(text)

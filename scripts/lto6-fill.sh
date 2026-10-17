@@ -275,7 +275,7 @@ trap '' INT
 python3 "$WRITER" write "${WARGS[@]}" 2>&1 | tee -a "$RUN/fill.log"
 WRC=${PIPESTATUS[0]}
 trap - INT
-log "writer exited rc=$WRC (0 done, 3 interrupted, 4 no refusal before the runaway cap, 5 stopped on a write error that is not a refusal)"
+log "writer exited rc=$WRC (0 done, 3 interrupted, 4 no refusal before the runaway cap, 5 stopped on a write error that is not a refusal, 6 unexpected error in the writer, partial results kept)"
 
 # The device is closed now (st writes a filemark on close if the last operation was a write).
 mt -f "$TAPE_DEV" status > "$RUN/after-close.mt.txt" 2>&1 || true
@@ -285,7 +285,8 @@ mt -f "$TAPE_DEV" rewind || true
 snapshot after-rewind
 
 VRC=0
-if [ "$STOP_AT_WARNING" -eq 0 ] && [ "$WRC" -eq 0 ]; then
+# Readback runs after a clean run, an interrupt or a writer error: it reads whatever slice result.json records.
+if [ "$STOP_AT_WARNING" -eq 0 ] && { [ "$WRC" -eq 0 ] || [ "$WRC" -eq 3 ] || [ "$WRC" -eq 6 ]; }; then
     log "readback: LOCATE to the post-warning slice and the seal block (the whole tape is never read)"
     python3 "$WRITER" verify --device "$TAPE_DEV" --src "$SRC" --run "$RUN" 2>&1 | tee -a "$RUN/fill.log"
     VRC=${PIPESTATUS[0]}
