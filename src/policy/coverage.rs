@@ -3870,4 +3870,378 @@ pub(crate) mod tests {
             })
         );
     }
+    // ── the cross-volume index's versions and holders (ADR-0012 item 80) ──
+
+    /// A catalog to ask [`index_versions`] about: tenants `alpha` and `bravo`,
+    /// units, volumes in any state, versions in any state, and who wrote what
+    /// where. The shared fixture of this module's item-80 tests and of
+    /// `volume::index`'s.
+    pub(crate) struct IndexCatalog {
+        pub conn: Connection,
+    }
+
+    impl IndexCatalog {
+        pub(crate) fn new() -> Self {
+            let conn = crate::db::open_memory().unwrap();
+            for (name, op) in [("operator", 1), ("alpha", 0), ("bravo", 0)] {
+                conn.execute(
+                    "INSERT INTO tenants (name, is_operator, status) VALUES (?1, ?2, 'active')",
+                    params![name, op],
+                )
+                .unwrap();
+            }
+            IndexCatalog { conn }
+        }
+
+        pub(crate) fn tenant(&self, name: &str) -> i64 {
+            self.conn
+                .query_row(
+                    "SELECT id FROM tenants WHERE name = ?1",
+                    params![name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        pub(crate) fn unit(&self, tenant: &str, name: &str) -> i64 {
+            self.conn
+                .execute(
+                    "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                     VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                    params![format!("uuid-{name}"), name, self.tenant(tenant)],
+                )
+                .unwrap();
+            self.conn.last_insert_rowid()
+        }
+
+        /// A volume `label` (uuid `uuid-<label>`, LTO-6) in `status` and
+        /// `condition`, sealed at `sealed_at`.
+        pub(crate) fn volume(
+            &self,
+            label: &str,
+            status: &str,
+            condition: &str,
+            sealed_at: Option<&str>,
+        ) -> i64 {
+            self.conn
+                .execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status, observed_condition, uuid,
+                                          sealed_at)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, ?2, ?3, ?4, ?5)",
+                    params![label, status, condition, format!("uuid-{label}"), sealed_at],
+                )
+                .unwrap();
+            self.conn.last_insert_rowid()
+        }
+
+        /// The chip serial `serial` of the cartridge `volume_id` is bound to.
+        pub(crate) fn bind_serial(&self, volume_id: i64, serial: &str) {
+            self.conn
+                .execute(
+                    "INSERT INTO cartridges (barcode, media_type, serial_number, nominal_capacity)
+                     VALUES (?1, 'LTO-6', ?2, 2500000000000)",
+                    params![format!("BC-{serial}"), serial],
+                )
+                .unwrap();
+            let cartridge = self.conn.last_insert_rowid();
+            self.conn
+                .execute(
+                    "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                    params![cartridge, volume_id],
+                )
+                .unwrap();
+        }
+
+        /// Version `version` of `unit_id`, its snapshot in `status`, with a
+        /// stage set whose slices have `slice_bytes` ciphertext bytes each.
+        /// Returns `(snapshot_id, stage_set_id)`.
+        pub(crate) fn version(
+            &self,
+            unit_id: i64,
+            version: i64,
+            status: &str,
+            slice_bytes: &[i64],
+        ) -> (i64, i64) {
+            self.conn
+                .execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, ?2, 'full', ?3, '/tmp/src')",
+                    params![unit_id, version, status],
+                )
+                .unwrap();
+            let snapshot_id = self.conn.last_insert_rowid();
+            self.conn
+                .execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                     VALUES (?1, 'staged', 1048576)",
+                    params![snapshot_id],
+                )
+                .unwrap();
+            let stage_set_id = self.conn.last_insert_rowid();
+            for (i, bytes) in slice_bytes.iter().enumerate() {
+                self.conn
+                    .execute(
+                        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                                   encrypted_bytes, sha256_plain, sha256_encrypted)
+                         VALUES (?1, ?2, ?3, ?3, 'p', ?4)",
+                        params![
+                            stage_set_id,
+                            i as i64 + 1,
+                            bytes,
+                            format!("e-{stage_set_id}-{i}")
+                        ],
+                    )
+                    .unwrap();
+            }
+            (snapshot_id, stage_set_id)
+        }
+
+        /// A write of `stage_set_id` to `volume_id` in `status`.
+        pub(crate) fn write(&self, stage_set_id: i64, volume_id: i64, status: &str) {
+            self.conn
+                .execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT id, snapshot_id, ?2, ?3 FROM stage_sets WHERE id = ?1",
+                    params![stage_set_id, volume_id, status],
+                )
+                .unwrap();
+        }
+
+        /// `(path, kind, size)` entries as the paths of `snapshot_id`.
+        pub(crate) fn paths(
+            &self,
+            snapshot_id: i64,
+            entries: &[(&str, crate::db::files::FileKind, i64)],
+        ) {
+            crate::db::files::insert_version(
+                &self.conn,
+                snapshot_id,
+                entries.iter().map(|(path, kind, size)| {
+                    Ok(crate::db::files::FileEntry {
+                        path: path.to_string(),
+                        kind: *kind,
+                        size_bytes: *size,
+                        mtime_ns: None,
+                        sha256: None,
+                        link_target: None,
+                    })
+                }),
+            )
+            .unwrap();
+        }
+    }
+
+    pub(crate) const THIS: IndexThisTape<'static> = IndexThisTape {
+        label: "L6-0100",
+        uuid: "uuid-L6-0100",
+        cartridge_serial: "THISSERIAL",
+        generation: "LTO-6",
+    };
+
+    /// `(unit, version, volume, state)` of each row, sorted.
+    fn index_keys(rows: &[IndexVersionRow]) -> Vec<(String, i64, String, &'static str)> {
+        let mut keys: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.unit.clone(),
+                    r.version,
+                    r.volume.clone(),
+                    r.state.as_str(),
+                )
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn key(
+        unit: &str,
+        version: i64,
+        volume: &str,
+        state: &'static str,
+    ) -> (String, i64, String, &'static str) {
+        (unit.to_string(), version, volume.to_string(), state)
+    }
+
+    /// Item 80, in one catalog: what is listed and who holds it.
+    #[test]
+    fn the_index_lists_current_versions_with_a_live_copy_and_this_writes_own() {
+        let c = IndexCatalog::new();
+        let photos = c.unit("alpha", "photos");
+        let docs = c.unit("bravo", "docs");
+        let sealed = c.volume("L6-0001", "sealed", "ok", Some("2026-10-01 10:00:00"));
+        let bad = c.volume(
+            "L6-0002",
+            "sealed",
+            "quarantined",
+            Some("2026-10-02 10:00:00"),
+        );
+        let retired = c.volume("L6-0003", "retired", "ok", Some("2026-10-03 10:00:00"));
+        let erased = c.volume("L6-0004", "erased", "ok", Some("2026-10-04 10:00:00"));
+        let half = c.volume("L6-0005", "initialized", "ok", Some("2026-10-05 10:00:00"));
+        let imported = c.volume("L6-0006", "active", "ok", None);
+
+        // photos v1: current, on a good sealed volume. This write copies it too.
+        let (_, p1) = c.version(photos, 1, "current", &[1000, 2000]);
+        c.write(p1, sealed, "completed");
+        // photos v2: current, on a quarantined volume only: listed, marked.
+        let (_, p2) = c.version(photos, 2, "current", &[500]);
+        c.write(p2, bad, "completed");
+        // photos v3 reclaimable and v4 purged, both on a good sealed volume:
+        // released by the operator, so not listed.
+        let (_, p3) = c.version(photos, 3, "reclaimable", &[10]);
+        c.write(p3, sealed, "completed");
+        let (_, p4) = c.version(photos, 4, "purged", &[10]);
+        c.write(p4, sealed, "completed");
+        // photos v5: this write's own, new (staged: not current yet).
+        let (_, p5) = c.version(photos, 5, "staged", &[300]);
+
+        // docs: current versions, none with a live holder.
+        let (_, d1) = c.version(docs, 1, "current", &[10]);
+        c.write(d1, retired, "completed");
+        let (_, d2) = c.version(docs, 2, "current", &[10]);
+        c.write(d2, erased, "completed");
+        let (_, d3) = c.version(docs, 3, "current", &[10]);
+        c.write(d3, half, "completed");
+        let (_, d4) = c.version(docs, 4, "current", &[10]);
+        c.write(d4, sealed, "aborted");
+        let (_, d5) = c.version(docs, 5, "current", &[10]);
+        c.write(d5, sealed, "interrupted");
+        let (_, d6) = c.version(docs, 6, "current", &[10]);
+        c.write(d6, imported, "completed");
+        // docs v7: current, on the sealed volume AND a retired one: the
+        // retired one is not a holder.
+        let (_, d7) = c.version(docs, 7, "current", &[10]);
+        c.write(d7, sealed, "completed");
+        c.write(d7, retired, "completed");
+
+        let rows = index_versions(&c.conn, &THIS, &[p1, p5]).unwrap();
+        assert_eq!(
+            index_keys(&rows),
+            vec![
+                // The older current version with a live copy, and this
+                // write's second copy of it.
+                key("docs", 7, "L6-0001", "sealed"),
+                key("photos", 1, "L6-0001", "sealed"),
+                key("photos", 1, "L6-0100", "this-tape"),
+                // A quarantined holder is listed and marked.
+                key("photos", 2, "L6-0002", "quarantined"),
+                // This write's own new version: this tape alone.
+                key("photos", 5, "L6-0100", "this-tape"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_index_row_carries_the_holders_own_facts() {
+        let c = IndexCatalog::new();
+        let photos = c.unit("alpha", "photos");
+        let tape = c.volume("L6-0001", "sealed", "ok", Some("2026-10-01 10:00:00"));
+        c.bind_serial(tape, "HUM00042");
+        let (snap, ss) = c.version(photos, 1, "current", &[1000, 2000, 500]);
+        c.write(ss, tape, "completed");
+        // A second, unbound holder.
+        let other = c.volume("L6-0002", "sealed", "ok", None);
+        c.write(ss, other, "completed");
+
+        let rows = index_versions(&c.conn, &THIS, &[]).unwrap();
+        assert_eq!(rows.len(), 2);
+        let r = rows.iter().find(|r| r.volume == "L6-0001").unwrap();
+        assert_eq!(r.tenant, "alpha");
+        assert_eq!(r.tenant_id, c.tenant("alpha"));
+        assert_eq!(
+            (r.unit.as_str(), r.unit_uuid.as_str()),
+            ("photos", "uuid-photos")
+        );
+        assert_eq!((r.snapshot_id, r.version), (snap, 1));
+        assert_eq!((r.num_slices, r.version_bytes), (3, 3500));
+        assert_eq!(r.volume_uuid, "uuid-L6-0001");
+        assert_eq!(r.cartridge_serial, "HUM00042");
+        assert_eq!(r.generation, "LTO-6");
+        assert_eq!(r.state, IndexHolderState::Sealed);
+        assert_eq!(r.sealed_at, "2026-10-01 10:00:00");
+        let u = rows.iter().find(|r| r.volume == "L6-0002").unwrap();
+        assert_eq!(u.cartridge_serial, "", "no cartridge bound: not known");
+        assert_eq!(u.sealed_at, "");
+    }
+
+    #[test]
+    fn this_tape_is_described_as_the_write_says_it_and_a_second_stage_set_is_one_row() {
+        let c = IndexCatalog::new();
+        let photos = c.unit("alpha", "photos");
+        let tape = c.volume("L6-0001", "sealed", "ok", Some("2026-10-01 10:00:00"));
+        let (snap, first) = c.version(photos, 1, "current", &[100]);
+        c.write(first, tape, "completed");
+        // A second stage set of the same version, also on the tape: one row.
+        c.conn
+            .execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 1)",
+                params![snap],
+            )
+            .unwrap();
+        let second = c.conn.last_insert_rowid();
+        c.write(second, tape, "completed");
+
+        let rows = index_versions(&c.conn, &THIS, &[first]).unwrap();
+        let this: Vec<_> = rows
+            .iter()
+            .filter(|r| r.state == IndexHolderState::ThisTape)
+            .collect();
+        assert_eq!(this.len(), 1);
+        assert_eq!(
+            (
+                this[0].volume.as_str(),
+                this[0].volume_uuid.as_str(),
+                this[0].cartridge_serial.as_str(),
+                this[0].generation.as_str(),
+                this[0].sealed_at.as_str()
+            ),
+            ("L6-0100", "uuid-L6-0100", "THISSERIAL", "LTO-6", "")
+        );
+        assert_eq!(rows.iter().filter(|r| r.volume == "L6-0001").count(), 1);
+        // The tape being written is never its own holder, even when the
+        // catalog already calls it sealed.
+        let again = index_versions(
+            &c.conn,
+            &IndexThisTape {
+                label: "L6-0001",
+                ..THIS
+            },
+            &[first],
+        )
+        .unwrap();
+        assert!(
+            again.iter().all(|r| r.state == IndexHolderState::ThisTape),
+            "{again:?}"
+        );
+    }
+
+    #[test]
+    fn the_index_holder_predicate_is_sealed_whatever_the_condition() {
+        let c = IndexCatalog::new();
+        for (label, status, condition, listed) in [
+            ("A", "sealed", "ok", true),
+            ("B", "sealed", "quarantined", true),
+            ("C", "initialized", "ok", false),
+            ("D", "active", "ok", false),
+            ("E", "retired", "ok", false),
+            ("F", "erased", "quarantined", false),
+        ] {
+            c.volume(label, status, condition, None);
+            let got: bool = c
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM volumes WHERE label = ?1",
+                        index_holder("volumes")
+                    ),
+                    params![label],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(got, listed, "{label}: {status}/{condition}");
+        }
+    }
 }
