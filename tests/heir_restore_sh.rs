@@ -3852,13 +3852,22 @@ fn the_manual_path_in_file_1_restores_a_unit_as_written() {
     .unwrap();
     assert_eq!(manifest.units.len(), 1);
     assert_eq!(manifest.units[0].name, "ledgers");
+    // Step 7: the tape is put at the first slice once; each read leaves it at
+    // the next file.
+    let (ok, text) = run(
+        &guide_block(&manual, "FIRST_POSITION"),
+        &[(
+            "FIRST_POSITION",
+            manifest.units[0].slices[0].tape_position.to_string(),
+        )],
+    );
+    assert!(ok, "{text}");
     let slice_block = guide_block(&manual, "> restore.NUMBER.dar");
     for sl in &manifest.units[0].slices {
         let (ok, text) = run(
             &slice_block,
             &[
                 ("SHA256_ENCRYPTED", sl.sha256_encrypted.clone()),
-                ("TAPE_POSITION", sl.tape_position.to_string()),
                 ("ENCRYPTED_BYTES", sl.encrypted_bytes.to_string()),
                 ("NUMBER", sl.number.to_string()),
                 ("YOUR_KEY.age.key", h.key("bob")),
@@ -5366,4 +5375,89 @@ fn a_fill_takes_a_replacement_slice_from_a_second_tape() {
     let ((first, first_rewinds), (second, second_rewinds)) = tapes_of(&b);
     assert!(ascending(&first) && first_rewinds == 1, "{first:?}");
     assert!(ascending(&second) && second_rewinds == 1, "{second:?}");
+}
+
+/// Finding 1 of the 2026-10-17 read of File 1: `fsf` takes the number of files
+/// to skip, not a file number. The guide's gap rule, run as written: read the
+/// slice in File P, space by COUNT = Q - P - 1, and the head is at the start
+/// of File Q, where the slice's own sha256 proves it (a wrong file fails the
+/// check). The control is the old advice, `fsf Q` from where the head is,
+/// which lands elsewhere.
+#[test]
+fn file_1_gap_spacing_reaches_the_slice_it_names() {
+    let h = Heir::new();
+    let photos = unit("photos/2019");
+    assert!(photos.positions.len() >= 4);
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let manual = guide_section(&guide, "Manual Recovery Steps");
+    let work = h.dir.join("gap");
+    std::fs::create_dir_all(&work).unwrap();
+    let run = |lines: &[String], subs: &[(&str, String)]| -> (bool, String) {
+        let mut script = lines.join("\n");
+        for (from, to) in subs {
+            script = script.replace(from, to);
+        }
+        let o = Command::new("bash")
+            .args(["-e", "-o", "pipefail", "-c", &script])
+            .current_dir(&work)
+            .env("PATH", &h.path)
+            .env("FAKE_TAPE", &h.dir)
+            .env("HOME", h.dir.join("home"))
+            .output()
+            .expect("spawn bash");
+        (
+            o.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        )
+    };
+    let slice = |n: usize| -> Vec<(&'static str, String)> {
+        vec![
+            ("SHA256_ENCRYPTED", photos.hashes[n - 1].clone()),
+            ("ENCRYPTED_BYTES", photos.sizes[n - 1].to_string()),
+            ("NUMBER", n.to_string()),
+            ("YOUR_KEY.age.key", h.key("alice")),
+        ]
+    };
+    let (ok, text) = run(&guide_block(&manual, "setblk 524288"), &[]);
+    assert!(ok, "{text}");
+    let (ok, text) = run(
+        &guide_block(&manual, "FIRST_POSITION"),
+        &[("FIRST_POSITION", photos.positions[0].to_string())],
+    );
+    assert!(ok, "{text}");
+    let slice_block = guide_block(&manual, "> restore.NUMBER.dar");
+    let (ok, text) = run(&slice_block, &slice(1));
+    assert!(ok, "slice 1: {text}");
+    // Slice 2 is skipped: P is slice 1's file, Q slice 3's.
+    let (p, q) = (photos.positions[0], photos.positions[2]);
+    let count = q - p - 1;
+    assert_eq!(count, 1, "the arithmetic the guide shows");
+    let (ok, text) = run(
+        &guide_block(&manual, "fsf COUNT"),
+        &[("COUNT", count.to_string())],
+    );
+    assert!(ok, "{text}");
+    let (ok, text) = run(&slice_block, &slice(3));
+    assert!(
+        ok,
+        "after the guide's spacing the head is at slice 3, whose sha256 says so: {text}"
+    );
+    assert!(work.join("restore.3.dar").exists());
+    // The control: slice 4 is next; spacing to it with the file number, as the
+    // old text had it, runs off to a file that is not slice 4.
+    let (ok, text) = run(
+        &[format!("mt -f /dev/nst0 fsf {}", photos.positions[3])],
+        &[],
+    );
+    assert!(
+        !ok || {
+            let (ok, _) = run(&slice_block, &slice(4));
+            !ok
+        },
+        "fsf of a file NUMBER from the middle of the tape does not reach that file: {text}"
+    );
 }
