@@ -3845,7 +3845,7 @@ job_extract() { # <job>
   fi
   local -a dar_opts=(-O -Q -N)
   [ "$OVERWRITE" = 0 ] || dar_opts+=(-w)
-  info "Extracting '$unit' to $destdir ..."
+  info "The slices are on disk; dar extracts '$unit' to $destdir ..."
   dar -x "$SCRATCH/job.$j/restore" -R "$(abs_dir "$destdir")" "${dar_opts[@]}" ${EXTRACT_G[@]+"${EXTRACT_G[@]}"} >"$WORK/extract.log" 2>&1 </dev/null || rc=$?
   rm -rf "$SCRATCH/job.$j"
   if [ -n "$gone" ] && [ "$rc" != 0 ] && [ "$rc" != 5 ]; then
