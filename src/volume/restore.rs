@@ -22,6 +22,7 @@ mod supply;
 mod tests_480;
 #[cfg(test)]
 use supply::FixedBay;
+pub use supply::Substitution;
 use supply::{Bay, DeviceBay, SliceSink, Supply};
 
 /// What a restore through `restore unit`'s one drive path is FOR — the whole
@@ -2110,7 +2111,7 @@ pub fn restore_file(
     block_size: usize,
     version: Option<i64>,
     options: &RestoreOptions,
-) -> Result<()> {
+) -> Result<RestoreReport> {
     // `dar -x -g` of the one entry into the restore's scratch directory, then
     // placed into `dest_dir`, inside the same recorded span
     // (`RestoreTarget::File`, issue #306) — through the one drive path
@@ -2132,8 +2133,7 @@ pub fn restore_file(
         block_size,
         version,
         false,
-    )?;
-    Ok(())
+    )
 }
 
 /// One unit of a multi-unit restore (issue #398).
@@ -2158,6 +2158,10 @@ pub struct UnitOutcome {
     /// `false`: never started — an earlier unit failed under `fail_fast`,
     /// or this is a dry run.
     pub attempted: bool,
+    /// Slices of this unit read from another copy (issue #480).
+    pub substitutions: Vec<supply::Substitution>,
+    /// Files of this unit filled from another copy of its version.
+    pub filled: Vec<(String, String)>,
 }
 
 /// What a multi-unit restore did, unit by unit, in tape order.
@@ -2413,6 +2417,8 @@ impl PlannedUnit {
             destination: self.dest_dir.clone(),
             error,
             attempted,
+            substitutions: Vec::new(),
+            filled: Vec::new(),
         }
     }
 }
@@ -2503,35 +2509,8 @@ fn plan_units(
 }
 
 /// [`restore_units`] minus the tape device: ONE contact, ONE corroboration
-/// of File 0, then each planned unit in turn over the same store, each with
-/// its own `restores` row, then ONE health reading.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn restore_units_from_store(
-    conn: &Connection,
-    paths: &TapectlPaths,
-    config: &Config,
-    volume_label: &str,
-    planned: &[PlannedUnit],
-    options: &RestoreOptions,
-    fail_fast: bool,
-    store: &mut dyn Store,
-    site: ContactSite<'_>,
-) -> Result<UnitsReport> {
-    restore_units_from_bay(
-        conn,
-        paths,
-        config,
-        volume_label,
-        planned,
-        options,
-        fail_fast,
-        &mut FixedBay(store),
-        site,
-    )
-}
-
-/// [`restore_units_from_store`] over a [`Bay`].
+/// of File 0, then each planned unit in turn over the same bay, each with its
+/// own `restores` row, then ONE health reading.
 #[allow(clippy::too_many_arguments)]
 fn restore_units_from_bay(
     conn: &Connection,
@@ -2570,7 +2549,7 @@ fn restore_units_from_bay(
     )
 }
 
-/// [`restore_units_from_store`] from the moment its contact is open (issue
+/// [`restore_units_from_bay`] from the moment its contact is open (issue
 /// #442): the one corroboration, each planned unit in turn, the contact's
 /// close, the one reading and the phase timings.
 #[allow(clippy::too_many_arguments)]
@@ -2602,6 +2581,7 @@ fn restore_units_in_contact(
         }
         let started_at = restore_record::now_sqlite();
         let mut trace = RestoreTrace::default();
+        let substitutions_before = supply.substitutions.len();
         let r = match &corroborated {
             // The wrong tape: every unit is refused for the same reason.
             Err(e) => Err(TapectlError::Other(e.to_string())),
@@ -2631,7 +2611,10 @@ fn restore_units_in_contact(
         if r.is_err() && fail_fast {
             stopped = true;
         }
-        units.push(p.outcome(r.err().map(|e| e.to_string()), true));
+        let mut outcome = p.outcome(r.err().map(|e| e.to_string()), true);
+        outcome.substitutions = supply.substitutions[substitutions_before..].to_vec();
+        outcome.filled = trace.filled.clone();
+        units.push(outcome);
     }
 
     let failed = units
@@ -5600,6 +5583,7 @@ mod tests {
                     None,
                     options,
                 )
+                .map(|_| ())
             }
 
             /// A refusal before contact: the drive never opened, and so no
@@ -6206,6 +6190,7 @@ mod tests {
                         None,
                         options,
                     )
+                    .map(|_| ())
                 }
 
                 /// Every archived file is in `dest`, byte for byte.

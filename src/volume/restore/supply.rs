@@ -204,8 +204,10 @@ impl<'c, 'a> Arrival<'c, 'a> {
 
 /// The restore handed one store and nothing else: the cartridge in it is the
 /// only one there will ever be.
+#[cfg(test)]
 pub(crate) struct FixedBay<'s>(pub &'s mut dyn Store);
 
+#[cfg(test)]
 impl Bay for FixedBay<'_> {
     fn store(&mut self) -> &mut dyn Store {
         self.0
@@ -413,8 +415,6 @@ impl<'a> SliceOut<'a> {
 pub(super) struct SliceRead {
     /// Plaintext bytes written that authenticated.
     pub authentic_bytes: u64,
-    /// The holes: plaintext byte ranges of the slice written as zeros.
-    pub holes: Vec<Range<u64>>,
     /// dar stopped reading before the slice was all delivered (a streamed
     /// restore whose archive a hole made unreadable): no later slice can
     /// be of use.
@@ -495,7 +495,7 @@ enum PresenceSite<'c, 'a> {
     /// The caller's: the restore's first cartridge.
     Given(ContactSite<'a>),
     /// Opened here, for a cartridge that was swapped in.
-    Arrived(Arrival<'c, 'a>),
+    Arrived(Box<Arrival<'c, 'a>>),
 }
 
 impl PresenceSite<'_, '_> {
@@ -686,11 +686,6 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         self.subject = subject.into();
     }
 
-    /// The store over the cartridge in the drive.
-    pub(crate) fn store(&mut self) -> &mut dyn Store {
-        self.bay.store()
-    }
-
     /// Whether a person can be asked to change the cartridge.
     pub(crate) fn attended(&self) -> bool {
         self.bay.attended()
@@ -725,11 +720,6 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         }
     }
 
-    /// The substitutions and the damage so far, for the restore's report.
-    pub(crate) fn tallies(&self) -> (Vec<Substitution>, Vec<Damage>) {
-        (self.substitutions.clone(), self.damage.clone())
-    }
-
     // ── reading a slice ───────────────────────────────────────────────
 
     /// Read slice `wp` into `sink`, from the cartridge in the drive or, if
@@ -748,7 +738,6 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 let hole_bytes: u64 = out.holes.iter().map(|h| h.end - h.start).sum();
                 Ok(SliceRead {
                     authentic_bytes: out.delivered - hole_bytes,
-                    holes: out.holes,
                     dar_gone: out.gone,
                 })
             }
@@ -1317,7 +1306,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             volume_id,
             label: label.to_string(),
             guard: Some(guard),
-            site: PresenceSite::Arrived(arrival),
+            site: PresenceSite::Arrived(Box::new(arrival)),
             notes: Vec::new(),
         };
         match identified {

@@ -402,6 +402,25 @@ impl Fixture {
         }
     }
 
+    /// Bind volume `label` to a cartridge with this sticker and chip serial,
+    /// as `volume init` does.
+    fn bind(&self, label: &str, barcode: &str, serial: &str) {
+        self.conn
+            .execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number, status)
+                 VALUES (?1, 'LTO-6', 2500000000000, ?2, 'in_use')",
+                params![barcode, serial],
+            )
+            .unwrap();
+        let cartridge_id = self.conn.last_insert_rowid();
+        self.conn
+            .execute(
+                "INSERT INTO cartridge_volumes (cartridge_id, volume_id) VALUES (?1, ?2)",
+                params![cartridge_id, self.volume_ids[label]],
+            )
+            .unwrap();
+    }
+
     /// Version `version` of the unit, with the same file list (checksums
     /// and all) — a different Version of the same unit.
     fn new_version(&self, version: i64) -> i64 {
@@ -727,7 +746,7 @@ fn without_a_terminal_the_restore_refuses_by_name_and_lists_the_holders() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("slice 3"), "{err}");
-    assert!(err.contains(&format!("\"unit-480\"")), "{err}");
+    assert!(err.contains("\"unit-480\""), "{err}");
     assert!(err.contains(B), "the holder is named: {err}");
     assert!(err.contains("swaps no cartridge"), "{err}");
     assert!(err.contains("--from L6-0002"), "{err}");
@@ -1272,4 +1291,138 @@ fn stopping_at_the_prompt_ends_the_restore_by_name() {
     let rows = crate::volume::restore_record::rows(&fx.conn).unwrap();
     assert_eq!(rows[0].outcome, "failed");
     assert!(!dest.path().join(SCRATCH_NAME).exists());
+}
+
+/// A quarantined volume (a verify proved its medium bad) is the last resort:
+/// an in-service copy is asked for first, and when the quarantined one is
+/// all there is it is asked for, said so.
+#[test]
+fn a_quarantined_copy_is_asked_for_last_and_said_to_be_the_last_resort() {
+    let mut fx = Fixture::new(&[A, B, C], tree());
+    let st = fx.stage(&tree(), "150k", false);
+    for label in [A, B, C] {
+        fx.write(&st, label);
+    }
+    fx.corrupt(A, &st, 3, 0);
+    fx.conn
+        .execute(
+            "UPDATE volumes SET observed_condition = 'quarantined' WHERE label = ?1",
+            params![B],
+        )
+        .unwrap();
+    // C (in service) is asked for, though B has the lower id.
+    let mut bay = fx.bay(A, true, &[Reply::Load(C)]);
+    let dest = TempDir::new().unwrap();
+    fx.restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap();
+    fx.assert_restored(dest.path());
+    assert_eq!(bay.asked_labels(), [C]);
+    assert!(!bay.asked[0].1.contains("last resort"), "{:?}", bay.asked);
+
+    // C damaged too: the quarantined B is all that is left, and the prompt says so.
+    fx.corrupt(C, &st, 3, 0);
+    let mut bay = fx.bay(A, true, &[Reply::Load(C), Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    fx.restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap();
+    fx.assert_restored(dest.path());
+    assert_eq!(bay.asked_labels(), [C, B]);
+    assert!(
+        bay.asked[1].1.contains("quarantined") && bay.asked[1].1.contains("last resort"),
+        "{:?}",
+        bay.asked
+    );
+}
+
+/// What the operator reads: the prompt, the lines `restore unit` prints after
+/// a repair, and the error of a restore that could not be made whole. Printed
+/// so the texts can be reviewed as the operator sees them (`--nocapture`), and
+/// pinned in the parts an operator acts on.
+#[test]
+fn what_the_operator_reads() {
+    use crate::cli::restore::repair_lines;
+
+    // A substitution.
+    let (mut fx, st) = two_copies(false);
+    fx.bind(B, "LTO6-0002", "HUM1234567");
+    fx.corrupt(A, &st, 3, 0);
+    let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    let report = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap();
+    assert!(
+        bay.asked[0]
+            .1
+            .contains("cartridge LTO6-0002, chip serial HUM1234567"),
+        "the prompt names the sticker and the chip: {:?}",
+        bay.asked
+    );
+    let mut out = String::new();
+    for line in bay.asked[0].1.split(" | ") {
+        out.push_str(&format!("{line}\n"));
+    }
+    out.push_str(&format!(
+        "restored \"{}\" v{} from {} ({} slices) to {}\n",
+        report.unit_name, report.version, report.volume_label, report.slices, report.destination
+    ));
+    for line in repair_lines(&report.substitutions, &report.filled) {
+        out.push_str(&format!("{line}\n"));
+    }
+    eprintln!("=== SUBSTITUTION ===\n{out}");
+    assert!(
+        out.contains("was read from L6-0002, another copy of it"),
+        "{out}"
+    );
+
+    // A salvage: one corrupted byte, the only copy.
+    let mut fx = Fixture::new(&[A], tree());
+    let st = fx.stage(&tree(), "150k", false);
+    fx.write(&st, A);
+    fx.corrupt(A, &st, 2, 1);
+    let mut mem = clone_mem(&fx.mems[A]);
+    let dest = TempDir::new().unwrap();
+    let dest_str = dest.path().to_string_lossy().into_owned();
+    let err = restore_unit_from_store(
+        &fx.conn,
+        &fx.paths,
+        &Config::default(),
+        &fx.unit,
+        A,
+        1,
+        RestoreTarget::Unit {
+            dest_dir: &dest_str,
+        },
+        &RestoreOptions::default(),
+        &mut mem,
+        site(),
+    )
+    .unwrap_err()
+    .to_string();
+    eprintln!("=== SALVAGE ===\n{err}\n");
+
+    // A fill.
+    let (mut fx, one, _two) = two_stagings(true);
+    fx.corrupt(A, &one, 3, 1);
+    let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+    let dest = TempDir::new().unwrap();
+    let report = fx
+        .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+        .unwrap();
+    let mut out = String::new();
+    for line in bay.asked[0].1.split(" | ") {
+        out.push_str(&format!("{line}\n"));
+    }
+    out.push_str(&format!(
+        "restored \"{}\" v{} from {} ({} slices) to {}\n",
+        report.unit_name, report.version, report.volume_label, report.slices, report.destination
+    ));
+    for line in repair_lines(&report.substitutions, &report.filled) {
+        out.push_str(&format!("{line}\n"));
+    }
+    eprintln!("=== FILL ===\n{out}");
+    assert!(
+        out.contains("were filled from another copy of this version"),
+        "{out}"
+    );
 }

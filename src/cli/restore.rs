@@ -278,6 +278,8 @@ pub fn run(
                         "slices": report.slices,
                         "destination": report.destination,
                         "dry_run": report.dry_run,
+                        "substitutions": substitutions_json(&report.substitutions),
+                        "filled": filled_json(&report.filled),
                     })
                 );
             } else if report.dry_run {
@@ -298,6 +300,9 @@ pub fn run(
                     report.slices,
                     report.destination,
                 );
+                for line in repair_lines(&report.substitutions, &report.filled) {
+                    println!("{line}");
+                }
             }
         }
 
@@ -336,47 +341,52 @@ pub fn run(
             };
             // Issue #435: no `--from` restores from the loaded tape; the
             // volume is then the one File 0 named.
-            let from: String = match from {
-                Some(from) => {
-                    volume::restore::restore_file(
-                        conn,
-                        paths,
-                        config,
-                        unit,
-                        file,
-                        from,
-                        to,
-                        &device,
-                        DEFAULT_BLOCK_SIZE,
-                        *version,
-                        &options,
-                    )?;
-                    from.clone()
-                }
-                None => {
-                    volume::restore::restore_file_from_loaded(
-                        conn,
-                        paths,
-                        config,
-                        unit,
-                        file,
-                        to,
-                        &device,
-                        DEFAULT_BLOCK_SIZE,
-                        *version,
-                        &options,
-                    )?
-                    .volume_label
-                }
+            let report = match from {
+                Some(from) => volume::restore::restore_file(
+                    conn,
+                    paths,
+                    config,
+                    unit,
+                    file,
+                    from,
+                    to,
+                    &device,
+                    DEFAULT_BLOCK_SIZE,
+                    *version,
+                    &options,
+                )?,
+                None => volume::restore::restore_file_from_loaded(
+                    conn,
+                    paths,
+                    config,
+                    unit,
+                    file,
+                    to,
+                    &device,
+                    DEFAULT_BLOCK_SIZE,
+                    *version,
+                    &options,
+                )?,
             };
+            let from = report.volume_label.clone();
 
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"file": file, "unit": unit, "volume": from, "destination": to})
+                    serde_json::json!({
+                        "file": file,
+                        "unit": unit,
+                        "volume": from,
+                        "destination": to,
+                        "substitutions": substitutions_json(&report.substitutions),
+                        "filled": filled_json(&report.filled),
+                    })
                 );
             } else {
                 println!("restored \"{file}\" from \"{unit}\" on {from} to {to}");
+                for line in repair_lines(&report.substitutions, &report.filled) {
+                    println!("{line}");
+                }
             }
         }
 
@@ -585,6 +595,54 @@ pub fn run(
     Ok(())
 }
 
+/// What was repaired on the way, one line each: slices read from another
+/// copy (ADR-0012 item 101) and files filled from another stage set of the
+/// same version (item 102).
+pub(crate) fn repair_lines(
+    substitutions: &[volume::restore::Substitution],
+    filled: &[(String, String)],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for s in substitutions {
+        lines.push(format!(
+            "  slice {} was damaged on {} ({}) and was read from {}, another copy of it",
+            s.slice_number, s.damaged_on, s.reason, s.supplied_by
+        ));
+    }
+    if !filled.is_empty() {
+        lines.push(format!(
+            "  {} file(s) came back damaged or missing and were filled from another copy of \
+             this version, each checked against its recorded checksum:",
+            filled.len()
+        ));
+        for (path, from) in filled {
+            lines.push(format!("    {path} (from {from})"));
+        }
+    }
+    lines
+}
+
+fn substitutions_json(substitutions: &[volume::restore::Substitution]) -> serde_json::Value {
+    substitutions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "slice": s.slice_number,
+                "read_from": s.supplied_by,
+                "damaged_on": s.damaged_on,
+                "reason": s.reason,
+            })
+        })
+        .collect()
+}
+
+fn filled_json(filled: &[(String, String)]) -> serde_json::Value {
+    filled
+        .iter()
+        .map(|(path, from)| serde_json::json!({"path": path, "from": from}))
+        .collect()
+}
+
 /// The refusal for `--dry-run` with no volume named (issue #435): a dry run
 /// opens no drive, and without a label the volume is whatever File 0 on the
 /// loaded tape says.
@@ -612,6 +670,7 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
             (Some(e), _, false) => format!("FAILED {what}: {e}"),
             (None, false, false) => format!("not attempted {what} (--fail-fast)"),
         });
+        lines.extend(repair_lines(&u.substitutions, &u.filled));
     }
     let total = report.units.len();
     lines.push(if report.dry_run {
@@ -651,6 +710,8 @@ fn units_report_json(report: &volume::restore::UnitsReport) -> serde_json::Value
                 "destination": u.destination,
                 "outcome": outcome,
                 "error": u.error,
+                "substitutions": substitutions_json(&u.substitutions),
+                "filled": filled_json(&u.filled),
             })
         })
         .collect();

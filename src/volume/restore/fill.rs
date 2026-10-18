@@ -513,7 +513,7 @@ fn fill_from(
                 lost.remove(path);
                 notes
                     .filled
-                    .push((path.clone(), format!("{} ({how})", holder.label)));
+                    .push((path.clone(), format!("{}, {how}", holder.label)));
             }
             Err(why) => {
                 warn!(file = %path, stage_set = copy.stage_set_id, volume = %holder.label, "{why}");
@@ -607,11 +607,24 @@ fn incomplete(
     )];
     for h in &ex.holes {
         let bytes: u64 = h.holes.iter().map(|r| r.end - r.start).sum();
+        let ranges: Vec<String> = h
+            .holes
+            .iter()
+            .take(8)
+            .map(|r| format!("{}..{}", r.start, r.end))
+            .collect();
         lines.push(format!(
-            "  slice {} on {}: {} damaged chunk range(s), {bytes} byte(s) written as zeros — {}",
+            "  slice {} on {}: {} hole(s) of zeros, {bytes} byte(s) in all, at plaintext byte(s) \
+             {}{} — {}",
             h.slice_number,
             h.volume,
             h.holes.len(),
+            ranges.join(", "),
+            if h.holes.len() > ranges.len() {
+                ", ..."
+            } else {
+                ""
+            },
             h.reason
         ));
     }
