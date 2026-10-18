@@ -17387,7 +17387,11 @@ mod tests {
                 ("restore.rs", include_str!("restore.rs")),
                 ("rebuild.rs", include_str!("rebuild.rs")),
             ];
-            let mut total = 0;
+            // The restore supply has no test module of its own to split off.
+            let supply = include_str!("restore/supply.rs");
+            let mut total = supply
+                .matches("health_after_read_contact(conn, site,")
+                .count();
             for (file, src) in corpus {
                 let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
                 assert!(prod.len() < src.len(), "positive control: {file} split");
@@ -17401,12 +17405,14 @@ mod tests {
                         .count();
             }
             assert_eq!(
-                total, 8,
-                "seven read seams — restore unit, restore of several units (#398), restore \
-                 raw-volume, catalog rebuild, volume identify, read-slices, compact-read — one \
-                 call each, and an eighth: the closer of a no-label restore's contact refused \
-                 before it reached its seam (#442), which a contact never takes along with its \
-                 seam's"
+                total, 7,
+                "six read seams — restore raw-volume, catalog rebuild, volume identify, \
+                 read-slices, compact-read, and the restore supply's closing of a cartridge's \
+                 contact (issue #480: restore unit, restore of several units (#398) and every \
+                 cartridge swapped in mid-restore close their contacts through the one \
+                 `Presence::close`, which was two call sites, one per tail) — one call each, \
+                 and a seventh: the closer of a no-label restore's contact refused before it \
+                 reached its seam (#442), which a contact never takes along with its seam's"
             );
             let write = corpus[0].1.split("#[cfg(test)]\nmod tests").next().unwrap();
             for f in [
@@ -17985,9 +17991,13 @@ mod tests {
         /// that the scan found all eight.
         #[test]
         fn every_read_path_holds_both_reads_for_its_contact() {
-            let files: [(&str, &str); 6] = [
+            let files: [(&str, &str); 7] = [
                 ("volume/write.rs", include_str!("write.rs")),
                 ("volume/restore.rs", include_str!("restore.rs")),
+                (
+                    "volume/restore/supply.rs",
+                    include_str!("restore/supply.rs"),
+                ),
                 ("volume/rebuild.rs", include_str!("rebuild.rs")),
                 ("cli/volume.rs", include_str!("../cli/volume.rs")),
                 ("cli/restore.rs", include_str!("../cli/restore.rs")),
@@ -18016,15 +18026,17 @@ mod tests {
                 with_reads += src.matches("with_mam_reads(").count();
             }
             assert_eq!(
-                checks, 11,
-                "verify, restore unit, restore of several units (#398), catalog rebuild, \
-                 restore raw-volume, identify, read-slices, compact-read, compact — and the \
-                 two that name no volume (#435): verify of the loaded tape and the one drive \
-                 helper behind restore unit, file and volume of the loaded tape"
+                checks, 9,
+                "verify, catalog rebuild, restore raw-volume, identify, read-slices, \
+                 compact-read, compact — the one for verify of the loaded tape (#435) — and the \
+                 restore supply's `DeviceBay::load` (issue #480), the ONE drive-opening behind \
+                 restore unit, file and volume, named or loaded, and behind every cartridge \
+                 swapped in mid-restore (it was three: restore unit, restore of several \
+                 units, and the loaded-tape helper)"
             );
             assert_eq!(
-                with_reads, 11,
-                "each of the eleven hands its holder to its contact"
+                with_reads, 9,
+                "each of the nine hands its holder to its contact"
             );
         }
 
@@ -18213,11 +18225,11 @@ mod tests {
             // Positive control on the walk: it found every read path the
             // count test names, in the files they live in.
             assert_eq!(
-                reads, 11,
-                "verify, restore unit, restore of several units (#398), catalog rebuild, \
-                 restore raw-volume, identify, read-slices, compact-read, compact — and the \
-                 two that name no volume (#435): verify of the loaded tape and the one drive \
-                 helper behind restore unit, file and volume of the loaded tape — found in \
+                reads, 9,
+                "verify, catalog rebuild, restore raw-volume, identify, read-slices, \
+                 compact-read, compact — verify of the loaded tape (#435) — and the restore \
+                 supply's one `DeviceBay::load` behind restore unit, file and volume, named \
+                 or loaded, and every cartridge swapped in mid-restore (#480) — found in \
                  {files:?}"
             );
             assert_eq!(
@@ -18231,7 +18243,7 @@ mod tests {
                     "cli/catalog.rs",
                     "cli/restore.rs",
                     "cli/volume.rs",
-                    "volume/restore.rs",
+                    "volume/restore/supply.rs",
                     "volume/write.rs"
                 ]
             );

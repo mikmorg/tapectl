@@ -39,11 +39,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 
 use super::supply::{Changed, Damage, SliceSink, Supply};
 use super::*;
 use crate::db::files::FileKind;
+use crate::pass_count::Sha256;
 use crate::volume::slice_holders::{self, StageCopy, StageHolder, Standing};
 
 /// What the extract left, handed to [`finish`] with the scratch directory

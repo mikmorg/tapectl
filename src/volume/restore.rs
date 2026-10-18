@@ -19,8 +19,6 @@ use crate::volume::restore_record::{self, RestoreRecord};
 mod fill;
 mod supply;
 #[cfg(test)]
-mod tests_480;
-#[cfg(test)]
 use supply::FixedBay;
 pub use supply::Substitution;
 use supply::{Bay, DeviceBay, SliceSink, Supply};
@@ -7615,3 +7613,8 @@ mod tests {
         }
     }
 }
+
+// Declared last: the source-scan tests split this file at its first `#[cfg(test)]
+// mod`, and the production code must all lie before it.
+#[cfg(test)]
+mod repair_tests;
