@@ -2785,7 +2785,10 @@ die_slice_keys() { # <slice number>
        slices: the envelope is sealed when the volume is written, each slice
        when it was staged, so a key rotation between the two puts them on
        different key generations. Supply the older key as well — repeat
-       --key once per key."
+       --key once per key.
+       If this is the right key, the slice itself may be damaged (a damaged
+       header reads this way too): --verify checks it without a key, and
+       --slices-from DIR or --swap-tapes take it from another copy."
 }
 
 # Every --key as age identities. A slice is decrypted ONCE, with all of them:
@@ -2948,7 +2951,12 @@ stream_unit() { # <slices file: num|pos|size|sha per line> <destination> [catalo
       die_io "reading tape file $tpos failed" "$WORK/dd.err" "$WORK"
     fi
     if [ "${st[3]:-1}" != 0 ]; then
-      if ! kill -0 "$DAR_PID" 2>/dev/null; then
+      # age's own complaint about the slice (a damaged chunk, a header no key
+      # opens) is what the heir needs to read, even when dar, seeing the slice
+      # cut short, has already died of it. Only an age that failed to WRITE
+      # (dar gone first) hands the word to dar.
+      if ! grep -E 'decrypt|authenticat|no identity matched|header|MAC' "$WORK/age.err" >/dev/null 2>&1 &&
+        ! kill -0 "$DAR_PID" 2>/dev/null; then
         die_dar "$destdir"
         return 0
       fi
@@ -3992,8 +4000,8 @@ swap_loop() {
     info "Load a cartridge that holds copies of these slices into $DEVICE (any tape whose front index lists"
     info "the sha256 values above; it need not be a copy of the whole tape), wait until the drive is ready,"
     info "then press ENTER. Type done and ENTER (or end the input) to go on without them."
-    reply=done
-    IFS= read -r reply || reply=done
+    reply=quit
+    IFS= read -r reply || reply=quit
     case "$reply" in
     [dD]one | DONE | q | quit)
       info "Going on without them."
@@ -4086,7 +4094,7 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
   if [ "$listdir" = "$todir" ]; then
     root=$todir
   else
-    sub=$(cd "$todir/$unit" 2>/dev/null && pwd -P || true)
+    sub=$(cd "$todir/$unit" 2>/dev/null && pwd -P) || sub=""
     if [ -n "$sub" ] && [ "$listdir" = "$sub" ]; then
       root=$sub
     fi

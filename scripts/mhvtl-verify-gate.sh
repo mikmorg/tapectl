@@ -5,7 +5,9 @@
 #   1. tapectl round trip: init → tenants → units → snapshot → stage →
 #      volume init/write/verify → restore → diff -r
 #   2. Heir leg (no tapectl, no DB): dd RESTORE.sh off the tape and run
-#      --info / --find-envelope / --restore with a tenant key
+#      --info / --find-envelope / --restore with a tenant key; since 1.3.0
+#      also --where and --find (the cross-volume index) and a --restore that
+#      takes a bad slice from a second cartridge (--slices-from, #480)
 #   3. Negative leg: cross-tenant decrypt must fail; raw media must not
 #      contain plaintext canaries
 #   4. Evidence leg: verify must leave a verification_sessions row (ADR-0001)
@@ -20,7 +22,8 @@
 #      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
 #      real one.
 #
-# The `check` lines below are the list (43 since #444; #400 is not exercisable on mhvtl, see its
+# The `check` lines below are the list (46 since #480: heir_where, heir_find and
+# heir_slice_from_copy join the 43 of #444; #400 is not exercisable on mhvtl, see its
 # section). The verdict judges each by NAME against the manifest, never by a total (#471).
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
@@ -729,6 +732,215 @@ check heir_info           step_heir_info
 check heir_find_envelope  step_heir_find
 check heir_restore        step_heir_restore
 check heir_restore_symlink_unit step_heir_restore_symlinks
+
+# ---------- heir_where, heir_find, heir_slice_from_copy (1.3.0; ADR-0012 items 78-81 and 101; #418, #480) ----------
+#
+# The tape tapectl wrote carries the cross-volume index in its envelopes
+# (volume-format-v2 1.5), and the RESTORE.sh on that tape reads it with the real
+# age, with no tapectl and no database. The unit, the version and the path the
+# first two legs expect come from the CATALOG and the source tree, never from the
+# script's own output, so a script that printed a fixed answer would fail.
+#
+# The third leg is item 101 on real media: the SAME staged unit written to a
+# second cartridge (a real tapectl copy, whose slices are byte for byte the first
+# tape's), one slice of the first tape bad when it is read, and RESTORE.sh
+# --slices-from a directory of slice files dd-copied off the second cartridge.
+# "Bad when it is read": a tape cannot be edited in the middle, so a dd stand-in
+# first on PATH flips one byte of that one tape file as RESTORE.sh reads it.
+# Everything else (mt, the drive, age, dar, tar, sha256sum) is the real thing.
+# The functions below are pure text work, and tests/heir_restore_sh.rs extracts
+# them from this file and runs them on RESTORE.sh's real output.
+
+# The tape files of one type in RESTORE.sh --info's file map, which prints
+# "  12  data_slice  1234 bytes  abcd..."; the --info text is on stdin.
+heir_positions_of_type() { # heir_positions_of_type <type>
+    awk -v t="$1" '$2 == t && $1 ~ /^[0-9]+$/ { print $1 }'
+}
+# The tape file of every slice of one unit, in order, from the MANIFEST.toml that
+# --find-envelope prints (on stdin).
+heir_slice_positions() { # heir_slice_positions <unit>
+    awk -v want="$1" '
+        /^\[\[units\]\]/ { head = 1; hit = 0; next }
+        /^\[\[units\.slices\]\]/ { head = 0; next }
+        /^\[/ { head = 0 }
+        head && /^name = / { v = $3; gsub(/"/, "", v); hit = (v == want) }
+        hit && /^tape_position = / { print $3 }
+    '
+}
+# The newest snapshot version the CATALOG holds for a unit.
+heir_unit_version() { # heir_unit_version <unit>
+    python3 - "$HOME_DIR/tapectl.db" "$1" <<'PY'
+import sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT MAX(s.version) FROM snapshots s JOIN units u ON u.id = s.unit_id WHERE u.name = ?",
+    (sys.argv[2],)).fetchone()
+assert row is not None and row[0] is not None, f"no snapshot of {sys.argv[2]} in the catalog"
+print(row[0])
+PY
+}
+# The dd stand-in. It reads through the real dd (REAL_DD) and flips one byte of
+# the tape file at FAULT_POS, found by asking the drive (REAL_MT status) which
+# file the head is at when dd starts; every other read is untouched. Each flip is
+# logged to FAULT_LOG, so a run can show the fault really happened. It handles dd
+# writing to a file (of=) and to a pipe.
+heir_write_injector() { # heir_write_injector <path of the dd to write>
+    cat >"$1" <<'INJECT'
+#!/bin/sh
+pos=$("$REAL_MT" -f "$TAPE_DEVICE" status 2>/dev/null | sed -n 's/.*[Ff]ile number *= *\([0-9-]*\).*/\1/p' | head -n 1)
+if [ "$pos" = "$FAULT_POS" ]; then
+    of=
+    for a in "$@"; do
+        case "$a" in of=*) of=${a#of=} ;; esac
+    done
+    if [ -n "$of" ]; then
+        "$REAL_DD" "$@" || exit $?
+        python3 -c 'import sys
+p = sys.argv[1]
+b = bytearray(open(p, "rb").read())
+b[min(len(b) - 1, 100000)] ^= 0xff
+open(p, "wb").write(b)' "$of"
+    else
+        "$REAL_DD" "$@" | python3 -c 'import sys
+b = bytearray(sys.stdin.buffer.read())
+b[min(len(b) - 1, 100000)] ^= 0xff
+sys.stdout.buffer.write(b)'
+    fi
+    echo "flipped one byte of tape file $pos" >>"$FAULT_LOG"
+    exit 0
+fi
+exec "$REAL_DD" "$@"
+INJECT
+    chmod +x "$1"
+}
+
+step_heir_where() {
+    local ver out rc needle key="$HOME_DIR/keys/alice-primary.age.key"
+    ver="$(heir_unit_version unitA)" || return 1
+    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --where unitA --key "$key" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    [ "$rc" -eq 0 ] || { echo "heir_where: RESTORE.sh --where unitA exited $rc, want 0"; return 1; }
+    for needle in "Unit unitA (tenant alice):" "  Version $ver: " "    tape $LABEL  (this tape)"; do
+        grep -F -- "$needle" >/dev/null <<<"$out" || { echo "heir_where: the output lacks \"$needle\""; return 1; }
+    done
+    # The same index asked about a unit it does not hold: exit 1, and it names the
+    # units it does hold. This is the control for the lines above, which prove the
+    # search finds a unit; this proves it is a search and not a fixed answer.
+    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --where no-such-unit --key "$key" 2>&1)"; rc=$?
+    [ "$rc" -eq 1 ] || { printf '%s\n' "$out"; echo "heir_where: an unknown unit exited $rc, want 1"; return 1; }
+    grep -F -- "unitA" >/dev/null <<<"$out" || { printf '%s\n' "$out"; echo "heir_where: the unknown-unit answer does not list the units the index holds"; return 1; }
+}
+step_heir_find_path() {
+    local ver size out rc needle key="$HOME_DIR/keys/alice-primary.age.key"
+    ver="$(heir_unit_version unitA)" || return 1
+    size=$(( $(wc -c <"$SRC/unitA/plain.txt") ))
+    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find plain.txt --key "$key" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    [ "$rc" -eq 0 ] || { echo "heir_find: RESTORE.sh --find plain.txt exited $rc, want 0"; return 1; }
+    for needle in "  unitA  v$ver  f  $size bytes  plain.txt" "    tape $LABEL  (this tape)"; do
+        grep -F -- "$needle" >/dev/null <<<"$out" || { echo "heir_find: the output lacks \"$needle\""; return 1; }
+    done
+    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find no-such-path-anywhere --key "$key" 2>&1)"; rc=$?
+    [ "$rc" -eq 1 ] || { printf '%s\n' "$out"; echo "heir_find: a path nothing holds exited $rc, want 1"; return 1; }
+}
+
+# The first cartridge back in the drive: a no-op when it is there already.
+heir_reload_first() { # heir_reload_first <the storage slot the first cartridge came from>
+    local status loaded
+    status="$(mtx -f "$CHG_SG" status)" || return 1
+    if grep -F "Data Transfer Element $DTE:Full (Storage Element $1 Loaded)" >/dev/null <<<"$status"; then
+        return 0
+    fi
+    loaded="$(sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p" <<<"$status")"
+    if [ -n "$loaded" ]; then
+        mtx -f "$CHG_SG" unload "$loaded" "$DTE" || return 1
+    fi
+    mtx -f "$CHG_SG" load "$1" "$DTE" || return 1
+    mt -f "$TAPE_DEV" rewind >/dev/null 2>&1 || true
+}
+# A real second copy: another cartridge, the same staged sets (--keep-staging, or
+# the write would release the staging that leg 4 writes from), and its data slices
+# dd-copied into a directory under names that say nothing about which slice is which.
+heir_second_copy() { # heir_second_copy <work dir> <label> <slot of the second cartridge> <slot of the first>
+    local w="$1" label="$2" b_slot="$3" a_slot="$4" info pos n cur=0
+    mtx -f "$CHG_SG" unload "$a_slot" "$DTE" || { echo "cannot take the first cartridge out to slot $a_slot"; return 1; }
+    mtx -f "$CHG_SG" load "$b_slot" "$DTE" || { echo "cannot load slot $b_slot"; return 1; }
+    if ! { mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase; }; then
+        echo "cannot erase the second cartridge"; return 1
+    fi
+    TCTL volume init "$label" --device "$TAPE_DEV" || return 1
+    TCTL volume write "$label" --device "$TAPE_DEV" --yes --keep-staging || return 1
+    # The copy's own RESTORE.sh (File 2 of the second cartridge) reads its file map.
+    if ! { mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
+        && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$w/RESTORE-copy.sh" \
+        && chmod +x "$w/RESTORE-copy.sh"; }; then
+        echo "cannot read RESTORE.sh off the second cartridge"; return 1
+    fi
+    info="$(TAPE_DEVICE="$TAPE_DEV" "$w/RESTORE-copy.sh" --info 2>&1)" || { printf '%s\n' "$info"; return 1; }
+    grep -F "Verdict: SEALED" >/dev/null <<<"$info" || { printf '%s\n' "$info"; echo "the second copy is not SEALED"; return 1; }
+    mt -f "$TAPE_DEV" rewind || return 1
+    for pos in $(heir_positions_of_type data_slice <<<"$info"); do
+        if [ "$pos" -gt "$cur" ]; then
+            mt -f "$TAPE_DEV" fsf $((pos - cur)) || { echo "cannot space to tape file $pos"; return 1; }
+        fi
+        dd if="$TAPE_DEV" of="$w/copies/tape-file-$pos" bs=512k 2>/dev/null || { echo "reading tape file $pos of the copy failed"; return 1; }
+        cur=$((pos + 1))
+    done
+    n=$(find "$w/copies" -type f | wc -l)
+    [ "$n" -gt 0 ] || { echo "the second copy has no data slice"; return 1; }
+    echo "second copy $label: $n slice file(s) copied off it"
+}
+step_heir_slice_from_copy() {
+    local w="$RUN/slice-copy" key="$HOME_DIR/keys/bob-primary.age.key" clabel="MHVTLC2"
+    local status a_slot b_slot manifest bad rc=0 out real_dd real_mt cleanup_rc=0
+    rm -rf "$w"; mkdir -p "$w/copies" "$w/inject"
+    status="$(mtx -f "$CHG_SG" status)" || { echo "mtx status failed"; return 1; }
+    a_slot="$(sed -n "s/.*Data Transfer Element $DTE:Full (Storage Element \([0-9]*\) Loaded).*/\1/p" <<<"$status")"
+    [ -n "$a_slot" ] || { echo "no cartridge in DTE $DTE"; return 1; }
+    b_slot="$(grep -E "Storage Element [0-9]+:Full" <<<"$status" | grep "VolumeTag=[EF][0-9]*$GEN" | head -n 1 | sed -n 's/.*Storage Element \([0-9]*\):Full.*/\1/p')"
+    [ -n "$b_slot" ] || { echo "no second $GEN cartridge in the library: this leg needs two"; return 1; }
+    # unitB is twelve 1 MiB slices on the first tape; the third is the one that goes bad.
+    manifest="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --find-envelope --key "$key" 2>&1)" \
+        || { printf '%s\n' "$manifest"; echo "RESTORE.sh --find-envelope failed on the first cartridge"; return 1; }
+    bad="$(heir_slice_positions unitB <<<"$manifest" | sed -n 3p)"
+    [ -n "$bad" ] || { printf '%s\n' "$manifest"; echo "unitB has fewer than 3 slices on the first tape: nothing to corrupt"; return 1; }
+    echo "first cartridge in slot $a_slot; second in slot $b_slot; tape file $bad is the slice that goes bad"
+
+    heir_second_copy "$w" "$clabel" "$b_slot" "$a_slot" || rc=$?
+    # Whatever happened, the first cartridge goes back into the drive, and the
+    # copy stops being a live copy: leg 4 asserts that its volumes hold the ONLY
+    # copy of unitA/unitB, which a second sealed volume would falsify.
+    heir_reload_first "$a_slot" || { echo "cannot put the first cartridge back in the drive"; return 1; }
+    if TCTL volume retire "$clabel" --yes; then :; else cleanup_rc=$?; echo "volume retire $clabel exited $cleanup_rc"; fi
+    [ "$rc" -eq 0 ] || return 1
+
+    real_dd="$(command -v dd)"
+    real_mt="$(command -v mt-st || command -v mt)"
+    heir_write_injector "$w/inject/dd"
+    # The control: slice $bad bad and no copy offered. The restore must fail and say
+    # what would help; it also proves the stand-in flips what it claims to.
+    : >"$w/fault.log"
+    out="$(cd "$HEIR" && env "PATH=$w/inject:$PATH" "REAL_DD=$real_dd" "REAL_MT=$real_mt" "FAULT_POS=$bad" \
+        "FAULT_LOG=$w/fault.log" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh --restore --unit unitB --key "$key" --to "$w/no-copy" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 12
+    [ -s "$w/fault.log" ] || { echo "control: the stand-in never flipped a byte, so the run proves nothing"; return 1; }
+    [ "$rc" -ne 0 ] || { echo "control: the restore SUCCEEDED with tape file $bad corrupted"; return 1; }
+    grep -F -- "--slices-from DIR" >/dev/null <<<"$out" || { echo "control: the failure does not name --slices-from"; return 1; }
+    # The leg: the same bad slice, the slices of the second cartridge offered.
+    : >"$w/fault.log"
+    out="$(cd "$HEIR" && env "PATH=$w/inject:$PATH" "REAL_DD=$real_dd" "REAL_MT=$real_mt" "FAULT_POS=$bad" \
+        "FAULT_LOG=$w/fault.log" "TAPE_DEVICE=$TAPE_DEV" ./RESTORE.sh --restore --unit unitB --key "$key" --to "$w/recovered" \
+        --slices-from "$w/copies" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | tail -n 25
+    [ -s "$w/fault.log" ] || { echo "the stand-in never flipped a byte, so the run proves nothing"; return 1; }
+    [ "$rc" -eq 0 ] || { echo "RESTORE.sh --slices-from exited $rc, want 0"; return 1; }
+    grep -F "RESTORE COMPLETE" >/dev/null <<<"$out" || { echo "no RESTORE COMPLETE"; return 1; }
+    grep -F "taking slice 3 from $w/copies/tape-file-" >/dev/null <<<"$out" || { echo "slice 3 was not taken from the copy"; return 1; }
+    diff -r "$SRC/unitB" "$w/recovered" || return 1
+    [ "$cleanup_rc" -eq 0 ] || return 1
+}
+check heir_where          step_heir_where
+check heir_find           step_heir_find_path
+check heir_slice_from_copy step_heir_slice_from_copy
 
 # ---------- leg 4: interrupt + resume (issue #93) ----------
 #

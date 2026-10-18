@@ -5461,3 +5461,296 @@ fn file_1_gap_spacing_reaches_the_slice_it_names() {
         "fsf of a file NUMBER from the middle of the tape does not reach that file: {text}"
     );
 }
+
+// ---- the gate's helpers for heir_where, heir_find and heir_slice_from_copy ----
+//
+// scripts/mhvtl-verify-gate.sh needs mhvtl and cannot run here, so the text work
+// its three new legs rest on is extracted from the script by name and run on
+// this harness's tape: the readers of RESTORE.sh's own output, and the dd
+// stand-in that flips one byte of one tape file as it is read.
+
+/// The host's python3 (the gate needs it too), for a stub on the harness PATH.
+fn python3_path() -> String {
+    host_tool("python3")
+        .expect("python3 must be on PATH")
+        .display()
+        .to_string()
+}
+
+/// The text of the shell function `name` in the gate script: from `name() {` to
+/// the first line that is just `}`.
+fn gate_function(name: &str) -> String {
+    let gate = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/mhvtl-verify-gate.sh"),
+    )
+    .expect("the gate script");
+    let start = gate
+        .find(&format!("\n{name}() {{"))
+        .unwrap_or_else(|| panic!("the gate has no function {name}"))
+        + 1;
+    let rest = &gate[start..];
+    let end = rest.find("\n}\n").expect("the function ends") + 3;
+    rest[..end].to_string()
+}
+
+/// Run `snippet` in bash with the gate's functions `names` defined, `stdin`
+/// on its standard input.
+fn run_gate_snippet(
+    names: &[&str],
+    snippet: &str,
+    stdin: &str,
+    env: &[(&str, &str)],
+) -> (i32, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut script = String::new();
+    for n in names {
+        script.push_str(&gate_function(n));
+    }
+    script.push_str(snippet);
+    let mut cmd = Command::new("bash");
+    cmd.args(["-c", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    (
+        o.status.code().unwrap_or(-1),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+    )
+}
+
+#[test]
+fn the_gates_readers_find_the_slices_in_restore_shs_real_output() {
+    let h = Heir::new();
+    let (code, info) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{info}");
+    let (code, found) = h.run(&["--find-envelope", "--key", &h.key("bob")]);
+    assert_eq!(code, 0, "{found}");
+
+    let (code, out) = run_gate_snippet(
+        &["heir_positions_of_type"],
+        "heir_positions_of_type data_slice",
+        &info,
+        &[],
+    );
+    assert_eq!(code, 0, "{out}");
+    let got: Vec<i64> = out.split_whitespace().map(|p| p.parse().unwrap()).collect();
+    let mut want: Vec<i64> = template()
+        .units
+        .iter()
+        .flat_map(|u| u.positions.clone())
+        .collect();
+    want.sort();
+    assert!(want.len() >= 10, "positive control: many slices");
+    assert_eq!(
+        got, want,
+        "every data slice of the file map, and nothing else:\n{info}"
+    );
+    let (_, out) = run_gate_snippet(
+        &["heir_positions_of_type"],
+        "heir_positions_of_type no_such_type",
+        &info,
+        &[],
+    );
+    assert_eq!(out.trim(), "", "a type the map lacks yields nothing");
+
+    let ledgers = unit("ledgers");
+    let (code, out) = run_gate_snippet(
+        &["heir_slice_positions"],
+        "heir_slice_positions ledgers",
+        &found,
+        &[],
+    );
+    assert_eq!(code, 0, "{out}");
+    let got: Vec<i64> = out.split_whitespace().map(|p| p.parse().unwrap()).collect();
+    assert_eq!(
+        got, ledgers.positions,
+        "ledgers' slices, in order:\n{found}"
+    );
+    let (_, out) = run_gate_snippet(
+        &["heir_slice_positions"],
+        "heir_slice_positions unit-not-there",
+        &found,
+        &[],
+    );
+    assert_eq!(out.trim(), "", "another unit's slices are not listed");
+}
+
+/// The stand-in flips a byte of the tape file at FAULT_POS as it is read, and
+/// of no other, whether dd writes to a file or to a pipe; it logs each flip.
+#[test]
+fn the_gates_dd_stand_in_flips_one_tape_file_and_no_other() {
+    let h = Heir::with_stubs(&[(
+        "python3",
+        &format!("#!/bin/sh\nexec {} \"$@\"\n", python3_path()),
+    )]);
+    let photos = unit("photos/2019");
+    let inject = h.dir.join("inject");
+    std::fs::create_dir_all(&inject).unwrap();
+    let (code, out) = run_gate_snippet(
+        &["heir_write_injector"],
+        &format!("heir_write_injector {}/dd", inject.display()),
+        "",
+        &[],
+    );
+    assert_eq!(code, 0, "{out}");
+    let bad = photos.positions[1];
+    let log = h.dir.join("fault.log");
+    let real_dd = h.dir.join("bin/dd");
+    let real_mt = h.dir.join("bin/mt-st");
+    // Files 0, 1, ... read in turn through the stand-in, as RESTORE.sh does.
+    let read = |pos: i64, to_file: bool| -> Vec<u8> {
+        let probe = format!(
+            "export PATH={}:{}\n\
+             {}\n\
+             mt -f /dev/nst-fake rewind\n\
+             {}\
+             if [ {to_file} = true ]; then dd if=/dev/nst-fake of=$FAKE_TAPE/out.bin bs=512k 2>/dev/null; cat $FAKE_TAPE/out.bin; \
+             else dd if=/dev/nst-fake bs=512k 2>/dev/null; fi\n",
+            inject.display(),
+            h.path,
+            "true",
+            if pos > 0 {
+                format!("mt -f /dev/nst-fake fsf {pos}\n")
+            } else {
+                String::new()
+            },
+        );
+        let o = Command::new("bash")
+            .args(["-c", &probe])
+            .env("FAKE_TAPE", &h.dir)
+            .env("REAL_DD", &real_dd)
+            .env("REAL_MT", &real_mt)
+            .env("TAPE_DEVICE", "/dev/nst-fake")
+            .env("FAULT_POS", bad.to_string())
+            .env("FAULT_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        o.stdout
+    };
+    let pristine = |pos: i64| std::fs::read(h.dir.join("tape").join(pos.to_string())).unwrap();
+    for to_file in [true, false] {
+        let _ = std::fs::remove_file(&log);
+        // Another file is read as it is.
+        let other = photos.positions[0];
+        assert_eq!(
+            read(other, to_file),
+            pristine(other),
+            "file {other} untouched"
+        );
+        assert!(!log.exists(), "nothing was logged for it");
+        // The named one has exactly one byte different.
+        let got = read(bad, to_file);
+        let was = pristine(bad);
+        assert_eq!(got.len(), was.len());
+        let diff: Vec<usize> = (0..got.len()).filter(|&i| got[i] != was[i]).collect();
+        assert_eq!(diff, vec![100_000.min(got.len() - 1)], "to_file={to_file}");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains(&format!("flipped one byte of tape file {bad}")),
+            "{logged}"
+        );
+    }
+}
+
+/// The gate's leg, against the fake tape: the stand-in makes one slice bad
+/// as it is read, a directory holds the copy's slices under names that say
+/// nothing, and RESTORE.sh --slices-from restores the unit; without the
+/// directory the same run fails and names the option.
+#[test]
+fn the_gates_restore_with_the_dd_stand_in_and_a_copys_slices_works() {
+    let t = template();
+    let ledgers = unit("ledgers");
+    let h = Heir::with_stubs(&[(
+        "python3",
+        &format!("#!/bin/sh\nexec {} \"$@\"\n", python3_path()),
+    )]);
+    let inject = h.dir.join("inject");
+    std::fs::create_dir_all(&inject).unwrap();
+    let (code, out) = run_gate_snippet(
+        &["heir_write_injector"],
+        &format!("heir_write_injector {}/dd", inject.display()),
+        "",
+        &[],
+    );
+    assert_eq!(code, 0, "{out}");
+    // The copy's slices, as dd copies them off a tape: padded, nameless.
+    let copies = h.dir.join("copies");
+    std::fs::create_dir_all(&copies).unwrap();
+    for (i, pos) in ledgers.positions.iter().enumerate() {
+        std::fs::write(
+            copies.join(format!("tape-file-{}", 40 + i)),
+            std::fs::read(t.dir.join("tape").join(pos.to_string())).unwrap(),
+        )
+        .unwrap();
+    }
+    let bad = ledgers.positions[1];
+    let log = h.dir.join("fault.log");
+    let path = format!("{}:{}", inject.display(), h.path);
+    let env: Vec<(&str, String)> = vec![
+        ("PATH", path),
+        ("REAL_DD", h.dir.join("bin/dd").display().to_string()),
+        ("REAL_MT", h.dir.join("bin/mt-st").display().to_string()),
+        ("FAULT_POS", bad.to_string()),
+        ("FAULT_LOG", log.display().to_string()),
+    ];
+    let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (code, text) = h.run_env(
+        &[
+            "--restore",
+            "--unit",
+            "ledgers",
+            "--key",
+            &h.key("bob"),
+            "--to",
+            &h.sub("no-copy"),
+        ],
+        &env_refs,
+    );
+    assert_ne!(code, 0, "the bad slice stops the restore: {text}");
+    assert!(log.exists(), "the stand-in fired");
+    assert!(text.contains("--slices-from DIR"), "{text}");
+    let _ = std::fs::remove_file(&log);
+    let dest = h.sub("recovered");
+    let (code, text) = h.run_env(
+        &[
+            "--restore",
+            "--unit",
+            "ledgers",
+            "--key",
+            &h.key("bob"),
+            "--to",
+            &dest,
+            "--slices-from",
+            &copies.display().to_string(),
+        ],
+        &env_refs,
+    );
+    assert_eq!(code, 0, "{text}");
+    assert!(log.exists(), "the stand-in fired again");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "taking slice 2 from {}/tape-file-",
+            copies.display()
+        )),
+        "{text}"
+    );
+    assert!(same_tree(&ledgers.src, Path::new(&dest)), "{text}");
+}
