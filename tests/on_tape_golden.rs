@@ -117,6 +117,50 @@
 //! `requires` (empty, `KNOWN_FEATURES=""`). The MANIFEST.toml pin did not move.
 //! The previous pin was `6c7bb948…`.
 //!
+//! **The 1.3.0 pin WIDENED, 2026-10-17, under the CTO's rulings in ADR-0012's
+//! 2026-10-17 amendment (items 101 and 102, #480),** within the same bound:
+//! this pin only, ending when v1.3.0 is installed (item 81 says the re-pin
+//! widens to carry RESTORE.sh's half of both). The first 1.3.0 pin
+//! (`36c970aa…`, `--where` and `--find`) was ADDITIONS ALONE; this one is `594da829…`. This widening is
+//! not, and says so. ADDED: `--slices-from DIR` (repeatable) and `--swap-tapes`
+//! on `--restore` and `--verify`, which take a slice that fails its ciphertext
+//! hash or will not read from another copy of the unit, matched by its
+//! `sha256_encrypted` from the front index and by nothing else (a `dd` copy,
+//! block padding and all, is trimmed to the size the index states), from a
+//! directory or from a second cartridge read forward from one rewind after the
+//! first (`other_tape_map`, `swap_fetch`, `swap_loop`); a slice still missing
+//! is left out and listed, never reported complete; `--fill-from LIST` on
+//! `--restore`, which restores only the files a `.tapectl-damaged-files.txt`
+//! names, from a tape whose envelope lists the same unit uuid at the same
+//! version, overwriting only those files (`do_fill`); `dar_result`, which reads
+//! the files dar says it could not restore (`AWK_DAR_DAMAGED`, a new named
+//! awk fragment, as is `AWK_FILL_LISTING`) into that list; and the `--help`,
+//! header-comment and hint text for all of it. CHANGED, and the reason a
+//! reader should look: (1) the end of every restore is now `restore_end`,
+//! which prints `RESTORE COMPLETE` only when no unit came back short and
+//! otherwise `RESTORE INCOMPLETE` with exit status 1 (it was printed
+//! unconditionally after the last unit); (2) the dar tail of `stream_unit`,
+//! `spool_unit` and `restore_paths` goes through `dar_result`: status 5 with
+//! the files named is a list and INCOMPLETE, a file-system refusal (permission
+//! denied, read-only, disk quota) and every other status stay fatal as before;
+//! (3) every dar gets an absolute `-R`, because dar prints it word for word in
+//! its messages; (4) `check_destination` is split, the stale-scratch refusal
+//! becoming `check_stale_scratch` so a fill, whose directory is full by
+//! definition, bypasses only the emptiness refusal; (5) `decrypt_slice` takes an
+//! optional byte count and `spool_slices` a target directory and a file for
+//! the slices not found; (6) `--verify` has an option parser and names, for a
+//! failed data slice, whether a copy is in a `--slices-from` directory or on a
+//! second cartridge; (7) `stream_unit` reports an age failure that names a
+//! decrypt, an authentication or a header as the slice's before asking whether
+//! dar is gone (a damaged chunk shortens the slice and dar can have died of it
+//! first, which hid the slice behind dar's exit); (8) a bad slice's failure
+//! names `--slices-from` and `--swap-tapes`, and the rejected-key message says a
+//! damaged slice reads that way too. A restore with neither option is
+//! unchanged except for those messages and the dar tail above. The two fixed
+//! points did not move and are asserted below: "tapectl 1.1.0" in
+//! `die_newer_needed`, and `requires` (empty, `KNOWN_FEATURES=""`). The
+//! MANIFEST.toml pin did not move. The previous pin was `36c970aa…`.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -133,7 +177,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "36c970aad8452c793c459bdd2650e45f5c013f82375b173ca17a38a247f633d6";
+const RESTORE_SH_SHA256: &str = "594da82903d4f700677f25c211e7b965d5b32b135dceedb75719f9644777f9f0";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -213,7 +257,7 @@ fn restore_sh_bytes_are_pinned() {
         "require_tools \"${TOOLS_PATH[@]}\"",
         "walk_envelopes count_other_envelope \"$CHOSEN_POS\"",
         "survey_other_envelopes \"${unit_names[0]}\"",
-        "  note_other_units\n  echo \"\"\n  info \"RESTORE COMPLETE\"",
+        "restore_unit() { # <slices file> <destination> <unit> <version>\n",
         "  if [ \"$MATCHED_DAMAGED\" -gt 0 ]; then\n    die \"$headline that could be opened.",
         "    MATCHED_DAMAGED=$((MATCHED_DAMAGED + 1))\n",
         "# WORK is the work directory, made in ${TMPDIR:-/tmp}: TMPDIR moves it.",
@@ -230,6 +274,35 @@ fn restore_sh_bytes_are_pinned() {
         "  walk_envelopes find_in_envelope\n",
         "index_banner() {\n",
         "die_no_index() {\n",
+        // 1.3.0, widened (ADR-0012 2026-10-17 items 101, 102, #480): a slice
+        // from another copy by its sha256, the damaged-file list, the fill
+        "--slices-from) SLICES_FROM+=(\"$2\") ;;",
+        "--fill-from) FILL_FROM=$2 ;;",
+        "    --all)\n      RESTORE_ALL=1\n      shift\n      ;;\n    --swap-tapes)\n      SWAP_TAPES=1",
+        "    --swap-tapes)\n      SWAP_TAPES=1\n      shift\n      ;;\n    *) die \"unknown option: $1\n\n       usage: $0 --verify",
+        "    --slices-from)\n      [ $# -ge 2 ] || die \"--slices-from needs a directory",
+        "check_stale_scratch() { # <directory>...\n",
+        "decrypt_slice() { # <ciphertext> <plaintext-out> <slice-number> [bytes]\n",
+        "spool_slices() { # <slices file> [<directory> [<file for the slices not found>]]\n",
+        "      if [ \"$(dir_sum \"$f\" \"$size\")\" = \"$sha\" ]; then\n",
+        "other_tape_map() {\n",
+        "swap_fetch() {\n",
+        "swap_loop() {\n",
+        "    [dD]one | DONE | q | quit)\n",
+        "DAMAGED_NAME=.tapectl-damaged-files.txt\n",
+        "dar_result() { # <log> <status> <destination> [slices not available]\n",
+        "  dar_result \"$WORK/extract.log\" \"$rc\" \"$destdir\"\n}\n\n# Read, check and decrypt the slices listed in $1",
+        "  SCRATCH=\"\"\n  dar_result \"$WORK/extract.log\" \"$rc\" \"$destdir\"\n}\n",
+        "  dar_result \"$WORK/extract.log\" \"$rc\" \"$destdir\"\n  if [ \"$UNIT_OK\" = 1 ]; then",
+        "do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>\n",
+        "restore_end() {\n",
+        "    info \"RESTORE INCOMPLETE\"\n",
+        "  info \"RESTORE COMPLETE\"\n  for line in ${DONE_LINES[@]+\"${DONE_LINES[@]}\"}; do",
+        "  finish_pending\n  restore_end\n",
+        "dar -x \"$fifos/restore\" -R \"$(abs_dir \"$destdir\")\" \"${dar_opts[@]}\"",
+        "dar -x \"$SCRATCH/job.$j/restore\" -R \"$(abs_dir \"$destdir\")\"",
+        "    do_fill \"$dest\" \"$want\" \"$scratch\"\n",
+        "  echo \"  $0 --restore --key KEYFILE --to DIR --unit U --fill-from LIST\"",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
