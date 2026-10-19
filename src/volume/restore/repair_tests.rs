@@ -1837,4 +1837,201 @@ mod tests {
             "{out}"
         );
     }
+
+    // ── ADR-0012 2026-10-19 item 107: the repairs with `--key` ──────────────
+    //
+    // An heir holds the escrow secret and nothing in the home opens the tape.
+    // Every repair runs on the same identities the first read does, so each of
+    // them must work with the identity given on the command line alone.
+
+    /// The heir's position: the key the slices are encrypted to is no longer in
+    /// the home — a decoy takes its file name, so the home still has a key for
+    /// the tenant and it opens nothing on this tape — and the secret is in a
+    /// file of its own, as `--key` takes it. The directory keeps the file.
+    fn heir_keys(fx: &Fixture) -> (TempDir, Vec<keys::KeyFile>) {
+        let home_key = fx.paths.keys_dir.join("t1-primary.age.key");
+        let secret = fs::read_to_string(&home_key).unwrap();
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("escrow.key");
+        fs::write(&file, format!("# the escrow secret\n{secret}")).unwrap();
+        keys::save_secret_key(&home_key, &keys::generate_keypair().secret_key).unwrap();
+        let given = vec![keys::KeyFile::read(&file).unwrap()];
+        (dir, given)
+    }
+
+    fn with_keys(given: &[keys::KeyFile]) -> RestoreOptions {
+        RestoreOptions {
+            keys: given.to_vec(),
+            ..RestoreOptions::default()
+        }
+    }
+
+    /// The wrong-key refusal as it stands today, with no `--key` — the control
+    /// every test below compares to: age's own words, and no key file named.
+    fn assert_wrong_key_refusal_without_keys(fx: &Fixture, label: &str, bay: &mut TestBay) {
+        let dest = TempDir::new().unwrap();
+        let err = fx
+            .restore(label, bay, dest.path(), &RestoreOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&age::DecryptError::NoMatchingKeys.to_string()),
+            "{err}"
+        );
+        assert!(!err.contains("--key"), "no --key was given: {err}");
+    }
+
+    /// SLICE SUBSTITUTION with only the given identity: the acceptance test of
+    /// the slice half, whole, through a swap to the second copy.
+    #[test]
+    fn a_slice_is_substituted_from_another_copy_with_only_the_key_given() {
+        for catalogue in [true, false] {
+            let (mut fx, st) = two_copies(catalogue);
+            fx.corrupt(A, &st, 3, 0);
+            fx.corrupt(B, &st, 2, 0);
+            let (_dir, given) = heir_keys(&fx);
+
+            // Control: the same damage, the home's key opens nothing.
+            let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+            assert_wrong_key_refusal_without_keys(&fx, A, &mut bay);
+
+            let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+            let dest = TempDir::new().unwrap();
+            let report = fx
+                .restore(A, &mut bay, dest.path(), &with_keys(&given))
+                .unwrap_or_else(|e| panic!("catalogue={catalogue}: {e}"));
+            fx.assert_restored(dest.path());
+            assert_eq!(bay.asked_labels(), [B], "catalogue={catalogue}");
+            assert_eq!(report.substitutions.len(), 1);
+            let sub = &report.substitutions[0];
+            assert_eq!(
+                (
+                    sub.slice_number,
+                    sub.supplied_by.as_str(),
+                    sub.damaged_on.as_str()
+                ),
+                (3, B, A)
+            );
+        }
+    }
+
+    /// CHUNK SALVAGE with only the given identity: one corrupted byte costs the
+    /// files in its chunk, the rest are byte for byte whole, the restore says
+    /// INCOMPLETE and names the damaged files — as without `--key`.
+    #[test]
+    fn a_bad_chunk_is_salvaged_around_with_only_the_key_given() {
+        for catalogue in [true, false] {
+            let mut fx = Fixture::new(&[A], tree());
+            let st = fx.stage(&tree(), "150k", catalogue);
+            fx.write(&st, A);
+            fx.corrupt(A, &st, 2, 1);
+            let (_dir, given) = heir_keys(&fx);
+            let restore = |options: &RestoreOptions, dest: &Path| {
+                let mut mem = clone_mem(&fx.mems[A]);
+                let dest_str = dest.to_string_lossy().into_owned();
+                restore_unit_from_store(
+                    &fx.conn,
+                    &fx.paths,
+                    &Config::default(),
+                    &fx.unit,
+                    A,
+                    1,
+                    RestoreTarget::Unit {
+                        dest_dir: &dest_str,
+                    },
+                    options,
+                    &mut mem,
+                    site(),
+                )
+                .unwrap_err()
+                .to_string()
+            };
+
+            // Control: the home's key opens nothing, and the refusal says so.
+            let dest = TempDir::new().unwrap();
+            let err = restore(&RestoreOptions::default(), dest.path());
+            assert!(
+                err.contains(&age::DecryptError::NoMatchingKeys.to_string()),
+                "{err}"
+            );
+
+            let dest = TempDir::new().unwrap();
+            let err = restore(&with_keys(&given), dest.path());
+            assert!(err.contains("INCOMPLETE"), "catalogue={catalogue}: {err}");
+            let differing = fx.differing(dest.path());
+            assert!(
+                !differing.is_empty() && differing.len() <= 2,
+                "one 64 KiB chunk of 100 KB files costs one or two files: {differing:?}"
+            );
+            for path in &differing {
+                assert!(err.contains(path.as_str()), "{path} is named: {err}");
+            }
+            for (path, bytes) in &fx.files {
+                if !differing.contains(path) {
+                    assert_eq!(&fs::read(dest.path().join(path)).unwrap(), bytes, "{path}");
+                }
+            }
+        }
+    }
+
+    /// FILE FILL with only the given identity: the only copy of a stage set is
+    /// damaged past reading and the lost files come whole from the other
+    /// staging of the version, decrypted with the identity given.
+    #[test]
+    fn lost_files_are_filled_from_another_staging_with_only_the_key_given() {
+        let (mut fx, one, _two) = two_stagings(true);
+        fx.corrupt(A, &one, 3, 1);
+        let (_dir, given) = heir_keys(&fx);
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let report = fx
+            .restore(A, &mut bay, dest.path(), &with_keys(&given))
+            .unwrap();
+        fx.assert_restored(dest.path());
+        assert_eq!(bay.asked_labels(), [B]);
+        assert!(!report.filled.is_empty(), "{report:?}");
+    }
+
+    /// A key given that opens nothing gets the refusal as it stands, with the
+    /// files named after it; one wrong file beside the right one is no
+    /// obstacle, in either order.
+    #[test]
+    fn a_wrong_key_is_refused_naming_the_files_and_a_right_one_beside_it_opens() {
+        let mut fx = Fixture::new(&[A], tree());
+        let st = fx.stage(&tree(), "150k", true);
+        fx.write(&st, A);
+        let (dir, right) = heir_keys(&fx);
+        let wrong_a = dir.path().join("wrong-a.key");
+        let wrong_b = dir.path().join("wrong-b.key");
+        for f in [&wrong_a, &wrong_b] {
+            fs::write(f, format!("{}\n", keys::generate_keypair().secret_key)).unwrap();
+        }
+        let wrong = keys::KeyFile::read_all(&[wrong_a.clone(), wrong_b.clone()]).unwrap();
+
+        let mut bay = fx.bay(A, true, &[]);
+        let dest = TempDir::new().unwrap();
+        let err = fx
+            .restore(A, &mut bay, dest.path(), &with_keys(&wrong))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&age::DecryptError::NoMatchingKeys.to_string()),
+            "the refusal as it stands: {err}"
+        );
+        for f in [&wrong_a, &wrong_b] {
+            assert!(err.contains(&f.display().to_string()), "{f:?} named: {err}");
+        }
+
+        for order in [[0, 1, 2], [2, 1, 0]] {
+            let all: Vec<keys::KeyFile> = [wrong[0].clone(), wrong[1].clone(), right[0].clone()]
+                .into_iter()
+                .collect();
+            let given: Vec<keys::KeyFile> = order.iter().map(|&i| all[i].clone()).collect();
+            let mut bay = fx.bay(A, true, &[]);
+            let dest = TempDir::new().unwrap();
+            fx.restore(A, &mut bay, dest.path(), &with_keys(&given))
+                .unwrap_or_else(|e| panic!("order {order:?}: {e}"));
+            fx.assert_restored(dest.path());
+        }
+    }
 }

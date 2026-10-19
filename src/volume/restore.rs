@@ -7656,3 +7656,5 @@ mod tests {
 // mod`, and the production code must all lie before it.
 #[cfg(test)]
 mod repair_tests;
+#[cfg(test)]
+mod heir_tests;

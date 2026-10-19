@@ -3080,6 +3080,53 @@ fn resolve_operator_identity(
 mod tests {
     use super::*;
 
+    /// Item 107: the tenant-key refusal names the `--key` files that were
+    /// given — one in the singular, several in the plural — and keeps the
+    /// heir recipe after it; any other error, and a call with no key, is
+    /// returned untouched.
+    #[test]
+    fn the_wrong_key_refusal_names_the_key_files_given() {
+        use crate::crypto::keys::KeyFile;
+        let dir = tempfile::tempdir().unwrap();
+        let mut given = Vec::new();
+        for name in ["stranger-a.key", "stranger-b.key"] {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!("{}\n", crate::crypto::keys::generate_keypair().secret_key),
+            )
+            .unwrap();
+            given.push(KeyFile::read(&path).unwrap());
+        }
+        let refusal = || TapectlError::Other(tenant_key_refusal_message());
+
+        let one = name_keys_given(refusal(), &given[..1]).to_string();
+        assert!(one.contains("stranger-a.key"), "{one}");
+        assert!(one.contains("cannot open the operator envelope"), "{one}");
+        assert!(
+            one.contains("neither an operator key nor the escrow key"),
+            "{one}"
+        );
+        assert!(!one.contains("this key"), "{one}");
+        assert!(one.contains("RESTORE.sh"), "the heir recipe stays: {one}");
+
+        let two = name_keys_given(refusal(), &given).to_string();
+        assert!(
+            two.contains("stranger-a.key") && two.contains("stranger-b.key"),
+            "{two}"
+        );
+        assert!(two.contains("none of the key files given"), "{two}");
+        assert!(two.contains("RESTORE.sh"), "{two}");
+
+        // Untouched: no key given (the library's own callers), another error.
+        assert_eq!(
+            name_keys_given(refusal(), &[]).to_string(),
+            tenant_key_refusal_message()
+        );
+        let other = name_keys_given(TapectlError::Other("tape unreadable".into()), &given);
+        assert_eq!(other.to_string(), "tape unreadable");
+    }
+
     /// The assumption attestation rests on: age unwraps the file key from
     /// the header alone, so a bounded prefix of a large ciphertext is enough
     /// to tell "this identity is a recipient" from "it is not". If a future
