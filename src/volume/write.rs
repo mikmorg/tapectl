@@ -1310,14 +1310,7 @@ fn volume_write_contacted<'c>(
     // consulted for it again. Reading `backends.lto[].nominal_capacity` here
     // is exactly how issue #141 planned an LTO-5 cartridge as 2.5 TB.
     let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
-    let usable_bytes = backend.fill_budget_bytes(nominal_capacity as u64);
-    // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
-    // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
-    // gone (T10 config cleanup: nothing read it after this path stopped, and
-    // this was that "nothing").
-    // `.max(0)` dropped (issue #59): a negative value is now rejected by
-    // the parser itself, so a successful `Ok` is already non-negative.
-    let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
+    let (usable_bytes, enospc_buffer) = write_budget(backend, nominal_capacity)?;
 
     let session = assemble_keys_for_units(conn, &units, &stage_set_ids)?;
 
@@ -1520,6 +1513,358 @@ fn volume_write_contacted<'c>(
     result.map(|_| ())
 }
 
+/// The two figures a write's capacity gate is built from: what the volume may
+/// take (its capacity times the drive's fill ceiling) and the end-of-tape
+/// reserve. One definition, for `volume write` and for `volume rewrite`'s
+/// capacity rehearsal (issue #483), so they cannot disagree.
+fn write_budget(
+    backend: &crate::config::LtoBackendConfig,
+    nominal_capacity: i64,
+) -> Result<(u64, u64)> {
+    let usable_bytes = backend.fill_budget_bytes(nominal_capacity as u64);
+    // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
+    // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
+    // gone (T10 config cleanup: nothing read it after this path stopped, and
+    // this was that "nothing").
+    // `.max(0)` dropped (issue #59): a negative value is now rejected by
+    // the parser itself, so a successful `Ok` is already non-negative.
+    let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
+    Ok((usable_bytes, enospc_buffer))
+}
+
+/// What the build of a write's Layout needs besides the staged batch and its
+/// keys: the volume's identity, the budget, and the ID thunk's informational
+/// fields.
+struct WriteBuild<'a> {
+    label: &'a str,
+    volume_uuid: String,
+    media_type: String,
+    created_at: String,
+    block_size: u64,
+    usable_bytes: u64,
+    enospc_buffer: u64,
+    nominal_capacity: i64,
+    mam_capacity: i64,
+    mam_manufacturer: String,
+    mam_length: i64,
+    mam_loads: i64,
+    cartridge_identity: CartridgeIdentity,
+}
+
+/// Build a write's Layout from the staged batch: the filtered `catalog.db`,
+/// the cross-volume index, every generated zone materialised into
+/// `session_dir`. THE one place a write's Layout is made: `volume write`
+/// (inside its contact) and `volume rewrite`'s capacity rehearsal
+/// ([`rehearse_write_capacity`], before it erases anything) both call it, so
+/// the rehearsal sizes exactly what the write will lay down. Returns the
+/// built Layout and the inputs it was built from (the plan step reads
+/// `inputs.units`).
+#[allow(clippy::too_many_arguments)]
+fn build_write_layout(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    w: WriteBuild<'_>,
+    units: Vec<BuildUnit>,
+    stage_set_ids: &[i64],
+    tenants: Vec<TenantInfo>,
+    operator_public_keys: Vec<String>,
+    escrow_public_key: Option<String>,
+    session_dir: &Path,
+) -> Result<(build::BuiltLayout, BuildInputs)> {
+    let WriteBuild {
+        label,
+        volume_uuid,
+        media_type,
+        created_at,
+        block_size,
+        usable_bytes,
+        enospc_buffer,
+        nominal_capacity,
+        mam_capacity,
+        mam_manufacturer,
+        mam_length,
+        mam_loads,
+        cartridge_identity,
+    } = w;
+    // Filtered catalog.db (issue #83): generated here, where `conn` is
+    // available — `build()` deliberately stays `Connection`-free (T5b). The
+    // scope is exactly this write's stage_sets (`units`, just gathered by
+    // `find_staged_data` above) — everything `status = 'staged'` right now
+    // is what is about to become this volume's `writes`/`write_positions`
+    // rows below, and nothing else is staged at this instant (the
+    // unresolved-write-session check above refuses a second concurrent
+    // write). `build()` appends it to the OPERATOR envelope only.
+    //
+    // It is plaintext — every path, size and hash of the write — so it is
+    // built in the tapectl home, read once by `build()` into the encrypted
+    // operator envelopes, and removed when `catalog_work` drops after
+    // `build()`: never under staging (ADR-0012 2026-10-06 item 4), where it
+    // used to stay in the session directory until `staging clean`.
+    fs::create_dir_all(session_dir)?;
+    let catalog_work = crate::staging::home_work_dir(paths, ".catalog-snapshot-")?;
+    let catalog_db_path = catalog_work.path().join("catalog_snapshot.db");
+    crate::db::catalog_snapshot::build_catalog_snapshot(conn, stage_set_ids, &catalog_db_path)?;
+
+    // The cross-volume index (`volume-format-v2.md` §1.5, #418 R4): which
+    // volumes hold which version of each unit, and every path of a tenant's
+    // versions. Plaintext, so built beside the `catalog.db` above, in the
+    // same tapectl-home work dir, streamed into the envelopes by `build()`
+    // and removed with `catalog_work` -- never under staging. It is generated
+    // BEFORE `build()` sizes the envelopes, so the capacity gate below counts
+    // it like every other byte. This tape is described as File 0 will say it
+    // (the binding that gives the catalog its serial runs after the build):
+    // an operator-named cartridge's barcode is not a chip serial.
+    let index = crate::volume::index::generate_files(
+        conn,
+        &crate::policy::coverage::IndexThisTape {
+            label,
+            uuid: &volume_uuid,
+            cartridge_serial: if cartridge_identity.source.as_deref() == Some("operator") {
+                ""
+            } else {
+                &cartridge_identity.serial
+            },
+            generation: &media_type,
+        },
+        stage_set_ids,
+        &catalog_work.path().join("index"),
+    )?;
+
+    let inputs = BuildInputs {
+        label: label.to_string(),
+        volume_uuid,
+        media_type,
+        tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
+        created_at,
+        block_size,
+        usable_bytes,
+        enospc_buffer,
+        nominal_capacity,
+        mam_capacity,
+        mam_manufacturer,
+        mam_serial: cartridge_identity.serial,
+        cartridge_identity_source: cartridge_identity.source,
+        mam_length,
+        mam_loads,
+        units,
+        tenants,
+        operator_public_keys,
+        escrow_public_key,
+        catalog_db_path: Some(catalog_db_path),
+        index: Some(index),
+    };
+
+    let built = build::build(&inputs, session_dir)?;
+    drop(catalog_work);
+    Ok((built, inputs))
+}
+
+/// What a write of a staged batch would put on a cartridge, and what that
+/// cartridge may take: the figures `volume rewrite` refuses on BEFORE it
+/// erases anything (issue #483), named in the refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityNumbers {
+    /// The staged slices' block-padded footprint (the live ciphertext).
+    pub staged: u64,
+    /// Every other file of the volume, block-padded: File 0, the guide,
+    /// RESTORE.sh, the front index, both operator envelopes, each tenant's
+    /// envelope and its backup (catalogues, the cross-volume index, the
+    /// on-tape `catalog.db`) and the seal.
+    pub generated: u64,
+    /// One block per generated file: the identity of a volume that does not
+    /// exist yet (its uuid, its creation time, the chip's strings) moves a
+    /// generated file's size by a few bytes, and a few bytes can cross a
+    /// block. Kept as a margin so the verdict bounds the real write's.
+    pub margin: u64,
+    /// The end-of-tape reserve (`enospc_buffer`).
+    pub reserve: u64,
+    /// What the cartridge may take: its capacity times the fill ceiling.
+    pub available: u64,
+}
+
+impl CapacityNumbers {
+    /// The gate the write runs, with the margin added: on-tape total plus the
+    /// reserve against the budget.
+    pub fn fits(&self) -> bool {
+        self.staged + self.generated + self.margin + self.reserve <= self.available
+    }
+
+    /// The refusal, with the numbers.
+    pub fn refusal(&self, label: &str, capacity_bytes: i64, fill_ceiling: f64) -> String {
+        use crate::util::format_bytes_binary as fmt;
+        let total = self.staged + self.generated + self.margin + self.reserve;
+        format!(
+            "the new volume \"{label}\" would not fit its cartridge: the live slices take {} \
+             and the volume's own files (File 0, the guide, RESTORE.sh, the front index, the \
+             envelopes with the catalogues, the cross-volume index and catalog.db, their \
+             backups, the seal, block padding) take {}, plus {} of margin for what only the \
+             real volume decides and {} of end-of-tape reserve: {} in all, against the {} the \
+             cartridge may take ({}% of its {} capacity). A unit is never split, so there is \
+             no smaller write of this data; compact onto a larger generation, or raise the \
+             ceiling with --fill-ceiling if you know the cartridge takes it",
+            fmt(self.staged as i64),
+            fmt(self.generated as i64),
+            fmt(self.margin as i64),
+            fmt(self.reserve as i64),
+            fmt(total as i64),
+            fmt(self.available as i64),
+            crate::volume::layout_model::fill_ceiling_percent(fill_ceiling),
+            crate::util::format_bytes_decimal(capacity_bytes),
+        )
+    }
+}
+
+/// [`CapacityNumbers`] of a built Layout. `Err` when an entry is unsized.
+pub(crate) fn capacity_numbers(layout: &Layout) -> Result<CapacityNumbers> {
+    let mut staged = 0u64;
+    let mut generated = 0u64;
+    let mut generated_files = 0u64;
+    for e in &layout.entries {
+        let Some(bytes) = e.on_tape_bytes(layout.block_size) else {
+            return Err(TapectlError::Other(format!(
+                "the Layout has an unsized file at position {} ({}): its capacity cannot be known",
+                e.position,
+                e.kind.type_label()
+            )));
+        };
+        if matches!(e.source, ContentSource::Staged(_)) {
+            staged += bytes;
+        } else {
+            generated += bytes;
+            generated_files += 1;
+        }
+    }
+    Ok(CapacityNumbers {
+        staged,
+        generated,
+        margin: generated_files * layout.block_size,
+        reserve: layout.budget.reserve_bytes,
+        available: layout.budget.available_bytes,
+    })
+}
+
+/// Removes a rehearsal's session directory however the rehearsal ends.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// What the volume to be initialised is expected to be, for a rehearsal.
+pub(crate) struct RehearsedVolume<'a> {
+    pub label: &'a str,
+    pub media_type: &'a str,
+    /// The capacity `volume init` will decide for the cartridge.
+    pub capacity_bytes: i64,
+    /// The cartridge's chip serial.
+    pub cartridge_serial: &'a str,
+    pub manufacturer: &'a str,
+}
+
+/// Rehearse a write of the staged batch (`only`: just those stage sets) to a
+/// volume that does not exist yet: build its real Layout from the staged
+/// slices exactly as `volume write` will ([`build_write_layout`] — the same
+/// catalog.db, index, envelopes and keys), run the write's own pre-flight
+/// `validate` on it, and compare its on-tape total with the cartridge's
+/// budget, margin included (issue #483; ADR-0012 item 106).
+///
+/// `volume rewrite` asks this after its slices are staged and verified and
+/// BEFORE it retires anything. The write's capacity gate (envelopes, the
+/// cross-volume index, `catalog.db` and their backups, block padding, file
+/// marks) otherwise runs only after the erase, when the staged slices may be
+/// the only copy and a refusal would leave them with nowhere to go.
+/// Everything is built in a session directory under staging that is removed
+/// afterwards, and the catalog is not touched.
+///
+/// `Err` names the numbers and changes nothing. `Ok` carries them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rehearse_write_capacity(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    device: &str,
+    block_size: usize,
+    volume: &RehearsedVolume<'_>,
+    only: Option<&[i64]>,
+    allow_missing_escrow: bool,
+) -> Result<CapacityNumbers> {
+    let label = volume.label;
+    let backend = crate::config::resolve_lto_backend(config, Some(device))?;
+    let (usable_bytes, enospc_buffer) = write_budget(backend, volume.capacity_bytes)?;
+    let units = checked_staged_units(conn, only)?;
+    let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+    let SessionKeys {
+        keys,
+        tenants,
+        operator_public_keys,
+        escrow_public_key,
+    } = assemble_keys_for_units(conn, &units, &stage_set_ids)?;
+
+    let session_dir = PathBuf::from(&config.staging.directory)
+        .join("sessions")
+        .join(format!("rehearsal-{label}-{}", Uuid::new_v4()));
+    let _cleanup = RemoveOnDrop(session_dir.clone());
+    let phase = progress::phase("rewrite-capacity-rehearsal", None);
+    let (built, _inputs) = build_write_layout(
+        conn,
+        paths,
+        WriteBuild {
+            label,
+            // The real volume's uuid is minted at its init; the same width.
+            volume_uuid: Uuid::new_v4().to_string(),
+            media_type: volume.media_type.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            block_size: block_size as u64,
+            usable_bytes,
+            enospc_buffer,
+            nominal_capacity: volume.capacity_bytes,
+            mam_capacity: 0,
+            mam_manufacturer: volume.manufacturer.to_string(),
+            mam_length: 0,
+            mam_loads: 0,
+            cartridge_identity: CartridgeIdentity {
+                serial: volume.cartridge_serial.to_string(),
+                source: Some("mam".to_string()),
+            },
+        },
+        units,
+        &stage_set_ids,
+        tenants,
+        operator_public_keys,
+        escrow_public_key,
+        &session_dir,
+    )?;
+    phase.done();
+
+    let numbers = capacity_numbers(&built.layout)?;
+    if !numbers.fits() {
+        return Err(TapectlError::Other(numbers.refusal(
+            label,
+            volume.capacity_bytes,
+            backend.fill_ceiling,
+        )));
+    }
+    // The write's own pre-flight validate, on the same Layout: keys, the
+    // staged files whole, the generated zones parse. (Its capacity check is
+    // the unpadded-by-margin form of the one above, which already passed.)
+    if let Err(errs) = built.validate(&keys, SliceCheck::Size) {
+        let (blocking, _waived) = blocking_validation_errors(errs, allow_missing_escrow);
+        if !blocking.is_empty() {
+            return Err(TapectlError::Other(format!(
+                "volume \"{label}\" would fail pre-write validation: {}",
+                blocking
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
+    }
+    Ok(numbers)
+}
+
 /// What `volume write` established BEFORE its contact opened — every
 /// catalog fact and refusal that needs no cartridge — handed into
 /// [`volume_write_in_contact`] as one value (issue #342).
@@ -1663,84 +2008,37 @@ fn volume_write_in_contact<'c>(
         .join("sessions")
         .join(format!("{label}-{}", Uuid::new_v4()));
 
-    // Filtered catalog.db (issue #83): generated here, where `conn` is
-    // available — `build()` deliberately stays `Connection`-free (T5b). The
-    // scope is exactly this write's stage_sets (`units`, just gathered by
-    // `find_staged_data` above) — everything `status = 'staged'` right now
-    // is what is about to become this volume's `writes`/`write_positions`
-    // rows below, and nothing else is staged at this instant (the
-    // unresolved-write-session check above refuses a second concurrent
-    // write). `build()` appends it to the OPERATOR envelope only.
-    //
-    // It is plaintext — every path, size and hash of the write — so it is
-    // built in the tapectl home, read once by `build()` into the encrypted
-    // operator envelopes, and removed when `catalog_work` drops after
-    // `build()`: never under staging (ADR-0012 2026-10-06 item 4), where it
-    // used to stay in the session directory until `staging clean`.
+    // The Layout is built by `build_write_layout`, the one place a write's
+    // Layout is made -- `volume rewrite`'s capacity rehearsal (issue #483)
+    // calls the same function before it erases anything.
     let phase = progress::phase("build", None);
-    fs::create_dir_all(&session_dir)?;
-    let catalog_work = crate::staging::home_work_dir(paths, ".catalog-snapshot-")?;
-    let catalog_db_path = catalog_work.path().join("catalog_snapshot.db");
-    crate::db::catalog_snapshot::build_catalog_snapshot(conn, &stage_set_ids, &catalog_db_path)?;
-
-    // The generation of the medium this volume was initialised on, not the
-    // drive's (ADR-0010). Only a pre-ADR-0010 row can lack one, and the
-    // drive's own generation is a better ID-thunk value than a blank.
-    let media_type = volume_media_type
-        .clone()
-        .unwrap_or_else(|| backend.generation.clone());
-
-    // The cross-volume index (`volume-format-v2.md` §1.5, #418 R4): which
-    // volumes hold which version of each unit, and every path of a tenant's
-    // versions. Plaintext, so built beside the `catalog.db` above, in the
-    // same tapectl-home work dir, streamed into the envelopes by `build()`
-    // and removed with `catalog_work` -- never under staging. It is generated
-    // BEFORE `build()` sizes the envelopes, so the capacity gate below counts
-    // it like every other byte. This tape is described as File 0 will say it
-    // (the binding that gives the catalog its serial runs after the build):
-    // an operator-named cartridge's barcode is not a chip serial.
-    let index = crate::volume::index::generate_files(
+    let (built, inputs) = build_write_layout(
         conn,
-        &crate::policy::coverage::IndexThisTape {
+        paths,
+        WriteBuild {
             label,
-            uuid: &volume_uuid,
-            cartridge_serial: if cartridge_identity.source.as_deref() == Some("operator") {
-                ""
-            } else {
-                &cartridge_identity.serial
-            },
-            generation: &media_type,
+            volume_uuid,
+            media_type: volume_media_type
+                .clone()
+                .unwrap_or_else(|| backend.generation.clone()),
+            created_at,
+            block_size: block_size as u64,
+            usable_bytes,
+            enospc_buffer,
+            nominal_capacity,
+            mam_capacity: mam.max_capacity_bytes.unwrap_or(0),
+            mam_manufacturer: mam.manufacturer.clone().unwrap_or_default(),
+            mam_length: mam.length_meters.unwrap_or(0),
+            mam_loads: mam.load_count.unwrap_or(0),
+            cartridge_identity,
         },
-        &stage_set_ids,
-        &catalog_work.path().join("index"),
-    )?;
-
-    let inputs = BuildInputs {
-        label: label.to_string(),
-        volume_uuid,
-        media_type,
-        tapectl_version: env!("CARGO_PKG_VERSION").to_string(),
-        created_at,
-        block_size: block_size as u64,
-        usable_bytes,
-        enospc_buffer,
-        nominal_capacity,
-        mam_capacity: mam.max_capacity_bytes.unwrap_or(0),
-        mam_manufacturer: mam.manufacturer.clone().unwrap_or_default(),
-        mam_serial: cartridge_identity.serial,
-        cartridge_identity_source: cartridge_identity.source,
-        mam_length: mam.length_meters.unwrap_or(0),
-        mam_loads: mam.load_count.unwrap_or(0),
         units,
+        &stage_set_ids,
         tenants,
         operator_public_keys,
         escrow_public_key,
-        catalog_db_path: Some(catalog_db_path),
-        index: Some(index),
-    };
-
-    let built = build::build(&inputs, &session_dir)?;
-    drop(catalog_work);
+        &session_dir,
+    )?;
     phase.done();
     // Snapshot the Layout before the typestate chain consumes `built` — the
     // terminal `SealedSession` only exposes `volume_id`/`label`, not the
@@ -22214,6 +22512,309 @@ mod tests {
                  capacity from the cartridge's registered capacity)"
             );
             assert_eq!(done.medium.to_json()["generation_source"], "cartridge_row");
+        }
+    }
+
+    // ---- issue #483: `volume rewrite`'s capacity rehearsal. The write's
+    // own capacity gate runs after the cartridge is erased; the rehearsal
+    // builds the real Layout from the staged slices first, through the same
+    // `build_write_layout`, and holds it to the budget with a margin.
+    mod capacity_rehearsal {
+        use super::*;
+
+        const DEVICE: &str = "/nonexistent/tapectl-rehearsal-nst";
+        const BS: usize = 4096;
+
+        struct Fixture {
+            conn: Connection,
+            paths: TapectlPaths,
+            config: Config,
+            _tmp: tempfile::TempDir,
+            live_bytes: u64,
+        }
+
+        /// A catalog with the operator and one tenant keyed, an escrow
+        /// recipient, and one staged set of real slice files of `sizes`.
+        fn fixture(sizes: &[usize]) -> Fixture {
+            let (conn, _tenant, stage_set_id) = escrow_check_fixture();
+            register_escrow(&conn);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let slices = tmp.path().join("slices");
+            fs::create_dir_all(&slices).unwrap();
+            let mut live = 0u64;
+            for (i, size) in sizes.iter().enumerate() {
+                let content = vec![(i + 1) as u8; *size];
+                conn.execute(
+                    "INSERT INTO stage_slices
+                        (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                         sha256_plain, sha256_encrypted)
+                     VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
+                    params![
+                        stage_set_id,
+                        i as i64 + 1,
+                        *size as i64,
+                        direct_hash(b"plaintext hash is not exercised here"),
+                        direct_hash(&content),
+                    ],
+                )
+                .unwrap();
+                let id = conn.last_insert_rowid();
+                let path = slices.join(format!("slice_{id}.age"));
+                fs::write(&path, &content).unwrap();
+                conn.execute(
+                    "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+                    params![path.to_string_lossy(), id],
+                )
+                .unwrap();
+                live += size.div_ceil(BS) as u64 * BS as u64;
+            }
+            let home = tmp.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+            let paths = TapectlPaths::new(home);
+            paths.ensure_dirs().unwrap();
+            let staging = tmp.path().join("staging");
+            fs::create_dir_all(&staging).unwrap();
+            let mut config = Config::default();
+            config.staging.directory = staging.to_string_lossy().into_owned();
+            config.backends.lto.push(crate::config::LtoBackendConfig {
+                name: "lto6".into(),
+                device_tape: DEVICE.into(),
+                device_sg: "/nonexistent/tapectl-rehearsal-sg".into(),
+                generation: "LTO-6".into(),
+                capacity_override: None,
+                fill_ceiling: 1.0,
+                enospc_buffer: "10K".into(),
+            });
+            Fixture {
+                conn,
+                paths,
+                config,
+                _tmp: tmp,
+                live_bytes: live,
+            }
+        }
+
+        fn rehearse(f: &Fixture, capacity: i64) -> Result<CapacityNumbers> {
+            rehearse_write_capacity(
+                &f.conn,
+                &f.paths,
+                &f.config,
+                DEVICE,
+                BS,
+                &RehearsedVolume {
+                    label: "NEW",
+                    media_type: "LTO-6",
+                    capacity_bytes: capacity,
+                    cartridge_serial: "CHIP-SERIAL-1",
+                    manufacturer: "HP",
+                },
+                None,
+                // The fixture's stage set was not encrypted to the escrow
+                // recipient it registers; that refusal is not under test.
+                true,
+            )
+        }
+
+        fn leftovers(f: &Fixture) -> Vec<String> {
+            let mut out = Vec::new();
+            for dir in [
+                Path::new(&f.config.staging.directory).join("sessions"),
+                f.paths.home.join("tmp"),
+            ] {
+                if let Ok(rd) = fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        out.push(e.path().display().to_string());
+                    }
+                }
+            }
+            out
+        }
+
+        /// The write's own pre-flight on the layout the WRITE would build,
+        /// for a volume whose identity differs from the rehearsal's in every
+        /// way a not-yet-existing volume can: another uuid and time, other
+        /// chip strings, a real MAM length and load count.
+        fn real_write_layout_errors(f: &Fixture, usable_bytes: u64) -> Vec<String> {
+            let units = checked_staged_units(&f.conn, None).unwrap();
+            let ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+            let SessionKeys {
+                keys,
+                tenants,
+                operator_public_keys,
+                escrow_public_key,
+            } = assemble_keys_for_units(&f.conn, &units, &ids).unwrap();
+            let dir = tempfile::TempDir::new().unwrap();
+            let (built, _) = build_write_layout(
+                &f.conn,
+                &f.paths,
+                WriteBuild {
+                    label: "NEW",
+                    volume_uuid: "ffffffff-ffff-4fff-8fff-ffffffffffff".into(),
+                    media_type: "LTO-6".into(),
+                    created_at: "2031-12-31T23:59:59.999999999+00:00".into(),
+                    block_size: BS as u64,
+                    usable_bytes,
+                    enospc_buffer: 10 * 1024,
+                    nominal_capacity: usable_bytes as i64,
+                    mam_capacity: 2_400_000_000_000,
+                    mam_manufacturer: "HEWLETT-PACKARD-SOMETHING-LONGER".into(),
+                    mam_length: 846,
+                    mam_loads: 12345,
+                    cartridge_identity: CartridgeIdentity {
+                        serial: "A-MUCH-LONGER-CHIP-SERIAL-NUMBER-0000001".into(),
+                        source: Some("mam".into()),
+                    },
+                },
+                units,
+                &ids,
+                tenants,
+                operator_public_keys,
+                escrow_public_key,
+                dir.path(),
+            )
+            .unwrap();
+            match built.validate(&keys, SliceCheck::Size) {
+                Ok(()) => Vec::new(),
+                Err(errs) => blocking_validation_errors(errs, true)
+                    .0
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect(),
+            }
+        }
+
+        /// Live data that fits is not a volume that fits: the envelopes, the
+        /// cross-volume index, catalog.db, their backups and the fixed files
+        /// are on the tape too. A cartridge that takes the live slices and
+        /// the reserve but not the rest is refused BEFORE the erase, with
+        /// every figure named.
+        #[test]
+        fn live_data_that_fits_with_metadata_that_does_not_is_refused_naming_the_numbers() {
+            let f = fixture(&[3 * BS + 17, 5 * BS]);
+            let roomy = rehearse(&f, 1_000_000_000).expect("a roomy cartridge passes");
+            assert_eq!(roomy.staged, f.live_bytes, "the live slices, block-padded");
+            assert!(
+                roomy.generated > 0 && roomy.margin > 0 && roomy.reserve == 10 * 1024,
+                "{roomy:?}"
+            );
+            // Room for the live slices and the reserve, and not for the rest.
+            let capacity = (roomy.staged + roomy.reserve + roomy.generated / 2) as i64;
+            assert!(
+                roomy.staged + roomy.reserve <= capacity as u64,
+                "positive control: the live data alone fits this cartridge"
+            );
+            let msg = rehearse(&f, capacity).unwrap_err().to_string();
+            assert!(msg.contains("would not fit its cartridge"), "{msg}");
+            for figure in [
+                crate::util::format_bytes_binary(roomy.staged as i64),
+                crate::util::format_bytes_binary(roomy.generated as i64),
+                crate::util::format_bytes_binary(roomy.margin as i64),
+                crate::util::format_bytes_binary(roomy.reserve as i64),
+                crate::util::format_bytes_decimal(capacity),
+            ] {
+                assert!(msg.contains(&figure), "the refusal names {figure}: {msg}");
+            }
+            assert!(msg.contains("100% of its"), "{msg}");
+        }
+
+        /// The pin: a rehearsal that passes bounds the real write. At the
+        /// exact budget the rehearsal accepts (live + files + margin +
+        /// reserve), the write's own pre-flight validate on its own build,
+        /// for a volume with every identity detail different, finds no
+        /// capacity problem; one byte under, the rehearsal refuses.
+        #[test]
+        fn a_passing_rehearsal_means_the_write_after_the_erase_cannot_refuse_on_capacity() {
+            let f = fixture(&[2 * BS + 1, BS, 7 * BS - 3]);
+            let probe = rehearse(&f, 1_000_000_000).unwrap();
+            let threshold = probe.staged + probe.generated + probe.margin + probe.reserve;
+
+            let at = rehearse(&f, threshold as i64).expect("exactly the threshold passes");
+            assert!(at.fits());
+            let errs = real_write_layout_errors(&f, threshold);
+            assert!(errs.is_empty(), "the real write refused: {errs:?}");
+            // Even with the margin taken away, the real build fits: the margin
+            // is slack, not the fit.
+            let errs = real_write_layout_errors(&f, threshold - probe.margin);
+            assert!(
+                errs.is_empty(),
+                "the real write needs less than the bound: {errs:?}"
+            );
+
+            rehearse(&f, threshold as i64 - 1).expect_err("one byte under refuses");
+            // Control: the real write DOES refuse a budget below what it
+            // needs, so the empty answers above are not an empty check.
+            let errs = real_write_layout_errors(&f, probe.staged);
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("exceed") || e.contains("capacity")),
+                "positive control: {errs:?}"
+            );
+        }
+
+        /// A refusal, and a pass, change nothing: no session directory under
+        /// staging, nothing left in the home's work directory, no volume, no
+        /// write, no event.
+        #[test]
+        fn a_rehearsal_leaves_no_trace_whether_it_refuses_or_passes() {
+            let f = fixture(&[4 * BS]);
+            let rows = |c: &Connection| -> Vec<i64> {
+                [
+                    "volumes",
+                    "writes",
+                    "write_positions",
+                    "events",
+                    "stage_sets",
+                ]
+                .iter()
+                .map(|t| {
+                    c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                        .unwrap()
+                })
+                .collect()
+            };
+            let before = rows(&f.conn);
+            rehearse(&f, 1_000_000_000).unwrap();
+            rehearse(&f, 1).unwrap_err();
+            assert_eq!(rows(&f.conn), before);
+            assert!(leftovers(&f).is_empty(), "{:?}", leftovers(&f));
+        }
+
+        /// The rehearsal runs the write's own pre-flight validate too: a
+        /// staged slice missing from disk is a refusal here, not after the erase.
+        #[test]
+        fn the_rehearsal_refuses_a_staged_slice_that_is_gone() {
+            let f = fixture(&[BS]);
+            let path: String = f
+                .conn
+                .query_row("SELECT staging_path FROM stage_slices LIMIT 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            fs::remove_file(&path).unwrap();
+            let msg = rehearse(&f, 1_000_000_000).unwrap_err().to_string();
+            assert!(msg.contains("not whole on disk"), "{msg}");
+        }
+
+        /// There is ONE place a write's Layout is built; the rehearsal and
+        /// the write both call it, so the rehearsal sizes what the write lays
+        /// down. Pinned in the source.
+        #[test]
+        fn the_rehearsal_and_the_write_build_through_the_same_function() {
+            const SRC: &str = include_str!("write.rs");
+            let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert_eq!(
+                prod.matches("build::build(").count(),
+                1,
+                "only build_write_layout builds a Layout"
+            );
+            let body = |name: &str| -> &str {
+                let start = prod.find(name).unwrap_or_else(|| panic!("no {name}"));
+                let end = prod[start..].find("\n}\n").unwrap() + start;
+                &prod[start..end]
+            };
+            assert!(body("fn volume_write_in_contact<'c>(").contains("build_write_layout("));
+            assert!(body("pub(crate) fn rehearse_write_capacity(").contains("build_write_layout("));
+            assert!(body("fn build_write_layout(").contains("build::build("));
         }
     }
 }

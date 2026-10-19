@@ -433,6 +433,13 @@ pub(crate) struct Plan {
     /// Bytes of reclaimable/purged versions on the source: what the rewrite
     /// frees on the cartridge.
     pub reclaimable_bytes: i64,
+    /// The generation `volume init` will record for the cartridge (the
+    /// source's), and the capacity it will decide: the source's, or less if
+    /// the drive's override or the cartridge row now says less.
+    pub media_type: String,
+    pub planned_capacity: i64,
+    /// The cartridge's manufacturer, for the new volume's File 0.
+    pub manufacturer: String,
     /// Live slices with no copy on another eligible volume.
     pub sole: Vec<coverage::SoleSlice>,
     /// `(unit, version)` whose retirement would take the last eligible copy
@@ -610,16 +617,21 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
     }
 
     // The cartridge: the source's open mount, and nothing else live on it.
-    let mount: Option<(i64, String, Option<String>)> = conn
+    // (cartridge id, barcode, chip serial, nominal capacity, manufacturer)
+    type Mount = (i64, String, Option<String>, i64, Option<String>);
+    let mount: Option<Mount> = conn
         .query_row(
-            "SELECT c.id, c.barcode, c.serial_number FROM cartridge_volumes cv
+            "SELECT c.id, c.barcode, c.serial_number, c.nominal_capacity, c.manufacturer
+             FROM cartridge_volumes cv
              JOIN cartridges c ON c.id = cv.cartridge_id
              WHERE cv.volume_id = ?1 AND cv.unmounted_at IS NULL",
             params![source_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?;
-    let Some((cartridge_id, cartridge_barcode, cartridge_serial)) = mount else {
+    let Some((cartridge_id, cartridge_barcode, cartridge_serial, cartridge_nominal, manufacturer)) =
+        mount
+    else {
         return Err(TapectlError::Other(format!(
             "volume rewrite refused: the catalog does not record which cartridge volume \
              \"{source}\" is on, and a rewrite reuses that cartridge (the erase is checked \
@@ -653,12 +665,33 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
     // The drive can write this cartridge's generation (ADR-0010; no flag
     // reaches it), and what is live fits one tape.
     let backend = crate::config::resolve_lto_backend(config, Some(opts.device))?;
-    if let Some(generation) = media_type
+    let generation = media_type
         .as_deref()
-        .and_then(crate::media::Generation::parse)
-    {
+        .and_then(crate::media::Generation::parse);
+    if let Some(generation) = generation {
         crate::tape::media_detect::check_drive_can_write(backend, generation)?;
     }
+    // The capacity `volume init` will decide for this cartridge (ADR-0010
+    // decision 3: the drive's override, else the cartridge row, else the
+    // generation table). The same cartridge and the same config decide what
+    // the source's init decided; if either has since said less, the lesser
+    // figure is the one the new volume gets, and the one planned against.
+    let planned_capacity = match generation {
+        Some(generation) => {
+            let override_bytes = match &backend.capacity_override {
+                Some(v) => Some(crate::media::parse_capacity_to_bytes(v)? as u64),
+                None => None,
+            };
+            let decided = crate::media::resolve_capacity(
+                override_bytes,
+                (cartridge_nominal > 0).then_some(cartridge_nominal as u64),
+                generation,
+            )
+            .0 as i64;
+            decided.min(capacity)
+        }
+        None => capacity,
+    };
 
     let slices = write::live_recovery_slices(conn, source_id)?;
     if slices.is_empty() {
@@ -670,14 +703,14 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
         )));
     }
     let live_bytes: i64 = slices.iter().map(|s| s.encrypted_bytes).sum();
-    let budget_bytes = backend.fill_budget_bytes(capacity.max(0) as u64);
+    let budget_bytes = backend.fill_budget_bytes(planned_capacity.max(0) as u64);
     if live_bytes as u64 > budget_bytes {
         return Err(TapectlError::Other(format!(
             "volume rewrite refused: the live data ({}) does not fit one tape at the {}% fill \
              ceiling (the cartridge's {} capacity gives {}). Nothing was changed.",
             crate::util::format_bytes_binary(live_bytes),
             (backend.fill_ceiling * 100.0).round() as i64,
-            crate::util::format_bytes_decimal(capacity),
+            crate::util::format_bytes_decimal(planned_capacity),
             crate::util::format_bytes_binary(budget_bytes as i64),
         )));
     }
@@ -775,6 +808,11 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
         slices,
         live_bytes,
         reclaimable_bytes,
+        media_type: media_type
+            .clone()
+            .unwrap_or_else(|| backend.generation.clone()),
+        planned_capacity,
+        manufacturer: manufacturer.unwrap_or_default(),
         sole,
         last_copy_versions,
         tier2_facts,
@@ -900,18 +938,39 @@ fn check_consent_obtainable(plan: &Plan, opts: &RewriteOptions<'_>) -> Result<()
 
 // ── The seam ────────────────────────────────────────────────────────────────
 
+/// The volume `volume init` is about to create on the erased cartridge, as
+/// far as the catalog and the chip can say before it exists.
+#[derive(Debug, Clone)]
+pub struct ExpectedVolume {
+    pub label: String,
+    pub media_type: String,
+    pub capacity_bytes: i64,
+    pub cartridge_serial: String,
+    pub manufacturer: String,
+}
+
 /// The steps of a rewrite that touch the drive.
 pub trait RewriteSteps {
     /// The quiet-host question `volume write` asks (ADR-0012 2026-09-24 item
     /// 7), asked ONCE here, before the read and long before the erase: the
     /// write after the erase must never be refused over it.
     fn host_preflight(&self, what: &str) -> Result<()>;
-    /// What the write would refuse from the catalog and the staged files
-    /// alone — a staged set not whole on disk, a tenant or the operator
-    /// without a key, a missing escrow recipient — for a write of only
-    /// `only_stage_sets` (`None`: every staged set). Asked after the slices
-    /// are staged and before anything is retired.
-    fn write_preflight(&self, label: &str, only_stage_sets: Option<&[i64]>) -> Result<()>;
+    /// What the write would refuse, rehearsed on the real thing: the new
+    /// volume's Layout is built from the staged slices exactly as the write
+    /// will build it (the envelopes with their catalogues, the cross-volume
+    /// index, `catalog.db`, the backups, the seal) and run through the write's
+    /// own pre-flight `validate` — a staged set not whole on disk, a tenant or
+    /// the operator without a key, a missing escrow recipient, and CAPACITY:
+    /// the on-tape total, margin included, against what the cartridge may
+    /// take. For a write of only `only_stage_sets` (`None`: every staged
+    /// set). Asked after the slices are staged and before anything is
+    /// retired, because after the erase a refusal would leave the staged
+    /// slices with nowhere to go. A refusal names the numbers.
+    fn write_preflight(
+        &self,
+        expected: &ExpectedVolume,
+        only_stage_sets: Option<&[i64]>,
+    ) -> Result<Option<write::CapacityNumbers>>;
     /// `compact-read` the source's live slices into staging.
     fn read(&self, source: &str) -> Result<CompactReadReport>;
     /// `cartridge erase` (short) of the cartridge in the drive, confirmed
@@ -951,13 +1010,28 @@ impl RewriteSteps for DriveRewriteSteps<'_> {
         )
     }
 
-    fn write_preflight(&self, label: &str, only_stage_sets: Option<&[i64]>) -> Result<()> {
-        write::write_catalog_preflight_in(
+    fn write_preflight(
+        &self,
+        expected: &ExpectedVolume,
+        only_stage_sets: Option<&[i64]>,
+    ) -> Result<Option<write::CapacityNumbers>> {
+        write::rehearse_write_capacity(
             self.conn,
-            label,
-            self.allow_missing_escrow,
+            self.paths,
+            self.config,
+            self.device,
+            crate::cli::volume::DEFAULT_BLOCK_SIZE,
+            &write::RehearsedVolume {
+                label: &expected.label,
+                media_type: &expected.media_type,
+                capacity_bytes: expected.capacity_bytes,
+                cartridge_serial: &expected.cartridge_serial,
+                manufacturer: &expected.manufacturer,
+            },
             only_stage_sets,
+            self.allow_missing_escrow,
         )
+        .map(Some)
     }
 
     fn read(&self, source: &str) -> Result<CompactReadReport> {
@@ -1366,18 +1440,49 @@ pub fn rewrite(
 
     // The write that follows the erase must not be able to refuse for
     // anything the catalog and the staged files already show: whole on disk,
-    // every key, the escrow recipient.
+    // every key, the escrow recipient -- and CAPACITY. The new volume's real
+    // Layout is built from the staged slices now (the envelopes, the
+    // cross-volume index, catalog.db, the backups, block padding) and held to
+    // the cartridge's budget, margin included; the write's own gate would
+    // otherwise run only after the erase, with the staged slices the only
+    // copy and nowhere to go.
     let scope: Option<&[i64]> = if opts.with_staged {
         None
     } else {
         Some(read.staged_sets.as_slice())
     };
-    if let Err(e) = steps.write_preflight(destination, scope) {
-        abandon("the write would be refused");
-        return Err(TapectlError::Other(format!(
-            "volume rewrite refused: the write of \"{destination}\" would be refused — {e}. \
-             Nothing destructive was done and staging was put back as it was."
-        )));
+    let expected = ExpectedVolume {
+        label: destination.to_string(),
+        media_type: plan.media_type.clone(),
+        capacity_bytes: plan.planned_capacity,
+        cartridge_serial: chip.clone(),
+        manufacturer: plan.manufacturer.clone(),
+    };
+    let capacity = match steps.write_preflight(&expected, scope) {
+        Ok(capacity) => capacity,
+        Err(e) => {
+            abandon("the write would be refused");
+            return Err(TapectlError::Other(format!(
+                "volume rewrite refused: {e}. Nothing destructive was done: the source is \
+                 untouched and staging was put back as it was."
+            )));
+        }
+    };
+    if let Some(n) = capacity {
+        record_step(
+            conn,
+            plan.source_id,
+            source,
+            "rewrite_capacity_checked",
+            serde_json::json!({
+                "destination": destination,
+                "staged_bytes": n.staged,
+                "generated_bytes": n.generated,
+                "margin_bytes": n.margin,
+                "reserve_bytes": n.reserve,
+                "available_bytes": n.available,
+            }),
+        )?;
     }
 
     // 4. Consent.
@@ -2223,6 +2328,10 @@ mod tests {
         /// The catalog-only asks, in order (`host ...`, `write_preflight ...`).
         asked: RefCell<Vec<String>>,
         fail_write_preflight: Cell<bool>,
+        /// What the fake rehearsal reports on success.
+        capacity: Cell<Option<write::CapacityNumbers>>,
+        /// A capacity refusal the fake rehearsal reports (its real text).
+        capacity_refusal: Cell<Option<write::CapacityNumbers>>,
     }
 
     impl<'a> Fake<'a> {
@@ -2242,6 +2351,8 @@ mod tests {
                 written_scope: RefCell::new(None),
                 asked: RefCell::new(Vec::new()),
                 fail_write_preflight: Cell::new(false),
+                capacity: Cell::new(None),
+                capacity_refusal: Cell::new(None),
             }
         }
 
@@ -2277,17 +2388,31 @@ mod tests {
             Ok(())
         }
 
-        fn write_preflight(&self, label: &str, only: Option<&[i64]>) -> Result<()> {
+        fn write_preflight(
+            &self,
+            expected: &ExpectedVolume,
+            only: Option<&[i64]>,
+        ) -> Result<Option<write::CapacityNumbers>> {
             self.asked.borrow_mut().push(format!(
-                "write_preflight {label} {}",
-                if only.is_some() { "scoped" } else { "all" }
+                "write_preflight {} {} {} {}",
+                expected.label,
+                if only.is_some() { "scoped" } else { "all" },
+                expected.media_type,
+                expected.capacity_bytes
             ));
             if self.fail_write_preflight.get() {
                 return Err(TapectlError::Other(
                     "refusing to write: these staged sets are not whole on disk".into(),
                 ));
             }
-            Ok(())
+            if let Some(n) = self.capacity_refusal.get() {
+                return Err(TapectlError::Other(n.refusal(
+                    &expected.label,
+                    expected.capacity_bytes,
+                    1.0,
+                )));
+            }
+            Ok(self.capacity.get())
         }
 
         fn read(&self, source: &str) -> Result<CompactReadReport> {
@@ -3544,7 +3669,10 @@ mod tests {
         rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
         assert_eq!(
             *fake.asked.borrow(),
-            ["host volume rewrite \"SRC\"", "write_preflight NEW scoped"],
+            [
+                "host volume rewrite \"SRC\"",
+                "write_preflight NEW scoped LTO-6 100000000"
+            ],
             "the quiet-host question once, and the write's catalog checks for the \
              rewrite's own sets"
         );
@@ -3555,7 +3683,10 @@ mod tests {
         o.only_copy_on_staging = Some("SRC");
         o.with_staged = true;
         rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
-        assert_eq!(fake.asked.borrow()[1], "write_preflight NEW all");
+        assert_eq!(
+            fake.asked.borrow()[1],
+            "write_preflight NEW all LTO-6 100000000"
+        );
     }
 
     /// A write that would be refused for something the catalog and the staged
@@ -3573,7 +3704,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            msg.contains("would be refused") && msg.contains("Nothing destructive"),
+            msg.contains("volume rewrite refused") && msg.contains("Nothing destructive"),
             "{msg}"
         );
         assert_eq!(fake.calls(), ["read"]);
@@ -3893,5 +4024,124 @@ mod tests {
         assert_eq!(snapshot(&s.w.conn), before);
         assert!(staged_files(&s.w.config).is_empty());
         assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
+    }
+
+    /// The capacity gate runs BEFORE the retire. A volume whose files (the
+    /// envelopes, the index, catalog.db, their backups, padding) do not fit
+    /// the cartridge beside the live slices is refused with the numbers, the
+    /// source untouched, staging put back and the hold closed -- not found
+    /// out by the write after the erase.
+    #[test]
+    fn a_capacity_refusal_names_the_numbers_and_changes_nothing() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        let numbers = write::CapacityNumbers {
+            staged: 3_000_000,
+            generated: 9_000_000,
+            margin: 1_572_864,
+            reserve: 52_428_800,
+            available: 10_000_000,
+        };
+        fake.capacity_refusal.set(Some(numbers));
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let msg = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+
+        assert!(msg.contains("volume rewrite refused"), "{msg}");
+        assert!(msg.contains("would not fit its cartridge"), "{msg}");
+        for figure in [
+            "2.9 MiB", "8.6 MiB", "1.5 MiB", "50.0 MiB", "62.9 MiB", "9.5 MiB",
+        ] {
+            assert!(msg.contains(figure), "names {figure}: {msg}");
+        }
+        assert!(msg.contains("Nothing destructive was done"), "{msg}");
+        // Nothing was retired, erased or initialised; staging is as found.
+        assert_eq!(fake.calls(), ["read"]);
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
+        assert_eq!(
+            scalar::<i64>(
+                &s.w.conn,
+                "SELECT COUNT(*) FROM volumes WHERE label = 'NEW'"
+            ),
+            0,
+            "no volume was initialised"
+        );
+        assert!(staged_files(&s.w.config).is_empty());
+        for v in [&s.keepsake, &s.docs] {
+            assert_eq!(set_status(&s.w.conn, v.stage_set_id), "cleaned");
+        }
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+        let outcome: String = scalar(&s.w.conn, "SELECT outcome FROM pending_rewrites");
+        assert_eq!(outcome, "abandoned");
+        assert_eq!(events_of(&s.w.conn, "retired"), 0);
+        assert_eq!(events_of(&s.w.conn, "rewrite_capacity_checked"), 0);
+    }
+
+    /// A passing rehearsal is recorded, with its figures, before the retire.
+    #[test]
+    fn a_passing_capacity_rehearsal_is_recorded_with_its_figures() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        fake.capacity.set(Some(write::CapacityNumbers {
+            staged: 1_000,
+            generated: 2_000,
+            margin: 300,
+            reserve: 40,
+            available: 99_999,
+        }));
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+        let d: String = scalar(
+            &s.w.conn,
+            "SELECT details FROM events WHERE action = 'rewrite_capacity_checked'",
+        );
+        assert!(
+            d.contains("\"staged_bytes\":1000")
+                && d.contains("\"generated_bytes\":2000")
+                && d.contains("\"margin_bytes\":300")
+                && d.contains("\"available_bytes\":99999"),
+            "{d}"
+        );
+        // Recorded before the retire.
+        let order: Vec<String> = s
+            .w
+            .conn
+            .prepare(
+                "SELECT action FROM events WHERE action IN ('rewrite_capacity_checked', 'retired')
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(order, ["rewrite_capacity_checked", "retired"]);
+    }
+
+    /// The expected volume the rehearsal is told about is the source's
+    /// generation and the capacity `volume init` will decide for the cartridge
+    /// -- the lesser of the source's and what the drive's override or the
+    /// cartridge row now says.
+    #[test]
+    fn the_rehearsal_is_told_the_capacity_init_will_decide() {
+        let s = scene(1);
+        // The cartridge row now says less than the source's init decided.
+        s.w.conn
+            .execute("UPDATE cartridges SET nominal_capacity = 50000000", [])
+            .unwrap();
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let p = plan(&s.w.conn, &s.w.config, &o).unwrap();
+        assert_eq!(p.media_type, "LTO-6");
+        assert_eq!(p.planned_capacity, 50_000_000, "the lesser figure");
+        let fake = Fake::new(&s);
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+        assert_eq!(
+            fake.asked.borrow()[1],
+            "write_preflight NEW scoped LTO-6 50000000"
+        );
     }
 }

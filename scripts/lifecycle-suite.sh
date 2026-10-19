@@ -4760,7 +4760,7 @@ PY
     local ev="$RUN/log-rw.events.json"
     TCTL report events --entity volume --json >"$ev" 2>"$ev.err" || { cat "$ev.err" "$ev"; return 1; }
     local a
-    for a in rewrite_started rewrite_staged_verified rewrite_consent rewrite_window_opened rewrite_erased rewrite_initialized rewrite_written rewrite_window_closed; do
+    for a in rewrite_started rewrite_staged_verified rewrite_capacity_checked rewrite_consent rewrite_window_opened rewrite_erased rewrite_initialized rewrite_written rewrite_window_closed; do
         grep -q "\"$a\"" "$ev" || { echo "no $a event: the rewrite's steps are not all recorded"; return 1; }
     done
     grep -q "holds the only copy of these" "$ev" || { echo "the window is not named in the events"; return 1; }
