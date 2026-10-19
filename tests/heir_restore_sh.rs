@@ -730,10 +730,17 @@ const PATHS_COLUMNS_PERMUTED: &[&str] = &[
     "size_bytes",
 ];
 
-/// `paths.tsv`: sorted by unit, version, then path (bytewise).
-fn render_paths(mut units: Vec<(String, i64, Vec<PathRow>)>) -> String {
+/// `paths.tsv`: sorted by unit, version, then path (bytewise). Without
+/// `hash_column` it is the file an index writer from before the hash was added
+/// wrote: the same columns, no `sha256`.
+fn render_paths(mut units: Vec<(String, i64, Vec<PathRow>)>, hash_column: bool) -> String {
+    let columns: Vec<&str> = PATHS_COLUMNS_PERMUTED
+        .iter()
+        .copied()
+        .filter(|c| hash_column || *c != "sha256")
+        .collect();
     units.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-    let mut out = PATHS_COLUMNS_PERMUTED.join("\t");
+    let mut out = columns.join("\t");
     out.push('\n');
     for (unit, version, mut rows) in units {
         rows.sort_by(|a, b| a.3.as_bytes().cmp(b.3.as_bytes()));
@@ -749,7 +756,7 @@ fn render_paths(mut units: Vec<(String, i64, Vec<PathRow>)>) -> String {
                     _ => "x".to_string(),
                 }
             };
-            let cells: Vec<String> = PATHS_COLUMNS_PERMUTED.iter().map(|c| field(c)).collect();
+            let cells: Vec<String> = columns.iter().map(|c| field(c)).collect();
             out.push_str(&cells.join("\t"));
             out.push('\n');
         }
@@ -758,6 +765,17 @@ fn render_paths(mut units: Vec<(String, i64, Vec<PathRow>)>) -> String {
 }
 
 fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Template {
+    build_template_with(tag, tenants, with_index, true)
+}
+
+/// `hash_column` false writes the index as a 1.3.0 build from before the
+/// `sha256` column wrote it (ADR-0012 item 103 added it).
+fn build_template_with(
+    tag: &str,
+    tenants: &[TenantSpec],
+    with_index: bool,
+    hash_column: bool,
+) -> Template {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "heir-restore-sh-template-{tag}-{}",
         std::process::id()
@@ -977,7 +995,10 @@ fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Templa
                     "index/units.tsv",
                     render_units(unit_rows, UNITS_COLUMNS_PERMUTED).as_bytes(),
                 );
-                add("index/paths.tsv", render_paths(path_rows).as_bytes());
+                add(
+                    "index/paths.tsv",
+                    render_paths(path_rows, hash_column).as_bytes(),
+                );
             }
         }
         stub_encrypt(recipients, "", &tar.into_inner().unwrap())
@@ -6186,4 +6207,104 @@ fn a_path_restore_checks_only_the_paths_it_restored() {
         text.contains("File check: 1 of 1 file(s) of 'checked' version 1 do NOT match"),
         "{text}"
     );
+}
+
+/// The same unit and version, indexed by an older 1.3.0 writer that wrote no
+/// `sha256` column. Nothing can be checked against it, and the script says so
+/// instead of calling the files good.
+fn chk_old_index() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template_with("chk-old", &chk_tenants(CHK_TAMPERED), true, false))
+}
+
+#[test]
+fn an_index_with_no_sha256_column_checks_nothing_and_says_so() {
+    let h = Heir::of(chk_old_index(), &[]);
+    let dest = h.sub("restored");
+    let (code, text) = runv(&h, &restore_args(&h, "checked", &dest));
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(
+        text.contains(
+            "the index records no sha256 for the 6 file(s) of 'checked' version 1: not checked"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("match the sha256 recorded"), "{text}");
+}
+
+/// A file with no recorded hash is not checked, and the run says how many
+/// it passed over: `photos/2019` has two regular files in its index (made-up
+/// rows) with no hash.
+#[test]
+fn files_with_no_recorded_hash_are_counted_not_checked() {
+    let h = Heir::new();
+    let photos = unit("photos/2019");
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--unit",
+        "photos/2019",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(
+        text.contains("File check: 6 restored file(s) of 'photos/2019' version 2 match the sha256 recorded in the index (2 more not checked: no sha256 recorded)"),
+        "{text}"
+    );
+    assert!(same_tree(&photos.src, Path::new(&dest)), "{text}");
+}
+
+/// A slice that is not there: dar names the files in it, and the check finds
+/// the same files missing. Each is on the list once, and a fill from a good
+/// copy makes the unit whole.
+#[test]
+fn a_file_dar_and_the_check_both_find_is_listed_once() {
+    let a = Heir::of(chk_good(), &[]);
+    let checked = unit_of(chk_good(), "checked");
+    flip_in_tape(&a, checked.positions[1]);
+    let empty = a.sub("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let dest = a.sub("restored");
+    let (code, text) = a.run(&[
+        "--restore",
+        "--key",
+        &a.key("alice"),
+        "--unit",
+        "checked",
+        "--to",
+        &dest,
+        "--slices-from",
+        &empty,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    assert!(text.contains("File check: "), "{text}");
+    assert!(text.contains("do NOT match"), "{text}");
+    let (_, listed) = damaged_list(&dest);
+    let mut unique = listed.clone();
+    unique.dedup();
+    assert_eq!(listed, unique, "each file once: {listed:?}");
+    let mut by_diff: Vec<String> = damaged_by_diff(&checked.src, Path::new(&dest))
+        .into_iter()
+        .filter(|p| p != ".tapectl-damaged-files.txt")
+        .map(|p| idx_esc(&p))
+        .collect();
+    by_diff.sort();
+    assert_eq!(
+        listed, by_diff,
+        "everything missing or short is listed:\n{text}"
+    );
+    assert!(listed.len() >= 2, "a positive control: {listed:?}");
+
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let b = Heir::of(chk_good(), &[]);
+    let (code, text) = runv(&b, &fill_args(&b, "checked", &list, &dest));
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("FILL COMPLETE"), "{text}");
+    assert!(same_tree(&checked.src, Path::new(&dest)), "{text}");
 }
