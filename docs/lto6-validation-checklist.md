@@ -109,11 +109,18 @@ TAPECTL_BIN=/usr/local/bin/tapectl scripts/lifecycle-suite.sh --scenario first-y
 
 There is no EOT salvage in Layout v2: a real EOT is a clean abort to an unsealed tape,
 and the pre-flight gate (generation table × the fill ceiling, 97% by default) is the capacity defence. What
-to measure is where the drive stops host writes, with `scripts/lto6-fill.sh`:
+to measure is where the drive stops host writes, with `scripts/lto-profile.sh` (the fill is its last
+measurement; `scripts/lto6-fill.sh` remains as a wrapper that runs the fill alone, and
+`scripts/lto6-measure.sh` as one that runs the minutes-long measurements alone):
 
 ```bash
-scripts/lto6-fill.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst --i-will-lose-the-cartridge EW7VWMVKF6
+scripts/lto-profile.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst --i-will-lose-the-cartridge EW7VWMVKF6
 ```
+
+`docs/lto-profiling.md` is the operator-facing account: what each measurement takes, the run
+directory and the `profile.json` report, and `scripts/lto-profile.sh --emit RUN_DIR...`, which
+prints the drive's `[[backends.lto]]` block (`fill_ceiling` and `post_warning_bytes`) from one or more
+runs. `--quick` leaves the fill out for a re-check that takes minutes.
 
 - [ ] One continuous stream (a chunk-per-`dd` loop stops the drive at every close and
       measured 77 MB/s; the stream ran at 163 MB/s).
@@ -128,10 +135,10 @@ scripts/lto6-fill.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst --i-will-lose-
       to 1.0047 for steady feeds (#323). tapectl records the ratio after every write and
       warns above 1.05 on a real drive (#338).
 
-### Past the early warning (#420; not yet run on the real drive)
+### Past the early warning (#420, #479; not yet run on the real drive)
 
 Since 2026-10-17 the fill does not stop at the first refusal. One python process
-(`scripts/lto6-fill-writer.py`) holds the drive open from BOT (closing st writes a filemark),
+(`scripts/lto6-fill-writer.py`, driven by `scripts/lto-profile.sh`) holds the drive open from BOT (closing st writes a filemark),
 turns hardware compression off as tapectl does, and at the first ENOSPC records what st does
 next: it writes one 1 GiB slice (2048 blocks) a block at a time, logging every return, stops
 after 8 consecutive refusals or any other error, then writes a filemark, a seal-sized block and
@@ -139,18 +146,35 @@ a filemark, and reads the slice and the seal back by LOCATE, comparing them with
 written. It then keeps writing to the hard end (capped at 110 GB past the warning, about 12
 minutes), measuring the room from early warning to the hard end, which bounds the slice size
 (ADR-0012 item 100); `--no-hard-end` skips that walk and `--stop-at-warning` keeps the old
-stop. The script refuses while
+stop. The script names the cartridge by its medium serial (checked against MAM before anything is
+written) and refuses while
 `tapectl-drive-poll.timer` is active, on a rewinding node, or without room for its 2 GiB
 keystream in the out dir (`/scratch/tapectl-lto6`, or `~/.cache/tapectl/lto6` where there is
-no `/scratch`). About 5 hours in all; `summary.txt` in the run directory is what to read, and
-exit 1 ("MEASUREMENT COMPLETE (readback: FAIL)") is a finding, not a failure.
+no `/scratch`). About 5 hours in all, since the full run also makes the minutes-long measurements first;
+`PROFILE.txt` in the run directory (`profile-<timestamp>-<serial>/`) is what to read, `fill/summary.txt`
+the fill's own account, and exit 1 ("MEASUREMENT COMPLETE (readback: FAIL)") is a finding, not a failure.
 
 - [ ] Record: what st returned after the first refusal (refused once then accepted, kept
       refusing, or short counts); whether the whole slice, the filemark and the seal block
       were accepted; each readback check.
 - [ ] Record the room from early warning to the hard end, beside page 0x0c's "minimum native
-      capacity from EW to EOP" (99,008 MB on 2026-09-23).
+      capacity from EW to EOP" (99,008 MB on 2026-09-23). The report states both and takes the
+      lower as `post_warning_bytes` (ADR-0012 item 100); `--emit` prints the block.
+- [ ] Record the cartridge's wear beside the end-of-tape point (`profile.json`, `wear`): MAM's
+      load count and lifetime writes as found and at the end, and the drive's rewrite counters
+      (ADR-0012 item 98). Recorded for a later fit, not fitted.
+- [ ] Paste the emitted block into a test config and run `tapectl config check`.
 - [ ] Erase the cartridge afterwards before it serves as the step-12 test cartridge again.
+
+### The measurements that take minutes (`scripts/lto-profile.sh --quick`)
+
+- [ ] Block size: 512 K and 1 M accepted, two passes in alternating order (record: a wash on this
+      drive, 114.0 vs 114.4 MiB/s).
+- [ ] Hardware compression as found (mode page 0x0f, DCE), and the Control Data Protection page
+      (0x0a/0xf0): MODE SENSE only.
+- [ ] MAM's capacity unit and over-report (record: MiB, over-report 0 bytes on 2026-09-23).
+- [ ] End of data: a forward read past it errors, it does not return stale data (§3.2's assumption;
+      not yet measured on the real drive).
 
 ## After a pass
 

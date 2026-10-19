@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""lto6-fill-writer.py -- the one-process tape writer, reader and summary of
-scripts/lto6-fill.sh (issue #420, the short seal at the drive's early warning).
+"""lto6-fill-writer.py -- the one-process tape writer, reader and summary of the fill in
+scripts/lto-profile.sh (issue #420, the short seal at the drive's early warning; issue #479 moved
+the driver, and scripts/lto6-fill.sh is now a wrapper of it). The file keeps its historical name.
 
 WHY IT IS ONE PROCESS. The Linux st driver admits one opener, and closing it
 after a write makes the driver write a filemark. Everything this run measures
@@ -13,7 +14,7 @@ and, on request, the walk to the hard end, without ever closing the device in
 between. Its status calls are MTIOCGET (no SCSI command) and, at three points
 where a flush happens anyway, MTIOCPOS (READ POSITION).
 
-Subcommands (scripts/lto6-fill.sh drives them; see its header):
+Subcommands (scripts/lto-profile.sh drives them; see its header):
 
   write    open DEV, fill from BOT to the first refusal, then the past-warning
            phase. Writes RUN/result.json, RUN/writer.log (every attempt of the
