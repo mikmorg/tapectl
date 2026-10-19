@@ -11633,6 +11633,184 @@ mod tests {
         assert_eq!(units[0].slices[0].sha256_encrypted, "b");
     }
 
+    /// Issue #483: a `volume rewrite` writes only its own stage sets. The
+    /// scope drops sets from the selection and leaves the order the query
+    /// gives (alphabetical by unit), and `None` is every staged set.
+    #[test]
+    fn find_staged_data_with_a_scope_returns_only_those_sets_in_the_same_order() {
+        let conn = crate::db::open_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        let mut ids = std::collections::BTreeMap::new();
+        for name in ["zeta", "alpha", "mid"] {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+                params![name, tenant_id],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, 1, 'staged', '/tmp', 1, 10)",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_slices
+                    (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+                 VALUES (?1, 1, 10, 10, 'a', 'b', '/tmp/x')",
+                params![ss_id],
+            )
+            .unwrap();
+            ids.insert(name, ss_id);
+        }
+        let names = |only: Option<&[i64]>| -> Vec<String> {
+            find_staged_data(&conn, only)
+                .unwrap()
+                .into_iter()
+                .map(|u| u.unit_name)
+                .collect()
+        };
+        assert_eq!(names(None), ["alpha", "mid", "zeta"]);
+        assert_eq!(names(Some(&[ids["zeta"], ids["mid"]])), ["mid", "zeta"]);
+        assert_eq!(names(Some(&[ids["alpha"]])), ["alpha"]);
+        assert!(
+            names(Some(&[])).is_empty(),
+            "an empty scope selects nothing"
+        );
+    }
+
+    /// Issue #483: a staged set outside the write's scope can neither be
+    /// written by it nor refuse it — the whole-on-disk check is scoped too,
+    /// so an unrelated broken set cannot stop a write hours after an erase.
+    #[test]
+    fn check_staged_slices_with_a_scope_ignores_a_set_outside_it() {
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        conn.execute(
+            "INSERT INTO tenants (name, is_operator, status) VALUES ('t1', 0, 'active')",
+            [],
+        )
+        .unwrap();
+        let tenant_id = conn.last_insert_rowid();
+        let mut make = |name: &str, on_disk: bool| -> i64 {
+            conn.execute(
+                "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                 VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+                params![name, tenant_id],
+            )
+            .unwrap();
+            let unit_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                 VALUES (?1, 1, 'current', '/tmp', 1, 10)",
+                params![unit_id],
+            )
+            .unwrap();
+            let snap_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                params![snap_id],
+            )
+            .unwrap();
+            let ss_id = conn.last_insert_rowid();
+            let path = tmp.path().join(format!("{name}.age"));
+            if on_disk {
+                std::fs::write(&path, [7u8; 10]).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO stage_slices
+                    (stage_set_id, slice_number, size_bytes, encrypted_bytes, sha256_plain, sha256_encrypted, staging_path)
+                 VALUES (?1, 1, 10, 10, 'a', 'b', ?2)",
+                params![ss_id, path.to_string_lossy()],
+            )
+            .unwrap();
+            ss_id
+        };
+        let whole = make("whole", true);
+        let broken = make("broken", false);
+
+        let err = check_staged_slices(&conn, None).unwrap_err().to_string();
+        assert!(
+            err.contains("broken"),
+            "unscoped, the broken set refuses: {err}"
+        );
+        check_staged_slices(&conn, Some(&[whole]))
+            .expect("scoped to the whole set, the broken one is not this write's business");
+        let err = check_staged_slices(&conn, Some(&[broken]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("broken.age") && !err.contains("whole.age"),
+            "{err}"
+        );
+    }
+
+    /// Issue #483: `compact-read` reports the stage sets it promoted and the
+    /// slice files it wrote, with the `staging_path` each replaced — what
+    /// `volume rewrite` re-reads from the disk and puts back if it refuses.
+    #[test]
+    fn compact_read_reports_the_sets_and_files_it_staged() {
+        let conn = crate::db::open_memory().unwrap();
+        let data = b"compact_read report fixture plaintext, repeated. ".repeat(10);
+        let slice_id = seed_one_slice_fixture(
+            &conn,
+            "CRREPORT",
+            "cr-report",
+            4,
+            &data,
+            "completed",
+            "staged",
+        );
+        let set_id = stage_set_of_slice(&conn, slice_id);
+        conn.execute("UPDATE stage_sets SET status = 'cleaned'", [])
+            .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.staging.directory = tmp.path().to_string_lossy().into_owned();
+        let mut store = mem_store_with_slice_at(4, &data);
+        let report = compact_read(
+            &conn,
+            &config,
+            "CRREPORT",
+            &mut store,
+            site(Operation::VolumeRewrite),
+        )
+        .unwrap();
+
+        assert_eq!(report.staged_sets, vec![set_id]);
+        assert_eq!(report.staged.len(), 1);
+        let staged = &report.staged[0];
+        assert_eq!(staged.slice_id, slice_id);
+        assert_eq!(staged.stage_set_id, set_id);
+        assert_eq!(staged.prior, None, "the set was released: no path before");
+        assert_eq!(std::fs::read(&staged.path).unwrap(), data);
+        assert!(staged.path.starts_with(tmp.path().join("compact-CRREPORT")));
+        let (path, status): (Option<String>, String) = conn
+            .query_row(
+                "SELECT sl.staging_path, ss.status FROM stage_slices sl
+                 JOIN stage_sets ss ON ss.id = sl.stage_set_id WHERE sl.id = ?1",
+                params![slice_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path.as_deref(), Some(staged.path.to_str().unwrap()));
+        assert_eq!(status, "staged");
+    }
+
     #[test]
     fn find_staged_data_skips_stage_sets_with_no_staged_slices() {
         // A stage_set whose only slice has staging_path = NULL (never
@@ -16899,6 +17077,8 @@ mod tests {
             for (operation, expected) in [
                 (Operation::VolumeCompactRead, "volume compact-read"),
                 (Operation::VolumeCompact, "volume compact"),
+                // Issue #483: `volume rewrite`'s read is its own command.
+                (Operation::VolumeRewrite, "volume rewrite"),
             ] {
                 let conn = crate::db::open_memory().unwrap();
                 let data = b"compact-read contact fixture bytes, repeated. ".repeat(4);

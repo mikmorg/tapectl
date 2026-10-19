@@ -5352,6 +5352,77 @@ mod tests {
             })
         }
 
+        /// Issue #483: `volume rewrite`'s flag surface. SOURCE and `--label`
+        /// together, or `--resume` alone; the typed consent has its own flag
+        /// and there is no `--force` (the Tier-2 waiver is the global
+        /// `--yes`, which does not reach the typed consent).
+        #[test]
+        fn rewrite_takes_a_source_and_a_label_or_a_resume() {
+            let VolumeCommands::Rewrite {
+                source,
+                label,
+                resume,
+                only_copy_on_staging,
+                with_staged,
+                keep_staging,
+                ..
+            } = try_parse(&["rewrite", "L6-0001", "--label", "L6-0009"]).unwrap()
+            else {
+                panic!("a rewrite");
+            };
+            assert_eq!(source.as_deref(), Some("L6-0001"));
+            assert_eq!(label.as_deref(), Some("L6-0009"));
+            assert!(resume.is_none() && only_copy_on_staging.is_none());
+            assert!(!with_staged && !keep_staging, "both default off");
+
+            let VolumeCommands::Rewrite {
+                resume,
+                source,
+                label,
+                ..
+            } = try_parse(&["rewrite", "--resume", "L6-0009"]).unwrap()
+            else {
+                panic!("a rewrite");
+            };
+            assert_eq!(resume.as_deref(), Some("L6-0009"));
+            assert!(source.is_none() && label.is_none());
+
+            let VolumeCommands::Rewrite {
+                only_copy_on_staging,
+                with_staged,
+                keep_staging,
+                ..
+            } = try_parse(&[
+                "rewrite",
+                "L6-0001",
+                "--label",
+                "L6-0009",
+                "--only-copy-on-staging",
+                "L6-0001",
+                "--with-staged",
+                "--keep-staging",
+            ])
+            .unwrap()
+            else {
+                panic!("a rewrite");
+            };
+            assert_eq!(only_copy_on_staging.as_deref(), Some("L6-0001"));
+            assert!(with_staged && keep_staging);
+
+            for bad in [
+                &["rewrite", "L6-0001"][..],
+                &["rewrite", "--label", "L6-0009"],
+                &["rewrite"],
+                &["rewrite", "L6-0001", "--label", "N", "--resume", "N"],
+                &["rewrite", "--resume", "N", "--only-copy-on-staging", "S"],
+                &["rewrite", "--resume", "N", "--with-staged"],
+                &["rewrite", "L6-0001", "--label", "N", "--force"],
+                &["rewrite", "--resume", "N", "--force"],
+            ] {
+                assert!(try_parse(bad).is_err(), "{bad:?} must be a usage error");
+            }
+        }
+
         #[test]
         fn verify_takes_a_label_or_none() {
             let VolumeCommands::Verify { label, .. } = try_parse(&["verify", "L6-0002"]).unwrap()

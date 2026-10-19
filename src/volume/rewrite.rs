@@ -3538,4 +3538,115 @@ mod tests {
             "{msg}"
         );
     }
+
+    // ── what counts as a copy elsewhere ─────────────────────────────────────
+
+    #[test]
+    fn a_slice_has_a_copy_elsewhere_only_on_another_eligible_volume() {
+        let s = scene(1);
+        let sole = |s: &Scene| -> Vec<(String, i64)> {
+            coverage::sole_slices(&s.w.conn, s.src)
+                .unwrap()
+                .into_iter()
+                .map(|x| (x.unit_name, x.version))
+                .collect()
+        };
+        // Nothing elsewhere: keepsake (2 slices) and docs (1); `old` is
+        // reclaimable, so not live.
+        assert_eq!(
+            sole(&s),
+            [
+                ("docs".to_string(), 1),
+                ("keepsake".to_string(), 1),
+                ("keepsake".to_string(), 1)
+            ]
+        );
+        let total: i64 = coverage::sole_slices(&s.w.conn, s.src)
+            .unwrap()
+            .iter()
+            .map(|x| x.encrypted_bytes)
+            .sum();
+        assert_eq!(
+            total as usize,
+            s.keepsake.data.iter().map(Vec::len).sum::<usize>() + s.docs.data[0].len()
+        );
+
+        // A sealed, unquarantined volume with a copy: covered (quick-confirmed
+        // is enough for a copy; the fully-read-back test is the hold's).
+        copy_elsewhere(&s, &s.keepsake, &[1, 2], false, "OTHER");
+        assert_eq!(sole(&s), [("docs".to_string(), 1)]);
+
+        // Quarantined, retired, or never sealed: carries nothing that counts.
+        for (sql, why) in [
+            (
+                "UPDATE volumes SET observed_condition = 'quarantined' WHERE label = 'OTHER'",
+                "quarantined",
+            ),
+            (
+                "UPDATE volumes SET observed_condition = 'ok', status = 'retired' WHERE label = 'OTHER'",
+                "retired",
+            ),
+            (
+                "UPDATE volumes SET status = 'initialized' WHERE label = 'OTHER'",
+                "unsealed",
+            ),
+        ] {
+            s.w.conn.execute(sql, []).unwrap();
+            assert_eq!(sole(&s).len(), 3, "a {why} copy is no copy");
+        }
+        s.w.conn
+            .execute(
+                "UPDATE volumes SET status = 'sealed' WHERE label = 'OTHER'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(sole(&s).len(), 1, "positive control: sealed and ok again");
+    }
+
+    /// The consent facts the typed gate shows: every unit and version at
+    /// stake, the staging path and the window sentence of item 106.
+    #[test]
+    fn the_typed_consent_names_the_units_the_staging_path_and_the_window() {
+        let s = scene(1);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let plan = plan(&s.w.conn, &s.w.config, &o).unwrap();
+        assert!(plan.needs_typed_consent());
+        let facts = plan.typed_facts("SRC", "NEW").join("\n");
+        assert!(
+            facts.contains("volume \"SRC\" holds the ONLY copy of these units"),
+            "{facts}"
+        );
+        assert!(facts.contains("unit \"docs\" v1: 1 slice(s)"), "{facts}");
+        assert!(
+            facts.contains("unit \"keepsake\" v1: 2 slice(s)"),
+            "{facts}"
+        );
+        assert!(
+            !facts.contains("\"old\""),
+            "a reclaimable version is not at stake: {facts}"
+        );
+        let staging = s.w.config.staging.directory.clone();
+        assert!(
+            facts.contains(&format!(
+                "from the erase until \"NEW\" seals and passes a full readback, the staging \
+                 disk at {staging}/compact-SRC holds the only copy of these"
+            )),
+            "{facts}"
+        );
+        assert!(
+            facts.contains("tapectl volume rewrite --resume NEW"),
+            "{facts}"
+        );
+
+        // With a copy of every live version elsewhere, the typed consent is
+        // not needed and the dry-run says so.
+        copy_elsewhere(&s, &s.keepsake, &[1, 2], true, "OTHER-A");
+        copy_elsewhere(&s, &s.docs, &[3], true, "OTHER-B");
+        let plan = super::plan(&s.w.conn, &s.w.config, &o).unwrap();
+        assert!(!plan.needs_typed_consent());
+        let said = plan.describe("SRC", "NEW").join("\n");
+        assert!(said.contains("consent: none needed"), "{said}");
+        assert_eq!(plan.to_json("SRC", "NEW")["consent"], "none");
+    }
 }

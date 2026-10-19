@@ -728,6 +728,16 @@ mod tests {
             name(&["stage", "create", "keepsake/a", "keepsake/b", "keepsake/c"]).as_deref(),
             Some("stage create keepsake/a +2 more")
         );
+        // Issue #483: a rewrite is hours of tape; it has a session log, named
+        // for the volume it rewrites or the one it resumes.
+        assert_eq!(
+            name(&["volume", "rewrite", "L6-0001", "--label", "L6-0009"]).as_deref(),
+            Some("volume rewrite L6-0001")
+        );
+        assert_eq!(
+            name(&["volume", "rewrite", "--resume", "L6-0009"]).as_deref(),
+            Some("volume rewrite --resume L6-0009")
+        );
     }
 
     /// ADR-0012, 2026-10-07 items 19 and 20 (issue #408): which commands'
