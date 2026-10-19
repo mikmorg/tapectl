@@ -466,10 +466,13 @@ pub struct LtoBackendConfig {
     ///
     /// When set, a slice plus the seal must fit in HALF of the smallest such
     /// room among the configured drives (a 2x margin for wear and variance):
-    /// `config check` (so every load) refuses a `slice_size` in
-    /// `[defaults]` or an `[[archive_sets]]` entry that does not, and
-    /// `stage create` refuses the slice size in force for a unit
-    /// ([`Config::slice_cap_problem`]).
+    /// `config check` reports (as an error, exiting non-zero) a `slice_size` in
+    /// `[defaults]` or an `[[archive_sets]]` entry that does not, `config set`
+    /// refuses an edit that makes one, and `stage create` refuses the slice
+    /// size in force for a unit ([`Config::slice_cap_problems`],
+    /// [`Config::slice_cap_problem`]). The file still LOADS: nothing else
+    /// reads `slice_size` or this key, and a staging setting must never block
+    /// a restore.
     ///
     /// Decimal, like `capacity_override` and for the same reason: it is a
     /// physical amount of tape, and log page 0x0c states it in decimal MB
@@ -1177,10 +1180,10 @@ impl Config {
     /// or the unit it was resolved for). `None` when it fits, or when no
     /// drive declares a room.
     ///
-    /// Shared by `Config::load` (through [`Config::range_problems`], which is
-    /// what makes `config check` and `config set` refuse it) and `stage
-    /// create` (which holds the slice size the unit's dotfile, archive set
-    /// and `[defaults]` resolve to), so the two cannot disagree.
+    /// Shared by [`Config::slice_cap_problems`] (the file-level check behind
+    /// `config check` and `config set`) and `stage create` (which holds the
+    /// slice size the unit's dotfile, archive set and `[defaults]` resolve
+    /// to), so the two cannot disagree.
     pub fn slice_cap_problem(&self, what: &str, slice_bytes: u64) -> Option<String> {
         let room = self.smallest_post_warning_room()?;
         let half = room.bytes / 2;
@@ -1211,6 +1214,46 @@ impl Config {
             needed_slice = slice_bytes_on_tape(slice_bytes),
             seal = SEAL_ALLOWANCE_BYTES,
         ))
+    }
+
+    /// Issue #479 (ADR-0012 2026-10-17 item 100): the file-level half of the
+    /// slice cap. With a measured post-warning room configured, `[defaults]`'s
+    /// `slice_size` and every `[[archive_sets]]` entry's must leave a slice and
+    /// the seal inside half of it ([`Config::slice_cap_problem`]). A slice size
+    /// that does not parse is [`Config::size_problems`]'s to report and is
+    /// skipped here.
+    ///
+    /// **Deliberately not a load problem.** `slice_size` is a staging setting;
+    /// a config that breaks the cap must still load, so that `restore`,
+    /// `volume verify`, `volume read-slices`, `catalog rebuild` and every other
+    /// command that never cuts a slice keeps working (a staging setting must
+    /// never block reading a tape in an emergency). `config check` reports
+    /// these as errors and exits non-zero, `config set` refuses an edit that
+    /// adds one, and `stage create` refuses the slice size in force for a unit.
+    pub fn slice_cap_problems(&self, path: &Path) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.smallest_post_warning_room().is_none() {
+            return problems;
+        }
+        let mut check = |what: String, text: &str| {
+            if let Ok(bytes) = crate::staging::parse_size_to_bytes(text) {
+                if bytes > 0 {
+                    if let Some(msg) = self.slice_cap_problem(&what, bytes as u64) {
+                        problems.push(format!("{}: {msg}", path.display()));
+                    }
+                }
+            }
+        };
+        check("defaults.slice_size".to_string(), &self.defaults.slice_size);
+        for (i, as_cfg) in self.archive_sets.iter().enumerate() {
+            if let Some(s) = &as_cfg.slice_size {
+                check(
+                    format!("archive_sets[{i}] (\"{}\").slice_size", as_cfg.name),
+                    s,
+                );
+            }
+        }
+        problems
     }
 
     /// This config with every `[[backends.lto]]` block's
@@ -1632,30 +1675,6 @@ impl Config {
                     path.display(),
                     backend.name
                 ));
-            }
-        }
-        // Issue #479 (ADR-0012 2026-10-17 item 100): with a measured
-        // post-warning room configured, the slice size must leave a slice and
-        // the seal inside half of it. A slice size that does not parse is
-        // `size_problems`'s to report, and is skipped here.
-        if self.smallest_post_warning_room().is_some() {
-            let mut check = |what: String, text: &str| {
-                if let Ok(bytes) = crate::staging::parse_size_to_bytes(text) {
-                    if bytes > 0 {
-                        if let Some(msg) = self.slice_cap_problem(&what, bytes as u64) {
-                            problems.push(format!("{}: {msg}", path.display()));
-                        }
-                    }
-                }
-            };
-            check("defaults.slice_size".to_string(), &self.defaults.slice_size);
-            for (i, as_cfg) in self.archive_sets.iter().enumerate() {
-                if let Some(s) = &as_cfg.slice_size {
-                    check(
-                        format!("archive_sets[{i}] (\"{}\").slice_size", as_cfg.name),
-                        s,
-                    );
-                }
             }
         }
         // Issue #422: an archive set's verify interval below one day; issue
@@ -3443,18 +3462,22 @@ mod tests {
         assert!(msg.contains("backends.lto[\"tight\"]"), "{msg}");
     }
 
-    /// The refusal at load: `[defaults]`'s slice size over half the room is a
-    /// load error (so `config check` exits non-zero and `config set` refuses
-    /// the edit), naming the key, the drive and the numbers; a slice size
-    /// that fits loads.
+    /// `[defaults]`'s slice size over half the room is NOT a load error (a
+    /// staging setting must never block a restore): the file loads, and the
+    /// file-level check reports the problem, naming the key, the drive and the
+    /// numbers, for `config check` (an error line, a non-zero exit) and `config
+    /// set` to act on. A slice size that fits reports nothing.
     #[test]
-    fn a_default_slice_size_over_half_the_room_is_refused_at_load() {
+    fn a_default_slice_size_over_half_the_room_loads_and_is_reported_as_a_slice_cap_problem() {
         // 2 GB of room: half is 1,000,000,000 bytes, below one 1 GiB slice.
         let text = room_config(Some("2G"), "1G", "");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, &text).unwrap();
-        let msg = Config::load(&path).unwrap_err().to_string();
+        let cfg = Config::load(&path).expect("the file loads: only staging is affected");
+        let problems = cfg.slice_cap_problems(&path);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        let msg = &problems[0];
         assert!(
             msg.contains("defaults.slice_size = 1.0 GiB (1073741824 bytes)")
                 && msg.contains("backends.lto[\"d\"].post_warning_bytes = 2G (2000000000 bytes)")
@@ -3463,26 +3486,32 @@ mod tests {
                 && msg.contains("ADR-0012 item 100"),
             "{msg}"
         );
+        // The lenient report (config check's and config set's view) is VALID,
+        // so nothing about the load changes, and carries the problem apart.
         let report = crate::policy::lenient_config::check(&text, &path);
-        assert!(!report.valid);
-        assert_eq!(report.problems[0], msg, "config check says what load says");
+        assert!(report.valid && report.problems.is_empty());
+        assert_eq!(&report.slice_cap_problems, &problems);
         // 3 GB of room: half is 1.5e9; a 1 GiB slice and the seal fit.
-        load_text(&room_config(Some("3G"), "1G", "")).unwrap();
+        let ok = load_text(&room_config(Some("3G"), "1G", "")).unwrap();
+        assert!(ok.slice_cap_problems(Path::new("config.toml")).is_empty());
     }
 
     /// An `[[archive_sets]]` entry's slice size is checked the same way and
-    /// named by position and name.
+    /// named by position and name; the file loads.
     #[test]
-    fn an_archive_set_slice_size_over_half_the_room_is_refused_at_load() {
+    fn an_archive_set_slice_size_over_half_the_room_is_reported_and_the_file_loads() {
         let extra = "\n[[archive_sets]]\nname = \"bulk\"\nslice_size = \"30G\"\n";
-        let msg = load_text(&room_config(Some("40G"), "1G", extra)).unwrap_err();
+        let cfg = load_text(&room_config(Some("40G"), "1G", extra)).expect("loads");
+        let problems = cfg.slice_cap_problems(Path::new("config.toml"));
+        assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
-            msg.contains("archive_sets[0] (\"bulk\").slice_size = 30.0 GiB")
-                && msg.contains("post_warning_bytes = 40G"),
-            "{msg}"
+            problems[0].contains("archive_sets[0] (\"bulk\").slice_size = 30.0 GiB")
+                && problems[0].contains("post_warning_bytes = 40G"),
+            "{problems:?}"
         );
         let ok = "\n[[archive_sets]]\nname = \"bulk\"\nslice_size = \"2G\"\n";
-        load_text(&room_config(Some("40G"), "1G", ok)).unwrap();
+        let cfg = load_text(&room_config(Some("40G"), "1G", ok)).unwrap();
+        assert!(cfg.slice_cap_problems(Path::new("config.toml")).is_empty());
     }
 
     /// The seal is accounted: the limit is on slice PLUS seal, so the largest

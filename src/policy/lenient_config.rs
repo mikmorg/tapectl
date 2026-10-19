@@ -66,6 +66,15 @@ pub struct LenientReport {
     /// stripper before it reached a real `Config`. `Some` whenever `valid`
     /// is `true`.
     pub best_effort: Option<Config>,
+    /// Issue #479: problems with a config that LOADS but that `config check`
+    /// refuses and `config set` will not write: today, a `slice_size` too
+    /// large for the measured `post_warning_bytes`
+    /// ([`Config::slice_cap_problems`]). They are not load problems, so
+    /// they never touch `valid` or `problems` (which mirror `Config::load`
+    /// exactly): every other command loads the file and runs, because a
+    /// staging setting must never block reading a tape. Computed from
+    /// `best_effort` whenever there is one.
+    pub slice_cap_problems: Vec<String>,
 }
 
 /// Bound on how many unknown keys this will strip-and-retry before giving
@@ -98,6 +107,7 @@ fn report(verdict: crate::error::Result<Config>, content: &str, path: &Path) -> 
         Ok(cfg) => LenientReport {
             valid: true,
             problems: Vec::new(),
+            slice_cap_problems: cfg.slice_cap_problems(path),
             best_effort: Some(cfg),
         },
         Err(load_err) => {
@@ -106,6 +116,10 @@ fn report(verdict: crate::error::Result<Config>, content: &str, path: &Path) -> 
             LenientReport {
                 valid: false,
                 problems,
+                slice_cap_problems: best_effort
+                    .as_ref()
+                    .map(|cfg| cfg.slice_cap_problems(path))
+                    .unwrap_or_default(),
                 best_effort,
             }
         }

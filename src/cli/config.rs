@@ -23,6 +23,13 @@
 //! already treats as fatal. `Check` is the one command allowed to survive
 //! that fact long enough to report it in full; see
 //! [`crate::policy::lenient_config`] for how.
+//!
+//! The one addition (issue #479): a config that LOADS but breaks the slice
+//! cap (`slice_size` too large for `post_warning_bytes`) is reported as an
+//! `error:` line and also exits non-zero, though every other command loads
+//! and runs it. The check lives here, in `config check`'s own report path,
+//! and in `config set` and `stage create`, never in `Config::load`: a
+//! staging setting must not block a restore.
 
 use rusqlite::Connection;
 
@@ -329,7 +336,7 @@ fn run_check(conn: &Connection, paths: &TapectlPaths, json_output: bool) -> Resu
         );
     }
 
-    Ok(if report.valid {
+    Ok(if report.valid && report.slice_cap_problems.is_empty() {
         EXIT_SUCCESS
     } else {
         EXIT_ERROR
@@ -509,6 +516,7 @@ fn print_json(
         serde_json::json!({
             "valid": report.valid,
             "problems": report.problems,
+            "slice_cap_problems": report.slice_cap_problems,
             "shadowing_dotfiles": shadowing_json,
             "subsumed_policy_fields": subsumed_json,
             "decorative_keys": decorative_json,
@@ -556,6 +564,12 @@ fn print_human(
         for problem in &report.problems {
             println!("  - {problem}");
         }
+    }
+    // Issue #479: the file loads, so every other command runs, but a slice
+    // size the measured post-warning room cannot hold is an error `config
+    // check` reports and exits non-zero on.
+    for problem in &report.slice_cap_problems {
+        println!("error: {problem}");
     }
     for hit in shadowing_hits {
         let mut fields = Vec::new();

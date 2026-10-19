@@ -131,11 +131,13 @@ fn the_room_key_is_refused_when_the_default_slice_cannot_be_sealed_in_it() {
     assert!(refused.contains("post_warning_bytes"), "{refused}");
 }
 
+/// The file-level cap is `config check`'s and `config set`'s, never a load error: a staging setting must
+/// not block reading a tape. Written by hand (the editor would have refused it), the file breaks the cap,
+/// `config check` reports an `error:` line and exits non-zero, and every other command loads it and runs.
 #[test]
-fn config_check_exits_nonzero_on_a_file_that_breaks_the_cap_and_one_edit_repairs_it() {
+fn config_check_fails_on_a_file_that_breaks_the_cap_but_every_other_command_still_runs() {
     let home = home_with_drive();
     let h = home.path();
-    // Written by hand: the editor would have refused it.
     let cfg = config_path(h);
     let original = std::fs::read_to_string(&cfg).unwrap();
     let broken = original.replacen(
@@ -149,25 +151,67 @@ fn config_check_exits_nonzero_on_a_file_that_breaks_the_cap_and_one_edit_repairs
     );
     std::fs::write(&cfg, broken).unwrap();
 
+    // config check: the file loads (the `config: valid` line), and the cap is an error with a non-zero exit.
     let out = run(h, &["config", "check"]);
     assert!(!out.status.success(), "{}", text(&out));
     let all = text(&out);
+    assert!(all.contains("config: valid"), "the file loads: {all}");
+    assert!(!all.contains("config: INVALID"), "{all}");
     assert!(
-        all.contains("post_warning_bytes = 2G") && all.contains("defaults.slice_size"),
+        all.contains("error: ")
+            && all.contains("defaults.slice_size")
+            && all.contains("post_warning_bytes = 2G"),
         "{all}"
     );
-    // Every other command refuses the file too (it is a load error), by the
-    // same text.
-    let other = run(h, &["unit", "list"]);
-    assert!(!other.status.success(), "{}", text(&other));
-    assert!(
-        text(&other).contains("post_warning_bytes"),
-        "{}",
-        text(&other)
+    let json = run(h, &["--json", "config", "check"]);
+    assert!(!json.status.success(), "{}", text(&json));
+    let v: serde_json::Value = serde_json::from_slice(&json.stdout).expect("--json is JSON");
+    assert_eq!(v["valid"], true, "{v}");
+    assert_eq!(
+        v["slice_cap_problems"].as_array().map(Vec::len),
+        Some(1),
+        "{v}"
     );
 
-    // The editor still works on it, and an edit that fixes the problem is
-    // accepted: the file loads again.
+    // Every other command loads the file and runs as before: the ones that read a catalog, and the restore
+    // path that never cuts a slice.
+    ok(h, &["unit", "list"]);
+    ok(h, &["volume", "list"]);
+    let missing = run(
+        h,
+        &[
+            "restore",
+            "unit",
+            "--unit",
+            "no-such-unit",
+            "--from",
+            "L6-0001",
+            "--to",
+            "/tmp/tapectl-post-warning-restore",
+            "--dry-run",
+        ],
+    );
+    let missing_text = text(&missing);
+    assert!(
+        !missing.status.success() && !missing_text.contains("post_warning_bytes"),
+        "restore unit loaded the config and failed for its own reason (no such unit), not the cap: {missing_text}"
+    );
+    assert!(
+        missing_text.contains("no-such-unit") || missing_text.contains("L6-0001"),
+        "{missing_text}"
+    );
+
+    // An edit that leaves the cap problem as it was goes through, with a warning; one that adds a problem
+    // is refused; the repair is accepted and `config check` passes.
+    let unrelated = run(h, &["config", "set", "defaults.min_copies", "3"]);
+    assert!(unrelated.status.success(), "{}", text(&unrelated));
+    assert!(
+        String::from_utf8_lossy(&unrelated.stderr).contains("still breaks the slice cap"),
+        "{}",
+        text(&unrelated)
+    );
+    let worse = set_refused(h, "backends.lto[hp].post_warning_bytes", "1G");
+    assert!(worse.contains("post_warning_bytes = 1G"), "{worse}");
     ok(h, &["config", "set", "defaults.slice_size", "256M"]);
     ok(h, &["config", "check"]);
 }

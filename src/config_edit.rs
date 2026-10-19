@@ -367,6 +367,17 @@ fn combos(slots: &[Vec<Value>]) -> Vec<Vec<usize>> {
 /// Whether `after` may be written over a file whose report was `before`:
 /// it loads, or (on a file that already failed) it adds no problem.
 fn acceptable(before: &LenientReport, after: &LenientReport) -> bool {
+    // Issue #479: a slice size the measured post-warning room cannot hold is
+    // not a load problem, but an edit must not write one. A cap problem the
+    // file already had, unchanged, does not make the edit unacceptable (it
+    // may be an unrelated edit, or part of the repair).
+    if after
+        .slice_cap_problems
+        .iter()
+        .any(|p| !before.slice_cap_problems.contains(p))
+    {
+        return false;
+    }
     if after.valid {
         return true;
     }
@@ -461,7 +472,7 @@ fn search(
         first.get_or_insert(report);
     }
     let report = first.expect("combos always yields at least one choice");
-    let problems: Vec<String> = report
+    let mut problems: Vec<String> = report
         .problems
         .iter()
         .filter(|p| {
@@ -469,6 +480,13 @@ fn search(
         })
         .map(|p| format!("  - {p}"))
         .collect();
+    problems.extend(
+        report
+            .slice_cap_problems
+            .iter()
+            .filter(|p| !before.slice_cap_problems.contains(p))
+            .map(|p| format!("  - {p}")),
+    );
     Err(TapectlError::Config(format!(
         "config {} {} refused; {} is unchanged:\n{}",
         edit.verb(),
@@ -491,6 +509,14 @@ fn finish(
     } else {
         after.problems[1..].to_vec()
     };
+    // Issue #479: the file loads, but `config check` still refuses it.
+    let mut warnings = warnings;
+    warnings.extend(
+        after
+            .slice_cap_problems
+            .iter()
+            .map(|p| format!("warning: the file still breaks the slice cap (`tapectl config check` exits non-zero): {p}")),
+    );
     Planned {
         changed: text != original,
         new_text: text,
