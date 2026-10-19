@@ -331,6 +331,7 @@ cross-volume index: about 1.1 KiB per tape, 2.2 KiB on it with the envelope back
 $ tapectl volume init L8-0001
 cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
 volume "L8-0001" initialized (id=1)
+medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
 
 $ tapectl volume write L8-0001
 about to write to volume "L8-0001":
@@ -2641,6 +2642,7 @@ that is the only identifier the tape carries:
 ```text
 cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
 volume "L8-0001" initialized (id=1)
+medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
 ```
 
 Now put a sticker on the shell and tell the catalog what it says. Before or
@@ -2834,7 +2836,10 @@ cannot drift apart. `volume move` does the same from the other end.
 drive can hold both. Declare the drive once as `generation = "LTO-6"`; tapectl
 reads each cartridge's own generation from the medium at `volume init` and
 plans that tape against that generation's capacity — 1.5 TB for LTO-5, 2.5 TB
-for LTO-6 (decimal terabytes, as printed on the cartridge). There is nothing to
+for LTO-6 (decimal terabytes, as printed on the cartridge). `volume init` says what it took the
+cartridge for on its last line, for example `medium: LTO-5, 1.50 TB (the cartridge chip's
+medium density code 0x58)`; the same line follows `volume write --init`, on stderr. `volume
+list` shows the GENERATION and CAPACITY of every volume. There is nothing to
 change between tapes and nothing to remember. If you load media the drive
 cannot write, `volume init` refuses before touching the tape, and no `--force`
 overrides it.

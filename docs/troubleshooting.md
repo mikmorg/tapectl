@@ -1541,7 +1541,7 @@ Related refusals:
 
 ```text
 error: an <drive-gen> drive cannot write <medium-gen> media. This is a physical limit of the drive, not a
-policy — --force does not override it. Load a <drive-gen>-writable cartridge, or write this one in a drive that
+policy — --force does not override it. Load an <drive-gen>-writable cartridge, or write this one in a drive that
 can.
 
 If this drive is not really an <drive-gen>, `generation` in the [[backends.lto]] block named "<name>" (<device>)
