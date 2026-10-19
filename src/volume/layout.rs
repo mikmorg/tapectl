@@ -1352,9 +1352,9 @@ v.label = 'TAPE'`:
       ORDER BY u.name, s.version, v.label;"
 
 A tape holds a good copy when its `status` is `sealed` and its `condition`
-is `ok`. `erased` and `retired` hold nothing now. `quarantined` (a
-`condition`) is a sealed tape whose medium a verify proved bad: it may read
-in part, so prefer another holder. Any other status is a tape that was
+is `ok`. `erased` is a wiped tape and `retired` one taken out of service:
+neither is a copy. `quarantined` (a `condition`) is a sealed tape whose
+medium a verify proved bad: it may read in part, so prefer another holder. Any other status is a tape that was
 never finished, or that tapectl did not write: count on nothing from it.
 `tape` is the tape's label, the one File 0 shows. The sticker is the barcode
 on the cartridge, which can have been replaced; the chip serial is File 0's
@@ -1599,12 +1599,13 @@ tapectl is open-source software, and its source is at
 https://github.com/mikmorg/tapectl: one place to look, and a web address
 may move over decades, so search for the name if it is gone. File 0's
 `tapectl_version` names the release that wrote this tape; the repository
-tags each release `v` followed by that number (`v1.4.0`), and that release
-or a newer one reads this tape. It is built from source. It needs the Rust
-toolchain the repository pins in `rust-toolchain.toml` (`rustup`, from
-rustup.rs, installs it on the first `cargo` run; a distribution's own
-cargo may be too old), a network connection to download its libraries, and
-`dar`, `mt-st` and `sg3-utils` installed ("Tools Required"):
+tags each release `v` followed by that number (`v1.4.0`); use that release
+or a newer one. It is built from source. It needs the Rust toolchain the
+repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs,
+installs it on the first `cargo` run, or when you run `rustup toolchain
+install` in the checkout; a distribution's own cargo may be too old), a
+network connection to download its libraries, and `dar`, `mt-st` and
+`sg3-utils` installed ("Tools Required"):
 
     git clone https://github.com/mikmorg/tapectl
     cd tapectl && git checkout vX.Y.Z      # X.Y.Z: the tapectl_version
@@ -11622,7 +11623,7 @@ sha256_encrypted = \"bbb\"
             "It needs `age` and `sqlite3` (package `sqlite3`; \"Tools Required\")",
             "Decrypt it, with the escrow key's file as `YOUR_KEY.age.key`, into a NEW file (`age -o` replaces a file of that name without asking)",
             "A tape holds a good copy when its `status` is `sealed` and its `condition` is `ok`",
-            "`erased` and `retired` hold nothing now",
+            "`erased` is a wiped tape and `retired` one taken out of service: neither is a copy",
             "`quarantined` (a `condition`) is a sealed tape whose medium a verify proved bad",
             "`sqlite3 catalog.db .schema` shows the tables it has",
         ] {
@@ -11960,8 +11961,8 @@ sha256_encrypted = \"bbb\"
         let f = flat_text(raw);
         for needle in [
             "tapectl is open-source software, and its source is at https://github.com/mikmorg/tapectl: one place to look, and a web address may move over decades, so search for the name if it is gone",
-            "File 0's `tapectl_version` names the release that wrote this tape; the repository tags each release `v` followed by that number (`v1.4.0`), and that release or a newer one reads this tape",
-            "the Rust toolchain the repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs, installs it on the first `cargo` run; a distribution's own cargo may be too old)",
+            "File 0's `tapectl_version` names the release that wrote this tape; the repository tags each release `v` followed by that number (`v1.4.0`); use that release or a newer one",
+            "the Rust toolchain the repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs, installs it on the first `cargo` run, or when you run `rustup toolchain install` in the checkout; a distribution's own cargo may be too old)",
             "`dar`, `mt-st` and `sg3-utils` installed (\"Tools Required\")",
             "`init` makes the home and adopts the operator's key; run it once",
             "run it once for each tape (`YOUR_KEY.age.key` may be the operator's key or the escrow key)",
