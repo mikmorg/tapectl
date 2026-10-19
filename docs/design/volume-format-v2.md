@@ -379,6 +379,17 @@ tape carries it twice, §1.3).
 before. A reader that does not know them (RESTORE.sh before 1.3.0; tapectl reads envelope members
 by name) ignores them, so the index needs no `requires` entry (§1.2 rule 3).
 
+### 1.6 RESTORE.sh's damaged-file list (written by RESTORE.sh, not on the tape)
+
+`.tapectl-damaged-files.txt` is written by RESTORE.sh (1.3.0, ADR-0012 items 102-103) in a
+unit's restored directory (`--to` for one unit, `--to/UNIT` for several), for a restore whose dar
+run named files it could not restore or whose files failed their recorded sha256. Line 1:
+`#tapectl-damaged-files`, TAB, `1` (the format), TAB, `unit=` and the unit name, TAB, `uuid=` and
+the unit uuid, TAB, `version=` and the version. Every further line is one path relative to the
+unit's root, escaped as §1.5 escapes. A fill (`--fill-from LIST`) uses a tape only if its envelope
+lists the same unit uuid at the same version, restores only the listed paths, and rewrites the
+list with the paths still damaged, or removes it.
+
 ## 2. Plaintext vs encrypted, and the isolation invariant
 
 | Zone | On tape | Why |

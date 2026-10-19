@@ -136,7 +136,7 @@ write path was rebuilt to Layout v2 and landed as playbook tasks T0–T10:
   on real tape including Rust-vs-bash chain-walk parity on both a good and a
   corrupted tape; `scripts/mhvtl-verify-gate.sh` GREEN **against an empty
   EXPECTED_FAIL manifest** (26/26 on 2026-09-10 — H7 #33 / H8 #34 are fixed and
-  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29).
+  removed; 40 checks since #355 added `empty_drive_refused`, GREEN 40/40 on 2026-09-29; 46 since #480 added `heir_where`, `heir_find` and `heir_slice_from_copy`, the last of which writes a second cartridge and retires its `MHVTLC2` volume).
 
 Issues #22–#28 (closed) describe the *pre-v2* design; read them against the normative
 set above, never as instructions.

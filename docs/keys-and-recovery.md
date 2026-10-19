@@ -606,6 +606,16 @@ that mode runs, and stops with `FATAL: missing required tool: <name>`: `--info` 
 tool in every mode (and before 2026-09-28 not `tar`: a missing one showed up only after the
 envelope had been decrypted).
 
+On a tape written by 1.3.0 or later, RESTORE.sh also repairs what it can. A slice that fails
+its checksum is taken from another copy matched by its sha256 alone: from a directory of slice
+files copied off another tape (`--slices-from DIR`) or from a second tape (`--swap-tapes`); either
+restores slice by slice onto disk, about twice the unit's size. Every restored file is checked
+against the sha256 recorded for it (`--no-file-check` skips that). A file that could not be
+restored, or fails its check, is listed in `.tapectl-damaged-files.txt` in the unit's directory,
+and the run ends `RESTORE INCOMPLETE`; `--restore --unit UNIT --fill-from THAT_LIST --to THE_SAME_DIR`
+against another tape of the same unit and version restores only those files. Only the same unit
+and version is a copy: another version is never used.
+
 1. **Read the tape's identity** (File 0) to confirm you have the right cartridge:
    ```bash
    mt -f "$TAPE" setblk 524288

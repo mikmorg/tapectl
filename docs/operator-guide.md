@@ -1235,6 +1235,25 @@ tape order with how it ended, and the command fails when any unit did
 (`--fail-fast` stops at the first failure instead). `--dry-run` lists the set
 without opening the drive.
 
+**When a slice or a file comes back damaged (1.3.0).** Copies are written from
+one staging, so a slice damaged on one cartridge is read from another that holds
+it: tapectl asks for that cartridge by label and chip serial, resumes the slice
+where the first stopped, and keeps the second in the drive while it serves. With
+no terminal it refuses by name instead and lists the holders. Next, if files are
+still damaged or missing, they are restored from another copy of the same
+version that came from a different staging (a different stage set), reading only
+the slices that hold them, and each is checked against the sha256 recorded for
+the version. Last, what no copy can give is written as zeros (age authenticates
+every 64 KiB chunk, so a defect costs 64 KiB and the files in it, not the rest
+of the slice), and the restore exits non-zero naming the slice, its byte ranges
+and the files. Use `tapectl drive eject` at the prompt. Another version is never
+a source. `--json` carries `substitutions` and `filled`. RESTORE.sh, on the heir
+path, takes a damaged slice from a directory of slice files (`--slices-from`) or
+a second tape (`--swap-tapes`), fills listed files from another tape of the same
+unit and version (`--fill-from`), and checks every restored file against its
+recorded sha256; it cannot read around a damaged chunk, because it runs the
+`age` program.
+
 Before it opens the drive, a restore checks everything it can without the
 tape, and refuses with nothing read
 ([troubleshooting](troubleshooting.md#restoring)):

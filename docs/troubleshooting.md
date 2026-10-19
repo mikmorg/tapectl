@@ -2401,17 +2401,72 @@ error: slice <n> checksum mismatch on tape: expected <sha>..., got <sha>...
 ```
 
 The ciphertext read off the tape differs from the checksum recorded when it
-was staged. Run a full `volume verify` on the volume and restore from another
-copy (`catalog locate` lists them). Scratch space for decrypted slices is
-removed when a restore fails. If tapectl cannot remove it, it warns and names
-the path, because that directory may hold decrypted data.
+was staged. Since 1.3.0 tapectl does not stop there. If another cartridge holds
+an identical copy of the slice (`catalog locate` lists them), it asks for that
+cartridge by label, sticker and chip serial (see "A damaged slice: tapectl asks
+for another cartridge"). Scratch space for decrypted slices is removed when a
+restore fails. If tapectl cannot remove it, it warns and names the path, because
+that directory may hold decrypted data. Only chunks that authenticate are ever
+written, so nothing that reached dar was damaged. If no copy can give the slice
+whole, its bad 64 KiB chunks are written as zeros and the restore ends
+INCOMPLETE (see below). Run a full `volume verify` on the damaged volume.
 
-A streamed restore (see above) decrypts as it reads, so dar has already
-extracted the slices before the bad one, and the error goes on to say
-`--to` may now hold a partial restore. age authenticates every 64 KiB of a
-slice before releasing it, so nothing that reached dar was damaged, but the
-unit is incomplete: empty `--to`, or restore again from the other copy with
-`--overwrite`.
+### A damaged slice: tapectl asks for another cartridge
+
+```text
+Slice <n> of unit "<unit>" v<v> is damaged on <label>: slice <n> checksum mismatch on tape: …
+<label2> holds an identical copy of it (cartridge <sticker>, chip serial <serial>).
+Unload the cartridge in <device> (`tapectl drive eject`), load <label2>, and press Enter. Type "skip" to leave a hole where the slice is damaged, or "stop" to give up (what is restored so far stays).
+```
+
+Load the cartridge named and press Enter. tapectl checks that it is that volume
+(File 0, chip serial, `requires`) and says so if it is not, then asks again.
+That cartridge keeps serving while it holds what is wanted, so several bad
+slices in a row cost one swap. `skip` writes the damaged chunks as zeros and
+carries on. `stop` ends the restore; what was restored stays. A volume marked
+"last resort" is quarantined (a verify proved its medium bad); it is asked for
+only when nothing else holds the slice.
+
+### `slice <n> of unit … cannot be read from <label> (…), and an identical copy of it is held by …`
+
+tapectl swaps no cartridge without a person at the terminal, and `--yes` cannot
+load one. Run the restore from a terminal and it will ask for the cartridge, or
+restore directly from one of the holders it lists with `--from`. Nothing further
+was written; what was restored before that slice stays.
+
+### The restore is INCOMPLETE: holes and damaged files
+
+```text
+restore of unit "<unit>" v<v> into <dest> is INCOMPLETE
+  slice <n> on <label>: <k> hole(s) of zeros, <bytes> byte(s) in all, at plaintext byte(s) <a>..<b> — …
+  <m> file(s) damaged or missing:
+    <path> (<why>)
+```
+
+No copy could give those chunks, so they are zeros, and dar's per-file check (or
+the version's recorded sha256) names the files they fell in. Everything else is
+whole. Damaged files are left as written; do not trust them. tapectl first tries
+to fill them from another copy of the same version (a different stage set); the
+lines "does not match the version's recorded checksum … not kept" and "another
+copy could not be used" say what happened. Restore the lost paths from another
+cartridge, or replace the file from the source. All lost paths are in the
+session log.
+
+### `… file(s) can be filled from another copy of this version, held by …`
+
+The fill needs a cartridge swap and there is no terminal. Run from a terminal,
+or restore the lost files from the holder named. Another version of the unit is
+never used as a source, even where the file is unchanged.
+
+### `<path>: the copy on <label> does not match the version's recorded checksum (…); not kept`
+
+The other copy's file differs from the sha256 staging recorded, so it was not
+written over the damaged one. The destination keeps what dar wrote.
+
+### `restore of unit … stopped at the operator's request while waiting for <label>`
+
+You answered `stop` at the swap prompt, or the input ended. What was restored
+before stays; run the restore again.
 
 ### RESTORE.sh: not enough disk space, or OUT OF DISK SPACE
 
