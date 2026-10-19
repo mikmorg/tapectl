@@ -263,6 +263,17 @@ impl CapacitySource {
             CapacitySource::GenerationTable => "the generation's native capacity",
         }
     }
+
+    /// The stable spelling `--json` carries for this source (issue #482).
+    /// Prose lives in [`CapacitySource::describe`] and may be reworded;
+    /// this may not.
+    pub fn key(self) -> &'static str {
+        match self {
+            CapacitySource::DriveOverride => "drive_capacity_override",
+            CapacitySource::CartridgeRow => "cartridge_row",
+            CapacitySource::GenerationTable => "generation_table",
+        }
+    }
 }
 
 /// A volume's capacity in bytes, decided ONCE at `volume init` and then

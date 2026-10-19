@@ -8,7 +8,7 @@ use crate::config::{Config, TapectlPaths};
 use crate::error::{Result, TapectlError};
 use crate::store::{TapeStore, Tier};
 use crate::tape::contact::{ContactSite, Medium, Operation};
-use crate::volume::write;
+use crate::volume::write::{self, Initialized};
 
 pub(crate) const DEFAULT_BLOCK_SIZE: usize = 512 * 1024; // 512 KB
 
@@ -1107,8 +1107,9 @@ trait WriteSteps {
     /// What the write refuses from the catalog and the disk alone, asked
     /// before `--init` initialises anything (issue #445).
     fn preflight(&self, label: &str) -> Result<()>;
-    /// `volume init <label>`; returns the new volume's id.
-    fn init(&self, label: &str, force: bool) -> Result<i64>;
+    /// `volume init <label>`; returns the new volume's id and the decision
+    /// about the medium that went onto its row (issue #482).
+    fn init(&self, label: &str, force: bool) -> Result<Initialized>;
     /// `volume write <label>`; `Ok` only when sealed and confirmed.
     fn write(&self, label: &str, force: bool) -> Result<()>;
 }
@@ -1130,7 +1131,7 @@ impl WriteSteps for DriveWriteSteps<'_> {
         write::write_catalog_preflight(self.conn, label, self.allow_missing_escrow)
     }
 
-    fn init(&self, label: &str, force: bool) -> Result<i64> {
+    fn init(&self, label: &str, force: bool) -> Result<Initialized> {
         write::volume_init(
             self.conn,
             self.config,
@@ -1174,13 +1175,36 @@ struct WriteRequest<'a> {
     json_output: bool,
 }
 
+/// What `volume init` prints (issue #482): the volume line it always
+/// printed, then one line naming the medium it decided on and what decided
+/// it, so an LTO-5 cartridge in an LTO-6 drive is seen to have been taken as
+/// LTO-5 at init, not discovered later in `volume info`.
+fn init_text(label: &str, init: &Initialized) -> String {
+    format!(
+        "volume \"{label}\" initialized (id={})\n{}",
+        init.volume_id,
+        init.medium.operator_line()
+    )
+}
+
+/// `volume init --json`: the keys it always had, plus the additive `medium`
+/// object (issue #482) -- the same facts as [`init_text`]'s second line, raw.
+fn init_json(label: &str, init: &Initialized) -> serde_json::Value {
+    serde_json::json!({
+        "volume_id": init.volume_id,
+        "label": label,
+        "status": "initialized",
+        "medium": init.medium.to_json(),
+    })
+}
+
 /// What one `volume write` did, once the volume was sealed and confirmed.
 #[derive(Debug)]
 struct WriteDone {
     /// The volume was chosen from the loaded tape (`--loaded`).
     loaded: bool,
-    /// The volume id `--init` created, when it ran.
-    initialized: Option<i64>,
+    /// The volume `--init` created and the medium it decided on, when it ran.
+    initialized: Option<Initialized>,
     release: StagingRelease,
     moved: MoveAfterWrite,
 }
@@ -1226,24 +1250,27 @@ fn write_and_follow(
     let initialized = if req.init {
         // Issue #445: before the cartridge is touched.
         steps.preflight(req.label)?;
-        let id = steps.init(req.label, req.force)?;
+        let init = steps.init(req.label, req.force)?;
         // stderr, so `--json` keeps stdout to the one document. The write
         // below may stop; the operator is told what stands and how to go on.
         eprintln!(
-            "volume \"{0}\" initialized (id={id}); writing it now. If the write does not \
+            "volume \"{0}\" initialized (id={1}); writing it now. If the write does not \
              complete the volume stays initialized: `tapectl volume write {0}` (without \
              --init) writes it, `tapectl volume resume {0}` continues an interrupted write.",
-            req.label
+            req.label, init.volume_id
         );
-        Some(id)
+        // What the init decided about the medium (issue #482), where the
+        // operator can see it before the hours of writing it commits them to.
+        eprintln!("{}", init.medium.operator_line());
+        Some(init)
     } else {
         None
     };
     let written = steps.write(req.label, req.force && !req.init);
     // Issue #445: a write that fails leaves the volume this command
     // initialised initialised, and says so before the error is printed.
-    if let (Err(e), Some(id)) = (&written, initialized) {
-        report_left_initialized(req, id, e);
+    if let (Err(e), Some(init)) = (&written, &initialized) {
+        report_left_initialized(req, init, e);
     }
     written?;
     // Reached only when the write above returned `Ok` — sealed AND
@@ -1264,13 +1291,18 @@ fn write_and_follow(
 /// the code that elsewhere means "the medium untouched". `initialized` is
 /// the key the success document already has; `volume_status` is what the
 /// catalog holds now.
-fn left_initialized_json(label: &str, volume_id: i64, error: &TapectlError) -> serde_json::Value {
+fn left_initialized_json(
+    label: &str,
+    init: &Initialized,
+    error: &TapectlError,
+) -> serde_json::Value {
     serde_json::json!({
         "label": label,
         "status": "failed",
         "initialized": true,
-        "volume_id": volume_id,
+        "volume_id": init.volume_id,
         "volume_status": "initialized",
+        "medium": init.medium.to_json(),
         "error": error.to_string(),
     })
 }
@@ -1280,7 +1312,8 @@ fn left_initialized_json(label: &str, volume_id: i64, error: &TapectlError) -> s
 /// the operator the volume would stay initialised; this one is the verdict,
 /// printed after the write stopped and before the error itself, and names
 /// the exact retry — `--init` again would be refused, the volume exists.
-fn report_left_initialized(req: &WriteRequest<'_>, volume_id: i64, error: &TapectlError) {
+fn report_left_initialized(req: &WriteRequest<'_>, init: &Initialized, error: &TapectlError) {
+    let volume_id = init.volume_id;
     eprintln!(
         "volume \"{0}\" was initialized by this command (id={volume_id}) and stays \
          initialized, whatever the write that followed did: its exit code describes the write, \
@@ -1289,7 +1322,7 @@ fn report_left_initialized(req: &WriteRequest<'_>, volume_id: i64, error: &Tapec
         req.label
     );
     if req.json_output {
-        println!("{}", left_initialized_json(req.label, volume_id, error));
+        println!("{}", left_initialized_json(req.label, init, error));
     }
 }
 
@@ -1305,6 +1338,9 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
             "label": label,
             "status": "completed",
             "initialized": done.initialized.is_some(),
+            // Null without `--init`, like `moved_to` without `--move-to`
+            // (issue #482): what the init decided about the medium.
+            "medium": done.initialized.as_ref().map(|i| i.medium.to_json()),
             "loaded": done.loaded,
         }),
         &done.release,
@@ -1370,7 +1406,7 @@ pub fn run(
                 ));
             }
             let device = write_device(config, device.as_deref())?;
-            let vol_id = write::volume_init(
+            let init = write::volume_init(
                 conn,
                 config,
                 label,
@@ -1381,12 +1417,9 @@ pub fn run(
                 cartridge.as_deref(),
             )?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::json!({"volume_id": vol_id, "label": label, "status": "initialized"})
-                );
+                println!("{}", init_json(label, &init));
             } else {
-                println!("volume \"{label}\" initialized (id={vol_id})");
+                println!("{}", init_text(label, &init));
             }
         }
 
@@ -4288,6 +4321,45 @@ mod tests {
             }
         }
 
+        /// What the scripted init decided about the cartridge: an LTO-5 the
+        /// chip's medium density code named, in the LTO-6 drive the real
+        /// run of issue #482 used.
+        fn fake_medium() -> crate::tape::media_detect::MediumDecision {
+            use crate::tape::media_detect::{DetectSource, MediaSource, MediumDecision};
+            MediumDecision {
+                generation: crate::media::Generation::Lto5,
+                generation_source: MediaSource::Detected(DetectSource::MamMedium),
+                density_code: Some(0x58),
+                capacity_bytes: 1_500_000_000_000,
+                capacity_source: crate::media::CapacitySource::GenerationTable,
+            }
+        }
+
+        /// Issue #482: `volume init` keeps the volume line it always printed
+        /// and adds one line naming the medium; `--json` keeps its keys and
+        /// adds the same facts as a `medium` object.
+        #[test]
+        fn init_prints_the_medium_line_after_the_volume_line_and_json_carries_it() {
+            let init = Initialized {
+                volume_id: 3,
+                medium: fake_medium(),
+            };
+            assert_eq!(
+                init_text("L5-0001", &init),
+                "volume \"L5-0001\" initialized (id=3)\n\
+                 medium: LTO-5, 1.50 TB (the cartridge chip's medium density code 0x58)"
+            );
+            let json = init_json("L5-0001", &init);
+            assert_eq!(json["volume_id"], 3);
+            assert_eq!(json["label"], "L5-0001");
+            assert_eq!(json["status"], "initialized");
+            assert_eq!(json["medium"]["media_type"], "LTO-5");
+            assert_eq!(json["medium"]["capacity_bytes"], 1_500_000_000_000u64);
+            assert_eq!(json["medium"]["generation_source"], "mam_medium_density");
+            assert_eq!(json["medium"]["density_code"], 0x58);
+            assert_eq!(json["medium"]["capacity_source"], "generation_table");
+        }
+
         impl WriteSteps for FakeSteps<'_> {
             fn preflight(&self, label: &str) -> Result<()> {
                 self.log.borrow_mut().push("preflight".to_string());
@@ -4297,7 +4369,7 @@ mod tests {
                 Ok(())
             }
 
-            fn init(&self, label: &str, force: bool) -> Result<i64> {
+            fn init(&self, label: &str, force: bool) -> Result<Initialized> {
                 self.log
                     .borrow_mut()
                     .push(format!("init {label} force={force}"));
@@ -4317,7 +4389,10 @@ mod tests {
                     .unwrap();
                 // File 0, as the real init writes it.
                 self.tape.borrow_mut().files.push(b"File 0".to_vec());
-                Ok(self.conn.last_insert_rowid())
+                Ok(Initialized {
+                    volume_id: self.conn.last_insert_rowid(),
+                    medium: fake_medium(),
+                })
             }
 
             fn write(&self, label: &str, force: bool) -> Result<()> {
@@ -4434,6 +4509,9 @@ mod tests {
             assert_eq!(json["staging_released"], true);
             // The additive keys.
             assert_eq!(json["initialized"], true);
+            // Issue #482: what the init decided about the medium, raw.
+            assert_eq!(json["medium"], fake_medium().to_json());
+            assert_eq!(json["medium"]["media_type"], "LTO-5");
             assert_eq!(json["moved_to"], "offsite");
             assert!(json["move_warning"].is_null());
             assert_eq!(json["volumes_moved"], serde_json::json!([NEW]));
@@ -4473,6 +4551,7 @@ mod tests {
             assert!(matches!(done.moved, MoveAfterWrite::NotAsked));
             let json = write_done_json(NEW, &done);
             assert_eq!(json["initialized"], false);
+            assert!(json["medium"].is_null(), "no --init, no decision: {json}");
             assert!(json["moved_to"].is_null() && json["move_warning"].is_null());
             assert_eq!(json["volumes_moved"], serde_json::json!([]));
         }
@@ -4702,12 +4781,24 @@ mod tests {
             assert!(s.file.exists(), "nothing was released");
 
             // The code is the write's: 2, a refusal before the tape moved.
-            let json = left_initialized_json(NEW, 7, &err);
+            let json = left_initialized_json(
+                NEW,
+                &Initialized {
+                    volume_id: 7,
+                    medium: fake_medium(),
+                },
+                &err,
+            );
             assert_eq!(exit_code(err), crate::error::EXIT_ERROR);
             assert_eq!(json["initialized"], true);
             assert_eq!(json["volume_status"], "initialized");
             assert_eq!(json["label"], NEW);
             assert_eq!(json["volume_id"], 7);
+            assert_eq!(
+                json["medium"],
+                fake_medium().to_json(),
+                "the init stood, and so did what it decided about the medium"
+            );
             assert_eq!(json["status"], "failed");
             assert!(
                 json["error"]

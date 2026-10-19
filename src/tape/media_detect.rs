@@ -21,7 +21,7 @@ use tracing::warn;
 
 use crate::config::{Config, LtoBackendConfig};
 use crate::error::{Result, TapectlError};
-use crate::media::Generation;
+use crate::media::{CapacitySource, Generation};
 use crate::tape::ioctl;
 use crate::tape::mam::{self, MamCapture, MamInfo};
 
@@ -330,6 +330,138 @@ impl MediaSource {
             Self::CartridgeRow(barcode) => format!("cartridge {barcode}"),
             Self::DriveGeneration => "the drive's generation".to_string(),
         }
+    }
+
+    /// The stable spelling `--json` carries for this source (additive keys
+    /// in `volume init --json`, issue #482). Never a rendering of
+    /// [`MediaSource::describe`]: that is prose and may be reworded.
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::Detected(DetectSource::MamMedium) => "mam_medium_density",
+            Self::Detected(DetectSource::MamFormat) => "mam_format_density",
+            Self::Detected(DetectSource::Driver) => "driver_density_register",
+            // `resolve_media` wraps only a source that produced a recognised
+            // code, so `DetectSource::None` cannot be inside `Detected`; the
+            // arm exists so the match stays total, not because it is reached.
+            Self::Detected(DetectSource::None) => "medium",
+            Self::Declared => "generation_flag",
+            Self::CartridgeRow(_) => "cartridge_row",
+            Self::DriveGeneration => "drive_generation",
+        }
+    }
+}
+
+/// What `volume init` decided about the loaded medium, and what decided it
+/// (issue #482): the generation, the capacity stored on the volume row, and
+/// the one source behind each.
+///
+/// Built ONCE, at the one place `volume init` resolves both
+/// ([`resolve_media`] and [`crate::media::resolve_capacity`]) and handed up
+/// to the CLI, which prints [`MediumDecision::operator_line`] -- the same
+/// values that go to the session log's `volume media resolved` line and onto
+/// `volumes.media_type`/`volumes.capacity_bytes`. Nothing here re-derives a
+/// decision: a second derivation is a second place that can disagree with the
+/// row the operator is then told about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediumDecision {
+    pub generation: Generation,
+    /// What decided `generation`: a detection source, or the declaration
+    /// that stood in when nothing could be read.
+    pub generation_source: MediaSource,
+    /// The density code detection read, recognised or not (`None` when no
+    /// source answered). For a detected generation it is the code that
+    /// decided it; for a fallback it is what the medium said instead, if
+    /// anything.
+    pub density_code: Option<u8>,
+    /// `volumes.capacity_bytes`: decimal (ADR-0012), decided here once.
+    pub capacity_bytes: u64,
+    /// What decided `capacity_bytes`.
+    pub capacity_source: CapacitySource,
+}
+
+impl MediumDecision {
+    /// The one line `volume init` prints after `volume "<label>" initialized`:
+    ///
+    /// `medium: LTO-5, 1.50 TB (the cartridge chip's medium density code 0x58)`
+    ///
+    /// The parenthetical names what decided the GENERATION (the chip's
+    /// medium density code, its format density code, the st driver's density
+    /// register -- or, when none of them could say, the declaration that
+    /// stood in, as an assumption). When the CAPACITY did not come from the
+    /// generation table, a second clause names what did decide it (the
+    /// cartridge row, the drive's `capacity_override`): an mhvtl LTO-8 that
+    /// reads 2.4 GB is alarming until the line says a drive override
+    /// declared it. Capacities are decimal (ADR-0012).
+    pub fn operator_line(&self) -> String {
+        let mut why = self.generation_phrase();
+        if self.capacity_source != CapacitySource::GenerationTable {
+            why.push_str(&format!(
+                "; capacity from {}",
+                self.capacity_source.describe()
+            ));
+        }
+        format!(
+            "medium: {}, {} ({why})",
+            self.generation,
+            crate::util::format_bytes_decimal(self.capacity_bytes as i64),
+        )
+    }
+
+    fn generation_phrase(&self) -> String {
+        let code = |c: Option<u8>| c.map(|c| format!(" 0x{c:02x}")).unwrap_or_default();
+        match &self.generation_source {
+            MediaSource::Detected(DetectSource::MamMedium) => {
+                format!(
+                    "the cartridge chip's medium density code{}",
+                    code(self.density_code)
+                )
+            }
+            MediaSource::Detected(DetectSource::MamFormat) => {
+                format!(
+                    "the cartridge chip's format density code{}",
+                    code(self.density_code)
+                )
+            }
+            MediaSource::Detected(DetectSource::Driver) => {
+                format!(
+                    "the st driver's density register{}",
+                    code(self.density_code)
+                )
+            }
+            MediaSource::Detected(DetectSource::None) => "the medium itself".to_string(),
+            fallback => {
+                let read = match self.density_code {
+                    Some(c) => format!(
+                        "the medium reported density code 0x{c:02x}, which is not an LTO generation"
+                    ),
+                    None => "no density code was read from the medium".to_string(),
+                };
+                let stood_in = match fallback {
+                    MediaSource::Declared => "--generation".to_string(),
+                    MediaSource::CartridgeRow(barcode) => {
+                        format!("the generation registered for cartridge {barcode}")
+                    }
+                    _ => "the drive's generation".to_string(),
+                };
+                format!("not detected: {read}; assumed from {stood_in}")
+            }
+        }
+    }
+
+    /// The same facts for `--json` (a `medium` object in `volume init` and
+    /// `volume write --init`): raw values, not prose. `media_type` and
+    /// `capacity_bytes` are the keys `volume info --json` already uses for
+    /// the stored columns; the two sources are the stable [`MediaSource::key`]
+    /// and [`CapacitySource::key`] spellings; `density_code` is the byte as a
+    /// number (`null` when no source answered).
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "media_type": self.generation.as_str(),
+            "capacity_bytes": self.capacity_bytes,
+            "generation_source": self.generation_source.key(),
+            "density_code": self.density_code,
+            "capacity_source": self.capacity_source.key(),
+        })
     }
 }
 
@@ -1176,7 +1308,7 @@ mod tests {
         );
     }
 
-    // ---- issue #482: the article ----
+    // ---- issue #482: the article, and the medium line's pure wording ----
 
     /// "an LTO-N", always: every generation's name starts with a vowel
     /// sound. `cannot_write_message` said "Load a LTO-7-writable
@@ -1213,5 +1345,103 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    fn decision(
+        source: MediaSource,
+        code: Option<u8>,
+        capacity: u64,
+        capacity_source: CapacitySource,
+    ) -> MediumDecision {
+        MediumDecision {
+            generation: Generation::Lto5,
+            generation_source: source,
+            density_code: code,
+            capacity_bytes: capacity,
+            capacity_source,
+        }
+    }
+
+    /// The line's two halves are independent: the generation's decider
+    /// always, the capacity's only when it was not the generation table.
+    #[test]
+    fn the_medium_line_names_the_capacity_decider_only_when_it_is_not_the_table() {
+        let table = decision(
+            MediaSource::Detected(DetectSource::MamMedium),
+            Some(0x58),
+            1_500_000_000_000,
+            CapacitySource::GenerationTable,
+        );
+        assert_eq!(
+            table.operator_line(),
+            "medium: LTO-5, 1.50 TB (the cartridge chip's medium density code 0x58)"
+        );
+        let row = decision(
+            MediaSource::Detected(DetectSource::MamMedium),
+            Some(0x58),
+            1_200_000_000_000,
+            CapacitySource::CartridgeRow,
+        );
+        assert!(
+            row.operator_line()
+                .ends_with("; capacity from the cartridge's registered capacity)"),
+            "{}",
+            row.operator_line()
+        );
+        let over = decision(
+            MediaSource::Detected(DetectSource::Driver),
+            Some(0x58),
+            2_400_000_000,
+            CapacitySource::DriveOverride,
+        );
+        assert_eq!(
+            over.operator_line(),
+            "medium: LTO-5, 2.4 GB (the st driver's density register 0x58; \
+             capacity from the drive's capacity_override)"
+        );
+    }
+
+    /// `--json` carries stable keys, not prose: every source has its own,
+    /// and no two coincide within a field.
+    #[test]
+    fn json_source_keys_are_distinct_and_stable() {
+        let gen_keys: Vec<&str> = [
+            MediaSource::Detected(DetectSource::MamMedium),
+            MediaSource::Detected(DetectSource::MamFormat),
+            MediaSource::Detected(DetectSource::Driver),
+            MediaSource::Declared,
+            MediaSource::CartridgeRow("A001L5".into()),
+            MediaSource::DriveGeneration,
+        ]
+        .iter()
+        .map(MediaSource::key)
+        .collect();
+        assert_eq!(
+            gen_keys,
+            [
+                "mam_medium_density",
+                "mam_format_density",
+                "driver_density_register",
+                "generation_flag",
+                "cartridge_row",
+                "drive_generation",
+            ]
+        );
+        let cap_keys: Vec<&str> = [
+            CapacitySource::DriveOverride,
+            CapacitySource::CartridgeRow,
+            CapacitySource::GenerationTable,
+        ]
+        .into_iter()
+        .map(CapacitySource::key)
+        .collect();
+        assert_eq!(
+            cap_keys,
+            [
+                "drive_capacity_override",
+                "cartridge_row",
+                "generation_table"
+            ]
+        );
     }
 }

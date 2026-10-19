@@ -18,6 +18,7 @@ use crate::tape::feed_ratio;
 use crate::tape::health;
 use crate::tape::log_pages;
 use crate::tape::mam_journal::{Hook, MamReads};
+use crate::tape::media_detect::MediumDecision;
 use crate::util::{HashingWriter, TruncatingWriter};
 
 use crate::store::{ConfirmPlan, OpenMode, Store, TapeStore, Tier};
@@ -178,7 +179,7 @@ pub fn volume_init(
     force: bool,
     declared_media: Option<&str>,
     cartridge_barcode: Option<&str>,
-) -> Result<i64> {
+) -> Result<Initialized> {
     // The contact cannot be opened here: every refusal above the MAM read
     // below — a label that already exists, no backend, an empty drive — is a
     // command that never reached a cartridge. See [`ContactSlot`].
@@ -196,6 +197,21 @@ pub fn volume_init(
         ContactStore::Device,
     );
     contact.finish_result(r)
+}
+
+/// What [`volume_init`] made: the new volume's id, and the decision about the
+/// loaded medium that went onto its row (issue #482).
+///
+/// `medium` is the one decision `volume init` took -- the generation and the
+/// capacity, each with what decided it -- not a second reading of the drive
+/// or the catalog, so a caller that tells the operator about it
+/// ([`MediumDecision::operator_line`], [`MediumDecision::to_json`]) tells
+/// the operator exactly what `volumes.media_type` and
+/// `volumes.capacity_bytes` hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Initialized {
+    pub volume_id: i64,
+    pub medium: MediumDecision,
 }
 
 /// How a write-path contact reaches the medium once every FACT check has
@@ -239,7 +255,7 @@ fn volume_init_contacted<'c>(
     cartridge_barcode: Option<&str>,
     contact: &mut ContactSlot<'c>,
     store: ContactStore<'_>,
-) -> Result<i64> {
+) -> Result<Initialized> {
     // Creation-time label validation (issue #103). A label reaches the
     // filesystem too: `volume_read_slices` below joins
     // `{staging}/clone-{from_label}-{unit_uuid}`. Same defect, third entry
@@ -346,7 +362,7 @@ fn volume_init_contacted<'c>(
         conn,
         config,
         device,
-        r.as_ref().ok().copied(),
+        r.as_ref().ok().map(|i| i.volume_id),
         contact.id(),
         health::Reading::Init,
         Operation::VolumeInit,
@@ -377,7 +393,7 @@ fn volume_init_in_contact<'c>(
     det: &crate::tape::media_detect::Detected,
     contact: &contact::ContactGuard<'c>,
     store: ContactStore<'_>,
-) -> Result<i64> {
+) -> Result<Initialized> {
     let declared = match declared_media {
         Some(m) => Some(crate::media::Generation::parse(m).ok_or_else(|| {
             TapectlError::Other(format!(
@@ -480,6 +496,16 @@ fn volume_init_in_contact<'c>(
         generation,
     );
     let nominal_capacity = nominal_capacity as i64;
+    // The one decision, kept: the log line below and the line the CLI prints
+    // after `volume init` (issue #482) are both made from it, so what the
+    // operator is told is what was stored on the volume row.
+    let medium = MediumDecision {
+        generation,
+        generation_source: media_source,
+        density_code: det.code,
+        capacity_bytes: nominal_capacity as u64,
+        capacity_source,
+    };
     info!(
         label,
         %generation,
@@ -676,7 +702,7 @@ fn volume_init_in_contact<'c>(
     )?;
     info!(label = label, "volume initialized");
 
-    Ok(volume_id)
+    Ok(Initialized { volume_id, medium })
 }
 
 /// Say what the binding did — ADR-0010 requires init to WARN about a
@@ -18525,7 +18551,8 @@ mod tests {
             );
             let volume_id = slot
                 .finish_result(r)
-                .expect("init on a blank MemStore succeeds");
+                .expect("init on a blank MemStore succeeds")
+                .volume_id;
 
             // The init did its job: one File 0 carrying the label, the
             // volume row bound to the named cartridge, the contact closed ok.
@@ -18631,7 +18658,9 @@ mod tests {
             // Positive control: the same init, the lock free, takes that id.
             drop(held);
             let mut store = crate::store::MemStore::new(512 * 1024);
-            let volume_id = init(&conn, &mut store).expect("a free lock does not refuse");
+            let volume_id = init(&conn, &mut store)
+                .expect("a free lock does not refuse")
+                .volume_id;
             assert_eq!(volume_id, next_id);
             assert_eq!(store.files.len(), 1, "File 0 was written");
         }
@@ -20946,6 +20975,19 @@ mod tests {
             force: bool,
             cartridge: Option<&str>,
         ) -> Result<i64> {
+            init_outcome_with(conn, label, fake, det, force, cartridge).map(|i| i.volume_id)
+        }
+
+        /// [`init_with`], keeping the whole outcome: the id and the decision
+        /// about the medium (issue #482).
+        fn init_outcome_with(
+            conn: &Connection,
+            label: &str,
+            fake: &FakeTape,
+            det: &Detected,
+            force: bool,
+            cartridge: Option<&str>,
+        ) -> Result<Initialized> {
             let config = config();
             let _drive = InjectedDrive::install(fake);
             let backend = crate::config::resolve_lto_backend(&config, Some(DEVICE))?;
@@ -21552,6 +21594,298 @@ mod tests {
                 "{msg}"
             );
             assert_eq!(volume_count(&conn), 0);
+        }
+    }
+
+    // ---- issue #482: `volume init` says which generation it took the
+    // cartridge for, and what decided it. Driven through
+    // `volume_init_in_contact` -- the one place both decisions are taken --
+    // on the in-memory tape, with the chip's answer scripted per detection
+    // source, so the line asserted is the line the CLI prints from the
+    // outcome, and the same decision as the row it stored.
+    mod medium_line_at_init {
+        use super::*;
+        use crate::media::Generation;
+        use crate::store::injected::InjectedDrive;
+        use crate::tape::fake::FakeTape;
+        use crate::tape::mam::MamCapture;
+        use crate::tape::media_detect::{DetectSource, Detected};
+
+        const BS: usize = 4096;
+        const DEVICE: &str = "/nonexistent/tapectl-medium-line-nst";
+
+        /// An LTO-6 drive, as home2's is, optionally with the mhvtl-style
+        /// `capacity_override`.
+        fn config(capacity_override: Option<&str>) -> Config {
+            let mut config = Config::default();
+            config.backends.lto.push(crate::config::LtoBackendConfig {
+                name: "lto6".into(),
+                device_tape: DEVICE.into(),
+                device_sg: "/nonexistent/tapectl-medium-line-sg".into(),
+                generation: "LTO-6".into(),
+                capacity_override: capacity_override.map(str::to_string),
+                fill_ceiling: 1.0,
+                enospc_buffer: "0".into(),
+            });
+            config
+        }
+
+        /// A never-written cartridge: File 0 unreadable, the chip says
+        /// nothing was ever written, so no `--force` is needed.
+        fn blank_tape() -> FakeTape {
+            let fake = FakeTape::with_files(vec![vec![1u8; BS], vec![2u8; BS]], BS);
+            fake.state().unreadable = vec![0];
+            fake
+        }
+
+        /// What the chip and the drive said: `generation` read off `source`
+        /// from `code` (or nothing recognised, for `generation: None`).
+        fn read(
+            generation: Option<Generation>,
+            code: Option<u8>,
+            source: DetectSource,
+        ) -> Detected {
+            Detected {
+                generation,
+                code,
+                source,
+                mam: MamInfo {
+                    serial: Some("SER-482".into()),
+                    life_written_mib_raw: Some(0),
+                    ..MamInfo::default()
+                },
+                capture: MamCapture::default(),
+            }
+        }
+
+        fn init(
+            conn: &Connection,
+            config: &Config,
+            det: &Detected,
+            declared: Option<&str>,
+            cartridge: Option<&str>,
+        ) -> Result<Initialized> {
+            let fake = blank_tape();
+            let _drive = InjectedDrive::install(&fake);
+            let backend = crate::config::resolve_lto_backend(config, Some(DEVICE))?;
+            let drive_gen = backend.native_generation()?;
+            let mut slot = ContactSlot::empty();
+            let contact = slot.open(
+                conn,
+                config,
+                Operation::VolumeInit,
+                DEVICE,
+                None,
+                Medium::Observed {
+                    backend,
+                    mam: &det.mam,
+                },
+            );
+            let r = volume_init_in_contact(
+                conn,
+                "ML-NEW",
+                DEVICE,
+                BS,
+                false,
+                declared,
+                cartridge,
+                backend,
+                drive_gen,
+                det,
+                contact,
+                ContactStore::Device,
+            );
+            slot.finish_result(r)
+        }
+
+        fn stored(conn: &Connection) -> (String, i64) {
+            conn.query_row(
+                "SELECT media_type, capacity_bytes FROM volumes WHERE label = 'ML-NEW'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        /// The issue's own case, verbatim: an LTO-5 cartridge in an LTO-6
+        /// drive, named by the chip's MEDIUM density code. And the line is
+        /// not a second opinion: it is the row `volumes` now holds.
+        #[test]
+        fn the_chips_medium_density_code_is_named_with_its_value() {
+            let conn = crate::db::open_memory().unwrap();
+            let det = read(Some(Generation::Lto5), Some(0x58), DetectSource::MamMedium);
+
+            let done = init(&conn, &config(None), &det, None, None).unwrap();
+
+            assert_eq!(
+                done.medium.operator_line(),
+                "medium: LTO-5, 1.50 TB (the cartridge chip's medium density code 0x58)"
+            );
+            assert_eq!(
+                stored(&conn),
+                ("LTO-5".to_string(), 1_500_000_000_000),
+                "what is printed is what was stored"
+            );
+            let json = done.medium.to_json();
+            assert_eq!(json["media_type"], "LTO-5");
+            assert_eq!(json["capacity_bytes"], 1_500_000_000_000u64);
+            assert_eq!(json["generation_source"], "mam_medium_density");
+            assert_eq!(json["density_code"], 0x58);
+            assert_eq!(json["capacity_source"], "generation_table");
+        }
+
+        #[test]
+        fn the_chips_format_density_code_is_named_as_the_format_code() {
+            let conn = crate::db::open_memory().unwrap();
+            let det = read(Some(Generation::Lto5), Some(0x58), DetectSource::MamFormat);
+
+            let done = init(&conn, &config(None), &det, None, None).unwrap();
+
+            assert_eq!(
+                done.medium.operator_line(),
+                "medium: LTO-5, 1.50 TB (the cartridge chip's format density code 0x58)"
+            );
+            assert_eq!(done.medium.to_json()["generation_source"], "mam_format_density");
+        }
+
+        #[test]
+        fn the_st_drivers_density_register_is_named_when_the_chip_said_nothing() {
+            let conn = crate::db::open_memory().unwrap();
+            let det = read(Some(Generation::Lto5), Some(0x58), DetectSource::Driver);
+
+            let done = init(&conn, &config(None), &det, None, None).unwrap();
+
+            assert_eq!(
+                done.medium.operator_line(),
+                "medium: LTO-5, 1.50 TB (the st driver's density register 0x58)"
+            );
+            assert_eq!(
+                done.medium.to_json()["generation_source"],
+                "driver_density_register"
+            );
+        }
+
+        /// The mhvtl case: the generation is detected, the capacity is the
+        /// drive's declared lie. Naming only one decider would be wrong, so
+        /// the line names both.
+        #[test]
+        fn a_drive_capacity_override_is_named_as_what_decided_the_capacity() {
+            let conn = crate::db::open_memory().unwrap();
+            let det = read(Some(Generation::Lto6), Some(0x5a), DetectSource::MamMedium);
+
+            let done = init(&conn, &config(Some("2400M")), &det, None, None).unwrap();
+
+            assert_eq!(
+                done.medium.operator_line(),
+                "medium: LTO-6, 2.4 GB (the cartridge chip's medium density code 0x5a; \
+                 capacity from the drive's capacity_override)"
+            );
+            assert_eq!(stored(&conn), ("LTO-6".to_string(), 2_400_000_000));
+            assert_eq!(
+                done.medium.to_json()["capacity_source"],
+                "drive_capacity_override"
+            );
+        }
+
+        /// A registered cartridge's `--capacity` decides the figure when no
+        /// override does -- the LTO-10 40 TB case ADR-0010 names, here a
+        /// 1.2 TB LTO-5 for a visible difference from the table's 1.50 TB.
+        #[test]
+        fn a_registered_cartridges_capacity_is_named_as_what_decided_the_capacity() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('A482L5', 'LTO-5', 1200000000000, 'SER-482', 'available')",
+                [],
+            )
+            .unwrap();
+            let det = read(Some(Generation::Lto5), Some(0x58), DetectSource::MamMedium);
+
+            let done = init(&conn, &config(None), &det, None, None).unwrap();
+
+            assert_eq!(
+                done.medium.operator_line(),
+                "medium: LTO-5, 1.20 TB (the cartridge chip's medium density code 0x58; \
+                 capacity from the cartridge's registered capacity)"
+            );
+            assert_eq!(done.medium.to_json()["capacity_source"], "cartridge_row");
+        }
+
+        /// Nothing readable and nothing declared: the drive's own generation
+        /// stands in, and the line says it is an assumption, not a reading.
+        #[test]
+        fn an_undetected_medium_is_said_to_be_assumed_from_the_drive() {
+            let conn = crate::db::open_memory().unwrap();
+            let det = read(None, None, DetectSource::None);
+
+            let done = init(&conn, &config(None), &det, None, None).unwrap();
+
+            assert_eq!(
+                done.medium.operator_line(),
+                "medium: LTO-6, 2.50 TB (not detected: no density code was read from the \
+                 medium; assumed from the drive's generation)"
+            );
+            let json = done.medium.to_json();
+            assert_eq!(json["generation_source"], "drive_generation");
+            assert!(json["density_code"].is_null(), "{json}");
+        }
+
+        /// A code that was read but is no LTO generation (the st driver's
+        /// 0x00 on a tape it has no density for) is reported as read.
+        #[test]
+        fn an_unrecognised_density_code_is_reported_not_hidden() {
+            let conn = crate::db::open_memory().unwrap();
+            let det = read(None, Some(0x00), DetectSource::None);
+
+            let done = init(&conn, &config(None), &det, None, None).unwrap();
+
+            assert_eq!(
+                done.medium.operator_line(),
+                "medium: LTO-6, 2.50 TB (not detected: the medium reported density code \
+                 0x00, which is not an LTO generation; assumed from the drive's generation)"
+            );
+            assert_eq!(done.medium.to_json()["density_code"], 0);
+        }
+
+        #[test]
+        fn a_generation_flag_that_stood_in_is_named() {
+            let conn = crate::db::open_memory().unwrap();
+            let det = read(None, None, DetectSource::None);
+
+            let done = init(&conn, &config(None), &det, Some("LTO-5"), None).unwrap();
+
+            assert_eq!(
+                done.medium.operator_line(),
+                "medium: LTO-5, 1.50 TB (not detected: no density code was read from the \
+                 medium; assumed from --generation)"
+            );
+            assert_eq!(done.medium.to_json()["generation_source"], "generation_flag");
+        }
+
+        /// The cartridge row's generation, when nothing else could say, names
+        /// the cartridge it came from.
+        #[test]
+        fn a_registered_generation_that_stood_in_names_its_cartridge() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO cartridges (barcode, media_type, nominal_capacity, serial_number,
+                                         status)
+                 VALUES ('A482L5', 'LTO-5', 1500000000000, 'SER-482', 'available')",
+                [],
+            )
+            .unwrap();
+            let det = read(None, None, DetectSource::None);
+
+            let done = init(&conn, &config(None), &det, None, None).unwrap();
+
+            assert_eq!(
+                done.medium.operator_line(),
+                "medium: LTO-5, 1.50 TB (not detected: no density code was read from the \
+                 medium; assumed from the generation registered for cartridge A482L5; \
+                 capacity from the cartridge's registered capacity)"
+            );
+            assert_eq!(done.medium.to_json()["generation_source"], "cartridge_row");
         }
     }
 }
