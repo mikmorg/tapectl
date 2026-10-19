@@ -98,6 +98,11 @@ fn emit(runs: &[&Path], extra: &[&str]) -> Output {
     run_py(&args)
 }
 
+/// The block's comments with their line wraps undone, for phrases the wrapping may split.
+fn flat(block: &str) -> String {
+    block.replace("\n#   ", " ")
+}
+
 fn block_lines(block: &str) -> Vec<&str> {
     block.lines().filter(|l| !l.starts_with('#')).collect()
 }
@@ -319,6 +324,7 @@ fn build_reads_a_recorded_run_directory_into_a_sourced_report() {
 // ---------------------------------------------------------------------------
 
 /// A recorded report in, the block out: pinned in full (the date line aside), derived from the one run.
+/// The run supports 0.98, and the block says 0.97 (never above the default, ADR-0012 item 98).
 #[test]
 fn emit_derives_the_block_from_a_recorded_report() {
     let tmp = TempDir::new().unwrap();
@@ -348,8 +354,15 @@ fn emit_derives_the_block_from_a_recorded_report() {
         out.contains("# post_warning_bytes from hp_lto6_run_a"),
         "{out}"
     );
-    // fill_ceiling 0.98: first refusal at 1.0008 of nominal, less the 0.02 margin, rounded down; the room
-    // is the drive's 99,008 MB, the lower of that and the walk's 99,377,741,824 bytes.
+    // The runs support fill_ceiling 0.98 (first refusal at 1.0008 of nominal, less the 0.02 margin, rounded
+    // down), but the emitted value is NEVER above the 0.97 default (ADR-0012 item 98) and the comment says
+    // so; the room is the drive's 99,008 MB, the lower of that and the walk's 99,377,741,824 bytes.
+    assert!(
+        flat(&out).contains(
+            "the runs support 0.98; kept at the 0.97 default until the wear allowance of ADR-0012 item 98 is fitted"
+        ),
+        "{out}"
+    );
     assert_eq!(
         block_lines(&out),
         vec![
@@ -357,7 +370,7 @@ fn emit_derives_the_block_from_a_recorded_report() {
             "name = \"hp-ultrium-6-scsi\"",
             "device_tape = \"/dev/tape/by-id/scsi-HUJ808A5L4-nst\"",
             "generation = \"LTO-6\"",
-            "fill_ceiling = 0.98",
+            "fill_ceiling = 0.97",
             "post_warning_bytes = \"99008M\"",
         ]
     );
@@ -374,7 +387,10 @@ fn the_emitted_block_loads_as_a_config_and_sets_the_slice_cap() {
     std::fs::write(&path, &block).unwrap();
     let cfg = tapectl::config::Config::load(&path).expect("the emitted block loads");
     let b = &cfg.backends.lto[0];
-    assert_eq!(b.fill_ceiling, 0.98);
+    assert_eq!(
+        b.fill_ceiling, 0.97,
+        "never above the default, whatever the runs support"
+    );
     assert_eq!(b.post_warning_room_bytes().unwrap(), Some(99_008_000_000));
     assert_eq!(b.native_generation().unwrap().as_str(), "LTO-6");
     assert_eq!(cfg.slice_cap_problem("defaults.slice_size", 1 << 30), None);
@@ -457,7 +473,7 @@ fn several_runs_combine_by_the_minimum_and_are_all_listed() {
         "{out}"
     );
     assert!(
-        out.contains("The data supports no more than the 0.97 default"),
+        flat(&out).contains("the runs support 0.97, no more than the 0.97 default"),
         "{out}"
     );
 
@@ -477,7 +493,14 @@ fn several_runs_combine_by_the_minimum_and_are_all_listed() {
     );
     // The margin is a flag.
     let tight = stdout(&emit(&[&a], &["--margin", "0.005"]));
-    assert!(tight.contains("fill_ceiling = 0.99"), "{tight}");
+    assert!(
+        block_lines(&tight).contains(&"fill_ceiling = 0.97"),
+        "capped at the default: {tight}"
+    );
+    assert!(
+        flat(&tight).contains("the runs support 0.99"),
+        "the derived value is still reported: {tight}"
+    );
 }
 
 #[test]
@@ -558,7 +581,14 @@ fn an_emulated_run_is_ignored_for_every_derived_value() {
     );
     // Mixed with a real run, the real one decides.
     let both = stdout(&emit(&[&a, &mhvtl], &[]));
-    assert!(both.contains("fill_ceiling = 0.98"), "{both}");
+    assert!(
+        flat(&both).contains("the runs support 0.98"),
+        "the real run decides what is derived: {both}"
+    );
+    assert!(
+        block_lines(&both).contains(&"fill_ceiling = 0.97"),
+        "{both}"
+    );
     // Trusted, the emulator's 0.02% early warning leaves nothing after the margin: refused, not emitted.
     let trusted = emit(&[&mhvtl], &["--trust-emulated"]);
     assert!(!trusted.status.success(), "{}", text(&trusted));
@@ -621,7 +651,7 @@ fn the_script_emits_through_its_emit_option() {
     let tmp = TempDir::new().unwrap();
     let run = built_run_a(&tmp);
     let out = run_script("lto-profile.sh", &["--emit", run.to_str().unwrap()]);
-    assert!(stdout(&out).contains("fill_ceiling = 0.98"));
+    assert!(block_lines(&stdout(&out)).contains(&"fill_ceiling = 0.97"));
 }
 
 /// Nothing is touched without the cartridge's name, and a device that is not an st node is refused

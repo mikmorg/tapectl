@@ -19,8 +19,8 @@ production tape.
 
 - A new drive model, or new drive firmware, before its first production tape.
 - A new cartridge generation in a drive that already has a profile.
-- Before turning on `post_warning_bytes` (the slice cap, below) or raising `fill_ceiling`
-  above the 0.97 default.
+- Before turning on `post_warning_bytes` (the slice cap, below), or to see what the runs say
+  `fill_ceiling` could be (the emitted block never raises it above the 0.97 default by itself).
 - Again on a few cartridges of the same model: the block takes the most conservative figure
   across the runs you give it, and says which run each value came from.
 
@@ -153,10 +153,13 @@ Only drive-level keys are set (item 97): capacity stays a property of the cartri
 
 - **`fill_ceiling`** is the lowest, over the runs, of (bytes written before the first write
   refusal ÷ the generation's marketed capacity), less a margin (`--margin`, default 0.02),
-  rounded **down** to a whole percent, at most 1. With no run that measured an early warning, it
-  stays at the 0.97 default and says why. If the measurement supports less than 0.97, the
-  ceiling comes **down**, with a warning in the block and on standard error: a drive that stops
-  short of the default would otherwise abort tapes at its early warning.
+  rounded **down** to a whole percent, and **never above the 0.97 default** (ADR-0012 item 98:
+  the default stays conservative until a fitted per-cartridge wear allowance is put to the CTO).
+  A derived value above 0.97 is printed in the comment ("the runs support 0.98; kept at the 0.97
+  default until the wear allowance of ADR-0012 item 98 is fitted") and the key says 0.97. With no
+  run that measured an early warning, it stays at 0.97 and says why. If the measurement supports
+  **less** than 0.97, the ceiling comes **down**, with a warning in the block and on standard
+  error: a drive that stops short of the default would otherwise abort tapes at its early warning.
 - **`post_warning_bytes`** is the smallest, over the runs, of the room above. With no run that
   walked or reported a figure, the key is left out, and absent means nothing is checked.
 - `name` and `device_tape` are placeholders you change (`--name` and `--device-tape` set them):
@@ -177,9 +180,11 @@ real drive has not yet been walked to the hard end):
 # runs:    hp_lto6_run_a (cartridge EW7VWMVKF6, FUJIFILM, 2026-09-23)
 # media makers seen (recorded, not a key, ADR-0012 item 97): FUJIFILM
 # rules:   fill_ceiling = the LOWEST over runs of (bytes written before the first write refusal / the marketed
-#          capacity), less a 0.02 margin, rounded DOWN to a whole percent, at most 1.0; 0.97 when no run measured
-#          an early warning. post_warning_bytes = the SMALLEST over runs of the lower of the measured walk from the
-#          first refusal to the hard end and the drive's page 0x0c 'minimum native capacity from EW to EOP'.
+#          capacity), less a 0.02 margin, rounded DOWN to a whole percent, and NEVER ABOVE the 0.97 default
+#          (ADR-0012 item 98: a higher value waits for a fitted wear allowance); 0.97 when no run measured an
+#          early warning. post_warning_bytes = the SMALLEST over runs of the lower of the measured walk from
+#          the first refusal to the hard end and the drive's page 0x0c 'minimum native capacity from EW to
+#          EOP'.
 #          Only drive-level keys are set; capacity stays a property of the cartridge (ADR-0010).
 # Set name and device_tape for your drive, then paste this block into config.toml (`tapectl config check`).
 [[backends.lto]]
@@ -188,8 +193,9 @@ device_tape = "/dev/tape/by-id/scsi-HUJ808A5L4-nst"
 generation = "LTO-6"
 # fill_ceiling from hp_lto6_run_a (cartridge EW7VWMVKF6, FUJIFILM, 2026-09-23): the lowest of 1 run(s) --
 #   first write refusal at 1.0008 of the 2,500,000,000,000-byte marketed capacity (2,501,995,134,976 bytes),
-#   less the 0.02 margin, rounded down to a whole percent
-fill_ceiling = 0.98
+#   less the 0.02 margin, rounded down to a whole percent: the runs support 0.98; kept at the 0.97 default
+#   until the wear allowance of ADR-0012 item 98 is fitted
+fill_ceiling = 0.97
 # post_warning_bytes from hp_lto6_run_a (cartridge EW7VWMVKF6, FUJIFILM, 2026-09-23): the smallest of 1 run(s)
 #   -- the lower of the measured walk and the drive-reported figure: measured walk 99,377,741,824 vs
 #   drive-reported page 0x0c 99,008,000,000
@@ -206,7 +212,7 @@ tapectl config check
 ## `post_warning_bytes` and the slice cap
 
 `post_warning_bytes` (a size in **decimal** units, like `capacity_override`: `99008M`, `99G`, or a
-bare byte count; above zero; `config set` validates it like the other keys) is the room a write
+bare byte count; above zero; `config set` validates it like the other keys and refuses a value that breaks the cap) is the room a write
 has between the drive's early warning and the hard end of the medium. Tapectl uses it for one
 check (ADR-0012 item 100): with the key on any configured drive, **a slice plus the seal must fit
 in half of the smallest such room** (a 2x margin for wear and variance), so that a tape can still
@@ -216,11 +222,15 @@ be sealed after the warning.
   header) and the writer pads it to whole 512 KiB blocks. The seal is a 16 MiB allowance (the seal
   marker with its full copy of the front index, about 170 bytes per tape file, covers a 30,000-file
   tape).
-- `config check` (and so every command that loads the config, and `config set`) refuses a
-  `[defaults] slice_size` or an `[[archive_sets]]` `slice_size` that does not fit, naming the key,
-  the drive and the numbers, and the largest `slice_size` that does. `stage create` refuses the
-  slice size in force for the unit (its dotfile's `[policy]`, its archive set, or `[defaults]`)
+- `config check` reports a `[defaults] slice_size` or an `[[archive_sets]]` `slice_size` that does
+  not fit as an `error:` line, naming the key, the drive and the numbers and the largest
+  `slice_size` that does, and exits non-zero (`--json`: `slice_cap_problems`). `config set` refuses
+  an edit (of `slice_size` or of `post_warning_bytes`) that would make one. `stage create` refuses
+  the slice size in force for the unit (its dotfile's `[policy]`, its archive set, or `[defaults]`)
   before it touches the staging directory or dar.
+- **The config still loads.** Every other command, `restore`, `volume verify`, `volume read-slices`
+  and `catalog rebuild` among them, runs as before: a staging setting must never block reading a
+  tape in an emergency.
 - With the key absent on every drive, nothing is checked.
 
 The default `slice_size` stays 1 GiB (ADR-0012 2026-10-06 item 10) unless the room is smaller.

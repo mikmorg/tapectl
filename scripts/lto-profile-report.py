@@ -15,6 +15,7 @@ later fitting exercise read:
                      profile.json files of one drive model and one medium
                      generation. Every derived value names the runs it came
                      from. The rules are in the comments of the block.
+                     fill_ceiling is never emitted above the 0.97 default.
   identify RUN_DIR -> identity.json and KEY=VALUE lines for the driver (the
                      drive's and the medium's generation, nominal capacity).
   meta RUN_DIR --set k=v ... -> merge keys into RUN_DIR/meta.json.
@@ -861,15 +862,20 @@ def derive_block(profiles, margin, trust_emulated, name=None, device_tape=None, 
         low_run = [p for f, p in points if f == lowest][0]
         if candidate <= 0:
             raise SystemExit("emit: the measured early-warning fraction %.4f leaves nothing after the %.2f margin" % (lowest, margin))
-        fill_ceiling = candidate
+        # The ceiling is never emitted above the default (ADR-0012 item 98): the default stays conservative
+        # until a fitted per-cartridge wear allowance is put to the CTO. A derived value above it is only
+        # reported, in the comment.
+        fill_ceiling = min(candidate, DEFAULT_FILL_CEILING)
         fc_note = ("from %s: the lowest of %d run(s) -- first write refusal at %.4f of the %s-byte marketed capacity (%s bytes), "
-                   "less the %.2f margin, rounded down to a whole percent" % (
-                       run_tag(low_run), len(points), lowest, humanize(nominal), humanize(low_run["early_warning"]["bytes_before_first_refusal"]), margin))
-        if fill_ceiling < DEFAULT_FILL_CEILING:
+                   "less the %.2f margin, rounded down to a whole percent: the runs support %.2f" % (
+                       run_tag(low_run), len(points), lowest, humanize(nominal), humanize(low_run["early_warning"]["bytes_before_first_refusal"]), margin, candidate))
+        if candidate < DEFAULT_FILL_CEILING:
             warnings.append("the measured early warning (%.4f of nominal) supports only fill_ceiling = %.2f, BELOW the %.2f default" % (lowest, fill_ceiling, DEFAULT_FILL_CEILING))
             fc_note += ". LOWER than the %.2f default: this drive and cartridge stop short of it" % DEFAULT_FILL_CEILING
-        elif fill_ceiling == DEFAULT_FILL_CEILING:
-            fc_note += ". The data supports no more than the %.2f default" % DEFAULT_FILL_CEILING
+        elif candidate == DEFAULT_FILL_CEILING:
+            fc_note += ", no more than the %.2f default" % DEFAULT_FILL_CEILING
+        else:
+            fc_note += "; kept at the %.2f default until the wear allowance of ADR-0012 item 98 is fitted" % DEFAULT_FILL_CEILING
         runs_for_fc = [p for _, p in points]
     else:
         fill_ceiling = DEFAULT_FILL_CEILING
@@ -900,10 +906,13 @@ def derive_block(profiles, margin, trust_emulated, name=None, device_tape=None, 
     a(textwrap.fill("runs:    " + "; ".join(run_tag(p) for p in profiles), width=110, initial_indent="# ",
                     subsequent_indent="#          ", break_long_words=False, break_on_hyphens=False))
     a("# media makers seen (recorded, not a key, ADR-0012 item 97): %s" % (", ".join(sorted(set(str(p['medium'].get('maker')) for p in profiles)))))
-    a("# rules:   fill_ceiling = the LOWEST over runs of (bytes written before the first write refusal / the marketed")
-    a("#          capacity), less a %.2f margin, rounded DOWN to a whole percent, at most 1.0; %.2f when no run measured" % (margin, DEFAULT_FILL_CEILING))
-    a("#          an early warning. post_warning_bytes = the SMALLEST over runs of the lower of the measured walk from the")
-    a("#          first refusal to the hard end and the drive's page 0x0c 'minimum native capacity from EW to EOP'.")
+    a(textwrap.fill(
+        "rules:   fill_ceiling = the LOWEST over runs of (bytes written before the first write refusal / the marketed "
+        "capacity), less a %.2f margin, rounded DOWN to a whole percent, and NEVER ABOVE the %.2f default (ADR-0012 item 98: "
+        "a higher value waits for a fitted wear allowance); %.2f when no run measured an early warning. post_warning_bytes = "
+        "the SMALLEST over runs of the lower of the measured walk from the first refusal to the hard end and the drive's "
+        "page 0x0c 'minimum native capacity from EW to EOP'." % (margin, DEFAULT_FILL_CEILING, DEFAULT_FILL_CEILING),
+        width=110, initial_indent="# ", subsequent_indent="#          ", break_long_words=False, break_on_hyphens=False))
     a("#          Only drive-level keys are set; capacity stays a property of the cartridge (ADR-0010).")
     for w in warnings:
         a("# WARNING: %s" % w)

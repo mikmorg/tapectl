@@ -3,9 +3,11 @@
 # runs:    hp_lto6_run_a (cartridge EW7VWMVKF6, FUJIFILM, 2026-09-23)
 # media makers seen (recorded, not a key, ADR-0012 item 97): FUJIFILM
 # rules:   fill_ceiling = the LOWEST over runs of (bytes written before the first write refusal / the marketed
-#          capacity), less a 0.02 margin, rounded DOWN to a whole percent, at most 1.0; 0.97 when no run measured
-#          an early warning. post_warning_bytes = the SMALLEST over runs of the lower of the measured walk from the
-#          first refusal to the hard end and the drive's page 0x0c 'minimum native capacity from EW to EOP'.
+#          capacity), less a 0.02 margin, rounded DOWN to a whole percent, and NEVER ABOVE the 0.97 default
+#          (ADR-0012 item 98: a higher value waits for a fitted wear allowance); 0.97 when no run measured an
+#          early warning. post_warning_bytes = the SMALLEST over runs of the lower of the measured walk from
+#          the first refusal to the hard end and the drive's page 0x0c 'minimum native capacity from EW to
+#          EOP'.
 #          Only drive-level keys are set; capacity stays a property of the cartridge (ADR-0010).
 # Set name and device_tape for your drive, then paste this block into config.toml (`tapectl config check`).
 [[backends.lto]]
@@ -14,8 +16,9 @@ device_tape = "/dev/tape/by-id/scsi-HUJ808A5L4-nst"
 generation = "LTO-6"
 # fill_ceiling from hp_lto6_run_a (cartridge EW7VWMVKF6, FUJIFILM, 2026-09-23): the lowest of 1 run(s) --
 #   first write refusal at 1.0008 of the 2,500,000,000,000-byte marketed capacity (2,501,995,134,976 bytes),
-#   less the 0.02 margin, rounded down to a whole percent
-fill_ceiling = 0.98
+#   less the 0.02 margin, rounded down to a whole percent: the runs support 0.98; kept at the 0.97 default
+#   until the wear allowance of ADR-0012 item 98 is fitted
+fill_ceiling = 0.97
 # post_warning_bytes from hp_lto6_run_a (cartridge EW7VWMVKF6, FUJIFILM, 2026-09-23): the smallest of 1 run(s)
 #   -- the lower of the measured walk and the drive-reported figure: measured walk 99,377,741,824 vs
 #   drive-reported page 0x0c 99,008,000,000
