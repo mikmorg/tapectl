@@ -34,6 +34,8 @@ tapectl volume [OPTIONS] <COMMAND>
 
 Initialize a new volume (write ID thunk to tape)
 
+After the volume line, prints one line naming the medium the cartridge was taken for: its generation, the capacity stored on the volume (decimal) and what decided each, e.g. `medium: LTO-5, 1.50 TB (the cartridge chip's medium density code 0x58)`. An LTO-5 cartridge in an LTO-6 drive is seen to be LTO-5 here. `--json` carries the same facts as a `medium` object.
+
 ```text
 tapectl volume init [OPTIONS] <LABEL>
 ```
@@ -380,6 +382,8 @@ tapectl volume deposit remove [OPTIONS] --from <FROM> <LABEL>
 List every volume, most recently written first.
 
 Catalog-only: never opens a drive. Every status is shown by default — ADR-0011: retired means unfit to WRITE, not unreadable ("a retired volume can still be restored from"), and the dangerous failure for an inventory is a tape you forgot you had. `--status` narrows; nothing is hidden without it.
+
+GENERATION and CAPACITY are what `volume init` decided for the volume (capacity decimal, as the box counts it); `--json` carries them as `media_type` and `capacity_bytes`.
 
 ```text
 tapectl volume list [OPTIONS]

@@ -7,6 +7,8 @@ tapectl\-volume\-init \- Initialize a new volume (write ID thunk to tape)
 \fBtapectl volume init\fR [\fB\-\-device\fR] [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] [\fB\-\-force\fR] [\fB\-\-generation\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-cartridge\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-home\fR] [\fB\-h\fR|\fB\-\-help\fR] <\fILABEL\fR> 
 .SH DESCRIPTION
 Initialize a new volume (write ID thunk to tape)
+.PP
+After the volume line, prints one line naming the medium the cartridge was taken for: its generation, the capacity stored on the volume (decimal) and what decided each, e.g. `medium: LTO\-5, 1.50 TB (the cartridge chip\*(Aqs medium density code 0x58)`. An LTO\-5 cartridge in an LTO\-6 drive is seen to be LTO\-5 here. `\-\-json` carries the same facts as a `medium` object.
 .SH OPTIONS
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
