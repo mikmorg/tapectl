@@ -323,8 +323,9 @@ fn build_sealed_harness_from(
     let half = fixtures.len() / 2;
     let mut build_units = Vec::with_capacity(fixtures.len());
     let mut units_plain = Vec::with_capacity(fixtures.len());
-    let mut unit_rows: Vec<(i64, std::path::PathBuf, Vec<(String, u64)>)> =
-        Vec::with_capacity(fixtures.len());
+    /// A unit's id, the directory its files are read from, and those files.
+    type UnitRow = (i64, std::path::PathBuf, Vec<(String, u64)>);
+    let mut unit_rows: Vec<UnitRow> = Vec::with_capacity(fixtures.len());
 
     for (i, fixture) in fixtures.iter().enumerate() {
         let tenant = if i < half { &tenants[0] } else { &tenants[1] };

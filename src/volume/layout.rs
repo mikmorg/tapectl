@@ -1012,6 +1012,19 @@ tape whose envelope lists the same unit, with the same uuid, at the same
 version is used; any other is refused by name, because another version can
 differ in the very files that are damaged.
 
+**A file fails its hash.** dar checks each file it restores with a short
+checksum, not a hash, and two equal flips in a file can cancel: a damaged file
+can come back with no error from dar. A tape written since 1.3.0 records the
+sha256 of every regular file in the index of its tenant envelope, and after
+each restore and each fill RESTORE.sh reads the restored files back from
+`--to` and checks them against it with `sha256sum`. A file that does not match,
+or is missing, goes on the same list as a file dar named, and the run ends
+`RESTORE INCOMPLETE`: fill it from another copy the same way. The check costs
+one read of the restored files from disk and none of the tape; with `--path`
+only the paths restored are checked. A file with no sha256 recorded is not
+checked, and a tape written before 1.3.0 has no index and is not checked at
+all; RESTORE.sh says both. `--no-file-check` skips the check.
+
 ## Manual Recovery Steps
 
 If RESTORE.sh is not available, follow these steps with `mt`, `dd`, `age`,
@@ -1345,8 +1358,9 @@ the seal marker.
 /// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_DAR_DAMAGED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
-        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
+        AWK_CHECK_FILE_LIST, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED, AWK_FILE_CHECK_LIST,
+        AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_COMMON,
+        AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
         AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
@@ -1363,7 +1377,7 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #   ./RESTORE.sh --find-envelope --key KEYFILE [--key K2 ...] Decrypt your envelope
 #   ./RESTORE.sh --restore --key KEYFILE [--key K2 ...] --to DIR
 #                [--unit U [--unit U2 ...] | --all] [--version N]
-#                [--no-space-check] [--overwrite] [--scratch DIR]
+#                [--no-space-check] [--overwrite] [--no-file-check] [--scratch DIR]
 #   ./RESTORE.sh --restore --key KEYFILE --to DIR --unit U --path P [--path P2 ...]
 #                [--version N] [--scratch DIR]                One file or folder
 #   ./RESTORE.sh --list --key KEYFILE [--unit U] [--version N]  A unit's files
@@ -1406,6 +1420,16 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 # directory (ADR-0012 item 102) and ends RESTORE INCOMPLETE. Another tape that
 # holds the same unit at the same version fills exactly those files:
 #   ./RESTORE.sh --restore --key KEYFILE --unit U --fill-from LIST --to DIR
+#
+# dar checks each file it restores with a short checksum, not a hash, so a
+# damaged file can come back with no error. A tape written since version 1.3.0
+# records the sha256 of every regular file in its index, and after each restore
+# and each fill this script reads the restored files back and checks them
+# against it with sha256sum (ADR-0012 item 103). A file that does not match, or
+# is missing, goes on the damaged-file list like one dar named, and the run ends
+# RESTORE INCOMPLETE. That costs one read of the restored files from disk, not
+# a tape read; --no-file-check skips it. A tape written before 1.3.0 has no
+# index to check against, and the script says so.
 #
 # Disk space: --restore streams each slice from the tape through age into dar,
 # so nothing decrypted is written to disk but the restored files themselves:
@@ -3676,7 +3700,16 @@ damaged_header() { # <unit> <uuid> <version>
 # files, where the list is, and the command that fills them from another copy.
 damage_note() { # <count> <list file> <slices not available, or empty>
   local n=$1 list=$2 gone=${3:-} to=${RESTORE_TO:-DIR}
-  echo "Unit '$UNIT_NAME' (version $UNIT_VER): $n file(s) were not restored."
+  if [ "${CHECK_ADDED:-0}" -eq 0 ]; then
+    echo "Unit '$UNIT_NAME' (version $UNIT_VER): $n file(s) were not restored."
+  elif [ "$CHECK_ADDED" -eq "$n" ]; then
+    echo "Unit '$UNIT_NAME' (version $UNIT_VER): $n file(s) do not match the sha256 the index records for them, or are missing."
+    echo "  dar named none of them: it checks a file with a short checksum, and this script checks it with a hash."
+  else
+    echo "Unit '$UNIT_NAME' (version $UNIT_VER): $n file(s) were not restored intact."
+    echo "  $CHECK_ADDED of them were written without a dar error but do not match the sha256 the index records"
+    echo "  for them, or are missing: dar checks a file with a short checksum, and this script checks it with a hash."
+  fi
   if [ -n "$gone" ]; then
     echo "  Slice(s) not available: $gone. The files in them are among those listed."
   fi
@@ -3716,6 +3749,179 @@ clear_stale_list() { # <destination>
   esac
 }
 
+# ---- the restored files against their recorded sha256 (1.3.0; ADR-0012 item 103) ----
+
+# dar checks each file it restores with a short checksum, not a hash: two equal
+# byte flips can cancel, and a damaged file comes back with no error. A tape
+# written since 1.3.0 records the sha256 of every regular file in its tenant
+# envelope's index/paths.tsv, and once a unit is extracted each file is read
+# back from --to and checked against it with sha256sum. The envelope is on disk
+# already and the files are the ones just restored: the tape is not touched. A
+# file that does not match, or a listed file that is not there, goes on the
+# damaged-file list, so --fill-from can take it from another copy. A file with
+# no recorded hash is not checked, and a tape with no index (written before
+# 1.3.0) is not checked at all; both are said. --no-file-check skips it.
+FILE_CHECK=1
+CHECK_NOTED=" "
+CHECK_INDEX=""
+CHECK_ANY_INDEX=0
+CHECK_BAD="$WORK/check.bad"
+CHECK_FAILED=0
+CHECK_UNNAMED=0
+CHECK_ADDED=0
+
+# True when $1 was said before in this run; else remembers it and is false.
+said_before() { # <key>
+  case "$CHECK_NOTED" in
+  *" $1 "*) return 0 ;;
+  esac
+  CHECK_NOTED="$CHECK_NOTED$1 "
+  return 1
+}
+
+# A path as the lists print it: one line, with no control character a
+# terminal would act on (the lists already hold a TAB, newline or carriage
+# return as \t, \n and \r).
+printable_path() { # <escaped path>
+  printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177'
+}
+
+# The paths.tsv, among the envelopes this run has open, that lists this
+# version of this unit: the envelope in use first, then the others the walk
+# opened (an escrow or operator key restores from the operator envelope, which
+# has no paths.tsv; the tenant envelope that lists the unit was opened before
+# it and is still on disk). Sets CHECK_INDEX ("" when there is none) and
+# CHECK_ANY_INDEX (1 when any open envelope carries an index member at all).
+index_for_unit() { # <unit> <version> <unit uuid>
+  local d
+  CHECK_INDEX=""
+  CHECK_ANY_INDEX=0
+  for d in "$CHOSEN_ENV" "$WORK"/opened.*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/index/units.tsv" ] || [ -f "$d/index/paths.tsv" ]; then
+      CHECK_ANY_INDEX=1
+    fi
+    [ -z "$CHECK_INDEX" ] || continue
+    [ -f "$d/index/paths.tsv" ] && [ -f "$d/index/units.tsv" ] || continue
+    if CHK_UNIT="$1" CHK_VER="$2" CHK_UUID="$3" awk '__AWK_INDEX_COMMON__ __AWK_FILE_CHECK_LISTED__' "$d/index/units.tsv"; then
+      CHECK_INDEX="$d/index/paths.tsv"
+    fi
+  done
+}
+
+# Check the regular files of UNIT_NAME, version UNIT_VER, that were restored
+# into $1, against the index. With $2, a file of escaped paths, only those
+# (a fill). With --path, only what was asked for. The files that fail are left
+# in $CHECK_BAD, one per line and escaped as the index escapes a path; their
+# number is CHECK_FAILED, and CHECK_UNNAMED counts failures that sha256sum
+# reported and this script could not name.
+file_check() { # <destination> [<file of escaped paths to check>]
+  local destdir=$1 only=${2:-} p whole=0
+  local rows=0 files=0 checked=0 nspecial=0 nohash=0 named=0 unmatched=0 stray=0
+  : >"$CHECK_BAD"
+  CHECK_FAILED=0
+  CHECK_UNNAMED=0
+  if [ "$FILE_CHECK" = 0 ]; then
+    said_before off || {
+      info "File check skipped (--no-file-check): the restored files are checked by dar's own checksum only,"
+      info "  not against the sha256 recorded for them in the index."
+    }
+    return 0
+  fi
+  if [ -n "$only" ] && [ ! -s "$only" ]; then
+    return 0
+  fi
+  index_for_unit "$UNIT_NAME" "$UNIT_VER" "$UNIT_UUID"
+  if [ -z "$CHECK_INDEX" ]; then
+    if [ "$CHECK_ANY_INDEX" = 0 ]; then
+      said_before no-index || {
+        info "File check: this tape carries no index (a tape written before version 1.3.0 has none), so the"
+        info "  restored files are checked by dar's own checksum only, not against a recorded sha256."
+      }
+    else
+      info "File check: no envelope this key opened lists '$(visible_text "$UNIT_NAME")' version $UNIT_VER with its files, so they are"
+      info "  not checked against a recorded sha256 (the key of the tenant who owns the unit opens the envelope that does)."
+    fi
+    return 0
+  fi
+  # --path: dar restored these paths and, for a directory, what is under it.
+  if [ -z "$only" ] && [ ${#RESTORE_PATHS[@]} -gt 0 ]; then
+    : >"$WORK/check.only"
+    for p in "${RESTORE_PATHS[@]}"; do
+      p=${p#/}
+      p=${p#./}
+      while [ "${p%/}" != "$p" ]; do
+        p=${p%/}
+      done
+      if [ -z "$p" ]; then
+        whole=1
+        break
+      fi
+      printf '%s\n' "$(escape_text "$p")" >>"$WORK/check.only"
+    done
+    [ "$whole" = 1 ] || only="$WORK/check.only"
+  fi
+  if ! CHK_UNIT="$UNIT_NAME" CHK_VER="$UNIT_VER" CHK_ONLY="$only" CHK_SUMS="$WORK/check.sums" \
+    CHK_SPECIAL="$WORK/check.special" CHK_COUNTS="$WORK/check.counts" \
+    awk '__AWK_INDEX_COMMON__ __AWK_FILE_CHECK_LIST__' "$CHECK_INDEX"; then
+    echo "WARNING: this script could not make the list of files to check from the index in the envelope (it has no" >&2
+    echo "         unit, version or path column, or the work directory $WORK is full; TMPDIR moves it):" >&2
+    echo "         the restored files of '$(visible_text "$UNIT_NAME")' are not checked against a recorded sha256." >&2
+    return 0
+  fi
+  read -r rows files checked nspecial nohash <"$WORK/check.counts" || true
+  if [ "$checked" -eq 0 ]; then
+    if [ "$nohash" -gt 0 ]; then
+      info "File check: the index records no sha256 for the $nohash file(s) of '$(visible_text "$UNIT_NAME")' version $UNIT_VER: not checked."
+    fi
+    return 0
+  fi
+  # Names that sha256sum -c takes as they stand: one pass, quiet, so only a
+  # failure is printed (a mismatch, or a file it could not open).
+  if [ "$checked" -gt "$nspecial" ]; then
+    (cd "$destdir" && sha256sum -c --quiet) <"$WORK/check.sums" >"$WORK/check.out" 2>"$WORK/check.err" || true
+    CHK_REPORT="$WORK/check.out" CHK_BAD="$WORK/check.named" CHK_COUNTS="$WORK/check.named.counts" \
+      awk '__AWK_FILE_CHECK_FAILED__' "$WORK/check.sums"
+    read -r named unmatched stray <"$WORK/check.named.counts" || true
+    cat "$WORK/check.named" >>"$CHECK_BAD"
+    if [ "$unmatched" -gt 0 ] || [ "$stray" -gt 0 ]; then
+      CHECK_UNNAMED=$((unmatched + stray))
+      echo "WARNING: sha256sum's report could not be matched to the files for $CHECK_UNNAMED line(s):" >&2
+      head -n 5 "$WORK/check.out" "$WORK/check.err" 2>/dev/null | sed 's/^/         /' >&2 || true
+    fi
+  fi
+  # A name with a backslash, a newline or a carriage return, one file at a
+  # time (sha256sum prints and reads such a name in an escaped form that
+  # differs between versions; hashing the file from standard input has no name
+  # to escape).
+  if [ "$nspecial" -gt 0 ]; then
+    local want esc got
+    while IFS=$'\t' read -r want esc; do
+      unesc_line "$esc"
+      got=$({ sha256sum <"$destdir/$UNESC"; } 2>/dev/null) || got=""
+      got=${got%% *}
+      [ "$got" = "$want" ] || printf '%s\n' "$esc" >>"$CHECK_BAD"
+    done <"$WORK/check.special"
+  fi
+  CHECK_FAILED=$(wc -l <"$CHECK_BAD")
+  local what="'$(visible_text "$UNIT_NAME")' version $UNIT_VER"
+  if [ "$CHECK_FAILED" -eq 0 ] && [ "$CHECK_UNNAMED" -eq 0 ]; then
+    if [ "$nohash" -gt 0 ]; then
+      info "File check: $checked restored file(s) of $what match the sha256 recorded in the index ($nohash more not checked: no sha256 recorded)"
+    else
+      info "File check: $checked restored file(s) of $what match the sha256 recorded in the index"
+    fi
+    return 0
+  fi
+  info "File check: $CHECK_FAILED of $checked file(s) of $what do NOT match their recorded sha256, or are missing:"
+  head -n 10 "$CHECK_BAD" | while IFS= read -r p; do
+    info "    $(printable_path "$p")"
+  done
+  if [ "$CHECK_FAILED" -gt 10 ]; then
+    info "    ... and $((CHECK_FAILED - 10)) more (all are in the damaged-file list)"
+  fi
+}
+
 # What a finished dar extraction (log $1, exit status $2, into $3) means.
 # Complete: status 0 and nothing skipped. Damage: status 5, which dar uses when
 # a file could not be restored, and it named the files (a failed CRC, a slice
@@ -3723,6 +3929,9 @@ clear_stale_list() { # <destination>
 # ending INCOMPLETE. $4 is the slices that were not available: with a slice
 # missing, a file dar skipped (user choice) is a file that was in it, not one
 # that was already there. Anything else is fatal, as it has always been.
+# Either way the restored files are then checked against the index
+# (file_check): the files dar named ($WORK/damaged.new, possibly none) and the
+# ones the check finds go in one list.
 dar_result() { # <log> <status> <destination> [slices not available]
   local log=$1 rc=$2 destdir=$3 gone=${4:-} errs=0 skipped=0 unmapped=0 failed=0 skips=0 n
   UNIT_OK=1
@@ -3731,9 +3940,10 @@ dar_result() { # <log> <status> <destination> [slices not available]
     die_io "dar extraction failed" "$log" "$destdir"
   fi
   [ -z "$gone" ] || skips=1
+  : >"$WORK/damaged.new"
   if [ "$rc" = 0 ] && [ "$skips" = 0 ]; then
     die_if_dar_skipped "$log" "$destdir"
-    clear_stale_list "$destdir"
+    finish_damage "$destdir" ""
     return 0
   fi
   if [ "$rc" != 0 ] && [ "$rc" != 5 ]; then
@@ -3755,14 +3965,34 @@ dar_result() { # <log> <status> <destination> [slices not available]
       die "dar extraction failed (exit $rc) — dar's own message is above"
     fi
     echo "NOTE: slice(s) $gone were not available, yet dar names no file it could not restore." >&2
-    clear_stale_list "$destdir"
+    finish_damage "$destdir" ""
     return 0
   fi
   if [ "$unmapped" -gt 0 ] || { [ "$rc" = 5 ] && [ "$errs" -ne "$failed" ]; }; then
     echo "WARNING: dar reported $failed file(s) failed and $skipped skipped, and this script could name" >&2
     echo "         $((errs + skipped - unmapped)) of them; the list written below may be short. Read dar's messages above." >&2
   fi
-  record_damage "$destdir" "$WORK/damaged.new" "$gone"
+  finish_damage "$destdir" "$gone"
+}
+
+# One unit's list, from the files dar named and the files the check finds: the
+# list is written when it holds any file, and a list left by an earlier run is
+# removed when it does not.
+finish_damage() { # <destination> <slices not available, or empty>
+  local destdir=$1 gone=${2:-} dar_n all_n
+  file_check "$destdir"
+  dar_n=$(wc -l <"$WORK/damaged.new")
+  awk '!seen[$0]++' "$WORK/damaged.new" "$CHECK_BAD" >"$WORK/damaged.all"
+  all_n=$(wc -l <"$WORK/damaged.all")
+  CHECK_ADDED=$((all_n - dar_n))
+  if [ "$all_n" -gt 0 ]; then
+    record_damage "$destdir" "$WORK/damaged.all" "$gone"
+  elif [ "$CHECK_UNNAMED" -gt 0 ]; then
+    UNIT_OK=0
+    INCOMPLETE+=("Unit '$UNIT_NAME' (version $UNIT_VER): $CHECK_UNNAMED file(s) failed the sha256 check and this script could not name them (see the WARNING above); no list is written.")
+  else
+    clear_stale_list "$destdir"
+  fi
 }
 
 # ---- salvage mode: a unit's slices on disk, bad ones replaced ----
@@ -4266,6 +4496,16 @@ fill_end() { # <list> <root>
     { w[$0] = 1; if (($0 in bad) && !($0 in out)) { out[$0] = 1; print } }
     END { for (i = 1; i <= k; i++) if (!(ord[i] in out)) { out[ord[i]] = 1; print ord[i] } }
   ' "$WORK/fill.absent" "$FILL_BAD" "$WORK/fill.wanted" >"$WORK/fill.still"
+  # What dar restored without complaint is checked against the index too
+  # (ADR-0012 item 103): a file that fails stays in the list.
+  awk 'FILENAME == ARGV[1] { s[$0] = 1; next } !($0 in s)' "$WORK/fill.still" "$WORK/fill.wanted" >"$WORK/fill.restored"
+  file_check "$root" "$WORK/fill.restored"
+  if [ "$CHECK_UNNAMED" -gt 0 ] && [ "$CHECK_FAILED" -eq 0 ]; then
+    cp "$WORK/fill.wanted" "$WORK/fill.still"
+  elif [ "$CHECK_FAILED" -gt 0 ]; then
+    awk '!seen[$0]++' "$WORK/fill.still" "$CHECK_BAD" >"$WORK/fill.still.new"
+    mv "$WORK/fill.still.new" "$WORK/fill.still"
+  fi
   n=$(wc -l <"$WORK/fill.still")
   echo ""
   if [ "$n" -eq 0 ]; then
@@ -4557,6 +4797,10 @@ case "${1:-}" in
       OVERWRITE=1
       shift
       ;;
+    --no-file-check)
+      FILE_CHECK=0
+      shift
+      ;;
     *) die "unknown option: $1" ;;
     esac
   done
@@ -4674,7 +4918,7 @@ case "${1:-}" in
   echo "  $0 --find-envelope --key KEYFILE [--key K2 ...]  Decrypt your envelope"
   echo "  $0 --restore --key KEYFILE [--key K2 ...] --to DIR"
   echo "               [--unit U [--unit U2 ...] | --all] [--version N]"
-  echo "               [--no-space-check] [--overwrite] [--slices-from DIR ...] [--swap-tapes]"
+  echo "               [--no-space-check] [--overwrite] [--no-file-check] [--slices-from DIR ...] [--swap-tapes]"
   echo "      Full restore. Without --version the NEWEST version of the unit on"
   echo "      this volume is restored. To see which versions this tape holds,"
   echo "      run --find-envelope --key KEYFILE: snapshot_version lives in the"
@@ -4742,9 +4986,19 @@ case "${1:-}" in
   echo "      With another tape that holds the SAME unit AT THE SAME VERSION: restore only the"
   echo "      files LIST names, over their damaged copies, and nothing else in the directory. The"
   echo "      first line of the list records the unit, its uuid and its version, and a tape that"
-  echo "      lists another is refused; no other version is ever used. dar checks each file. The"
-  echo "      list is rewritten with what is still damaged and removed when nothing is. Give --to"
-  echo "      the same directory as the restore (the list is in it, or in --to/UNIT)."
+  echo "      lists another is refused; no other version is ever used. dar checks each file, and so"
+  echo "      does the sha256 check below. The list is rewritten with what is still damaged and"
+  echo "      removed when nothing is. Give --to the same directory as the restore (the list is in"
+  echo "      it, or in --to/UNIT)."
+  echo "  --no-file-check   (--restore, with --fill-from too) dar checks each file it restores with a"
+  echo "      short checksum, so a damaged file can come back with no error. A tape written since"
+  echo "      version 1.3.0 records the sha256 of every regular file in its index, and after each"
+  echo "      restore and fill this script reads the restored files back and checks them against it"
+  echo "      (with --path, only the paths restored). A file that does not match, or is missing, goes"
+  echo "      on the damaged-file list like one dar named, so --fill-from can take it from another"
+  echo "      copy, and the run ends RESTORE INCOMPLETE. The cost is one read of the restored files"
+  echo "      from disk; the tape is not read again. --no-file-check skips it. A file with no sha256"
+  echo "      recorded is not checked, and a tape written before 1.3.0 has no index: both are said."
   echo "  --no-space-check   Skip that check (a compressed or thin-provisioned"
   echo "      filesystem can hold more than df reports)."
   echo "  --overwrite   --to must otherwise be empty or new: dar keeps a file"
@@ -4790,6 +5044,9 @@ esac
         .replace("__AWK_INDEX_FIND__", AWK_INDEX_FIND)
         .replace("__AWK_DAR_DAMAGED__", AWK_DAR_DAMAGED)
         .replace("__AWK_FILL_LISTING__", AWK_FILL_LISTING)
+        .replace("__AWK_FILE_CHECK_LISTED__", AWK_FILE_CHECK_LISTED)
+        .replace("__AWK_FILE_CHECK_LIST__", AWK_FILE_CHECK_LIST)
+        .replace("__AWK_FILE_CHECK_FAILED__", AWK_FILE_CHECK_FAILED)
         .replace("__TOOLS_READ__", &tools_for(MODE_READ).join(" "))
         .replace("__TOOLS_ENVELOPE__", &tools_for(MODE_ENVELOPE).join(" "))
         .replace("__TOOLS_LIST__", &tools_for(MODE_LIST).join(" "))
@@ -5059,7 +5316,9 @@ them). Find a column by its name, and ignore a column you do not know.
 `volume` (the tape's label), `volume_uuid`, `cartridge_serial`,
 `generation`, `state` (`sealed`, `quarantined` or `this-tape`) and
 `sealed_at`. `paths.tsv` has `unit`, `version`, `kind` (`d` directory, `f`
-file, `l` symlink, `s` special), `size_bytes` and `path`.
+file, `l` symlink, `s` special), `size_bytes`, `sha256` (the file's content
+hash as 64 hex characters; empty for anything but a regular file, and where
+none was recorded) and `path`.
 
 These two lines print the rows for a unit, and the paths that contain some
 text. They compare the text as it is stored, so type a backslash, TAB or
@@ -5107,6 +5366,20 @@ another unit or another version:
 
 ```bash
 ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --fill-from /destination/.tapectl-damaged-files.txt --to /destination
+```
+
+dar checks each file it restores with a short checksum, not a hash, so a
+damaged file can come back with no error. A tape written since 1.3.0 records
+each regular file's sha256 in `index/paths.tsv`, and `RESTORE.sh` checks every
+file it restores, and every file it fills, against it: a file that does not
+match, or is missing, goes on the same list and the run ends `RESTORE
+INCOMPLETE`. It costs one read of the restored files from disk, and
+`--no-file-check` skips it. By hand, for a unit and version, in the unpacked
+envelope's directory (a name with a backslash, TAB, newline or carriage return
+is written escaped there, and this line does not decode it):
+
+```bash
+V=1 U='photos/2019' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next } $c["unit"] == ENVIRON["U"] && $c["version"] == ENVIRON["V"] && $c["sha256"] != "" { print $c["sha256"] "  " $c["path"] }' index/paths.tsv | (cd /destination && sha256sum -c --quiet)
 ```
 
 "##;
@@ -5288,8 +5561,9 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_DAR_DAMAGED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
-        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
+        AWK_CHECK_FILE_LIST, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED, AWK_FILE_CHECK_LIST,
+        AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_COMMON,
+        AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
         AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
 
@@ -6405,12 +6679,301 @@ sha256_encrypted = \"bbb\"
             ("AWK_INDEX_FIND", AWK_INDEX_FIND),
             ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
+            ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
+            ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
+            ("AWK_FILE_CHECK_FAILED", AWK_FILE_CHECK_FAILED),
         ] {
             assert!(
                 script.contains(fragment),
                 "{name} is not a verbatim substring of the assembled script"
             );
         }
+    }
+
+    /// Run an awk program (`AWK_INDEX_COMMON` first when `common`) over `input`
+    /// with `env`, under every awk this host has, and return what each prints
+    /// with its exit status. The three must agree.
+    fn run_awk(
+        common: bool,
+        program: &str,
+        input: &std::path::Path,
+        env: &[(&str, String)],
+    ) -> (i32, String) {
+        use std::process::Command;
+        let text = if common {
+            format!("{AWK_INDEX_COMMON} {program}")
+        } else {
+            program.to_string()
+        };
+        let mut seen: Vec<(i32, String)> = Vec::new();
+        for awk in ["awk", "mawk", "gawk"] {
+            let mut cmd = Command::new(awk);
+            cmd.arg(&text).arg(input);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            let Ok(o) = cmd.output() else { continue };
+            seen.push((
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stdout).to_string(),
+            ));
+        }
+        assert!(!seen.is_empty(), "no awk on this host");
+        assert!(
+            seen.windows(2).all(|w| w[0] == w[1]),
+            "awks differ: {seen:?}"
+        );
+        seen.remove(0)
+    }
+
+    /// ADR-0012 item 103: the three fragments of the file check, on text as the
+    /// index writes it (names holding a TAB, a newline and a backslash), under
+    /// every awk on the host. Which version an envelope lists; what a version
+    /// asks to be checked; and which names `sha256sum -c --quiet` named, read
+    /// from its REAL output for a changed file, a missing one and a name that
+    /// looks like the checker's own words.
+    #[test]
+    fn the_file_check_fragments_read_the_index_and_the_checkers_report() {
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let hash = |n: u8| format!("{n:02x}").repeat(32);
+
+        // Which version an envelope lists: by decoded name, version and, when
+        // both sides state one, the uuid.
+        let units = d.join("units.tsv");
+        std::fs::write(
+            &units,
+            "volume\tunit\tunit_uuid\tzz_future\tversion\nV1\tphotos/2019\tuuid-a\tx\t2\nV2\tdocs\tuuid-b\tx\t1\nV3\ta\\tb\t\tx\t1\n",
+        )
+        .unwrap();
+        let listed = |unit: &str, ver: &str, uuid: &str| {
+            run_awk(
+                true,
+                AWK_FILE_CHECK_LISTED,
+                &units,
+                &[
+                    ("CHK_UNIT", unit.to_string()),
+                    ("CHK_VER", ver.to_string()),
+                    ("CHK_UUID", uuid.to_string()),
+                ],
+            )
+            .0
+        };
+        assert_eq!(listed("photos/2019", "2", "uuid-a"), 0);
+        assert_eq!(listed("photos/2019", "2", ""), 0, "no uuid to compare");
+        assert_eq!(listed("photos/2019", "1", "uuid-a"), 1, "another version");
+        assert_eq!(
+            listed("photos/2019", "2", "uuid-z"),
+            1,
+            "another unit of the name"
+        );
+        assert_eq!(
+            listed("a\tb", "1", "uuid-q"),
+            0,
+            "the row states no uuid; the name is decoded"
+        );
+        assert_eq!(listed("nothing", "1", ""), 1);
+        let bad = d.join("bad.tsv");
+        std::fs::write(&bad, "volume\tversion\nV1\t1\n").unwrap();
+        assert_eq!(
+            run_awk(true, AWK_FILE_CHECK_LISTED, &bad, &[]).0,
+            2,
+            "a file with no unit column cannot be read"
+        );
+
+        // What a version asks to be checked.
+        let paths = d.join("paths.tsv");
+        let h1 = hash(0xab);
+        let h2 = hash(0xcd);
+        std::fs::write(
+            &paths,
+            format!(
+                "unit\tversion\tkind\tsize_bytes\tsha256\tpath\n\
+                 docs\t1\td\t0\t\tsub\n\
+                 docs\t1\tf\t5\t{h1}\tsub/a\\tb\n\
+                 docs\t1\tf\t5\t{h2}\tc\\\\d.txt\n\
+                 docs\t1\tf\t5\t{h1}\tl\\nf.txt\n\
+                 docs\t1\tf\t7\t\tnohash\n\
+                 docs\t1\tf\t7\tnot-a-hash\tbadhash\n\
+                 docs\t1\tl\t7\t{h1}\ta-link\n\
+                 docs\t2\tf\t7\t{h1}\tother\n\
+                 docs\t1\tf\t7\t{h1}\t../escape\n\
+                 docs\t1\tf\t7\t{h1}\t/absolute\n\
+                 docs\t1\tf\t7\t{h2}\tplain\n"
+            ),
+        )
+        .unwrap();
+        let outs = |n: &str| d.join(n);
+        let env = |only: &str| -> Vec<(&'static str, String)> {
+            vec![
+                ("CHK_UNIT", "docs".into()),
+                ("CHK_VER", "1".into()),
+                ("CHK_ONLY", only.into()),
+                ("CHK_SUMS", outs("sums").display().to_string()),
+                ("CHK_SPECIAL", outs("special").display().to_string()),
+                ("CHK_COUNTS", outs("counts").display().to_string()),
+            ]
+        };
+        let (code, _) = run_awk(true, AWK_FILE_CHECK_LIST, &paths, &env(""));
+        assert_eq!(code, 0);
+        // rows of the version; regular files; checked; of those special; no hash
+        assert_eq!(
+            std::fs::read_to_string(outs("counts")).unwrap().trim(),
+            "10 8 4 2 4",
+            "badhash, nohash, ../escape and /absolute are never hashed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outs("sums")).unwrap(),
+            format!("{h1}  sub/a\tb\n{h2}  plain\n"),
+            "a TAB stays in the name; no backslash or newline reaches this list"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outs("special")).unwrap(),
+            format!("{h2}\tc\\\\d.txt\n{h1}\tl\\nf.txt\n"),
+            "a backslash or a newline is kept in its escaped form"
+        );
+
+        // Only some paths: a name, and a folder with what is under it.
+        let only = d.join("only");
+        std::fs::write(&only, "plain\nsub\n").unwrap();
+        run_awk(
+            true,
+            AWK_FILE_CHECK_LIST,
+            &paths,
+            &env(only.to_str().unwrap()),
+        );
+        assert_eq!(
+            std::fs::read_to_string(outs("sums")).unwrap(),
+            format!("{h1}  sub/a\tb\n{h2}  plain\n")
+        );
+        assert_eq!(std::fs::read_to_string(outs("special")).unwrap(), "");
+        std::fs::write(&only, "pla\nsu\n").unwrap();
+        run_awk(
+            true,
+            AWK_FILE_CHECK_LIST,
+            &paths,
+            &env(only.to_str().unwrap()),
+        );
+        assert_eq!(
+            std::fs::read_to_string(outs("sums")).unwrap(),
+            "",
+            "a prefix of a name is not the name"
+        );
+
+        // An index written before the column existed records no hash at all.
+        let old = d.join("old.tsv");
+        std::fs::write(
+            &old,
+            "unit\tversion\tkind\tsize_bytes\tpath\ndocs\t1\td\t0\tsub\ndocs\t1\tf\t5\tsub/a\n",
+        )
+        .unwrap();
+        run_awk(true, AWK_FILE_CHECK_LIST, &old, &env(""));
+        assert_eq!(
+            std::fs::read_to_string(outs("counts")).unwrap().trim(),
+            "2 1 0 0 1"
+        );
+        assert_eq!(std::fs::read_to_string(outs("sums")).unwrap(), "");
+        assert_eq!(
+            run_awk(true, AWK_FILE_CHECK_LIST, &bad, &env("")).0,
+            2,
+            "no path column"
+        );
+
+        // The checker's report, from the real sha256sum: a changed file, two
+        // missing ones, and a file whose name ends in the checker's own words.
+        let tree = d.join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        let sha = |bytes: &[u8]| {
+            let mut c = Command::new("sha256sum")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            c.stdin.take().unwrap().write_all(bytes).unwrap();
+            let o = c.wait_with_output().unwrap();
+            String::from_utf8_lossy(&o.stdout)[..64].to_string()
+        };
+        let files: [(&str, &[u8], &[u8]); 5] = [
+            ("a b", b"one", b"one"),
+            ("ok", b"five", b"five"),
+            ("sub/f", b"four", b"WRONG"),
+            ("tab\tname", b"two", b"two"),
+            ("x: FAILED", b"three", b"three"),
+        ];
+        let mut list = String::new();
+        for (name, on_disk, recorded) in files {
+            std::fs::write(tree.join(name), on_disk).unwrap();
+            list.push_str(&format!("{}  {name}\n", sha(recorded)));
+        }
+        list.push_str(&format!("{}  gone\n{}  z-last\n", hash(1), hash(2)));
+        std::fs::write(outs("list"), &list).unwrap();
+        let out = Command::new("sha256sum")
+            .args(["-c", "--quiet"])
+            .current_dir(&tree)
+            .stdin(std::fs::File::open(outs("list")).unwrap())
+            .output()
+            .unwrap();
+        std::fs::write(outs("report"), &out.stdout).unwrap();
+        let fenv = |report: &std::path::Path| -> Vec<(&'static str, String)> {
+            vec![
+                ("CHK_REPORT", report.display().to_string()),
+                ("CHK_BAD", outs("named").display().to_string()),
+                ("CHK_COUNTS", outs("fcounts").display().to_string()),
+            ]
+        };
+        run_awk(
+            false,
+            AWK_FILE_CHECK_FAILED,
+            &outs("list"),
+            &fenv(&outs("report")),
+        );
+        assert_eq!(
+            std::fs::read_to_string(outs("named")).unwrap(),
+            "sub/f\ngone\nz-last\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outs("fcounts")).unwrap().trim(),
+            "3 0 0"
+        );
+        // A failure the list does not hold cannot be named, and is counted.
+        std::fs::write(
+            outs("short"),
+            list.replace(&format!("{}  gone\n", hash(1)), ""),
+        )
+        .unwrap();
+        run_awk(
+            false,
+            AWK_FILE_CHECK_FAILED,
+            &outs("short"),
+            &fenv(&outs("report")),
+        );
+        assert_eq!(
+            std::fs::read_to_string(outs("named")).unwrap(),
+            "sub/f\nz-last\n",
+            "a failure the list lacks does not hide the ones after it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outs("fcounts")).unwrap().trim(),
+            "2 1 0"
+        );
+        std::fs::write(
+            outs("noise"),
+            "sha256sum: WARNING: 1 computed checksum did NOT match\n",
+        )
+        .unwrap();
+        run_awk(
+            false,
+            AWK_FILE_CHECK_FAILED,
+            &outs("list"),
+            &fenv(&outs("noise")),
+        );
+        assert_eq!(
+            std::fs::read_to_string(outs("fcounts")).unwrap().trim(),
+            "0 0 1",
+            "a line that is no failure is counted, not matched"
+        );
     }
 
     /// ADR-0012 item 102: the fragment that reads dar's messages, on dar's
@@ -6627,6 +7190,9 @@ sha256_encrypted = \"bbb\"
             ("AWK_INDEX_FIND", AWK_INDEX_FIND),
             ("AWK_DAR_DAMAGED", AWK_DAR_DAMAGED),
             ("AWK_FILL_LISTING", AWK_FILL_LISTING),
+            ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
+            ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
+            ("AWK_FILE_CHECK_FAILED", AWK_FILE_CHECK_FAILED),
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");
         }
@@ -8902,6 +9468,92 @@ sha256_encrypted = \"bbb\"
                 run(&lines[1].replace("T='report'", "T='a\\tb'"), awk),
                 "docs\t1\tf\t5\ta\\tb.txt\n",
                 "{awk}: the path line"
+            );
+        }
+    }
+
+    /// ADR-0012 item 103: RECOVERY.md says the file check exists, what it
+    /// costs and how to skip it, names the `sha256` column, and its by-hand line
+    /// does what it says: it passes files that match the index and names the
+    /// ones that do not, under every awk. File 1 says the same of the script.
+    #[test]
+    fn the_guides_describe_the_file_check_and_the_by_hand_line_works() {
+        let r = generate_recovery_md("LAB01", "alice", &[], &[]);
+        let f = flat_text(&r);
+        for needle in [
+            "`sha256` (the file's content hash as 64 hex characters; empty for anything but a regular file, and where none was recorded)",
+            "dar checks each file it restores with a short checksum, not a hash",
+            "`RESTORE.sh` checks every file it restores, and every file it fills, against it",
+            "It costs one read of the restored files from disk",
+            "`--no-file-check` skips it",
+        ] {
+            assert!(f.contains(needle), "{needle:?}: {f}");
+        }
+        let g = flat_text(&generate_system_guide_v2_for_media("LAB01", 30, "LTO-6"));
+        for needle in [
+            "**A file fails its hash.**",
+            "dar checks each file it restores with a short checksum, not a hash",
+            "reads the restored files back from `--to` and checks them against it with `sha256sum`",
+            "one read of the restored files from disk and none of the tape",
+            "with `--path` only the paths restored are checked",
+            "a tape written before 1.3.0 has no index and is not checked at all",
+            "`--no-file-check` skips the check",
+        ] {
+            assert!(g.contains(needle), "{needle:?}: {g}");
+        }
+
+        let line = r
+            .lines()
+            .find(|l| l.starts_with("V=1 U="))
+            .unwrap_or_else(|| panic!("no by-hand line:\n{r}"));
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir_all(d.join("index")).unwrap();
+        std::fs::create_dir_all(d.join("dest/sub")).unwrap();
+        let sha = |bytes: &[u8]| {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        std::fs::write(d.join("dest/a.bin"), b"alpha").unwrap();
+        std::fs::write(d.join("dest/sub/b.bin"), b"CHANGED").unwrap();
+        std::fs::write(
+            d.join("index/paths.tsv"),
+            format!(
+                "unit\tversion\tkind\tsize_bytes\tsha256\tpath\n\
+                 photos/2019\t1\td\t0\t\tsub\n\
+                 photos/2019\t1\tf\t5\t{}\ta.bin\n\
+                 photos/2019\t1\tf\t5\t{}\tsub/b.bin\n\
+                 photos/2019\t1\tf\t5\t\tno-hash\n\
+                 photos/2019\t2\tf\t5\t{}\ta.bin\n",
+                sha(b"alpha"),
+                sha(b"bravo"),
+                sha(b"zzz"),
+            ),
+        )
+        .unwrap();
+        let line = line.replace("/destination", &d.join("dest").display().to_string());
+        for awk in ["awk", "mawk", "gawk"] {
+            if std::process::Command::new(awk)
+                .arg("BEGIN{}")
+                .output()
+                .is_err()
+            {
+                continue;
+            }
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(line.replacen("awk", awk, 1))
+                .current_dir(d)
+                .output()
+                .unwrap();
+            let out = String::from_utf8_lossy(&o.stdout);
+            assert!(
+                out.contains("sub/b.bin: FAILED") && !out.contains("a.bin: FAILED"),
+                "{awk}: only the changed file is named: {out}{}",
+                String::from_utf8_lossy(&o.stderr)
             );
         }
     }

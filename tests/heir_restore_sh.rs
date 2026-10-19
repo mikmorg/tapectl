@@ -23,6 +23,7 @@
 //! writer that can wait on each other, and a regression there must fail this
 //! suite, not hang it.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -283,6 +284,12 @@ struct UnitSpec {
     /// staged, so the tape's hashes agree with it and only dar's own CRC
     /// per file sees it.
     corrupt: &'static [(usize, usize)],
+    /// Files (by index into the unit's file names) whose bytes are changed in
+    /// the source tree AFTER the index's sha256 was taken and BEFORE dar reads
+    /// them: dar's own checksum is computed over the changed bytes and so
+    /// passes, and only the recorded sha256 sees them. This is the damage
+    /// dar's short checksum misses (ADR-0012 item 103).
+    tamper: &'static [usize],
 }
 
 struct TenantSpec {
@@ -343,6 +350,7 @@ fn template() -> &'static Template {
                         file_len: 150_000,
                         names: &[],
                         corrupt: &[],
+                        tamper: &[],
                     },
                     UnitSpec {
                         name: "docs",
@@ -354,6 +362,7 @@ fn template() -> &'static Template {
                         file_len: 140_000,
                         names: &[],
                         corrupt: &[],
+                        tamper: &[],
                     },
                 ],
             },
@@ -369,6 +378,7 @@ fn template() -> &'static Template {
                     file_len: 130_000,
                     names: &[],
                     corrupt: &[],
+                    tamper: &[],
                 }],
             },
             TenantSpec {
@@ -384,6 +394,7 @@ fn template() -> &'static Template {
                         file_len: 120_000,
                         names: &[],
                         corrupt: &[],
+                        tamper: &[],
                     },
                     UnitSpec {
                         name: "nocat",
@@ -395,6 +406,7 @@ fn template() -> &'static Template {
                         file_len: 110_000,
                         names: &[],
                         corrupt: &[],
+                        tamper: &[],
                     },
                 ],
             },
@@ -420,6 +432,7 @@ fn lone_template() -> &'static Template {
             file_len: 110_000,
             names: &[],
             corrupt: &[],
+            tamper: &[],
         };
         let tenants = vec![
             TenantSpec {
@@ -460,6 +473,7 @@ fn solo_template() -> &'static Template {
                 file_len: 110_000,
                 names: &[],
                 corrupt: &[],
+                tamper: &[],
             }],
         }];
         build_template("solo", &tenants, false)
@@ -656,57 +670,88 @@ fn idx_rows_for(
     rows
 }
 
-/// One `index/paths.tsv` row: (kind, size, path as the unit holds it).
-type PathRow = (&'static str, u64, String);
+/// One `index/paths.tsv` row: (kind, size, the recorded sha256 as 64 hex
+/// characters or empty, path as the unit holds it).
+type PathRow = (&'static str, u64, String, String);
 
 /// A tenant's paths for a unit: what is really in its source tree, and the
 /// paths the tests look for. A path with a TAB, an LF and a backslash; one
 /// with a literal backslash followed by `t` (never a TAB); and, in `docs`,
-/// enough matching paths to pass the print limit.
-fn idx_paths_for(unit: &str, src: &Path) -> Vec<PathRow> {
+/// enough matching paths to pass the print limit. A file that is really in
+/// the tree records the hash it had when it was staged (`hashes`, taken
+/// before a `tamper`); the made-up rows, which the archive does not hold,
+/// record none.
+fn idx_paths_for(unit: &str, src: &Path, hashes: &BTreeMap<String, String>) -> Vec<PathRow> {
     let mut rows: Vec<PathRow> = Vec::new();
+    let hash_of = |rel: &str| hashes.get(rel).cloned().unwrap_or_default();
     for e in std::fs::read_dir(src).unwrap() {
         let e = e.unwrap();
         let name = e.file_name().to_string_lossy().to_string();
         if e.file_type().unwrap().is_dir() {
-            rows.push(("d", 0, name.clone()));
+            rows.push(("d", 0, String::new(), name.clone()));
             for f in std::fs::read_dir(e.path()).unwrap() {
                 let f = f.unwrap();
-                rows.push((
-                    "f",
-                    f.metadata().unwrap().len(),
-                    format!("{name}/{}", f.file_name().to_string_lossy()),
-                ));
+                let rel = format!("{name}/{}", f.file_name().to_string_lossy());
+                rows.push(("f", f.metadata().unwrap().len(), hash_of(&rel), rel));
             }
         } else {
-            rows.push(("f", e.metadata().unwrap().len(), name));
+            let sha = hash_of(&name);
+            rows.push(("f", e.metadata().unwrap().len(), sha, name));
         }
     }
     if unit == "photos/2019" {
-        rows.push(("f", 11, "weird\ttab\nnew\\back.txt".to_string()));
-        rows.push(("f", 12, "lit\\tera.txt".to_string()));
-        rows.push(("l", 0, "link-to-file0".to_string()));
+        rows.push((
+            "f",
+            11,
+            String::new(),
+            "weird\ttab\nnew\\back.txt".to_string(),
+        ));
+        rows.push(("f", 12, String::new(), "lit\\tera.txt".to_string()));
+        rows.push(("l", 0, String::new(), "link-to-file0".to_string()));
     }
     if unit == "docs" {
         for i in 1..=120 {
-            rows.push(("f", 100 + i, format!("bulk/item-{i:03}.dat")));
+            rows.push(("f", 100 + i, String::new(), format!("bulk/item-{i:03}.dat")));
         }
     }
     rows
 }
 
+/// The columns of a fixture `paths.tsv`, in an order that is not the format's
+/// and with one the reader does not know: the script finds columns by their
+/// header names (sec 1.5), and every restore and `--find` below reads this.
+const PATHS_COLUMNS_PERMUTED: &[&str] = &[
+    "sha256",
+    "path",
+    "zz_future",
+    "unit",
+    "kind",
+    "version",
+    "size_bytes",
+];
+
 /// `paths.tsv`: sorted by unit, version, then path (bytewise).
 fn render_paths(mut units: Vec<(String, i64, Vec<PathRow>)>) -> String {
     units.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-    let mut out = String::from("unit\tversion\tkind\tsize_bytes\tpath\n");
+    let mut out = PATHS_COLUMNS_PERMUTED.join("\t");
+    out.push('\n');
     for (unit, version, mut rows) in units {
-        rows.sort_by(|a, b| a.2.as_bytes().cmp(b.2.as_bytes()));
-        for (kind, size, path) in rows {
-            out.push_str(&format!(
-                "{}\t{version}\t{kind}\t{size}\t{}\n",
-                idx_esc(&unit),
-                idx_esc(&path)
-            ));
+        rows.sort_by(|a, b| a.3.as_bytes().cmp(b.3.as_bytes()));
+        for (kind, size, sha, path) in rows {
+            let field = |name: &str| -> String {
+                match name {
+                    "unit" => idx_esc(&unit),
+                    "version" => version.to_string(),
+                    "kind" => kind.to_string(),
+                    "size_bytes" => size.to_string(),
+                    "sha256" => sha.clone(),
+                    "path" => idx_esc(&path),
+                    _ => "x".to_string(),
+                }
+            };
+            let cells: Vec<String> = PATHS_COLUMNS_PERMUTED.iter().map(|c| field(c)).collect();
+            out.push_str(&cells.join("\t"));
+            out.push('\n');
         }
     }
     out
@@ -732,27 +777,43 @@ fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Templa
         slices: Vec<Vec<u8>>,
         catalogue: Option<Vec<u8>>,
         src: PathBuf,
+        /// The sha256 of each file as staged: what the index records.
+        hashes: BTreeMap<String, String>,
     }
     let mut staged: Vec<Staged> = Vec::new();
     for t in tenants {
         for u in &t.units {
             let src = dir.join("src").join(u.name);
             std::fs::create_dir_all(&src).unwrap();
+            let mut hashes: BTreeMap<String, String> = BTreeMap::new();
             for i in 0..u.files {
                 let name = if u.names.is_empty() {
                     format!("file{i}.bin")
                 } else {
                     u.names[i].to_string()
                 };
-                std::fs::write(src.join(name), content(u.seed * 100 + i as u64, u.file_len))
-                    .unwrap();
+                let bytes = content(u.seed * 100 + i as u64, u.file_len);
+                hashes.insert(name.clone(), sha256_hex(&bytes));
+                std::fs::write(src.join(&name), &bytes).unwrap();
             }
             std::fs::create_dir_all(src.join("sub")).unwrap();
-            std::fs::write(
-                src.join("sub").join("note.txt"),
-                format!("unit {}\n", u.name),
-            )
-            .unwrap();
+            let note = format!("unit {}\n", u.name);
+            hashes.insert("sub/note.txt".to_string(), sha256_hex(note.as_bytes()));
+            std::fs::write(src.join("sub").join("note.txt"), note).unwrap();
+            // The damage dar cannot see: changed after the hash was taken,
+            // before dar reads the file, so dar records and later checks the
+            // changed bytes.
+            for &i in u.tamper {
+                let name = if u.names.is_empty() {
+                    format!("file{i}.bin")
+                } else {
+                    u.names[i].to_string()
+                };
+                let mut bytes = content(u.seed * 100 + i as u64, u.file_len);
+                let mid = bytes.len() / 2;
+                bytes[mid] ^= 0x55;
+                std::fs::write(src.join(&name), &bytes).unwrap();
+            }
             let work = dir.join("work").join(u.uuid);
             std::fs::create_dir_all(&work).unwrap();
             let base = work.join("arch");
@@ -822,6 +883,7 @@ fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Templa
                 slices,
                 catalogue,
                 src,
+                hashes,
             });
         }
     }
@@ -903,7 +965,7 @@ fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Templa
                 path_rows.push((
                     s.unit.name.clone(),
                     s.unit.snapshot_version,
-                    idx_paths_for(&s.unit.name, &s.src),
+                    idx_paths_for(&s.unit.name, &s.src, &s.hashes),
                 ));
             }
             if tenant == "operator" {
@@ -4626,6 +4688,7 @@ fn dmg_tenants(
             file_len: 150_000,
             names: &[],
             corrupt,
+            tamper: &[],
         }],
     }]
 }
@@ -4712,6 +4775,7 @@ fn odd_tenants(corrupt: &'static [(usize, usize)]) -> Vec<TenantSpec> {
             file_len: 80_000,
             names: ODD_NAMES,
             corrupt,
+            tamper: &[],
         }],
     }]
 }
@@ -5753,4 +5817,373 @@ fn the_gates_restore_with_the_dd_stand_in_and_a_copys_slices_works() {
         "{text}"
     );
     assert!(same_tree(&ledgers.src, Path::new(&dest)), "{text}");
+}
+
+// ---- the restored files against their recorded sha256 (ADR-0012 item 103) ----
+
+const CHK_UUID: &str = "abcdabcd-1111-2222-3333-444444444444";
+
+/// One unit, `checked`, whose five files have the odd names of `ODD_NAMES`
+/// (a TAB, a newline, a backslash, spaces and a colon) beside `sub/note.txt`.
+/// The index records each file's hash as staged; the files in `tamper` are
+/// changed in the source tree after that, before dar reads them, so dar's own
+/// checksum is computed over the changed bytes and sees nothing wrong.
+fn chk_tenants(tamper: &'static [usize]) -> Vec<TenantSpec> {
+    vec![TenantSpec {
+        name: "alice",
+        units: vec![UnitSpec {
+            cat: Cat::Matched,
+            name: "checked",
+            uuid: CHK_UUID,
+            version: 1,
+            seed: 41,
+            files: 5,
+            file_len: 80_000,
+            names: ODD_NAMES,
+            corrupt: &[],
+            tamper,
+        }],
+    }]
+}
+
+/// Indexes into `ODD_NAMES` of the files `chk_bad` changes: every odd name,
+/// not `plain.bin`.
+const CHK_TAMPERED: &[usize] = &[1, 2, 3, 4];
+
+/// The tape whose archive holds four files that differ from the hashes its own
+/// index records.
+fn chk_bad() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template("chk-bad", &chk_tenants(CHK_TAMPERED), true))
+}
+
+/// Another copy of the same unit and version, as staged: its files are the
+/// ones the index hashes.
+fn chk_good() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| build_template("chk-good", &chk_tenants(&[]), true))
+}
+
+/// Two tenants, one unit each, both indexed; bob's `bravo-docs` has a changed
+/// file. An escrow key restoring both opens the operator envelope, which has no
+/// paths.tsv: each unit's check reads its own tenant's envelope.
+fn chk_two() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let unit = |name, uuid, seed, tamper| UnitSpec {
+            cat: Cat::Matched,
+            name,
+            uuid,
+            version: 1,
+            seed,
+            files: 3,
+            file_len: 60_000,
+            names: &[],
+            corrupt: &[],
+            tamper,
+        };
+        let tenants = vec![
+            TenantSpec {
+                name: "alice",
+                units: vec![unit(
+                    "alpha-docs",
+                    "aaaaaaaa-0000-1111-2222-333333333333",
+                    51,
+                    &[],
+                )],
+            },
+            TenantSpec {
+                name: "bob",
+                units: vec![unit(
+                    "bravo-docs",
+                    "bbbbbbbb-0000-1111-2222-333333333333",
+                    52,
+                    &[1],
+                )],
+            },
+        ];
+        build_template("chk-two", &tenants, true)
+    })
+}
+
+fn damaged_list(dir: &str) -> (String, Vec<String>) {
+    let text = std::fs::read_to_string(Path::new(dir).join(".tapectl-damaged-files.txt")).unwrap();
+    let mut lines = text.lines();
+    let header = lines.next().unwrap().to_string();
+    let mut paths: Vec<String> = lines.map(str::to_string).collect();
+    paths.sort();
+    (header, paths)
+}
+
+fn odd_escaped(indexes: &[usize]) -> Vec<String> {
+    let mut v: Vec<String> = indexes.iter().map(|&i| idx_esc(ODD_NAMES[i])).collect();
+    v.sort();
+    v
+}
+
+/// A clean restore passes, says how many files it checked, reads the tape
+/// exactly as it did before (forward only, one rewind: the check reads the
+/// restored files from disk), and the figure counts every regular file of the
+/// unit, the ones named with a TAB, a newline and a backslash included.
+#[test]
+fn a_clean_restore_passes_the_file_check_and_counts_what_it_checked() {
+    let h = Heir::of(chk_good(), &[]);
+    let checked = unit_of(chk_good(), "checked");
+    let dest = h.sub("restored");
+    let (code, text) = runv(&h, &restore_args(&h, "checked", &dest));
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(
+        text.contains(
+            "File check: 6 restored file(s) of 'checked' version 1 match the sha256 recorded in the index"
+        ),
+        "five files and sub/note.txt, none skipped:\n{text}"
+    );
+    assert!(same_tree(&checked.src, Path::new(&dest)), "{text}");
+    assert!(!Path::new(&dest).join(".tapectl-damaged-files.txt").exists());
+    assert_forward_only(&h, "a checked restore");
+    let with_check = h.ops();
+
+    // The same restore without the check reads the same tape the same way.
+    let h2 = Heir::of(chk_good(), &[]);
+    let dest2 = h2.sub("restored");
+    let mut args = restore_args(&h2, "checked", &dest2);
+    args.push("--no-file-check".to_string());
+    let (code, text) = runv(&h2, &args);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(h2.ops(), with_check, "the check moves the tape not at all");
+}
+
+/// The test of the whole item. Four files come back from dar with no error
+/// (dar's checksum is computed over the changed bytes, so it agrees), and the
+/// recorded sha256 finds them: the run ends INCOMPLETE and the list names them,
+/// each once, escaped as the index escapes a path. A second copy of the same
+/// unit and version, as staged, fills exactly those files, checks them, and
+/// the restore is whole.
+#[test]
+fn a_file_dar_cannot_see_is_found_by_its_hash_and_filled_from_another_copy() {
+    let bad = Heir::of(chk_bad(), &[]);
+    let good_src = unit_of(chk_good(), "checked").src;
+    let dest = bad.sub("restored");
+    let (code, text) = runv(&bad, &restore_args(&bad, "checked", &dest));
+    println!("--- the restore from the tape with four changed files ---\n{text}");
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        !text.contains("Bad CRC") && !text.contains("Error while restoring"),
+        "positive control: dar saw nothing wrong:\n{text}"
+    );
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    assert!(!text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(
+        text.contains("File check: 4 of 6 file(s) of 'checked' version 1 do NOT match their recorded sha256, or are missing"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Unit 'checked' (version 1): 4 file(s) do not match the sha256 the index records"
+        ) && text.contains("dar named none of them"),
+        "{text}"
+    );
+    let (header, listed) = damaged_list(&dest);
+    assert_eq!(
+        header,
+        format!("#tapectl-damaged-files\t1\tunit=checked\tuuid={CHK_UUID}\tversion=1")
+    );
+    assert_eq!(listed, odd_escaped(CHK_TAMPERED), "{text}");
+    let mut by_diff: Vec<String> = damaged_by_diff(&good_src, Path::new(&dest))
+        .into_iter()
+        .filter(|p| p != ".tapectl-damaged-files.txt")
+        .map(|p| idx_esc(&p))
+        .collect();
+    by_diff.sort();
+    assert_eq!(listed, by_diff, "the list is exactly the files that differ");
+    assert!(
+        listed.iter().any(|l| l.contains("\\n"))
+            && listed.iter().any(|l| l.contains("\\t"))
+            && listed.iter().any(|l| l.contains("\\\\")),
+        "a newline, a TAB and a backslash are in the list, escaped: {listed:?}"
+    );
+    assert!(text.contains("--fill-from"), "the fill command: {text}");
+
+    // The fill, from a copy whose files are the ones the index hashes.
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let other = Heir::of(chk_good(), &[]);
+    let (code, text) = runv(&other, &fill_args(&other, "checked", &list, &dest));
+    println!("--- the fill from another copy ---\n{text}");
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("File check: 4 restored file(s) of 'checked' version 1 match the sha256 recorded in the index"),
+        "{text}"
+    );
+    assert!(text.contains("FILL COMPLETE"), "{text}");
+    assert!(!list.exists(), "the list is removed");
+    assert!(same_tree(&good_src, Path::new(&dest)), "{text}");
+}
+
+/// A fill takes its files from a copy, and a copy whose files are not the ones
+/// the index hashes does not repair them: the filled files are checked too,
+/// stay in the list, and the fill ends INCOMPLETE.
+#[test]
+fn a_fill_whose_files_still_fail_their_hash_stays_incomplete() {
+    let a = Heir::of(chk_bad(), &[]);
+    let dest = a.sub("restored");
+    let (code, text) = runv(&a, &restore_args(&a, "checked", &dest));
+    assert_eq!(code, 1, "{text}");
+    let list = Path::new(&dest).join(".tapectl-damaged-files.txt");
+    let before = damaged_list(&dest).1;
+    assert_eq!(before.len(), 4);
+
+    let again = Heir::of(chk_bad(), &[]);
+    let (code, text) = runv(&again, &fill_args(&again, "checked", &list, &dest));
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("FILL INCOMPLETE: 4 file(s)"), "{text}");
+    assert!(
+        text.contains("do NOT match their recorded sha256"),
+        "{text}"
+    );
+    assert_eq!(damaged_list(&dest).1, before, "the same four are listed");
+}
+
+/// `--no-file-check` runs the restore the old way: dar's checksum alone, the
+/// changed files come back and the run says COMPLETE, and it says it did not
+/// check. (The positive control for the item: without the hash check this
+/// damage goes through.)
+#[test]
+fn no_file_check_skips_it_and_says_so() {
+    let h = Heir::of(chk_bad(), &[]);
+    let dest = h.sub("restored");
+    let mut args = restore_args(&h, "checked", &dest);
+    args.push("--no-file-check".to_string());
+    let (code, text) = runv(&h, &args);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert!(
+        text.contains("File check skipped (--no-file-check)"),
+        "{text}"
+    );
+    assert!(!text.contains("File check: "), "{text}");
+    assert!(!Path::new(&dest).join(".tapectl-damaged-files.txt").exists());
+    let good_src = unit_of(chk_good(), "checked").src;
+    assert_eq!(
+        damaged_by_diff(&good_src, Path::new(&dest)).len(),
+        4,
+        "the four changed files were restored without a word"
+    );
+    // And it is in --help.
+    let (_, help) = h.run(&["--help"]);
+    assert!(help.contains("--no-file-check"), "{help}");
+}
+
+/// A tape written before 1.3.0 has no index: the check is skipped, once for
+/// the whole run however many units it restores, with the reason.
+#[test]
+fn a_tape_with_no_index_skips_the_check_and_says_so_once() {
+    let h = Heir::lone();
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--all",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("RESTORE COMPLETE"), "{text}");
+    assert_eq!(
+        text.matches("this tape carries no index").count(),
+        1,
+        "said once for three units:\n{text}"
+    );
+    assert!(
+        !text.contains("match the sha256"),
+        "no file was checked: {text}"
+    );
+    assert!(text.contains("version 1.3.0"), "{text}");
+}
+
+/// An escrow key restoring every unit opens the operator envelope, which has
+/// no paths.tsv: each unit is checked against the tenant envelope that lists
+/// it. Bob's unit has a changed file and alice's has none, so the list is
+/// bob's alone; the operator key reaching bob's unit by name does the same.
+#[test]
+fn an_escrow_or_operator_key_checks_against_the_tenant_envelopes_index() {
+    let h = Heir::of(chk_two(), &[]);
+    let dest = h.sub("restored");
+    let (code, text) = h.run(&["--restore", "--key", &h.key("esc"), "--all", "--to", &dest]);
+    println!("--- --all with the escrow key ---\n{text}");
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("Decrypted envelope at file 6"),
+        "the operator envelope is the one in use:\n{text}"
+    );
+    assert!(
+        text.contains("File check: 4 restored file(s) of 'alpha-docs' version 1 match"),
+        "three files and sub/note.txt:\n{text}"
+    );
+    assert!(
+        text.contains("File check: 1 of 4 file(s) of 'bravo-docs' version 1 do NOT match"),
+        "{text}"
+    );
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    assert!(!Path::new(&dest)
+        .join("alpha-docs")
+        .join(".tapectl-damaged-files.txt")
+        .exists());
+    let (header, listed) = damaged_list(&format!("{dest}/bravo-docs"));
+    assert!(header.contains("unit=bravo-docs"), "{header}");
+    assert_eq!(listed, vec!["file1.bin".to_string()]);
+
+    let o = Heir::of(chk_two(), &[]);
+    let dest = o.sub("restored");
+    let (code, text) = o.run(&[
+        "--restore",
+        "--key",
+        &o.key("op"),
+        "--unit",
+        "bravo-docs",
+        "--to",
+        &dest,
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert_eq!(damaged_list(&dest).1, vec!["file1.bin".to_string()]);
+}
+
+/// `--path` checks only what it restored: a changed file elsewhere in the
+/// unit is not looked at, a folder is checked file by file, and a changed file
+/// asked for by name is found.
+#[test]
+fn a_path_restore_checks_only_the_paths_it_restored() {
+    let h = Heir::of(chk_bad(), &[]);
+    let path_args = |dest: &str, path: &str| {
+        let mut a = restore_args(&h, "checked", dest);
+        a.extend(["--path".to_string(), path.to_string()]);
+        a
+    };
+
+    let dest = h.sub("one-good");
+    let (code, text) = runv(&h, &path_args(&dest, "plain.bin"));
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("File check: 1 restored file(s) of 'checked' version 1 match"),
+        "the one file asked for, not the four changed ones:\n{text}"
+    );
+
+    let dest = h.sub("folder");
+    let (code, text) = runv(&h, &path_args(&dest, "sub"));
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("File check: 1 restored file(s) of 'checked' version 1 match"),
+        "sub/note.txt:\n{text}"
+    );
+
+    let dest = h.sub("one-bad");
+    let (code, text) = runv(&h, &path_args(&dest, "we ird : name.bin"));
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("RESTORE INCOMPLETE"), "{text}");
+    assert_eq!(damaged_list(&dest).1, odd_escaped(&[1]));
+    assert!(
+        text.contains("File check: 1 of 1 file(s) of 'checked' version 1 do NOT match"),
+        "{text}"
+    );
 }
