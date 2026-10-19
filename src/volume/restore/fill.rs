@@ -734,10 +734,12 @@ mod tests {
             slice_number: 2,
             volume: "L6-1".into(),
             reason: "bad".into(),
-            holes: vec![0..65536],
+            holes: std::iter::once(0..65536).collect(),
         }];
-        let mut trace = RestoreTrace::default();
-        trace.dar = Some(r);
+        let trace = RestoreTrace {
+            dar: Some(r),
+            ..RestoreTrace::default()
+        };
         let ex = judge(
             &trace,
             Err(TapectlError::Dar(verdict)),
