@@ -1804,3 +1804,12 @@ Ruled 2026-10-19, after v1.3.0 was tagged:
      passes; until then no release path may free them, and a failure after the erase leaves them
      staged with the command that resumes the write named. Every other retire path keeps the absolute
      floor. A candidate planner suggests which compaction candidates to merge onto one destination.
+107. **tapectl's restore takes `--key FILE`** (CTO, 2026-10-19, 1.4.0). `restore unit`, `restore
+     file`, `restore volume` and `catalog rebuild` accept `--key FILE` (repeatable): an identity used
+     for decryption in that command only, never copied into the home, never registered as the
+     operator's or the escrow's identity (ADR-0005 stands: no command replaces a registered escrow
+     identity). An heir holding only the escrow key runs `init` with the escrow PUBLIC key as today,
+     `catalog rebuild --from-volume --key escrow.key`, then `restore unit --key escrow.key`, and so
+     gets tapectl's chunk-level salvage and file fill, which RESTORE.sh cannot do. File 1's "tapectl
+     itself" section says so. File 1 may also link age's release page (github.com/FiloSottile/age)
+     for the `age` tool, which Debian 10 does not package.
