@@ -532,10 +532,13 @@ fn guide_drive_basics() -> String {
          system untouched) and \"IR\" (integrated RAID: the card can also build \
          simple RAID sets from disks). IT is the one to want for a tape drive, \
          and many adapters sold as plain host adapters already run it, so a \
-         card that says (IT) needs nothing. Reflash only a card that runs RAID \
-         firmware (IR, or a MegaRAID controller) and only when the drive does \
-         not appear, with the maker's own tool and instructions: a flash that \
-         fails can leave a card unusable. To see what a card is: `lspci -k` \
+         card that says (IT) needs nothing. Change nothing unless the drive \
+         does not appear. If it does not, and the card runs RAID firmware (IR, \
+         or a MegaRAID controller), IT firmware can cure it where the maker \
+         offers one for that card (not every RAID controller has one: then use \
+         a plain adapter instead); flash it only with the maker's own tool and \
+         instructions, because a flash that fails can leave a card unusable. \
+         To see what a card is: `lspci -k` \
          names the kernel driver in use under each adapter. `mpt3sas` (`mpt2sas` on \
          older kernels) is the driver of LSI and Broadcom host adapters, and \
          `megaraid_sas` is the driver of their RAID controllers, which are the wrong \
@@ -10607,7 +10610,7 @@ sha256_encrypted = \"bbb\"
             "they may be different generations",
             "A bare internal drive needs more: a place to sit (a 5.25-inch bay in a desktop or server, or an enclosure made for it), power from a power supply, and the internal SAS cable",
             "A PCIe SAS adapter needs a free PCIe slot",
-            "Reflash only a card that runs RAID firmware",
+            "IT firmware can cure it where the maker offers one for that card",
             "Slide the write-protect tab on the cartridge to the protected position",
             "`mt -f /dev/nst0 status` says ONLINE",
             "`mt -f /dev/nst0 offline` rewinds the tape and ejects it",
@@ -11859,7 +11862,7 @@ sha256_encrypted = \"bbb\"
         for needle in [
             "LSI (now Broadcom) host adapters come with one of two firmwares: \"IT\" (initiator-target: the card hands every device to the operating system untouched) and \"IR\" (integrated RAID: the card can also build simple RAID sets from disks)",
             "many adapters sold as plain host adapters already run it, so a card that says (IT) needs nothing",
-            "Reflash only a card that runs RAID firmware (IR, or a MegaRAID controller) and only when the drive does not appear, with the maker's own tool and instructions: a flash that fails can leave a card unusable",
+            "Change nothing unless the drive does not appear. If it does not, and the card runs RAID firmware (IR, or a MegaRAID controller), IT firmware can cure it where the maker offers one for that card (not every RAID controller has one: then use a plain adapter instead); flash it only with the maker's own tool and instructions, because a flash that fails can leave a card unusable",
             "An external drive, in its own case with its own power supply, is the simplest: it needs only an adapter with an external port and an external SAS cable that fits both ends",
             "A bare internal drive needs more: a place to sit (a 5.25-inch bay in a desktop or server, or an enclosure made for it), power from a power supply, and the internal SAS cable that matches the adapter's connector",
             "or use a Thunderbolt PCIe enclosure (\"The tape drive\")",
