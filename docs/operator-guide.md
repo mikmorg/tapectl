@@ -2624,6 +2624,68 @@ outright, and no flag passes it, when a live slice on the source has no copy
 on any other volume, or when the source holds the last eligible copy of a live
 version.
 
+### Compacting in place: `volume rewrite`
+
+`volume compact` needs a second cartridge. `volume rewrite` reclaims the space
+on the cartridge a volume is already on, with one drive and one tape (ADR-0012
+item 106). It reads the volume's live slices into staging, retires the volume,
+erases its cartridge, initialises a new volume on the same cartridge, writes the
+staged slices to it with the full confirm (every file read back), and only then
+releases staging. It works when the volume holds the only copy of a unit.
+
+```bash
+tapectl report compaction-candidates --plan          # what to compact, grouped by what fits one tape
+tapectl volume rewrite L6-0001 --label L6-0011 --dry-run
+tapectl volume rewrite L6-0001 --label L6-0011       # L6-0001 loaded
+tapectl volume rewrite L6-0001 --label L6-0011 --only-copy-on-staging L6-0001   # unattended
+```
+
+Before anything is read it checks that the source is sealed and trusted, that
+`--label` is free, that the cartridge carries no other live volume, that the
+drive can write its generation, that the live data fits one tape and that
+staging has room. It asks the quiet-host question once and reads the chip
+serial. After the read it re-reads every staged slice from the staging disk and
+matches its hash, checks what the write would refuse (keys, escrow, a staged set
+not whole), and builds the new volume's real layout from the staged slices (the
+envelopes with their catalogues, the cross-volume index, `catalog.db`, the
+backups, block padding), holding its total, plus a margin and the end-of-tape
+reserve, to the cartridge's budget. A refusal at any of these changes nothing,
+with the figures named.
+
+Consent depends on what else holds the data:
+
+- Every live slice has a copy on another sealed volume: the usual Tier-2
+  prompt, and only when a version would fall below its policy (a terminal asks,
+  `--yes` confirms in advance, no terminal and no `--yes` refuses).
+- Some live slice has no copy anywhere else: the retire family's zero floor is
+  amended for this command alone. The units and versions, the staging path and
+  the window are shown, and the source's label must be typed at a terminal, or
+  given as `--only-copy-on-staging L6-0001` for an unattended run. `--yes` does
+  not give it, and the command has no `--force`. `volume retire`,
+  `volume compact-finish`, `cartridge retire` and `cartridge mark-erased` keep
+  the absolute floor.
+
+**The window.** From the erase until the new volume seals and passes a full
+readback, the staging disk holds the only copy of those units. The window is
+named in the `rewrite_window_opened` and `rewrite_window_closed` events and in
+the session log. If the command stops in it, the staged slices stay staged and
+nothing releases them (`staging clean --force`, the release after
+`volume write`/`volume resume`, and `collection run` all refuse). The error
+names `tapectl volume rewrite --resume L6-0011`, which continues from where the
+catalog says it stopped and lifts the hold once the new volume has passed the
+full readback. `--with-staged` writes whatever else is staged beside the
+rewrite's slices (without it the new volume carries the rewrite's slices and
+nothing else); `--keep-staging` releases nothing afterwards.
+
+`report compaction-candidates --plan [--generation LTO-N]` groups the flagged
+volumes whose live data fits one destination tape (capacity times the fill
+ceiling, less the end-of-tape reserve), largest reclaim first, and names the
+command: `volume rewrite` for a group of one, or `compact-read` the others and
+then `volume rewrite HOST --with-staged` for a group of several.
+
+Exit status is the write family's: 4 means it stopped after the tape was
+touched and `--resume` finishes it.
+
 ## Cartridge Tracking
 
 **A cartridge is known by the serial its chip reports. A barcode is a sticker**

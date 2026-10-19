@@ -141,6 +141,10 @@ are left as, so a script knows what to do next without parsing the message:
 | 6 | **the medium proven bad**: the confirm, or a resume's contact check, found the tape is not what was written; the volume is quarantined and no longer counts as a copy | write the data to another cartridge |
 | 75 | the catalog was busy before anything was written ([above](#75-catalog-busy)) | run the command again once the other one has finished |
 
+`volume rewrite` uses the same table: a refusal in its preflight, the staged-slice re-read, the
+capacity rehearsal or the consent exits 2 with the tape untouched; once the source is retired or
+its cartridge erased, a stop exits **4** and `tapectl volume rewrite --resume NEW` finishes it.
+
 `collection run` writes one copy per run, and exits with the worst outcome
 among its copies, in the order 6, 5, 4, 3, 2, 0: a run with any copy
 quarantined exits 6 whatever the others did.
@@ -329,6 +333,7 @@ answers a prompt.
 | `unit mark-tape-only` | `--yes` or `--force` |
 | `snapshot mark-reclaimable` | `--yes` or `--force` |
 | `cartridge erase` | neither: the label read from the tape's File 0 (its chip serial, for a tape tapectl did not write), typed at the prompt or given as `--confirm-label` |
+| `volume rewrite` | Tier-2 (a version left below policy): `--yes`. The typed consent (the only copy will be the staging disk): the source's label, typed, or `--only-copy-on-staging LABEL`; `--yes` does not give it and there is no `--force` |
 
 `snapshot mark-reclaimable` has one refusal that no prompt answers. When no
 current version supersedes the version you name, marking it reclaimable would
@@ -2023,6 +2028,29 @@ session's: `volume "<label>" quarantined: identity mismatch: expected
 label="<label>", uuid="<uuid>"; found label="<other>", uuid="<uuid>"` (or
 `found a present but unparseable/corrupt File 0`), or `tape already carries a
 seal marker at position <n> (ADR-0003: sealed volumes are immutable)`.
+
+### `volume rewrite`
+
+- **"refused: some of this volume's live data has no copy on any other volume"**: expected when
+  the volume holds the only copy. Give `--only-copy-on-staging <SOURCE_LABEL>` (or type the label
+  at a terminal) if you accept the window in which the staging disk holds the only copy.
+- **"the staged copy of unit ... is not what the catalog recorded"**: the staging disk changed;
+  nothing was destroyed and staging was put back. Check the disk, then run it again.
+- **"the new volume ... would not fit its cartridge"**: the live slices fit but the volume's own
+  files (envelopes, index, catalog.db, backups, padding) do not; nothing was destroyed. Compact onto
+  a larger generation, or raise `--fill-ceiling` only if you know the cartridge takes it.
+- **"The rewrite is NOT finished: its staged slices are held"** (after the erase): load the same
+  cartridge (the message names the chip serial if another is in the drive) and run
+  `tapectl volume rewrite --resume NEW`. `staging clean` prints "held by the rewrite of volume ..."
+  and `--force` does not release them.
+- **`--resume` says the staged slices were released**: every unit has a fully read back copy on
+  another volume. The record is closed and the source's cartridge is free: `volume init <LABEL>`
+  and a normal write reuse it.
+- **"sealed but was not fully read back"**: run `tapectl volume verify NEW --full`, then
+  `--resume`.
+- **The cartridge is unusable after the erase**: `volume init OTHER` on a blank cartridge, then
+  `volume compact-write --destination OTHER --full-confirm`, which lifts the hold when it passes.
+  Do not run `--resume` (it would use the old cartridge); then `tapectl staging clean`.
 
 ### `volume compact` needs a terminal
 

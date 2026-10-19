@@ -267,7 +267,7 @@ then the short seal) and waits for #420 (#478); the profiling toolkit is #479.
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
 open hardware questions are answered there — block size 512 K vs 1 M is a wash, MAM
-over-report is +2 MiB. `scripts/lifecycle-suite.sh` (16 scenarios, `--list` names
+over-report is +2 MiB. `scripts/lifecycle-suite.sh` (17 scenarios, `--list` names
 them, x a 12-method restore matrix) is the permutation suite built from it.
 
 ## Build Commands
