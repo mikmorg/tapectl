@@ -60,6 +60,7 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
 
+use age::secrecy::zeroize::Zeroizing;
 use rusqlite::Connection;
 use tracing::{info, warn};
 
@@ -1391,7 +1392,7 @@ fn decrypt_chunks(
         out.open()?;
         let skip = out.delivered;
         let mut pos = 0u64;
-        let mut buf = Vec::with_capacity(chunks::CHUNK);
+        let mut buf = Zeroizing::new(Vec::with_capacity(chunks::CHUNK));
         loop {
             let next = chunks
                 .next(&mut buf)

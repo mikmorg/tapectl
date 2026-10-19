@@ -28,14 +28,31 @@
 //! `encrypted_len - header - nonce` bytes, cut into 65 552-byte chunks with
 //! a shorter last one, so a bad chunk's plaintext span is arithmetic and
 //! needs none of its bytes.
+//!
+//! **What a chunk's tag proves, and what it does not.** It proves the chunk
+//! was encrypted under the file key this header unwraps, at this index. It
+//! does not prove the file is the one the caller expected: any other age
+//! file to the same recipient authenticates in full. Two things stand
+//! between a caller and that mistake. [`ChunkReader::header`] is the bytes
+//! that identify the file (the header with its fresh ephemeral share, and
+//! the payload nonce), so chunks of two reads can be required to come from
+//! one file; and the caller holds the catalog's checksums, which a chunk
+//! cannot stand in for.
+//!
+//! **Key material** is held in `SecretBox`es and wiped when dropped: the
+//! file key (copied out of age's own wrapper into one) and the payload key
+//! (which only builds the AEAD, itself wiped on drop). The plaintext of a
+//! chunk is decrypted in place in the caller's [`Zeroizing`] buffer, so no
+//! other copy of it is made, and the buffer is wiped before each reuse.
 
 use std::cell::RefCell;
 use std::io::{self, Read};
 
-use age::secrecy::ExposeSecret;
+use age::secrecy::zeroize::{Zeroize, Zeroizing};
+use age::secrecy::{ExposeSecret, SecretBox};
 use age::DecryptError;
 use age_core::format::{FileKey, Stanza};
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::ChaCha20Poly1305;
 
 use crate::error::{Result, TapectlError};
@@ -71,7 +88,8 @@ impl<R: Read> Read for Tap<R> {
 /// the one that matched unwrapped.
 struct KeyGrab<'a> {
     identities: &'a [age::x25519::Identity],
-    key: RefCell<Option<[u8; 16]>>,
+    /// The noted key, wiped on drop like age's own wrapper it was copied from.
+    key: RefCell<Option<SecretBox<[u8; 16]>>>,
 }
 
 impl KeyGrab<'_> {
@@ -79,7 +97,11 @@ impl KeyGrab<'_> {
         &self,
         unwrapped: std::result::Result<FileKey, DecryptError>,
     ) -> std::result::Result<FileKey, DecryptError> {
-        unwrapped.inspect(|k| *self.key.borrow_mut() = Some(*k.expose_secret()))
+        unwrapped.inspect(|k| {
+            *self.key.borrow_mut() = Some(SecretBox::init_with_mut(|noted: &mut [u8; 16]| {
+                noted.copy_from_slice(k.expose_secret())
+            }))
+        })
     }
 }
 
@@ -120,6 +142,9 @@ pub enum Next {
 pub struct ChunkReader<R> {
     src: R,
     aead: ChaCha20Poly1305,
+    /// The header and the payload nonce, as they lay in the file: what
+    /// identifies this age file among all others.
+    header: Vec<u8>,
     /// The index of the next chunk.
     index: u64,
     chunks: u64,
@@ -164,8 +189,14 @@ pub fn open<R: Read>(
         tap.seen.len().checked_sub(PAYLOAD_NONCE).ok_or_else(|| {
             TapectlError::Encryption("decryptor: the age header is too short".into())
         })?;
-    let payload_key =
-        age_core::primitives::hkdf(&tap.seen[nonce_at..], b"payload", file_key.as_slice());
+    // `init_with` wipes the stack copy of the derived key once it is boxed.
+    let payload_key = SecretBox::<[u8; 32]>::init_with(|| {
+        age_core::primitives::hkdf(
+            &tap.seen[nonce_at..],
+            b"payload",
+            file_key.expose_secret().as_slice(),
+        )
+    });
     let payload = encrypted_len.checked_sub(tap.count).ok_or_else(|| {
         TapectlError::Encryption(format!(
             "the age file is shorter ({encrypted_len} bytes) than its own header ({})",
@@ -187,7 +218,8 @@ pub fn open<R: Read>(
     }
     Ok(ChunkReader {
         src: tap.inner,
-        aead: ChaCha20Poly1305::new((&payload_key).into()),
+        aead: ChaCha20Poly1305::new(payload_key.expose_secret().into()),
+        header: tap.seen,
         index: 0,
         chunks,
         last_len,
@@ -201,6 +233,16 @@ impl<R> ChunkReader<R> {
         self.chunks
     }
 
+    /// The bytes that identify this age file: its header (recipient stanzas
+    /// with a fresh ephemeral share each, and the header MAC) and the payload
+    /// nonce. Equal for every read of one file, however damaged elsewhere;
+    /// different for any other file, even of the same plaintext to the same
+    /// recipient. Chunks of two reads with different headers are never chunks
+    /// of one file. Public bytes, not key material.
+    pub fn header(&self) -> &[u8] {
+        &self.header
+    }
+
     /// The plaintext length of the whole file, from its length alone.
     pub fn plain_len(&self) -> u64 {
         (self.chunks - 1) * CHUNK as u64 + (self.last_len - TAG) as u64
@@ -208,15 +250,15 @@ impl<R> ChunkReader<R> {
 }
 
 impl<R: Read> ChunkReader<R> {
-    /// Read the next chunk. On [`Next::Authentic`] its plaintext replaces the
-    /// contents of `out`; otherwise `out` is emptied.
+    /// Read the next chunk. On [`Next::Authentic`] its plaintext is in `out`,
+    /// which is wiped before each read and on every other outcome.
     ///
     /// An `Err` is the source failing to read (a tape error) — the chunks
     /// not yet read are then the caller's to account for, by [`Self::index`]
     /// and [`Self::plain_len`]. A source that ends early is not an error: the
     /// chunk it cut short is [`Next::Damaged`], as is every one after it.
-    pub fn next(&mut self, out: &mut Vec<u8>) -> io::Result<Next> {
-        out.clear();
+    pub fn next(&mut self, out: &mut Zeroizing<Vec<u8>>) -> io::Result<Next> {
+        out.zeroize();
         if self.index >= self.chunks {
             return Ok(Next::End);
         }
@@ -245,16 +287,18 @@ impl<R: Read> ChunkReader<R> {
         let mut nonce = [0u8; 12];
         nonce[3..11].copy_from_slice(&index.to_be_bytes());
         nonce[11] = u8::from(last);
-        match self.aead.decrypt((&nonce).into(), &self.scratch[..want]) {
-            Ok(plain) => {
-                // age rejects an empty last chunk after a non-empty file.
-                if plain.is_empty() && index > 0 {
-                    return Ok(Next::Damaged { plain_len });
-                }
-                *out = plain;
-                Ok(Next::Authentic)
+        out.extend_from_slice(&self.scratch[..want]);
+        match self.aead.decrypt_in_place((&nonce).into(), b"", &mut **out) {
+            // age rejects an empty last chunk after a non-empty file.
+            Ok(()) if out.is_empty() && index > 0 => {
+                out.zeroize();
+                Ok(Next::Damaged { plain_len })
             }
-            Err(_) => Ok(Next::Damaged { plain_len }),
+            Ok(()) => Ok(Next::Authentic),
+            Err(_) => {
+                out.zeroize();
+                Ok(Next::Damaged { plain_len })
+            }
         }
     }
 
@@ -276,6 +320,7 @@ impl<R: Read> ChunkReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chacha20poly1305::aead::Aead;
     use std::io::{Cursor, Seek, SeekFrom};
 
     fn keypair() -> (age::x25519::Identity, String) {
@@ -297,7 +342,7 @@ mod tests {
             cipher.len() as u64,
         )
         .unwrap();
-        let (mut plain, mut damaged, mut buf) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut plain, mut damaged, mut buf) = (Vec::new(), Vec::new(), Zeroizing::default());
         loop {
             let at = plain.len() as u64;
             match reader.next(&mut buf).unwrap() {
@@ -417,7 +462,7 @@ mod tests {
             cipher.len() as u64,
         )
         .unwrap();
-        let mut buf = Vec::new();
+        let mut buf = Zeroizing::default();
         let mut outcomes = Vec::new();
         loop {
             match reader.next(&mut buf).unwrap() {
@@ -481,6 +526,355 @@ mod tests {
             "if this passes age can continue past a bad chunk and this module is no longer \
              needed: {outcome:?}, {} bytes",
             rest.len()
+        );
+    }
+
+    // ── the adversarial review's cases (#480) ─────────────────────────
+
+    fn pattern_seeded(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i * 31 + seed as usize) % 251) as u8)
+            .collect()
+    }
+
+    fn enc(plain: &[u8], recipients: &[String]) -> Vec<u8> {
+        crate::staging::encrypt_data(plain, recipients).unwrap()
+    }
+
+    /// Every chunk of `cipher` read as a file of `len` bytes: the outcomes,
+    /// and the plaintext with zeros where a chunk was damaged. A damaged
+    /// chunk leaves the buffer empty, always.
+    fn outcomes(cipher: &[u8], ids: &[age::x25519::Identity], len: u64) -> (Vec<Next>, Vec<u8>) {
+        let mut r = open(Cursor::new(cipher.to_vec()), ids, len).unwrap();
+        let (mut v, mut plain, mut buf) = (Vec::new(), Vec::new(), Zeroizing::default());
+        loop {
+            match r.next(&mut buf).unwrap() {
+                Next::End => break,
+                Next::Authentic => {
+                    plain.extend_from_slice(&buf);
+                    v.push(Next::Authentic)
+                }
+                Next::Damaged { plain_len } => {
+                    assert!(buf.is_empty(), "a damaged chunk leaves nothing behind");
+                    plain.extend(std::iter::repeat_n(0u8, plain_len));
+                    v.push(Next::Damaged { plain_len })
+                }
+            }
+        }
+        (v, plain)
+    }
+
+    fn header_len(cipher: &[u8], payload_plain: usize) -> usize {
+        let chunks = payload_plain.div_ceil(CHUNK).max(1);
+        cipher.len() - payload_plain - chunks * TAG
+    }
+
+    /// A file cut at a chunk boundary, whose recorded length is the cut's
+    /// length: the cut chunk was a non-last chunk, so under the last-chunk
+    /// nonce it does not authenticate — a truncation is never "complete".
+    #[test]
+    fn a_file_truncated_at_a_chunk_boundary_with_a_matching_length_is_not_complete() {
+        let (id, public) = keypair();
+        for plain_len in [3 * CHUNK + 500, 3 * CHUNK] {
+            let plain = pattern_seeded(plain_len, 1);
+            let cipher = enc(&plain, std::slice::from_ref(&public));
+            let h = header_len(&cipher, plain_len);
+            let cut = &cipher[..h + 2 * ENCRYPTED_CHUNK];
+            let (v, _) = outcomes(cut, std::slice::from_ref(&id), cut.len() as u64);
+            assert_eq!(
+                v,
+                vec![Next::Authentic, Next::Damaged { plain_len: CHUNK }],
+                "{plain_len}"
+            );
+        }
+    }
+
+    /// A file extended by a copied chunk: with its own length it is damaged
+    /// at the seam, and with the catalog's length the extra bytes are ignored.
+    #[test]
+    fn a_file_extended_by_an_appended_chunk_is_not_authentic() {
+        let (id, public) = keypair();
+        let plain = pattern_seeded(2 * CHUNK, 2);
+        let cipher = enc(&plain, std::slice::from_ref(&public));
+        let h = header_len(&cipher, 2 * CHUNK);
+        let mut ext = cipher.clone();
+        ext.extend_from_slice(&cipher[h..h + ENCRYPTED_CHUNK]);
+        let (v, _) = outcomes(&ext, std::slice::from_ref(&id), ext.len() as u64);
+        assert_eq!(
+            v,
+            vec![
+                Next::Authentic,
+                Next::Damaged { plain_len: CHUNK },
+                Next::Damaged { plain_len: CHUNK }
+            ]
+        );
+        let (v, got) = outcomes(&ext, std::slice::from_ref(&id), cipher.len() as u64);
+        assert_eq!(v, vec![Next::Authentic, Next::Authentic]);
+        assert_eq!(got, plain);
+    }
+
+    /// The first chunk, the full-length last chunk, a one-chunk file and an
+    /// empty file, each damaged: a hole of exactly its own length.
+    #[test]
+    fn a_damaged_first_chunk_and_a_full_length_last_chunk_are_holes_of_their_own_length() {
+        let (id, public) = keypair();
+        let plain = pattern_seeded(2 * CHUNK, 3);
+        let cipher = enc(&plain, std::slice::from_ref(&public));
+        let h = header_len(&cipher, 2 * CHUNK);
+        let mut c0 = cipher.clone();
+        c0[h + 3] ^= 0x80;
+        let (v, got) = outcomes(&c0, std::slice::from_ref(&id), c0.len() as u64);
+        assert_eq!(v, vec![Next::Damaged { plain_len: CHUNK }, Next::Authentic]);
+        assert!(got[..CHUNK].iter().all(|&b| b == 0));
+        assert_eq!(&got[CHUNK..], &plain[CHUNK..]);
+        let mut c1 = cipher.clone();
+        let n = c1.len();
+        c1[n - 1] ^= 0x01; // the last chunk's tag
+        let (v, got) = outcomes(&c1, std::slice::from_ref(&id), c1.len() as u64);
+        assert_eq!(v, vec![Next::Authentic, Next::Damaged { plain_len: CHUNK }]);
+        assert_eq!(got.len(), plain.len());
+        // A one-chunk file damaged: the only chunk is first and last.
+        let plain = pattern_seeded(10, 4);
+        let mut c = enc(&plain, std::slice::from_ref(&public));
+        let n = c.len();
+        c[n - 20] ^= 0x01;
+        let (v, _) = outcomes(&c, std::slice::from_ref(&id), c.len() as u64);
+        assert_eq!(v, vec![Next::Damaged { plain_len: 10 }]);
+        // An empty file damaged.
+        let mut c = enc(b"", std::slice::from_ref(&public));
+        let n = c.len();
+        c[n - 1] ^= 0x01;
+        let (v, _) = outcomes(&c, std::slice::from_ref(&id), c.len() as u64);
+        assert_eq!(v, vec![Next::Damaged { plain_len: 0 }]);
+    }
+
+    /// The header is age's to refuse (its MAC covers the stanzas, the grease
+    /// among them); the payload nonce lies outside the MAC, so changing it
+    /// fails every chunk and releases nothing.
+    #[test]
+    fn a_tampered_header_is_refused_and_a_tampered_nonce_releases_nothing() {
+        let (id, public) = keypair();
+        let cipher = enc(&pattern_seeded(1000, 5), std::slice::from_ref(&public));
+        let mac_at = cipher.windows(4).position(|w| w == b"--- ").unwrap() + 4;
+        // A MAC character swapped for another base64 character.
+        let mut c = cipher.clone();
+        c[mac_at + 5] = if c[mac_at + 5] == b'A' { b'B' } else { b'A' };
+        assert!(open(
+            Cursor::new(c.clone()),
+            std::slice::from_ref(&id),
+            c.len() as u64
+        )
+        .is_err());
+        // A byte of a stanza body (inside the MAC'd region), base64-valid.
+        let mut c = cipher.clone();
+        let nl = c.iter().position(|&b| b == b'\n').unwrap(); // end of version line
+        let nl2 = nl + 1 + c[nl + 1..].iter().position(|&b| b == b'\n').unwrap(); // first stanza line
+        let at = nl2 + 3;
+        c[at] = if c[at] == b'A' { b'B' } else { b'A' };
+        assert!(open(
+            Cursor::new(c.clone()),
+            std::slice::from_ref(&id),
+            c.len() as u64
+        )
+        .is_err());
+        // The grease stanza's tag changed: the key still unwraps, only the
+        // MAC can refuse.
+        let mut c = cipher.clone();
+        let g = c.windows(7).position(|w| w == b"-grease").unwrap() - 1;
+        c[g] = if c[g] == b'!' { b'#' } else { b'!' };
+        assert!(
+            open(
+                Cursor::new(c.clone()),
+                std::slice::from_ref(&id),
+                c.len() as u64
+            )
+            .is_err(),
+            "the MAC refuses a changed grease stanza"
+        );
+        // The payload nonce changed: every chunk fails, nothing is emitted.
+        let mut c = cipher.clone();
+        let nonce_at = mac_at + 43 + 1;
+        c[nonce_at] ^= 0x01;
+        let (v, got) = outcomes(&c, std::slice::from_ref(&id), c.len() as u64);
+        assert_eq!(v, vec![Next::Damaged { plain_len: 1000 }]);
+        assert!(got.iter().all(|&b| b == 0));
+    }
+
+    /// Several identities, several recipients: the one that unwraps is used,
+    /// in any order, and an identity that matches nothing is not an error.
+    #[test]
+    fn several_identities_and_several_recipients_open_the_same_file() {
+        let (id, public) = keypair();
+        let (other, other_pub) = keypair();
+        let plain = pattern_seeded(CHUNK + 7, 6);
+        let cipher = enc(&plain, &[other_pub.clone(), public.clone()]);
+        for ids in [
+            vec![id.clone()],
+            vec![other.clone()],
+            vec![other.clone(), id.clone()],
+        ] {
+            let (v, got) = outcomes(&cipher, &ids, cipher.len() as u64);
+            assert_eq!(v, vec![Next::Authentic, Next::Authentic]);
+            assert_eq!(got, plain);
+        }
+        let only = enc(&plain, std::slice::from_ref(&public));
+        let (third, _) = keypair();
+        let (v, got) = outcomes(&only, &[third, id.clone()], only.len() as u64);
+        assert_eq!(v, vec![Next::Authentic, Next::Authentic]);
+        assert_eq!(got, plain);
+    }
+
+    /// A length the file cannot have is refused at open or reads as damage,
+    /// and a claimed length of u64::MAX allocates nothing.
+    #[test]
+    fn inconsistent_lengths_are_refused_or_read_as_damage() {
+        let (id, public) = keypair();
+        let plain = pattern_seeded(CHUNK + 1000, 7);
+        let mut cipher = enc(&plain, std::slice::from_ref(&public));
+        let real = cipher.len() as u64;
+        cipher.extend_from_slice(&[0u8; 100]); // tape block padding
+        let (v, _) = outcomes(&cipher, std::slice::from_ref(&id), real + 5);
+        assert_eq!(v, vec![Next::Authentic, Next::Damaged { plain_len: 1005 }]);
+        let (v, _) = outcomes(&cipher, std::slice::from_ref(&id), real - 5);
+        assert_eq!(v, vec![Next::Authentic, Next::Damaged { plain_len: 995 }]);
+        let h = header_len(&cipher[..real as usize], CHUNK + 1000) as u64;
+        // A length leaving 1..15 bytes for the last chunk is refused at open.
+        let refused =
+            |len: u64| open(Cursor::new(cipher.clone()), std::slice::from_ref(&id), len).is_err();
+        assert!(refused(h + ENCRYPTED_CHUNK as u64 + 15));
+        assert!(refused(h + 15));
+        assert!(refused(h - 1));
+        assert!(refused(0));
+        // A huge claimed length: the source ends, so it is damage.
+        let mut r = open(
+            Cursor::new(cipher.clone()),
+            std::slice::from_ref(&id),
+            u64::MAX,
+        )
+        .unwrap();
+        let mut buf = Zeroizing::default();
+        assert_eq!(r.next(&mut buf).unwrap(), Next::Authentic);
+        assert_eq!(
+            r.next(&mut buf).unwrap(),
+            Next::Damaged { plain_len: CHUNK }
+        );
+        assert!(r.plain_len() > 0);
+    }
+
+    /// age refuses an empty last chunk after a non-empty one, and so does
+    /// this module — as damage of zero length, never as data.
+    #[test]
+    fn an_empty_last_chunk_after_a_non_empty_one_is_damage_of_zero_length() {
+        let (id, public) = keypair();
+        let plain = pattern_seeded(CHUNK, 8);
+        let cipher = enc(&plain, std::slice::from_ref(&public));
+        let h = header_len(&cipher, CHUNK);
+        let r = open(
+            Cursor::new(cipher.clone()),
+            std::slice::from_ref(&id),
+            cipher.len() as u64,
+        )
+        .unwrap();
+        let mut crafted = cipher[..h].to_vec();
+        let n0 = [0u8; 12];
+        let mut n1 = [0u8; 12];
+        n1[10] = 1;
+        n1[11] = 1;
+        crafted.extend(r.aead.encrypt((&n0).into(), &plain[..]).unwrap());
+        crafted.extend(r.aead.encrypt((&n1).into(), &b""[..]).unwrap());
+        let (v, got) = outcomes(&crafted, std::slice::from_ref(&id), crafted.len() as u64);
+        assert_eq!(v, vec![Next::Authentic, Next::Damaged { plain_len: 0 }]);
+        assert_eq!(got, plain);
+        // age itself refuses it.
+        let mut a = age::Decryptor::new(Cursor::new(&crafted))
+            .unwrap()
+            .decrypt(std::iter::once(&id as &dyn age::Identity))
+            .unwrap();
+        let mut sink = Vec::new();
+        assert!(Read::read_to_end(&mut a, &mut sink).is_err());
+    }
+
+    /// THE finding behind #480's second review: a DIFFERENT age file to the
+    /// same recipient, of the length the catalog recorded, authenticates in
+    /// full — every chunk's tag proves only "encrypted under some key this
+    /// identity unwraps". What tells it from the expected file is its header:
+    /// the caller is given those bytes to compare, and the plaintext to hash.
+    #[test]
+    fn a_substituted_file_authenticates_in_full_and_is_told_apart_by_its_header() {
+        let (id, public) = keypair();
+        let a_plain = pattern_seeded(3 * CHUNK + 123, 9);
+        let a = enc(&a_plain, std::slice::from_ref(&public));
+        let b_plain = pattern_seeded(3 * CHUNK + 123, 77);
+        let mut tries = 0;
+        let b = loop {
+            tries += 1;
+            let b = enc(&b_plain, std::slice::from_ref(&public));
+            if b.len() == a.len() {
+                break b;
+            }
+            assert!(tries < 5000, "no equal-length header in {tries} tries");
+        };
+        let (v, got) = outcomes(&b, std::slice::from_ref(&id), a.len() as u64);
+        assert!(v.iter().all(|n| *n == Next::Authentic), "{v:?}");
+        assert_eq!(got, b_plain);
+        assert_ne!(got, a_plain);
+        let header_of = |cipher: &[u8]| {
+            open(
+                Cursor::new(cipher.to_vec()),
+                std::slice::from_ref(&id),
+                a.len() as u64,
+            )
+            .unwrap()
+            .header()
+            .to_vec()
+        };
+        assert_ne!(
+            header_of(&a),
+            header_of(&b),
+            "two files to one recipient are told apart by their headers"
+        );
+        // Unequal header length: all but the last chunk authenticate.
+        let c = loop {
+            let c = enc(&b_plain, std::slice::from_ref(&public));
+            if c.len() != a.len() {
+                break c;
+            }
+        };
+        let mut padded = c.clone();
+        padded.extend_from_slice(&[0u8; 4096]);
+        let (v, _) = outcomes(&padded, std::slice::from_ref(&id), a.len() as u64);
+        assert_eq!(
+            &v[..3],
+            &[Next::Authentic, Next::Authentic, Next::Authentic]
+        );
+        assert!(matches!(v[3], Next::Damaged { .. }));
+    }
+
+    /// The identifying header is the same bytes on every read of one file,
+    /// damaged elsewhere or not, and covers the whole header and the nonce.
+    #[test]
+    fn the_header_is_the_same_on_every_read_of_one_file() {
+        let (id, public) = keypair();
+        let plain = pattern_seeded(3 * CHUNK, 10);
+        let cipher = enc(&plain, std::slice::from_ref(&public));
+        let h = header_len(&cipher, 3 * CHUNK);
+        let mut hurt = cipher.clone();
+        hurt[h + ENCRYPTED_CHUNK + 4] ^= 0xFF;
+        let read = |bytes: &[u8]| {
+            open(
+                Cursor::new(bytes.to_vec()),
+                std::slice::from_ref(&id),
+                bytes.len() as u64,
+            )
+            .unwrap()
+            .header()
+            .to_vec()
+        };
+        assert_eq!(read(&cipher), read(&hurt));
+        assert_eq!(
+            read(&cipher),
+            &cipher[..h],
+            "it is the header and the nonce, exactly as they lay in the file"
         );
     }
 }
