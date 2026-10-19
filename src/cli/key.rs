@@ -95,10 +95,13 @@ pub enum KeyCommands {
     /// Generate the printed Heir Kit and the encrypted catalog bundle
     /// (ADR-0005 / ADR-0009).
     ///
-    /// Writes three files: COVER.txt (the plain-text cover sheet — the
+    /// Writes four files: COVER.txt (the plain-text cover sheet — the
     /// artifact with the decades-scale claim), escrow-kit.html (the same
-    /// content with an inline QR, for printing), and catalog.db.age (the
-    /// whole catalog encrypted to the escrow recipient).
+    /// content with an inline QR, for printing), catalog.db.age (the
+    /// whole catalog encrypted to the escrow recipient), and tapectl-VERSION
+    /// (a copy of this tapectl program, mode 0755, whose size and sha256 the
+    /// cover sheet names, so the kit does not depend on a repository
+    /// surviving).
     ///
     /// This command stops at the files. Printing them, sealing them into
     /// tamper-evident envelopes and distributing them across at least two
@@ -463,6 +466,9 @@ pub fn run(
                         "cover_txt": report.cover_txt,
                         "html": report.html,
                         "catalog_age": report.catalog_age,
+                        "tapectl_copy": report.tapectl_copy,
+                        "tapectl_sha256": report.tapectl_sha256,
+                        "tapectl_bytes": report.tapectl_bytes,
                         "catalog_bytes": report.catalog_bytes,
                         "sealed_volumes": report.sealed_volumes,
                         "escrow_public_key": report.escrow_public_key,
@@ -475,6 +481,16 @@ pub fn run(
                 println!(
                     "  catalog.db.age   encrypted catalog, {} bytes, covering {} sealed volume(s)",
                     report.catalog_bytes, report.sealed_volumes
+                );
+                println!(
+                    "  {:<16} the program that made this kit, {} bytes, sha256 {} (named on the sheet)",
+                    report
+                        .tapectl_copy
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    report.tapectl_bytes,
+                    report.tapectl_sha256
                 );
                 println!();
                 // ADR-0005 puts the custody requirements on the printed sheet,

@@ -7,13 +7,14 @@
 //! deferred on the belief that the whole of it needed a person; that covered
 //! only the second half.
 //!
-//! Three artifacts land in the output directory:
+//! Four artifacts land in the output directory:
 //!
 //! | file | what it is |
 //! |---|---|
 //! | `COVER.txt` | The plain-text cover sheet. The artifact with the decades-scale claim: no browser, no tooling, readable with `cat`. Carries the escrow IDENTITY (the public half, in retypable Bech32) and a boxed hand-fill area for the escrow SECRET, which `tapectl init` printed once and nothing on this machine holds (ADR-0005, issue #341). The public half decrypts nothing; the sheet says so and tells the operator to write the secret in. It also names the drives that read the sealed volumes' media generations ([`Generation::can_read`], issue #448), lists the places the catalog shelves them beside a hand-fill "Tapes are at" box, and gives RESTORE.sh's tool list. |
 //! | `escrow-kit.html` | The same content, self-contained, with the identity as an inline SVG QR and print styling. Exists so the ceremony is one keystroke, because ADR-0005 requires repeating it after every write session and a ceremony with friction is one that gets skipped. |
 //! | `catalog.db.age` | The **full** `tapectl.db`, age-encrypted to the escrow recipient. |
+//! | `tapectl-<version>` | A copy of the tapectl program that generated the kit (`std::env::current_exe`), mode 0755, so the heir's one tool for reading around a damaged slice does not depend on a repository still existing (ADR-0012 item 109, #485). The cover sheet and the HTML page name it with its size and sha256. |
 //!
 //! **Why the full database and not #83's filtered `catalog.db`** (ADR-0009):
 //! the filtered schema was designed to ride *on tape*, where the sacred
@@ -41,6 +42,13 @@ pub struct KitReport {
     pub cover_txt: PathBuf,
     pub html: PathBuf,
     pub catalog_age: PathBuf,
+    /// The copy of the tapectl program that generated the kit (#485), in the
+    /// output directory as `tapectl-<version>`.
+    pub tapectl_copy: PathBuf,
+    /// Its sha256 (hex), read back from the copy, as the cover sheet names it.
+    pub tapectl_sha256: String,
+    /// Its size in bytes, as the cover sheet names it.
+    pub tapectl_bytes: u64,
     /// Size of the encrypted catalog bundle, so the operator can sanity-check
     /// that something real was written before carrying it to a printer.
     pub catalog_bytes: u64,
@@ -56,6 +64,24 @@ pub struct KitReport {
 /// identity the thing the whole kit is addressed to, so a kit without one
 /// would be a cover sheet pointing at nothing and an unopenable bundle.
 pub fn generate(conn: &Connection, db_path: &Path, out_dir: &Path) -> Result<KitReport> {
+    let exe = std::env::current_exe().map_err(|e| {
+        TapectlError::Other(format!(
+            "cannot find the running tapectl program to copy into the kit: {e}. \
+             The kit carries the program that made it (ADR-0012 item 109)."
+        ))
+    })?;
+    generate_with_program(conn, db_path, out_dir, &exe)
+}
+
+/// [`generate`] with the program to copy named: the running binary in
+/// production, a small file in the tests (a copy of a debug test binary is
+/// hundreds of megabytes, once for each test).
+pub fn generate_with_program(
+    conn: &Connection,
+    db_path: &Path,
+    out_dir: &Path,
+    program: &Path,
+) -> Result<KitReport> {
     let escrow = queries::escrow_public_key(conn)?.ok_or_else(|| {
         TapectlError::Other(
             "no escrow recipient is registered, so there is nobody to address the kit to \
@@ -77,6 +103,12 @@ pub fn generate(conn: &Connection, db_path: &Path, out_dir: &Path) -> Result<Kit
 
     let catalog_bytes = write_encrypted_catalog(conn, db_path, &catalog_age, &escrow)?;
 
+    // The program that made the kit, beside the sheet that names it (#485).
+    // Copied before the sheet is rendered: the sheet carries the sha256 and
+    // size of the file as it now lies in the kit, read back from the disk.
+    let tapectl_copy = out_dir.join(program_file_name());
+    let (tapectl_sha256, tapectl_bytes) = copy_program(program, &tapectl_copy)?;
+
     let sealed_volumes: i64 = conn.query_row(
         "SELECT COUNT(*) FROM volumes WHERE status = 'sealed'",
         [],
@@ -96,6 +128,13 @@ pub fn generate(conn: &Connection, db_path: &Path, out_dir: &Path) -> Result<Kit
         warehouse_deposits,
         generations: &generations,
         places: &places,
+        program: Some(ProgramFact {
+            file_name: program_file_name(),
+            version: env!("CARGO_PKG_VERSION"),
+            arch: std::env::consts::ARCH,
+            sha256: tapectl_sha256.clone(),
+            bytes: tapectl_bytes,
+        }),
     };
     fs::write(&cover_txt, render_cover_text(&facts))?;
     fs::write(&html, render_cover_html(&facts)?)?;
@@ -124,9 +163,40 @@ pub fn generate(conn: &Connection, db_path: &Path, out_dir: &Path) -> Result<Kit
         cover_txt,
         html,
         catalog_age,
+        tapectl_copy,
+        tapectl_sha256,
+        tapectl_bytes,
         catalog_bytes,
         escrow_public_key: escrow,
         sealed_volumes,
+    })
+}
+
+/// The kit's copy of the program is named for the release that made it.
+fn program_file_name() -> String {
+    format!("tapectl-{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Copy `program` to `dest` as an executable (mode 0755, and failing if that
+/// cannot be set: an heir who gets a file that will not run learns nothing
+/// from a best-effort chmod), and return the sha256 and size of the file as
+/// it now lies in the kit. A half-written copy is removed.
+fn copy_program(program: &Path, dest: &Path) -> Result<(String, u64)> {
+    use std::os::unix::fs::PermissionsExt;
+    let copied = (|| -> Result<(String, u64)> {
+        fs::copy(program, dest)?;
+        fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
+        let mut hashing = crate::util::HashingReader::new(fs::File::open(dest)?);
+        let bytes = std::io::copy(&mut hashing, &mut std::io::sink())?;
+        Ok((hashing.finalize_hex(), bytes))
+    })();
+    copied.map_err(|e| {
+        let _ = fs::remove_file(dest);
+        TapectlError::Other(format!(
+            "could not copy the tapectl program {} into the kit as {}: {e}",
+            program.display(),
+            dest.display()
+        ))
     })
 }
 
@@ -200,6 +270,25 @@ struct KitFacts<'a> {
     /// Where the catalog says the sealed volumes are (#448), grouped by
     /// place, as a starting point for the hand-filled "Tapes are at" box.
     places: &'a [PlaceFact],
+    /// The copy of the tapectl program in the kit (#485); `None` renders no
+    /// mention of one (the unit tests of the other paragraphs).
+    program: Option<ProgramFact>,
+}
+
+/// The tapectl program the kit carries, as the cover sheet names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProgramFact {
+    /// `tapectl-<version>`, the file's name in the kit directory.
+    file_name: String,
+    /// The release that made the kit: `CARGO_PKG_VERSION`, whose tag in the
+    /// repository is `v` followed by it.
+    version: &'static str,
+    /// The machine type the program was built for (`std::env::consts::ARCH`).
+    arch: &'static str,
+    /// Hex sha256 of the copy in the kit, read back from the disk.
+    sha256: String,
+    /// Its size in bytes.
+    bytes: u64,
 }
 
 /// A group of sealed volumes written on one media generation.
@@ -637,7 +726,7 @@ WHAT ELSE IS IN THIS ENVELOPE
                    location. {bytes} bytes. Decrypt it with the
                    SECRET from the box above (see HOW TO CHECK
                    THE PAIR for the command).
-
+{program_entry}
 WHAT TO DO FIRST
 ----------------
 1. Do NOT bulk-erase, degauss, or reformat the cartridges.
@@ -680,7 +769,7 @@ WHAT TO DO FIRST
 
    The first works with no database at all. /dev/nst0 is only an
    example: `ls -l /dev/tape/by-id/` lists the drives you have.
-
+{program_hint}
 {warehouse}CUSTODY -- FOR WHOEVER MAINTAINS THIS
 -------------------------------------
   * Store in a tamper-evident envelope.
@@ -716,6 +805,53 @@ GENERATED
         warehouse = warehouse_section(f.warehouse_deposits),
         generations = generations_text(f.generations),
         places = places_text(f.places),
+        program_entry = program_entry(f.program.as_ref()),
+        program_hint = program_hint(f.program.as_ref()),
+    )
+}
+
+/// The list entry for the copy of tapectl in the kit's folder (#485), with
+/// the sha256 and size an heir checks the file against. Empty when the kit
+/// carries none. The hash is one unbroken line so it can be searched for.
+fn program_entry(p: Option<&ProgramFact>) -> String {
+    let Some(p) = p else {
+        return String::new();
+    };
+    format!(
+        "
+  {name:<16} The program that made this kit, a file in the same
+                   folder as catalog.db.age (it is not on paper). It
+                   is tapectl {version} for Linux on {arch} machines,
+                   and its source is at
+                   https://github.com/mikmorg/tapectl, tag v{version}.
+                   Check the copy against this sheet:
+
+    sha256sum {name}
+
+      sha256  {sha}
+      size    {bytes} bytes
+",
+        name = p.file_name,
+        version = p.version,
+        arch = p.arch,
+        sha = p.sha256,
+        bytes = p.bytes,
+    )
+}
+
+/// What step 4 of WHAT TO DO FIRST adds when the kit carries tapectl.
+fn program_hint(p: Option<&ProgramFact>) -> String {
+    let Some(p) = p else {
+        return String::new();
+    };
+    format!(
+        "
+   A copy of tapectl is in this kit's folder: run it as ./{name}
+   in place of `tapectl` above. If it will not run on your machine,
+   the source link above builds it (File 1 on every tape, in \"tapectl
+   itself\", says how).
+",
+        name = p.file_name,
     )
 }
 
@@ -811,12 +947,31 @@ mod tests {
         conn
     }
 
+    /// A small stand-in for the tapectl binary. `generate` copies the running
+    /// program, which under `cargo test` is a test binary of hundreds of
+    /// megabytes; these tests name this file to `generate_with_program`.
+    fn fake_program() -> tempfile::NamedTempFile {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        fs::write(f.path(), b"#!/bin/sh\necho a stand-in for tapectl\n").unwrap();
+        f
+    }
+
+    fn sha256_of(path: &Path) -> String {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(fs::read(path).unwrap()))
+    }
+
     #[test]
     fn refuses_when_no_escrow_recipient_is_registered() {
         let conn = crate::db::open_memory().unwrap();
         let tmp = TempDir::new().unwrap();
-        let err = generate(&conn, Path::new("/nonexistent.db"), tmp.path())
-            .expect_err("a kit with nobody to address it to must not be produced");
+        let err = generate_with_program(
+            &conn,
+            Path::new("/nonexistent.db"),
+            tmp.path(),
+            fake_program().path(),
+        )
+        .expect_err("a kit with nobody to address it to must not be produced");
         let msg = err.to_string();
         assert!(
             msg.contains("key generate --escrow"),
@@ -825,12 +980,18 @@ mod tests {
     }
 
     #[test]
-    fn produces_all_three_artifacts_and_logs_one_event() {
+    fn produces_all_four_artifacts_and_logs_one_event() {
         let conn = conn_with_escrow();
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("kit");
 
-        let report = generate(&conn, Path::new("/nonexistent.db"), &out).expect("kit generation");
+        let report = generate_with_program(
+            &conn,
+            Path::new("/nonexistent.db"),
+            &out,
+            fake_program().path(),
+        )
+        .expect("kit generation");
 
         assert!(report.cover_txt.exists(), "COVER.txt must exist");
         assert!(report.html.exists(), "the HTML page must exist");
@@ -858,7 +1019,13 @@ mod tests {
         let conn = conn_with_escrow();
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("kit");
-        generate(&conn, Path::new("/nonexistent.db"), &out).unwrap();
+        generate_with_program(
+            &conn,
+            Path::new("/nonexistent.db"),
+            &out,
+            fake_program().path(),
+        )
+        .unwrap();
 
         let leftovers: Vec<String> = fs::read_dir(&out)
             .unwrap()
@@ -879,7 +1046,13 @@ mod tests {
         let conn = conn_with_escrow();
         let tmp = TempDir::new().unwrap();
         let out = tmp.path().join("kit");
-        generate(&conn, Path::new("/nonexistent.db"), &out).unwrap();
+        generate_with_program(
+            &conn,
+            Path::new("/nonexistent.db"),
+            &out,
+            fake_program().path(),
+        )
+        .unwrap();
 
         let bytes = fs::read(out.join("catalog.db.age")).unwrap();
         assert!(
@@ -890,6 +1063,120 @@ mod tests {
             !bytes.starts_with(b"SQLite format 3"),
             "the bundle IS the plaintext database — encryption did not happen"
         );
+    }
+
+    /// #485 (ADR-0012 item 109): the kit carries the program that made it, so
+    /// the heir's one tool for reading around a damaged slice does not depend
+    /// on a repository still existing. The copy is there, it runs (mode 0755),
+    /// it is byte for byte the program named, and the cover sheet and the HTML
+    /// page name it with the sha256 and size of the file as the kit holds it.
+    #[test]
+    fn the_kit_carries_the_program_and_both_pages_name_it_with_its_hash() {
+        use std::os::unix::fs::PermissionsExt;
+        let conn = conn_with_escrow();
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("kit");
+        let program = fake_program();
+
+        let report =
+            generate_with_program(&conn, Path::new("/nonexistent.db"), &out, program.path())
+                .expect("kit generation");
+
+        let name = format!("tapectl-{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(report.tapectl_copy, out.join(&name));
+        assert!(report.tapectl_copy.is_file(), "the copy is in the kit");
+        assert_eq!(
+            fs::metadata(&report.tapectl_copy)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "an heir runs it as it lies"
+        );
+        assert_eq!(
+            fs::read(&report.tapectl_copy).unwrap(),
+            fs::read(program.path()).unwrap(),
+            "the copy is the program, byte for byte"
+        );
+
+        // The hash the report and the sheets name is the hash of the file in
+        // the kit, computed here independently of the code under test.
+        let want = sha256_of(&report.tapectl_copy);
+        assert_eq!(report.tapectl_sha256, want);
+        assert_eq!(
+            report.tapectl_bytes,
+            fs::metadata(&report.tapectl_copy).unwrap().len()
+        );
+        let size_line = format!("size    {} bytes", report.tapectl_bytes);
+        for (what, text) in [
+            ("COVER.txt", fs::read_to_string(&report.cover_txt).unwrap()),
+            ("escrow-kit.html", fs::read_to_string(&report.html).unwrap()),
+        ] {
+            assert!(text.contains(&name), "{what} names the file {name}");
+            assert!(text.contains(&want), "{what} carries the sha256 {want}");
+            assert!(text.contains(&size_line), "{what} carries {size_line:?}");
+            let flat = flat(&text);
+            for needle in [
+                "The program that made this kit",
+                &format!("for Linux on {} machines", std::env::consts::ARCH),
+                "its source is at https://github.com/mikmorg/tapectl",
+                &format!("tag v{}", env!("CARGO_PKG_VERSION")),
+                &format!("sha256sum {name}"),
+                &format!("run it as ./{name} in place of `tapectl` above"),
+            ] {
+                assert!(flat.contains(needle), "{what} lacks {needle:?}:\n{text}");
+            }
+        }
+    }
+
+    /// The copy is the RUNNING program: `generate` takes no program argument.
+    /// (The one test that copies a test binary; every other test names a small
+    /// file to `generate_with_program`.)
+    #[test]
+    fn generate_copies_the_running_program() {
+        let conn = conn_with_escrow();
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("kit");
+        let report = generate(&conn, Path::new("/nonexistent.db"), &out).expect("kit generation");
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(report.tapectl_sha256, sha256_of(&exe));
+        assert_eq!(report.tapectl_bytes, fs::metadata(&exe).unwrap().len());
+    }
+
+    /// A program that cannot be copied is an error that names it, and leaves
+    /// no half-written file behind that a sheet could be taken to describe.
+    #[test]
+    fn a_program_that_cannot_be_copied_refuses_the_kit_by_name() {
+        let conn = conn_with_escrow();
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("kit");
+        let missing = tmp.path().join("no-such-program");
+        let err = generate_with_program(&conn, Path::new("/nonexistent.db"), &out, &missing)
+            .expect_err("a kit without the program it names must not be produced");
+        let msg = err.to_string();
+        assert!(msg.contains("could not copy the tapectl program"), "{msg}");
+        assert!(msg.contains("no-such-program"), "{msg}");
+        assert!(
+            !out.join(format!("tapectl-{}", env!("CARGO_PKG_VERSION")))
+                .exists(),
+            "no partial copy"
+        );
+        assert!(
+            !out.join("COVER.txt").exists(),
+            "no cover sheet that names a program that is not there"
+        );
+    }
+
+    /// With no program to name (the other tests' facts) the sheet says nothing
+    /// of one: no file name, no hash, no source line.
+    #[test]
+    fn a_sheet_with_no_program_says_nothing_of_one() {
+        let txt = render_cover_text(&facts_for(&[], &[]));
+        assert!(!txt.contains("The program that made this kit"), "{txt}");
+        assert!(!txt.contains("sha256sum tapectl-"), "{txt}");
+        assert!(!txt.contains("github.com/mikmorg/tapectl"), "{txt}");
+        assert!(!txt.contains("A copy of tapectl is in this kit"), "{txt}");
     }
 
     /// Renamed from `the_cover_sheet_carries_the_key_and_the_custody_rules`
@@ -906,6 +1193,7 @@ mod tests {
             warehouse_deposits: 0,
             generations: &[],
             places: &[],
+            program: None,
         };
         let txt = render_cover_text(&f);
         assert!(
@@ -944,6 +1232,7 @@ mod tests {
             warehouse_deposits: 0,
             generations: &[],
             places: &[],
+            program: None,
         };
         let txt = render_cover_text(&f);
         for forbidden in [
@@ -980,6 +1269,7 @@ mod tests {
             warehouse_deposits: 0,
             generations: &[],
             places: &[],
+            program: None,
         };
         let txt = render_cover_text(&f);
         let start = txt
@@ -1032,6 +1322,7 @@ mod tests {
             warehouse_deposits: 2,
             generations: &[],
             places: &[],
+            program: None,
         };
         let txt = render_cover_text(&f);
         assert!(
@@ -1056,6 +1347,7 @@ mod tests {
             warehouse_deposits: 0,
             generations: &[],
             places: &[],
+            program: None,
         };
         let txt = render_cover_text(&f);
         assert!(
@@ -1081,6 +1373,7 @@ mod tests {
             warehouse_deposits: 0,
             generations: &[],
             places: &[],
+            program: None,
         };
         let txt = render_cover_text(&f);
         let start = txt
@@ -1141,6 +1434,7 @@ mod tests {
             warehouse_deposits: 0,
             generations,
             places,
+            program: None,
         }
     }
 
@@ -1262,7 +1556,13 @@ mod tests {
         )
         .unwrap();
         let tmp = TempDir::new().unwrap();
-        generate(&conn, Path::new("/nonexistent.db"), tmp.path()).unwrap();
+        generate_with_program(
+            &conn,
+            Path::new("/nonexistent.db"),
+            tmp.path(),
+            fake_program().path(),
+        )
+        .unwrap();
         let prose = flat(&fs::read_to_string(tmp.path().join("COVER.txt")).unwrap());
 
         assert!(
@@ -1444,7 +1744,13 @@ mod tests {
         )
         .unwrap();
         let tmp = TempDir::new().unwrap();
-        generate(&conn, Path::new("/nonexistent.db"), tmp.path()).unwrap();
+        generate_with_program(
+            &conn,
+            Path::new("/nonexistent.db"),
+            tmp.path(),
+            fake_program().path(),
+        )
+        .unwrap();
         let txt = fs::read_to_string(tmp.path().join("COVER.txt")).unwrap();
         assert!(txt.contains("home-rack: L6-0001 (BC0001L6)"), "{txt}");
         assert!(txt.contains("offsite: L6-0002 (BC0002L6)"), "{txt}");
@@ -1503,6 +1809,7 @@ mod tests {
             warehouse_deposits: 0,
             generations: &[],
             places: &[],
+            program: None,
         };
         let html = render_cover_html(&f).unwrap();
         assert!(html.contains("<svg"), "the QR must be inlined as SVG");

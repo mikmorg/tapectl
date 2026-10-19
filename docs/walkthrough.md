@@ -576,6 +576,7 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 672130 bytes, covering 2 sealed volume(s)
+  tapectl-1.5.0    the program that made this kit, 41238016 bytes, sha256 3a7bd3e2… (named on the sheet)
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -585,6 +586,10 @@ still to do, and only you can do it:
   3. seal it in a tamper-evident envelope
   4. store copies in at least TWO independent failure domains
 ```
+
+The kit also carries a copy of the tapectl program that made it (the fourth file, with
+its size and sha256 on the cover sheet), so the heir's one tool for reading around a
+damaged slice does not depend on a repository still existing.
 
 Regenerate it after every write session. The escrow secret opens every tape ever
 written, old and new; what goes stale is the kit's encrypted catalog, which lists only
