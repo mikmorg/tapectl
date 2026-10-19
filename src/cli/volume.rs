@@ -3061,6 +3061,17 @@ struct VolumeRow {
     /// STATUS alone can no longer show.
     #[tabled(rename = "CONDITION")]
     condition: String,
+    /// `volumes.media_type`: the generation `volume init` decided the
+    /// medium is (ADR-0010, issue #482) -- the same key `volume info --json`
+    /// uses for the column. Nullable in the schema (`None` for a row older
+    /// than the column), rendered "—" in the table, `null` in `--json`.
+    #[tabled(rename = "GENERATION", display_with = "display_generation")]
+    media_type: Option<String>,
+    /// `volumes.capacity_bytes`: the capacity `volume init` decided, once
+    /// (ADR-0010 decision 3) -- raw bytes in `--json`, DECIMAL in the table
+    /// (ADR-0012: cartridge capacities are decimal, data sizes binary).
+    #[tabled(rename = "CAPACITY", display_with = "display_capacity")]
+    capacity_bytes: i64,
     /// The cartridge this volume is bound to, by barcode
     /// (`cartridge_volumes`, ADR-0010). `None` for a volume `volume init`
     /// left unbound (no readable medium serial) — rendered "(unbound)",
@@ -3130,6 +3141,14 @@ fn versions_phrase(versions: &[i64]) -> String {
     format!("({})", named.join(", "))
 }
 
+fn display_generation(v: &Option<String>) -> String {
+    v.clone().unwrap_or_else(|| "—".to_string())
+}
+
+fn display_capacity(bytes: &i64) -> String {
+    crate::util::format_bytes_decimal(*bytes)
+}
+
 fn display_cartridge(v: &Option<String>) -> String {
     v.clone().unwrap_or_else(|| "(unbound)".to_string())
 }
@@ -3186,7 +3205,8 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
                  ) per) AS copies,
                 (SELECT MAX({dated}) FROM verification_sessions vs
                   WHERE vs.volume_id = v.id AND vs.outcome = 'passed'
-                    AND vs.verify_type = 'full') AS last_verified
+                    AND vs.verify_type = 'full') AS last_verified,
+                v.media_type, v.capacity_bytes
          FROM volumes v
          LEFT JOIN cartridge_volumes cv ON cv.volume_id = v.id
          LEFT JOIN cartridges c ON c.id = cv.cartridge_id
@@ -3213,6 +3233,8 @@ fn volume_rows(conn: &Connection, status: Option<&str>) -> Result<Vec<VolumeRow>
                 location: row.get(4)?,
                 copies: row.get(5)?,
                 verified: row.get(6)?,
+                media_type: row.get(7)?,
+                capacity_bytes: row.get(8)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6447,6 +6469,8 @@ mod tests {
                 for key in [
                     "label",
                     "status",
+                    "media_type",
+                    "capacity_bytes",
                     "cartridge",
                     "location",
                     "copies",
@@ -6464,6 +6488,73 @@ mod tests {
             );
             assert_eq!(initialized["cartridge"], "E01001L8_17757944");
             assert_eq!(initialized["location"], "home-rack");
+            // Issue #482: the stored columns, raw -- the keys `volume info
+            // --json` already uses, a number and not "2.50 TB".
+            assert_eq!(initialized["media_type"], "LTO-6");
+            assert_eq!(initialized["capacity_bytes"], 2_500_000_000_000u64);
+        }
+
+        /// Issue #482: `volume list` shows the generation `volume init`
+        /// decided and the capacity it stored, so an LTO-5 cartridge written
+        /// in an LTO-6 drive is told apart from an LTO-6 without opening
+        /// `volume info`. The capacity is DECIMAL (ADR-0012), and a row with
+        /// no recorded generation renders the dash, not an empty cell.
+        #[test]
+        fn list_shows_the_generation_and_the_decimal_capacity_of_each_volume() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute_batch(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes,
+                                      status, created_at) VALUES
+                    ('L5-0001','lto','lto6','LTO-5',1500000000000,'sealed','2026-09-03 00:00:00'),
+                    ('L6-0001','lto','lto6','LTO-6',2500000000000,'sealed','2026-09-02 00:00:00'),
+                    ('OLD-0001','lto','lto6',NULL,0,'erased','2026-09-01 00:00:00');",
+            )
+            .unwrap();
+            let rows = volume_rows(&conn, None).unwrap();
+
+            let table = Table::new(&rows).to_string();
+            let header = table.lines().nth(1).expect(&table);
+            assert!(header.contains("GENERATION"), "{table}");
+            assert!(header.contains("CAPACITY"), "{table}");
+            let cells = |label: &str| -> Vec<String> {
+                table
+                    .lines()
+                    .find(|l| l.contains(label))
+                    .unwrap_or_else(|| panic!("no row for {label}:\n{table}"))
+                    .split('|')
+                    .map(|c| c.trim().to_string())
+                    .collect()
+            };
+            let col = |name: &str| -> usize {
+                header
+                    .split('|')
+                    .position(|c| c.trim() == name)
+                    .unwrap_or_else(|| panic!("no column {name}:\n{table}"))
+            };
+            let (g, c) = (col("GENERATION"), col("CAPACITY"));
+            assert_eq!(cells("L5-0001")[g], "LTO-5", "{table}");
+            assert_eq!(cells("L5-0001")[c], "1.50 TB", "{table}");
+            assert_eq!(cells("L6-0001")[g], "LTO-6", "{table}");
+            assert_eq!(cells("L6-0001")[c], "2.50 TB", "{table}");
+            assert_eq!(cells("OLD-0001")[g], "—", "{table}");
+            assert_eq!(cells("OLD-0001")[c], "0 B", "{table}");
+
+            let json = volume_rows_to_json(&rows);
+            let l5 = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["label"] == "L5-0001")
+                .unwrap();
+            assert_eq!(l5["media_type"], "LTO-5");
+            assert_eq!(l5["capacity_bytes"], 1_500_000_000_000u64);
+            let old = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["label"] == "OLD-0001")
+                .unwrap();
+            assert!(old["media_type"].is_null(), "raw null, not the table's dash: {old}");
         }
 
         /// Acceptance: copies must agree with `report copies` on the same
@@ -6548,6 +6639,8 @@ mod tests {
                 location: None,
                 copies: None,
                 verified: None,
+                media_type: None,
+                capacity_bytes: 0,
             };
             let has_data_never_verified = VolumeRow {
                 label: "L6-DATA".into(),
@@ -6557,6 +6650,8 @@ mod tests {
                 location: None,
                 copies: Some(1),
                 verified: None,
+                media_type: Some("LTO-6".into()),
+                capacity_bytes: 2_500_000_000_000,
             };
             assert_eq!(no_data.display_verified(), "—");
             assert_eq!(has_data_never_verified.display_verified(), "never");
