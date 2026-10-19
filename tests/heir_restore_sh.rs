@@ -1328,6 +1328,7 @@ const HOST_TOOLS: &[&str] = &[
     "truncate",
     "cp",
     "mv",
+    "chmod",
     "find",
     "readlink",
     "touch",
@@ -7135,6 +7136,11 @@ fn file_1_box_commands_show_the_uuid_and_the_units_the_index_lists() {
     assert!(text.contains(&format!("uuid = \"{THIS_UUID}\"")), "{text}");
     assert!(text.contains("media_type = "), "{text}");
     assert!(text.contains("cartridge_serial = "), "{text}");
+    // The same line dates the tape, which orders an unsealed one.
+    assert!(
+        text.contains("created_at = \"2026-10-05T00:00:00Z\""),
+        "{text}"
+    );
     // --where prints the uuid of a holder, for the comparison.
     let (code, text) = h.run(&["--where", "photos/2019", "--key", &h.key("esc")]);
     assert_eq!(code, 0, "{text}");
@@ -7164,6 +7170,155 @@ fn file_1_box_commands_show_the_uuid_and_the_units_the_index_lists() {
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("tape OTHER02"), "{text}");
     assert!(text.contains("  Version 1: "), "{text}");
+}
+
+/// M-script and M-sudo: the guide's four fetch commands, run as written, save
+/// the script under the tape's own name; the saved file runs; and the `env` form
+/// the guide shows for `sudo` (sudo itself is not run here) hands the script its
+/// device and work directory.
+#[test]
+fn file_1_script_is_saved_under_the_tapes_name_and_runs_from_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let auto = guide_section(&guide, "Automated Recovery (recommended)");
+    let fetch = guide_block(&auto, &format!("> RESTORE-{LABEL}.sh"));
+    assert_eq!(fetch.len(), 4, "{fetch:#?}");
+    assert_eq!(fetch[3], format!("chmod +x RESTORE-{LABEL}.sh"));
+    let work = h.dir.join("saved");
+    std::fs::create_dir_all(&work).unwrap();
+    let (ok, text) = run_guide(&h, &work, &fetch, &[], true);
+    assert!(ok, "{text}");
+    let saved = work.join(format!("RESTORE-{LABEL}.sh"));
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        generate_restore_script_v2(LABEL, template().total_files),
+        "the guide's commands read File 2 off the tape, byte for byte"
+    );
+    assert_ne!(
+        std::fs::metadata(&saved).unwrap().permissions().mode() & 0o111,
+        0,
+        "chmod +x"
+    );
+    assert!(
+        !work.join("RESTORE.sh").exists(),
+        "nothing under the shared name"
+    );
+    // The saved name runs, as the guide's `./RESTORE.sh` lines mean it to.
+    let (ok, text) = run_guide(
+        &h,
+        &work,
+        &[format!(
+            "TAPE_DEVICE=/dev/nst-fake ./RESTORE-{LABEL}.sh --info"
+        )],
+        &[],
+        true,
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("Verdict: SEALED"), "{text}");
+    // The form sudo is given: `env` sets the device and the work directory
+    // after sudo's own environment has been cleaned.
+    let tmp = h.dir.join("work-tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let load = flat(&guide_section(
+        &guide,
+        "Loading the tape, and a drive that does not show up",
+    ));
+    assert!(
+        load.contains("sudo env TAPE_DEVICE=/dev/nst0 TMPDIR=/tmp ./RESTORE-LABEL.sh --info"),
+        "{load}"
+    );
+    let (ok, text) = run_guide(
+        &h,
+        &work,
+        &[format!(
+            "env TAPE_DEVICE=/dev/nst-fake TMPDIR={} ./RESTORE-{LABEL}.sh --find-envelope --key {}",
+            tmp.display(),
+            h.key("esc")
+        )],
+        &[],
+        true,
+    );
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("Tape device:      /dev/nst-fake (from TAPE_DEVICE)"),
+        "{text}"
+    );
+    assert!(text.contains("Decrypted envelope at file"), "{text}");
+}
+
+/// The done rule: an unsealed tape has no "Sealed at" (File 0's `created_at`,
+/// from the guide's own `grep`, dates it), and a tape the key cannot open ends
+/// in the words the rule quotes, with `--info` (no key) saying nothing of what
+/// the tape holds.
+#[test]
+fn file_1_done_rule_words_are_what_the_script_prints() {
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let bx = flat(&guide_section(
+        &guide,
+        "The rest of the box: other tapes, copies and the index",
+    ));
+    // An unsealed tape: the seal marker is gone.
+    let seal = template().total_files as i64 - 1;
+    std::fs::remove_file(h.dir.join("tape").join(seal.to_string())).unwrap();
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Verdict: UNSEALED"), "{text}");
+    assert!(
+        text.contains("Sealed at: unknown (tape not sealed)"),
+        "{text}"
+    );
+    assert!(
+        bx.contains("(`unknown (tape not sealed)` there means the tape is unsealed"),
+        "{bx}"
+    );
+    let sec = guide_section(
+        &guide,
+        "The rest of the box: other tapes, copies and the index",
+    );
+    let work = h.dir.join("unsealed-file0");
+    std::fs::create_dir_all(&work).unwrap();
+    let (ok, text) = run_guide(
+        &h,
+        &work,
+        &guide_block(&sec, "grep -E '^(label|uuid"),
+        &[],
+        true,
+    );
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("created_at = \"2026-10-05T00:00:00Z\""),
+        "File 0 dates the unsealed tape: {text}"
+    );
+    // --info says nothing of what the tape holds: no unit, tenant or key.
+    let (_, info) = h.run(&["--info"]);
+    for word in ["photos/2019", "ledgers", "alice", "tenant "] {
+        assert!(!info.contains(word), "--info names {word}: {info}");
+    }
+    // A key that opens nothing: the words the rule quotes.
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("stranger")]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("no envelope matched the key provided"),
+        "{text}"
+    );
+    let (code, text) = h.run(&[
+        "--find-envelope",
+        "--key",
+        &h.key("stranger"),
+        "--key",
+        &h.key("stranger"),
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("no envelope matched any of the 2 keys provided"),
+        "{text}"
+    );
+    assert!(
+        bx.contains("\"no envelope matched the key provided\" (or \"any of the N keys provided\")"),
+        "{bx}"
+    );
 }
 
 /// M6: RESTORE.sh written for another tape reads the tape in the drive for the
