@@ -19,7 +19,19 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-19 (NEWEST) — v1.3.0 TAGGED on master `a3c848c`** (whole chain green on
+- **QUEUE STATE 2026-10-19 late (NEWEST) — v1.4.0 TAGGED on master `e4b3b7a`** (whole chain
+  green there: unit 3813/0/21, gate 47/47, lifecycle --all 472/0/15 skipped incl. rewrite-in-place,
+  fr414, erase proof, pscan; CI 39329793470 green). Closed: #479 (toolkit; its real-drive run is
+  #420's measurement), #481 (File 1 after reads 3-5; ADR-0012 item 108 is the stopping rule: no sixth
+  read), #483 (volume rewrite, migration 037), #484 (flaky test: age's grease length, not load).
+  home2 (still 1.1.0) goes straight to 1.4.0 by handoff (f). Open, all needing the real drive or a
+  CTO-ruled future re-pin: #420 (the past-warning fill on home2, then the short seal), #478
+  (spanning, after #420), #482 (real LTO-5 in the HP drive), #444 (blank proofs on the HP drive),
+  #388 (LBP prototype + ruling), #485 (read 5's minors, for the next re-pin, ruled). Nothing is
+  buildable here without the drive or a new ruling. Lessons: run the WHOLE unit suite after a text
+  change (a pin in tests/heir_restore_sh.rs caught what --lib did not); a new lifecycle scenario's
+  first whole-chain run found a product gap (report events hid `details`).
+- **QUEUE STATE 2026-10-19 — v1.3.0 TAGGED on master `a3c848c`** (whole chain green on
   a3efcb1, test-only change after; CI 39273005724 green). Closed: #418 (R4), #476, #477 (three
   fresh reads of File 1), #480 (restore repairs + crypto review fixes), #409 (accepted cost), #364.
   Open: #479 (profiling toolkit + item 100's post-warning key and slice cap; building now, no
