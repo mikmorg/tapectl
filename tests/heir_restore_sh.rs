@@ -480,6 +480,91 @@ fn solo_template() -> &'static Template {
     })
 }
 
+/// A volume whose index names far more units than this tape holds, and more
+/// than the 40 the miss-path listing used to stop at (the box scenario of
+/// `--where --all`): alice's `docs` and bob's `ledgers` are really on this tape
+/// (and `docs` also on OTHER02); every other unit is a [`Phantom`], held on
+/// other tapes only. 53 units in all: alice 49 (`docs`, 45 `archive/unit-NNN`,
+/// `dup` twice under two uuids, `tens`) and bob 4 (`ledgers`, `bob/old-N` x 3).
+fn box_template() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let real = |name, uuid, version, seed| UnitSpec {
+            cat: Cat::Matched,
+            name,
+            uuid,
+            version,
+            seed,
+            files: 2,
+            file_len: 110_000,
+            names: &[],
+            corrupt: &[],
+            tamper: &[],
+        };
+        let tenants = vec![
+            TenantSpec {
+                name: "alice",
+                units: vec![real("docs", "22222222-3333-4444-5555-666666666666", 1, 12)],
+            },
+            TenantSpec {
+                name: "bob",
+                units: vec![real(
+                    "ledgers",
+                    "33333333-4444-5555-6666-777777777777",
+                    3,
+                    13,
+                )],
+            },
+        ];
+        let mut phantoms = Vec::new();
+        for i in 1..=45 {
+            phantoms.push(Phantom {
+                tenant: "alice",
+                name: format!("archive/unit-{i:03}"),
+                uuid: format!("aaaaaaaa-0000-4000-8000-{i:012}"),
+                // Every third unit has only a version 1; the rest have two.
+                versions: if i % 3 == 0 { vec![1] } else { vec![1, 2] },
+                // Every tenth has a second, quarantined copy of its newest version.
+                quarantined_copy: i % 10 == 0,
+            });
+        }
+        for i in 1..=3 {
+            phantoms.push(Phantom {
+                tenant: "bob",
+                name: format!("bob/old-{i}"),
+                uuid: format!("bbbbbbbb-0000-4000-8000-{i:012}"),
+                versions: vec![1],
+                quarantined_copy: false,
+            });
+        }
+        // One name made twice: two units, and their rows interleave in the file
+        // (dup v1 of A, dup v1 of B, dup v2 of A).
+        phantoms.push(Phantom {
+            tenant: "alice",
+            name: "dup".into(),
+            uuid: "dddddddd-0000-4000-8000-000000000001".into(),
+            versions: vec![1, 2],
+            quarantined_copy: false,
+        });
+        phantoms.push(Phantom {
+            tenant: "alice",
+            name: "dup".into(),
+            uuid: "dddddddd-0000-4000-8000-000000000002".into(),
+            versions: vec![1],
+            quarantined_copy: false,
+        });
+        // Versions 2, 9 and 10: the newest by number is 10.
+        phantoms.push(Phantom {
+            tenant: "alice",
+            name: "tens".into(),
+            uuid: "eeeeeeee-0000-4000-8000-000000000001".into(),
+            versions: vec![2, 9, 10],
+            quarantined_copy: false,
+        });
+        build_template_full("box", &tenants, true, true, &phantoms)
+    })
+}
+
 // ---- the cross-volume index (volume-format-v2.md 1.5), built from the spec ----
 
 /// One `index/units.tsv` row: a (version, holding volume) pair.
@@ -768,6 +853,19 @@ fn build_template(tag: &str, tenants: &[TenantSpec], with_index: bool) -> Templa
     build_template_with(tag, tenants, with_index, true)
 }
 
+/// A unit the index names that this tape does not hold: it lives on another
+/// tape of the box (the case `--where --all` exists for). Its rows go into its
+/// tenant's `units.tsv` and the operator's, one row for each version and
+/// holding tape, and no slice of it is on this tape.
+struct Phantom {
+    tenant: &'static str,
+    name: String,
+    uuid: String,
+    versions: Vec<i64>,
+    /// Also held by the quarantined tape (its newest version).
+    quarantined_copy: bool,
+}
+
 /// `hash_column` false writes the index as a 1.3.0 build from before the
 /// `sha256` column wrote it (ADR-0012 item 103 added it).
 fn build_template_with(
@@ -775,6 +873,67 @@ fn build_template_with(
     tenants: &[TenantSpec],
     with_index: bool,
     hash_column: bool,
+) -> Template {
+    build_template_full(tag, tenants, with_index, hash_column, &[])
+}
+
+/// The phantom units' rows: each version on the sealed tape OTHER02, and the
+/// newest also on the quarantined tape when the unit says so.
+fn phantom_rows(p: &Phantom) -> Vec<IdxRow> {
+    let mut rows = Vec::new();
+    let newest = p.versions.iter().copied().max().unwrap_or(0);
+    for &v in &p.versions {
+        let mut row = |volume: &'static str,
+                       volume_uuid: &'static str,
+                       serial: &'static str,
+                       generation: &'static str,
+                       state: &'static str,
+                       sealed_at: &'static str| {
+            rows.push(IdxRow {
+                tenant: p.tenant,
+                unit: p.name.clone(),
+                unit_uuid: p.uuid.clone(),
+                version: v,
+                num_slices: 3,
+                first: 1,
+                last: 3,
+                bytes: 3_000_000 + v,
+                volume,
+                volume_uuid,
+                serial,
+                generation,
+                state,
+                sealed_at,
+            });
+        };
+        row(
+            "OTHER02",
+            OTHER_UUID,
+            "OTHERSER02",
+            "LTO-6",
+            "sealed",
+            "2026-09-01T10:00:00Z",
+        );
+        if p.quarantined_copy && v == newest {
+            row(
+                "QUAR03",
+                QUAR_UUID,
+                "",
+                "LTO-5",
+                "quarantined",
+                "2026-08-15T09:30:00Z",
+            );
+        }
+    }
+    rows
+}
+
+fn build_template_full(
+    tag: &str,
+    tenants: &[TenantSpec],
+    with_index: bool,
+    hash_column: bool,
+    phantoms: &[Phantom],
 ) -> Template {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "heir-restore-sh-template-{tag}-{}",
@@ -985,6 +1144,11 @@ fn build_template_with(
                     s.unit.snapshot_version,
                     idx_paths_for(&s.unit.name, &s.src, &s.hashes),
                 ));
+            }
+            for p in phantoms {
+                if tenant == "operator" || tenant == p.tenant {
+                    unit_rows.extend(phantom_rows(p));
+                }
             }
             if tenant == "operator" {
                 let mut cols = UNITS_COLUMNS.to_vec();
@@ -3455,6 +3619,13 @@ fn where_names_the_units_the_index_lists_when_it_finds_none() {
         .filter(|l| l.starts_with("    ") && !l.trim().is_empty())
         .collect();
     assert_eq!(listed, ["    docs", "    photos/2019"], "{text}");
+    // It points at the uncapped listing, and prints no cap of its own.
+    let f = flat(&text);
+    assert!(
+        f.contains("each one's newest version and holders:") && f.contains("--where --all --key"),
+        "{f}"
+    );
+    assert!(!f.contains("first 40") && !f.contains("not shown"), "{f}");
     assert!(
         text.contains("the operator or escrow key opens the"),
         "{text}"
@@ -3468,6 +3639,28 @@ fn where_names_the_units_the_index_lists_when_it_finds_none() {
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("    ledgers"), "{text}");
     assert!(!text.contains("opens that tenant's index only"), "{text}");
+}
+
+/// The miss path names every unit of a large index (it stopped at 40), one
+/// per line, and points at `--where --all` for their versions and holders.
+#[test]
+fn a_miss_on_a_large_index_names_every_unit_and_points_at_the_listing() {
+    let h = Heir::of(box_template(), &[]);
+    let (code, text) = h.run(&["--where", "nonesuch", "--key", &h.key("esc")]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("No unit named 'nonesuch' is in this index."),
+        "{text}"
+    );
+    let named: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("    ") && !l.trim().is_empty())
+        .collect();
+    // 53 units, 52 distinct names (`dup` is two units): all of them, sorted.
+    assert_eq!(named.len(), 52, "{text}");
+    assert!(named.contains(&"    archive/unit-045"), "{text}");
+    assert!(named.contains(&"    bob/old-3"), "{text}");
+    assert!(flat(&text).contains("--where --all --key"), "{text}");
 }
 
 /// A tape written before the index existed says so plainly, and says what it
@@ -3492,6 +3685,266 @@ fn a_tape_without_an_index_says_so_for_where_and_find() {
         assert!(t.contains("--list"), "{t}");
         assert!(!text.contains("No unit named"), "not a miss: {text}");
     }
+}
+
+/// The unit headings of a `--where --all` listing, in order.
+fn all_headings(text: &str) -> Vec<&str> {
+    text.lines().filter(|l| l.starts_with("Unit ")).collect()
+}
+
+/// The lines of the "NOT on this tape" recap of a `--where --all` listing.
+fn all_recap(text: &str) -> Vec<&str> {
+    text.lines()
+        .skip_while(|l| !l.contains("is NOT on this tape"))
+        .skip(1)
+        .take_while(|l| l.starts_with("    "))
+        .collect()
+}
+
+/// One unit of a `--where --all` listing: from its heading line (which starts
+/// with `heading`) to the next unit's, blank lines between versions included.
+fn all_unit<'a>(text: &'a str, heading: &str) -> Vec<&'a str> {
+    let mut lines = text.lines().skip_while(|l| !l.starts_with(heading));
+    let mut out: Vec<&str> = lines.next().into_iter().collect();
+    out.extend(lines.take_while(|l| !l.starts_with("Unit ")));
+    out
+}
+
+/// `--where --all` lists EVERY unit the index names, past the 40 the miss path
+/// used to stop at, with each unit's newest version and whether this tape holds
+/// it; the escrow key reads the operator envelope's map of every tenant.
+#[test]
+fn where_all_lists_every_unit_the_index_names_past_forty() {
+    let h = Heir::of(box_template(), &[]);
+    let (code, text) = h.run(&["--where", "--all", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    eprintln!("---- --where --all --key esc (box tape) ----\n{text}----");
+    let f = flat(&text);
+    assert!(f.contains("Index read from tape: HEIR01 (written "), "{f}");
+    assert!(
+        f.contains("53 unit(s) in this index; this tape holds the newest version of 2 of them."),
+        "{f}"
+    );
+    let headings = all_headings(&text);
+    assert_eq!(headings.len(), 53, "every unit, uncapped:\n{text}");
+    // Positive controls past the old cap of 40 (they sort after the first 40).
+    assert!(
+        headings
+            .contains(&"Unit archive/unit-045 (tenant alice): newest version 1, NOT on this tape"),
+        "{text}"
+    );
+    assert!(
+        headings.contains(&"Unit bob/old-3 (tenant bob): newest version 1, NOT on this tape"),
+        "{text}"
+    );
+    // The two units really on this tape are marked so, with their newest versions.
+    assert!(
+        headings.contains(&"Unit docs (tenant alice): newest version 1, on this tape"),
+        "{text}"
+    );
+    assert!(
+        headings.contains(&"Unit ledgers (tenant bob): newest version 3, on this tape"),
+        "{text}"
+    );
+    assert_eq!(
+        headings
+            .iter()
+            .filter(|l| l.ends_with(", on this tape"))
+            .count(),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        headings
+            .iter()
+            .filter(|l| l.ends_with(", NOT on this tape"))
+            .count(),
+        51,
+        "{text}"
+    );
+    // The newest version of a unit is the highest NUMBER (10, not the 9 a text
+    // comparison would pick), and its versions are listed in order.
+    assert!(
+        headings.contains(&"Unit tens (tenant alice): newest version 10, NOT on this tape"),
+        "{text}"
+    );
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("no {needle:?}:\n{text}"))
+    };
+    assert!(
+        at("  Version 2: 3 slice(s)") < at("  Version 9: 3 slice(s)"),
+        "{text}"
+    );
+    assert!(
+        at("  Version 9: 3 slice(s)") < at("  Version 10 (newest): 3 slice(s)"),
+        "{text}"
+    );
+    // One name made twice is two units, each with its own newest version and uuid.
+    let dups: Vec<&&str> = headings
+        .iter()
+        .filter(|l| l.starts_with("Unit dup "))
+        .collect();
+    assert_eq!(dups.len(), 2, "{text}");
+    assert!(
+        dups.contains(&&"Unit dup (tenant alice): newest version 2, NOT on this tape"),
+        "{text}"
+    );
+    assert!(
+        dups.contains(&&"Unit dup (tenant alice): newest version 1, NOT on this tape"),
+        "{text}"
+    );
+    assert!(
+        text.contains("unit uuid dddddddd-0000-4000-8000-000000000001"),
+        "{text}"
+    );
+    assert!(
+        text.contains("unit uuid dddddddd-0000-4000-8000-000000000002"),
+        "{text}"
+    );
+    // Every holder with the fields a reader needs to find the cartridge.
+    let docs = all_unit(&text, "Unit docs (tenant alice)");
+    let n = box_template()
+        .units
+        .iter()
+        .find(|u| u.name == "docs")
+        .unwrap()
+        .positions
+        .len();
+    assert!(
+        docs.iter()
+            .any(|l| l.starts_with(&format!("  Version 1 (newest): {n} slice(s), "))),
+        "{docs:#?}"
+    );
+    assert!(
+        docs.iter()
+            .any(|l| l.trim() == format!("tape HEIR01  (this tape)  slices 1-{n} of {n}")),
+        "{docs:#?}"
+    );
+    assert!(
+        docs.iter().any(|l| l.trim()
+            == format!("tape OTHER02  (sealed 2026-09-01T10:00:00Z)  slices 1-{n} of {n}")),
+        "{docs:#?}"
+    );
+    let u40 = all_unit(&text, "Unit archive/unit-040 (tenant alice)");
+    assert!(
+        u40.iter()
+            .any(|l| l.contains("tape QUAR03  (QUARANTINED: a verify proved this medium bad")),
+        "{u40:#?}"
+    );
+    assert!(
+        u40.contains(
+            &format!(
+                "        volume uuid {OTHER_UUID}; cartridge serial OTHERSER02; generation LTO-6"
+            )
+            .as_str()
+        ),
+        "{u40:#?}"
+    );
+    // The recap names the 51 units whose newest version is on other tapes, with
+    // the tapes that hold it, before the listing.
+    let recap = all_recap(&text);
+    assert_eq!(recap.len(), 51, "{recap:#?}\n{text}");
+    assert!(
+        recap.contains(
+            &"    archive/unit-040 (tenant alice), version 2, unit uuid aaaaaaaa-0000-4000-8000-000000000040: OTHER02, QUAR03 (QUARANTINED)"
+        ),
+        "{recap:#?}"
+    );
+    assert!(
+        recap.contains(&"    archive/unit-045 (tenant alice), version 1, unit uuid aaaaaaaa-0000-4000-8000-000000000045: OTHER02"),
+        "{recap:#?}"
+    );
+    assert!(
+        recap.contains(&"    tens (tenant alice), version 10, unit uuid eeeeeeee-0000-4000-8000-000000000001: OTHER02"),
+        "{recap:#?}"
+    );
+    assert!(
+        text.find("is NOT on this tape").unwrap() < text.find("Unit docs (tenant alice)").unwrap(),
+        "the recap comes before the listing"
+    );
+    // No cap anywhere, in the output or the script.
+    assert!(!f.contains("first 40") && !f.contains("not shown"), "{f}");
+    // Forward-only, one rewind, envelopes only (the operator envelope ends the walk).
+    assert_forward_only(&h, "--where --all with the escrow key");
+    let first_slice = box_template().units[0].positions[0];
+    assert!(
+        reads(&h).iter().all(|p| *p < first_slice),
+        "only envelopes are read:\n{:#?}",
+        h.ops()
+    );
+}
+
+/// A tenant's key reads that tenant's index: its units only, headed by the
+/// tenant named in its envelope; two tenants' keys read both.
+#[test]
+fn where_all_with_a_tenant_key_lists_that_tenants_units_only() {
+    let h = Heir::of(box_template(), &[]);
+    let (code, text) = h.run(&["--where", "--all", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    let f = flat(&text);
+    assert!(
+        f.contains("49 unit(s) in this index; this tape holds the newest version of 1 of them."),
+        "{f}"
+    );
+    let headings = all_headings(&text);
+    assert_eq!(headings.len(), 49, "{text}");
+    assert!(
+        headings.iter().all(|l| l.contains("(tenant alice)")),
+        "{text}"
+    );
+    assert!(
+        !text.contains("ledgers") && !text.contains("bob/old") && !text.contains("tenant bob"),
+        "another tenant's units stay unnamed: {text}"
+    );
+    assert!(
+        headings.contains(&"Unit docs (tenant alice): newest version 1, on this tape"),
+        "{text}"
+    );
+    assert_forward_only(&h, "--where --all with a tenant key");
+
+    let (code, text) = h.run(&[
+        "--where",
+        "--all",
+        "--key",
+        &h.key("alice"),
+        "--key",
+        &h.key("bob"),
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(all_headings(&text).len(), 53, "{text}");
+    assert!(
+        flat(&text)
+            .contains("53 unit(s) in this index; this tape holds the newest version of 2 of them."),
+        "{text}"
+    );
+    assert_forward_only(&h, "--where --all with two tenant keys");
+}
+
+/// A tape with no index exits 1 and says so, like `--where UNIT` and `--find`;
+/// a key that opens nothing is the same refusal as every other mode.
+#[test]
+fn where_all_on_a_tape_without_an_index_says_so() {
+    let h = Heir::of(solo_template(), &[]);
+    for key in ["bob", "esc"] {
+        let (code, text) = h.run(&["--where", "--all", "--key", &h.key(key)]);
+        assert_eq!(code, 1, "{key}: {text}");
+        let t = flat(&text);
+        assert!(t.contains("This tape carries no index."), "{t}");
+        assert!(
+            t.contains("Tapes written before version 1.3.0 have none"),
+            "{t}"
+        );
+        assert!(!text.contains("unit(s) in this index"), "{text}");
+        assert!(!text.contains("No unit named"), "not a miss: {text}");
+    }
+    let h = Heir::of(box_template(), &[]);
+    let (code, text) = h.run(&["--where", "--all", "--key", &h.key("stranger")]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("no envelope matched the key provided"),
+        "{text}"
+    );
 }
 
 /// `--find` prints each match as unit, version, kind, size and path, then the
@@ -3670,6 +4123,8 @@ fn the_index_modes_read_forward_from_one_rewind() {
         vec!["--find", "item-0", "--key", &h.key("alice")],
         vec!["--where", "docs", "--key", &h.key("op")],
         vec!["--find", "item-0", "--key", &h.key("esc")],
+        vec!["--where", "--all", "--key", &h.key("alice")],
+        vec!["--where", "--all", "--key", &h.key("op")],
     ] {
         let (code, text) = h.run(&args);
         assert_eq!(code, 0, "{args:?}: {text}");
@@ -3699,6 +4154,7 @@ fn the_index_modes_read_forward_from_one_rewind() {
 fn the_index_modes_check_the_tools_they_run_and_no_others() {
     for args in [
         vec!["--where", "docs", "--key", "KEY"],
+        vec!["--where", "--all", "--key", "KEY"],
         vec!["--find", "x", "--key", "KEY"],
     ] {
         for (missing, host) in [("age", false), ("tar", true), ("truncate", true)] {
@@ -3764,6 +4220,12 @@ fn the_index_modes_have_usage_errors_and_are_in_help() {
         (vec!["--find"], "--find needs the text to look for"),
         (vec!["--find", ""], "an empty text matches every path"),
         (vec!["--where", "docs"], "usage: "),
+        (vec!["--where", "--all"], "usage: "),
+        (vec!["--where", "--all", "--key"], "--key needs a value"),
+        (
+            vec!["--where", "--all", "--bogus"],
+            "unknown option: --bogus",
+        ),
         (vec!["--find", "x", "--key"], "--key needs a value"),
         (vec!["--find", "x", "--bogus"], "unknown option: --bogus"),
     ] {
@@ -3777,6 +4239,10 @@ fn the_index_modes_have_usage_errors_and_are_in_help() {
     let f = flat(&help);
     for needle in [
         "--where UNIT --key KEYFILE [--key K2 ...]",
+        "--where --all --key KEYFILE [--key K2 ...]",
+        "EVERY unit the index names, with no limit",
+        "whether this tape holds it, and every version with each tape that holds it",
+        "The units whose newest version is not on this tape are named first",
         "--find TEXT --key KEYFILE [--key K2 ...]",
         "At most 50 matches are printed",
         "A TAB, newline or carriage return in a path is shown as \\t, \\n or \\r.",
@@ -3788,6 +4254,10 @@ fn the_index_modes_have_usage_errors_and_are_in_help() {
     let (_, info) = h.run(&["--info"]);
     assert!(
         info.contains("--where UNIT --key YOUR_KEY.age.key"),
+        "{info}"
+    );
+    assert!(
+        info.contains("--where --all --key YOUR_KEY.age.key"),
         "{info}"
     );
 }
@@ -6588,6 +7058,62 @@ fn file_1_box_procedure_gives_each_unit_a_directory_of_its_own() {
     );
 }
 
+/// `--all` restores the units of ONE envelope: the one that lists the most units
+/// among those the keys open, not the union. With the escrow or operator key
+/// that is the operator envelope (every unit); with a tenant's key it is that
+/// tenant's; with several tenant keys it is the biggest tenant's only, and the
+/// others need their own run (File 1 says so).
+#[test]
+fn all_restores_one_envelope_and_not_the_union_of_several_tenant_keys() {
+    let h = Heir::new();
+    let both = h.sub("both-keys");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--key",
+        &h.key("bob"),
+        "--all",
+        "--to",
+        &both,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    for name in ["docs", "photos/2019"] {
+        assert!(
+            same_tree(&unit(name).src, &Path::new(&both).join(name)),
+            "{name} (alice has the most units) is restored"
+        );
+    }
+    assert!(
+        !Path::new(&both).join("ledgers").exists(),
+        "bob's unit is not: --all took one envelope, not both"
+    );
+    // Bob's key, on its own run into a directory of its own.
+    let bobs = h.sub("bob-alone");
+    let (code, text) = h.run(&["--restore", "--key", &h.key("bob"), "--all", "--to", &bobs]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&unit("ledgers").src, Path::new(&bobs)), "{text}");
+    // An operator key alongside a tenant's: the operator envelope lists the most.
+    let everything = h.sub("op-and-alice");
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("alice"),
+        "--key",
+        &h.key("op"),
+        "--all",
+        "--to",
+        &everything,
+    ]);
+    assert_eq!(code, 0, "{text}");
+    for name in ["docs", "photos/2019", "ledgers", "restaged", "nocat"] {
+        assert!(
+            Path::new(&everything).join(name).is_dir(),
+            "{name} is restored by the operator envelope's --all"
+        );
+    }
+}
+
 /// M13/S3: File 0, read with the guide's `dd | tr | grep` line, shows the
 /// label, uuid, generation and cartridge serial that tell an erased and
 /// rewritten cartridge from the volume the index names; `--where` prints the
@@ -6613,17 +7139,24 @@ fn file_1_box_commands_show_the_uuid_and_the_units_the_index_lists() {
     let (code, text) = h.run(&["--where", "photos/2019", "--key", &h.key("esc")]);
     assert_eq!(code, 0, "{text}");
     assert!(text.contains(&format!("volume uuid {THIS_UUID}")), "{text}");
-    // The units the index lists, by asking for one it lacks; the script
-    // prints at most 40 (the guide says the first 40).
-    let (code, text) = h.run(&["--where", "nonesuch", "--key", &h.key("esc")]);
-    assert_eq!(code, 1, "{text}");
+    // The units the index lists, by the guide's own command: every one, no cap.
+    let listing = guide_block(&sec, "--where --all --key YOUR_KEY.age.key");
+    assert!(
+        listing.contains(&"./RESTORE.sh --where --all --key YOUR_KEY.age.key".to_string()),
+        "{listing:#?}"
+    );
+    let (code, text) = h.run(&["--where", "--all", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
     for name in ["docs", "ledgers", "nocat", "photos/2019", "restaged"] {
-        assert!(text.contains(&format!("    {name}\n")), "{name}: {text}");
+        assert!(
+            text.contains(&format!("Unit {name} (tenant ")),
+            "{name}: {text}"
+        );
     }
     let script = generate_restore_script_v2(LABEL, template().total_files);
     assert!(
-        script.contains("sort -u \"$WORK/where.known\" | head -n 40"),
-        "the guide's 'first 40' is the script's"
+        !script.contains("head -n 40"),
+        "no 40-unit cap anywhere in the script"
     );
     // The index names holders besides this tape for units that are on it, and
     // the older version of photos/2019 that is on the other tape only.

@@ -354,10 +354,11 @@ pub(crate) const AWK_INDEX_COMMON: &str = r##"
 /// name comes in through `WHERE_UNIT` in the environment, never `-v`, which
 /// would process the backslashes of an escaped name; it is compared with the
 /// DECODED `unit` column. Every unit name seen is appended to the file
-/// `WHERE_KNOWN`, so a miss can list what the index does hold. `WHERE_TENANT`
-/// names the tenant of a tenant envelope, whose rows carry no `tenant` column.
-/// Exit status 0 when the unit has rows, 1 when it has none, 2 when the file
-/// lacks the `unit` or `version` column.
+/// `WHERE_KNOWN`, so a miss can list what the index does hold (every name, no
+/// limit; `--where --all` adds each unit's newest version and holders).
+/// `WHERE_TENANT` names the tenant of a tenant envelope, whose rows carry no
+/// `tenant` column. Exit status 0 when the unit has rows, 1 when it has none, 2
+/// when the file lacks the `unit` or `version` column.
 pub(crate) const AWK_INDEX_WHERE: &str = r##"
     BEGIN {
       FS = "\t"
@@ -393,6 +394,107 @@ pub(crate) const AWK_INDEX_WHERE: &str = r##"
     END {
       if (bad) exit 2
       exit(found ? 0 : 1)
+    }
+  "##;
+
+/// `--where --all` over one `index/units.tsv` (`volume-format-v2.md` sec 1.5):
+/// EVERY unit the index names, with no limit, so an heir can enumerate a box.
+/// The whole file is read before anything is printed, and no row order is
+/// relied on. The writer sorts rows by tenant, unit name, version (as a number)
+/// and volume, so a unit that was deleted and made again under one name is two
+/// units with two uuids whose rows interleave. A unit is therefore keyed by
+/// tenant, name AND unit uuid, in the order first seen, and its newest version
+/// is the highest by NUMBER (never by text, where `9` follows `10`). For each
+/// unit it prints the newest version, whether this tape holds it (a holder row
+/// in state `this-tape`), and every version with each tape that holds it, the
+/// holders as `--where` prints them.
+///
+/// `ALL_TENANT` names the tenant of a tenant envelope, whose rows carry no
+/// `tenant` column. Two files are written for the caller, who prints a summary
+/// before the listing: `ALL_COUNTS` gets `UNITS ON_THIS_TAPE` (units listed;
+/// units whose newest version this tape holds), and `ALL_ABSENT` gets, appended,
+/// one line for each unit whose newest version this tape does not hold, with
+/// the tapes that do. Exit status 0 when the file has units, 1 when it has
+/// none, 2 when it lacks the `unit` or `version` column.
+pub(crate) const AWK_INDEX_ALL: &str = r##"
+    function holders_of(k,    j, r, s, lab, st) {
+      s = ""
+      for (j = 1; j <= rows[k]; j++) {
+        split(row[k, j], r, "\t")
+        lab = nk(show(val(r, h, "volume")))
+        st = val(r, h, "state")
+        if (st == "this-tape") lab = lab " (this tape)"
+        else if (st == "quarantined") lab = lab " (QUARANTINED)"
+        s = s (s == "" ? "" : ", ") lab
+      }
+      return (s == "") ? "no tape the index lists" : s
+    }
+    BEGIN {
+      FS = "\t"
+      tenant = ENVIRON["ALL_TENANT"]
+      counts = ENVIRON["ALL_COUNTS"]
+      absent = ENVIRON["ALL_ABSENT"]
+    }
+    NR == 1 {
+      header($0, h)
+      if (!("unit" in h) || !("version" in h)) { bad = 1; exit 2 }
+      next
+    }
+    $0 == "" { next }
+    {
+      split($0, f, "\t")
+      t = ("tenant" in h) ? val(f, h, "tenant") : tenant
+      id = val(f, h, "unit_uuid")
+      g = unesc(t) SUBSEP unesc(val(f, h, "unit")) SUBSEP id
+      if (!(g in gnum)) { gnum[g] = ++ng; gten[ng] = t; gunit[ng] = val(f, h, "unit") }
+      n = gnum[g]
+      v = val(f, h, "version") + 0
+      k = n SUBSEP v
+      if (!(k in rows)) {
+        rows[k] = 0
+        nver[n]++
+        ver[n, nver[n]] = v
+        vtext[k] = val(f, h, "version")
+        vslices[k] = val(f, h, "num_slices")
+        vbytes[k] = val(f, h, "version_bytes")
+        vuuid[k] = id
+      }
+      rows[k]++
+      row[k, rows[k]] = $0
+      if (val(f, h, "state") == "this-tape") here[k] = 1
+    }
+    END {
+      if (bad) exit 2
+      for (n = 1; n <= ng; n++) {
+        c = nver[n]
+        for (i = 1; i <= c; i++) vs[i] = ver[n, i]
+        for (i = 2; i <= c; i++) {
+          x = vs[i]
+          for (j = i - 1; j >= 1 && vs[j] > x; j--) vs[j + 1] = vs[j]
+          vs[j + 1] = x
+        }
+        newest = vs[c]
+        kn = n SUBSEP newest
+        who = (gten[n] == "") ? "" : " (tenant " show(gten[n]) ")"
+        onhere = (kn in here)
+        if (onhere) tothere++
+        print "Unit " show(gunit[n]) who ": newest version " show(vtext[kn]) ", " (onhere ? "on this tape" : "NOT on this tape")
+        if (!onhere) printf "    %s%s, version %s, unit uuid %s: %s\n", show(gunit[n]), who, show(vtext[kn]), nk(show(vuuid[kn])), holders_of(kn) >> absent
+        for (i = 1; i <= c; i++) {
+          k = n SUBSEP vs[i]
+          if (i > 1) print ""
+          print "  Version " show(vtext[k]) (vs[i] == newest ? " (newest)" : "") ": " show(vslices[k]) " slice(s), " human(vbytes[k]) " (" show(vbytes[k]) " bytes); unit uuid " nk(show(vuuid[k]))
+          for (j = 1; j <= rows[k]; j++) {
+            split(row[k, j], r, "\t")
+            print holder(r, h)
+          }
+        }
+        print ""
+      }
+      print ng + 0, tothere + 0 > counts
+      close(counts)
+      close(absent)
+      exit(ng > 0 ? 0 : 1)
     }
   "##;
 
