@@ -484,8 +484,9 @@ fn solo_template() -> &'static Template {
 /// than the 40 the miss-path listing used to stop at (the box scenario of
 /// `--where --all`): alice's `docs` and bob's `ledgers` are really on this tape
 /// (and `docs` also on OTHER02); every other unit is a [`Phantom`], held on
-/// other tapes only. 53 units in all: alice 49 (`docs`, 45 `archive/unit-NNN`,
-/// `dup` twice under two uuids, `tens`) and bob 4 (`ledgers`, `bob/old-N` x 3).
+/// other tapes only. 54 units in all: alice 50 (`docs`, 45 `archive/unit-NNN`,
+/// `dup` twice under two uuids, `tens`, and a name holding a TAB, an LF and a
+/// backslash) and bob 4 (`ledgers`, `bob/old-N` x 3).
 fn box_template() -> &'static Template {
     static T: OnceLock<Template> = OnceLock::new();
     T.get_or_init(|| {
@@ -550,6 +551,14 @@ fn box_template() -> &'static Template {
             tenant: "alice",
             name: "dup".into(),
             uuid: "dddddddd-0000-4000-8000-000000000002".into(),
+            versions: vec![1],
+            quarantined_copy: false,
+        });
+        // A name with a TAB, an LF and a backslash: one heading line, shown escaped.
+        phantoms.push(Phantom {
+            tenant: "alice",
+            name: "weird\ttab\nnew\\back".into(),
+            uuid: "ffffffff-0000-4000-8000-000000000001".into(),
             versions: vec![1],
             quarantined_copy: false,
         });
@@ -3657,8 +3666,8 @@ fn a_miss_on_a_large_index_names_every_unit_and_points_at_the_listing() {
         .lines()
         .filter(|l| l.starts_with("    ") && !l.trim().is_empty())
         .collect();
-    // 53 units, 52 distinct names (`dup` is two units): all of them, sorted.
-    assert_eq!(named.len(), 52, "{text}");
+    // 54 units, 53 distinct names (`dup` is two units): all of them, sorted.
+    assert_eq!(named.len(), 53, "{text}");
     assert!(named.contains(&"    archive/unit-045"), "{text}");
     assert!(named.contains(&"    bob/old-3"), "{text}");
     assert!(flat(&text).contains("--where --all --key"), "{text}");
@@ -3723,11 +3732,11 @@ fn where_all_lists_every_unit_the_index_names_past_forty() {
     let f = flat(&text);
     assert!(f.contains("Index read from tape: HEIR01 (written "), "{f}");
     assert!(
-        f.contains("53 unit(s) in this index; this tape holds the newest version of 2 of them."),
+        f.contains("54 unit(s) in this index; this tape holds the newest version of 2 of them."),
         "{f}"
     );
     let headings = all_headings(&text);
-    assert_eq!(headings.len(), 53, "every unit, uncapped:\n{text}");
+    assert_eq!(headings.len(), 54, "every unit, uncapped:\n{text}");
     // Positive controls past the old cap of 40 (they sort after the first 40).
     assert!(
         headings
@@ -3760,9 +3769,18 @@ fn where_all_lists_every_unit_the_index_names_past_forty() {
             .iter()
             .filter(|l| l.ends_with(", NOT on this tape"))
             .count(),
-        51,
+        52,
         "{text}"
     );
+    // A name with a TAB, an LF and a backslash is one heading line, escaped as
+    // the index writes it (a raw LF would forge a second line).
+    assert!(
+        headings.contains(
+            &"Unit weird\\ttab\\nnew\\back (tenant alice): newest version 1, NOT on this tape"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("weird\ttab"), "no raw TAB in the output");
     // The newest version of a unit is the highest NUMBER (10, not the 9 a text
     // comparison would pick), and its versions are listed in order.
     assert!(
@@ -3845,7 +3863,7 @@ fn where_all_lists_every_unit_the_index_names_past_forty() {
     // The recap names the 51 units whose newest version is on other tapes, with
     // the tapes that hold it, before the listing.
     let recap = all_recap(&text);
-    assert_eq!(recap.len(), 51, "{recap:#?}\n{text}");
+    assert_eq!(recap.len(), 52, "{recap:#?}\n{text}");
     assert!(
         recap.contains(
             &"    archive/unit-040 (tenant alice), version 2, unit uuid aaaaaaaa-0000-4000-8000-000000000040: OTHER02, QUAR03 (QUARANTINED)"
@@ -3885,11 +3903,11 @@ fn where_all_with_a_tenant_key_lists_that_tenants_units_only() {
     assert_eq!(code, 0, "{text}");
     let f = flat(&text);
     assert!(
-        f.contains("49 unit(s) in this index; this tape holds the newest version of 1 of them."),
+        f.contains("50 unit(s) in this index; this tape holds the newest version of 1 of them."),
         "{f}"
     );
     let headings = all_headings(&text);
-    assert_eq!(headings.len(), 49, "{text}");
+    assert_eq!(headings.len(), 50, "{text}");
     assert!(
         headings.iter().all(|l| l.contains("(tenant alice)")),
         "{text}"
@@ -3913,10 +3931,10 @@ fn where_all_with_a_tenant_key_lists_that_tenants_units_only() {
         &h.key("bob"),
     ]);
     assert_eq!(code, 0, "{text}");
-    assert_eq!(all_headings(&text).len(), 53, "{text}");
+    assert_eq!(all_headings(&text).len(), 54, "{text}");
     assert!(
         flat(&text)
-            .contains("53 unit(s) in this index; this tape holds the newest version of 2 of them."),
+            .contains("54 unit(s) in this index; this tape holds the newest version of 2 of them."),
         "{text}"
     );
     assert_forward_only(&h, "--where --all with two tenant keys");
@@ -7225,7 +7243,7 @@ fn file_1_script_is_saved_under_the_tapes_name_and_runs_from_it() {
         "Loading the tape, and a drive that does not show up",
     ));
     assert!(
-        load.contains("sudo env TAPE_DEVICE=/dev/nst0 TMPDIR=/tmp ./RESTORE-LABEL.sh --info"),
+        load.contains("sudo env TAPE_DEVICE=/dev/nst0 TMPDIR=/tmp ./RESTORE.sh --info"),
         "{load}"
     );
     let (ok, text) = run_guide(

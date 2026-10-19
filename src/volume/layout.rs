@@ -551,7 +551,7 @@ fn guide_drive_basics() -> String {
          keep `TMPDIR` (the system's dynamic loader removes it from a \
          set-user-ID program such as sudo before sudo starts: ld.so(8)). Give \
          both after sudo, with `env`: `sudo env TAPE_DEVICE=/dev/nst0 \
-         TMPDIR=/tmp ./RESTORE-LABEL.sh --info`. (`sudo \
+         TMPDIR=/tmp ./RESTORE.sh --info`. (`sudo \
          --preserve-env=TAPE_DEVICE` keeps the device alone; sudo 1.8.21 or \
          later has it, and Debian 10 has 1.8.27.) What the script writes is then \
          owned by root.",
@@ -1078,10 +1078,10 @@ on that tape are named first. List the units the newest index you can read
 has and the tapes that hold them, and set that against the tapes in the box:
 a holder the index names that you do not have is a tape to look for, and a
 unit, or the newest version of a unit, whose every holder is missing is not
-in this box. Then ask whoever kept the archive. The Heir Kit, if you have one ("Words
-this guide uses"), records the archive as of the day it was made, including
-where the tapes are kept; one made after your newest tape was written may
-name tapes this box lacks.
+in this box. Then ask whoever kept the archive. The Heir Kit, if you have
+one ("Words this guide uses"), records the archive as of the day it was
+made, including where the tapes are kept; one made after your newest tape
+was written may name tapes this box lacks.
 
 The whole box, in short:
 
@@ -1135,7 +1135,8 @@ The whole box, in short:
      `--info`, which needs no key, shows only the tape's label, dates and
      map, never what it holds. Do not count that tape as looked at: name it
      (a tape of another installation, or a key you do not have) and try
-     every other key you hold on it.
+     every other key you hold on it. If none opens it, the box is not done,
+     and you say so, by that tape's name.
    - A tape written before 1.3.0 has no index. It counts by its own
      envelopes alone, and nothing on it names a tape or a unit but its own.
    - An unsealed tape (no "Sealed at") is ordered by File 0's `created_at`.
@@ -11072,7 +11073,7 @@ sha256_encrypted = \"bbb\"
             "A tape your key cannot open is NOT done.",
             "\"no envelope matched the key provided\" (or \"any of the N keys provided\")",
             "`--info`, which needs no key, shows only the tape's label, dates and map, never what it holds",
-            "Do not count that tape as looked at: name it (a tape of another installation, or a key you do not have) and try every other key you hold on it",
+            "Do not count that tape as looked at: name it (a tape of another installation, or a key you do not have) and try every other key you hold on it. If none opens it, the box is not done, and you say so, by that tape's name",
             "A tape written before 1.3.0 has no index. It counts by its own envelopes alone, and nothing on it names a tape or a unit but its own",
             "An unsealed tape (no \"Sealed at\") is ordered by File 0's `created_at`",
             "If the newest tape in the box will not read, the older tapes' indexes cannot see what was written after them: say that some units may be unknown",
@@ -11140,7 +11141,7 @@ sha256_encrypted = \"bbb\"
         for needle in [
             "`sudo usermod -aG tape YOUR_USER`, then log in again). Running the commands with `sudo` works too, but sudo hides your `TAPE_DEVICE` and `TMPDIR` from the script, which then reads `/dev/nst0` and `/tmp` whatever you set",
             "`--preserve-env` cannot keep `TMPDIR` (the system's dynamic loader removes it from a set-user-ID program such as sudo before sudo starts: ld.so(8))",
-            "Give both after sudo, with `env`: `sudo env TAPE_DEVICE=/dev/nst0 TMPDIR=/tmp ./RESTORE-LABEL.sh --info`",
+            "Give both after sudo, with `env`: `sudo env TAPE_DEVICE=/dev/nst0 TMPDIR=/tmp ./RESTORE.sh --info`",
             "(`sudo --preserve-env=TAPE_DEVICE` keeps the device alone; sudo 1.8.21 or later has it, and Debian 10 has 1.8.27.)",
             "What the script writes is then owned by root",
         ] {
