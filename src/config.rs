@@ -3514,7 +3514,7 @@ mod tests {
         // On tape a 1 GiB slice is a little more than 1 GiB, in whole blocks.
         let on_tape = slice_bytes_on_tape(1 << 30);
         assert!(
-            on_tape > (1 << 30) && on_tape % TAPE_BLOCK_BYTES == 0,
+            on_tape > (1 << 30) && on_tape.is_multiple_of(TAPE_BLOCK_BYTES),
             "{on_tape}"
         );
         assert!(on_tape < (1 << 30) + (1 << 20), "{on_tape}");
