@@ -1692,7 +1692,8 @@ by the number or position of a slice or by a file name:
 
 `--verify` takes the same two options and says whether a copy of each failed
 slice was found. To copy a slice off the other tape by hand, find its tape
-file in THAT tape's front index (File 3) by its sha256, then:
+file in THAT tape's front index (File 3) by its sha256 (the entry's
+`position` is POSITION), then:
 
     mt -f /dev/nst0 rewind
     mt -f /dev/nst0 fsf POSITION
@@ -6532,8 +6533,8 @@ pub fn generate_recovery_md(
         if held {
             s.push_str(&format!(
                 " If dar\n\
-                 cannot read the last slice's catalogue, `-A {cat}` gives it this\n\
-                 envelope's copy instead.",
+                 cannot read the catalogue at the end of the last slice, `-A {cat}`\n\
+                 gives it this envelope's dar catalogue instead.",
                 cat = catalogue,
             ));
         }
@@ -13176,5 +13177,31 @@ sha256_encrypted = \"bbb\"
             "{manual}"
         );
         assert!(manual.contains("FIRST_TAPE_POSITION") && !manual.contains("FIRST_POSITION"));
+        let dmg = flat_text(guide_section(&g, "If a slice or a file is damaged"));
+        assert!(
+            dmg.contains("by its sha256 (the entry's `position` is POSITION), then:"),
+            "{dmg}"
+        );
+        // RECOVERY.md says "dar catalogue" for the envelope's copy and names
+        // the other one by where it lies.
+        let unit = ManifestUnit {
+            name: "alpha".into(),
+            uuid: "aaaaaaaa-0000-0000-0000-000000000000".into(),
+            snapshot_version: 2,
+            stage_set_id: 1,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![],
+        };
+        let r = flat_text(&generate_recovery_md(
+            "LAB01",
+            "alice",
+            &[unit],
+            &["aaaaaaaa_v2.1.dar".to_string()],
+        ));
+        assert!(
+            r.contains("If dar cannot read the catalogue at the end of the last slice, `-A catalogs/aaaaaaaa_v2` gives it this envelope's dar catalogue instead"),
+            "{r}"
+        );
     }
 }
