@@ -1776,3 +1776,15 @@ Ruled 2026-10-17, measuring drives instead of assuming them:
      (`6c7bb948…` to `95862b49…`); MANIFEST.toml's did not. Item 81's bound stands: the
      authorization ends when v1.3.0 is installed. The third read's remaining minor findings are
      #481, for the next re-pin.
+
+Ruled 2026-10-19, after v1.3.0 was tagged:
+
+105. **A 1.4.0 re-pin now, for #481.** The third fresh read's remaining minor File 1 findings ship
+     in 1.4.0 rather than waiting for the short seal or spanning: File 1's text only (RESTORE.sh's
+     bytes do not move unless a finding cannot be met otherwise, and then the CTO is asked), then
+     another fresh read with its verdict recorded on #481. File 1 names the public repository,
+     https://github.com/mikmorg/tapectl, beside the release File 0 names, as one place to find
+     tapectl (a URL may rot over decades). home2 installs 1.4.0 instead of 1.3.0; the on-tape
+     authorizations of 1.2.0, 1.3.0 and 1.4.0 (items 72, 81, 104, 105) all end when the release
+     home2 installs is installed. 1.4.0 also carries #479 (the profiling toolkit and item 100's
+     post-warning key), which changes nothing on tape.
