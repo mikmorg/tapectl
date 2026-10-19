@@ -28,8 +28,8 @@ mod tests {
     use crate::progress::{self, Display};
     use crate::store::injected::InjectedDrive;
     use crate::store::MemStore;
-    use crate::tape::fake::FakeTape;
     use crate::tape::contact::Medium;
+    use crate::tape::fake::FakeTape;
     use crate::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
     use crate::volume::layout_model::{KeyAvailability, SliceCheck};
     use crate::volume::rebuild;
@@ -355,7 +355,11 @@ mod tests {
         out
     }
 
-    fn rebuild_with(home: &Home, tape: &mut Tape, given: &[KeyFile]) -> Result<rebuild::RebuildReport> {
+    fn rebuild_with(
+        home: &Home,
+        tape: &mut Tape,
+        given: &[KeyFile],
+    ) -> Result<rebuild::RebuildReport> {
         let scratch = TempDir::new().unwrap();
         rebuild::rebuild_from_store(
             &home.conn,
@@ -392,12 +396,7 @@ mod tests {
             RestoreTarget::Unit { dest_dir: &dest },
             options,
             &mut tape.store,
-            ContactSite::new(
-                cfg(),
-                Operation::RestoreUnit,
-                "memstore",
-                Medium::NoBackend,
-            ),
+            ContactSite::new(cfg(), Operation::RestoreUnit, "memstore", Medium::NoBackend),
         )
     }
 
@@ -467,10 +466,16 @@ mod tests {
         // `catalog rebuild --from-volume --key escrow.key`
         let report = rebuild_with(&home, &mut tape, &given).expect("the escrow key rebuilds");
         assert!(report.volume_inserted, "{report:?}");
-        assert!(report.key_is_escrow, "the key given is the registered escrow");
+        assert!(
+            report.key_is_escrow,
+            "the key given is the registered escrow"
+        );
         assert_eq!(report.units, 1);
         assert_eq!(
-            count(&home.conn, "SELECT COUNT(*) FROM units WHERE name = 'keepsake'"),
+            count(
+                &home.conn,
+                "SELECT COUNT(*) FROM units WHERE name = 'keepsake'"
+            ),
             1
         );
         assert_eq!(
@@ -646,14 +651,10 @@ mod tests {
         // usage error naming it.
         {
             use clap::Parser;
-            let err = crate::cli::Cli::try_parse_from([
-                "tapectl",
-                "catalog",
-                "rebuild",
-                "--from-volume",
-            ])
-            .unwrap_err()
-            .to_string();
+            let err =
+                crate::cli::Cli::try_parse_from(["tapectl", "catalog", "rebuild", "--from-volume"])
+                    .unwrap_err()
+                    .to_string();
             assert!(err.contains("--key"), "{err}");
         }
 
@@ -674,15 +675,21 @@ mod tests {
         .expect("two --key flags, one of them the escrow secret, rebuild");
         assert_eq!(
             home.conn
-                .query_row("SELECT COUNT(*) FROM units WHERE name = 'keepsake'", [], |r| {
-                    r.get::<_, i64>(0)
-                })
+                .query_row(
+                    "SELECT COUNT(*) FROM units WHERE name = 'keepsake'",
+                    [],
+                    |r| { r.get::<_, i64>(0) }
+                )
                 .unwrap(),
             1
         );
 
         let check = |dest: &Path, files: &[&str]| {
-            for (path, bytes) in tape.files.iter().filter(|(p, _)| files.contains(&p.as_str())) {
+            for (path, bytes) in tape
+                .files
+                .iter()
+                .filter(|(p, _)| files.contains(&p.as_str()))
+            {
                 assert_eq!(
                     &std::fs::read(dest.join(path)).unwrap_or_default(),
                     bytes,
@@ -793,8 +800,15 @@ mod tests {
             let good_s = good.to_string_lossy().into_owned();
             let lines: Vec<Vec<&str>> = vec![
                 vec![
-                    "catalog", "rebuild", "--from-volume", "--device", DEVICE, "--key", &good_s,
-                    "--key", &bad_s,
+                    "catalog",
+                    "rebuild",
+                    "--from-volume",
+                    "--device",
+                    DEVICE,
+                    "--key",
+                    &good_s,
+                    "--key",
+                    &bad_s,
                 ],
                 vec![
                     "restore", "unit", "--unit", UNIT, "--from", LABEL, "--device", DEVICE, "--to",

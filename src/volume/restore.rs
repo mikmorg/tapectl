@@ -7655,6 +7655,6 @@ mod tests {
 // Declared last: the source-scan tests split this file at its first `#[cfg(test)]
 // mod`, and the production code must all lie before it.
 #[cfg(test)]
-mod repair_tests;
-#[cfg(test)]
 mod heir_tests;
+#[cfg(test)]
+mod repair_tests;

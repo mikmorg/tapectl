@@ -829,7 +829,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (a, b) = (generate_keypair(), generate_keypair());
         let two = tmp.path().join("two.key");
-        fs::write(&two, format!("# first\n{}\n\n{}\n", a.secret_key, b.secret_key)).unwrap();
+        fs::write(
+            &two,
+            format!("# first\n{}\n\n{}\n", a.secret_key, b.secret_key),
+        )
+        .unwrap();
         let file = KeyFile::read(&two).unwrap();
         let publics: Vec<String> = file
             .identities()
@@ -853,7 +857,10 @@ mod tests {
         let cases: Vec<(Vec<u8>, &str)> = vec![
             (b"# only a comment\n\n".to_vec(), "holds no age identity"),
             (b"".to_vec(), "holds no age identity"),
-            (format!("{}\n", a.public_key).into_bytes(), "is a public key"),
+            (
+                format!("{}\n", a.public_key).into_bytes(),
+                "is a public key",
+            ),
             (b"AGE-PLUGIN-YUBIKEY-1QQQQQQ\n".to_vec(), "plugin identity"),
             (
                 b"AGE-SECRET-KEY-1NOTREALLYAKEY\n".to_vec(),
@@ -884,13 +891,19 @@ mod tests {
         let ghost = KeyFile::read(&tmp.path().join("ghost.key"))
             .unwrap_err()
             .to_string();
-        assert!(ghost.contains("ghost.key") && ghost.contains("cannot read"), "{ghost}");
+        assert!(
+            ghost.contains("ghost.key") && ghost.contains("cannot read"),
+            "{ghost}"
+        );
         let dir = KeyFile::read(tmp.path()).unwrap_err().to_string();
         assert!(dir.contains("cannot read"), "{dir}");
         let big = tmp.path().join("big.key");
         fs::write(&big, vec![b'#'; ADOPT_MAX_BYTES + 1]).unwrap();
         let msg = KeyFile::read(&big).unwrap_err().to_string();
-        assert!(msg.contains("big.key") && msg.contains("far more than"), "{msg}");
+        assert!(
+            msg.contains("big.key") && msg.contains("far more than"),
+            "{msg}"
+        );
     }
 
     /// `read_all` stops at the first refusal and names that file, so a list
