@@ -565,7 +565,8 @@ hand-written secret) and the kit's `catalog.db.age`. In this order:
    kit does **not** contain them: the database stores public halves only. If
    no copy exists, the escrow secret still opens every tape (it is a recipient
    of every slice), so the data is recoverable — through `RESTORE.sh --key`
-   or `catalog rebuild --key <escrow secret file>` — but the tenants' own key
+   or `catalog rebuild --key <escrow secret file>` and then `restore unit --key <escrow secret
+   file>` — but the tenants' own key
    files are not, and new tapes for those tenants will be encrypted to keys
    you generate afresh.
 3. Decrypt and import the bundle, then fsck. Run this in the directory that

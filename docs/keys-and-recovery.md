@@ -420,7 +420,7 @@ removes the past.
 |---|---|---|
 | **One tenant key file** (say `family-primary.age.key`) | Everything. The other pair, the operator keys and the escrow secret are all recipients of the same files | `tapectl key rotate --tenant family` so new data does not depend on a pair with a missing half. Keep the surviving old file: older tapes still need it |
 | **All of one tenant's key files** | tapectl's `restore` still reads that tenant's data using the operator keys; `RESTORE.sh` works with the operator key or escrow secret | `key rotate --tenant family`, then give the tenant their new files. They can no longer read old tapes independently; only the operator or escrow can |
-| **The whole home** (catalog, keys, config), escrow paper intact | Every tape is still readable with the escrow secret, through `RESTORE.sh --key`, or through `restore raw-volume` + `age` + `dar` once a new home carries the original escrow identity (runbook C, step 3). The catalog comes back from the kit's `catalog.db.age` and `catalog rebuild` | [Runbook C](#c-the-catalog-is-gone-and-you-hold-the-operator-or-escrow-key). Unless a key-bearing backup survives, **tapectl's own `restore unit\|file` cannot read the old tapes**: it reads keys only from `keys/`, and the escrow secret must never be put there. Old data comes back through `RESTORE.sh`. Rotate every tenant and the operator before staging anything new |
+| **The whole home** (catalog, keys, config), escrow paper intact | Every tape is still readable with the escrow secret, through `RESTORE.sh --key`, or through `restore raw-volume` + `age` + `dar` once a new home carries the original escrow identity (runbook C, step 3). The catalog comes back from the kit's `catalog.db.age` and `catalog rebuild` | [Runbook C](#c-the-catalog-is-gone-and-you-hold-the-operator-or-escrow-key). tapectl's own `restore unit\|file\|volume` reads the old tapes when given the escrow secret with `--key escrow.key` (1.4.0): the file is used for that one command and never copied into `keys/`, where the escrow secret must never be put. `RESTORE.sh --key` needs no tapectl at all. Rotate every tenant and the operator before staging anything new |
 | **The escrow paper** (every copy), home intact | Everything, today: the operator and tenant keys open every tape | Make sure a key-bearing copy of the home exists off the machine, because it is now your only way back. The secret cannot be re-printed (it was never stored), and no command registers a replacement identity. Every future tape still carries the old escrow recipient, which nobody can use |
 | **The home and the escrow paper** | Only what survives elsewhere: a `db backup --include-keys` copy or a home tarball restores everything; a tenant holding their own key files can still restore their own data with `RESTORE.sh` | Without any of those, the data on tape cannot be decrypted by anyone. This is the loss the Heir Kit's two failure domains exist to prevent |
 
@@ -872,10 +872,13 @@ is the same procedure for a service-user host.
    decrypted to disk before dar reads it, and the space check asks for every unit
    plus the largest unit's slices (`--scratch DIR` puts those on another disk);
    `catalog rebuild` names such sets. One unit's failure does not stop the rest; the report names
-   it, and the command exits non-zero. tapectl's restore reads only the private
-   keys in `<home>/keys/` (step 5), never the escrow secret. With only the
-   escrow secret, restore through `RESTORE.sh --key` from
-   [runbook B](#b-a-tenant-holding-only-their-key-files-and-a-tape).
+   it, and the command exits non-zero. tapectl's restore reads the private keys
+   in `<home>/keys/` (step 5) and any `--key FILE` you give it (1.4.0). With
+   only the escrow secret, add it to the restore: `tapectl restore volume
+   L8-0002 --to /srv/restore --device "$TAPE" --key escrow.key`. The file is used
+   for that command and is never copied into the home or registered. Without
+   tapectl, use `RESTORE.sh --key`
+   ([runbook B](#b-a-tenant-holding-only-their-key-files-and-a-tape)).
 
    One exception, after step 6: what `audit` says about the Heir Kit
    (`escrow_kit_missing`, `escrow_kit_stale`) is measured against the kit

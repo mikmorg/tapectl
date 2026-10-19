@@ -2419,8 +2419,14 @@ error: encryption error: decrypt: <age's reason>
 The second means none of the keys present opens this slice. Copy the missing
 secret key files back into `<home>/keys/`. A `db backup --include-keys` copy
 keeps them in the `.keys/` directory beside the backup file. `key import`
-cannot help here: it registers a public key only. Otherwise recover with the
-operator or escrow key. See [keys-and-recovery.md](keys-and-recovery.md).
+cannot help here: it registers a public key only. Or give the key for this one
+command: `restore unit|file|volume --key FILE` (repeatable, 1.4.0) adds an age
+identity file to the home's keys without copying it in. When none of them opens the
+slice, the refusal ends `(none of the identities in the --key file(s) given — a.key —
+nor the home's own keys opens this slice)`. A file that is not an identity is refused
+before the drive is opened: `error: encryption error: --key PATH is not an age X25519
+identity file: <why>`. `catalog rebuild --key` takes the same flag. Otherwise recover
+with the operator or escrow key. See [keys-and-recovery.md](keys-and-recovery.md).
 
 ### A slice fails its checksum on the way back
 

@@ -1284,6 +1284,14 @@ tape, and refuses with nothing read
   (`restore volume`, an empty or new `DIR/<unit name>` for each unit), and
   `restore file` refuses when a file of the same name is already there.
   `--overwrite` restores anyway and replaces what collides.
+- **A key that is not in the home.** `--key FILE` (repeatable) on `restore unit`,
+  `restore file`, `restore volume` and `catalog rebuild` adds an age identity file to
+  the keys tried, for that command only (ADR-0012 item 107). It is never copied into
+  the home, registered as a key, or logged. An heir holding only the escrow secret
+  runs `catalog rebuild --from-volume --key escrow.key`, then `restore unit --unit U
+  --key escrow.key --to DIR`, and gets chunk salvage and file fill, which `RESTORE.sh`
+  cannot do. A file that is not an identity is refused by name before the drive is
+  opened.
 - **The file.** `restore file --file` must be a path the catalog recorded for
   that version, relative to the unit's root, as `catalog ls` and
   `catalog search` print it. A directory is refused: restore the unit. dar is
