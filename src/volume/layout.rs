@@ -1068,9 +1068,8 @@ the dar command of each unit, in its `dar_command` line (unpacked
 envelope: `grep '^dar_command' env/MANIFEST.toml`; with an escrow or
 operator key `--find-envelope` prints only a table of units, so unpack the
 operator envelope by hand, as under "Tools Required"). An argument that
-starts
-`-z`, as in `\"-zgzip\"` or `\"-zzstd\"`, means the unit was compressed,
-and none means it was not. The dar catalogue cannot tell you: `dar -l`
+starts `-z`, as in `\"-zgzip\"` or `\"-zzstd\"`, means the unit was
+compressed, and none means it was not. The dar catalogue cannot tell you: `dar -l`
 of the dar catalogue in the envelope shows `-----` in its compression
 column either way.
 
@@ -1801,13 +1800,13 @@ says where to get it and what to run; nothing else in this guide needs it.
 ## tapectl itself
 
 Look in the Heir Kit first. A kit made by tapectl 1.5.0 or later holds a
-copy of the program that made it, a file named `tapectl-` and its version
-(`tapectl-1.5.0`), in the folder with `catalog.db.age`. The cover sheet
-names it with its size and sha256 (check the file against the sheet with
-`sha256sum`) and says it is for Linux on one machine type (`uname -m` says
-yours). It needs no building: run it as `./tapectl-1.5.0` wherever this
-section says `tapectl`, after `./tapectl-1.5.0 --version` has shown it
-starts. Its release must be File 0's `tapectl_version` or newer; a kit made
+copy of the program that made it, in the folder with `catalog.db.age`: a
+file named `tapectl-` and its version, `tapectl-X.Y.Z` below (such as
+`tapectl-1.5.0`). The cover sheet names it with its size and sha256 (check
+the file against the sheet with `sha256sum`) and says it is for Linux on
+one machine type (`uname -m` says yours). It needs no building: run it as
+`./tapectl-X.Y.Z` wherever this section says `tapectl`, after
+`./tapectl-X.Y.Z --version` has shown it starts. Its release must be File 0's `tapectl_version` or newer; a kit made
 before the tape was written can hold an older one. With no kit, a copy that
 is too old, or one that will not run on your machine, read on.
 
@@ -1815,7 +1814,7 @@ tapectl is open-source software, and its source is at
 https://github.com/mikmorg/tapectl: one place to look, and a web address
 may move over decades, so search for the name if it is gone. File 0's
 `tapectl_version` names the release that wrote this tape; the repository
-tags each release `v` followed by that number (`v1.5.0`); use that release
+tags each release `v` followed by that number (such as `v1.5.0`); use that release
 or a newer one. It is built from source. It needs the Rust toolchain the
 repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs,
 installs it on the first `cargo` run, or when you run `rustup toolchain
@@ -12244,7 +12243,7 @@ sha256_encrypted = \"bbb\"
         let f = flat_text(raw);
         for needle in [
             "tapectl is open-source software, and its source is at https://github.com/mikmorg/tapectl: one place to look, and a web address may move over decades, so search for the name if it is gone",
-            "File 0's `tapectl_version` names the release that wrote this tape; the repository tags each release `v` followed by that number (`v1.5.0`); use that release or a newer one",
+            "File 0's `tapectl_version` names the release that wrote this tape; the repository tags each release `v` followed by that number (such as `v1.5.0`); use that release or a newer one",
             "the Rust toolchain the repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs, installs it on the first `cargo` run, or when you run `rustup toolchain install` in the checkout; a distribution's own cargo may be too old)",
             "`dar`, `mt-st` and `sg3-utils` installed (\"Tools Required\")",
             "`init` makes the home and registers the escrow PUBLIC key, which decrypts nothing; run it once",
@@ -12998,9 +12997,9 @@ sha256_encrypted = \"bbb\"
             .unwrap();
         assert!(kit < repo, "{sec}");
         for needle in [
-            "A kit made by tapectl 1.5.0 or later holds a copy of the program that made it, a file named `tapectl-` and its version (`tapectl-1.5.0`), in the folder with `catalog.db.age`",
+            "A kit made by tapectl 1.5.0 or later holds a copy of the program that made it, in the folder with `catalog.db.age`: a file named `tapectl-` and its version, `tapectl-X.Y.Z` below (such as `tapectl-1.5.0`)",
             "The cover sheet names it with its size and sha256 (check the file against the sheet with `sha256sum`) and says it is for Linux on one machine type (`uname -m` says yours)",
-            "It needs no building: run it as `./tapectl-1.5.0` wherever this section says `tapectl`, after `./tapectl-1.5.0 --version` has shown it starts",
+            "It needs no building: run it as `./tapectl-X.Y.Z` wherever this section says `tapectl`, after `./tapectl-X.Y.Z --version` has shown it starts",
             "Its release must be File 0's `tapectl_version` or newer; a kit made before the tape was written can hold an older one",
             "With no kit, a copy that is too old, or one that will not run on your machine, read on",
         ] {

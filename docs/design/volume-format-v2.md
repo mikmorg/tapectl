@@ -737,7 +737,19 @@ name" (a directory per unit uuid where names recur across tapes), "When no envel
 package names with one `apt` line and the oldest age tried (1.0.0-rc.1, linking age's release
 page), IR and IT defined, internal versus external drives and the USB/Thunderbolt answer, the disk
 chosen after the units are listed on a Linux filesystem, one disk-space rule, and a manual slice
-step that stops on a failed hash. "Start here" may run to 60 lines.
+step that stops on a failed hash. After the fifth read (still 1.4.0), "Did the restore get
+everything?" checks that `--all` restored every unit `--find-envelope` lists.
+
+**Since 1.5.0** (ADR-0012 item 109, #485; no golden pin moves). File 1 and RECOVERY.md text
+only. File 1 gained: "done" in Start here holds over the tapes held; "Files deleted before the
+newest version" (`--list --version` twice, then `grep` and `awk`); where to get a newer dar; in
+"Compressed units", a short way to a unit's `dar_command` with an escrow or operator key and
+"three times" as a rule of thumb, not a ceiling; in "The tape drive", a cartridge's generation
+read without a drive and one working setup; after a failed `dd`, a rewind and `fsf` to the
+wanted position; glossary entries "Index" and "Catalogue" and the placeholders `OPERATOR_NAME` and
+`FIRST_TAPE_POSITION`; and "tapectl itself" sends the heir to the Heir Kit's copy of the program
+first (a kit made by 1.5.0 or later carries `tapectl-<version>`, named on its cover sheet with its
+sha256). "Start here" may run to 64 lines.
 
 ## 7. Block mode
 

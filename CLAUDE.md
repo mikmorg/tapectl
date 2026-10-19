@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), and upgrades in place to 1.4.0 (handoff (f)).
+(`keepsake` on L6-0001 and L6-0002), and upgrades in place to 1.5.0 (handoff (f)).
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -271,6 +271,13 @@ hold no release path can lift until the new volume reads back (#483; `src/volume
 migration 037). `restore unit|file|volume` and `catalog rebuild` take `--key FILE`, so an heir with
 only the escrow secret restores through tapectl (item 107). `scripts/lto-profile.sh` profiles a
 drive and emits its `[[backends.lto]]` block; `post_warning_bytes` caps the slice size (#479).
+
+**2026-10-19: 1.5.0, the fifth read's last findings and the kit's own tapectl**
+(`docs/releases/1.5.0.md`; ADR-0012 item 109, #485). File 1 and RECOVERY.md text only; no golden
+pin moved and there is no migration. `key escrow-kit` writes a fourth file, `tapectl-<version>`, a
+copy of the running binary named on the cover sheet with its sha256 (`escrow_kit::generate`;
+tests call `generate_with_program` with a small stand-in), and File 1's "tapectl itself" sends the
+heir there first.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used

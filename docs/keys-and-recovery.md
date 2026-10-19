@@ -431,11 +431,13 @@ removes the past.
 The Heir Kit ([ADR-0009](adr/0009-heir-kit-contents-and-staleness.md)) is what
 survives the machine: a printed cover sheet naming the escrow identity, with a box
 where you copy the secret by hand, plus the whole catalog encrypted to the escrow
-recipient.
+recipient, and (from 1.5.0) a copy of the tapectl program that made the kit, so an
+heir's tool does not depend on the repository surviving.
 
 From 1.4.0 File 1 on every tape says how to open the catalog ("The Heir Kit's catalogue"):
 `age -d -i escrow.key -o catalog.db catalog.db.age`, then `sqlite3`. Only the escrow secret
-opens it, and it is as of the day the kit was made.
+opens it, and it is as of the day the kit was made. From 1.5.0 its "tapectl itself" section
+sends the heir to the kit's copy of tapectl first.
 
 ```text
 $ tapectl key escrow-kit --out ~/heir-kit
@@ -443,6 +445,7 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 672130 bytes, covering 2 sealed volume(s)
+  tapectl-1.5.0    the program that made this kit, 41238016 bytes, sha256 3a7bd3e2… (named on the sheet)
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -458,6 +461,7 @@ still to do, and only you can do it:
 | `COVER.txt` | The cover sheet in plain text. It is the part meant to last decades: readable with `cat` long after browsers change. It prints the escrow **identity** (the public `age1…`, which decrypts nothing) and a boxed area headed `THE ESCROW SECRET -- WRITE IT HERE`. Its example commands say `/dev/nst0`, and the sheet says that is only an example: `ls -l /dev/tape/by-id/` lists the drives on the machine at hand |
 | `escrow-kit.html` | The same words, with the identity also as a QR code. Self-contained; print it from any browser |
 | `catalog.db.age` | The **whole** `tapectl.db`, encrypted to the escrow recipient: units, versions, which volume is on which cartridge, and which location it is in. It holds no private keys |
+| `tapectl-<version>` | A copy of the tapectl program that made the kit (mode 0755), for Linux on the machine type the cover sheet names. The sheet prints its size and sha256 (check it with `sha256sum`). It is the heir's tool for reading around a damaged slice (`restore unit --key escrow.key`), so that does not depend on the repository surviving. A kit made before 1.5.0 has none. The kit copies whichever binary runs `key escrow-kit`, so run the installed production build. Regenerating a kit after an upgrade leaves the older `tapectl-<oldversion>` beside the new one: delete it |
 
 The command stops at the files. The rest of the ceremony is yours:
 
@@ -474,8 +478,8 @@ The command stops at the files. The rest of the ceremony is yours:
    age-keygen -y escrow.key      # must print the sheet's age1… exactly
    shred -u escrow.key
    ```
-4. **Seal** the sheet, with `catalog.db.age` on a USB stick or disc, in a
-   tamper-evident envelope.
+4. **Seal** the sheet, with `catalog.db.age` and `tapectl-<version>` on a USB
+   stick or disc, in a tamper-evident envelope.
 5. **Store two copies in independent failure domains**, not two shelves in one
    building. Paper belongs in a UL-350 rated safe, or Class-125 if it shares the
    safe with tape.
@@ -522,7 +526,8 @@ and how many sealed cartridges it knew (under GENERATED), so an old sheet beside
 a new catalog states the wrong size and count, and a wrong size can look like
 tampering. The identity and the secret do not change. For each envelope:
 
-1. Put the new `catalog.db.age` in, with the newly printed `COVER.txt` in front.
+1. Put the new `catalog.db.age` in (and the new `tapectl-<version>`, if tapectl was
+   upgraded since the last kit), with the newly printed `COVER.txt` in front.
 2. Either copy the secret into the new sheet's box, check the pair again, and
    shred the old sheet; or keep the old hand-filled sheet behind the new one for
    its secret, with its byte count and cartridge count struck out. The new sheet
@@ -734,7 +739,10 @@ is the same procedure for a service-user host.
 **The order matters: home, then keys, then rows.** `db import` replaces the
 *whole* live database, so anything rebuilt before it is lost.
 
-1. **Install tapectl** ([install.md](install.md)).
+1. **Install tapectl** ([install.md](install.md)). If you hold a Heir Kit made by
+   1.5.0 or later, its `tapectl-<version>` file is the first place to look: check
+   its sha256 against the cover sheet and run it as `./tapectl-<version>`; build
+   from source only if it will not run.
 
 2. **Make the key file.** For the escrow secret, type it from the cover sheet
    alone on one line of `escrow.key`, then check it:

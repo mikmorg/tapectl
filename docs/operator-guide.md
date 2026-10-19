@@ -402,6 +402,7 @@ heir kit written to ~/heir-kit
   COVER.txt        the printable cover sheet (print this)
   escrow-kit.html  same content with a QR, for a browser's print dialog
   catalog.db.age   encrypted catalog, 672130 bytes, covering 2 sealed volume(s)
+  tapectl-1.5.0    the program that made this kit, 41238016 bytes, sha256 3a7bd3e2… (named on the sheet)
 
 still to do, and only you can do it:
   1. print COVER.txt (or the HTML page)
@@ -2459,13 +2460,14 @@ is the operator's routine.
 tapectl key escrow-kit --out ~/heir-kit
 ```
 
-It writes three files:
+It writes four files:
 
 | file | what to do with it |
 |---|---|
 | `COVER.txt` | **Print this.** The plain-text cover sheet. It carries the escrow *identity* (the public half, `age1…`, in retypable Bech32) and a boxed hand-fill area for the escrow *secret* (`AGE-SECRET-KEY-1…`), which `init` printed once and nothing on the machine holds. The printed `age1…` decrypts nothing by itself; the sheet says so. It is the artifact with the decades-scale claim — readable with `cat` when no browser exists. |
 | `escrow-kit.html` | Same content with the identity as a QR, captioned as the identity. Open it and use the browser's print dialog. Self-contained: it renders with no network. |
 | `catalog.db.age` | The whole catalog, encrypted to the escrow recipient. Put it on the media that travels with the paper. |
+| `tapectl-<version>` | A copy of the tapectl binary that ran the command (mode 0755), from 1.5.0. The cover sheet names it with its size and sha256 and says it is for Linux on one machine type; File 1 on every tape sends an heir there first. Put it on the same media as `catalog.db.age`. Run the installed production binary to make the kit, since the copy is whatever binary ran; after an upgrade, delete the older `tapectl-<oldversion>` the new kit leaves beside it. |
 
 **The command stops at the files. The rest is yours, and the kit is worth
 nothing until you do it:**
