@@ -449,10 +449,14 @@ impl RebuildReport {
 
 /// Read a sealed volume and insert whatever catalog rows are missing.
 ///
-/// `key_path` must be an operator or the escrow secret key. A tenant key
-/// cannot open the operator envelope (its recipients are operator + escrow
-/// only) and is refused with a pointer at `RESTORE.sh`, which is the heir
-/// path and does not need a catalog at all.
+/// `keys` are the `--key` files, read by the caller before the drive was
+/// opened (ADR-0012 2026-10-19 item 107): one operator or the escrow secret
+/// key opens the operator envelope, and several may be given (the escrow key
+/// among them attests, as with one). A tenant key cannot open the operator
+/// envelope (its recipients are operator + escrow only) and is refused with
+/// a pointer at `RESTORE.sh`, which is the heir path and does not need a
+/// catalog at all. The keys are used for this call only: nothing is copied
+/// into the home or registered.
 #[allow(clippy::too_many_arguments)]
 pub fn rebuild_from_volume(
     conn: &Connection,
@@ -463,17 +467,14 @@ pub fn rebuild_from_volume(
     config: &crate::config::Config,
     device: &str,
     block_size: usize,
-    key_path: &Path,
+    keys: &[crate::crypto::keys::KeyFile],
     expect_label: Option<&str>,
     fallback_tenant: &str,
     backend_name: Option<&str>,
     scratch: &Path,
     reads: &crate::tape::mam_journal::MamReads<'_>,
 ) -> Result<RebuildReport> {
-    let secret = crate::crypto::keys::read_secret_key(key_path)?;
-    let identity: age::x25519::Identity = secret.parse().map_err(|e| {
-        TapectlError::Encryption(format!("invalid key in {}: {e}", key_path.display()))
-    })?;
+    let identities = crate::crypto::keys::KeyFile::all_identities(keys);
     // Before the store open: reading the MAM opens the device read-only and
     // drops the fd, and the st driver refuses a second concurrent open.
     // LENIENT (ADR-0010): rebuild is THE disaster-recovery read path, so a
@@ -484,7 +485,7 @@ pub fn rebuild_from_volume(
     rebuild_from_store(
         conn,
         &mut store,
-        &[identity],
+        &identities,
         expect_label,
         fallback_tenant,
         backend_name,
@@ -503,6 +504,35 @@ pub fn rebuild_from_volume(
         )
         .with_mam_reads(reads),
     )
+    .map_err(|e| name_keys_given(e, keys))
+}
+
+/// The opening of the refusal [`tenant_key_refusal_message`] makes: the
+/// words [`name_keys_given`] swaps for the files the operator gave.
+const TENANT_KEY_REFUSAL_LEAD: &str = "this key cannot open the operator envelope, so it is \
+     neither an operator key nor the escrow key.";
+
+/// The wrong-key refusal, naming the `--key` files that were given (item
+/// 107): the same refusal, its first sentence about the files rather than
+/// "this key". Any other error passes through untouched.
+fn name_keys_given(e: TapectlError, keys: &[crate::crypto::keys::KeyFile]) -> TapectlError {
+    let message = e.to_string();
+    if keys.is_empty() || !message.contains(TENANT_KEY_REFUSAL_LEAD) {
+        return e;
+    }
+    let named = crate::crypto::keys::KeyFile::describe(keys);
+    let lead = if keys.len() == 1 {
+        format!(
+            "{named} cannot open the operator envelope, so it is neither an operator key nor \
+             the escrow key."
+        )
+    } else {
+        format!(
+            "none of the key files given ({named}) can open the operator envelope, so none is \
+             an operator key or the escrow key."
+        )
+    };
+    TapectlError::Other(message.replacen(TENANT_KEY_REFUSAL_LEAD, &lead, 1))
 }
 
 /// The whole of the rebuild, over any [`Store`].
@@ -1107,8 +1137,7 @@ fn tenant_key_refusal_message() -> String {
     // a terabyte on a full cartridge, to fetch a 50 KB script. File 1's own
     // two-line `mt`/`dd` recipe needs no tapectl at all.
     format!(
-        "this key cannot open the operator envelope, so it is neither an \
-         operator key nor the escrow key.\n\n\
+        "{TENANT_KEY_REFUSAL_LEAD}\n\n\
          A tenant key restores that tenant's own data without a catalog at \
          all: run RESTORE.sh from tape file 2 —\n\n    \
          tapectl restore raw-volume --device DEV --to DIR --only restore_sh\n    \

@@ -70,10 +70,15 @@ pub enum CatalogCommands {
         /// `/dev/tape/by-id/`.
         #[arg(long)]
         device: Option<String>,
-        /// Operator or escrow secret key file. A tenant key cannot open the
-        /// operator envelope and is refused with a pointer at RESTORE.sh.
-        #[arg(long)]
-        key: PathBuf,
+        /// Operator or escrow secret key file (an age identity,
+        /// `AGE-SECRET-KEY-1…`); repeat for several. For this command only:
+        /// never copied into the home or registered as any key, so an heir
+        /// can rebuild with the escrow key alone and then restore with the
+        /// same `--key`. A tenant key cannot open the operator envelope and
+        /// is refused with a pointer at RESTORE.sh; a file that is not an
+        /// identity is refused, naming it, before the drive is opened
+        #[arg(long, required = true, value_name = "FILE")]
+        key: Vec<PathBuf>,
         /// Refuse unless the tape's own reported label matches — a
         /// wrong-tape guard, not a database lookup
         #[arg(long)]
@@ -632,6 +637,10 @@ fn dispatch(
                      volume to know what rows would be inserted.",
                 ));
             }
+            // Item 107: every `--key` is read, and a file that is not an
+            // identity refused by name, before the device is resolved and
+            // before the drive is touched.
+            let keys = crate::crypto::keys::KeyFile::read_all(key)?;
             // LENIENT (ADR-0010): rebuild is the disaster-recovery read
             // path — the machine running it typically has keys and no
             // `backend add` yet, so the backend is optional and only names
@@ -666,7 +675,7 @@ fn dispatch(
                 config,
                 &device,
                 DEFAULT_BLOCK_SIZE,
-                key,
+                &keys,
                 label.as_deref(),
                 tenant,
                 backend.map(|b| b.name.as_str()),

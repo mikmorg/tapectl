@@ -96,6 +96,12 @@ pub struct RestoreOptions {
     /// The way round a streaming problem, and the way to reproduce the
     /// path a rebuilt catalog takes. `restore file` always spools anyway.
     pub spool: bool,
+    /// Identity files given with `--key` (ADR-0012 2026-10-19 item 107),
+    /// read before the drive was opened. They are used for decryption in
+    /// this restore only and ADD to the home's own keys: never copied into
+    /// the home, never registered as the operator's or the escrow's
+    /// identity, never logged (`KeyFile`'s `Debug` shows a path only).
+    pub keys: Vec<keys::KeyFile>,
 }
 
 /// The scratch directory's name, inside the destination or `--scratch`.
@@ -1299,7 +1305,7 @@ fn restore_unit_contacted(
     let scratch = scratch_dir(Path::new(target.destination()), options.scratch.as_deref());
     let plan = plan_restore(conn, config, &selection, target, &scratch, options.spool)?;
 
-    let identities = load_identities(conn, paths, &tenant)?;
+    let identities = load_identities(conn, paths, &tenant, &options.keys)?;
     let substitutions_before = supply.substitutions.len();
     restore_planned(
         conn,
@@ -1313,7 +1319,8 @@ fn restore_unit_contacted(
         &identities,
         supply,
         trace,
-    )?;
+    )
+    .map_err(|e| name_keys_given(e, &options.keys))?;
 
     info!(unit = unit_name, volume = volume_label, "restore complete");
 
@@ -1424,14 +1431,17 @@ fn record_restore(
 }
 
 /// Every secret key the tenant owns, and the operator's, for trial
-/// decryption. Ownership comes from the catalog's key rows, so tenant
-/// `family` no longer also loads tenant `family-old`'s keys; with no row
-/// (after `catalog rebuild`) a file goes to every tenant it may belong to,
-/// so a tenant's own key is never withheld (issue #350, keys::KeyOwners).
+/// decryption — plus the identities given with `--key` (item 107), which
+/// add to the home's and replace nothing. Ownership comes from the
+/// catalog's key rows, so tenant `family` no longer also loads tenant
+/// `family-old`'s keys; with no row (after `catalog rebuild`) a file goes to
+/// every tenant it may belong to, so a tenant's own key is never withheld
+/// (issue #350, keys::KeyOwners).
 fn load_identities(
     conn: &Connection,
     paths: &TapectlPaths,
     tenant: &crate::db::models::Tenant,
+    given: &[keys::KeyFile],
 ) -> Result<Vec<age::x25519::Identity>> {
     let mut identities = keys::load_tenant_identities(conn, &paths.keys_dir, &tenant.name)?;
     if !tenant.is_operator {
@@ -1443,6 +1453,7 @@ fn load_identities(
             )?);
         }
     }
+    identities.extend(keys::KeyFile::all_identities(given));
     if identities.is_empty() {
         return Err(TapectlError::Encryption(format!(
             "no secret keys found for tenant \"{}\"",
@@ -1450,6 +1461,29 @@ fn load_identities(
         )));
     }
     Ok(identities)
+}
+
+/// The refusal a restore gives when no identity it holds opens a slice —
+/// the decrypt failure `chunks::open` reports for age's `NoMatchingKeys`,
+/// whose own wording is the needle so a change of it cannot desynchronise.
+fn is_no_matching_key(e: &TapectlError) -> bool {
+    e.to_string()
+        .contains(&age::DecryptError::NoMatchingKeys.to_string())
+}
+
+/// A restore that found no identity to open a slice, told which `--key`
+/// files were given (item 107): the same refusal as without `--key`, with
+/// the files the operator tried named after it. Any other error, and any
+/// restore with no `--key`, passes through untouched.
+fn name_keys_given(e: TapectlError, given: &[keys::KeyFile]) -> TapectlError {
+    if given.is_empty() || !is_no_matching_key(&e) {
+        return e;
+    }
+    TapectlError::Encryption(format!(
+        "{e} (none of the identities in the --key file(s) given — {} — nor the home's own \
+         keys opens this slice)",
+        keys::KeyFile::describe(given),
+    ))
 }
 
 /// How one restore gets its slices to dar, and which slices it reads —
@@ -2653,7 +2687,7 @@ fn restore_planned_unit(
         .ok_or_else(|| TapectlError::UnitNotFound(p.unit.clone()))?;
     let tenant = queries::get_tenant_by_id(conn, unit.tenant_id)?
         .ok_or_else(|| TapectlError::Other("tenant not found".into()))?;
-    let identities = load_identities(conn, paths, &tenant)?;
+    let identities = load_identities(conn, paths, &tenant, &options.keys)?;
     restore_planned(
         conn,
         config,
@@ -2667,6 +2701,7 @@ fn restore_planned_unit(
         supply,
         trace,
     )
+    .map_err(|e| name_keys_given(e, &options.keys))
 }
 
 /// Move the one entry `file_path` out of the extract at `extracted` into
@@ -6925,6 +6960,7 @@ mod tests {
                     no_space_check: false,
                     spool: false,
                     fail_fast: false,
+                    key: Vec::new(),
                     dry_run: false,
                 }
             }
@@ -7202,6 +7238,7 @@ mod tests {
                     overwrite: false,
                     no_space_check: false,
                     spool: false,
+                    key: Vec::new(),
                     dry_run: false,
                 };
                 let root = TempDir::new().unwrap();

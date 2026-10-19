@@ -62,6 +62,15 @@ pub enum RestoreCommands {
         /// directory and --to on one disk
         #[arg(long)]
         spool: bool,
+        /// An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt
+        /// with in this command only; repeat for several. It is added to
+        /// the home's own keys and nothing more: never copied into the
+        /// home, registered as any key, or logged. Lets an heir who holds
+        /// only the escrow key restore through tapectl after `catalog
+        /// rebuild --from-volume --key`. A file that is not an identity is
+        /// refused, naming it, before the drive is opened
+        #[arg(long, value_name = "FILE")]
+        key: Vec<std::path::PathBuf>,
         /// Show what would be restored without restoring
         #[arg(long)]
         dry_run: bool,
@@ -117,6 +126,15 @@ pub enum RestoreCommands {
         /// attempted. Without it every unit is tried
         #[arg(long)]
         fail_fast: bool,
+        /// An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt
+        /// with in this command only; repeat for several. It is added to
+        /// the home's own keys and nothing more: never copied into the
+        /// home, registered as any key, or logged. Lets an heir who holds
+        /// only the escrow key restore through tapectl after `catalog
+        /// rebuild --from-volume --key`. A file that is not an identity is
+        /// refused, naming it, before the drive is opened
+        #[arg(long, value_name = "FILE")]
+        key: Vec<std::path::PathBuf>,
         /// Show what would be restored, unit by unit in tape order, without
         /// opening the drive
         #[arg(long)]
@@ -170,6 +188,15 @@ pub enum RestoreCommands {
         /// compressed or thin-provisioned one
         #[arg(long)]
         no_space_check: bool,
+        /// An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt
+        /// with in this command only; repeat for several. It is added to
+        /// the home's own keys and nothing more: never copied into the
+        /// home, registered as any key, or logged. Lets an heir who holds
+        /// only the escrow key restore through tapectl after `catalog
+        /// rebuild --from-volume --key`. A file that is not an identity is
+        /// refused, naming it, before the drive is opened
+        #[arg(long, value_name = "FILE")]
+        key: Vec<std::path::PathBuf>,
     },
 
     /// Dump every file off a tape verbatim, using only what is on the tape
@@ -227,8 +254,12 @@ pub fn run(
             overwrite,
             no_space_check,
             spool,
+            key,
             dry_run,
         } => {
+            // Item 107: a `--key` that is not an identity is refused first,
+            // by name, before the device is resolved or the drive opened.
+            let keys = crate::crypto::keys::KeyFile::read_all(key)?;
             // Issue #435: no `--from` restores from the loaded tape, which
             // File 0 names. A dry run opens no drive, so it cannot.
             if from.is_none() && *dry_run {
@@ -240,6 +271,7 @@ pub fn run(
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
                 spool: *spool,
+                keys,
             };
             let report = match from {
                 Some(from) => volume::restore::restore_unit(
@@ -316,7 +348,11 @@ pub fn run(
             scratch,
             overwrite,
             no_space_check,
+            key,
         } => {
+            // Item 107: refused by name before anything else, as `restore
+            // unit` does.
+            let keys = crate::crypto::keys::KeyFile::read_all(key)?;
             // Issue #241: unlike `restore unit`, this has no preview. The
             // catalog check of `--file` runs before any tape contact (issue
             // #406), but proving the entry is really in the archive still
@@ -338,6 +374,7 @@ pub fn run(
                 no_space_check: *no_space_check,
                 // `restore file` always spools the slices it reads.
                 spool: false,
+                keys,
             };
             // Issue #435: no `--from` restores from the loaded tape; the
             // volume is then the one File 0 named.
@@ -400,8 +437,11 @@ pub fn run(
             no_space_check,
             spool,
             fail_fast,
+            key,
             dry_run,
         } => {
+            // Item 107: refused by name before anything else.
+            let keys = crate::crypto::keys::KeyFile::read_all(key)?;
             // Issue #435: no label restores from the loaded tape, which File
             // 0 names; the units are then listed from that volume once it is
             // known. A dry run opens no drive, so it cannot.
@@ -413,6 +453,7 @@ pub fn run(
                 overwrite: *overwrite,
                 no_space_check: *no_space_check,
                 spool: *spool,
+                keys,
             };
             let report = match label {
                 Some(label) => {
