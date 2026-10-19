@@ -1900,3 +1900,95 @@ fn decrypt_chunks(
         Err(e) => Err(e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(bytes: &[u8]) -> [u8; 32] {
+        sha2::Sha256::digest(bytes).into()
+    }
+
+    /// The clean path hashes no plaintext: a slice's first read keeps no
+    /// running hash (the ciphertext hash is its proof), and when a spooled
+    /// slice's plaintext is wanted anyway it is read back from its file.
+    #[test]
+    fn a_first_read_keeps_no_running_hash_and_a_spooled_file_is_hashed_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restore.1.dar");
+        let mut out = SliceOut::new(SliceSink::File(&path), 1);
+        out.begin_attempt();
+        out.open().unwrap();
+        out.write(b"the first half, ").unwrap();
+        out.write(b"and the second").unwrap();
+        assert!(out.plain.is_none(), "a first read hashes nothing");
+        assert_eq!(
+            out.plain_digest().unwrap(),
+            Some(digest(b"the first half, and the second"))
+        );
+        // A second read of a spooled slice keeps no running hash either: the
+        // file is the record.
+        out.begin_attempt();
+        assert!(out.plain.is_none() && !out.unhashed);
+    }
+
+    /// A spooled slice that is not the slice is started over: nothing of it
+    /// survives, not the bytes, the holes, or the file it was tied to.
+    #[test]
+    fn a_reset_forgets_everything_a_spooled_slice_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restore.1.dar");
+        let mut out = SliceOut::new(SliceSink::File(&path), 1);
+        out.begin_attempt();
+        out.bind(b"header-and-nonce");
+        out.write(b"abc").unwrap();
+        out.hole(5).unwrap();
+        assert_eq!((out.delivered, out.holes.len()), (8, 1));
+        out.reset();
+        assert_eq!((out.delivered, out.holes.len(), out.hole_bytes), (0, 0, 0));
+        assert!(out.bound.is_none(), "free to be tied to another file");
+        assert!(!path.exists(), "the spooled bytes are gone");
+        out.write(b"xy").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"xy");
+    }
+
+    /// A slice is tied to the age file that delivered its first bytes, and to
+    /// that one only.
+    #[test]
+    fn a_slice_is_tied_to_the_first_file_that_wrote_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restore.1.dar");
+        let mut out = SliceOut::new(SliceSink::File(&path), 1);
+        out.bind(b"first");
+        out.bind(b"second");
+        assert_eq!(out.bound.as_deref(), Some(&b"first"[..]));
+    }
+
+    fn damage(holes: Vec<Range<u64>>) -> Damage {
+        Damage {
+            slice_number: 7,
+            volume: "L6-0001".into(),
+            reason: "why".into(),
+            holes,
+        }
+    }
+
+    /// Both kinds of damage say the slice is unproven; only one has holes.
+    #[test]
+    fn damage_says_unproven_with_holes_or_without() {
+        let holed = damage(vec![0..65536, 131072..131073]).describe();
+        assert!(holed.contains("slice 7 on L6-0001"), "{holed}");
+        assert!(
+            holed.contains("2 hole(s) of zeros, 65537 byte(s)"),
+            "{holed}"
+        );
+        assert!(holed.contains("0..65536, 131072..131073"), "{holed}");
+        assert!(holed.contains("unproven"), "{holed}");
+        let bare = damage(Vec::new()).describe();
+        assert!(bare.contains("slice 7 on L6-0001"), "{bare}");
+        assert!(
+            bare.contains("unproven") && !bare.contains("hole"),
+            "{bare}"
+        );
+    }
+}
