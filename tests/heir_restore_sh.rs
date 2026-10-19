@@ -6308,3 +6308,761 @@ fn a_file_dar_and_the_check_both_find_is_listed_once() {
     assert!(text.contains("FILL COMPLETE"), "{text}");
     assert!(same_tree(&checked.src, Path::new(&dest)), "{text}");
 }
+
+// ---- the second fresh read of File 1 (2026-10-19, ADR-0012 item 81, #477) ----
+//
+// The commands the new text shows are run as written, against the fake tape
+// and the real dar, as the earlier ones above are.
+
+/// Run `lines` of the guide in `work` against the fake tape. `errexit` stops at
+/// the first failing line (`bash -e`); the commands that expect dar to fail run
+/// without it, as a person typing them one at a time would.
+fn run_guide(
+    h: &Heir,
+    work: &Path,
+    lines: &[String],
+    subs: &[(&str, String)],
+    errexit: bool,
+) -> (bool, String) {
+    let mut script = lines.join("\n");
+    for (from, to) in subs {
+        script = script.replace(from, to);
+    }
+    let mut cmd = Command::new("bash");
+    if errexit {
+        cmd.arg("-e");
+    }
+    let o = cmd
+        .args(["-o", "pipefail", "-c", &script])
+        .current_dir(work)
+        .env("PATH", &h.path)
+        .env("FAKE_TAPE", &h.dir)
+        .env("HOME", h.dir.join("home"))
+        .output()
+        .expect("spawn bash");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    (o.status.success(), text)
+}
+
+/// The front index's entries as (position, type, size_bytes, sha256_encrypted),
+/// read from the `front_index.toml` that the guide's step 3 wrote into `work`.
+fn front_index_entries(work: &Path) -> Vec<(String, String, String, String)> {
+    let fi = std::fs::read_to_string(work.join("front_index.toml")).unwrap();
+    fi.split("[[files]]")
+        .skip(1)
+        .map(|chunk| {
+            let get = |key: &str| {
+                chunk
+                    .lines()
+                    .find_map(|l| l.strip_prefix(&format!("{key} = ")))
+                    .map(|v| v.trim_matches('"').to_string())
+                    .unwrap_or_default()
+            };
+            (
+                get("position"),
+                get("type"),
+                get("size_bytes"),
+                get("sha256_encrypted"),
+            )
+        })
+        .collect()
+}
+
+/// Steps 1-3 of the guide's manual path: block mode, File 0, File 3. Leaves
+/// `file0.txt` and `front_index.toml` in a fresh `work` directory.
+fn manual_front(h: &Heir, manual: &str, name: &str) -> PathBuf {
+    let work = h.dir.join(name);
+    std::fs::create_dir_all(&work).unwrap();
+    for needle in ["setblk 524288", "> file0.txt", "> front_index.toml"] {
+        let (ok, text) = run_guide(h, &work, &guide_block(manual, needle), &[], true);
+        assert!(ok, "{needle}: {text}");
+    }
+    work
+}
+
+/// Step 5 of the guide for one envelope entry: read, trim, check, decrypt and
+/// (when it opens) unpack into `work/env`. Returns whether `key` opened it, and
+/// the output of the guide's commands.
+fn manual_open_envelope(
+    h: &Heir,
+    manual: &str,
+    work: &Path,
+    key: &str,
+    entry: &(String, String, String, String),
+) -> (bool, String) {
+    let (pos, _, size, sha) = entry;
+    let subs = [
+        ("POSITION", pos.clone()),
+        ("SIZE", size.clone()),
+        ("YOUR_KEY.age.key", h.key(key)),
+    ];
+    let (ok, text) = run_guide(h, work, &guide_block(manual, "> envelope.tar"), &subs, true);
+    if !ok {
+        assert!(
+            text.contains("no identity matched any of the recipients"),
+            "a key that does not open an envelope says so: {text}"
+        );
+        return (false, text);
+    }
+    assert!(
+        text.contains(sha),
+        "the sha256sum printed equals the front index's: {text}"
+    );
+    let _ = std::fs::remove_dir_all(work.join("env"));
+    let (ok, text2) = run_guide(
+        h,
+        work,
+        &guide_block(manual, "tar xf envelope.tar"),
+        &[],
+        true,
+    );
+    assert!(ok, "{text2}");
+    (true, text)
+}
+
+/// The names `grep -E '^(name|uuid|snapshot_version) =' env/MANIFEST.toml`
+/// prints, the guide's own line for step 6.
+fn manual_unit_names(h: &Heir, manual: &str, work: &Path) -> Vec<String> {
+    let (ok, text) = run_guide(
+        h,
+        work,
+        &guide_block(manual, "snapshot_version) ="),
+        &[],
+        true,
+    );
+    assert!(ok, "{text}");
+    text.lines()
+        .filter_map(|l| l.strip_prefix("name = "))
+        .map(|v| v.trim_matches('"').to_string())
+        .collect()
+}
+
+/// S1: with the escrow (or operator) key the first envelope that decrypts is a
+/// TENANT's and lists that tenant's units only; the operator envelope lists
+/// every unit. A tenant's key does not open the operator envelope. The guide's
+/// step 5 and 6 commands are the ones run.
+#[test]
+fn file_1_manual_path_with_an_escrow_key_opens_the_operator_envelope_for_every_unit() {
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let manual = guide_section(&guide, "Manual Recovery Steps");
+    let work = manual_front(&h, &manual, "manual-esc");
+    let entries = front_index_entries(&work);
+
+    // In tape order: the first envelope the escrow key opens is a tenant's.
+    let mut first_open: Option<Vec<String>> = None;
+    let mut operator: Option<Vec<String>> = None;
+    for e in &entries {
+        if e.1 != "tenant_envelope" && e.1 != "operator_envelope" {
+            continue;
+        }
+        let (opened, _) = manual_open_envelope(&h, &manual, &work, "esc", e);
+        assert!(opened, "the escrow key opens every envelope: {e:?}");
+        let names = manual_unit_names(&h, &manual, &work);
+        if first_open.is_none() {
+            assert_eq!(e.1, "tenant_envelope", "tenant envelopes come first");
+            first_open = Some(names.clone());
+        }
+        if e.1 == "operator_envelope" && operator.is_none() {
+            operator = Some(names);
+        }
+    }
+    let first = first_open.expect("an envelope opened");
+    let all = operator.expect("an operator envelope");
+    assert_eq!(first, ["photos/2019", "docs"], "one tenant's units only");
+    let mut want: Vec<String> = template().units.iter().map(|u| u.name.clone()).collect();
+    want.sort();
+    let mut got = all.clone();
+    got.sort();
+    assert_eq!(got, want, "the operator envelope lists every unit");
+    assert!(all.len() > first.len(), "a positive control");
+
+    // (That the operator envelope's tar also lists PLAN.toml, and a tenant's
+    // never does, is pinned in volume::build's tests; this fake tape's
+    // operator envelope is a bare one.)
+
+    // A tenant's key opens a tenant envelope and never the operator's.
+    let work_t = manual_front(&h, &manual, "manual-bob");
+    let mut opened = Vec::new();
+    for e in &front_index_entries(&work_t) {
+        if e.1 != "tenant_envelope" && e.1 != "operator_envelope" {
+            continue;
+        }
+        let (ok, _) = manual_open_envelope(&h, &manual, &work_t, "bob", e);
+        if ok {
+            opened.push(e.1.clone());
+            assert_eq!(
+                manual_unit_names(&h, &manual, &work_t),
+                ["ledgers"],
+                "bob's own units"
+            );
+        }
+    }
+    assert!(!opened.is_empty(), "bob opens his own envelope");
+    assert!(
+        opened.iter().all(|t| t == "tenant_envelope"),
+        "bob never opens the operator envelope: {opened:?}"
+    );
+}
+
+/// S2: the whole-box procedure. `--all` puts several units each into its own
+/// directory under `--to`, and a single unit straight into `--to`; a second
+/// `--all` into a directory that already holds files is refused before the
+/// tape is read, and `--overwrite` would keep a file only the older copy had.
+/// The guide's per-unit `--unit UNIT --to /destination/UNIT` is the way
+/// through: each lands in a directory of its own.
+#[test]
+fn file_1_box_procedure_gives_each_unit_a_directory_of_its_own() {
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let sec = flat(&guide_section(
+        &guide,
+        "The rest of the box: other tapes, copies and the index",
+    ));
+    for needle in [
+        "`--to` must be empty or new (a directory that is not empty is refused)",
+        "A tape that holds the newest version needs no `--version`",
+        "`--overwrite` would keep the files that only the older version had",
+        "move it aside and restore the newer version into an empty one",
+    ] {
+        assert!(sec.contains(needle), "{needle:?}: {sec}");
+    }
+    assert!(
+        sec.contains(
+            "`./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to /destination/UNIT`"
+        ),
+        "the box step names a directory per unit: {sec}"
+    );
+
+    // --all: several units, each into --to/UNIT.
+    let all_dest = h.sub("box-all");
+    let key = h.key("alice");
+    let args = ["--restore", "--key", &key, "--all", "--to", &all_dest];
+    let (code, text) = h.run(&args);
+    assert_eq!(code, 0, "{text}");
+    for name in ["docs", "photos/2019"] {
+        assert!(
+            same_tree(&unit(name).src, &Path::new(&all_dest).join(name)),
+            "{name} landed in {all_dest}/{name}"
+        );
+    }
+    // A second --all into the same directory is refused, tape unread.
+    let (code, text) = h.run(&args);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("is not empty"), "{text}");
+    assert!(text.contains("Nothing has been read from tape."), "{text}");
+    // A single unit goes straight into --to, not --to/UNIT.
+    let one = h.sub("box-one");
+    let (code, text) = h.run(&["--restore", "--key", &h.key("bob"), "--all", "--to", &one]);
+    assert_eq!(code, 0, "{text}");
+    assert!(same_tree(&unit("ledgers").src, Path::new(&one)), "{text}");
+
+    // The guide's way through: one directory per unit, each restore its own.
+    for name in ["docs", "photos/2019"] {
+        let to = h.sub(&format!("box-units/{name}"));
+        let (code, text) = h.run(&["--restore", "--key", &key, "--unit", name, "--to", &to]);
+        assert_eq!(code, 0, "{name}: {text}");
+        assert!(same_tree(&unit(name).src, Path::new(&to)), "{name}");
+    }
+    // --overwrite replaces what the restore holds and keeps what it does not.
+    let to = h.sub("box-units/docs");
+    std::fs::write(Path::new(&to).join("only-in-the-older-copy.txt"), "stale").unwrap();
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &key,
+        "--unit",
+        "docs",
+        "--to",
+        &to,
+        "--overwrite",
+    ]);
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        Path::new(&to).join("only-in-the-older-copy.txt").exists(),
+        "--overwrite keeps a file the archive does not hold"
+    );
+}
+
+/// M13/S3: File 0, read with the guide's `dd | tr | grep` line, shows the
+/// label, uuid, generation and cartridge serial that tell an erased and
+/// rewritten cartridge from the volume the index names; `--where` prints the
+/// uuid of each holder; and a name the index lacks lists the units it has.
+#[test]
+fn file_1_box_commands_show_the_uuid_and_the_units_the_index_lists() {
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let sec = guide_section(
+        &guide,
+        "The rest of the box: other tapes, copies and the index",
+    );
+    let block = guide_block(&sec, "grep -E '^(label|uuid");
+    let work = h.dir.join("box-file0");
+    std::fs::create_dir_all(&work).unwrap();
+    let (ok, text) = run_guide(&h, &work, &block, &[], true);
+    assert!(ok, "{text}");
+    assert!(text.contains(&format!("label = \"{LABEL}\"")), "{text}");
+    assert!(text.contains(&format!("uuid = \"{THIS_UUID}\"")), "{text}");
+    assert!(text.contains("media_type = "), "{text}");
+    assert!(text.contains("cartridge_serial = "), "{text}");
+    // --where prints the uuid of a holder, for the comparison.
+    let (code, text) = h.run(&["--where", "photos/2019", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains(&format!("volume uuid {THIS_UUID}")), "{text}");
+    // The units the index lists, by asking for one it lacks; the script
+    // prints at most 40 (the guide says the first 40).
+    let (code, text) = h.run(&["--where", "nonesuch", "--key", &h.key("esc")]);
+    assert_eq!(code, 1, "{text}");
+    for name in ["docs", "ledgers", "nocat", "photos/2019", "restaged"] {
+        assert!(text.contains(&format!("    {name}\n")), "{name}: {text}");
+    }
+    let script = generate_restore_script_v2(LABEL, template().total_files);
+    assert!(
+        script.contains("sort -u \"$WORK/where.known\" | head -n 40"),
+        "the guide's 'first 40' is the script's"
+    );
+    // The index names holders besides this tape for units that are on it, and
+    // the older version of photos/2019 that is on the other tape only.
+    let (code, text) = h.run(&["--where", "photos/2019", "--key", &h.key("alice")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("tape OTHER02"), "{text}");
+    assert!(text.contains("  Version 1: "), "{text}");
+}
+
+/// M6: RESTORE.sh written for another tape reads the tape in the drive for the
+/// modes that only read it, with the WRONG TAPE box as a reminder; the label it
+/// prints for the tape is the loaded tape's own.
+#[test]
+fn file_1_another_tapes_script_surveys_the_loaded_tape() {
+    let h = Heir::new();
+    std::fs::write(
+        h.dir.join("RESTORE.sh"),
+        generate_restore_script_v2("OTHER99", template().total_files),
+    )
+    .unwrap();
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("WRONG TAPE?"), "{text}");
+    assert!(
+        text.contains(&format!("=== tapectl volume: {LABEL} ===")),
+        "{text}"
+    );
+    assert!(text.contains("Verdict: SEALED"), "{text}");
+    let (code, text) = h.run(&["--where", "ledgers", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("WRONG TAPE?"), "{text}");
+    assert!(text.contains("Unit ledgers (tenant bob):"), "{text}");
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("ledgers"), "{text}");
+}
+
+/// Read slice `n` of `unit` with the guide's step 7 commands, leaving
+/// `restore.N.dar` in `dir`: wind to its file, then the guide's slice block.
+fn manual_read_slice(
+    h: &Heir,
+    manual: &str,
+    dir: &Path,
+    key: &str,
+    sl: &tapectl::volume::manifest::ManifestSlice,
+) {
+    let wind = vec![
+        "mt -f /dev/nst0 rewind".to_string(),
+        format!("mt -f /dev/nst0 fsf {}", sl.tape_position),
+    ];
+    let (ok, text) = run_guide(h, dir, &wind, &[], true);
+    assert!(ok, "{text}");
+    let (ok, text) = run_guide(
+        h,
+        dir,
+        &guide_block(manual, "> restore.NUMBER.dar"),
+        &[
+            ("SHA256_ENCRYPTED", sl.sha256_encrypted.clone()),
+            ("ENCRYPTED_BYTES", sl.encrypted_bytes.to_string()),
+            ("NUMBER", sl.number.to_string()),
+            ("YOUR_KEY.age.key", h.key(key)),
+        ],
+        true,
+    );
+    assert!(ok, "slice {}: {text}", sl.number);
+}
+
+/// The files (not directories) whose data touches slice `lost`, from the
+/// guide's `dar -l CATALOGUE -T slice -N -Q`.
+fn files_touching_slice(work: &Path, stem: &str, lost: i64) -> Vec<String> {
+    let o = Command::new("dar")
+        .args(["-l", &format!("env/catalogs/{stem}"), "-T", "slice", "-N", "-Q"])
+        .current_dir(work)
+        .output()
+        .expect("dar -l");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let text = String::from_utf8_lossy(&o.stdout).to_string();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((range, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        let (lo, hi) = match range.trim().split_once('-') {
+            Some((a, b)) => (a.parse::<i64>(), b.parse::<i64>()),
+            None => (range.trim().parse::<i64>(), range.trim().parse::<i64>()),
+        };
+        let (Ok(lo), Ok(hi)) = (lo, hi) else { continue };
+        // "[InRef][ ]  [-L-][-----][ ] -rw-rw-r-- sub/file"
+        let mut cols = rest.split_whitespace();
+        let perm = cols.by_ref().find(|c| c.len() == 10 && c.contains('r'));
+        if perm.is_none_or(|p| !p.starts_with('-')) {
+            continue;
+        }
+        let name: Vec<&str> = cols.collect();
+        if (lo..=hi).contains(&lost) {
+            out.push(name.join(" "));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// S5: with no other copy of a slice, the guide's by-hand commands restore
+/// every file the passing slices hold. dar does not stop at the gap: it names
+/// each file it left (`not restored (user choice)`), leaves an empty or short
+/// file of that name, exits 0, and counts them under "ignored"; RECOVERY.md's
+/// `sha256sum` line then names those leftovers. With the LAST slice gone dar
+/// stops (the guide's words), and `-0` restores the files before the break.
+#[test]
+fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let manual = guide_section(&guide, "Manual Recovery Steps");
+    let damaged = guide_section(&guide, "If a slice or a file is damaged");
+    let g = flat(&damaged);
+    for needle in [
+        "leave the failed slices out: do not decrypt them, and do not put empty files in their place",
+        "this is the one time a gap in the numbering is right",
+        "For each of the others it prints `PATH not restored (user choice)`",
+        "leaves a file of that name that is EMPTY or short",
+        "The exit status is 0",
+        "so a status of 0 does not mean the unit is whole",
+        "`dar -l env/catalogs/NAME -T slice -N -Q`",
+        "(\"The last file of the set is not present\", exit status 4)",
+        "add `-0` (sequential read)",
+        "tapectl is the program that wrote this tape",
+        "`tapectl_version`",
+        "reads around a damaged 64 KiB piece of a slice",
+        "type `done` when it asks for another cartridge",
+    ] {
+        assert!(g.contains(needle), "{needle:?}: {g}");
+    }
+    assert!(
+        !g.contains("http"),
+        "no URL is given for tapectl: {g}"
+    );
+
+    // Alice's envelope, by the guide's step 5, then the manifest.
+    let work = manual_front(&h, &manual, "manual-gap");
+    let entry = front_index_entries(&work)
+        .into_iter()
+        .find(|e| {
+            e.1 == "tenant_envelope" && manual_open_envelope(&h, &manual, &work, "alice", e).0
+        })
+        .expect("alice's envelope");
+    let _ = entry;
+    let manifest = tapectl::volume::manifest::Manifest::from_toml(
+        &std::fs::read_to_string(work.join("env/MANIFEST.toml")).unwrap(),
+    )
+    .unwrap();
+    let unit = manifest
+        .units
+        .iter()
+        .find(|u| u.name == "photos/2019")
+        .expect("photos/2019 is alice's");
+    let n = unit.slices.len();
+    assert!(n >= 5, "a unit with a middle to lose: {n} slices");
+    let lost = 3i64;
+    let stem = format!("{}_v{}", &unit.uuid[..8], unit.snapshot_version);
+
+    // Step 7, leaving slice 3 out: the guide's first-position block, its slice
+    // block for each slice that passes, and its `fsf COUNT` over the gap.
+    let dir = h.dir.join("gap");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (ok, text) = run_guide(
+        &h,
+        &dir,
+        &guide_block(&manual, "FIRST_POSITION"),
+        &[("FIRST_POSITION", unit.slices[0].tape_position.to_string())],
+        true,
+    );
+    assert!(ok, "{text}");
+    let mut head = unit.slices[0].tape_position;
+    for sl in &unit.slices {
+        if sl.number == lost {
+            continue;
+        }
+        if sl.tape_position > head {
+            let (ok, text) = run_guide(
+                &h,
+                &dir,
+                &guide_block(&manual, "fsf COUNT"),
+                &[("COUNT", (sl.tape_position - head).to_string())],
+                true,
+            );
+            assert!(ok, "{text}");
+        }
+        let (ok, text) = run_guide(
+            &h,
+            &dir,
+            &guide_block(&manual, "> restore.NUMBER.dar"),
+            &[
+                ("SHA256_ENCRYPTED", sl.sha256_encrypted.clone()),
+                ("ENCRYPTED_BYTES", sl.encrypted_bytes.to_string()),
+                ("NUMBER", sl.number.to_string()),
+                ("YOUR_KEY.age.key", h.key("alice")),
+            ],
+            true,
+        );
+        assert!(ok, "slice {}: {text}", sl.number);
+        head = sl.tape_position + 1;
+    }
+    assert!(!dir.join(format!("restore.{lost}.dar")).exists());
+    assert!(dir.join("restore.2.dar").exists() && dir.join("restore.4.dar").exists());
+    // The catalogue (env/catalogs/..) is read from the envelope's directory.
+    std::os::unix::fs::symlink(work.join("env"), dir.join("env")).unwrap();
+
+    // The guide's three lines, into an empty directory.
+    let dest = h.sub("gap-restored");
+    std::fs::create_dir_all(&dest).unwrap();
+    let (_, text) = run_guide(
+        &h,
+        &dir,
+        &guide_block(&damaged, "dar -x restore -R /destination"),
+        &[("/destination", dest.clone())],
+        false,
+    );
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("0"), "dar exits 0 over the gap: {text}");
+    let named: Vec<String> = lines
+        .filter_map(|l| l.strip_suffix(" not restored (user choice)"))
+        .filter_map(|p| p.strip_prefix(&format!("{dest}/")))
+        .map(str::to_string)
+        .collect();
+    let mut want = files_touching_slice(&dir, &stem, lost);
+    let mut got = named.clone();
+    want.sort();
+    got.sort();
+    assert!(!want.is_empty(), "a positive control: files touch slice 3");
+    assert_eq!(got, want, "dar names the files whose slices are gone");
+    let log = std::fs::read_to_string(dir.join("dar.log")).unwrap();
+    let ignored: usize = log
+        .lines()
+        .find_map(|l| l.trim().strip_suffix(" inode(s) ignored (excluded by filters)"))
+        .expect("dar's summary line")
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(ignored >= named.len(), "counted as ignored: {log}");
+    // Every other file is exactly the source; the named ones are empty or short.
+    let src = &unit_on_tape("photos/2019").src;
+    let mut intact = 0;
+    for f in ["file0.bin", "file1.bin", "file2.bin", "file3.bin", "file4.bin"] {
+        let (a, b) = (src.join(f), Path::new(&dest).join(f));
+        if named.iter().any(|n| n == f) {
+            let len = std::fs::metadata(&b).map(|m| m.len()).unwrap_or(0);
+            assert!(
+                len < std::fs::metadata(&a).unwrap().len(),
+                "{f}: a leftover, not the file"
+            );
+        } else {
+            assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap(), "{f}");
+            intact += 1;
+        }
+    }
+    assert!(intact >= 1, "some file came back whole");
+
+    // RECOVERY.md's sha256sum line names the leftovers (and only those).
+    let recovery = std::fs::read_to_string(work.join("env/RECOVERY.md")).unwrap();
+    let line = recovery
+        .lines()
+        .find(|l| l.starts_with("V=1 U="))
+        .expect("RECOVERY.md's by-hand line")
+        .replace("V=1 U='photos/2019'", &format!("V={} U='photos/2019'", unit.snapshot_version))
+        .replace("/destination", &dest);
+    let (_, text) = run_guide(&h, &work.join("env"), &[line], &[], false);
+    let failed: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_suffix(": FAILED"))
+        .filter(|p| p.ends_with(".bin"))
+        .collect();
+    let mut failed: Vec<String> = failed.iter().map(|s| s.to_string()).collect();
+    failed.sort();
+    let mut want_files: Vec<String> = named.iter().filter(|n| n.ends_with(".bin")).cloned().collect();
+    want_files.sort();
+    assert_eq!(failed, want_files, "the hash check names the leftovers: {text}");
+
+    // The LAST slice gone: dar stops at once; -0 restores up to the break.
+    let last = unit.slices.last().unwrap();
+    let dir2 = h.dir.join("gap-last");
+    std::fs::create_dir_all(&dir2).unwrap();
+    for sl in unit.slices.iter().filter(|s| s.number != last.number) {
+        manual_read_slice(&h, &manual, &dir2, "alice", sl);
+    }
+    std::os::unix::fs::symlink(work.join("env"), dir2.join("env")).unwrap();
+    let dest2 = h.sub("gap-last-restored");
+    std::fs::create_dir_all(&dest2).unwrap();
+    let dar = |extra: &str, to: &str| -> (bool, String) {
+        let cmd = format!("dar -x restore {extra} -R {to} -O -Q -N > dar.log 2>&1; echo $?; cat dar.log");
+        run_guide(&h, &dir2, &[cmd], &[], false)
+    };
+    let (_, text) = dar("", &dest2);
+    assert!(
+        text.lines().next() != Some("0")
+            && text.contains("The last file of the set is not present"),
+        "dar stops when the last slice is gone: {text}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&dest2).unwrap().count(),
+        0,
+        "and restores nothing"
+    );
+    let dest3 = h.sub("gap-last-sequential");
+    std::fs::create_dir_all(&dest3).unwrap();
+    let (_, text) = dar("-0", &dest3);
+    assert!(text.lines().next() != Some("0"), "stops at the break: {text}");
+    let mut whole = 0;
+    let mut absent = 0;
+    for f in ["file0.bin", "file1.bin", "file2.bin", "file3.bin", "file4.bin"] {
+        let (a, b) = (src.join(f), Path::new(&dest3).join(f));
+        match std::fs::read(&b) {
+            Ok(bytes) if bytes == std::fs::read(&a).unwrap() => whole += 1,
+            Ok(_) => assert!(
+                text.contains(&format!("{f} not restored (user choice)")),
+                "a short file is named: {f}: {text}"
+            ),
+            Err(_) => absent += 1,
+        }
+    }
+    assert!(whole >= 1, "files before the break come back whole: {text}");
+    assert!(absent >= 1 || text.contains("not restored (user choice)"), "{text}");
+}
+
+fn unit_on_tape(name: &str) -> UnitOnTape {
+    unit(name)
+}
+
+/// S4: how to tell a unit was stored compressed. The guide says to look in
+/// MANIFEST.toml's `dar_command` for an argument that starts `-z`, written
+/// `\"-zgzip\"` there. Here the command is the one tapectl really records
+/// (`spawn_archive`), put through the real manifest writer, and the guide's own
+/// `grep` run on the result; an uncompressed run has no such argument. And the
+/// catalogue cannot tell: its compression column is `-----` for a compressed
+/// file, as the guide says.
+#[test]
+fn file_1_says_how_to_tell_a_compressed_unit_and_it_works() {
+    use tapectl::dar::create::{spawn_archive, DarCreateParams};
+    use tapectl::volume::layout::generate_manifest_toml;
+
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let disk = guide_section(&guide, "Disk space");
+    let f = flat(&disk);
+    for needle in [
+        "up to about TWICE a unit's size",
+        "Doing it by hand (\"Manual Recovery Steps\") is the same",
+        "For a whole box, the destination needs the sum of the sizes of the units you restore",
+        "**Compressed units.**",
+        "`grep '^dar_command' env/MANIFEST.toml`",
+        "An argument that starts `-z`, as in `\\\"-zgzip\\\"`",
+        "shows `-----` in its compression column either way",
+    ] {
+        assert!(f.contains(needle), "{needle:?}: {f}");
+    }
+    assert!(
+        !f.contains("need no more than that"),
+        "the old ceiling sentence contradicted the spool rule: {f}"
+    );
+    let grep_line = disk
+        .split('`')
+        .find(|c| c.starts_with("grep '^dar_command'"))
+        .expect("the guide's grep");
+
+    let src = h.dir.join("compress-src");
+    std::fs::create_dir_all(&src).unwrap();
+    let text: String = "some compressible text line\n".repeat(20_000);
+    std::fs::write(src.join("text.txt"), &text).unwrap();
+    let recorded = |compression: &str| -> String {
+        let catalogue = h.dir.join(format!("fly-{compression}"));
+        let mut stream = spawn_archive(&DarCreateParams {
+            dar_binary: "dar",
+            source_path: &src,
+            compression,
+            exclude_patterns: &[],
+            exclude_paths: &[],
+            preserve_xattrs: true,
+            preserve_fsa: true,
+            on_fly_catalogue: &catalogue,
+        })
+        .expect("dar -c -");
+        let command = stream.dar_command.clone();
+        let mut out = stream.take_stdout();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut out, &mut bytes).unwrap();
+        drop(out);
+        stream.finish().expect("dar finished");
+        if compression != "none" {
+            assert!(
+                bytes.len() < text.len() / 4,
+                "a positive control: the archive is compressed ({} bytes)",
+                bytes.len()
+            );
+        }
+        command
+    };
+    for (compression, expect) in [("gzip", true), ("none", false)] {
+        let unit = ManifestUnit {
+            name: "u".into(),
+            uuid: "11111111-2222-3333-4444-555555555555".into(),
+            snapshot_version: 1,
+            stage_set_id: 1,
+            dar_version: Some("2.7.13".into()),
+            dar_command: Some(recorded(compression)),
+            slices: vec![],
+        };
+        let work = h.dir.join(format!("compress-{compression}"));
+        std::fs::create_dir_all(work.join("env")).unwrap();
+        std::fs::write(
+            work.join("env/MANIFEST.toml"),
+            generate_manifest_toml("V", "t", std::slice::from_ref(&unit)),
+        )
+        .unwrap();
+        let (ok, out) = run_guide(&h, &work, &[grep_line.to_string()], &[], true);
+        assert!(ok, "{out}");
+        let marked = out.contains(&format!("\\\"-z{compression}\\\""));
+        assert_eq!(marked, expect, "{compression}: {out}");
+        if !expect {
+            assert!(!out.contains("\\\"-z"), "no -z argument when uncompressed: {out}");
+        }
+    }
+
+    // The catalogue's compression column is blank of information either way.
+    let dir = h.dir.join("compress-cat");
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |args: &[&str]| {
+        let o = Command::new("dar").args(args).current_dir(&dir).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    run(&["-c", "arch", "-R", src.to_str().unwrap(), "-zgzip", "-N", "-Q"]);
+    run(&["-C", "cat", "-A", "arch", "-N", "-Q"]);
+    let listing = run(&["-l", "cat", "-N", "-Q"]);
+    assert!(
+        listing.lines().any(|l| l.contains("text.txt") && l.contains("[-----]")),
+        "{listing}"
+    );
+    let real = run(&["-l", "arch", "-N", "-Q"]);
+    assert!(
+        real.lines().any(|l| l.contains("text.txt") && !l.contains("[-----]")),
+        "the archive itself does show a ratio, which the envelope lacks: {real}"
+    );
+}

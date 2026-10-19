@@ -10247,4 +10247,500 @@ sha256_encrypted = \"bbb\"
             }
         }
     }
+    // ---- the second fresh-reader read of File 1 (2026-10-19, ADR-0012 item 81, #477) ----
+    //
+    // Five serious gaps (S1-S5) and nine smaller ones (M6-M14). The commands the
+    // fixes show are run in tests/heir_restore_sh.rs; here are the words.
+
+    /// S2: a short "Start here" is the first section, and every section it
+    /// names is a real heading of the guide.
+    #[test]
+    fn reread2_s2_start_here_comes_first_and_names_sections_that_exist() {
+        let g = guide17();
+        let start = g.find("## Start here").expect("a Start here section");
+        assert!(start < g.find("## Words this guide uses").unwrap());
+        let sec = flat_text(guide_section(&g, "Start here"));
+        for needle in [
+            "Check your key: \"Which file is your key\". A tenant's key opens that tenant's units only; the operator key and the escrow key open every tenant's",
+            "Run `./RESTORE.sh --info` on EVERY tape you hold",
+            "Start from the NEWEST tape",
+            "`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` shows, for a unit, every version and every tape that holds it",
+            "restore each unit's NEWEST version once, from a tape that holds it, into a directory of its own (`/destination/UNIT`), with that tape's own RESTORE.sh, and never an older version first",
+            "Check each restore: \"Did the restore get everything?\"",
+            "Know when you are done",
+            "\"Manual Recovery Steps\" does the same job by hand",
+            "\"If All Else Fails\"",
+        ] {
+            assert!(sec.contains(needle), "{needle:?}: {sec}");
+        }
+        // Every quoted section name is a heading (or a prefix of one).
+        let headings: Vec<&str> = g
+            .lines()
+            .filter_map(|l| l.strip_prefix("## "))
+            .collect();
+        let mut named = 0;
+        for quoted in sec.split('"').skip(1).step_by(2) {
+            if ["Sealed at", "Verdict:"].contains(&quoted) || quoted.starts_with("`") {
+                continue;
+            }
+            // Only titles: a quoted string that is a heading's start.
+            if headings.iter().any(|h| h.starts_with(quoted)) {
+                named += 1;
+            } else {
+                // Quotes that are not section names.
+                assert!(
+                    ["Sealed at"].contains(&quoted) || quoted.len() > 60,
+                    "{quoted:?} is not a heading of the guide: {headings:#?}"
+                );
+            }
+        }
+        assert!(named >= 8, "the sequence points to sections: {sec}");
+        // Short: a page, not a chapter.
+        assert!(guide_section(&g, "Start here").lines().count() <= 45);
+    }
+
+    /// S1: with the escrow or operator key the first envelope that opens is a
+    /// tenant's; the manual path and rung 3 say to take the operator envelope.
+    #[test]
+    fn reread2_s1_the_escrow_key_takes_the_operator_envelope_not_the_first_that_opens() {
+        let g = guide17();
+        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
+        for needle in [
+            "Which one to open depends on your key",
+            "A tenant's key opens that tenant's `tenant_envelope` and no other, so the first that decrypts is yours",
+            "The operator key and the escrow key open EVERY envelope, and the tenant envelopes come first: the first that decrypts is then one tenant's, and its MANIFEST.toml lists that tenant's units and no one else's",
+            "For all the units on the tape open the `operator_envelope` instead, whose MANIFEST.toml lists every unit",
+            "With a tenant's key the first that decrypts is yours; with the operator or escrow key you choose, as above",
+            "`env/MANIFEST.toml` describes the units of the envelope you opened",
+            "grep -E '^(name|uuid|snapshot_version) =' env/MANIFEST.toml",
+        ] {
+            assert!(manual.contains(needle), "{needle:?}: {manual}");
+        }
+        assert!(
+            !manual.contains("The first that decrypts is yours."),
+            "the unconditional claim is gone"
+        );
+        assert!(!manual.contains("describes your units"));
+        let ladder = flat_text(guide_section(&g, "If All Else Fails"));
+        for needle in [
+            "With the operator or escrow key do not stop there: the tenants' envelopes come first and each lists only one tenant's units, so keep going to the operator envelope, the one whose tar also lists `PLAN.toml` (a tenant's never does), and whose MANIFEST.toml lists every unit on the tape",
+            "Once the envelope you want decrypts, unpack it",
+            "every slice belonging to the units it lists",
+        ] {
+            assert!(ladder.contains(needle), "{needle:?}: {ladder}");
+        }
+        assert!(
+            !ladder.contains("belonging to your unit(s)"),
+            "rung 3 no longer assumes your envelope is the whole tape"
+        );
+        // The slice-table hint of the verdict section already says the same.
+        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
+        assert!(verdict.contains("decrypt the operator envelope by hand"), "{verdict}");
+    }
+
+    /// S2: the per-tape checks say they are per tape, and the automated recipe
+    /// warns that `--all` is for one tape and that a second one is refused.
+    #[test]
+    fn reread2_s2_the_checks_are_for_one_tape_and_the_box_is_complete_only_by_its_procedure() {
+        let g = guide17();
+        let done = flat_text(guide_section(&g, "Did the restore get everything?"));
+        for needle in [
+            "These checks are for ONE restore, of one unit or one tape's worth, from one tape",
+            "They say nothing about the other tapes and units of a box",
+            "a box is complete only when the procedure in \"The rest of the box\" has been followed to its end",
+        ] {
+            assert!(done.contains(needle), "{needle:?}: {done}");
+        }
+        let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"))
+            .replace(" # ", " ");
+        for needle in [
+            "Full restore of THIS tape to an EMPTY directory",
+            "With other tapes in the box, read \"The rest of the box\" before this: a second --all into the same /destination is refused",
+            "finishes a restore that stopped part way, never one over an older version",
+            "(a single unit goes straight into /destination)",
+        ] {
+            assert!(auto.contains(needle), "{needle:?}: {auto}");
+        }
+        let bx = flat_text(guide_section(
+            &g,
+            "The rest of the box: other tapes, copies and the index",
+        ));
+        for needle in [
+            "`--to` must be empty or new (a directory that is not empty is refused), which is why each unit has its own directory under /destination and not /destination itself",
+            "Do not restore an older version first and then a newer one into the same directory: it is refused as not empty, and `--overwrite` would keep the files that only the older version had",
+            "If a directory already holds an older version, move it aside and restore the newer version into an empty one",
+        ] {
+            assert!(bx.contains(needle), "{needle:?}: {bx}");
+        }
+    }
+
+    /// S3: nothing can name a tape written later; the index does list units
+    /// held only elsewhere; the box can be compared against the newest index;
+    /// the Heir Kit is as old as the day it was made.
+    #[test]
+    fn reread2_s3_the_guide_does_not_claim_a_box_is_known_complete() {
+        let g = guide17();
+        let bx = flat_text(guide_section(
+            &g,
+            "The rest of the box: other tapes, copies and the index",
+        ));
+        for needle in [
+            "**Is the box complete?** Nothing on a tape can name tapes written after it, so the newest tape you hold may not be the newest ever written, and no tape can tell you that",
+            "including units held only on OTHER tapes",
+            "a holder the index names that you do not have is a tape to look for",
+            "a unit, or the newest version of a unit, whose every holder is missing is not in this box",
+            "ask `--where` for a name it does not have: it answers that the name is not in the index and prints the units it does list (the first 40)",
+            "The Heir Kit, if you have one (\"Words this guide uses\"), records the archive as of the day it was made",
+            "one made after your newest tape was written may name tapes this box lacks",
+            "You are done when every unit the newest index lists is restored at its newest version (or the best you could reach) and every tape in the box has been looked at",
+            "That is the most a box can show about itself",
+            "If no holder of a unit's newest version is in the box, the highest version you can reach is the best this box can give",
+        ] {
+            assert!(bx.contains(needle), "{needle:?}: {bx}");
+        }
+        assert!(
+            !bx.contains("It never names a tape written after it, and a tape it names may since have been retired or erased. So the NEWEST tape's index is the most complete: start with the newest tape you have (`./RESTORE.sh --info` prints \"Sealed at\"), and expect an older tape to know less. A tape written before 1.3.0 has no index and says so. The index is plain text in the envelope (`index/` in the unpacked envelope; RECOVERY.md shows how to read it with `awk`), so it needs no tapectl either. The whole box")
+        );
+        let words = flat_text(guide_section(&g, "Words this guide uses"));
+        assert!(words.contains("It records the archive as of the day it was made, which may be before the newest tape was written"), "{words}");
+    }
+
+    /// S4: one rule for disk space, no contradiction between "no more than
+    /// the capacity" and "about twice".
+    #[test]
+    fn reread2_s4_disk_space_is_one_rule() {
+        let g = guide17();
+        let disk = flat_text(guide_section(&g, "Disk space"));
+        for needle in [
+            "so everything on it takes at most that on the tape. Restored, its files take about as much room as they took on the tape, and more for a unit that was stored compressed",
+            "`--to` needs room for about the size of the units you restore",
+            "`--find-envelope` lists each unit with its size, and so does `--where`",
+            "need more room, up to about TWICE a unit's size (its slices, then its restored files)",
+            "the older-dar fallback above (all of the unit's slices), `--path` (only the few slices that hold the path), and asking for a replacement slice",
+            "Doing it by hand (\"Manual Recovery Steps\") is the same: the decrypted slices and the restored files, about twice the unit's size; delete a unit's slices once it is restored",
+            "For a whole box, the destination needs the sum of the sizes of the units you restore, whichever tapes they come from; the extra room for slices is needed for one unit at a time",
+            "**Compressed units.**",
+            "The dar catalogue cannot tell you",
+            "With no `dar_command` line, allow generously",
+        ] {
+            assert!(disk.contains(needle), "{needle:?}: {disk}");
+        }
+        assert!(!disk.contains("need no more than that"), "{disk}");
+        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
+        assert!(
+            manual.contains("about the unit's size, and as much again for step 8's restored files: about twice the unit's size in all"),
+            "{manual}"
+        );
+        // The unknown-generation ceiling says the same.
+        let unknown = flat_text(&generate_system_guide_v2_for_media("U", 30, "DLT-IV"));
+        assert!(
+            unknown.contains("so everything on it takes at most that on the tape. Restored, its files take about as much room as they took on the tape"),
+            "{unknown}"
+        );
+    }
+
+    /// S5: a damaged only copy has commands, by RESTORE.sh and by hand, and
+    /// says what tapectl is. The dar behaviour is run in heir_restore_sh.rs.
+    #[test]
+    fn reread2_s5_a_damaged_only_copy_has_commands_and_says_what_tapectl_is() {
+        let g = guide17();
+        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
+        assert!(
+            verdict.contains("the files that lie wholly inside them can be restored by hand: \"If a slice or a file is damaged\" has the commands under \"No other copy\""),
+            "{verdict}"
+        );
+        assert!(!verdict.contains("but nothing here promises it"), "{verdict}");
+        let sec = guide_section(&g, "If a slice or a file is damaged");
+        let f = flat_text(sec);
+        for needle in [
+            "**No other copy.**",
+            "RESTORE.sh does this for you: run the `--swap-tapes` restore above and type `done` when it asks for another cartridge",
+            "lists the others in `.tapectl-damaged-files.txt`",
+            "By hand, without RESTORE.sh, do the steps of \"Manual Recovery Steps\" for the unit, but leave the failed slices out",
+            "this is the one time a gap in the numbering is right",
+            "dar does not stop at the gap",
+            "For each of the others it prints `PATH not restored (user choice)`",
+            "If the failed slice is the LAST one, dar stops at once (\"The last file of the set is not present\", exit status 4) and restores nothing; add `-0` (sequential read)",
+            "tapectl is the program that wrote this tape (File 0 names its release in `tapectl_version`); it is open-source software",
+            "reads around a damaged 64 KiB piece of a slice",
+            "the `age` program stops at the first damaged piece",
+        ] {
+            assert!(f.contains(needle), "{needle:?}: {f}");
+        }
+        assert!(
+            sec.lines().any(|l| l.trim()
+                == "dar -x restore -R /destination -O -Q -N > dar.log 2>&1"),
+            "{sec}"
+        );
+        assert!(
+            sec.lines()
+                .any(|l| l.trim() == "grep 'not restored (user choice)' dar.log"),
+            "{sec}"
+        );
+        assert!(!f.contains("http"), "no URL: {f}");
+        // The manual path points here at the slice that fails its hash, and
+        // its "no gaps" rule has the one exception.
+        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
+        assert!(manual.contains("With no other copy, leave that slice out and go on"), "{manual}");
+        assert!(manual.contains("and no gaps (but for a slice you must leave out"), "{manual}");
+        let done = flat_text(guide_section(&g, "Did the restore get everything?"));
+        assert!(done.contains("\"Ignored (excluded by filters)\" above 0 in a whole-unit restore means dar skipped files"), "{done}");
+    }
+
+    /// M7: the drive table is `Generation::can_read`, row by row, and the
+    /// sentence on one drive for a box holds.
+    #[test]
+    fn reread2_m7_the_box_table_of_drives_follows_the_compatibility_chart() {
+        use crate::media::Generation::{self, *};
+        let g = guide17();
+        let sec = guide_section(&g, "The tape drive");
+        let rows: Vec<(String, String)> = sec
+            .lines()
+            .filter(|l| l.starts_with("    LTO-"))
+            .map(|l| {
+                let l = l.trim();
+                let at = l.find("  ").expect("two columns");
+                (l[..at].to_string(), l[at..].trim().to_string())
+            })
+            .collect();
+        assert_eq!(rows.len(), 7, "{rows:#?}");
+        let all_drives = [Lto1, Lto2, Lto3, Lto4, Lto5, Lto6, Lto7, Lto8, Lto9, Lto10];
+        for (media, read_by) in [
+            ("LTO-5", Lto5),
+            ("LTO-6", Lto6),
+            ("LTO-7", Lto7),
+            ("LTO-7 Type M", Lto7M8),
+            ("LTO-8", Lto8),
+            ("LTO-9", Lto9),
+            ("LTO-10", Lto10),
+        ] {
+            let row = rows.iter().find(|r| r.0 == media).expect(media);
+            let want: Vec<&str> = all_drives
+                .iter()
+                .filter(|d| Generation::can_read(**d, read_by))
+                .map(|d| d.as_str())
+                .collect();
+            let got: Vec<String> = row
+                .1
+                .replace(" or ", ", ")
+                .split(", ")
+                .map(str::to_string)
+                .collect();
+            assert_eq!(got, want, "{media}");
+        }
+        // The prose: an LTO-7 drive reads 5, 6 and 7; an LTO-8 drive reads 7,
+        // 7 Type M and 8; no drive reads both a 6 and an 8.
+        let f = flat_text(sec);
+        assert!(f.contains("An LTO-7 drive reads LTO-5, LTO-6 and LTO-7 cartridges, an LTO-8 drive reads LTO-7, LTO-7 Type M and LTO-8 cartridges"), "{f}");
+        for (drive, reads) in [(Lto7, [Lto5, Lto6, Lto7]), (Lto8, [Lto7, Lto7M8, Lto8])] {
+            for m in reads {
+                assert!(Generation::can_read(drive, m), "{drive:?} {m:?}");
+            }
+        }
+        assert!(all_drives
+            .iter()
+            .all(|d| !(Generation::can_read(*d, Lto6) && Generation::can_read(*d, Lto8))));
+        assert!(f.contains("needs two drives, one after the other"), "{f}");
+        assert!(f.contains("No drive reads every generation"), "{f}");
+    }
+
+    /// M8: how to tell a plain host adapter from a RAID one, the drive-side
+    /// connector, and what a Fibre Channel drive needs.
+    #[test]
+    fn reread2_m8_hba_mode_connectors_and_fibre_channel() {
+        let g = guide17();
+        let load = flat_text(guide_section(
+            &g,
+            "Loading the tape, and a drive that does not show up",
+        ));
+        for needle in [
+            "must run the plain \"IT\" (initiator-target, pass-through) firmware",
+            "`lspci -k` names the kernel driver in use under each adapter",
+            "`mpt3sas` (`mpt2sas` on older cards) is the driver of LSI and Broadcom host adapters, and `megaraid_sas` is the driver of their RAID controllers",
+            "A card on `mpt3sas` can still carry RAID (\"IR\") firmware: the maker's flash tool says which (`sas3flash -list`, or `sas2flash -list` on older cards, prints a Firmware Product ID tagged (IT) or (IR))",
+        ] {
+            assert!(load.contains(needle), "{needle:?}: {load}");
+        }
+        let drive = flat_text(guide_section(&g, "The tape drive"));
+        for needle in [
+            "An internal drive commonly has the SAS drive connector (SFF-8482, the one on a SAS disk)",
+            "the adapter's internal port, commonly SFF-8087 or the newer SFF-8643",
+            "The maker's data sheets for the drive and for the adapter name their connectors, and they, not this text, decide",
+            "A Fibre Channel drive needs a Fibre Channel host adapter (a SAS adapter cannot drive it)",
+            "`qla2xxx` (QLogic) and `lpfc` (Emulex)",
+        ] {
+            assert!(drive.contains(needle), "{needle:?}: {drive}");
+        }
+    }
+
+    /// M9: no tape says which keys it was written for.
+    #[test]
+    fn reread2_m9_nothing_on_a_tape_names_its_keys() {
+        let g = guide17();
+        let key = flat_text(guide_section(&g, "Which file is your key"));
+        for needle in [
+            "Nothing on a tape says which keys it was written for",
+            "`./RESTORE.sh --info`, File 0 and the front index name no recipient",
+            "an age file does not carry the name of the key it is for",
+            "So no tape can be asked which key it wants: try your key on each tape, which `--find-envelope` does",
+            "A key that opens one tape of a box may not open another",
+        ] {
+            assert!(key.contains(needle), "{needle:?}: {key}");
+        }
+        // And it is true of what RESTORE.sh prints and what File 0 holds.
+        let thunk = generate_id_thunk_v2(&IdThunkV2Params {
+            label: "L",
+            uuid: "u",
+            media_type: "LTO-6",
+            tapectl_version: "1.3.0",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: 5,
+            mam_manufacturer: "m",
+            mam_serial: "s",
+            mam_length: 1,
+            mam_loads: 1,
+            created_at: "t",
+            cartridge_identity_source: None,
+        });
+        for word in ["recipient", "age1", "AGE-"] {
+            assert!(!thunk.contains(word), "File 0 names no key ({word}): {thunk}");
+        }
+    }
+
+    /// M10, M11: the terms the guide uses are defined, "File 0's commands" is
+    /// one of them, and the tools are listed for what they are needed for.
+    #[test]
+    fn reread2_m10_m11_the_glossary_and_the_tool_list() {
+        let g = guide17();
+        let words = flat_text(guide_section(&g, "Words this guide uses"));
+        for needle in [
+            "**ID thunk (File 0)**: the first tape file, plain text, that says which tape this is: its `label`, `uuid`, `media_type` (the LTO generation), `cartridge_serial` and `tapectl_version`",
+            "\"File 0's commands\" in this guide means those",
+            "**`requires`**: a line in File 0 and in the seal marker that lists the features a reader must understand to read the tape correctly. It is empty (`requires = []`)",
+            "A version is also called a snapshot: MANIFEST.toml states it as `snapshot_version`, RECOVERY.md as \"snapshot v2\" and RESTORE.sh as \"snapshot version\"",
+            "so the highest number is the newest",
+            "A unit is identified by its `uuid`",
+            "**Installation**: one tapectl setup, with its own catalogue and its own keys",
+            "**Heir Kit, cover sheet**: the papers and files the operator prepares for the person who inherits the archive",
+            "`catalog.db.age`, the whole catalogue encrypted to the escrow key",
+        ] {
+            assert!(words.contains(needle), "{needle:?}: {words}");
+        }
+        let tools = flat_text(guide_section(&g, "Tools Required"));
+        for needle in [
+            "Only for finding the drive and checking a key, never for the restore itself: `ls`, `lsscsi`, `lspci`, `dmesg`, `lsmod`, `modprobe`, `sudo` and `usermod`",
+            "`age-keygen`, which comes with `age` (\"Which file is your key\")",
+            "`wc`, `tail`, `od`",
+        ] {
+            assert!(tools.contains(needle), "{needle:?}: {tools}");
+        }
+        // Everything those lines name is something the guide says to run.
+        let all = flat_text(&g);
+        for tool in ["lsscsi", "lspci", "dmesg", "lsmod", "modprobe", "usermod", "age-keygen"] {
+            assert!(all.matches(tool).count() >= 2, "{tool} is named where it is used");
+        }
+    }
+
+    /// M12: the manual path takes one version of one unit into a directory of
+    /// its own, the highest `snapshot_version`.
+    #[test]
+    fn reread2_m12_manual_steps_take_one_unit_one_version_a_directory() {
+        let g = guide17();
+        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
+        for needle in [
+            "Restore ONE version of ONE unit at a time, each in a directory of its own: the slices of every unit are named `restore.N.dar`, so two units in one directory would overwrite each other",
+            "If the manifest lists the unit more than once, take the block with the highest `snapshot_version`, the newest, unless you want an older one",
+            "A unit stored in several versions has a `[[units]]` block, with its own slices, for each version",
+            "With several units, give each its own directory (`/destination/UNIT`)",
+            "add `-w` (overwrite); never use it to restore a newer version over an older one",
+            "Delete the unit's `restore.N.dar` files once it is restored and checked",
+        ] {
+            assert!(manual.contains(needle), "{needle:?}: {manual}");
+        }
+    }
+
+    /// M13: the retired-or-erased wording agrees with itself, an erased and
+    /// reused cartridge is described, and two tapes are copies only with the
+    /// same unit uuid.
+    #[test]
+    fn reread2_m13_states_erased_cartridges_and_the_uuid() {
+        let g = guide17();
+        let bx = flat_text(guide_section(
+            &g,
+            "The rest of the box: other tapes, copies and the index",
+        ));
+        for needle in [
+            "A tape that was already retired or erased when the index was written is not listed, and one that is listed may have been retired or erased since",
+            "A cartridge that was erased and written again carries a NEW volume: File 0 then shows another label and another `uuid` on the same `cartridge_serial`, and the index row for the old volume names data that is gone",
+            "So match a tape to an index row by its label AND its uuid (`--where` prints the uuid; File 0 shows it)",
+            "dd if=/dev/nst0 bs=512k | tr -d '\\0' | grep -E '^(label|uuid|media_type|cartridge_serial) ='",
+            "A unit that appears at the same version AND with the same unit uuid on two tapes has two copies",
+            "A name and a version number alone prove nothing",
+        ] {
+            assert!(bx.contains(needle), "{needle:?}: {bx}");
+        }
+        assert!(!bx.contains("A retired or erased tape is not listed."), "{bx}");
+        // The File 0 line has `mt -f` and does not trip the tr-for-plain-text count.
+        assert!(!g.contains("tr -d '\\0' | grep") || g.lines().filter(|l| l.contains("| tr -d '\\0' >")).count() == 4);
+    }
+
+    /// M6: which RESTORE.sh to use for the survey and for the restore, how to
+    /// get another tape's, and whether the WRONG TAPE box matters.
+    #[test]
+    fn reread2_m6_which_restore_sh_for_which_job() {
+        let g = guide17();
+        let bx = flat_text(guide_section(
+            &g,
+            "The rest of the box: other tapes, copies and the index",
+        ));
+        for needle in [
+            "(any copy of RESTORE.sh will do for this: see the end of this list)",
+            "The modes that only read the tape (`--info`, `--verify`, `--find-envelope`, `--list`, `--where`, `--find`) describe the tape that is in the drive, whichever tape's RESTORE.sh runs them",
+            "it is only a reminder that the script was written for another volume",
+            "For a restore use the loaded tape's own RESTORE.sh, which was written for that tape's format",
+            "take \"WRONG TAPE?\" during a restore as a sign that the script or the tape is the wrong one",
+            "To get a tape's own script, load that tape and run the four commands at the start of \"Automated Recovery (recommended)\"",
+        ] {
+            assert!(bx.contains(needle), "{needle:?}: {bx}");
+        }
+    }
+
+    /// M14: the device named for `mt` and `dd` is the one RESTORE.sh reads.
+    #[test]
+    fn reread2_m14_the_device_is_set_once_for_the_restore_lines() {
+        let g = guide17();
+        let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"));
+        for needle in [
+            "put your own device in the `mt` and `dd` lines below, and set `TAPE_DEVICE` to the same device once, with `export TAPE_DEVICE=/dev/nstN`",
+            "The `./RESTORE.sh` lines further down read `TAPE_DEVICE`, and without it they read `/dev/nst0`, which may be another drive or another tape",
+            "(the ones File 0 prints for reading this guide)",
+        ] {
+            assert!(auto.contains(needle), "{needle:?}: {auto}");
+        }
+        // It comes before the first RESTORE.sh command.
+        let raw = guide_section(&g, "Automated Recovery (recommended)");
+        assert!(raw.find("export TAPE_DEVICE=/dev/nstN").unwrap() < raw.find("./RESTORE.sh --info").unwrap());
+        let start = flat_text(guide_section(&g, "Start here"));
+        assert!(start.contains("Set `TAPE_DEVICE` to the same device once"), "{start}");
+    }
+
+    /// RECOVERY.md repeats the staleness rule honestly and carries the
+    /// no-other-copy paragraph, without naming a dar catalogue (#449).
+    #[test]
+    fn reread2_recovery_md_says_the_newest_tape_may_not_be_the_newest_ever() {
+        let r = generate_recovery_md("LAB01", "alice", &[], &[]);
+        let f = flat_text(&r);
+        for needle in [
+            "Nothing on a tape can name tapes written after it, so the newest tape you hold may not be the newest ever written",
+            "With no other copy, leave the failed slice out of the steps above: do not decrypt it, and do not put an empty file in its place",
+            "(`dar -x restore -R /destination -O -Q -N > dar.log 2>&1`)",
+            "`PATH not restored (user choice)` (`grep 'not restored (user choice)' dar.log` lists them)",
+            "leaves an EMPTY or short file of that name, which is not the real file; its exit status is still 0",
+            "If the failed slice is the last one, dar stops (\"The last file of the set is not present\"); add `-0`",
+        ] {
+            assert!(f.contains(needle), "{needle:?}: {f}");
+        }
+        assert!(!r.contains("catalogs/") && !r.contains("dar -l"), "{r}");
+    }
 }
