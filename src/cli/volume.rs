@@ -2626,6 +2626,16 @@ pub fn run(
             keep_staging,
         } => {
             use crate::volume::rewrite;
+            // A resume decides what to do from what the drive and the catalog
+            // say when it runs: there is nothing to preview. First statement,
+            // before any lookup (issue #241's rule for a refusal).
+            if dry_run && resume.is_some() {
+                return Err(crate::cli::refuse_dry_run(
+                    "volume rewrite --resume",
+                    "what it would do depends on what the drive and the catalog say \
+                     when it runs; `tapectl staging status` shows the held slices.",
+                ));
+            }
             // Strict, as every write path: a rewrite erases and writes.
             let device = write_device(config, device.as_deref())?;
             // Issue #391: `--fill-ceiling` for this command only (the
@@ -2646,10 +2656,8 @@ pub fn run(
             };
             if dry_run {
                 let (Some(src), Some(dest)) = (source.as_deref(), label.as_deref()) else {
-                    return Err(crate::cli::refuse_dry_run(
-                        "volume rewrite --resume",
-                        "what it would do depends on what the drive and the catalog say \
-                         when it runs; `tapectl staging status` shows the held slices.",
+                    return Err(TapectlError::Other(
+                        "volume rewrite needs SOURCE and --label NEW, or --resume NEW".into(),
                     ));
                 };
                 let plan = rewrite::plan(conn, config, &opts(src, dest))?;

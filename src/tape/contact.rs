@@ -1247,6 +1247,7 @@ pub(crate) mod tests {
                 "volume read-slices",
                 "volume compact-read",
                 "volume compact",
+                "volume rewrite",
                 "restore unit",
                 "restore volume",
                 "restore raw-volume",

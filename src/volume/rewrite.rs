@@ -567,7 +567,9 @@ pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>
         )));
     }
 
-    if status != "sealed" || condition != "ok" {
+    // Sealed and unquarantined: `policy::coverage`'s own predicate for "this
+    // volume's tape is a copy right now", never a status list of this file's.
+    if !coverage::counts_as_copy(conn, source)? {
         return Err(TapectlError::Other(format!(
             "volume rewrite refused: volume \"{source}\" is {status}{}, not a sealed volume \
              whose tape is trusted to read. Only a sealed, unquarantined volume is read back \
@@ -811,7 +813,11 @@ impl Plan {
                  give it):"
                     .to_string(),
             );
-            lines.extend(self.typed_facts(source, destination));
+            lines.extend(
+                self.typed_facts(source, destination)
+                    .into_iter()
+                    .map(|l| format!("    {l}")),
+            );
         } else if self.tier2_facts.is_empty() {
             lines.push(
                 "  consent: none needed — every live slice has a copy on another volume and \
@@ -851,16 +857,22 @@ impl Plan {
     }
 }
 
+/// What the consent is for, in the words every prompt and refusal of this
+/// command uses.
+fn consent_action(source: &str, destination: &str) -> String {
+    format!(
+        "rewrite volume \"{source}\" in place onto \"{destination}\" (retire it, erase its \
+         cartridge, write the staged slices to \"{destination}\")"
+    )
+}
+
 /// The non-interactive half of the consent, asked before anything is read:
 /// a `--only-copy-on-staging` that does not match, or no way to give the
 /// typed consent at all, or a Tier-2 prompt with no terminal and no `--yes`.
 /// The prompts themselves come after the staged slices are verified.
 fn check_consent_obtainable(plan: &Plan, opts: &RewriteOptions<'_>) -> Result<()> {
     let tty = crate::cli::consent::stdin_is_terminal();
-    let action = format!(
-        "rewrite volume \"{}\" in place onto \"{}\"",
-        opts.source, opts.destination
-    );
+    let action = consent_action(opts.source, opts.destination);
     if plan.needs_typed_consent() {
         if let Some(word) = opts.only_copy_on_staging {
             if word != opts.source {
@@ -1068,6 +1080,14 @@ pub fn verify_staged(conn: &Connection, staged: &[StagedSlice]) -> Result<()> {
         ),
     );
     for slice in staged {
+        // Between slices, as every long read is interruptible (issue #404):
+        // nothing destructive has happened yet, and the caller puts staging
+        // back on this error as on a mismatch.
+        crate::signal::check(|| {
+            "volume rewrite stopped while re-reading the staged slices; nothing destructive \
+             was done and staging was put back as it was"
+                .to_string()
+        })?;
         let (expected, bytes, unit, version, number): (String, i64, String, i64, i64) = conn
             .query_row(
                 "SELECT sl.sha256_encrypted, sl.encrypted_bytes, u.name, s.version, sl.slice_number
@@ -1361,10 +1381,7 @@ pub fn rewrite(
     }
 
     // 4. Consent.
-    let action = format!(
-        "rewrite volume \"{source}\" in place onto \"{destination}\" (retire it, erase its \
-         cartridge, write the staged slices to \"{destination}\")"
-    );
+    let action = consent_action(source, destination);
     let consented = if plan.needs_typed_consent() {
         crate::cli::consent::confirm_only_copy(
             &action,
@@ -1401,8 +1418,13 @@ pub fn rewrite(
         )
         .inspect_err(|_| abandon("the source volume has a live session"))?;
         let tx = conn.unchecked_transaction()?;
+        // Still a copy, as the preflight found it: an update that matches
+        // nothing means the volume changed while the slices were read.
         let changed = tx.execute(
-            "UPDATE volumes SET status = 'retired' WHERE id = ?1 AND status = 'sealed'",
+            &format!(
+                "UPDATE volumes SET status = 'retired' WHERE id = ?1 AND {}",
+                coverage::eligible("volumes")
+            ),
             params![plan.source_id],
         )?;
         if changed != 1 {
@@ -3840,5 +3862,36 @@ mod tests {
             None,
             "the resume wrote every staged set, as the first run asked"
         );
+    }
+
+    /// `--dry-run` is the plan alone: the same catalog-only function the real
+    /// run starts with, and not one row changes (no record, no event, no
+    /// staging, no volume status).
+    #[test]
+    fn a_dry_run_plan_changes_nothing() {
+        let s = scene(1);
+        let snapshot = |c: &Connection| -> Vec<i64> {
+            [
+                "SELECT COUNT(*) FROM events",
+                "SELECT COUNT(*) FROM pending_rewrites",
+                "SELECT COUNT(*) FROM pending_rewrite_sets",
+                "SELECT COUNT(*) FROM volumes",
+                "SELECT COUNT(*) FROM cartridge_volumes",
+                "SELECT COUNT(*) FROM stage_slices WHERE staging_path IS NOT NULL",
+                "SELECT COUNT(*) FROM stage_sets WHERE status = 'staged'",
+                "SELECT COUNT(*) FROM cartridge_contacts",
+            ]
+            .iter()
+            .map(|q| scalar::<i64>(c, q))
+            .collect()
+        };
+        let before = snapshot(&s.w.conn);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = None;
+        let plan = plan(&s.w.conn, &s.w.config, &o).expect("a dry run is a plan, not a refusal");
+        assert!(plan.needs_typed_consent());
+        assert_eq!(snapshot(&s.w.conn), before);
+        assert!(staged_files(&s.w.config).is_empty());
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
     }
 }

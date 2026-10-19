@@ -375,6 +375,12 @@ const TABLE: &[(&[&str], Verdict)] = &[
             probe_args: &["--destination", "NOSUCHVOL"],
         },
     ),
+    // Issue #483: `volume rewrite SRC --label NEW --dry-run` runs the
+    // catalog-only plan (the same function the real run starts with) and
+    // shows the consent it would need, touching nothing -- proven by
+    // `volume::rewrite::tests::a_dry_run_plan_changes_nothing`. `--resume`
+    // refuses it as the first statement of the arm.
+    (&["volume", "rewrite"], Verdict::Honours),
     (&["volume", "deposit", "add"], Verdict::Honours),
     (&["volume", "deposit", "list"], Verdict::ReadOnly),
     (&["volume", "deposit", "remove"], Verdict::Honours),

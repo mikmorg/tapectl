@@ -18555,12 +18555,13 @@ mod tests {
             // Positive control on the walk: it found every read path the
             // count test names, in the files they live in.
             assert_eq!(
-                reads, 9,
+                reads, 10,
                 "verify, catalog rebuild, restore raw-volume, identify, read-slices, \
                  compact-read, compact — verify of the loaded tape (#435) — and the restore \
                  supply's one `DeviceBay::load` behind restore unit, file and volume, named \
-                 or loaded, and every cartridge swapped in mid-restore (#480) — found in \
-                 {files:?}"
+                 or loaded, and every cartridge swapped in mid-restore (#480), and `volume \
+                 rewrite`'s read of the source's live slices (#483: the same checks, in the \
+                 same order, as compact-read's) — found in {files:?}"
             );
             assert_eq!(
                 writes, 4,
@@ -18574,6 +18575,7 @@ mod tests {
                     "cli/restore.rs",
                     "cli/volume.rs",
                     "volume/restore/supply.rs",
+                    "volume/rewrite.rs",
                     "volume/write.rs"
                 ]
             );
