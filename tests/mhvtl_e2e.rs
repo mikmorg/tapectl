@@ -249,6 +249,7 @@ fn setup_mhvtl(name: &str) -> Harness {
         capacity_override: Some("2400G".into()),
         fill_ceiling: 0.92,
         enospc_buffer: "50M".into(),
+        post_warning_bytes: None,
     });
 
     // Register the permanent escrow recipient (ADR-0005). Pre-write validation

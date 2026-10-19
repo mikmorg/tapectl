@@ -6946,6 +6946,7 @@ mod tests {
                     capacity_override: None,
                     fill_ceiling: 0.95,
                     enospc_buffer: "1GiB".to_string(),
+                    post_warning_bytes: None,
                 }),
                 mam,
             },
@@ -9467,6 +9468,7 @@ mod tests {
             capacity_override: None,
             fill_ceiling: 0.95,
             enospc_buffer: "1GiB".to_string(),
+            post_warning_bytes: None,
         });
         config
     }
@@ -12078,6 +12080,7 @@ mod tests {
             capacity_override: Some("2400G".into()),
             fill_ceiling: 0.92,
             enospc_buffer: "50M".into(),
+            post_warning_bytes: None,
         });
 
         let err = volume_write(
@@ -13824,6 +13827,7 @@ mod tests {
             capacity_override: None,
             fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
+            post_warning_bytes: None,
         });
         let paths = TapectlPaths::new(tmp.path().join("home"));
 
@@ -13977,6 +13981,7 @@ mod tests {
             capacity_override: None,
             fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
+            post_warning_bytes: None,
         });
 
         let err = volume_resume(
@@ -15485,6 +15490,7 @@ mod tests {
                 capacity_override: Some("2400G".into()),
                 fill_ceiling: 0.92,
                 enospc_buffer: "50M".into(),
+                post_warning_bytes: None,
             });
 
             let err = volume_write(
@@ -16846,6 +16852,7 @@ mod tests {
                 capacity_override: None,
                 fill_ceiling: 0.95,
                 enospc_buffer: "1GiB".to_string(),
+                post_warning_bytes: None,
             });
             config
         }
@@ -17550,6 +17557,7 @@ mod tests {
                 capacity_override: None,
                 fill_ceiling: 1.0,
                 enospc_buffer: "0".into(),
+                post_warning_bytes: None,
             });
             config
         }
@@ -20904,6 +20912,7 @@ mod tests {
                 capacity_override: None,
                 fill_ceiling: 1.0,
                 enospc_buffer: "0".into(),
+                post_warning_bytes: None,
             });
             config
         }
@@ -21626,6 +21635,7 @@ mod tests {
                 capacity_override: capacity_override.map(str::to_string),
                 fill_ceiling: 1.0,
                 enospc_buffer: "0".into(),
+                post_warning_bytes: None,
             });
             config
         }

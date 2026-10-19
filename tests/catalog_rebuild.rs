@@ -42,6 +42,7 @@ fn backend() -> &'static tapectl::config::LtoBackendConfig {
         capacity_override: None,
         fill_ceiling: 0.95,
         enospc_buffer: "1GiB".to_string(),
+        post_warning_bytes: None,
     })
 }
 use tapectl::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};

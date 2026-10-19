@@ -694,6 +694,7 @@ mod tests {
             capacity_override: Some("10M".into()),
             fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
+            post_warning_bytes: None,
         });
         config
     }
@@ -961,6 +962,7 @@ mod tests {
             capacity_override: Some("4M".into()),
             fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
+            post_warning_bytes: None,
         });
 
         // Without a device, two drives is an error asking for one — not a

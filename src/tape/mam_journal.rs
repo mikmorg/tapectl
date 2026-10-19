@@ -926,6 +926,7 @@ mod tests {
             capacity_override: None,
             fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
+            post_warning_bytes: None,
         });
         {
             let reads = MamReads::new(&conn, Operation::VolumeIdentify);

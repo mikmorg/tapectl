@@ -1002,6 +1002,7 @@ mod tests {
             capacity_override: None,
             fill_ceiling: 0.92,
             enospc_buffer: "50M".to_string(),
+            post_warning_bytes: None,
         }
     }
 
@@ -1140,6 +1141,7 @@ mod tests {
             capacity_override: None,
             fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
+            post_warning_bytes: None,
         });
         config
     }

@@ -151,6 +151,7 @@ mod tests {
             capacity_override: Some("2.5T".to_string()),
             fill_ceiling: 0.92,
             enospc_buffer: "50M".to_string(),
+            post_warning_bytes: None,
         }
     }
 

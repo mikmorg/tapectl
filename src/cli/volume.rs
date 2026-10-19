@@ -4125,6 +4125,7 @@ mod tests {
                     capacity_override: None,
                     fill_ceiling: 1.0,
                     enospc_buffer: "0".into(),
+                    post_warning_bytes: None,
                 });
                 c
             };
@@ -4979,6 +4980,7 @@ mod tests {
                 capacity_override: None,
                 fill_ceiling: 1.0,
                 enospc_buffer: "0".into(),
+                post_warning_bytes: None,
             });
             c
         }
@@ -5195,6 +5197,7 @@ mod tests {
                 capacity_override: None,
                 fill_ceiling: 1.0,
                 enospc_buffer: "0".into(),
+                post_warning_bytes: None,
             });
             let paths = TapectlPaths::new(dir.path().join("home"));
             let device = Some("/nonexistent/tapectl-435-nst".to_string());
@@ -5532,6 +5535,7 @@ mod tests {
                 capacity_override: None,
                 fill_ceiling: 1.0,
                 enospc_buffer: "0".into(),
+                post_warning_bytes: None,
             });
             let cmd = VolumeCommands::Compact {
                 label: SRC.into(),

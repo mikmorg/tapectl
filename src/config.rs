@@ -456,6 +456,29 @@ pub struct LtoBackendConfig {
     pub fill_ceiling: f64,
     #[serde(default = "default_enospc_buffer")]
     pub enospc_buffer: String,
+    /// The **post-warning room** (issue #479, ADR-0012 2026-10-17 item 100):
+    /// how much a write can still put on a cartridge between this drive's
+    /// early warning and the hard end of the medium, as MEASURED by
+    /// `scripts/lto-profile.sh` (the lower of the walk it makes to the hard
+    /// end and the drive's own figure, log page 0x0c "minimum native
+    /// capacity from EW to EOP"). Optional: absent means nobody measured it
+    /// and nothing is checked.
+    ///
+    /// When set, a slice plus the seal must fit in HALF of the smallest such
+    /// room among the configured drives (a 2x margin for wear and variance):
+    /// `config check` (so every load) refuses a `slice_size` in
+    /// `[defaults]` or an `[[archive_sets]]` entry that does not, and
+    /// `stage create` refuses the slice size in force for a unit
+    /// ([`Config::slice_cap_problem`]).
+    ///
+    /// Decimal, like `capacity_override` and for the same reason: it is a
+    /// physical amount of tape, and log page 0x0c states it in decimal MB
+    /// (`K`=10^3 ... `T`=10^12; [`crate::media::parse_capacity_to_bytes`]).
+    /// Above zero. It describes the DRIVE (its early-warning point and the
+    /// medium it writes), so it is a drive-level key like `fill_ceiling`;
+    /// capacity itself stays a property of the cartridge (ADR-0010).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_warning_bytes: Option<String>,
 }
 
 /// ADR-0012, 2026-10-06 amendment, item 16: 97% of the cartridge's capacity.
@@ -500,12 +523,88 @@ fn default_enospc_buffer() -> String {
     "50M".to_string()
 }
 
+/// What the seal takes of the post-warning room (issue #479, ADR-0012
+/// 2026-10-17 item 100): the seal marker with its full copy of the front
+/// index, padded to whole tape blocks, and the filemark after it.
+///
+/// The seal's size depends on the layout, which no config check or stage
+/// create has: the marker is a short header plus one `[[files]]` entry per
+/// tape file, about 170 bytes each (`position`, `type`, `size_bytes` and a
+/// 64-character `sha256_encrypted`), so it grows with the number of files on
+/// the tape. 16 MiB holds about 98,000 entries, which is a 30 TB LTO-10
+/// cartridge written in 300 MB slices; the test
+/// `the_seal_allowance_covers_the_seal_of_a_thirty_terabyte_tape` pins that
+/// against the real generator. The 2x margin on the room covers the rest.
+pub const SEAL_ALLOWANCE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The tape's block, which every file is padded to ([`crate::store`]).
+const TAPE_BLOCK_BYTES: u64 = 512 * 1024;
+/// age's STREAM format: 64 KiB of plaintext per chunk, plus a 16-byte tag.
+const AGE_CHUNK_BYTES: u64 = 64 * 1024;
+const AGE_TAG_BYTES: u64 = 16;
+/// The age header: a version line, one stanza per recipient (tenant keys,
+/// operator, escrow: about 200 bytes each) and the MAC, and the 16-byte
+/// payload nonce. 4 KiB is room for a score of recipients.
+const AGE_HEADER_ALLOWANCE_BYTES: u64 = 4096;
+
+/// What one dar slice of `slice_size` bytes takes on the tape once age has
+/// encrypted it and the writer has padded it to whole blocks.
+pub fn slice_bytes_on_tape(slice_size: u64) -> u64 {
+    let chunks = slice_size.div_ceil(AGE_CHUNK_BYTES);
+    let cipher = slice_size + chunks * AGE_TAG_BYTES + AGE_HEADER_ALLOWANCE_BYTES;
+    cipher.div_ceil(TAPE_BLOCK_BYTES) * TAPE_BLOCK_BYTES
+}
+
+/// The largest `slice_size` whose slice plus the seal ([`SEAL_ALLOWANCE_BYTES`])
+/// fits in `budget` bytes of tape; `None` when not even the seal fits.
+pub fn max_slice_size_within(budget: u64) -> Option<u64> {
+    if budget < slice_bytes_on_tape(1) + SEAL_ALLOWANCE_BYTES {
+        return None;
+    }
+    let (mut lo, mut hi) = (1u64, budget);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if slice_bytes_on_tape(mid) + SEAL_ALLOWANCE_BYTES <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo)
+}
+
+/// The smallest configured post-warning room, and the drive it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostWarningRoom {
+    pub backend: String,
+    /// The key as written (`"40G"`).
+    pub text: String,
+    pub bytes: u64,
+}
+
 impl LtoBackendConfig {
     /// The most a write may put on a volume of `capacity_bytes`: the
     /// capacity times [`LtoBackendConfig::fill_ceiling`] (issue #391). The
     /// one place that multiplication is written, for every gate and planner.
     pub fn fill_budget_bytes(&self, capacity_bytes: u64) -> u64 {
         (capacity_bytes as f64 * self.fill_ceiling) as u64
+    }
+
+    /// The measured post-warning room in bytes ([`Self::post_warning_bytes`]),
+    /// `None` when the key is absent.
+    pub fn post_warning_room_bytes(&self) -> Result<Option<u64>> {
+        match &self.post_warning_bytes {
+            None => Ok(None),
+            Some(text) => {
+                let bytes = crate::media::parse_capacity_to_bytes(text)?;
+                if bytes <= 0 {
+                    return Err(TapectlError::Config(format!(
+                        "{text:?} is not above zero (omit the key when the room is not measured)"
+                    )));
+                }
+                Ok(Some(bytes as u64))
+            }
+        }
     }
 
     /// This drive's own native generation, parsed.
@@ -1053,6 +1152,67 @@ impl LoggingConfig {
 }
 
 impl Config {
+    /// The smallest `post_warning_bytes` among the configured LTO drives
+    /// that declare one; `None` when none does (nothing is checked then). A
+    /// value that does not parse is skipped here: `size_problems` reports it.
+    pub fn smallest_post_warning_room(&self) -> Option<PostWarningRoom> {
+        self.backends
+            .lto
+            .iter()
+            .filter_map(|b| match b.post_warning_room_bytes() {
+                Ok(Some(bytes)) => Some(PostWarningRoom {
+                    backend: b.name.clone(),
+                    text: b.post_warning_bytes.clone().unwrap_or_default(),
+                    bytes,
+                }),
+                _ => None,
+            })
+            .min_by_key(|r| r.bytes)
+    }
+
+    /// Issue #479, ADR-0012 2026-10-17 item 100: the refusal of a slice size
+    /// that cannot be sealed past the drive's early warning. A slice plus the
+    /// seal must fit in HALF of the smallest measured post-warning room;
+    /// `what` names where the slice size came from (`defaults.slice_size`,
+    /// or the unit it was resolved for). `None` when it fits, or when no
+    /// drive declares a room.
+    ///
+    /// Shared by `Config::load` (through [`Config::range_problems`], which is
+    /// what makes `config check` and `config set` refuse it) and `stage
+    /// create` (which holds the slice size the unit's dotfile, archive set
+    /// and `[defaults]` resolve to), so the two cannot disagree.
+    pub fn slice_cap_problem(&self, what: &str, slice_bytes: u64) -> Option<String> {
+        let room = self.smallest_post_warning_room()?;
+        let half = room.bytes / 2;
+        let needed = slice_bytes_on_tape(slice_bytes) + SEAL_ALLOWANCE_BYTES;
+        if needed <= half {
+            return None;
+        }
+        let binary =
+            |b: u64| crate::util::format_bytes_binary(i64::try_from(b).unwrap_or(i64::MAX));
+        let advice = match max_slice_size_within(half) {
+            Some(max) => format!("Lower it to at most {} ({max} bytes)", binary(max)),
+            None => "Even the seal alone does not fit, so no slice size can; check the \
+                     measured figure"
+                .to_string(),
+        };
+        Some(format!(
+            "{what} = {} ({slice_bytes} bytes) is too large for backends.lto[\"{}\"].\
+             post_warning_bytes = {} ({} bytes): a slice (which takes {needed_slice} bytes on \
+             tape once age has encrypted it and the writer has padded it to blocks) plus the \
+             seal ({seal} bytes allowed) must fit in half of that room, {half} bytes, so a \
+             tape can still be sealed after the drive's early warning (ADR-0012 item 100). \
+             {advice}, or measure the room again with scripts/lto-profile.sh and correct \
+             post_warning_bytes.",
+            binary(slice_bytes),
+            room.backend,
+            room.text,
+            room.bytes,
+            needed_slice = slice_bytes_on_tape(slice_bytes),
+            seal = SEAL_ALLOWANCE_BYTES,
+        ))
+    }
+
     /// This config with every `[[backends.lto]]` block's
     /// [`LtoBackendConfig::fill_ceiling`] replaced by `ceiling` — the
     /// `--fill-ceiling` flag (issue #391: "overridable per write"). Applied
@@ -1294,6 +1454,13 @@ impl Config {
                     backend.name
                 ));
             }
+            if let Err(e) = backend.post_warning_room_bytes() {
+                problems.push(format!(
+                    "{}: backends.lto[{i}] (\"{}\").post_warning_bytes = {e}",
+                    path.display(),
+                    backend.name
+                ));
+            }
         }
         // Issue #215 finding 2: an `[[archive_sets]]` entry's `slice_size`
         // used to be validated only at `archive-set sync` time
@@ -1465,6 +1632,30 @@ impl Config {
                     path.display(),
                     backend.name
                 ));
+            }
+        }
+        // Issue #479 (ADR-0012 2026-10-17 item 100): with a measured
+        // post-warning room configured, the slice size must leave a slice and
+        // the seal inside half of it. A slice size that does not parse is
+        // `size_problems`'s to report, and is skipped here.
+        if self.smallest_post_warning_room().is_some() {
+            let mut check = |what: String, text: &str| {
+                if let Ok(bytes) = crate::staging::parse_size_to_bytes(text) {
+                    if bytes > 0 {
+                        if let Some(msg) = self.slice_cap_problem(&what, bytes as u64) {
+                            problems.push(format!("{}: {msg}", path.display()));
+                        }
+                    }
+                }
+            };
+            check("defaults.slice_size".to_string(), &self.defaults.slice_size);
+            for (i, as_cfg) in self.archive_sets.iter().enumerate() {
+                if let Some(s) = &as_cfg.slice_size {
+                    check(
+                        format!("archive_sets[{i}] (\"{}\").slice_size", as_cfg.name),
+                        s,
+                    );
+                }
             }
         }
         // Issue #422: an archive set's verify interval below one day; issue
@@ -3141,6 +3332,221 @@ mod tests {
         assert!(parse_fill_ceiling("most").is_err());
     }
 
+    // ---- issue #479: the post-warning room and the slice cap ----
+
+    /// A config with one drive `d` whose `post_warning_bytes` is `room` (or
+    /// absent), and `defaults.slice_size` / extra text as given.
+    fn room_config(room: Option<&str>, slice_size: &str, extra: &str) -> String {
+        let key = room
+            .map(|r| format!("post_warning_bytes = \"{r}\"\n"))
+            .unwrap_or_default();
+        format!("[defaults]\nslice_size = \"{slice_size}\"\n\n{LTO_BLOCK}{key}{extra}")
+    }
+
+    fn load_text(text: &str) -> std::result::Result<Config, String> {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        Config::load(&path).map_err(|e| e.to_string())
+    }
+
+    /// The key is optional, decimal like `capacity_override`, and read back as
+    /// bytes; a bare byte count and the suffixes the capacity parser takes
+    /// all load.
+    #[test]
+    fn post_warning_bytes_is_optional_and_decimal() {
+        let cfg = load_text(&room_config(None, "1G", "")).unwrap();
+        assert_eq!(cfg.backends.lto[0].post_warning_bytes, None);
+        assert_eq!(cfg.backends.lto[0].post_warning_room_bytes().unwrap(), None);
+        for (text, bytes) in [
+            ("99008M", 99_008_000_000u64),
+            ("99G", 99_000_000_000),
+            ("99.008GB", 99_008_000_000),
+            ("2500000000", 2_500_000_000),
+        ] {
+            let cfg = load_text(&room_config(Some(text), "1M", "")).unwrap();
+            assert_eq!(
+                cfg.backends.lto[0].post_warning_room_bytes().unwrap(),
+                Some(bytes),
+                "{text}"
+            );
+        }
+    }
+
+    /// Validated at load, like the other sizes: a bad value, and zero, are
+    /// refused naming the key and the drive; `config check`'s lenient report
+    /// carries the same text.
+    #[test]
+    fn a_bad_post_warning_bytes_is_refused_naming_the_key_and_the_drive() {
+        for bad in ["lots", "-5G", "12Q", "0"] {
+            let text = room_config(Some(bad), "1M", "");
+            let msg = load_text(&text).unwrap_err();
+            assert!(
+                msg.contains("backends.lto[0] (\"d\").post_warning_bytes"),
+                "{bad}: {msg}"
+            );
+            let report = crate::policy::lenient_config::check(&text, Path::new("config.toml"));
+            assert!(!report.valid, "{bad}");
+            assert!(
+                report
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("post_warning_bytes")),
+                "{bad}: {:?}",
+                report.problems
+            );
+        }
+    }
+
+    /// The key survives a round trip through the serializer (`init`'s
+    /// `Config::save`) only when set; an unset key is not written.
+    #[test]
+    fn post_warning_bytes_is_written_only_when_set() {
+        let mut cfg = load_text(&room_config(None, "1G", "")).unwrap();
+        assert!(!toml::to_string_pretty(&cfg)
+            .unwrap()
+            .contains("post_warning_bytes"));
+        cfg.backends.lto[0].post_warning_bytes = Some("40G".into());
+        assert!(toml::to_string_pretty(&cfg)
+            .unwrap()
+            .contains("post_warning_bytes = \"40G\""));
+    }
+
+    /// Absent keys mean no check, however large the slice size; with the key
+    /// on SOME drives, the smallest of those governs, and a drive without the
+    /// key neither lifts nor lowers it.
+    #[test]
+    fn no_post_warning_bytes_means_no_slice_check_and_the_smallest_room_governs() {
+        let cfg = load_text(&room_config(None, "10T", "")).unwrap();
+        assert_eq!(cfg.smallest_post_warning_room(), None);
+        assert_eq!(
+            cfg.slice_cap_problem("defaults.slice_size", u64::MAX / 4),
+            None
+        );
+
+        let two = format!(
+            "{}\n[[backends.lto]]\nname = \"tight\"\ndevice_tape = \"/dev/zero\"\n\
+             device_sg = \"/dev/zero\"\ngeneration = \"LTO-6\"\npost_warning_bytes = \"3G\"\n\
+             \n[[backends.lto]]\nname = \"unmeasured\"\ndevice_tape = \"/dev/random\"\n\
+             device_sg = \"/dev/random\"\ngeneration = \"LTO-6\"\n",
+            room_config(Some("99G"), "1M", "")
+        );
+        let cfg = load_text(&two).unwrap();
+        let room = cfg.smallest_post_warning_room().unwrap();
+        assert_eq!(
+            (room.backend.as_str(), room.text.as_str(), room.bytes),
+            ("tight", "3G", 3_000_000_000)
+        );
+        // 1 GiB fits in half of 3 GB (1.5e9) with the seal; 2 GiB does not.
+        assert_eq!(cfg.slice_cap_problem("x", 1 << 30), None);
+        let msg = cfg.slice_cap_problem("x", 2 << 30).unwrap();
+        assert!(msg.contains("backends.lto[\"tight\"]"), "{msg}");
+    }
+
+    /// The refusal at load: `[defaults]`'s slice size over half the room is a
+    /// load error (so `config check` exits non-zero and `config set` refuses
+    /// the edit), naming the key, the drive and the numbers; a slice size
+    /// that fits loads.
+    #[test]
+    fn a_default_slice_size_over_half_the_room_is_refused_at_load() {
+        // 2 GB of room: half is 1,000,000,000 bytes, below one 1 GiB slice.
+        let text = room_config(Some("2G"), "1G", "");
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, &text).unwrap();
+        let msg = Config::load(&path).unwrap_err().to_string();
+        assert!(
+            msg.contains("defaults.slice_size = 1.0 GiB (1073741824 bytes)")
+                && msg.contains("backends.lto[\"d\"].post_warning_bytes = 2G (2000000000 bytes)")
+                && msg.contains("1000000000 bytes")
+                && msg.contains("Lower it to at most")
+                && msg.contains("ADR-0012 item 100"),
+            "{msg}"
+        );
+        let report = crate::policy::lenient_config::check(&text, &path);
+        assert!(!report.valid);
+        assert_eq!(report.problems[0], msg, "config check says what load says");
+        // 3 GB of room: half is 1.5e9; a 1 GiB slice and the seal fit.
+        load_text(&room_config(Some("3G"), "1G", "")).unwrap();
+    }
+
+    /// An `[[archive_sets]]` entry's slice size is checked the same way and
+    /// named by position and name.
+    #[test]
+    fn an_archive_set_slice_size_over_half_the_room_is_refused_at_load() {
+        let extra = "\n[[archive_sets]]\nname = \"bulk\"\nslice_size = \"30G\"\n";
+        let msg = load_text(&room_config(Some("40G"), "1G", extra)).unwrap_err();
+        assert!(
+            msg.contains("archive_sets[0] (\"bulk\").slice_size = 30.0 GiB")
+                && msg.contains("post_warning_bytes = 40G"),
+            "{msg}"
+        );
+        let ok = "\n[[archive_sets]]\nname = \"bulk\"\nslice_size = \"2G\"\n";
+        load_text(&room_config(Some("40G"), "1G", ok)).unwrap();
+    }
+
+    /// The seal is accounted: the limit is on slice PLUS seal, so the largest
+    /// slice size that fits is strictly below half the room by at least the
+    /// seal allowance, one byte more is refused, and a slice of exactly half
+    /// the room (which would fit without the seal) is refused.
+    #[test]
+    fn the_seal_and_the_encryption_overhead_are_inside_the_limit() {
+        let half = 20_000_000_000u64;
+        let max = max_slice_size_within(half).unwrap();
+        assert!(max + SEAL_ALLOWANCE_BYTES <= half, "{max}");
+        assert!(slice_bytes_on_tape(max) + SEAL_ALLOWANCE_BYTES <= half);
+        assert!(slice_bytes_on_tape(max + 1) + SEAL_ALLOWANCE_BYTES > half);
+
+        let mut cfg = load_text(&room_config(Some("40G"), "1M", "")).unwrap();
+        assert_eq!(cfg.slice_cap_problem("s", max), None);
+        assert!(cfg.slice_cap_problem("s", max + 1).is_some());
+        assert!(
+            cfg.slice_cap_problem("s", half).is_some(),
+            "a slice of exactly half the room leaves no room for the seal"
+        );
+        // A room too small for even the seal: nothing fits, and the message
+        // says so rather than offering a size.
+        cfg.backends.lto[0].post_warning_bytes = Some("20M".into());
+        let msg = cfg.slice_cap_problem("s", 1).unwrap();
+        assert!(msg.contains("Even the seal alone does not fit"), "{msg}");
+        assert_eq!(max_slice_size_within(SEAL_ALLOWANCE_BYTES), None);
+
+        // On tape a 1 GiB slice is a little more than 1 GiB, in whole blocks.
+        let on_tape = slice_bytes_on_tape(1 << 30);
+        assert!(
+            on_tape > (1 << 30) && on_tape % TAPE_BLOCK_BYTES == 0,
+            "{on_tape}"
+        );
+        assert!(on_tape < (1 << 30) + (1 << 20), "{on_tape}");
+    }
+
+    /// The allowance covers the real seal marker of a very large tape: 30,000
+    /// files (a 30 TB LTO-10 cartridge in 1 GB slices), each entry as long as
+    /// the generator makes them, padded to whole blocks.
+    #[test]
+    fn the_seal_allowance_covers_the_seal_of_a_thirty_terabyte_tape() {
+        let files: Vec<crate::volume::layout::FrontIndexFile> = (0..30_000u32)
+            .map(|i| crate::volume::layout::FrontIndexFile {
+                position: i as i32,
+                type_label: "data_slice",
+                size_bytes: Some(1_073_741_824 + i as u64),
+                sha256_encrypted: Some("f".repeat(64)),
+            })
+            .collect();
+        let seal = crate::volume::layout::generate_seal_marker(
+            "L10-0001",
+            30_000,
+            &"a".repeat(64),
+            &files,
+        );
+        let padded = (seal.len() as u64).div_ceil(TAPE_BLOCK_BYTES) * TAPE_BLOCK_BYTES;
+        assert!(
+            padded + TAPE_BLOCK_BYTES <= SEAL_ALLOWANCE_BYTES,
+            "a 30,000-file seal is {} bytes ({padded} padded); the allowance is {SEAL_ALLOWANCE_BYTES}",
+            seal.len()
+        );
+    }
+
     /// `--fill-ceiling` replaces every block's ceiling for one command, and
     /// `None` changes nothing.
     /// Issue #421: `[health] read_error_rise_factor` defaults to the
@@ -3301,6 +3707,7 @@ mod tests {
             capacity_override: None,
             fill_ceiling: default_fill_ceiling(),
             enospc_buffer: default_enospc_buffer(),
+            post_warning_bytes: None,
         }
     }
 

@@ -695,6 +695,27 @@ fn stage_create_inner(
     // was silently discarded even where #48 gives archive_set_id a writer.
     let resolved = crate::policy::resolve(conn, config, &unit)?;
 
+    // Issue #479 (ADR-0012 2026-10-17 item 100): the slice size this unit
+    // will be cut at must leave a slice and the seal inside half the
+    // measured post-warning room of the smallest configured drive. The
+    // config-level check (`Config::load`) sees only `[defaults]` and the
+    // file's archive sets; this is the size in force after the unit's
+    // dotfile and its archive set's database row have had their say. It
+    // runs before the staging directory is touched, the `stage_sets` INSERT
+    // and dar.
+    if let Some(problem) = config.slice_cap_problem(
+        &format!(
+            "the slice_size in force for unit \"{}\" (its dotfile's [policy], its archive set \
+             or [defaults])",
+            unit.name
+        ),
+        resolved.slice_size.max(0) as u64,
+    ) {
+        return Err(TapectlError::Other(format!(
+            "{problem} Nothing was staged."
+        )));
+    }
+
     // `ResolvedPolicy.slice_size` is bytes-only at every layer (even
     // `policy::resolve`'s own default layer runs `config.defaults.slice_size`
     // through `parse_size_to_bytes`), but dar's `-s` argument must keep
@@ -6397,6 +6418,7 @@ mod tests {
             capacity_override: Some(cap.into()),
             fill_ceiling: 1.0,
             enospc_buffer: "0".into(),
+            post_warning_bytes: None,
         };
         config.backends.lto.push(drive("small", "/dev/null", "1M"));
         let real_dar = std::mem::replace(
@@ -6447,5 +6469,81 @@ mod tests {
         config.dar.binary = real_dar;
         stage_create(&conn, &paths, &config, snap_id, false)
             .expect("a unit that fits the largest configured generation stages");
+    }
+
+    /// Issue #479 (ADR-0012 2026-10-17 item 100): with a measured
+    /// post-warning room on a configured drive, `stage create` refuses a
+    /// slice size whose slice plus the seal does not fit in half of it,
+    /// before the `stage_sets` INSERT and before dar. Two routes to the same
+    /// refusal: `[defaults]`, and the unit's own dotfile (which the
+    /// config-level check never sees). Absent key and a slice size that fits
+    /// are the controls.
+    #[test]
+    fn stage_create_refuses_a_slice_size_the_post_warning_room_cannot_hold() {
+        let tmp = TempDir::new().unwrap();
+        let (conn, paths, mut config, src) = setup_unit_with_excludes(&tmp, vec![]);
+        fs::write(src.join("f.dat"), vec![7u8; 4096]).unwrap();
+        let snap_id = snapshot_create(&conn, "unit1", &Config::default()).unwrap();
+        let drive = |room: Option<&str>| crate::config::LtoBackendConfig {
+            name: "hp".into(),
+            device_tape: "/dev/null".into(),
+            device_sg: "/dev/null".into(),
+            generation: "LTO-6".into(),
+            capacity_override: None,
+            fill_ceiling: 1.0,
+            enospc_buffer: "0".into(),
+            post_warning_bytes: room.map(str::to_string),
+        };
+        // 60 MB of room: half is 30,000,000 bytes, of which the seal takes
+        // 16 MiB; a 100 MiB slice cannot be sealed after the warning.
+        config.backends.lto.push(drive(Some("60M")));
+        config.defaults.slice_size = "100M".into();
+        let real_dar = std::mem::replace(
+            &mut config.dar.binary,
+            "/nonexistent/dar-must-never-run".to_string(),
+        );
+
+        let msg = stage_create(&conn, &paths, &config, snap_id, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("unit \"unit1\"")
+                && msg.contains("backends.lto[\"hp\"].post_warning_bytes = 60M (60000000 bytes)")
+                && msg.contains("30000000 bytes")
+                && msg.contains("Lower it to at most")
+                && msg.contains("Nothing was staged."),
+            "names the unit, the key, the drive and the numbers: {msg}"
+        );
+        assert!(!msg.contains("dar-must-never-run"), "{msg}");
+        let stage_sets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM stage_sets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stage_sets, 0, "the refusal precedes the stage_sets INSERT");
+
+        // The unit's own dotfile overrides a `[defaults]` that fits: the
+        // size in force is what is checked.
+        config.defaults.slice_size = "1M".into();
+        let dotfile = src.join(".tapectl-unit.toml");
+        let mut df = crate::unit::dotfile::read_dotfile(&dotfile).unwrap();
+        df.slice_size = Some("100M".into());
+        crate::unit::dotfile::write_dotfile(&dotfile, &df).unwrap();
+        let msg = stage_create(&conn, &paths, &config, snap_id, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("unit \"unit1\"") && msg.contains("post_warning_bytes"),
+            "a dotfile slice_size is refused too: {msg}"
+        );
+
+        // Control: the same 100M slice size with the key absent stages (real
+        // dar), so the refusals above were the key's and nothing else's.
+        config.defaults.slice_size = "100M".into();
+        df.slice_size = None;
+        crate::unit::dotfile::write_dotfile(&dotfile, &df).unwrap();
+        config.dar.binary = real_dar;
+        config.backends.lto.clear();
+        config.backends.lto.push(drive(None));
+        stage_create(&conn, &paths, &config, snap_id, false)
+            .expect("with no post_warning_bytes nothing is checked");
     }
 }

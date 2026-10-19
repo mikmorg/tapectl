@@ -4521,6 +4521,7 @@ mod tests {
             capacity_override: None,
             fill_ceiling: 0.92,
             enospc_buffer: "50M".to_string(),
+            post_warning_bytes: None,
         }];
         conn.execute(
             "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
@@ -5564,6 +5565,7 @@ mod tests {
                 capacity_override: None,
                 fill_ceiling: 0.92,
                 enospc_buffer: "50M".to_string(),
+                post_warning_bytes: None,
             }
         }
 

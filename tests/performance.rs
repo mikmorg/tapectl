@@ -121,6 +121,7 @@ fn setup(name: &str) -> PerfHarness {
         capacity_override: Some("2400G".into()),
         fill_ceiling: 0.92,
         enospc_buffer: "50M".into(),
+        post_warning_bytes: None,
     });
 
     PerfHarness {

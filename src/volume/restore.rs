@@ -4379,6 +4379,7 @@ mod tests {
                 capacity_override: None,
                 fill_ceiling: 0.95,
                 enospc_buffer: "1GiB".to_string(),
+                post_warning_bytes: None,
             }
         }
 

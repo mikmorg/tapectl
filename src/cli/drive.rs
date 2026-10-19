@@ -765,6 +765,7 @@ pub fn status(
                 capacity_override: None,
                 fill_ceiling: 0.95,
                 enospc_buffer: "1GiB".into(),
+                post_warning_bytes: None,
             });
             drive_identity::read_identity(&id_backend)
         });
@@ -2112,6 +2113,7 @@ mod tests {
             capacity_override: None,
             fill_ceiling: 0.95,
             enospc_buffer: "1GiB".into(),
+            post_warning_bytes: None,
         }
     }
 
