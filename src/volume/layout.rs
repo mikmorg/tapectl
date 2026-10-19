@@ -11673,15 +11673,21 @@ sha256_encrypted = \"bbb\"
                 "place"
             ]
         );
-        let tapes: Vec<(
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            Option<String>,
-        )> = stmt
+        // tape | sticker | chip serial | status | place, one string a row.
+        let tapes: Vec<String> = stmt
             .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(4)?, r.get(7)?))
+                let text = |i: usize| -> rusqlite::Result<String> {
+                    Ok(r.get::<_, Option<String>>(i)?
+                        .unwrap_or_else(|| "(none)".to_string()))
+                };
+                Ok(format!(
+                    "{} | {} | {} | {} | {}",
+                    text(0)?,
+                    text(1)?,
+                    text(2)?,
+                    text(4)?,
+                    text(7)?
+                ))
             })
             .unwrap()
             .collect::<std::result::Result<_, _>>()
@@ -11689,27 +11695,9 @@ sha256_encrypted = \"bbb\"
         assert_eq!(
             tapes,
             [
-                (
-                    "L6-0001".into(),
-                    Some("BC0001L6".into()),
-                    Some("HUJ808A5L4".into()),
-                    "sealed".into(),
-                    Some("home-rack".into())
-                ),
-                (
-                    "L6-0002".into(),
-                    Some("BC0002L6".into()),
-                    Some("HUJ808A5L5".into()),
-                    "sealed".into(),
-                    Some("bank-box".into())
-                ),
-                (
-                    "L6-0003".into(),
-                    Some("BC0003L6".into()),
-                    Some("HUJ808A5L6".into()),
-                    "erased".into(),
-                    None
-                ),
+                "L6-0001 | BC0001L6 | HUJ808A5L4 | sealed | home-rack",
+                "L6-0002 | BC0002L6 | HUJ808A5L5 | sealed | bank-box",
+                "L6-0003 | BC0003L6 | HUJ808A5L6 | erased | (none)",
             ]
         );
         // 2. which tapes hold which units: only completed writes, each
