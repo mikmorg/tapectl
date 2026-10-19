@@ -195,7 +195,7 @@ pub(super) fn finish(
     }
     progress::log(&format!(
         "restore of unit \"{}\" v{}: {} file(s) damaged or missing after the extract; {} slice(s) \
-         with holes",
+         with holes or unproven",
         ctx.unit_name,
         ctx.version,
         lost.len(),
@@ -223,8 +223,9 @@ pub(super) fn finish(
     if lost.is_empty() && (ex.dar_failure.is_none() || !expected.is_empty()) {
         if !ex.holes.is_empty() {
             warn!(
-                "the slices that had holes held nothing this version's files needed; the restore \
-                 is whole"
+                "the slices that had holes or could not be proven held nothing this version's \
+                 files needed, and every file that could be checked matched its recorded \
+                 checksum; the restore is whole"
             );
         }
         return Ok(notes.filled);
@@ -607,27 +608,7 @@ fn incomplete(
         ex.root.display()
     )];
     for h in &ex.holes {
-        let bytes: u64 = h.holes.iter().map(|r| r.end - r.start).sum();
-        let ranges: Vec<String> = h
-            .holes
-            .iter()
-            .take(8)
-            .map(|r| format!("{}..{}", r.start, r.end))
-            .collect();
-        lines.push(format!(
-            "  slice {} on {}: {} hole(s) of zeros, {bytes} byte(s) in all, at plaintext byte(s) \
-             {}{} — {}",
-            h.slice_number,
-            h.volume,
-            h.holes.len(),
-            ranges.join(", "),
-            if h.holes.len() > ranges.len() {
-                ", ..."
-            } else {
-                ""
-            },
-            h.reason
-        ));
+        lines.push(format!("  {}", h.describe()));
     }
     if let Some(e) = &ex.dar_failure {
         lines.push(format!(
