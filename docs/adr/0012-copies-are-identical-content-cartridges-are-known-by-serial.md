@@ -1766,3 +1766,13 @@ Ruled 2026-10-17, measuring drives instead of assuming them:
      file is checked with `sha256sum` against it; a mismatch goes on the damaged-file list, so
      `--fill-from` can repair it from another copy. `--no-file-check` skips the check. The column
      needs no `requires` entry (a reader ignores a column it does not know).
+104. **The 1.3.0 re-pin was widened for the fresh reads of File 1** (CTO, 2026-10-19). File 1 was
+     read three times by a fresh reader with no design docs (#477): each read's findings inside
+     #477's topics were fixed in 1.3.0, and after the third ("mostly"; two SERIOUS findings, both
+     about enumerating a whole box) the CTO ruled "fix the two, then tag". RESTORE.sh gained
+     `--where --all` (every unit the index names, no cap) and File 1 a done rule that counts every
+     tape opened with the key, every listed unit restored at its newest version, and names a tape no
+     key opens as not done. The RESTORE.sh pin moved five times in 1.3.0, each in its own commit
+     (`6c7bb948…` to `95862b49…`); MANIFEST.toml's did not. Item 81's bound stands: the
+     authorization ends when v1.3.0 is installed. The third read's remaining minor findings are
+     #481, for the next re-pin.
