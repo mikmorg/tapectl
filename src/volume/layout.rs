@@ -333,6 +333,15 @@ fn guide_drive_section(media_type: &str) -> String {
     let readers = crate::media::Generation::parse(media_type)
         .map(|g| (g, drives_that_read(g)))
         .filter(|(_, drives)| !drives.is_empty());
+    let readers_phrase = readers.as_ref().map(|(_, drives)| drive_phrase(drives));
+    // The cover sheet's own line for this generation (`generations_text` in
+    // the Heir Kit), so the example is the line an heir of THIS tape finds.
+    let sheet_line = match &readers {
+        Some((g, drives)) => format!("\"{} (2 volume(s)): {}\"", g.as_str(), drive_phrase(drives)),
+        None => {
+            "\"LTO-n (2 volume(s)): an LTO-n drive\", with the generation in place of n".to_string()
+        }
+    };
     let which = match readers {
         Some((g, drives)) => format!(
             "This tape is {} (File 0 says so: media_type). A drive reads it only if it \
@@ -351,9 +360,38 @@ fn guide_drive_section(media_type: &str) -> String {
                  shows which drives read which."
             .to_string(),
     };
+    // This guide is on the tape, so a reader without a drive cannot have read
+    // it: the generation comes off the cartridge or the Heir Kit's sheet.
+    let without_drive = format!(
+        "You can learn a cartridge's generation without a drive, and before this guide \
+         can be read: it is printed on the cartridge (the LTO logo and number on the \
+         case, and the last two characters of the barcode label, where L6 is LTO-6), \
+         and the Heir Kit's cover sheet lists the generations of the tapes the Heir \
+         Kit's catalogue knew when it was made, with the drives that read each, in \
+         lines like {sheet_line}. A sheet made when the Heir Kit's catalogue listed \
+         no sealed cartridge says so and sends you to the label."
+    );
     let interface = "The drive connects by SAS (some models by Fibre Channel), so the \
                      computer needs a matching host adapter (HBA); there is no USB or SATA \
                      tape drive. Fit the pieces together before the day you need them:";
+    let drive_for_this_tape = match readers_phrase.as_deref() {
+        Some(drives) => format!("{drives} with a SAS interface"),
+        None => "a drive that reads this tape's generation, with a SAS interface".to_string(),
+    };
+    let setup = format!(
+        "A setup that works, as one example: {drive_for_this_tape}, a PCIe SAS host \
+         adapter in a desktop computer with a free PCIe slot, and the cable and power \
+         to match. For an external drive, which has its own power supply: an adapter \
+         with an external port (an LSI or Broadcom 9200-8e, which has SFF-8088 ports, or \
+         a 9300-8e, which has SFF-8644, on IT firmware) and an external SAS cable whose \
+         ends fit the drive and the adapter. For a bare internal drive, in a 5.25-inch \
+         bay: an adapter with an internal port (a 9211-8i, SFF-8087, or a 9300-8i, \
+         SFF-8643), a cable from that port that ends in an SFF-8482 drive connector, and \
+         the drive's power from the computer's power supply, through that connector or \
+         from a separate lead (often a 4-pin Molex plug), as the drive's data sheet \
+         says. These models are examples, not a recommendation: the connectors are the \
+         standards that last, and the data sheets decide."
+    );
     let hardware = [
         "SAS comes in generations (3, 6 and 12 Gb/s). A link runs at the highest \
          speed both ends support, so an adapter and a drive of different \
@@ -402,11 +440,13 @@ fn guide_drive_section(media_type: &str) -> String {
         .map(|b| wrap_words(&format!("- {b}"), 72, "  "))
         .collect();
     format!(
-        "## The tape drive\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n",
+        "## The tape drive\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n",
         wrap_words(&which, 72, ""),
+        wrap_words(&without_drive, 72, ""),
         guide_box_drives(),
         wrap_words(interface, 72, ""),
         bullets.join("\n"),
+        wrap_words(&setup, 72, ""),
         wrap_words(firm, 72, "")
     )
 }
@@ -522,7 +562,9 @@ fn guide_drive_basics() -> String {
         "Read the generation printed on the cartridge (L6 on its label is LTO-6) \
          before you buy or borrow a drive, and look at every cartridge in the box: \
          they may be different generations, and a drive that reads one may not read \
-         another.",
+         another. This guide is on the tape, which you cannot read without a \
+         drive, so take the generation from the cartridge or the Heir Kit's cover \
+         sheet (\"The tape drive\").",
         "An external drive, in its own case with its own power supply, is the \
          simplest: it needs only an adapter with an external port and an \
          external SAS cable that fits both ends. A bare internal drive needs \
@@ -635,6 +677,7 @@ the drive and checking a key use).
 ## Start here
 
 The whole job in order. Each step names the section that has its commands.
+Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
 
 1. Check your key: "Which file is your key". A tenant's key opens that
    tenant's units only; the operator key and the escrow key open every
@@ -685,15 +728,16 @@ The whole job in order. Each step names the section that has its commands.
    the newest version of every unit any of them lists restored; every
    unit `--where --all` names on the newest readable index restored, or
    named as held only on tapes you do not have; and any tape your key
-   cannot open named, never counted as looked at. "The rest of the box"
-   has the whole rule and what a box cannot show you. With nobody left to
-   ask, the Heir Kit's catalogue may name tapes the index cannot: "The Heir
+   cannot open named, never counted as looked at. That is done over the
+   tapes you hold: no tape names one written after it, and a tape from
+   before 1.3.0 has no index to check against. "The rest of the box" has
+   the whole rule and what a box cannot show you. With nobody left to ask,
+   the Heir Kit's catalogue may name tapes the index cannot: "The Heir
    Kit's catalogue".
 
-RESTORE.sh or its tools are not available: "Manual Recovery Steps" does the
-same job by hand. The tape's map is lost: "If All Else Fails". A slice
-damaged in the middle, which RESTORE.sh cannot read around: "tapectl
-itself".
+No RESTORE.sh or tools: "Manual Recovery Steps" does the same job by hand.
+The tape's map is lost: "If All Else Fails". A slice damaged in the middle,
+which RESTORE.sh cannot read around: "tapectl itself".
 
 ## Words this guide uses
 
@@ -724,10 +768,12 @@ itself".
   complete it. "Every file" means the files the unit had when that version
   was made: a file deleted before then exists only in an older version, so
   restore an older version (`--version N`, into a directory of its own) only
-  if you want such files. A version is also called a snapshot: MANIFEST.toml states it
-  as `snapshot_version`, RECOVERY.md as "snapshot v2" and RESTORE.sh as
-  "snapshot version". Versions are numbered 1, 2, 3 ... for each unit in
-  the order they were made, so the highest number is the newest. A unit is
+  if you want such files ("Files deleted before the newest version", in "The
+  rest of the box", finds them). A version is also called a snapshot:
+  MANIFEST.toml states it as `snapshot_version`, RECOVERY.md as "snapshot
+  v2" and RESTORE.sh as "snapshot version". Versions are numbered 1, 2, 3 ...
+  for each unit in the order they were made, so the highest number is the
+  newest. A unit is
   identified by its `uuid`: it can be renamed, and tapes from different
   times or installations can use one name for different units, so version
   numbers compare only between archives with the same uuid. A tape's
@@ -745,18 +791,21 @@ itself".
   kept apart from the rest, is never replaced: it opens every tenant's data
   on every tape that installation wrote. Whichever of the three you hold,
   it is "your key" in this guide.
-- **Installation**: one tapectl setup, with its own catalogue and its own
-  keys (an operator key, the tenants' keys and one escrow key). Every tape
-  an installation writes is encrypted to that installation's keys, so a
-  tape from another installation needs that installation's keys.
+- **Installation**: one tapectl setup, with its own catalogue (its database
+  of tapes, units and where the tapes are kept) and its own keys (an
+  operator key, the tenants' keys and one escrow key). Every tape an
+  installation writes is encrypted to that installation's keys, so a tape
+  from another installation needs that installation's keys.
 - **Heir Kit, cover sheet**: the papers and files the operator prepares
   for the person who inherits the archive and keeps with the tapes (or
   apart from them): a cover sheet (`COVER.txt`, also as a printable page)
   that names the escrow key's public half, where the tapes are kept and
-  which drives read them, and `catalog.db.age`, the whole catalogue
-  encrypted to the escrow key ("The Heir Kit's catalogue" opens it). It
-  records the archive as of the day it was made, which may be before the
-  newest tape was written. You may have none.
+  which drives read them, and `catalog.db.age`, the Heir Kit's catalogue
+  (the whole database), encrypted to the escrow key ("The Heir Kit's
+  catalogue" opens it). A kit made by tapectl 1.5.0 or later also holds a
+  copy of the tapectl program that made it, a file named `tapectl-` and its
+  version ("tapectl itself"). It records the archive as of the day it was
+  made, which may be before the newest tape was written. You may have none.
 - **`YOUR_KEY.age.key`**: the one name this guide uses for your key file,
   an age identity file (a text file with a line that starts
   `AGE-SECRET-KEY-`). Replace it with your own file's name, whether it
@@ -768,12 +817,26 @@ itself".
   tenant's envelope only; the operator and escrow keys open all of them.
   Inside are `MANIFEST.toml` (each unit's slices and the tape file each is
   in), `RECOVERY.md` (the steps for your units, written out as commands),
-  `catalogs/`, and on a tape written by tapectl 1.3.0 or later `index/`
-  (see "The rest of the box").
+  `catalogs/` (the units' dar catalogues, below), and on a tape written by
+  tapectl 1.3.0 or later `index/` (the index, below).
 - **Slice**: a unit is archived by dar in numbered pieces called slices.
   Each slice is encrypted on its own and stored as one tape file, and one
   unit's slices lie together on the tape. Restoring a unit means reading
   all of its slices, in order.
+- **Index**: two different things. The FRONT index is File 3 (the seal
+  marker, the last file, carries a copy): a plain-text map of THIS tape,
+  with every tape file's position, type, size and hash. The index, with no
+  "front", is the directory `index/` in an envelope of a tape written by
+  tapectl 1.3.0 or later: which units, versions and paths the archive had
+  when that tape was written, and which tapes hold them. `--where` and
+  `--find` read it ("The rest of the box").
+- **Catalogue**: this guide never uses the word bare, because it names three
+  different things. The Heir Kit's catalogue is the archive's database, as
+  of the day the kit was made, kept as `catalog.db.age` ("The Heir Kit's
+  catalogue"); an installation's own catalogue is the live database it was
+  copied from. A dar catalogue (the next entry) is a small file that lists
+  one version of one unit. `catalogs/` is the directory of an envelope that
+  holds the dar catalogues.
 - **dar catalogue**: a small file for each version of a unit, kept in the
   envelope under `catalogs/`. It lists every file of the unit and which
   slice holds it, so `dar -l` can list the unit, and one file can be
@@ -782,7 +845,7 @@ itself".
   version number: version 2 of a unit whose uuid starts `11111111-` is
   `catalogs/11111111_v2.1.dar`, and dar is given the name without `.1.dar`
   (`dar -l catalogs/11111111_v2 -N -Q`). MANIFEST.toml states each unit's
-  uuid and version. A catalogue's listing marks every entry `[InRef]`,
+  uuid and version. A dar catalogue's listing marks every entry `[InRef]`,
   dar's word for "the data is in the archive this catalogue was cut from",
   which here means the unit's slices on the tape. It does not mean the unit
   is a difference from another version.
@@ -890,11 +953,11 @@ box has its own: File 0 of that tape gives it (`total_files`, and
   as Debian's and Ubuntu's is: such a dar refuses to start without it
   ("INITIALIZATION FAILED FOR GPGME"). RESTORE.sh checks and says so.
 - dar 2.7.9 or later streams a restore with no disk space for slices;
-  an older one, or a unit without its catalogue on a dar before 2.7.21,
+  an older one, or a unit without its dar catalogue on a dar before 2.7.21,
   is restored by decrypting the slices to disk first (RESTORE.sh
   chooses, and checks the space either way). `dar --version` says which
-  dar you have. A unit's catalogue is the small file `catalogs/NAME` in
-  its envelope ("Words this guide uses"); "without its catalogue" means
+  dar you have. A unit's dar catalogue is the small file `catalogs/NAME` in
+  its envelope ("Words this guide uses"); "without its dar catalogue" means
   the envelope has none for that unit, or dar refuses the one it has
   because it was cut from another run of the same snapshot. RESTORE.sh
   says so when that happens.
@@ -907,10 +970,19 @@ box has its own: File 0 of that tape gives it (`total_files`, and
   whole MANIFEST.toml, but with an escrow or operator key it prints only a
   table of units: then unpack the operator envelope by hand (steps 5 and 6
   of "Manual Recovery Steps") and read `env/MANIFEST.toml` (the unit's uuid
-  alone is in `--where --all`). If your dar is older than a unit's
+  alone is in `--where --all`). ("Compressed units", in "Disk space", has
+  the short way to one unit's `dar_command`.) If your dar is older than a unit's
   `dar_version`, install that version or a newer one before you give the
   unit up. 2.6 is the oldest dar tapectl writes with, not a promise that
-  every dar from 2.6 on reads every unit.
+  every dar from 2.6 on reads every unit. Where to get a newer dar: a newer
+  release of your distribution may package one (`apt-cache policy dar` says
+  which version it offers); otherwise dar's own site, dar.linux.free.fr
+  (release notes and source tarballs), and its project at
+  sourceforge.net/projects/dar (the same releases). A source tarball builds
+  with the commands in its INSTALL and README files (for most releases
+  `./configure`, `make` and `make install`, which name the libraries it
+  needs). These addresses may move over decades: search for "dar" and its
+  author, Denis Corbin, if they are gone.
 - Only for finding the drive and checking a key, never for the restore
   itself: `ls`, `lsscsi` (package lsscsi), `lspci` (pciutils), `dmesg`
   (util-linux), `lsmod` and `modprobe` (kmod), `sudo` (sudo) and `usermod`
@@ -952,10 +1024,11 @@ another filesystem afterwards if you must.
 
 **How much room, in one place:** the sum of the sizes of the units you
 restore, as `--find-envelope` and `--where` print them (each unit's slices
-as stored on tape); three times that when you cannot tell that a unit was
-stored uncompressed ("Compressed units", below), and watch `df` while it
-runs; and, for the ways of restoring that keep its slices on disk as well
-(below), one more unit's size, for the slices of the unit being restored. The rest of this section says why.
+as stored on tape); three times that, and more for mostly text, when you
+cannot tell that a unit was stored uncompressed ("Compressed units",
+below), and watch `df` while it runs; and, for the ways of restoring that
+keep its slices on disk as well (below), one more unit's size, for the
+slices of the unit being restored. The rest of this section says why.
 
 {capacity}
 
@@ -969,7 +1042,7 @@ envelopes (the operator envelope's `catalog.db` and the dar catalogues,
 which grow with the number of files) go to a work directory under
 `$TMPDIR` (default `/tmp`; set `TMPDIR` to move it). `/tmp` is a small RAM
 disk on many systems (`df -h /tmp` says), and no data slice ever goes
-there, but a unit of millions of files has a large catalogue: if `/tmp`
+there, but a unit of millions of files has a large dar catalogue: if `/tmp`
 is small, set `TMPDIR` to a directory on a real disk with some GiB free
 (`TMPDIR=/big/disk/tmp ./RESTORE.sh ...`).
 
@@ -998,10 +1071,34 @@ operator envelope by hand, as under "Tools Required"). An argument that
 starts
 `-z`, as in `\"-zgzip\"` or `\"-zzstd\"`, means the unit was compressed,
 and none means it was not. The dar catalogue cannot tell you: `dar -l`
-of the catalogue in the envelope shows `-----` in its compression column
-either way. With no `dar_command` line, you cannot tell: take the three
-times above (more for mostly text). RESTORE.sh names a full disk when it
-happens, and `--overwrite` finishes the restore once you have made room.
+of the dar catalogue in the envelope shows `-----` in its compression
+column either way.
+
+The short way to the `dar_command` lines, with an escrow or operator key
+and no unpacking of the whole envelope. `--find-envelope` prints "Decrypted
+envelope at file N (tenant: operator)" for the operator envelope, the one
+that lists every unit; call that N POSITION below. Read File 3 into
+`front_index.toml` (step 3 of "Manual Recovery Steps") and run
+`grep -A3 '^position = POSITION$' front_index.toml`: the entry it prints has
+the `size_bytes` that is SIZE below. Then, with the block size set as in "Manual
+Recovery Steps":
+
+    mt -f /dev/nst0 rewind
+    mt -f /dev/nst0 fsf POSITION
+    dd if=/dev/nst0 bs=512k of=envelope.raw
+    truncate -s SIZE envelope.raw
+    age -d -i YOUR_KEY.age.key envelope.raw | tar -xOf - MANIFEST.toml | grep -E '^(name|snapshot_version|dar_command) ='
+
+It prints each unit's name and version with its `dar_command`. If the
+envelope will not read, use its backup (step 5 of "Manual Recovery Steps").
+
+"Three times" is a rule of thumb for mixed files, not a ceiling: text,
+source code, logs and database dumps compress ten times or more, so a
+compressed unit of mostly such files can need far more than three times its
+slices' size, and nothing on the tape says how much more. With no
+`dar_command` line, or a compressed unit, restore to a disk you can add room
+to and watch `df`. RESTORE.sh names a full disk when it happens, and
+`--overwrite` finishes the restore once you have made room.
 
 ## Which device?
 
@@ -1198,7 +1295,7 @@ needs no tapectl either.
 **Is the box complete?** Nothing on a tape can name tapes written after
 it, so the newest tape you hold may not be the newest ever written, and no
 tape can tell you that. What you can do is compare. The newest index lists
-every unit the archive's catalogue knew when its tape was written,
+every unit the installation's catalogue knew when its tape was written,
 including units held only on OTHER tapes (`units.tsv` has a row for each
 tape that holds each version, and `--where UNIT` prints those rows).
 `./RESTORE.sh --where --all --key YOUR_KEY.age.key` prints all of them, with
@@ -1215,9 +1312,9 @@ tape only by its label, cartridge serial and uuid, so look for cartridges
 labelled so, and for the operator's papers and storage records. The Heir
 Kit, if you have one ("Words this guide uses"), records the
 archive as of the day it was made, including where the tapes were kept: the
-cover sheet's "Tapes are at" box, and the catalogue in `catalog.db.age`,
-which "The Heir Kit's catalogue" opens; one made after your newest tape was
-written may name tapes this box lacks.
+cover sheet's "Tapes are at" box, and the Heir Kit's catalogue in
+`catalog.db.age`, which "The Heir Kit's catalogue" opens; one made after
+your newest tape was written may name tapes this box lacks.
 
 The whole box, in short:
 
@@ -1290,6 +1387,28 @@ The whole box, in short:
    older version (`--version N`, into a directory of its own) only if you
    want such files.
 
+**Files deleted before the newest version.** Nothing says which files exist
+only in an older version, but you can see: list the paths of two versions
+and print those the older one has and the newer one lacks. `--list` takes
+`--version`, and needs both versions on the tape in the drive and their dar
+catalogues in its envelope (a version without one prints "no dar
+catalogue"). If the two versions are on different tapes (`--where UNIT`
+says which), run each `--list` with its own tape loaded. With versions 3
+(the newest) and 2 of UNIT, the last command prints the paths of version 2
+that version 3 does not have:
+
+    ./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT --version 3 | grep -E '^\[.{{5}}\]\[.\] ' | awk -F'\t' '{{ print $NF }}' > newer.paths
+    ./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT --version 2 | grep -E '^\[.{{5}}\]\[.\] ' | awk -F'\t' '{{ print $NF }}' > older.paths
+    awk 'NR == FNR {{ seen[$0]; next }} !($0 in seen)' newer.paths older.paths
+
+Each entry line of dar's listing ends with the path, after its last TAB (a
+path with a TAB in it is cut at the TAB). Nothing printed means version 3
+has every path version 2 had. To restore one that is printed, from version
+2, into a directory of its own:
+
+    ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --version 2 \
+        --path PATH --to /destination/UNIT-v2
+
 **A renamed unit.** A unit is the same unit by its `uuid`, but every
 command takes its NAME, and a tape's envelope knows a unit by the name it
 had when THAT tape was written. If the unit was renamed after an older tape
@@ -1315,9 +1434,9 @@ unit's `name` beside its `uuid`; with an escrow or operator key
 `--find-envelope` prints only a table of units (see "Tools Required"), so
 unpack the operator envelope by hand, or take the uuid from `--where --all`.
 
-**Two units of one name.** A name is unique inside one catalogue, but it can
-recur across tapes: a unit renamed and its old name used again, or tapes of
-two installations. They are different units when their uuids differ
+**Two units of one name.** A name is unique inside one installation's
+catalogue, but it can recur across tapes: a unit renamed and its old name
+used again, or tapes of two installations. They are different units when their uuids differ
 (`--where --all` prints each as an entry of its own, with its uuid). The
 box procedure puts each unit in `/destination/UNIT`, and two such units
 would meet there. RESTORE.sh refuses a `--to` that is not empty, but the
@@ -1374,8 +1493,8 @@ replaced.
 ## The Heir Kit's catalogue (catalog.db.age)
 
 If you hold the Heir Kit ("Words this guide uses"), its file
-`catalog.db.age` is the archive's whole catalogue, a SQLite database,
-encrypted to the ESCROW key alone: a tenant's or the operator's key does
+`catalog.db.age` is the Heir Kit's catalogue, the archive's whole database
+(SQLite), encrypted to the ESCROW key alone: a tenant's or the operator's key does
 not open it. It can say which tapes there are and where they were kept,
 which no tape can. It is as of the day the kit was made. It knows no tape
 written after that day; a unit's name, a tape's place or a tape's state may
@@ -1389,7 +1508,7 @@ it holds:
     age -d -i YOUR_KEY.age.key -o catalog.db catalog.db.age
     sqlite3 catalog.db .tables
 
-Every tape the catalogue knows, with its cartridge's sticker and chip
+Every tape the Heir Kit's catalogue knows, with its cartridge's sticker and chip
 serial, generation, state, when it was sealed and where it was kept:
 
     sqlite3 -header -column catalog.db "SELECT v.label AS tape,
@@ -1515,9 +1634,9 @@ A restore went right only if all of these hold:
    "Ignored (excluded by filters)" above 0 in a whole-unit restore means dar
    skipped files, as it does for a slice that was left out ("No other
    copy" in "If a slice or a file is damaged").
-3. The count matches the catalogue. The inodes (files and directories) a
-   unit's catalogue lists are the lines of `--list` that begin with a status
-   such as `[Saved]` or `[InRef]`:
+3. The count matches the dar catalogue. The inodes (files and directories)
+   a unit's dar catalogue lists are the lines of `--list` that begin with a
+   status such as `[Saved]` or `[InRef]`:
 
        ./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT \
            | grep -c -E '^\[.{{5}}\]\[.\] '
@@ -1668,7 +1787,7 @@ the LAST one, dar stops at once ("The last file of the set is not present",
 exit status 4) and restores nothing; add `-0` (sequential read) and it
 restores the files in order up to the first missing slice, then stops with
 status 4. The file it was in the middle of is left short and named, and
-those after it are not named at all, so compare with the catalogue's list.
+those after it are not named at all, so compare with the dar catalogue's list.
 
 Neither way can read around a damaged part of a slice: the `age` program
 stops at the first damaged piece. tapectl can. tapectl is the program that
@@ -1680,11 +1799,22 @@ says where to get it and what to run; nothing else in this guide needs it.
 
 ## tapectl itself
 
+Look in the Heir Kit first. A kit made by tapectl 1.5.0 or later holds a
+copy of the program that made it, a file named `tapectl-` and its version
+(`tapectl-1.5.0`), in the folder with `catalog.db.age`. The cover sheet
+names it with its size and sha256 (check the file against the sheet with
+`sha256sum`) and says it is for Linux on one machine type (`uname -m` says
+yours). It needs no building: run it as `./tapectl-1.5.0` wherever this
+section says `tapectl`, after `./tapectl-1.5.0 --version` has shown it
+starts. Its release must be File 0's `tapectl_version` or newer; a kit made
+before the tape was written can hold an older one. With no kit, a copy that
+is too old, or one that will not run on your machine, read on.
+
 tapectl is open-source software, and its source is at
 https://github.com/mikmorg/tapectl: one place to look, and a web address
 may move over decades, so search for the name if it is gone. File 0's
 `tapectl_version` names the release that wrote this tape; the repository
-tags each release `v` followed by that number (`v1.4.0`); use that release
+tags each release `v` followed by that number (`v1.5.0`); use that release
 or a newer one. It is built from source. It needs the Rust toolchain the
 repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs,
 installs it on the first `cargo` run, or when you run `rustup toolchain
@@ -1704,17 +1834,18 @@ sheet, the escrow key's public half (with only the key file, `age-keygen -y
 escrow.key` prints it), and YOUR_KEY.age.key is your key file, the escrow
 key's included:
 
-    tapectl init --operator NAME --escrow-public-key ESCROW_PUBLIC
+    tapectl init --operator OPERATOR_NAME --escrow-public-key ESCROW_PUBLIC
     tapectl catalog rebuild --from-volume --device /dev/nst0 --key YOUR_KEY.age.key
     tapectl restore unit --unit UNIT --device /dev/nst0 --to /destination/UNIT --key YOUR_KEY.age.key
 
 `init` makes the home and registers the escrow PUBLIC key, which decrypts
-nothing; run it once. NAME is the operator's name where you know it (the
-Heir Kit's catalogue has it: `sqlite3 catalog.db "SELECT name FROM tenants
-WHERE is_operator = 1;"`); otherwise leave `--operator` off and `init`
-names the operator after your login, because the rebuild takes the tenants'
-names from the tape. `catalog rebuild` reads the loaded tape and puts what
-it says into the catalogue; run it once for each tape. `restore unit`
+nothing; run it once. OPERATOR_NAME is the operator's name where you know it
+(the Heir Kit's catalogue has it: `sqlite3 catalog.db "SELECT name FROM
+tenants WHERE is_operator = 1;"`); otherwise leave `--operator` off and
+`init` names the operator after your login, because the rebuild takes the
+tenants' names from the tape. `catalog rebuild` reads the loaded tape and
+puts what it says into tapectl's own catalogue (its database, in the new
+home); run it once for each tape. `restore unit`
 restores the newest version of a unit on the loaded tape into an empty
 directory (`--version N` for another). Use your own device ("Which
 device?"). The repository's `docs/keys-and-recovery.md` (runbook C) is the
@@ -1737,10 +1868,13 @@ on paper, apart from every machine); `--key` is how the escrow key is used.
 
 If RESTORE.sh is not available, follow these steps with `mt`, `dd`,
 `truncate`, `age`, `tar`, `sha256sum` and `dar`. They use the non-rewinding
-device ("Which device?"; `/dev/nst0` is an example). Each `dd` leaves the
-head at the start of the next file, so `mt fsf N` moves forward N files from where you
-are, and `mt rewind` then `mt fsf N` reaches File N from anywhere. Read the
-tape forward where you can; rewinding is slow.
+device ("Which device?"; `/dev/nst0` is an example). Each `dd` that finishes
+leaves the head at the start of the next file, so `mt fsf N` moves forward N
+files from where you are, and `mt rewind` then `mt fsf N` reaches File N from
+anywhere. A `dd` that stops with an error ("Input/output error") leaves the
+head INSIDE that file, not at the start of the next: after any failed read,
+`mt rewind` and `mt fsf` to the file you want next, whatever the counting
+below says. Read the tape forward where you can; rewinding is slow.
 
 Deleting the padding zeros with `tr -d '\0'` is for the plain text files
 only (Files 0 to 3 and the last). An envelope or a slice is trimmed to its
@@ -1794,8 +1928,8 @@ exact size with `truncate` instead, never with `tr`.
    its MANIFEST.toml lists that tenant's units and no one else's. For all
    the units on the tape open the `operator_envelope` instead, whose
    MANIFEST.toml lists every unit (or open each `tenant_envelope` and
-   restore the units of each). For each envelope you try, with POSITION and
-   SIZE from its entry:
+   restore the units of each). For each envelope you try, with POSITION
+   (the entry's `position`) and SIZE (its `size_bytes`):
 
        mt -f /dev/nst0 rewind
        mt -f /dev/nst0 fsf POSITION
@@ -1838,16 +1972,16 @@ exact size with `truncate` instead, never with `tr`.
    more than once, take the block with the highest `snapshot_version`, the
    newest, unless you want an older one. Put the tape at the first slice,
    once. `fsf N` moves forward N files from where the head is, so from the
-   start of the tape it reaches File N: the TAPE_POSITION of the first
-   slice, from the manifest.
+   start of the tape it reaches File N: the `tape_position` of the first
+   slice, from the manifest (FIRST_TAPE_POSITION below).
 
        mt -f /dev/nst0 rewind
-       mt -f /dev/nst0 fsf FIRST_POSITION
+       mt -f /dev/nst0 fsf FIRST_TAPE_POSITION
 
    Then, for each slice of the unit in order of its number, with
    ENCRYPTED_BYTES, SHA256_ENCRYPTED and NUMBER from the manifest (each read
-   leaves the tape at the start of the next file, so the next slice needs no
-   spacing unless there is a gap):
+   that finishes leaves the tape at the start of the next file, so the next
+   slice needs no spacing unless there is a gap or a read failed):
 
        dd if=/dev/nst0 bs=512k of=restore.NUMBER.dar.age
        truncate -s ENCRYPTED_BYTES restore.NUMBER.dar.age
@@ -1867,7 +2001,11 @@ exact size with `truncate` instead, never with `tr`.
        mt -f /dev/nst0 fsf COUNT           # COUNT = Q - P - 1
 
    (from File 6 to File 9 that is `fsf 2`). Rewinding and `fsf Q`, as above,
-   reaches it too and is slower. A slice that fails its `sha256sum -c` is
+   reaches it too and is slower. If a `dd` stopped with an error instead
+   ("Input/output error"), the head is inside that slice's file and the
+   count above is wrong: `mt rewind`, then `fsf` to the `tape_position` of
+   the slice you want next (or of the same slice, to try it again), and
+   read on from there. A slice that fails its `sha256sum -c` is
    damaged: do not decrypt it, but read the same slice from another copy of
    the tape. The copy lists it in its own front index under the same
    `sha256_encrypted`, at whatever File that tape puts it, so find it by
@@ -1999,7 +2137,9 @@ the tape was written, and the operator and escrow keys open every one.
    `mt -f /dev/nst0 fsf 4`), then read candidate files one by one with
    `dd if=/dev/nst0 bs=512k of=candidate.raw`. Each read leaves the tape
    at the start of the next file, so read again without spacing; an
-   extra `fsf 1` between reads would skip a file.
+   extra `fsf 1` between reads would skip a file. After a `dd` that failed
+   with an error the head is inside that file: `mt rewind` and `fsf` to the
+   next candidate instead.
 2. Strip only the TRAILING zero bytes from the file you read — the
    block padding. Never delete every zero byte (`tr -d '\0'`): zero
    bytes inside the ciphertext are part of it, and age will reject what
@@ -6165,6 +6305,19 @@ U='photos/2019' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next 
 T='report' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next } index($c["path"], ENVIRON["T"])' index/paths.tsv
 ```
 
+The newest version of a unit holds the files that version had; a file deleted
+before it was made exists only in an older version. In a tenant's envelope this
+prints the paths version `OLD` of a unit has and version `NEW` lacks (both
+versions need rows in this `paths.tsv`: a version held only on another tape has
+none here, and the command says so):
+
+```bash
+OLD=2 NEW=3 U='photos/2019' awk -F'\t' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next } $c["unit"] == ENVIRON["U"] { if ($c["version"] == ENVIRON["NEW"]) { n++; seen[$c["path"]] } else if ($c["version"] == ENVIRON["OLD"]) old[$c["path"]] } END { if (!n) print "no paths for version " ENVIRON["NEW"] > "/dev/stderr"; else for (p in old) if (!(p in seen)) print p }' index/paths.tsv | sort
+```
+
+To restore one of them, follow the section of this file for version `OLD` of
+the unit, into a directory of its own.
+
 "##;
 
 /// RECOVERY.md's section on a damaged slice or file (ADR-0012 items 101 and
@@ -6316,7 +6469,10 @@ pub fn generate_recovery_md(
         s.push_str(
             "Put the drive in fixed 512KB block mode, then read, trim, verify and\n\
              decrypt each slice, in order: the tape is wound to the first slice\n\
-             once, and each read leaves it at the start of the next file.\n\
+             once, and each read that finishes leaves it at the start of the next\n\
+             file. A `dd` that stops with an error (\"Input/output error\") leaves\n\
+             the head inside that file instead: `mt rewind`, then `mt fsf` to the\n\
+             tape file of the slice you want next, which its `# Slice` line gives.\n\
              `/dev/nst0` below is an example — run `ls -l /dev/tape/by-id/` and\n\
              substitute your own drive, or you may read a different tape. Work in\n\
              a directory with room for the whole unit plus one slice: each\n\
@@ -10258,7 +10414,7 @@ sha256_encrypted = \"bbb\"
             assert!(f.contains(line), "dar's summary line {line:?}: {f}");
         }
         assert!(sec.contains("| grep -c -E '^\\[.{5}\\]\\[.\\] '"), "{sec}");
-        assert!(f.contains("The count matches the catalogue"), "{f}");
+        assert!(f.contains("The count matches the dar catalogue"), "{f}");
         assert!(f.contains("`--list`"), "{f}");
     }
 
@@ -10523,10 +10679,16 @@ sha256_encrypted = \"bbb\"
             !manual.contains("fsf TAPE_POSITION"),
             "no absolute fsf from where the head is"
         );
+        // #485 item 8: the placeholder is the manifest field's name, and the
+        // front-index placeholder (`position`) is not confused with it.
+        assert!(
+            !manual.contains("FIRST_POSITION") && !manual.contains("TAPE_POSITION of"),
+            "the position placeholders follow the manifest's `tape_position`"
+        );
         let f = flat_text(manual);
         for needle in [
-            "`fsf N` moves forward N files from where the head is, so from the start of the tape it reaches File N",
-            "mt -f /dev/nst0 fsf FIRST_POSITION",
+            "`fsf N` moves forward N files from where the head is, so from the start of the tape it reaches File N: the `tape_position` of the first slice, from the manifest (FIRST_TAPE_POSITION below)",
+            "mt -f /dev/nst0 fsf FIRST_TAPE_POSITION",
             "`fsf` takes the number of files to skip, not a file number",
             "after reading the slice in File P the head is at the start of File P+1",
             "mt -f /dev/nst0 fsf COUNT # COUNT = Q - P - 1",
@@ -10636,7 +10798,7 @@ sha256_encrypted = \"bbb\"
             "`--version N` (with `--restore --unit UNIT`, or with `--list`) takes version N instead",
             "`--find-envelope` shows which versions this tape holds",
             "Every version is a FULL archive of the unit as it was: the newest version alone holds every file, and an older one is never needed to complete it",
-            "A catalogue's listing marks every entry `[InRef]`, dar's word for \"the data is in the archive this catalogue was cut from\"",
+            "A dar catalogue's listing marks every entry `[InRef]`, dar's word for \"the data is in the archive this catalogue was cut from\"",
             "It does not mean the unit is a difference from another version",
         ] {
             assert!(words.contains(needle), "{needle:?}: {words}");
@@ -10766,7 +10928,7 @@ sha256_encrypted = \"bbb\"
         let tools = flat_text(guide_section(&g, "Tools Required"));
         for needle in [
             "`dar --version` says which dar you have",
-            "\"without its catalogue\" means the envelope has none for that unit, or dar refuses the one it has",
+            "\"without its dar catalogue\" means the envelope has none for that unit, or dar refuses the one it has",
         ] {
             assert!(tools.contains(needle), "{needle:?}: {tools}");
         }
@@ -11018,7 +11180,7 @@ sha256_encrypted = \"bbb\"
             "For a whole box, the destination needs the sum of the sizes of the units you restore, whichever tapes they come from; the extra room for slices is needed for one unit at a time",
             "**Compressed units.**",
             "The dar catalogue cannot tell you",
-            "With no `dar_command` line, you cannot tell: take the three times above (more for mostly text)",
+            "\"Three times\" is a rule of thumb for mixed files, not a ceiling: text, source code, logs and database dumps compress ten times or more, so a compressed unit of mostly such files can need far more than three times its slices' size, and nothing on the tape says how much more",
         ] {
             assert!(disk.contains(needle), "{needle:?}: {disk}");
         }
@@ -11231,9 +11393,9 @@ sha256_encrypted = \"bbb\"
             "A version is also called a snapshot: MANIFEST.toml states it as `snapshot_version`, RECOVERY.md as \"snapshot v2\" and RESTORE.sh as \"snapshot version\"",
             "so the highest number is the newest",
             "A unit is identified by its `uuid`",
-            "**Installation**: one tapectl setup, with its own catalogue and its own keys",
+            "**Installation**: one tapectl setup, with its own catalogue (its database of tapes, units and where the tapes are kept) and its own keys",
             "**Heir Kit, cover sheet**: the papers and files the operator prepares for the person who inherits the archive",
-            "`catalog.db.age`, the whole catalogue encrypted to the escrow key",
+            "`catalog.db.age`, the Heir Kit's catalogue (the whole database), encrypted to the escrow key",
         ] {
             assert!(words.contains(needle), "{needle:?}: {words}");
         }
@@ -11741,7 +11903,7 @@ sha256_encrypted = \"bbb\"
         ));
         for needle in [
             "Nobody may be left to ask, so look for the answer on paper too",
-            "the cover sheet's \"Tapes are at\" box, and the catalogue in `catalog.db.age`, which \"The Heir Kit's catalogue\" opens",
+            "the cover sheet's \"Tapes are at\" box, and the Heir Kit's catalogue in `catalog.db.age`, which \"The Heir Kit's catalogue\" opens",
         ] {
             assert!(bx.contains(needle), "{needle:?}: {bx}");
         }
@@ -11952,8 +12114,8 @@ sha256_encrypted = \"bbb\"
             "Choose the disk once you have listed the units you will restore (`--find-envelope` and `--where --all` print each unit's size), not before",
             "The disk needs a filesystem that keeps what the archive holds: file names exactly as they were, files of 4 GiB and more, symbolic links and Unix permissions. A Linux filesystem does (ext4 and xfs are the usual ones)",
             "FAT, exFAT and NTFS do not keep all of that (FAT cannot hold a file of 4 GiB or more, and none of the three keeps Unix permissions and symbolic links as Linux does)",
-            "three times that when you cannot tell that a unit was stored uncompressed (\"Compressed units\", below), and watch `df` while it runs",
-            "With no `dar_command` line, you cannot tell: take the three times above (more for mostly text). RESTORE.sh names a full disk when it happens, and `--overwrite` finishes the restore once you have made room",
+            "three times that, and more for mostly text, when you cannot tell that a unit was stored uncompressed (\"Compressed units\", below), and watch `df` while it runs",
+            "With no `dar_command` line, or a compressed unit, restore to a disk you can add room to and watch `df`. RESTORE.sh names a full disk when it happens, and `--overwrite` finishes the restore once you have made room",
         ] {
             assert!(disk.contains(needle), "{needle:?}: {disk}");
         }
@@ -12081,11 +12243,11 @@ sha256_encrypted = \"bbb\"
         let f = flat_text(raw);
         for needle in [
             "tapectl is open-source software, and its source is at https://github.com/mikmorg/tapectl: one place to look, and a web address may move over decades, so search for the name if it is gone",
-            "File 0's `tapectl_version` names the release that wrote this tape; the repository tags each release `v` followed by that number (`v1.4.0`); use that release or a newer one",
+            "File 0's `tapectl_version` names the release that wrote this tape; the repository tags each release `v` followed by that number (`v1.5.0`); use that release or a newer one",
             "the Rust toolchain the repository pins in `rust-toolchain.toml` (`rustup`, from rustup.rs, installs it on the first `cargo` run, or when you run `rustup toolchain install` in the checkout; a distribution's own cargo may be too old)",
             "`dar`, `mt-st` and `sg3-utils` installed (\"Tools Required\")",
             "`init` makes the home and registers the escrow PUBLIC key, which decrypts nothing; run it once",
-            "`catalog rebuild` reads the loaded tape and puts what it says into the catalogue; run it once for each tape",
+            "`catalog rebuild` reads the loaded tape and puts what it says into tapectl's own catalogue (its database, in the new home); run it once for each tape",
             "`restore unit` restores the newest version of a unit on the loaded tape into an empty directory (`--version N` for another)",
             "The repository's `docs/keys-and-recovery.md` (runbook C) is the long form",
             "`--key` names a key file for that one command and nothing more: tapectl does not copy it into its home or register it, and the escrow secret is never stored on the machine. Give it on each command, and once for each key file if the units need more than one (`--key` repeats)",
@@ -12113,7 +12275,7 @@ sha256_encrypted = \"bbb\"
         }
         assert_eq!(
             cmds[0],
-            "tapectl init --operator NAME --escrow-public-key ESCROW_PUBLIC"
+            "tapectl init --operator OPERATOR_NAME --escrow-public-key ESCROW_PUBLIC"
         );
         assert!(cmds[1]
             .contains("catalog rebuild --from-volume --device /dev/nst0 --key YOUR_KEY.age.key"));
@@ -12248,7 +12410,7 @@ sha256_encrypted = \"bbb\"
         let g = guide17();
         let bx = box_section(&g);
         for needle in [
-            "**Two units of one name.** A name is unique inside one catalogue, but it can recur across tapes: a unit renamed and its old name used again, or tapes of two installations",
+            "**Two units of one name.** A name is unique inside one installation's catalogue, but it can recur across tapes: a unit renamed and its old name used again, or tapes of two installations",
             "They are different units when their uuids differ (`--where --all` prints each as an entry of its own, with its uuid)",
             "RESTORE.sh refuses a `--to` that is not empty, but the manual dar path keeps what is already there and exits 0, so it merges them without a word",
             "Restore each into a directory of its own, `/destination/UNIT-` followed by the first 8 characters of its uuid, and with the manual path always into a new, empty directory",
@@ -12367,7 +12529,7 @@ sha256_encrypted = \"bbb\"
             "{f}"
         );
         for line in [
-            "tapectl init --operator NAME --escrow-public-key ESCROW_PUBLIC",
+            "tapectl init --operator OPERATOR_NAME --escrow-public-key ESCROW_PUBLIC",
             "tapectl catalog rebuild --from-volume --device /dev/nst0 --key YOUR_KEY.age.key",
             "tapectl restore unit --unit UNIT --device /dev/nst0 --to /destination/UNIT --key YOUR_KEY.age.key",
         ] {
@@ -12453,14 +12615,18 @@ sha256_encrypted = \"bbb\"
         let g = guide17();
         let disk = flat_text(guide_section(&g, "Disk space"));
         for needle in [
-            "**How much room, in one place:** the sum of the sizes of the units you restore, as `--find-envelope` and `--where` print them (each unit's slices as stored on tape); three times that when you cannot tell that a unit was stored uncompressed (\"Compressed units\", below), and watch `df` while it runs; and, for the ways of restoring that keep its slices on disk as well (below), one more unit's size, for the slices of the unit being restored",
+            "**How much room, in one place:** the sum of the sizes of the units you restore, as `--find-envelope` and `--where` print them (each unit's slices as stored on tape); three times that, and more for mostly text, when you cannot tell that a unit was stored uncompressed (\"Compressed units\", below), and watch `df` while it runs; and, for the ways of restoring that keep its slices on disk as well (below), one more unit's size, for the slices of the unit being restored",
             "The tape's capacity bounds what is stored on it, not what a restore writes",
             "a unit stored compressed restores larger, and the capacity is no ceiling for it (\"Compressed units\", below)",
-            "take the three times above (more for mostly text)",
+            "\"Three times\" is a rule of thumb for mixed files, not a ceiling",
         ] {
             assert!(disk.contains(needle), "{needle:?}: {disk}");
         }
+        // #485 item 4: the factor is stated twice, once as the rule and once
+        // as what it is not; "take the three times above (more for mostly
+        // text)" is gone, because it read as a bound.
         assert_eq!(disk.matches("three times").count(), 2, "{disk}");
+        assert!(!disk.contains("take the three times above"), "{disk}");
         assert!(!disk.contains("As a ceiling"), "{disk}");
         let unknown = flat_text(guide_section(
             &generate_system_guide_v2_for_media("U", 30, "DLT-IV"),
@@ -12650,5 +12816,365 @@ sha256_encrypted = \"bbb\"
             start.contains("Check your key: \"Which file is your key\". A tenant's key opens that tenant's units only; the operator key and the escrow key open every tenant's. Check it against the cover sheet's `age1...` line (`age-keygen -y`); with only a key file, the check is that it opens an envelope (`--find-envelope`, step 5)"),
             "{start}"
         );
+    }
+
+    // ---- The sixth read's fixes (#485, ADR-0012 item 109, tapectl 1.5.0) ----
+    // File 1 and RECOVERY.md text only; the commands they show are run
+    // against the fake tape and a real dar in tests/heir_restore_sh.rs.
+
+    /// #485 item 1: "done" is said in step 8 itself to hold over the tapes you
+    /// hold, with the two reasons, and Start here still fits its page.
+    #[test]
+    fn reread6_i1_step_8_says_done_is_over_the_tapes_you_hold() {
+        let g = guide17();
+        let start = flat_text(guide_section(&g, "Start here"));
+        let step8 = &start[start.find("8. Know when you are done").unwrap()..];
+        for needle in [
+            "That is done over the tapes you hold: no tape names one written after it, and a tape from before 1.3.0 has no index to check against",
+            "\"The rest of the box\" has the whole rule and what a box cannot show you",
+        ] {
+            assert!(step8.contains(needle), "{needle:?}: {step8}");
+        }
+        // The caveat's source, "Is the box complete?", is still where it was.
+        assert!(
+            box_section(&g).contains("Nothing on a tape can name tapes written after it"),
+            "the full rule stays in the box section"
+        );
+        assert!(guide_section(&g, "Start here").lines().count() <= 64);
+    }
+
+    /// #485 item 2: a way to see the files only an older version has, with
+    /// the options RESTORE.sh really takes (`--list` and `--restore` both
+    /// take `--version`; `--restore` takes `--path`).
+    #[test]
+    fn reread6_i2_files_deleted_before_the_newest_version_can_be_listed() {
+        let g = guide17();
+        let bx = box_section(&g);
+        for needle in [
+            "**Files deleted before the newest version.** Nothing says which files exist only in an older version, but you can see: list the paths of two versions and print those the older one has and the newer one lacks. `--list` takes `--version`",
+            "needs both versions on the tape in the drive and their dar catalogues in its envelope (a version without one prints \"no dar catalogue\")",
+            "./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT --version 3 | grep -E '^\\[.{5}\\]\\[.\\] ' | awk -F'\\t' '{ print $NF }' > newer.paths",
+            "./RESTORE.sh --list --key YOUR_KEY.age.key --unit UNIT --version 2 | grep -E '^\\[.{5}\\]\\[.\\] ' | awk -F'\\t' '{ print $NF }' > older.paths",
+            "awk 'NR == FNR { seen[$0]; next } !($0 in seen)' newer.paths older.paths",
+            "Nothing printed means version 3 has every path version 2 had",
+            "./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --version 2 \\ --path PATH --to /destination/UNIT-v2",
+        ] {
+            assert!(bx.contains(needle), "{needle:?}: {bx}");
+        }
+        let words = flat_text(guide_section(&g, "Words this guide uses"));
+        assert!(
+            words.contains("(\"Files deleted before the newest version\", in \"The rest of the box\", finds them)"),
+            "{words}"
+        );
+        // Only tools the guide lists: no comm, no diff.
+        let block = guide_section(&g, "The rest of the box: other tapes, copies and the index");
+        assert!(
+            !block.contains("comm ") && !block.contains("diff "),
+            "{block}"
+        );
+        // The options are the script's.
+        let script = generate_restore_script_v2("I2", 20);
+        assert!(script.contains("--list --key KEYFILE [--unit U] [--version N]"));
+        assert!(
+            script.contains("--restore --key KEYFILE --to DIR [--unit U | --all] [--version N]")
+        );
+        // RECOVERY.md has the same question for one envelope.
+        let r = flat_text(&generate_recovery_md("LAB01", "alice", &[], &[]));
+        assert!(
+            r.contains("a file deleted before it was made exists only in an older version. In a tenant's envelope this prints the paths version `OLD` of a unit has and version `NEW` lacks"),
+            "{r}"
+        );
+    }
+
+    /// RECOVERY.md's line for the same question runs, under every awk, on a
+    /// paths.tsv of two versions, and says so when the newer version has no
+    /// rows rather than listing every path of the older one.
+    #[test]
+    fn reread6_i2_recovery_md_line_lists_paths_only_the_older_version_has() {
+        let s = generate_recovery_md("LAB01", "alice", &[], &[]);
+        let line = s
+            .lines()
+            .find(|l| l.starts_with("OLD=2 NEW=3 U="))
+            .unwrap_or_else(|| panic!("no OLD/NEW line:\n{s}"))
+            .to_string();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("index")).unwrap();
+        // Columns permuted and one unknown, as the section says to expect.
+        std::fs::write(
+            dir.path().join("index/paths.tsv"),
+            "path\tzz\tunit\tversion\nkeep.txt\tx\tphotos/2019\t2\nkeep.txt\tx\tphotos/2019\t3\n\
+             gone.txt\tx\tphotos/2019\t2\nnew.txt\tx\tphotos/2019\t3\na\\tb.txt\tx\tphotos/2019\t2\n\
+             other.txt\tx\tdocs\t2\n",
+        )
+        .unwrap();
+        for awk in ["awk", "mawk", "gawk"] {
+            if std::process::Command::new(awk)
+                .arg("BEGIN{}")
+                .output()
+                .is_err()
+            {
+                continue;
+            }
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(line.replacen("awk", awk, 1))
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{awk}: {o:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout),
+                "a\\tb.txt\ngone.txt\n",
+                "{awk}: the paths only version 2 has, as stored"
+            );
+            // No rows for the newer version: say so, list nothing.
+            let o = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(line.replacen("awk", awk, 1).replace("NEW=3", "NEW=9"))
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(o.stdout.is_empty(), "{awk}: {o:?}");
+            assert!(
+                String::from_utf8_lossy(&o.stderr).contains("no paths for version 9"),
+                "{awk}: {o:?}"
+            );
+        }
+    }
+
+    /// #485 item 3: a newer dar has somewhere to come from.
+    #[test]
+    fn reread6_i3_a_newer_dar_has_a_source() {
+        let g = guide17();
+        let tools = flat_text(guide_section(&g, "Tools Required"));
+        for needle in [
+            "Where to get a newer dar: a newer release of your distribution may package one (`apt-cache policy dar` says which version it offers); otherwise dar's own site, dar.linux.free.fr (release notes and source tarballs), and its project at sourceforge.net/projects/dar (the same releases)",
+            "A source tarball builds with the commands in its INSTALL and README files (for most releases `./configure`, `make` and `make install`, which name the libraries it needs)",
+            "These addresses may move over decades: search for \"dar\" and its author, Denis Corbin, if they are gone",
+        ] {
+            assert!(tools.contains(needle), "{needle:?}: {tools}");
+        }
+    }
+
+    /// #485 item 4: an escrow-only heir has a short way to a unit's
+    /// `dar_command` (the commands are run on the fake tape in
+    /// tests/heir_restore_sh.rs), and "three times" is not offered as a bound.
+    #[test]
+    fn reread6_i4_the_dar_command_has_a_short_way_and_three_times_is_no_ceiling() {
+        let g = guide17();
+        let disk = flat_text(guide_section(&g, "Disk space"));
+        for needle in [
+            "The short way to the `dar_command` lines, with an escrow or operator key and no unpacking of the whole envelope. `--find-envelope` prints \"Decrypted envelope at file N (tenant: operator)\" for the operator envelope, the one that lists every unit; call that N POSITION below. Read File 3 into `front_index.toml` (step 3 of \"Manual Recovery Steps\") and run `grep -A3 '^position = POSITION$' front_index.toml`: the entry it prints has the `size_bytes` that is SIZE below",
+            "mt -f /dev/nst0 rewind mt -f /dev/nst0 fsf POSITION dd if=/dev/nst0 bs=512k of=envelope.raw truncate -s SIZE envelope.raw age -d -i YOUR_KEY.age.key envelope.raw | tar -xOf - MANIFEST.toml | grep -E '^(name|snapshot_version|dar_command) ='",
+            "It prints each unit's name and version with its `dar_command`. If the envelope will not read, use its backup (step 5 of \"Manual Recovery Steps\")",
+            "text, source code, logs and database dumps compress ten times or more",
+            "and nothing on the tape says how much more",
+        ] {
+            assert!(disk.contains(needle), "{needle:?}: {disk}");
+        }
+        let tools = flat_text(guide_section(&g, "Tools Required"));
+        assert!(
+            tools.contains("(\"Compressed units\", in \"Disk space\", has the short way to one unit's `dar_command`.)"),
+            "{tools}"
+        );
+        // The script's own line is what the guide quotes.
+        let script = generate_restore_script_v2("I4", 20);
+        assert!(script.contains("info \"Decrypted envelope at file $pos${who:+ (tenant: $who)}\""));
+    }
+
+    /// #485 item 5, File 1's half: the Heir Kit's copy is the first place
+    /// to look for tapectl, before the repository, and the glossary says a
+    /// kit may hold one.
+    #[test]
+    fn reread6_i5_tapectl_itself_looks_in_the_heir_kit_first() {
+        let g = guide17();
+        let sec = flat_text(guide_section(&g, "tapectl itself"));
+        let kit = sec
+            .find("Look in the Heir Kit first.")
+            .expect("the kit comes first");
+        let repo = sec
+            .find("tapectl is open-source software, and its source is at")
+            .unwrap();
+        assert!(kit < repo, "{sec}");
+        for needle in [
+            "A kit made by tapectl 1.5.0 or later holds a copy of the program that made it, a file named `tapectl-` and its version (`tapectl-1.5.0`), in the folder with `catalog.db.age`",
+            "The cover sheet names it with its size and sha256 (check the file against the sheet with `sha256sum`) and says it is for Linux on one machine type (`uname -m` says yours)",
+            "It needs no building: run it as `./tapectl-1.5.0` wherever this section says `tapectl`, after `./tapectl-1.5.0 --version` has shown it starts",
+            "Its release must be File 0's `tapectl_version` or newer; a kit made before the tape was written can hold an older one",
+            "With no kit, a copy that is too old, or one that will not run on your machine, read on",
+        ] {
+            assert!(sec.contains(needle), "{needle:?}: {sec}");
+        }
+        let words = flat_text(guide_section(&g, "Words this guide uses"));
+        assert!(
+            words.contains("A kit made by tapectl 1.5.0 or later also holds a copy of the tapectl program that made it, a file named `tapectl-` and its version (\"tapectl itself\")"),
+            "{words}"
+        );
+    }
+
+    /// #485 item 6: a working setup for this tape's generation, and where
+    /// the generation is read without a drive, in what the cover sheet
+    /// really prints (`generations_text`).
+    #[test]
+    fn reread6_i6_a_setup_that_works_and_the_generation_without_a_drive() {
+        let g = flat_text(guide_section(&guide17(), "The tape drive"));
+        for needle in [
+            "You can learn a cartridge's generation without a drive, and before this guide can be read: it is printed on the cartridge (the LTO logo and number on the case, and the last two characters of the barcode label, where L6 is LTO-6), and the Heir Kit's cover sheet lists the generations of the tapes the Heir Kit's catalogue knew when it was made, with the drives that read each, in lines like \"LTO-6 (2 volume(s)): an LTO-6 or LTO-7 drive\". A sheet made when the Heir Kit's catalogue listed no sealed cartridge says so and sends you to the label",
+            "A setup that works, as one example: an LTO-6 or LTO-7 drive with a SAS interface, a PCIe SAS host adapter in a desktop computer with a free PCIe slot, and the cable and power to match",
+            "For an external drive, which has its own power supply: an adapter with an external port (an LSI or Broadcom 9200-8e, which has SFF-8088 ports, or a 9300-8e, which has SFF-8644, on IT firmware) and an external SAS cable whose ends fit the drive and the adapter",
+            "For a bare internal drive, in a 5.25-inch bay: an adapter with an internal port (a 9211-8i, SFF-8087, or a 9300-8i, SFF-8643), a cable from that port that ends in an SFF-8482 drive connector, and the drive's power from the computer's power supply, through that connector or from a separate lead (often a 4-pin Molex plug), as the drive's data sheet says",
+            "These models are examples, not a recommendation: the connectors are the standards that last, and the data sheets decide",
+        ] {
+            assert!(g.contains(needle), "{needle:?}: {g}");
+        }
+        // The sample line is the one the cover sheet prints for the generation.
+        let g8 = flat_text(guide_section(
+            &generate_system_guide_v2_for_media("L8", 20, "LTO-8"),
+            "The tape drive",
+        ));
+        assert!(
+            g8.contains("in lines like \"LTO-8 (2 volume(s)): an LTO-8 or LTO-9 drive\""),
+            "{g8}"
+        );
+        assert!(g8.contains(
+            "A setup that works, as one example: an LTO-8 or LTO-9 drive with a SAS interface"
+        ));
+        let unknown = flat_text(guide_section(
+            &generate_system_guide_v2_for_media("U", 20, "DLT-IV"),
+            "The tape drive",
+        ));
+        assert!(
+            unknown.contains("A setup that works, as one example: a drive that reads this tape's generation, with a SAS interface"),
+            "{unknown}"
+        );
+        assert!(
+            unknown.contains(
+                "\"LTO-n (2 volume(s)): an LTO-n drive\", with the generation in place of n"
+            ),
+            "{unknown}"
+        );
+        // The loading bullet points at the same two sources.
+        let load = flat_text(guide_section(
+            &guide17(),
+            "Loading the tape, and a drive that does not show up",
+        ));
+        assert!(
+            load.contains("This guide is on the tape, which you cannot read without a drive, so take the generation from the cartridge or the Heir Kit's cover sheet (\"The tape drive\")"),
+            "{load}"
+        );
+    }
+
+    /// #485 item 7: after a failed `dd` the head is inside the file, and the
+    /// manual steps, the rung-3 reads and RECOVERY.md say to rewind and `fsf`.
+    #[test]
+    fn reread6_i7_a_failed_dd_leaves_the_head_inside_the_file() {
+        let g = guide17();
+        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
+        for needle in [
+            "Each `dd` that finishes leaves the head at the start of the next file",
+            "A `dd` that stops with an error (\"Input/output error\") leaves the head INSIDE that file, not at the start of the next: after any failed read, `mt rewind` and `mt fsf` to the file you want next, whatever the counting below says",
+            "each read that finishes leaves the tape at the start of the next file, so the next slice needs no spacing unless there is a gap or a read failed",
+            "If a `dd` stopped with an error instead (\"Input/output error\"), the head is inside that slice's file and the count above is wrong: `mt rewind`, then `fsf` to the `tape_position` of the slice you want next (or of the same slice, to try it again), and read on from there",
+        ] {
+            assert!(manual.contains(needle), "{needle:?}: {manual}");
+        }
+        let rung3 = flat_text(guide_section(&g, "If All Else Fails"));
+        assert!(
+            rung3.contains("After a `dd` that failed with an error the head is inside that file: `mt rewind` and `fsf` to the next candidate instead"),
+            "{rung3}"
+        );
+        let units = vec![ManifestUnit {
+            name: "alpha".into(),
+            uuid: "uuid-a".into(),
+            snapshot_version: 2,
+            stage_set_id: 7,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![ManifestSlice {
+                number: 1,
+                tape_position: 4,
+                size_bytes: 1_048_576,
+                encrypted_bytes: 1_049_000,
+                sha256_plain: "abc".into(),
+                sha256_encrypted: "def456".into(),
+            }],
+        }];
+        let r = flat_text(&generate_recovery_md("LAB01", "alice", &units, &[]));
+        assert!(
+            r.contains("each read that finishes leaves it at the start of the next file. A `dd` that stops with an error (\"Input/output error\") leaves the head inside that file instead: `mt rewind`, then `mt fsf` to the tape file of the slice you want next, which its `# Slice` line gives"),
+            "{r}"
+        );
+    }
+
+    /// #485 item 8: "catalogue" is never bare, the two `NAME`s are two names,
+    /// and the position placeholders follow the manifest's field.
+    #[test]
+    fn reread6_i8_the_overloaded_words_are_told_apart() {
+        let g = guide17();
+        let words = flat_text(guide_section(&g, "Words this guide uses"));
+        for needle in [
+            "**Index**: two different things. The FRONT index is File 3 (the seal marker, the last file, carries a copy): a plain-text map of THIS tape, with every tape file's position, type, size and hash. The index, with no \"front\", is the directory `index/` in an envelope of a tape written by tapectl 1.3.0 or later: which units, versions and paths the archive had when that tape was written, and which tapes hold them",
+            "**Catalogue**: this guide never uses the word bare, because it names three different things. The Heir Kit's catalogue is the archive's database, as of the day the kit was made, kept as `catalog.db.age` (\"The Heir Kit's catalogue\"); an installation's own catalogue is the live database it was copied from. A dar catalogue (the next entry) is a small file that lists one version of one unit. `catalogs/` is the directory of an envelope that holds the dar catalogues",
+        ] {
+            assert!(words.contains(needle), "{needle:?}: {words}");
+        }
+        let start = flat_text(guide_section(&g, "Start here"));
+        assert!(
+            start.contains(
+                "Unit, envelope, index, cover sheet: \"Words this guide uses\" says what each is"
+            ),
+            "{start}"
+        );
+        assert!(
+            start
+                .find("\"Words this guide uses\" says what each is")
+                .unwrap()
+                < start.find("1. Check your key").unwrap(),
+            "the pointer comes before the first word is used"
+        );
+        // No bare "catalogue": each use follows one of the qualifiers this
+        // guide defines (or is the word being defined, or a plural).
+        let flat = flat_text(&g);
+        let mut at = 0;
+        while let Some(i) = flat[at..].find("catalogue") {
+            let i = at + i;
+            let before = &flat[i.saturating_sub(24)..i];
+            let ok = [
+                "dar ",
+                "Kit's ",
+                "installation's ",
+                "installation's own ",
+                "tapectl's own ",
+                "its own ",
+                "dar-",
+                "Catalogue** ",
+                "archive this ",
+            ]
+            .iter()
+            .any(|p| before.ends_with(p))
+                || flat[i..].starts_with("catalogues");
+            assert!(
+                ok,
+                "a bare 'catalogue': ...{before}[catalogue]{}",
+                &flat[i + 9..(i + 50).min(flat.len())]
+            );
+            at = i + 9;
+        }
+        // The operator's name and the dar catalogue's stem are not both NAME.
+        let itself = guide_section(&g, "tapectl itself");
+        assert!(itself.contains("--operator OPERATOR_NAME"), "{itself}");
+        assert!(!itself.contains("--operator NAME"), "{itself}");
+        assert!(
+            flat_text(itself).contains("OPERATOR_NAME is the operator's name where you know it"),
+            "{itself}"
+        );
+        // The position placeholders: the front index's `position` is POSITION,
+        // the manifest's `tape_position` is FIRST_TAPE_POSITION.
+        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
+        assert!(
+            manual.contains("with POSITION (the entry's `position`) and SIZE (its `size_bytes`)"),
+            "{manual}"
+        );
+        assert!(manual.contains("FIRST_TAPE_POSITION") && !manual.contains("FIRST_POSITION"));
     }
 }

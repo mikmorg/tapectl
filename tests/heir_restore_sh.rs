@@ -970,6 +970,9 @@ fn build_template_full(
     for t in tenants {
         for u in &t.units {
             let src = dir.join("src").join(u.name);
+            // A second version of a unit starts from an empty tree, so a file
+            // the first version had can be missing from it.
+            let _ = std::fs::remove_dir_all(&src);
             std::fs::create_dir_all(&src).unwrap();
             let mut hashes: BTreeMap<String, String> = BTreeMap::new();
             for i in 0..u.files {
@@ -1000,7 +1003,7 @@ fn build_template_full(
                 bytes[mid] ^= 0x55;
                 std::fs::write(src.join(&name), &bytes).unwrap();
             }
-            let work = dir.join("work").join(u.uuid);
+            let work = dir.join("work").join(format!("{}-v{}", u.uuid, u.version));
             std::fs::create_dir_all(&work).unwrap();
             let base = work.join("arch");
             run_dar(&[
@@ -4427,9 +4430,9 @@ fn the_manual_path_in_file_1_restores_a_unit_as_written() {
     // Step 7: the tape is put at the first slice once; each read leaves it at
     // the next file.
     let (ok, text) = run(
-        &guide_block(&manual, "FIRST_POSITION"),
+        &guide_block(&manual, "FIRST_TAPE_POSITION"),
         &[(
-            "FIRST_POSITION",
+            "FIRST_TAPE_POSITION",
             manifest.units[0].slices[0].tape_position.to_string(),
         )],
     );
@@ -4465,8 +4468,8 @@ fn the_manual_path_in_file_1_restores_a_unit_as_written() {
         let good = std::fs::read(work.join(format!("restore.{}.dar", sl.number))).unwrap();
         std::fs::remove_file(work.join(format!("restore.{}.dar", sl.number))).unwrap();
         let (ok, text) = run(
-            &guide_block(&manual, "FIRST_POSITION"),
-            &[("FIRST_POSITION", sl.tape_position.to_string())],
+            &guide_block(&manual, "FIRST_TAPE_POSITION"),
+            &[("FIRST_TAPE_POSITION", sl.tape_position.to_string())],
         );
         assert!(ok, "{text}");
         let loose = |line: &str| -> String {
@@ -6049,8 +6052,8 @@ fn file_1_gap_spacing_reaches_the_slice_it_names() {
     let (ok, text) = run(&guide_block(&manual, "setblk 524288"), &[]);
     assert!(ok, "{text}");
     let (ok, text) = run(
-        &guide_block(&manual, "FIRST_POSITION"),
-        &[("FIRST_POSITION", photos.positions[0].to_string())],
+        &guide_block(&manual, "FIRST_TAPE_POSITION"),
+        &[("FIRST_TAPE_POSITION", photos.positions[0].to_string())],
     );
     assert!(ok, "{text}");
     let slice_block = guide_block(&manual, "> restore.NUMBER.dar");
@@ -7565,8 +7568,11 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
     let (ok, text) = run_guide(
         &h,
         &dir,
-        &guide_block(&manual, "FIRST_POSITION"),
-        &[("FIRST_POSITION", unit.slices[0].tape_position.to_string())],
+        &guide_block(&manual, "FIRST_TAPE_POSITION"),
+        &[(
+            "FIRST_TAPE_POSITION",
+            unit.slices[0].tape_position.to_string(),
+        )],
         true,
     );
     assert!(ok, "{text}");
@@ -7893,4 +7899,293 @@ fn file_1_says_how_to_tell_a_compressed_unit_and_it_works() {
             .any(|l| l.contains("text.txt") && !l.contains("[-----]")),
         "the archive itself does show a ratio, which the envelope lacks: {real}"
     );
+}
+
+// ---- tapectl 1.5.0: the sixth read's commands, run as written (#485) ----
+//
+// File 1's new text shows commands for three things a fresh reader asked for:
+// the files only an older version has (item 2), a unit's `dar_command` from an
+// escrow key without unpacking an envelope (item 4), and the way back after a
+// failed `dd` (item 7). Each is run here against the fake tape, the real dar
+// and the real `grep`, `awk` and `tar`, from the guide's own lines.
+
+/// A volume with two versions of one unit: version 1 holds `keep.txt` and
+/// `gone.txt`, version 2 holds `keep.txt` and `new.txt`.
+fn versions_template() -> &'static Template {
+    static T: OnceLock<Template> = OnceLock::new();
+    T.get_or_init(|| {
+        let v = |version, seed, names: &'static [&'static str]| UnitSpec {
+            cat: Cat::Matched,
+            name: "docs",
+            uuid: "22222222-3333-4444-5555-666666666666",
+            version,
+            seed,
+            files: names.len(),
+            file_len: 30_000,
+            names,
+            corrupt: &[],
+            tamper: &[],
+        };
+        let tenants = vec![TenantSpec {
+            name: "alice",
+            units: vec![
+                v(1, 1, &["keep.txt", "gone.txt"]),
+                v(2, 2, &["keep.txt", "new.txt"]),
+            ],
+        }];
+        build_template("versions", &tenants, true)
+    })
+}
+
+/// `./RESTORE.sh` in a guide line is this Heir's script, with the work
+/// directory and a device name that mean nothing to the fake.
+fn this_script(h: &Heir) -> (&'static str, String) {
+    (
+        "./RESTORE.sh",
+        format!(
+            "env TMPDIR={} TAPE_DEVICE=/dev/nst-fake bash {}",
+            h.dir.join("tmp").display(),
+            h.dir.join("RESTORE.sh").display()
+        ),
+    )
+}
+
+/// "Files deleted before the newest version": the guide's three lines list
+/// the paths two versions have, and print those only the older one has. The
+/// file the newer version lacks is printed and nothing else is; swapped, the
+/// last line prints the file only the newer version has (it is directional);
+/// and the restore line brings the deleted file back from the older version
+/// into a directory of its own, byte for byte.
+#[test]
+fn file_1_lists_the_files_only_an_older_version_has_and_restores_one() {
+    let t = versions_template();
+    let h = Heir::of(t, &[]);
+    let guide = generate_system_guide_v2(LABEL, t.total_files);
+    let bx = guide_section(
+        &guide,
+        "The rest of the box: other tapes, copies and the index",
+    );
+    let lists = guide_block(&bx, "newer.paths");
+    assert_eq!(lists.len(), 3, "{lists:?}");
+    let work = h.dir.join("deleted");
+    std::fs::create_dir_all(&work).unwrap();
+    // The guide's example says versions 3 and 2; this tape has 2 and 1.
+    let versions = |lines: Vec<String>| -> Vec<String> {
+        lines
+            .into_iter()
+            .map(|l| {
+                l.replace("--version 2", "--version @OLD")
+                    .replace("--version 3", "--version 2")
+                    .replace("--version @OLD", "--version 1")
+            })
+            .collect()
+    };
+    let subs = |h: &Heir| -> Vec<(&'static str, String)> {
+        vec![
+            ("UNIT", "docs".to_string()),
+            ("YOUR_KEY.age.key", h.key("esc")),
+            this_script(h),
+        ]
+    };
+    let (ok, text) = run_guide(&h, &work, &versions(lists[..2].to_vec()), &subs(&h), true);
+    assert!(ok, "{text}");
+    let newer = std::fs::read_to_string(work.join("newer.paths")).unwrap();
+    let older = std::fs::read_to_string(work.join("older.paths")).unwrap();
+    for p in ["keep.txt", "new.txt", "sub", "sub/note.txt"] {
+        assert!(newer.lines().any(|l| l == p), "newer has {p}: {newer}");
+    }
+    for p in ["keep.txt", "gone.txt", "sub", "sub/note.txt"] {
+        assert!(older.lines().any(|l| l == p), "older has {p}: {older}");
+    }
+    assert!(!newer.lines().any(|l| l == "gone.txt"), "{newer}");
+    assert!(!older.lines().any(|l| l == "new.txt"), "{older}");
+
+    let (ok, printed) = run_guide(&h, &work, &lists[2..], &[], true);
+    assert!(ok, "{printed}");
+    assert_eq!(printed, "gone.txt\n", "only the deleted file is printed");
+    // Directional: the same line with the files swapped prints the new file.
+    let swapped = lists[2].replace("newer.paths older.paths", "older.paths newer.paths");
+    assert_ne!(swapped, lists[2]);
+    let (ok, printed) = run_guide(&h, &work, &[swapped], &[], true);
+    assert!(ok, "{printed}");
+    assert_eq!(printed, "new.txt\n");
+
+    // To restore the deleted file, from the older version, into a directory
+    // of its own.
+    let restore = guide_block(&bx, "UNIT-v2");
+    let dest = h.sub("old-version");
+    let mut restore_subs = vec![("PATH", "gone.txt".to_string())];
+    restore_subs.push(("UNIT", "docs".to_string()));
+    restore_subs.push(("YOUR_KEY.age.key", h.key("esc")));
+    restore_subs.push(("/destination", dest.clone()));
+    restore_subs.push(this_script(&h));
+    let (ok, text) = run_guide(&h, &work, &versions(restore), &restore_subs, true);
+    assert!(ok, "{text}");
+    assert_eq!(
+        std::fs::read(Path::new(&dest).join("docs-v2/gone.txt")).unwrap(),
+        content(101, 30_000),
+        "the file only version 1 had comes back from version 1"
+    );
+}
+
+/// "Compressed units": an escrow-only heir reads each unit's `dar_command`
+/// from the operator envelope with the guide's own lines. `--find-envelope`
+/// names the operator envelope ("Decrypted envelope at file N (tenant:
+/// operator)"), File 3 gives its size, and the five commands print every
+/// unit's name, version and `dar_command` without unpacking the envelope.
+#[test]
+fn file_1_short_way_to_the_dar_command_works_with_the_escrow_key() {
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let disk = guide_section(&guide, "Disk space");
+    let manual = guide_section(&guide, "Manual Recovery Steps");
+    let work = h.dir.join("dar-command");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let (code, text) = h.run(&["--find-envelope", "--key", &h.key("esc")]);
+    assert_eq!(code, 0, "{text}");
+    let operator_at = text
+        .lines()
+        .find_map(|l| {
+            l.split("Decrypted envelope at file ")
+                .nth(1)
+                .filter(|rest| rest.contains("(tenant: operator)"))
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("no operator envelope named:\n{text}"));
+
+    // File 3 into front_index.toml, as step 3 of the manual steps does.
+    for needle in ["setblk 524288", "> file0.txt", "> front_index.toml"] {
+        let (ok, out) = run_guide(&h, &work, &guide_block(&manual, needle), &[], true);
+        assert!(ok, "{needle}: {out}");
+    }
+    let grep = disk
+        .split('`')
+        .find(|c| c.starts_with("grep -A3 '^position = POSITION$'"))
+        .expect("the guide's grep of the front index")
+        .to_string();
+    let (ok, entry) = run_guide(
+        &h,
+        &work,
+        &[grep],
+        &[("POSITION", operator_at.clone())],
+        true,
+    );
+    assert!(ok, "{entry}");
+    assert!(
+        entry.contains("type = \"operator_envelope\""),
+        "the entry is the operator envelope's: {entry}"
+    );
+    let size = entry
+        .lines()
+        .find_map(|l| l.strip_prefix("size_bytes = "))
+        .unwrap_or_else(|| panic!("no size_bytes in:\n{entry}"))
+        .to_string();
+
+    let (ok, out) = run_guide(
+        &h,
+        &work,
+        &guide_block(&disk, "tar -xOf"),
+        &[
+            ("POSITION", operator_at),
+            ("SIZE", size),
+            ("YOUR_KEY.age.key", h.key("esc")),
+        ],
+        true,
+    );
+    assert!(ok, "{out}");
+    for unit in ["photos/2019", "docs", "ledgers", "restaged", "nocat"] {
+        assert!(
+            out.lines().any(|l| l == format!("name = \"{unit}\"")),
+            "{unit} is listed:\n{out}"
+        );
+    }
+    assert_eq!(
+        out.lines()
+            .filter(|l| *l == "dar_command = \"dar -c base -R /src -N\"")
+            .count(),
+        5,
+        "a dar_command for each of the five units:\n{out}"
+    );
+    assert!(
+        out.lines().any(|l| l.starts_with("snapshot_version = ")),
+        "{out}"
+    );
+}
+
+/// A `dd` that stops with an error leaves the head INSIDE that file (the fake
+/// loses the position, as the st driver does mid-file), so the next slice
+/// read straight after is not that slice. The guide's way back is to rewind
+/// and `fsf` to the `tape_position` of the slice wanted: that reads it, and
+/// the failed slice again.
+#[test]
+fn file_1_after_a_failed_dd_a_rewind_and_fsf_reads_the_next_slice() {
+    let h = Heir::new();
+    let guide = generate_system_guide_v2(LABEL, template().total_files);
+    let manual = guide_section(&guide, "Manual Recovery Steps");
+    let u = unit("photos/2019");
+    assert!(u.positions.len() >= 3, "{:?}", u.positions);
+    let work = h.dir.join("dd-error");
+    std::fs::create_dir_all(&work).unwrap();
+    let slice = |i: usize, fail_at: Option<i64>| -> (bool, String) {
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(p) = fail_at {
+            lines.push(format!("export FAKE_DD_FAIL={p}"));
+        }
+        lines.extend(guide_block(&manual, "> restore.NUMBER.dar"));
+        run_guide(
+            &h,
+            &work,
+            &lines,
+            &[
+                ("SHA256_ENCRYPTED", u.hashes[i].clone()),
+                ("ENCRYPTED_BYTES", u.sizes[i].to_string()),
+                ("NUMBER", (i + 1).to_string()),
+                ("YOUR_KEY.age.key", h.key("alice")),
+            ],
+            false,
+        )
+    };
+    let go_to = |p: i64| -> (bool, String) {
+        run_guide(
+            &h,
+            &work,
+            &[
+                "mt -f /dev/nst0 rewind".to_string(),
+                format!("mt -f /dev/nst0 fsf {p}"),
+            ],
+            &[],
+            true,
+        )
+    };
+
+    let (ok, text) = go_to(u.positions[0]);
+    assert!(ok, "{text}");
+    let (_, text) = slice(0, None);
+    assert!(work.join("restore.1.dar").exists(), "slice 1 reads: {text}");
+
+    // Slice 2 fails with an I/O error.
+    let (_, text) = slice(1, Some(u.positions[1]));
+    assert!(text.contains("Input/output error"), "{text}");
+    assert!(!work.join("restore.2.dar").exists(), "{text}");
+
+    // Straight on to slice 3, as the counting would say: the head is lost.
+    let (_, text) = slice(2, None);
+    assert!(
+        !work.join("restore.3.dar").exists(),
+        "slice 3 is not read from where the failed read left the head: {text}"
+    );
+    let _ = std::fs::remove_file(work.join("restore.3.dar.age"));
+
+    // The guide's way back: rewind, `fsf` to the `tape_position` wanted.
+    let (ok, text) = go_to(u.positions[2]);
+    assert!(ok, "{text}");
+    let (_, text) = slice(2, None);
+    assert!(work.join("restore.3.dar").exists(), "slice 3 reads: {text}");
+    // And the slice that failed can be tried again the same way.
+    let (ok, text) = go_to(u.positions[1]);
+    assert!(ok, "{text}");
+    let (_, text) = slice(1, None);
+    assert!(work.join("restore.2.dar").exists(), "slice 2 reads: {text}");
 }
