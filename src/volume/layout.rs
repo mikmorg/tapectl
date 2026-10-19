@@ -12075,15 +12075,9 @@ sha256_encrypted = \"bbb\"
             .collect();
         assert_eq!(cmds.len(), 3, "{cmds:?}");
         for cmd in &cmds {
-            let mut argv: Vec<&str> = cmd.split_whitespace().collect();
-            // ADR-0012 item 107: `restore unit|file|volume` take `--key FILE`
-            // (repeatable), built on branch w152-key. Until that lands here
-            // the clap layer refuses the flag, so it is taken off for the
-            // parse (and asserted below); delete this strip at integration.
-            if argv.get(1) == Some(&"restore") {
-                let at = argv.iter().position(|a| *a == "--key").expect("--key");
-                argv.drain(at..at + 2);
-            }
+            // `restore unit|file|volume` take `--key FILE` (ADR-0012 item 107):
+            // every command is parsed as File 1 prints it.
+            let argv: Vec<&str> = cmd.split_whitespace().collect();
             crate::cli::Cli::try_parse_from(&argv)
                 .unwrap_or_else(|e| panic!("File 1 shows a command the CLI refuses: {cmd}: {e}"));
         }

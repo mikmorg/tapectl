@@ -2103,6 +2103,7 @@ mod tests {
             generation: "LTO-6".into(),
             capacity_override: None,
             fill_ceiling: 1.0,
+            post_warning_bytes: None,
             enospc_buffer: "0".into(),
         });
         conn.execute(
