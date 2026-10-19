@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-volume \- Restore several units from one volume in one pass over the tape
 .SH SYNOPSIS
-\fBtapectl restore volume\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-unit\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-home\fR] [\fB\-\-spool\fR] [\fB\-\-fail\-fast\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
+\fBtapectl restore volume\fR [\fB\-\-json\fR] <\fB\-\-to\fR> [\fB\-\-unit\fR] [\fB\-\-device\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-home\fR] [\fB\-\-spool\fR] [\fB\-\-fail\-fast\fR] [\fB\-\-key\fR] [\fB\-\-dry\-run\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fILABEL\fR] 
 .SH DESCRIPTION
 Restore several units from one volume in one pass over the tape
 .PP
@@ -56,6 +56,9 @@ Spool every unit\*(Aqs slices to the scratch directory instead of streaming them
 .TP
 \fB\-\-fail\-fast\fR
 Stop at the first unit that fails; the units after it are not attempted. Without it every unit is tried
+.TP
+\fB\-\-key\fR \fI<FILE>\fR
+An age identity file (the SECRET, `AGE\-SECRET\-KEY\-1…`) to decrypt with in this command only; repeat for several. It is added to the home\*(Aqs own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild \-\-from\-volume \-\-key`. A file that is not an identity is refused, naming it, before the drive is opened
 .TP
 \fB\-\-dry\-run\fR
 Show what would be restored, unit by unit in tape order, without opening the drive

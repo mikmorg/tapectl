@@ -36,6 +36,7 @@ tapectl restore unit [OPTIONS] --unit <UNIT> --to <TO>
 - `--overwrite` — Restore into a destination that already holds files, replacing any that collide. Without it a destination that is not empty is refused before the tape is touched
 - `--no-space-check` — Skip the free-space check (the unit's size when it streams; about twice that when its slices are spooled, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
 - `--spool` — Decrypt every slice to the scratch directory before dar extracts them, even when the unit could stream (its isolated catalogue on disk). Needs about twice the unit's size with the scratch directory and --to on one disk
+- `--key <FILE>` — An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt with in this command only; repeat for several. It is added to the home's own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild --from-volume --key`. A file that is not an identity is refused, naming it, before the drive is opened
 - `--dry-run` — Show what would be restored without restoring
 
 ### tapectl restore volume
@@ -62,6 +63,7 @@ tapectl restore volume [OPTIONS] --to <DIR> [LABEL]
 - `--no-space-check` — Skip the free-space check of the whole set (every restored unit, plus the largest unit's spooled slices)
 - `--spool` — Spool every unit's slices to the scratch directory instead of streaming them into dar (see `restore unit --spool`)
 - `--fail-fast` — Stop at the first unit that fails; the units after it are not attempted. Without it every unit is tried
+- `--key <FILE>` — An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt with in this command only; repeat for several. It is added to the home's own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild --from-volume --key`. A file that is not an identity is refused, naming it, before the drive is opened
 - `--dry-run` — Show what would be restored, unit by unit in tape order, without opening the drive
 
 ### tapectl restore file
@@ -83,6 +85,7 @@ tapectl restore file [OPTIONS] --file <FILE> --unit <UNIT> --to <TO>
 - `--scratch <DIR>` — Where the decrypted slices wait for dar: a scratch directory is made inside DIR and removed when the restore ends. Defaults to inside --to, never the system temp directory. With the unit's isolated catalogue from `stage create` on disk only the slices holding the file (and the last) are read; otherwise every slice
 - `--overwrite` — Replace a file of the same name already in --to. Without it one is refused before the tape is touched
 - `--no-space-check` — Skip the free-space check (the decrypted slices read, plus the file, with the scratch directory and --to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin-provisioned one
+- `--key <FILE>` — An age identity file (the SECRET, `AGE-SECRET-KEY-1…`) to decrypt with in this command only; repeat for several. It is added to the home's own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild --from-volume --key`. A file that is not an identity is refused, naming it, before the drive is opened
 
 ### tapectl restore raw-volume
 

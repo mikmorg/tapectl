@@ -76,7 +76,7 @@ tapectl catalog stats [OPTIONS]
 Reconstruct catalog rows by reading a sealed volume — the path back when the database is gone and there is no backup
 
 ```text
-tapectl catalog rebuild [OPTIONS] --key <KEY>
+tapectl catalog rebuild [OPTIONS] --key <FILE>
 ```
 
 **Options**
@@ -85,7 +85,7 @@ tapectl catalog rebuild [OPTIONS] --key <KEY>
 - `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured.
   
     There is still no `/dev/nst0` fallback (ADR-0010): `/dev/nstN` numbering is not stable across reboots on a host with more than one drive, and unlike a read-only dump this command writes what it reads into the catalog — a silent wrong-device default would file one tape's contents under another's. The sole configured backend's `device_tape` is not a guess about which drive you meant; a guessed device number is. Resolve by serial through `/dev/tape/by-id/`.
-- `--key <KEY>` *(required)* — Operator or escrow secret key file. A tenant key cannot open the operator envelope and is refused with a pointer at RESTORE.sh
+- `--key <FILE>` *(required)* — Operator or escrow secret key file (an age identity, `AGE-SECRET-KEY-1…`); repeat for several. For this command only: never copied into the home or registered as any key, so an heir can rebuild with the escrow key alone and then restore with the same `--key`. A tenant key cannot open the operator envelope and is refused with a pointer at RESTORE.sh; a file that is not an identity is refused, naming it, before the drive is opened
 - `--label <LABEL>` — Refuse unless the tape's own reported label matches — a wrong-tape guard, not a database lookup
 - `--tenant <TENANT>` *(default: `recovered`)* — Tenant to file units under when no tenant envelope on this cartridge names their owner (only reachable with a damaged or partial tape)
 

@@ -4,7 +4,7 @@
 .SH NAME
 tapectl\-restore\-file \- Restore a single file from a unit
 .SH SYNOPSIS
-\fBtapectl restore file\fR <\fB\-\-file\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> [\fB\-\-from\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] <\fB\-\-to\fR> [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-version\fR] [\fB\-\-home\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-h\fR|\fB\-\-help\fR] 
+\fBtapectl restore file\fR <\fB\-\-file\fR> [\fB\-\-json\fR] [\fB\-\-dry\-run\fR] <\fB\-\-unit\fR> [\fB\-\-from\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] <\fB\-\-to\fR> [\fB\-\-device\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-version\fR] [\fB\-\-home\fR] [\fB\-\-scratch\fR] [\fB\-\-overwrite\fR] [\fB\-\-no\-space\-check\fR] [\fB\-\-key\fR] [\fB\-h\fR|\fB\-\-help\fR] 
 .SH DESCRIPTION
 Restore a single file from a unit
 .SH OPTIONS
@@ -60,6 +60,9 @@ Replace a file of the same name already in \-\-to. Without it one is refused bef
 .TP
 \fB\-\-no\-space\-check\fR
 Skip the free\-space check (the decrypted slices read, plus the file, with the scratch directory and \-\-to on one disk), for a filesystem that holds more than it reports free, such as a compressed or thin\-provisioned one
+.TP
+\fB\-\-key\fR \fI<FILE>\fR
+An age identity file (the SECRET, `AGE\-SECRET\-KEY\-1…`) to decrypt with in this command only; repeat for several. It is added to the home\*(Aqs own keys and nothing more: never copied into the home, registered as any key, or logged. Lets an heir who holds only the escrow key restore through tapectl after `catalog rebuild \-\-from\-volume \-\-key`. A file that is not an identity is refused, naming it, before the drive is opened
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

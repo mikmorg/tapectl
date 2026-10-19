@@ -23,8 +23,8 @@ There is still no `/dev/nst0` fallback (ADR\-0010): `/dev/nstN` numbering is not
 \fB\-\-dry\-run\fR
 Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
 .TP
-\fB\-\-key\fR \fI<KEY>\fR
-Operator or escrow secret key file. A tenant key cannot open the operator envelope and is refused with a pointer at RESTORE.sh
+\fB\-\-key\fR \fI<FILE>\fR
+Operator or escrow secret key file (an age identity, `AGE\-SECRET\-KEY\-1…`); repeat for several. For this command only: never copied into the home or registered as any key, so an heir can rebuild with the escrow key alone and then restore with the same `\-\-key`. A tenant key cannot open the operator envelope and is refused with a pointer at RESTORE.sh; a file that is not an identity is refused, naming it, before the drive is opened
 .TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Enable verbose output
