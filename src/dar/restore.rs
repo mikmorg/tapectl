@@ -39,7 +39,7 @@ const SKIPPED_MARKER: &str = "not restored (user choice)";
 ///
 /// So we key off the per-file line, which names the path and is the only
 /// place the specific casualty appears.
-fn skipped_paths(stdout: &str) -> Vec<String> {
+pub(crate) fn skipped_paths(stdout: &str) -> Vec<String> {
     stdout
         .lines()
         .filter_map(|line| {
@@ -156,7 +156,7 @@ fn argv_of(dar_binary: &str, args: &[std::ffi::OsString]) -> Vec<String> {
 
 /// [`run_extract`]'s verdict on a finished dar: a non-zero exit (or a
 /// signal) fails, and so does exit 0 with a silent skip (`fail_on_skipped`).
-fn verdict_of(report: &DarReport, what: &str, dest: &Path) -> Result<()> {
+pub(crate) fn verdict_of(report: &DarReport, what: &str, dest: &Path) -> Result<()> {
     if report.exit_code != Some(0) {
         let stderr = String::from_utf8_lossy(&report.stderr);
         return Err(TapectlError::Dar(format!("{what} failed: {stderr}")));

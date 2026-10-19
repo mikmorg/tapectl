@@ -101,14 +101,63 @@ pub(super) fn judge(
             dar_failure: None,
             holes,
         }),
-        Err(e) if !holes.is_empty() => Ok(Extracted {
-            root,
-            damaged: reported,
-            dar_failure: Some(e),
-            holes,
-        }),
+        Err(e) if !holes.is_empty() => {
+            let e = skipped_over_holes(report, &stdout, &root).unwrap_or(e);
+            Ok(Extracted {
+                root,
+                damaged: reported,
+                dar_failure: Some(e),
+                holes,
+            })
+        }
         Err(e) => Err(e),
     }
+}
+
+/// dar's exit-0 verdict over a hole, in words that are true of it (#484).
+///
+/// A slice of zeros makes dar read on past it and, measured on 2.7.13, ask
+/// its overwrite question about entries it had itself begun earlier in the
+/// same run (one dar, one empty destination, no slice re-fed): with no
+/// terminal the answer is no, it prints `not restored (user choice)` for each
+/// and exits 0. [`dar::restore::extract_reported`]'s verdict reads that line
+/// as a stale copy left at the destination and tells the operator to empty
+/// it, which is the right advice when the destination was not empty and wrong
+/// here, where the files are dar's own partial output. Over holes the files
+/// are judged by their checksums (`suspect_check`) and the loss is named from
+/// the catalog, so only the cause is restated.
+///
+/// `None` when dar did not exit 0 or skipped nothing: the verdict is then
+/// not that one.
+fn skipped_over_holes(
+    report: Option<&dar::restore::DarReport>,
+    stdout: &str,
+    root: &Path,
+) -> Option<TapectlError> {
+    if report?.exit_code != Some(0) {
+        return None;
+    }
+    let skipped = dar::restore::skipped_paths(stdout);
+    if skipped.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = skipped
+        .iter()
+        .map(|p| {
+            Path::new(p)
+                .strip_prefix(root)
+                .map_or_else(|_| p.clone(), |r| r.to_string_lossy().into_owned())
+        })
+        .collect();
+    Some(TapectlError::Other(format!(
+        "dar exited 0 but did not restore {} file(s) (\"not restored (user choice)\"): {}. \
+         None was left by an earlier restore: the destination was empty, or dar was told to \
+         overwrite, when it began. With no terminal dar answers its own questions no, and after \
+         a slice it could not read it asks them about files it had created itself earlier in \
+         this run",
+        names.len(),
+        names.join(", "),
+    )))
 }
 
 /// Everything [`finish`] needs that the restore already knows.
@@ -653,6 +702,71 @@ fn incomplete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report(exit_code: Option<i32>, stdout: &str) -> dar::restore::DarReport {
+        dar::restore::DarReport {
+            argv: vec!["dar".into()],
+            exit_code,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    const SKIPS: &str = "/dest/big.bin not restored (user choice)\n\
+                         /dest/sub/small.txt not restored (user choice)\n";
+
+    /// Over a hole, dar's exit-0 skip is not called a stale copy: the files
+    /// it names are its own, and the advice to empty the destination is wrong.
+    /// The positive control is the verdict `extract_reported` gives the same
+    /// output, which says exactly that.
+    #[test]
+    fn a_skip_over_a_hole_is_not_called_a_stale_copy() {
+        let r = report(Some(0), SKIPS);
+        let verdict = dar::restore::verdict_of(&r, "dar -x --sequential-read", Path::new("/dest"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            verdict.contains("stale copies"),
+            "positive control: {verdict}"
+        );
+
+        let holes = vec![Damage {
+            slice_number: 2,
+            volume: "L6-1".into(),
+            reason: "bad".into(),
+            holes: vec![0..65536],
+        }];
+        let mut trace = RestoreTrace::default();
+        trace.dar = Some(r);
+        let ex = judge(
+            &trace,
+            Err(TapectlError::Dar(verdict)),
+            PathBuf::from("/dest"),
+            holes,
+        )
+        .unwrap();
+        let said = ex.dar_failure.expect("dar's failure is kept").to_string();
+        assert!(!said.contains("stale"), "{said}");
+        assert!(!said.contains("declined to overwrite"), "{said}");
+        assert!(!said.contains("remove those files"), "{said}");
+        assert!(
+            said.contains("big.bin, sub/small.txt"),
+            "paths under the root: {said}"
+        );
+        assert!(said.contains("2 file(s)"), "{said}");
+    }
+
+    /// Only dar's exit-0 skip is restated. A dar that failed keeps its own
+    /// words, and with no hole the verdict is the plain refusal.
+    #[test]
+    fn only_an_exit_zero_skip_is_restated() {
+        let root = Path::new("/dest");
+        assert!(skipped_over_holes(Some(&report(Some(5), SKIPS)), SKIPS, root).is_none());
+        assert!(skipped_over_holes(Some(&report(None, SKIPS)), SKIPS, root).is_none());
+        assert!(skipped_over_holes(Some(&report(Some(0), "")), "", root).is_none());
+        assert!(skipped_over_holes(None, SKIPS, root).is_none());
+        assert!(skipped_over_holes(Some(&report(Some(0), SKIPS)), SKIPS, root).is_some());
+    }
 
     #[test]
     fn a_file_is_checked_against_its_recorded_checksum() {

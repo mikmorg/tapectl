@@ -6626,6 +6626,10 @@ mod tests {
                     "a hole is not a stream that failed: {err}"
                 );
                 assert!(err.contains("big.bin"), "the file that spans it: {err}");
+                assert!(
+                    !err.contains("stale") && !err.contains("remove those files"),
+                    "dar's own files are not stale copies, and the destination was empty: {err}"
+                );
                 // No unauthenticated byte: whatever dar left is the original or
                 // the zeros of a hole.
                 for (path, original) in &m.files {
