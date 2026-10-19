@@ -1166,7 +1166,8 @@ tapectl, needs to know this:
   different tape, or fails.
 - **Other tapes:** a tape written by 1.3.0 or later carries an index of the other
   tapes. `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` lists every version of a
-  unit and the tapes holding it; `--find TEXT` finds a path. The newest tape's index
+  unit and the tapes holding it; `--where --all` lists every unit the index names, no
+  limit, with the tapes that hold each; `--find TEXT` finds a path. The newest tape's index
   is the most complete.
 - **Tools:** `mt` (package `mt-st`), `dd`, `head`, `truncate`, `tar`, `mkfifo`,
   `tee`, `sha256sum`, `age` and `age-keygen` ([age-encryption.org](https://age-encryption.org);

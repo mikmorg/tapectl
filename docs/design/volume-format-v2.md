@@ -370,7 +370,10 @@ tape carries it twice, §1.3).
 **Who reads it.**
 - RESTORE.sh: `--where UNIT` prints the rows of `units.tsv` for a unit (every version and the
   tapes holding it); `--find PATH` prints the rows of `paths.tsv` whose path contains the text
-  given, with the holders of each match. Both read the envelopes the key opens.
+  given, with the holders of each match. `--where --all` prints every unit the index names,
+  with no limit: for each unit (keyed by tenant, name and unit uuid) its newest version by number,
+  whether the loaded tape holds it, and every version's holders, after a summary and the units
+  whose newest version the loaded tape does not hold. All three read the envelopes the key opens.
 - RESTORE.sh `--restore` and `--fill-from`: after each unit is extracted, read the `sha256`
   column of the `paths.tsv` of the tenant envelope that lists the unit and version (an escrow or
   operator key finds it among the envelopes the walk opened; the operator envelope has none), check

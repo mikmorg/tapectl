@@ -854,6 +854,11 @@ step_heir_where() {
     out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --where no-such-unit --key "$key" 2>&1)"; rc=$?
     [ "$rc" -eq 1 ] || { printf '%s\n' "$out"; echo "heir_where: an unknown unit exited $rc, want 1"; return 1; }
     grep -F -- "unitA" >/dev/null <<<"$out" || { printf '%s\n' "$out"; echo "heir_where: the unknown-unit answer does not list the units the index holds"; return 1; }
+    # --where --all (the third fresh read of File 1): every unit the index names, no cap.
+    out="$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --where --all --key "$key" 2>&1)"; rc=$?
+    [ "$rc" -eq 0 ] || { printf '%s\n' "$out"; echo "heir_where: --where --all exited $rc, want 0"; return 1; }
+    grep -F -- "Unit unitA (tenant alice): newest version $ver, on this tape" >/dev/null <<<"$out" \
+        || { printf '%s\n' "$out"; echo "heir_where: --where --all does not list unitA at its newest version on this tape"; return 1; }
 }
 step_heir_find_path() {
     local ver size out rc needle key="$HOME_DIR/keys/alice-primary.age.key"

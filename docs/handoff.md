@@ -364,7 +364,8 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
    failing closed). Record both on #444 with the run. It is also the first run on the real
    drive, with the real `age`, `dar`, `mt`, `tar` and `sha256sum`, of 1.2.0's and 1.3.0's
    RESTORE.sh (the per-mode tool checks, the lone-unit note, the work-directory warning,
-   `--where`/`--find` on the index, slice replacement and the per-file sha256 check); the mhvtl
+   `--where`, `--where --all` and `--find` on the index, slice replacement and the per-file
+   sha256 check); the mhvtl
    gate's heir legs are the only other real-tool run (ADR-0012 item 70). Record `age --version`
    with it. The first tape 1.3.0 writes is the first whose index names the others.
 
