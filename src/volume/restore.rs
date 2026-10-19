@@ -6144,6 +6144,16 @@ mod tests {
                 pub _drive: InjectedDrive,
             }
 
+            /// Where [`Multi::damage`] hits a slice's age file.
+            #[derive(Clone, Copy)]
+            pub(crate) enum Spot {
+                /// Inside the header's MAC line: the file does not open.
+                HeaderMac,
+                /// Inside the 16-byte payload nonce: the file opens and no
+                /// chunk authenticates.
+                Nonce,
+            }
+
             /// `(unit name, its files as (path, bytes), dar slice size)`.
             pub(crate) type UnitSpec<'a> = (&'a str, &'a [(&'a str, Vec<u8>)], &'a str);
 
@@ -6171,6 +6181,36 @@ mod tests {
                             _ => None,
                         })
                         .collect()
+                }
+
+                /// Flip one byte of slice `slice` (1-based) as the tape holds
+                /// it, at a landmark of its age file found in the bytes
+                /// themselves. NEVER an absolute offset: age puts a grease
+                /// stanza of random length (a tag of 1-8 characters, up to
+                /// four arguments, a body of up to 99 bytes) before the MAC
+                /// line, so the header ends anywhere from about byte 195 to
+                /// byte 370 and a fixed offset lands in the header on one
+                /// encryption and in the payload nonce on the next (#484).
+                pub(crate) fn damage(&self, slice: usize, spot: Spot) {
+                    let mut tape = self.fake.state();
+                    let file = &mut tape.files[FIRST as usize + slice - 1];
+                    // The MAC line is the only one that starts with `---`:
+                    // stanza lines start `->` and their bodies are base64.
+                    let mac = file
+                        .windows(5)
+                        .position(|w| w == b"\n--- ")
+                        .expect("an age header's MAC line")
+                        + 5;
+                    let at = match spot {
+                        // A character of the MAC itself: age refuses the header.
+                        Spot::HeaderMac => mac + 5,
+                        // The payload nonce follows the MAC's 43 characters and
+                        // its newline. It lies outside the MAC, so the header
+                        // opens and the key unwraps, but every chunk then fails
+                        // to authenticate.
+                        Spot::Nonce => mac + 43 + 1 + 3,
+                    };
+                    file[at] ^= 0xFF;
                 }
 
                 /// Forget the catalogue, as a catalog rebuilt from tape
@@ -6434,7 +6474,7 @@ mod tests {
         }
 
         mod streaming {
-            use super::multi::{multi, noise, FIRST};
+            use super::multi::{multi, noise, Spot, FIRST};
             use super::record::only_row;
             use super::*;
             use crate::tape::fake::Op;
@@ -6516,18 +6556,26 @@ mod tests {
                 assert!(!argv.contains("--sequential-read"), "{argv}");
             }
 
-            /// A slice that fails its checksum mid-stream fails the restore
-            /// naming the slice and saying dar may have written part of the
-            /// unit into --to; the slice is read to its end (no rewind), and
-            /// no later slice is read.
+            /// A slice whose age header does not open cannot be read around:
+            /// no chunk of it can be told from another, so nothing can be a
+            /// hole. The restore fails naming the slice and saying dar may
+            /// have written part of the unit into --to; the slice is read to
+            /// its end (no rewind), and no later slice is read.
+            ///
+            /// This is the case where a bad slice fails a streamed restore
+            /// outright. A slice whose header opens but whose chunks do not
+            /// authenticate is a hole instead and the restore goes on past it
+            /// (`a_slice_whose_every_chunk_fails_is_a_hole_and_the_restore_is_incomplete`,
+            /// and `repair_tests` for one bad chunk).
+            ///
+            /// The byte is a landmark of the age file, not an offset: this
+            /// test used to flip byte 200, which was in the header on 93
+            /// encryptions of 100 and in the nonce on the other 7, because
+            /// age's grease stanza makes the header's length random (#484).
             #[test]
             fn a_corrupt_slice_mid_stream_names_the_slice_and_the_partial_extract() {
                 let m = multi("ST-3", "st-unit", &tree(), "150k", true);
-                {
-                    let mut s = m.fake.state();
-                    let at = (FIRST + 1) as usize;
-                    s.files[at][200] ^= 0xFF;
-                }
+                m.damage(2, Spot::HeaderMac);
                 let dest = TempDir::new().unwrap();
                 let err = m
                     .unit("ST-3", "st-unit", dest.path(), &RestoreOptions::default())
@@ -6535,7 +6583,61 @@ mod tests {
                     .to_string();
                 assert!(err.contains("slice 2 checksum mismatch"), "{err}");
                 assert!(err.contains("partial"), "{err}");
+                assert!(err.contains("cannot be read around"), "{err}");
                 assert_eq!(m.slice_reads(), vec![1, 2], "{:?}", m.fake.ops());
+                assert_eq!(m.fake.rewinds(), 1);
+                assert!(
+                    !dest.path().join(SCRATCH_NAME).exists(),
+                    "the pipes are cleaned up"
+                );
+            }
+
+            /// The other half of #484, which the test above used to hit one
+            /// time in fourteen: a byte of the payload nonce, outside the
+            /// header's MAC. The header opens and the key unwraps, but no
+            /// chunk of the slice authenticates, and the only copy has
+            /// nothing to substitute, so slice 2 is delivered as a hole of
+            /// zeros from end to end and dar is fed on past it.
+            ///
+            /// dar, reading on past a slice of zeros, exits 0 having
+            /// skipped files it had begun itself in the same run (its
+            /// "not restored (user choice)" lines: with no terminal it
+            /// answers its own overwrite question no). It is ONE dar into a
+            /// destination that was empty; no tapectl path re-feeds a slice
+            /// or runs a second extract. The restore must end INCOMPLETE,
+            /// name the slice, its holes and the files, write no byte that
+            /// did not authenticate, and not call dar's own files stale
+            /// copies.
+            #[test]
+            fn a_slice_whose_every_chunk_fails_is_a_hole_and_the_restore_is_incomplete() {
+                let m = multi("ST-4", "st-unit", &tree(), "150k", true);
+                m.damage(2, Spot::Nonce);
+                let dest = TempDir::new().unwrap();
+                let err = m
+                    .unit("ST-4", "st-unit", dest.path(), &RestoreOptions::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("INCOMPLETE"), "{err}");
+                assert!(err.contains("slice 2 on ST-4"), "{err}");
+                assert!(err.contains("hole(s) of zeros"), "{err}");
+                assert!(err.contains("0..65536"), "every chunk: {err}");
+                assert!(
+                    !err.contains("partial restore"),
+                    "a hole is not a stream that failed: {err}"
+                );
+                assert!(err.contains("big.bin"), "the file that spans it: {err}");
+                // No unauthenticated byte: whatever dar left is the original or
+                // the zeros of a hole.
+                for (path, original) in &m.files {
+                    let Ok(got) = fs::read(dest.path().join(path)) else {
+                        continue;
+                    };
+                    assert!(got.len() <= original.len(), "{path}: {} bytes", got.len());
+                    assert!(
+                        got.iter().zip(original).all(|(g, o)| g == o || *g == 0),
+                        "{path} carries a byte that is neither the original nor a hole"
+                    );
+                }
                 assert_eq!(m.fake.rewinds(), 1);
                 assert!(
                     !dest.path().join(SCRATCH_NAME).exists(),
