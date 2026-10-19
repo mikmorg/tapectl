@@ -897,7 +897,8 @@ def derive_block(profiles, margin, trust_emulated, name=None, device_tape=None, 
     a = L.append
     a("# tapectl LTO profile block, emitted by scripts/lto-profile.sh --emit on %s" % utc())
     a("# drive:   %s %s, firmware %s (%s drive); medium generation %s" % (d["vendor"], d["product"], ", ".join(fw), d["generation"], m["generation"]))
-    a("# runs:    %s" % ("; ".join(run_tag(p) for p in profiles)))
+    a(textwrap.fill("runs:    " + "; ".join(run_tag(p) for p in profiles), width=110, initial_indent="# ",
+                    subsequent_indent="#          ", break_long_words=False, break_on_hyphens=False))
     a("# media makers seen (recorded, not a key, ADR-0012 item 97): %s" % (", ".join(sorted(set(str(p['medium'].get('maker')) for p in profiles)))))
     a("# rules:   fill_ceiling = the LOWEST over runs of (bytes written before the first write refusal / the marketed")
     a("#          capacity), less a %.2f margin, rounded DOWN to a whole percent, at most 1.0; %.2f when no run measured" % (margin, DEFAULT_FILL_CEILING))
