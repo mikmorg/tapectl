@@ -161,6 +161,41 @@
 //! `die_newer_needed`, and `requires` (empty, `KNOWN_FEATURES=""`). The
 //! MANIFEST.toml pin did not move. The previous pin was `36c970aa…`.
 //!
+//! **The 1.3.0 pin WIDENED AGAIN, 2026-10-19, under ADR-0012 item 103 (the
+//! heir checks every restored file against its recorded sha256, #418),**
+//! within the same bound: this pin only, ending when v1.3.0 is installed. The
+//! previous pin was `594da829…`; this one is `072b0c6e…`. dar's per-file check
+//! is a short checksum where equal byte flips cancel, so a damaged file could
+//! come back with no error; the tenant envelope's `index/paths.tsv` now carries
+//! each regular file's recorded sha256 (a `sha256` column between `size_bytes`
+//! and `path`, found by its header name; a reader that does not know the column
+//! ignores it, so it needs no `requires` entry), and RESTORE.sh checks the
+//! files it restored against it. ADDED: `--no-file-check` on `--restore`
+//! (`--fill-from` too); `file_check`, which reads the restored files back from
+//! `--to` and checks them with one `sha256sum -c --quiet` pass over the unit's
+//! hashed regular files (a name holding a backslash, a newline or a carriage
+//! return is hashed alone, from standard input, because `sha256sum` escapes
+//! such a name differently between versions); `index_for_unit`, which finds the
+//! `paths.tsv` that lists the unit and version among the envelopes the run has
+//! open (the one in use first; an escrow or operator key restores from the
+//! operator envelope, which has none, and the tenant envelope that lists the
+//! unit was opened before it); `finish_damage`; three named awk fragments,
+//! `AWK_FILE_CHECK_LISTED`, `AWK_FILE_CHECK_LIST` and `AWK_FILE_CHECK_FAILED`;
+//! and the header-comment, `--help` and message text for all of it. CHANGED:
+//! `dar_result` now always ends in `finish_damage`, which runs the check and
+//! unions the files dar named with the ones the check finds into one
+//! damaged-file list, so `record_damage` and `clear_stale_list` are reached
+//! through it only; `damage_note` has three wordings, by how many files the
+//! check added; `fill_end` checks the files the fill restored and keeps a
+//! failing one in the list. No tool was added: `sha256sum` was in every mode's
+//! set already, and the `TOOLS_*` lines did not move. A tape with no index
+//! (written before 1.3.0), or a file with no sha256 recorded, is not checked,
+//! and the script says so. The tape is not touched by the check (it reads the
+//! restored files and the envelope already on disk). The fixed points did not
+//! move and are asserted below: "tapectl 1.1.0" in `die_newer_needed`,
+//! `requires` (empty) and `KNOWN_FEATURES=""`. The MANIFEST.toml pin did not
+//! move.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -177,7 +212,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "594da82903d4f700677f25c211e7b965d5b32b135dceedb75719f9644777f9f0";
+const RESTORE_SH_SHA256: &str = "072b0c6ef7d7639274d194ee8fea3f382ad6ed4e320c80ec515fc3e1d99d08f4";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -303,6 +338,14 @@ fn restore_sh_bytes_are_pinned() {
         "dar -x \"$SCRATCH/job.$j/restore\" -R \"$(abs_dir \"$destdir\")\"",
         "    do_fill \"$dest\" \"$want\" \"$scratch\"\n",
         "  echo \"  $0 --restore --key KEYFILE --to DIR --unit U --fill-from LIST\"",
+        // 1.3.0, widened again (ADR-0012 item 103): the restored files against
+        // the sha256 their index records
+        "    --no-file-check)\n      FILE_CHECK=0\n      shift\n      ;;\n",
+        "index_for_unit() { # <unit> <version> <unit uuid>\n",
+        "file_check() { # <destination> [<file of escaped paths to check>]\n",
+        "finish_damage() { # <destination> <slices not available, or empty>\n",
+        "  file_check \"$root\" \"$WORK/fill.restored\"\n",
+        "  (cd \"$destdir\" && sha256sum -c --quiet) <\"$WORK/check.sums\"",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
