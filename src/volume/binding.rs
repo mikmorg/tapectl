@@ -725,6 +725,7 @@ fn operation_may_write_the_medium(op: Operation) -> bool {
         | Operation::VolumeReadSlices
         | Operation::VolumeCompactRead
         | Operation::VolumeCompact
+        | Operation::VolumeRewrite
         | Operation::RestoreUnit
         | Operation::RestoreVolume
         | Operation::RestoreRawVolume

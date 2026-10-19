@@ -751,7 +751,7 @@ fn returned_to_service_json(cleared: bool, counts_as_copy: bool) -> bool {
 /// What `volume write` / `volume resume` did about staging once the copy
 /// was sealed and confirmed (issue #440).
 #[derive(Debug)]
-enum StagingRelease {
+pub enum StagingRelease {
     /// `--keep-staging`: nothing was looked at, nothing released.
     Kept,
     /// Every unit written now meets its resolved `min_copies`: the report of
@@ -774,7 +774,7 @@ enum StagingRelease {
 /// volume now holds a completed write of. Never fails the write: an error
 /// becomes [`StagingRelease::Failed`], the warning naming the step and
 /// `tapectl staging clean`, which finishes it.
-fn release_staging_after_write(
+pub fn release_staging_after_write(
     conn: &Connection,
     config: &Config,
     label: &str,

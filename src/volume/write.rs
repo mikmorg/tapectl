@@ -1092,6 +1092,47 @@ pub fn volume_write(
     full_confirm: bool,
     assume_yes: bool,
 ) -> Result<()> {
+    volume_write_scoped(
+        conn,
+        paths,
+        config,
+        label,
+        device,
+        block_size,
+        force,
+        allow_missing_escrow,
+        prewrite_hash,
+        full_confirm,
+        assume_yes,
+        None,
+    )
+}
+
+/// [`volume_write`], optionally writing only some of the staged sets.
+///
+/// `only_stage_sets` is `None` for every ordinary write: the selection is
+/// every `staged` set in the catalog ([`find_staged_data`]). `volume rewrite`
+/// passes the stage sets it staged and holds (issue #483, ADR-0012
+/// 2026-10-19 item 106): its new volume carries those slices and nothing else
+/// that happens to be staged (its `--with-staged` is `None`). The selection
+/// is narrowed everywhere the write looks at staging — the batch it plans,
+/// the whole-on-disk check, the keys and the pre-flight — so a staged set
+/// outside the scope can neither be written by it nor refuse it.
+#[allow(clippy::too_many_arguments)]
+pub fn volume_write_scoped(
+    conn: &Connection,
+    paths: &TapectlPaths,
+    config: &Config,
+    label: &str,
+    device: &str,
+    block_size: usize,
+    force: bool,
+    allow_missing_escrow: bool,
+    prewrite_hash: bool,
+    full_confirm: bool,
+    assume_yes: bool,
+    only_stage_sets: Option<&[i64]>,
+) -> Result<()> {
     // ONE contact for the whole write, and the one `volume compact-write`,
     // `collection run` and `quick-archive` inherit — all three reach the
     // drive only through this function, so a guard of their own would
@@ -1112,6 +1153,7 @@ pub fn volume_write(
         assume_yes,
         &mut contact,
         ContactStore::Device,
+        only_stage_sets,
     );
     contact.finish_result(r)
 }
@@ -1133,6 +1175,8 @@ fn volume_write_contacted<'c>(
     assume_yes: bool,
     contact: &mut ContactSlot<'c>,
     store: ContactStore<'_>,
+    // `None`: every staged set. See [`volume_write_scoped`].
+    only_stage_sets: Option<&[i64]>,
 ) -> Result<()> {
     let (volume_id, volume_status, observed_condition): (i64, String, String) = conn
         .query_row(
@@ -1227,7 +1271,7 @@ fn volume_write_contacted<'c>(
     // The write's staged-data facts, from the catalog and the disk alone
     // (issues #402, #445): shared with `volume write --init`, which asks
     // them BEFORE it initialises a cartridge ([`write_catalog_preflight`]).
-    let units = checked_staged_units(conn)?;
+    let units = checked_staged_units(conn, only_stage_sets)?;
     // Issue #201: say what is about to happen before anything below touches
     // a backend, a MAM, or the drive. See `announce_staged_selection`'s doc
     // comment for why this is stderr and why it changes no selection logic.
@@ -5380,14 +5424,15 @@ fn stream_verify_slice_to_staging(
 
 /// One slice a recovery read (`read-slices`, `compact-read`) is to pull off
 /// a tape, as the catalog records it.
-struct RecoverySlice {
+#[derive(Debug)]
+pub(crate) struct RecoverySlice {
     /// The tape file position (`write_positions.position`, text in the catalog).
     position: String,
     sha_on_volume: String,
-    encrypted_bytes: i64,
+    pub(crate) encrypted_bytes: i64,
     sha_encrypted: String,
-    stage_set_id: i64,
-    slice_id: i64,
+    pub(crate) stage_set_id: i64,
+    pub(crate) slice_id: i64,
     /// The snapshot version this slice belongs to.
     version: i64,
 }
@@ -5413,6 +5458,34 @@ impl RecoverySlice {
     fn expected_hashes(&self) -> [&str; 2] {
         [self.sha_on_volume.as_str(), self.sha_encrypted.as_str()]
     }
+}
+
+/// The live slices of `volume_id`, in tape order: those of a completed write
+/// whose snapshot is neither `reclaimable` nor `purged`. The one selection
+/// `compact-read` stages and `volume rewrite` plans against (issue #483), so
+/// the rewrite's preflight and the read it then runs cannot disagree about
+/// what is live.
+pub(crate) fn live_recovery_slices(
+    conn: &Connection,
+    volume_id: i64,
+) -> Result<Vec<RecoverySlice>> {
+    let mut stmt = conn.prepare(
+        "SELECT wp.position, wp.sha256_on_volume,
+                ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id, ss.id as slice_id,
+                s.version
+         FROM write_positions wp
+         JOIN writes w ON w.id = wp.write_id
+         JOIN stage_slices ss ON ss.id = wp.stage_slice_id
+         JOIN stage_sets sts ON sts.id = w.stage_set_id
+         JOIN snapshots s ON s.id = sts.snapshot_id
+         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
+           AND s.status NOT IN ('reclaimable', 'purged')
+         ORDER BY CAST(wp.position AS INTEGER)",
+    )?;
+    let slices = stmt
+        .query_map(params![volume_id], RecoverySlice::from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(slices)
 }
 
 /// A slice file a recovery read wrote into staging, and what
@@ -5514,7 +5587,7 @@ fn remove_dir_if_empty(dir: &Path) {
 /// this is a refusal naming the figures, not the "may not fit" question
 /// `stage create` asks about an estimate. Checked before the first slice is
 /// read, so a full staging directory costs no tape time.
-fn check_recovery_read_space(
+pub(crate) fn check_recovery_read_space(
     staging_dir: &Path,
     slice_dir: &Path,
     slices: &[RecoverySlice],
@@ -5897,6 +5970,24 @@ pub struct CompactReadReport {
     pub slices_read: i64,
     pub bytes_read: i64,
     pub slices_skipped: i64,
+    /// The stage sets this read promoted to `staged` (every slice of each
+    /// was read and verified), ascending — the set `volume rewrite` holds
+    /// and writes (issue #483).
+    pub staged_sets: Vec<i64>,
+    /// Every slice file this read wrote, with the `staging_path` it replaced
+    /// — what `volume rewrite` re-reads from the staging disk before it
+    /// destroys anything, and puts back if it then refuses (issue #483).
+    pub staged: Vec<StagedSlice>,
+}
+
+/// One slice file a `compact-read` wrote into staging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedSlice {
+    pub slice_id: i64,
+    pub stage_set_id: i64,
+    pub path: PathBuf,
+    /// `stage_slices.staging_path` before this read recorded `path`.
+    pub prior: Option<String>,
 }
 
 /// Compact-read: read live encrypted slices from a volume to staging.
@@ -5981,22 +6072,7 @@ fn compact_read_contacted(
     binding::corroborate_volume(conn, volume_id, label, &medium)?;
 
     // Find live slices (snapshots not reclaimable/purged)
-    let mut stmt = conn.prepare(
-        "SELECT wp.position, wp.sha256_on_volume,
-                ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id, ss.id as slice_id,
-                s.version
-         FROM write_positions wp
-         JOIN writes w ON w.id = wp.write_id
-         JOIN stage_slices ss ON ss.id = wp.stage_slice_id
-         JOIN stage_sets sts ON sts.id = w.stage_set_id
-         JOIN snapshots s ON s.id = sts.snapshot_id
-         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
-           AND s.status NOT IN ('reclaimable', 'purged')
-         ORDER BY CAST(wp.position AS INTEGER)",
-    )?;
-    let live_slices: Vec<RecoverySlice> = stmt
-        .query_map(params![volume_id], RecoverySlice::from_row)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let live_slices = live_recovery_slices(conn, volume_id)?;
 
     if live_slices.is_empty() {
         return Err(TapectlError::Other(format!(
@@ -6100,10 +6176,23 @@ fn compact_read_contacted(
         "compact-read complete"
     );
 
+    let mut staged_sets = whole;
+    staged_sets.sort_unstable();
     Ok(CompactReadReport {
         slices_read: tally.slices_read,
         bytes_read: tally.bytes_read,
         slices_skipped: tally.slices_skipped,
+        staged_sets,
+        staged: run
+            .files
+            .iter()
+            .map(|f| StagedSlice {
+                slice_id: f.slice_id,
+                stage_set_id: f.stage_set_id,
+                path: f.path.clone(),
+                prior: f.prior.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -6564,11 +6653,11 @@ pub struct VerifyReport {
 /// MAM or the drive; [`write_catalog_preflight`] runs it, and then
 /// [`assemble_keys_for_units`], ahead of `volume write --init`'s `volume
 /// init` (issue #445).
-fn checked_staged_units(conn: &Connection) -> Result<Vec<BuildUnit>> {
-    let units = find_staged_data(conn)?;
+fn checked_staged_units(conn: &Connection, only: Option<&[i64]>) -> Result<Vec<BuildUnit>> {
+    let units = find_staged_data(conn, only)?;
     // Issue #402: every staged set whole, on disk, before anything below
     // touches a backend, a MAM or the drive.
-    check_staged_slices(conn)?;
+    check_staged_slices(conn, only)?;
     if units.is_empty() {
         return Err(TapectlError::Other(
             "no staged data to write — run `tapectl stage create` first".into(),
@@ -6620,7 +6709,7 @@ pub(crate) fn write_catalog_preflight(
     label: &str,
     allow_missing_escrow: bool,
 ) -> Result<()> {
-    let units = checked_staged_units(conn)?;
+    let units = checked_staged_units(conn, None)?;
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let session = assemble_keys_for_units(conn, &units, &stage_set_ids)?;
     // The write's `validate` also checks keys, escrow and per-set escrow
@@ -6656,7 +6745,11 @@ pub(crate) fn write_catalog_preflight(
 /// `ORDER BY u.name` stays — the alphabetical (next-fit) ordering ruled in
 /// sheet §7 (`docs/design/v2-open-questions.md`); `build()` never reorders
 /// its input, so this is where unit order is decided.
-fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
+///
+/// `only` narrows the selection to those stage sets (`volume rewrite`, issue
+/// #483); `None` is every `staged` set. The order is the query's own either
+/// way: a scope drops sets from the list, it never reorders it.
+fn find_staged_data(conn: &Connection, only: Option<&[i64]>) -> Result<Vec<BuildUnit>> {
     let mut stmt = conn.prepare(
         "SELECT ss.id, ss.snapshot_id, u.name, u.uuid, u.tenant_id,
                 ss.dar_version, ss.dar_command, ss.catalog_path, s.version
@@ -6678,7 +6771,7 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
         Option<String>,
         i64,
     );
-    let rows: Vec<Row> = stmt
+    let mut rows: Vec<Row> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
@@ -6693,6 +6786,9 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    if let Some(only) = only {
+        rows.retain(|r| only.contains(&r.0));
+    }
 
     let mut units = Vec::new();
     for (ss_id, snap_id, name, uuid, tenant_id, dar_ver, dar_cmd, catalog_path, snap_ver) in rows {
@@ -6751,8 +6847,8 @@ fn find_staged_data(conn: &Connection) -> Result<Vec<BuildUnit>> {
 /// media, and the operator chooses the remedy — pulling the identical
 /// ciphertext back from a sealed copy, or releasing the set and staging the
 /// version again.
-fn check_staged_slices(conn: &Connection) -> Result<()> {
-    let sets: Vec<(i64, i64, String, i64, String)> = conn
+fn check_staged_slices(conn: &Connection, only: Option<&[i64]>) -> Result<()> {
+    let mut sets: Vec<(i64, i64, String, i64, String)> = conn
         .prepare(
             "SELECT ss.id, u.id, u.name, s.version, u.status
              FROM stage_sets ss
@@ -6771,6 +6867,12 @@ fn check_staged_slices(conn: &Connection) -> Result<()> {
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    // `volume rewrite` (issue #483) writes only its own sets: a staged set it
+    // does not write must not refuse a write that ran out of everything but
+    // the staging disk, hours after the erase.
+    if let Some(only) = only {
+        sets.retain(|(id, ..)| only.contains(id));
+    }
 
     let mut report = String::new();
     for (stage_set_id, unit_id, name, version, unit_status) in sets {
@@ -9619,7 +9721,7 @@ mod tests {
         // `volume write --init` also calls, and the call sites are pinned
         // here in their stead.
         let last_fact = at("assemble_keys_for_units(conn,");
-        let staged = at("checked_staged_units(conn)?");
+        let staged = at("checked_staged_units(conn, only_stage_sets)?");
         let drive = at("crate::tape::media_detect::detect(device");
         assert!(
             staged < preflight && last_fact < preflight,
@@ -11506,7 +11608,7 @@ mod tests {
             .unwrap();
         }
 
-        let units = find_staged_data(&conn).unwrap();
+        let units = find_staged_data(&conn, None).unwrap();
         assert_eq!(units.len(), 2);
         assert_eq!(
             units[0].unit_name, "alpha",
@@ -11559,7 +11661,7 @@ mod tests {
         )
         .unwrap();
 
-        let units = find_staged_data(&conn).unwrap();
+        let units = find_staged_data(&conn, None).unwrap();
         assert!(
             units.is_empty(),
             "a stage_set with no on-disk slices must not surface as staged data"
@@ -12355,7 +12457,7 @@ mod tests {
 
         // Positive control: the selection really does hand `build` a
         // one-slice unit — the defect this gate exists for.
-        let units = find_staged_data(&conn).unwrap();
+        let units = find_staged_data(&conn, None).unwrap();
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].slices.len(), 1, "only the path-bearing slice");
 
@@ -18914,6 +19016,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             let err = slot.finish_result(r).unwrap_err().to_string();
             assert!(
@@ -18988,6 +19091,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             slot.finish_result(r)
                 .expect("a write to a blank MemStore completes");
@@ -19109,6 +19213,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             slot.finish_result(r).expect("the write completes");
             let seal = store.inner.files.len() as u32 - 1;
@@ -19161,6 +19266,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             slot.finish_result(r).expect("the write completes");
             let files = store.inner.files.len() as u32;
@@ -19241,6 +19347,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             crate::signal::interrupt_this_thread(false);
             let err = slot.finish_result(r).expect_err("the confirm stops");
@@ -19295,6 +19402,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             slot.finish_result(r)
                 .expect("a write to a blank MemStore completes");
@@ -19361,6 +19469,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(store),
+                None,
             );
             slot.finish_result(r).map(|_| ())
         }
@@ -19608,6 +19717,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(store),
+                None,
             );
             let r = slot.finish_result(r).map(|_| ());
             let code = match &r {
@@ -19730,6 +19840,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             slot.finish_result(r).expect("the write seals");
 
@@ -19925,6 +20036,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             crate::signal::interrupt_this_thread(false);
             let err = slot.finish_result(r).unwrap_err();
@@ -20065,6 +20177,7 @@ mod tests {
                     true,
                     &mut slot,
                     ContactStore::Injected(&mut store),
+                    None,
                 );
                 slot.finish_result(r)
                     .expect("a write to a blank MemStore completes");
@@ -20150,6 +20263,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             assert!(slot.finish_result(r).is_err());
             drop(session);
@@ -20205,6 +20319,7 @@ mod tests {
                     true,
                     &mut slot,
                     ContactStore::Injected(&mut store),
+                    None,
                 );
                 let err = slot.finish_result(r).unwrap_err().to_string();
                 if prewrite_hash {
@@ -20261,6 +20376,7 @@ mod tests {
                 true,
                 &mut slot,
                 ContactStore::Injected(&mut store),
+                None,
             );
             crate::signal::interrupt_this_thread(false);
             let err = slot.finish_result(r).unwrap_err();

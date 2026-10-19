@@ -206,6 +206,13 @@ pub enum Operation {
     /// `st` driver refuses a second concurrent open), which is physically
     /// what happens.
     VolumeCompact,
+    /// `volume rewrite` (issue #483; ADR-0012 2026-10-19 item 106): its
+    /// step 1, the read of the source's live slices. Only that read is this
+    /// contact. The erase, the init and the write that follow are separate
+    /// contacts of their own commands' operations (`cartridge erase`,
+    /// `volume init`, `volume write`), because the read-only store closes
+    /// before each, and each is physically a separate contact.
+    VolumeRewrite,
     /// Also the operation recorded for `restore file`, which reaches the
     /// drive through `restore_unit` and so shares its one contact.
     RestoreUnit,
@@ -245,6 +252,7 @@ impl Operation {
             Operation::VolumeReadSlices => "volume read-slices",
             Operation::VolumeCompactRead => "volume compact-read",
             Operation::VolumeCompact => "volume compact",
+            Operation::VolumeRewrite => "volume rewrite",
             Operation::RestoreUnit => "restore unit",
             Operation::RestoreVolume => "restore volume",
             Operation::RestoreRawVolume => "restore raw-volume",
@@ -265,6 +273,7 @@ impl Operation {
         Operation::VolumeReadSlices,
         Operation::VolumeCompactRead,
         Operation::VolumeCompact,
+        Operation::VolumeRewrite,
         Operation::RestoreUnit,
         Operation::RestoreVolume,
         Operation::RestoreRawVolume,

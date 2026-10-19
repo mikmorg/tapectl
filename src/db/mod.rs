@@ -476,6 +476,12 @@ fn migrations() -> Migrations<'static> {
         // from the events; `cartridges` is not rebuilt. A new table, no rows
         // touched. See the header.
         M::up(include_str!("migrations/036_cleaning_cartridges.sql")),
+        // 037 records a `volume rewrite` (issue #483; ADR-0012 2026-10-19
+        // item 106): `pending_rewrites` and `pending_rewrite_sets`, the
+        // marker the staging release paths refuse on while the staged slices
+        // are the only copy. Whether a set is still held is derived, not
+        // stored. A new pair of tables, no rows touched. See the header.
+        M::up(include_str!("migrations/037_pending_rewrites.sql")),
     ])
 }
 
@@ -5248,6 +5254,122 @@ mod tests {
         assert!(
             report.integrity_ok && report.issues.is_empty(),
             "db fsck must be clean after 036: {:?}",
+            report.issues
+        );
+    }
+
+    /// Migration 037 creates `pending_rewrites` and `pending_rewrite_sets`
+    /// and touches NOTHING else (issue #483; ADR-0012 2026-10-19 item 106).
+    /// Pinned by difference against 036, the way 036's is. The schema's own
+    /// rules are enforced, not merely declared: one OPEN rewrite per source
+    /// and per destination label (a finished one frees both), a closed
+    /// state vocabulary, and `finished_at` and `outcome` set together.
+    #[test]
+    fn migration_037_creates_only_the_pending_rewrite_tables() {
+        let latest_conn = open_memory_at_version(37);
+        let before = schema_objects(&open_memory_at_version(36));
+        let after = schema_objects(&latest_conn);
+        let added: Vec<(&str, &str)> = after
+            .iter()
+            .filter(|o| !before.contains(o))
+            .map(|o| (o.0.as_str(), o.1.as_str()))
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                ("index", "idx_pending_rewrite_sets_stage_set"),
+                ("index", "idx_pending_rewrites_open_destination"),
+                ("index", "idx_pending_rewrites_open_source"),
+                ("index", "sqlite_autoindex_pending_rewrite_sets_1"),
+                ("table", "pending_rewrite_sets"),
+                ("table", "pending_rewrites"),
+            ]
+        );
+        let changed_or_removed: Vec<&(String, String, String, Option<String>)> =
+            before.iter().filter(|o| !after.contains(o)).collect();
+        assert!(
+            changed_or_removed.is_empty(),
+            "037 must alter no existing object: {changed_or_removed:?}"
+        );
+        assert_eq!(
+            table_info(&latest_conn, "pending_rewrites")
+                .into_iter()
+                .map(|c| c.0)
+                .collect::<Vec<_>>(),
+            [
+                "id",
+                "source_volume_id",
+                "destination_label",
+                "cartridge_serial",
+                "consent",
+                "state",
+                "started_at",
+                "window_opened_at",
+                "finished_at",
+                "outcome"
+            ]
+        );
+
+        latest_conn
+            .execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, capacity_bytes, status)
+                 VALUES ('SRC', 'lto', 'p', 1, 'sealed')",
+                [],
+            )
+            .unwrap();
+        let insert = |dest: &str, consent: &str, state: &str| {
+            latest_conn.execute(
+                "INSERT INTO pending_rewrites (source_volume_id, destination_label, consent, state)
+                 VALUES (1, ?1, ?2, ?3)",
+                rusqlite::params![dest, consent, state],
+            )
+        };
+        assert!(
+            insert("NEW", "bogus", "staged").is_err(),
+            "consent is a closed set"
+        );
+        assert!(
+            insert("NEW", "typed_label", "bogus").is_err(),
+            "state is a closed set"
+        );
+        assert!(
+            insert("", "typed_label", "staged").is_err(),
+            "the destination label may not be empty"
+        );
+        insert("NEW", "typed_label", "staged").expect("positive control: a legal row");
+        assert!(
+            insert("OTHER", "typed_label", "staged").is_err(),
+            "one open rewrite per source"
+        );
+        latest_conn
+            .execute(
+                "UPDATE pending_rewrites SET finished_at = datetime('now') WHERE id = 1",
+                [],
+            )
+            .expect_err("finished_at without an outcome is refused");
+        latest_conn
+            .execute(
+                "UPDATE pending_rewrites SET finished_at = datetime('now'), outcome = 'completed'
+                 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        insert("NEW", "typed_flag", "staged").expect("a finished rewrite frees source and label");
+        assert!(
+            latest_conn
+                .execute(
+                    "INSERT INTO pending_rewrites (source_volume_id, destination_label, consent)
+                     VALUES (1, 'NEW', 'typed_label')",
+                    [],
+                )
+                .is_err(),
+            "one open rewrite per destination label (and source)"
+        );
+
+        let report = crate::cli::operations::db_fsck(&latest_conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "db fsck must be clean after 037: {:?}",
             report.issues
         );
     }

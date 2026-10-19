@@ -16,6 +16,14 @@
 //!   structurally impossible to defeat. Routing a Tier-3 condition through
 //!   this module would itself be the bug: it would let `--yes` waive a
 //!   guard ADR-0008 says nothing may waive.
+//!
+//! The one amendment of Tier 3 (ADR-0012 2026-10-19 item 106) is `volume
+//! rewrite`, and it does not use [`confirm`] either: the retire family keeps
+//! its absolute floor everywhere else, and the one command allowed past it
+//! is gated by [`confirm_only_copy`], a WORD typed (the source's label), which
+//! takes no `assume_yes` or `force` argument at all, so `--yes` and `--force`
+//! cannot reach it by construction — the shape [`confirm_typed`] already
+//! has for `cartridge erase`.
 
 use std::io::{IsTerminal, Write};
 
@@ -190,6 +198,96 @@ pub(crate) fn confirm_typed_with(
     }
 }
 
+/// The consent `volume rewrite` needs when some live slice of the volume
+/// has no copy on any other eligible volume (ADR-0012 2026-10-19 item 106):
+/// the one place the retire family's absolute zero floor is amended, and only
+/// for that command. From the erase of the source's cartridge until the new
+/// volume seals and passes a full readback, the staging disk holds the only
+/// copy of those slices; the operator says they accept that by typing the
+/// source's label.
+///
+/// **There is no `assume_yes` and no `force` here.** `--yes` and `--force`
+/// confirm a Tier-2 prompt in advance; they must not stand in for this, and
+/// the way to guarantee that is a function that cannot be handed them.
+///
+/// - `supplied` (`--only-copy-on-staging`): must equal `expected`, on a
+///   terminal or not, and stdin is never read. A different word refuses,
+///   naming both, and nothing has been changed.
+/// - no `supplied`, stdin a terminal: `facts` are shown, the word is asked
+///   for, and only that exact word (surrounding whitespace aside) proceeds.
+/// - no `supplied`, not a terminal: refuses at once, `facts` folded in, and
+///   never reads stdin (issue #33's hang; ADR-0008).
+pub fn confirm_only_copy(
+    action: &str,
+    facts: &[String],
+    expected: &str,
+    supplied: Option<&str>,
+) -> Result<()> {
+    confirm_only_copy_with(
+        action,
+        facts,
+        expected,
+        supplied,
+        stdin_is_terminal(),
+        || {
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            Ok(input)
+        },
+    )
+}
+
+/// [`confirm_only_copy`] with the TTY check and the stdin read injected, as
+/// [`confirm_typed_with`] is for [`confirm_typed`].
+pub(crate) fn confirm_only_copy_with(
+    action: &str,
+    facts: &[String],
+    expected: &str,
+    supplied: Option<&str>,
+    is_tty: bool,
+    read_answer: impl FnOnce() -> Result<String>,
+) -> Result<()> {
+    if let Some(word) = supplied {
+        if word == expected {
+            return Ok(());
+        }
+        return Err(TapectlError::Other(format!(
+            "{action} refused: --only-copy-on-staging \"{word}\" does not match \"{expected}\", \
+             the label of the volume being rewritten. Nothing was changed. This consent is \
+             that volume's label, typed exactly; check which volume you mean to rewrite."
+        )));
+    }
+    let why = if facts.is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", facts.join("\n"))
+    };
+    if !is_tty {
+        return Err(TapectlError::Other(format!(
+            "{action} refused: some of this volume's live data has no copy on any other \
+             volume, and rewriting it in place puts its only copy on the staging disk while \
+             its cartridge is erased and rewritten. Non-interactive session and no \
+             --only-copy-on-staging given. This consent is the source's label, typed; --yes \
+             and --force do not give it. Re-run with --only-copy-on-staging {expected} if you \
+             accept that.{why}"
+        )));
+    }
+    for fact in facts {
+        eprintln!("{fact}");
+    }
+    eprint!("{action} — type {expected} to proceed: ");
+    let _ = std::io::stderr().flush();
+    let input = read_answer()?;
+    if input.trim() == expected {
+        Ok(())
+    } else {
+        Err(TapectlError::Other(format!(
+            "{action}: aborted, \"{}\" is not \"{expected}\". Nothing was changed.",
+            input.trim()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! These tests exercise `confirm_with` exclusively, never the real
@@ -322,6 +420,87 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--confirm-label L6-0001"), "{msg}");
         assert!(msg.contains("File 0: volume L6-0001"), "the facts: {msg}");
+    }
+
+    // ── confirm_only_copy_with: `volume rewrite`'s typed gate (issue #483) ──
+
+    #[test]
+    fn only_copy_a_matching_flag_proceeds_without_reading_stdin() {
+        confirm_only_copy_with("rewrite", &[], "L6-0001", Some("L6-0001"), false, || {
+            panic!("--only-copy-on-staging must never read stdin")
+        })
+        .expect("the source's label, given by flag, is consent");
+        confirm_only_copy_with("rewrite", &[], "L6-0001", Some("L6-0001"), true, || {
+            panic!("--only-copy-on-staging must never read stdin, even on a terminal")
+        })
+        .expect("on a terminal too");
+    }
+
+    #[test]
+    fn only_copy_a_wrong_flag_refuses_naming_both_words_and_changing_nothing() {
+        let err = confirm_only_copy_with("rewrite", &[], "L6-0001", Some("L6-0002"), true, || {
+            panic!("must never read stdin")
+        })
+        .expect_err("a different label is no consent");
+        let msg = err.to_string();
+        assert!(msg.contains("L6-0002") && msg.contains("L6-0001"), "{msg}");
+        assert!(msg.contains("Nothing was changed"), "{msg}");
+    }
+
+    #[test]
+    fn only_copy_without_the_flag_off_a_terminal_refuses_and_never_reads_stdin() {
+        let facts = vec!["unit \"keepsake\" v1: 3 slice(s)".to_string()];
+        let err = confirm_only_copy_with("rewrite", &facts, "L6-0001", None, false, || {
+            panic!("must never read stdin when non-TTY")
+        })
+        .expect_err("non-TTY without the flag must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("--only-copy-on-staging L6-0001"), "{msg}");
+        assert!(msg.contains("--yes") && msg.contains("--force"), "{msg}");
+        assert!(msg.contains("unit \"keepsake\" v1"), "the facts: {msg}");
+    }
+
+    #[test]
+    fn only_copy_on_a_terminal_takes_only_the_exact_label() {
+        assert!(
+            confirm_only_copy_with("rewrite", &[], "L6-0001", None, true, || Ok(
+                " L6-0001\n".to_string()
+            ))
+            .is_ok()
+        );
+        // `y` and `yes` are the Tier-2 answers; neither is this consent.
+        for answer in ["y\n", "yes\n", "\n", "l6-0001\n", "L6-000\n", "L6-00011\n"] {
+            assert!(
+                confirm_only_copy_with("rewrite", &[], "L6-0001", None, true, || Ok(
+                    answer.to_string()
+                ))
+                .is_err(),
+                "{answer:?} is not the label"
+            );
+        }
+    }
+
+    /// The structural half: the gate's signature has no `assume_yes` and no
+    /// `force`, so no caller can pass `--yes` or `--force` into it. Pinned by
+    /// the source text of the two functions, so a "convenient" parameter
+    /// cannot be added later.
+    #[test]
+    fn the_only_copy_gate_takes_no_assume_yes_and_no_force() {
+        const SRC: &str = include_str!("consent.rs");
+        for name in [
+            "pub fn confirm_only_copy(",
+            "pub(crate) fn confirm_only_copy_with(",
+        ] {
+            let start = SRC.find(name).unwrap_or_else(|| panic!("no {name}"));
+            let end = SRC[start..].find(") -> Result<()>").unwrap() + start;
+            let signature = &SRC[start..end];
+            for forbidden in ["assume_yes", "force", "yes"] {
+                assert!(
+                    !signature.contains(forbidden),
+                    "{name} must not take `{forbidden}`: {signature}"
+                );
+            }
+        }
     }
 
     #[test]

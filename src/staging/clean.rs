@@ -412,6 +412,33 @@ pub fn clean_staging(
     }
     let candidates = candidates_free;
 
+    // Issue #483 (ADR-0012 2026-10-19 item 106): a stage set a pending
+    // `volume rewrite` holds is never released, `force` or not. The window
+    // from the rewrite's erase until its new volume has passed a full
+    // readback is one in which these staged slices may be the ONLY copy of a
+    // unit; the hold is a fact about that window (the catalog's record of the
+    // rewrite and the absence of a fully read back copy elsewhere), not a
+    // policy judgement, so it sits beside the live-session check above and
+    // inside the policy-free rule. Every release path funnels through here —
+    // `staging clean`, `release_if_covered` (so `volume write`, `volume
+    // resume` and `collection run`) — and so inherits it. One query for the
+    // whole call, not one per candidate.
+    let held = if candidates.is_empty() {
+        Default::default()
+    } else {
+        crate::volume::rewrite::holds(conn)?
+    };
+    let mut candidates_free = Vec::with_capacity(candidates.len());
+    for (stage_set_id, status) in candidates {
+        match held.get(&stage_set_id) {
+            Some(hold) => report
+                .held_by_pending_rewrite
+                .push((stage_set_id, hold.clone())),
+            None => candidates_free.push((stage_set_id, status)),
+        }
+    }
+    let candidates = candidates_free;
+
     if candidates.is_empty() {
         return Ok(report);
     }
@@ -699,6 +726,12 @@ pub struct CleanReport {
     /// volume they are planned onto (issue #376), with those volumes'
     /// labels. `--force` does not release them; they wait for the session.
     pub held_by_live_session: Vec<(i64, Vec<String>)>,
+    /// Stage sets NOT released because a pending `volume rewrite` holds them
+    /// (issue #483, ADR-0012 2026-10-19 item 106): until the rewrite's new
+    /// volume has been fully read back, these staged slices may be the only
+    /// copy. `--force` does not release them; `volume rewrite --resume`
+    /// finishes the rewrite and lifts the hold.
+    pub held_by_pending_rewrite: Vec<(i64, crate::volume::rewrite::Hold)>,
 }
 
 /// Reclaim `{staging.directory}/sessions/*` directories and terminal

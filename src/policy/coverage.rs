@@ -1546,6 +1546,90 @@ pub fn versions_at_stake(
     Ok(rows)
 }
 
+// ── What a `volume rewrite` asks of the catalog (ADR-0012 2026-10-19 item 106) ──
+
+/// One live slice of a volume that no other eligible volume carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoleSlice {
+    pub stage_slice_id: i64,
+    pub stage_set_id: i64,
+    pub unit_name: String,
+    /// `snapshots.version` of the slice's snapshot.
+    pub version: i64,
+    pub encrypted_bytes: i64,
+}
+
+/// The live slices of `volume_id` that have NO copy on another volume that is
+/// [`eligible`] right now: the bytes whose only home, once the volume is given
+/// up, would be the staging disk a `volume rewrite` read them into.
+///
+/// "Live" is `compact-read`'s own reading: a slice of a completed write whose
+/// snapshot is neither `reclaimable` nor `purged`, so the slices returned are
+/// a subset of exactly the slices that command stages. "A copy elsewhere" is a
+/// `written` position of the same slice in a completed write on another
+/// eligible volume — a retired, erased, quarantined or unsealed volume carries
+/// nothing that counts, and neither does a warehouse deposit (the bytes a
+/// rewrite's operator can rely on are on a cartridge). That is deliberately
+/// stricter than `compact-finish`'s own gate, which asks only for a completed
+/// write on another volume of any status.
+pub fn sole_slices(conn: &Connection, volume_id: i64) -> crate::error::Result<Vec<SoleSlice>> {
+    let sql = format!(
+        "SELECT sl.id, sts.id, u.name, s.version, sl.encrypted_bytes
+         FROM write_positions wp
+         JOIN writes w ON w.id = wp.write_id
+         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+         JOIN stage_sets sts ON sts.id = sl.stage_set_id
+         JOIN snapshots s ON s.id = sts.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         WHERE w.volume_id = ?1 AND w.status = 'completed' AND wp.status = 'written'
+           AND s.status NOT IN ('reclaimable', 'purged')
+           AND NOT EXISTS (
+             SELECT 1 FROM write_positions wp2
+             JOIN writes w2 ON w2.id = wp2.write_id
+             JOIN volumes v2 ON v2.id = w2.volume_id
+             WHERE wp2.stage_slice_id = wp.stage_slice_id
+               AND w2.volume_id <> ?1
+               AND w2.status = 'completed' AND wp2.status = 'written'
+               AND {})
+         GROUP BY sl.id
+         ORDER BY u.name, s.version, sl.slice_number",
+        eligible("v2")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![volume_id], |row| {
+            Ok(SoleSlice {
+                stage_slice_id: row.get(0)?,
+                stage_set_id: row.get(1)?,
+                unit_name: row.get(2)?,
+                version: row.get(3)?,
+                encrypted_bytes: row.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// A SQL boolean expression: stage set `stage_set_expr` has a copy on an
+/// [`eligible`] volume that was FULLY READ BACK — a `completed` write with
+/// `write_verified = 1`, which only an Integrity confirm or a passing full
+/// `volume verify` sets (ADR-0012 2026-10-06 item 24). It is the fact that
+/// lifts a pending rewrite's hold on a staged set: item 106 releases the
+/// staged slices only after the new volume has passed a full readback, and
+/// asking for the fact rather than the command that produced it makes the
+/// release independent of which command ran the readback.
+///
+/// Embeds `writes`/`volumes` under the aliases `hw`/`hv`; `stage_set_expr`
+/// is the caller's own column or placeholder.
+pub fn fully_read_back_copy(stage_set_expr: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
+                 WHERE hw.stage_set_id = {stage_set_expr} AND hw.status = 'completed'
+                   AND hw.write_verified = 1 AND {})",
+        eligible("hv")
+    )
+}
+
 // ── The cross-volume index's versions and holders (ADR-0012 items 78-80) ──
 
 /// The volumes the cross-volume index (`volume-format-v2.md` §1.5) names as
