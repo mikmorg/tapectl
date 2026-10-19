@@ -1148,8 +1148,8 @@ tenant's units and nobody else's.
 
 If the operator envelope and its backup will not read, the biggest envelope
 that does read may be a tenant's, and --all then restores only that
-tenant's units, with the DAMAGED warnings above as the only sign. The
-script names the file it used ("Decrypted envelope at file N"): compare it
+tenant's units, with the DAMAGED warnings the script printed as the only
+sign. The script names the file it used ("Decrypted envelope at file N"): compare it
 with `--find-envelope`, which lists the units of every envelope that
 opened, and with the units `--where --all` names.
 
@@ -1571,10 +1571,10 @@ failed, a slice that was not there), RESTORE.sh restores the rest, ends
 `RESTORE INCOMPLETE` with exit status 1, and writes the paths of those files,
 one per line, to `.tapectl-damaged-files.txt` in the unit's directory: `--to`
 itself when the restore had one unit (a lone unit goes straight into `--to`,
-`--all` included), `--to/UNIT` when it had several. A path is written as the index writes
-one: a backslash as `\\`, a TAB as `\t`, a newline as `\n`, a carriage
-return as `\r`. The first line records the unit, its uuid and its version.
-The box procedure restores each unit with `--to /destination/UNIT`, so its
+`--all` included), `--to/UNIT` when it had several. A path is written as
+the index writes one: a backslash as `\\`, a TAB as `\t`, a newline as
+`\n`, a carriage return as `\r`. The first line records the unit, its uuid
+and its version. The box procedure restores each unit with `--to /destination/UNIT`, so its
 list is `/destination/UNIT/.tapectl-damaged-files.txt`. A tape that holds ONE
 unit, restored with `--all --to /destination`, puts the files straight into
 `/destination`: its list is `/destination/.tapectl-damaged-files.txt`, and
@@ -1711,9 +1711,9 @@ on paper, apart from every machine); `--key` is how the escrow key is used.
 ## Manual Recovery Steps
 
 If RESTORE.sh is not available, follow these steps with `mt`, `dd`,
-`truncate`, `age`, `tar`, `sha256sum` and `dar`. They use the non-rewinding device ("Which
-device?"; `/dev/nst0` is an example). Each `dd` leaves the head at the
-start of the next file, so `mt fsf N` moves forward N files from where you
+`truncate`, `age`, `tar`, `sha256sum` and `dar`. They use the non-rewinding
+device ("Which device?"; `/dev/nst0` is an example). Each `dd` leaves the
+head at the start of the next file, so `mt fsf N` moves forward N files from where you
 are, and `mt rewind` then `mt fsf N` reaches File N from anywhere. Read the
 tape forward where you can; rewinding is slow.
 
@@ -1866,9 +1866,10 @@ exact size with `truncate` instead, never with `tr`.
    several units, give each its own directory (`/destination/UNIT`); two
    units of one name (different uuids) take `/destination/UNIT-` and the
    first 8 characters of the uuid, each a new directory, or dar would merge
-   them without a word. dar keeps any file already there and still reports success, so to finish an
-   earlier restore of the same unit that stopped part way, add `-w`
-   (overwrite); never use it to restore a newer version over an older one.
+   them without a word. dar keeps any file already there and still reports
+   success, so to finish an earlier restore of the same unit that stopped
+   part way, add `-w` (overwrite); never use it to restore a newer version
+   over an older one.
    `-N` keeps a `~/.darrc` on your machine from changing what is restored.
    Delete the unit's `restore.N.dar` files once it is restored and checked.
 
@@ -1963,9 +1964,9 @@ not stop there: the tenants' envelopes come first and each lists only one
 tenant's units, so keep going to the operator envelope, the one whose tar
 also lists `PLAN.toml` (the operator envelope's plan of the tape: its
 units, each with its uuid, slice count and size; a tenant's envelope never
-has one), and whose MANIFEST.toml lists every unit on the tape; or restore the units of every envelope that
-opens. If the files have grown large (slices) and none
-opened, your key is not a recipient of any envelope on this tape: try the
+has one), and whose MANIFEST.toml lists every unit on the tape; or restore
+the units of every envelope that opens. If the files have grown large
+(slices) and none opened, your key is not a recipient of any envelope on this tape: try the
 other keys you hold, since an envelope is sealed to the keys active when
 the tape was written, and the operator and escrow keys open every one.
 
@@ -12298,7 +12299,7 @@ sha256_encrypted = \"bbb\"
         let g = guide17();
         let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"));
         for needle in [
-            "If the operator envelope and its backup will not read, the biggest envelope that does read may be a tenant's, and --all then restores only that tenant's units, with the DAMAGED warnings above as the only sign",
+            "If the operator envelope and its backup will not read, the biggest envelope that does read may be a tenant's, and --all then restores only that tenant's units, with the DAMAGED warnings the script printed as the only sign",
             "The script names the file it used (\"Decrypted envelope at file N\"): compare it with `--find-envelope`, which lists the units of every envelope that opened, and with the units `--where --all` names",
         ] {
             assert!(auto.contains(needle), "{needle:?}: {auto}");
