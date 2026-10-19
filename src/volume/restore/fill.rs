@@ -151,8 +151,8 @@ fn skipped_over_holes(
         .collect();
     Some(TapectlError::Other(format!(
         "dar exited 0 but did not restore {} file(s) (\"not restored (user choice)\"): {}. \
-         None was left by an earlier restore: the destination was empty, or dar was told to \
-         overwrite, when it began. With no terminal dar answers its own questions no, and after \
+         None was there before this restore: tapectl refuses a destination holding what it would \
+         write unless told to overwrite, before dar begins. With no terminal dar answers its own questions no, and after \
          a slice it could not read it asks them about files it had created itself earlier in \
          this run",
         names.len(),

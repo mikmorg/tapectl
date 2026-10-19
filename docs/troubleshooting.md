@@ -2278,6 +2278,14 @@ destination that is not empty is refused before the tape is read (above), so
 this now means a file appeared in `--to` while the restore ran. Restore into an
 empty directory, or pass `--overwrite`.
 
+When a slice had holes (a chunk or a whole slice that would not authenticate,
+and no other copy to take it from), the same dar behaviour reads differently.
+Under "dar could not read the archive through the holes" the line is "dar exited
+0 but did not restore <n> file(s) ("not restored (user choice)"): <paths>".
+Those files are dar's own partial output from this restore, not an earlier
+restore's. The damaged-or-missing list that follows is what to act on: restore
+the unit again from another copy.
+
 ### `restore volume`: some units were not restored
 
 ```text
