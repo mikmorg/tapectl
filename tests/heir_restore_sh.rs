@@ -4456,6 +4456,56 @@ fn the_manual_path_in_file_1_restores_a_unit_as_written() {
         );
     }
 
+    // Read 4 (M12): the slice line stops at a failed hash. An heir types the
+    // lines one at a time, with no `-e` to save them, so run them that way
+    // with a WRONG hash on the first slice: the encrypted copy is kept and
+    // nothing is decrypted or deleted. (The same slice, put right again after.)
+    {
+        let sl = &manifest.units[0].slices[0];
+        let good = std::fs::read(work.join(format!("restore.{}.dar", sl.number))).unwrap();
+        std::fs::remove_file(work.join(format!("restore.{}.dar", sl.number))).unwrap();
+        let (ok, text) = run(
+            &guide_block(&manual, "FIRST_POSITION"),
+            &[("FIRST_POSITION", sl.tape_position.to_string())],
+        );
+        assert!(ok, "{text}");
+        let loose = |line: &str| -> String {
+            let line = line
+                .replace("SHA256_ENCRYPTED", &"0".repeat(64))
+                .replace("ENCRYPTED_BYTES", &sl.encrypted_bytes.to_string())
+                .replace("NUMBER", &sl.number.to_string())
+                .replace("YOUR_KEY.age.key", &h.key("bob"));
+            let o = Command::new("bash")
+                .args(["-c", &line])
+                .current_dir(&work)
+                .env("PATH", &h.path)
+                .env("FAKE_TAPE", &h.dir)
+                .env("HOME", h.dir.join("home"))
+                .output()
+                .expect("spawn bash");
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        };
+        let mut said = String::new();
+        for line in &slice_block {
+            said.push_str(&loose(line));
+        }
+        assert!(said.contains("FAILED"), "the hash check failed: {said}");
+        assert!(
+            work.join(format!("restore.{}.dar.age", sl.number)).exists(),
+            "the encrypted copy is kept when its hash fails: {said}"
+        );
+        assert!(
+            !work.join(format!("restore.{}.dar", sl.number)).exists(),
+            "a slice whose hash failed is never decrypted: {said}"
+        );
+        std::fs::remove_file(work.join(format!("restore.{}.dar.age", sl.number))).unwrap();
+        std::fs::write(work.join(format!("restore.{}.dar", sl.number)), good).unwrap();
+    }
+
     // Step 8: the guide's dar line, into an empty directory.
     let snippet = |starts: &str| -> String {
         manual
