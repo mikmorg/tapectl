@@ -19,7 +19,18 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-17 (NEWEST) — 1.3.0 IN BUILD; SPANNING DESIGNED AND RULED.** The CTO ruled
+- **QUEUE STATE 2026-10-19 (NEWEST) — v1.3.0 TAGGED on master `a3c848c`** (whole chain green on
+  a3efcb1, test-only change after; CI 39273005724 green). Closed: #418 (R4), #476, #477 (three
+  fresh reads of File 1), #480 (restore repairs + crypto review fixes), #409 (accepted cost), #364.
+  Open: #479 (profiling toolkit + item 100's post-warning key and slice cap; building now, no
+  drive needed to build), #481 (File 1 minors: waits for the CTO to pick a re-pin), and the
+  drive-bound #482 (real LTO-5 in the HP drive), #478 (spanning, after #420), #444, #420 (the
+  operator's past-warning fill on home2 first), #388 (LBP prototype). Lessons this round: a fresh
+  reader of File 1 always finds more (verdict "mostly" three times); set a stopping rule and bring
+  SERIOUS findings to the CTO. A test whose damage depends on dar's file order (readdir order)
+  passed here and failed on CI. Never leave a pid-less WANT marker (homorg's nightly waited 4 h).
+
+- **QUEUE STATE 2026-10-17 — 1.3.0 IN BUILD; SPANNING DESIGNED AND RULED.** The CTO ruled
   ADR-0012 items 76-91 in rounds (2026-10-16/17): spanning is shape A (slices across tapes),
   opt-in per unit, packed last, cut at the drive's early warning then the short seal; staged
   whole; one generation per span; heir restore scratch-and-join baseline plus tape swap; built
