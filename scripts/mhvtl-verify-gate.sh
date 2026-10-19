@@ -22,7 +22,7 @@
 #      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
 #      real one.
 #
-# The `check` lines below are the list (46 since #480: heir_where, heir_find and
+# The `check` lines below are the list (47 since item 103's heir_file_check; 46 since #480: heir_where, heir_find and
 # heir_slice_from_copy join the 43 of #444; #400 is not exercisable on mhvtl, see its
 # section). The verdict judges each by NAME against the manifest, never by a total (#471).
 #
@@ -732,6 +732,32 @@ check heir_info           step_heir_info
 check heir_find_envelope  step_heir_find
 check heir_restore        step_heir_restore
 check heir_restore_symlink_unit step_heir_restore_symlinks
+
+# heir_file_check (1.3.0, ADR-0012 item 103): the RESTORE.sh on the tape checks every
+# restored regular file against the sha256 the tenant index records, with the real
+# sha256sum; --no-file-check skips it. The leg wants the "match" line (never the
+# "no envelope ... lists" or "do NOT match" lines) and the tree equal to the source,
+# then the skipped line on a second restore.
+step_heir_file_check() {
+    local out
+    out=$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit unitA --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered-fc" 2>&1) \
+        || { echo "$out" | tail -20; return 1; }
+    if ! printf '%s\n' "$out" | grep -E "File check: [1-9][0-9]* restored file\(s\) of .* match the sha256 recorded in the index" >/dev/null; then
+        echo "no file-check match line; the File check lines were:"
+        printf '%s\n' "$out" | grep "File check" || echo "(none)"
+        return 1
+    fi
+    if printf '%s\n' "$out" | grep "do NOT match" >/dev/null; then
+        printf '%s\n' "$out" | grep -A5 "do NOT match"
+        return 1
+    fi
+    diff -r "$SRC/unitA" "$HEIR/recovered-fc" || return 1
+    out=$(cd "$HEIR" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit unitA --no-file-check --key "$HOME_DIR/keys/alice-primary.age.key" --to "$HEIR/recovered-nofc" 2>&1) \
+        || { echo "$out" | tail -20; return 1; }
+    printf '%s\n' "$out" | grep "File check skipped (--no-file-check)" >/dev/null \
+        || { echo "no skipped line with --no-file-check"; return 1; }
+}
+check heir_file_check     step_heir_file_check
 
 # ---------- heir_where, heir_find, heir_slice_from_copy (1.3.0; ADR-0012 items 78-81 and 101; #418, #480) ----------
 #
