@@ -6565,7 +6565,10 @@ mod tests {
                 .iter()
                 .find(|r| r["label"] == "OLD-0001")
                 .unwrap();
-            assert!(old["media_type"].is_null(), "raw null, not the table's dash: {old}");
+            assert!(
+                old["media_type"].is_null(),
+                "raw null, not the table's dash: {old}"
+            );
         }
 
         /// Acceptance: copies must agree with `report copies` on the same

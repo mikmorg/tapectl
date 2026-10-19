@@ -21745,7 +21745,10 @@ mod tests {
                 done.medium.operator_line(),
                 "medium: LTO-5, 1.50 TB (the cartridge chip's format density code 0x58)"
             );
-            assert_eq!(done.medium.to_json()["generation_source"], "mam_format_density");
+            assert_eq!(
+                done.medium.to_json()["generation_source"],
+                "mam_format_density"
+            );
         }
 
         #[test]
@@ -21860,7 +21863,10 @@ mod tests {
                 "medium: LTO-5, 1.50 TB (not detected: no density code was read from the \
                  medium; assumed from --generation)"
             );
-            assert_eq!(done.medium.to_json()["generation_source"], "generation_flag");
+            assert_eq!(
+                done.medium.to_json()["generation_source"],
+                "generation_flag"
+            );
         }
 
         /// The cartridge row's generation, when nothing else could say, names
