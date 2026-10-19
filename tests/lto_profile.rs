@@ -642,10 +642,13 @@ fn the_script_refuses_without_consent_or_a_tape_node() {
     );
     assert_eq!(not_tape.status.code(), Some(2), "{}", text(&not_tape));
     let msg = text(&not_tape);
+    // The lock is taken before the node is looked at (as in the scripts this one absorbed), so a gate or
+    // a suite running on this host at the same moment answers first.
     assert!(
         msg.contains("not an st tape node")
             || msg.contains("required binary missing")
-            || msg.contains("tapectl-drive-poll"),
+            || msg.contains("tapectl-drive-poll")
+            || msg.contains("another process holds the tape lock"),
         "{msg}"
     );
 

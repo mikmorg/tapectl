@@ -239,5 +239,5 @@ does not match the volume the script was written for (`3b5d287`).
   home2. Re-check after a host reboot.
 - **Media state.** A FUJIFILM LTO-6 (`EW7VWMVKF6`) is loaded as of 2026-09-10
   and is pristine — load count 1, 0 MiB written. The block-size question above
-  is one `scripts/lto6-measure.sh --erase-cartridge <BARCODE>` run away, but
+  is one `scripts/lto6-measure.sh --erase-cartridge <MEDIUM_SERIAL>` run away, but
   that harness erases the cartridge, so it ends the pristine state.

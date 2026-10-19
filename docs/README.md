@@ -39,6 +39,7 @@ the repository, grouped by what you are trying to do.
 |---|---|
 | [Lifecycle suite](lifecycle-suite.md) | Simulating years of use in minutes on a virtual library (or, carefully, a real drive). |
 | [LTO-6 validation checklist](lto6-validation-checklist.md) | The procedure for validating a real drive. |
+| [Profiling an LTO drive](lto-profiling.md) | Measuring a drive and a test cartridge with `scripts/lto-profile.sh`, and the `[[backends.lto]]` block it emits. |
 | [LTO-6 passthrough](lto6-drive-passthrough.md) | Lending a physical drive to a VM (libvirt SCSI hostdev). |
 | [Performance baselines](perf-baselines.md) | Regression baselines for the performance suite. |
 
