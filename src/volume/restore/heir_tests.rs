@@ -26,7 +26,9 @@ mod tests {
     use super::super::*;
     use crate::crypto::keys::{generate_keypair, KeyFile};
     use crate::progress::{self, Display};
+    use crate::store::injected::InjectedDrive;
     use crate::store::MemStore;
+    use crate::tape::fake::FakeTape;
     use crate::tape::contact::Medium;
     use crate::volume::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
     use crate::volume::layout_model::{KeyAvailability, SliceCheck};
@@ -588,5 +590,252 @@ mod tests {
         for (path, bytes) in &tape.files {
             assert_eq!(&std::fs::read(dest.path().join(path)).unwrap(), bytes);
         }
+    }
+
+    const DEVICE: &str = "/nonexistent/tapectl-heir-nst";
+
+    /// The command line, parsed by the real clap tree.
+    fn parse(args: &[&str]) -> crate::cli::Commands {
+        use clap::Parser;
+        let mut argv = vec!["tapectl"];
+        argv.extend_from_slice(args);
+        crate::cli::Cli::try_parse_from(argv)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+            .command
+    }
+
+    /// Run one parsed `catalog rebuild` or `restore ...` line against the
+    /// home, as `main` dispatches it.
+    fn dispatch(home: &Home, line: &[&str]) -> Result<()> {
+        match parse(line) {
+            crate::cli::Commands::Catalog { command } => crate::cli::catalog::run_with_paths(
+                &home.conn,
+                &home.paths,
+                cfg(),
+                &command,
+                false,
+                false,
+            ),
+            crate::cli::Commands::Restore { command } => {
+                crate::cli::restore::run(&home.conn, &home.paths, cfg(), &command, false, false)
+            }
+            other => panic!("not a command under test: {other:?}"),
+        }
+    }
+
+    /// The heir's commands as the ADR types them, parsed by the real clap
+    /// tree and dispatched as `main` does, over a fake drive holding the
+    /// sealed tape: the flag, its spelling and its repetition reach the
+    /// restore. `restore unit`, `restore file` and `restore volume` each
+    /// restore with the escrow secret alone.
+    #[test]
+    fn the_commands_as_the_heir_types_them_restore_with_the_escrow_key_alone() {
+        let tape = written_tape();
+        let home = heir_home(&tape.escrow_public);
+        let keydir = TempDir::new().unwrap();
+        let escrow = keydir.path().join("escrow.key");
+        std::fs::write(&escrow, format!("{}\n", tape.escrow_secret)).unwrap();
+        let escrow = escrow.to_string_lossy().into_owned();
+        let stranger = keydir.path().join("stranger.key");
+        std::fs::write(&stranger, format!("{}\n", generate_keypair().secret_key)).unwrap();
+        let stranger = stranger.to_string_lossy().into_owned();
+        let fake = FakeTape::with_files(tape.store.files.clone(), BS as usize);
+        let _drive = InjectedDrive::install(&fake);
+
+        // `--key` is required of the rebuild: a rebuild with no key is a
+        // usage error naming it.
+        {
+            use clap::Parser;
+            let err = crate::cli::Cli::try_parse_from([
+                "tapectl",
+                "catalog",
+                "rebuild",
+                "--from-volume",
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("--key"), "{err}");
+        }
+
+        dispatch(
+            &home,
+            &[
+                "catalog",
+                "rebuild",
+                "--from-volume",
+                "--device",
+                DEVICE,
+                "--key",
+                &stranger,
+                "--key",
+                &escrow,
+            ],
+        )
+        .expect("two --key flags, one of them the escrow secret, rebuild");
+        assert_eq!(
+            home.conn
+                .query_row("SELECT COUNT(*) FROM units WHERE name = 'keepsake'", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+
+        let check = |dest: &Path, files: &[&str]| {
+            for (path, bytes) in tape.files.iter().filter(|(p, _)| files.contains(&p.as_str())) {
+                assert_eq!(
+                    &std::fs::read(dest.join(path)).unwrap_or_default(),
+                    bytes,
+                    "{path} restored wrong"
+                );
+            }
+        };
+        let all: Vec<&str> = tape.files.iter().map(|(p, _)| p.as_str()).collect();
+
+        // Without `--key` each command is refused with the wrong-key
+        // refusal as it stands; with it, each restores.
+        let unit_dest = TempDir::new().unwrap();
+        let unit_dest_s = unit_dest.path().to_string_lossy().into_owned();
+        let unit_line = |extra: &[&str]| -> Vec<String> {
+            let mut line: Vec<String> = [
+                "restore", "unit", "--unit", UNIT, "--from", LABEL, "--device", DEVICE, "--to",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            line.push(unit_dest_s.clone());
+            line.extend(extra.iter().map(|s| s.to_string()));
+            line
+        };
+        let run_line = |line: Vec<String>| {
+            let line: Vec<&str> = line.iter().map(String::as_str).collect();
+            dispatch(&home, &line)
+        };
+        let err = run_line(unit_line(&[])).unwrap_err().to_string();
+        assert!(
+            err.contains(&age::DecryptError::NoMatchingKeys.to_string()),
+            "{err}"
+        );
+        let err = run_line(unit_line(&["--key", &stranger]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&stranger), "the file given is named: {err}");
+        // The refused tries left no residue in the destination.
+        assert!(unit_dest.path().read_dir().unwrap().next().is_none());
+        run_line(unit_line(&["--key", &stranger, "--key", &escrow]))
+            .expect("restore unit --key stranger.key --key escrow.key");
+        check(unit_dest.path(), &all);
+
+        let file_dest = TempDir::new().unwrap();
+        let file_dest_s = file_dest.path().to_string_lossy().into_owned();
+        let file_line = |key: &[&str]| -> Vec<String> {
+            let mut line: Vec<String> = [
+                "restore", "file", "--unit", UNIT, "--file", "f2.bin", "--from", LABEL, "--device",
+                DEVICE, "--to",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            line.push(file_dest_s.clone());
+            for k in key {
+                line.push("--key".into());
+                line.push((*k).into());
+            }
+            line
+        };
+        assert!(run_line(file_line(&[])).is_err(), "no key, no file");
+        run_line(file_line(&[&escrow])).expect("restore file --key escrow.key");
+        check(file_dest.path(), &["f2.bin"]);
+
+        let volume_dest = TempDir::new().unwrap();
+        let volume_dest_s = volume_dest.path().to_string_lossy().into_owned();
+        let volume_line = |key: &[&str]| -> Vec<String> {
+            let mut line: Vec<String> = ["restore", "volume", LABEL, "--device", DEVICE, "--to"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            line.push(volume_dest_s.clone());
+            for k in key {
+                line.push("--key".into());
+                line.push((*k).into());
+            }
+            line
+        };
+        assert!(run_line(volume_line(&[])).is_err(), "no key, no volume");
+        // A failed `restore volume` leaves its unit directory behind; the
+        // retry names it empty again.
+        let _ = std::fs::remove_dir_all(volume_dest.path().join(UNIT));
+        run_line(volume_line(&[&escrow])).expect("restore volume --key escrow.key");
+        check(&volume_dest.path().join(UNIT), &all);
+    }
+
+    /// A `--key` that is not an identity file is refused by name, with the
+    /// reason, before anything else — before the device is resolved and the
+    /// drive opened — by each of the four commands.
+    #[test]
+    fn a_key_that_is_not_an_identity_is_refused_by_name_before_the_drive_opens() {
+        let tape = written_tape();
+        let home = heir_home(&tape.escrow_public);
+        let dir = TempDir::new().unwrap();
+        let public_only = dir.path().join("escrow.pub");
+        std::fs::write(&public_only, format!("{}\n", tape.escrow_public)).unwrap();
+        let junk = dir.path().join("junk.key");
+        std::fs::write(&junk, "this is not a key\n").unwrap();
+        let good = dir.path().join("escrow.key");
+        std::fs::write(&good, format!("{}\n", tape.escrow_secret)).unwrap();
+        let fake = FakeTape::with_files(tape.store.files.clone(), BS as usize);
+        let _drive = InjectedDrive::install(&fake);
+        let dest = TempDir::new().unwrap();
+        let dest_s = dest.path().join("out").to_string_lossy().into_owned();
+
+        for bad in [&public_only, &junk, &dir.path().join("missing.key")] {
+            let bad_s = bad.to_string_lossy().into_owned();
+            let good_s = good.to_string_lossy().into_owned();
+            let lines: Vec<Vec<&str>> = vec![
+                vec![
+                    "catalog", "rebuild", "--from-volume", "--device", DEVICE, "--key", &good_s,
+                    "--key", &bad_s,
+                ],
+                vec![
+                    "restore", "unit", "--unit", UNIT, "--from", LABEL, "--device", DEVICE, "--to",
+                    &dest_s, "--key", &good_s, "--key", &bad_s,
+                ],
+                vec![
+                    "restore", "file", "--unit", UNIT, "--file", "f0.bin", "--from", LABEL,
+                    "--device", DEVICE, "--to", &dest_s, "--key", &bad_s, "--key", &good_s,
+                ],
+                vec![
+                    "restore", "volume", LABEL, "--device", DEVICE, "--to", &dest_s, "--key",
+                    &bad_s,
+                ],
+            ];
+            for line in lines {
+                let err = dispatch(&home, &line)
+                    .expect_err("a bad key file is refused")
+                    .to_string();
+                assert!(err.contains(&bad_s), "{line:?}: the file is named: {err}");
+                assert!(
+                    err.contains("is not an age X25519 identity file")
+                        || err.contains("cannot read"),
+                    "{line:?}: {err}"
+                );
+                assert!(
+                    !err.contains(&tape.escrow_secret),
+                    "a refusal never echoes a secret: {err}"
+                );
+                assert!(
+                    fake.opens().is_empty(),
+                    "{line:?}: the drive was opened before the key was checked"
+                );
+            }
+        }
+        assert_eq!(
+            home.conn
+                .query_row("SELECT COUNT(*) FROM volumes", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "nothing was rebuilt"
+        );
+        assert!(!dest.path().join("out").exists());
     }
 }
