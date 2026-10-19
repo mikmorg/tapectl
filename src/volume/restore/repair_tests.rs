@@ -463,6 +463,46 @@ mod tests {
             self.mems.get_mut(label).unwrap().files[position][at] ^= 0xFF;
         }
 
+        /// Replace slice `slice` as cartridge `label` holds it with `plain`
+        /// encrypted afresh to the tenant: a DIFFERENT age file (its own key,
+        /// header and nonce) of exactly the length the catalog recorded, with
+        /// the block padding the original had. Every chunk of it authenticates
+        /// under the tenant's identity; its ciphertext hash is not the
+        /// recorded one.
+        fn replace_slice(&mut self, label: &str, st: &Staging, slice: usize, plain: &[u8]) {
+            assert_eq!(
+                plain.len(),
+                st.plains[slice - 1].len(),
+                "same plaintext length"
+            );
+            let position = self.first_position[&(label.to_string(), st.stage_set_id)] + slice - 1;
+            let want = st.ciphers[slice - 1].len();
+            let mut tries = 0;
+            let mut cipher = loop {
+                tries += 1;
+                assert!(tries < 5000, "no age file of {want} bytes in {tries} tries");
+                let c = crate::staging::encrypt_data(plain, std::slice::from_ref(&self.public_key))
+                    .unwrap();
+                if c.len() == want {
+                    break c;
+                }
+            };
+            let stored = self.mems[label].files[position].len();
+            cipher.resize(stored, 0);
+            self.mems.get_mut(label).unwrap().files[position] = cipher;
+        }
+
+        /// Forget the plaintext checksum recorded for slice `slice` of `st`,
+        /// as a catalog that never had one.
+        fn forget_plain_sha(&self, st: &Staging, slice: usize) {
+            self.conn
+                .execute(
+                    "UPDATE stage_slices SET sha256_plain = '' WHERE stage_set_id = ?1 AND slice_number = ?2",
+                    params![st.stage_set_id, slice as i64],
+                )
+                .unwrap();
+        }
+
         /// The bay, with `start` in the drive: `fake` puts each cartridge on a
         /// [`FakeTape`] (for the motions), otherwise memory.
         fn bay(&self, start: &str, attended: bool, script: &[Reply]) -> TestBay {
@@ -789,6 +829,10 @@ mod tests {
                 .to_string();
             assert!(err.contains("INCOMPLETE"), "{err}");
             assert!(err.contains("slice 3 on L6-0001"), "{err}");
+            assert!(
+                err.contains("unproven"),
+                "a slice with holes is said to be unproven as well: {err}"
+            );
             let differing = fx.differing(dest.path());
             assert!(
                 !differing.is_empty() && differing.len() < fx.files.len(),
@@ -902,6 +946,363 @@ mod tests {
             assert!(
                 !dest.path().join(SCRATCH_NAME).exists(),
                 "the scratch directory is gone"
+            );
+        }
+    }
+
+    // ── what proves a slice whole (the second review's finding) ──────────
+    //
+    // An age chunk's tag proves it was encrypted under some key the tenant's
+    // identity unwraps; any other age file to that tenant authenticates in
+    // full. These tests put such a file where the catalog expects a slice.
+
+    /// Bytes unlike anything else in the fixtures (`noise` is one stream
+    /// read from different offsets, so its seeds overlap): a hash chain.
+    fn unlike(len: usize, tag: u64) -> Vec<u8> {
+        use sha2::Digest;
+        let mut out = Vec::with_capacity(len + 32);
+        let mut n = 0u64;
+        while out.len() < len {
+            let mut h = sha2::Sha256::new();
+            h.update(tag.to_le_bytes());
+            h.update(n.to_le_bytes());
+            out.extend_from_slice(&h.finalize());
+            n += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// A wrong plaintext of slice 3's length: not a dar slice of this archive
+    /// (dar may give up on it as soon as it reads it).
+    fn wrong_plain(st: &Staging) -> Vec<u8> {
+        unlike(st.plains[2].len(), 4242)
+    }
+
+    /// Slice 3's own plaintext with one byte flipped well inside it: a
+    /// different file, but one dar reads to the end (it finds the damage by a
+    /// file's CRC, not by giving up).
+    fn nearly_plain(st: &Staging) -> Vec<u8> {
+        let mut plain = st.plains[2].clone();
+        let at = plain.len() / 2;
+        plain[at] ^= 0x55;
+        plain
+    }
+
+    /// THE finding, spooled: a different age file at the right position, of
+    /// the right length, authenticates in full and does not hash. It is not
+    /// the slice: it is dropped, the slice is read from the other copy, and
+    /// the restore is whole with the substitution said.
+    #[test]
+    fn a_wrong_age_file_at_the_right_position_is_taken_from_another_copy_when_spooled() {
+        let (mut fx, st) = two_copies(false);
+        let wrong = wrong_plain(&st);
+        fx.replace_slice(A, &st, 3, &wrong);
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let report = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        fx.assert_restored(dest.path());
+        assert_eq!(bay.asked_labels(), [B]);
+        assert!(
+            bay.asked[0].1.contains("Slice 3") && bay.asked[0].1.contains("checksum mismatch"),
+            "{:?}",
+            bay.asked
+        );
+        assert_eq!(report.substitutions.len(), 1, "{report:?}");
+        let sub = &report.substitutions[0];
+        assert_eq!(
+            (
+                sub.slice_number,
+                sub.supplied_by.as_str(),
+                sub.damaged_on.as_str()
+            ),
+            (3, B, A)
+        );
+        assert!(report.filled.is_empty());
+    }
+
+    /// The same, streamed: the wrong file's bytes went down the pipe to dar
+    /// before anything could say so, and a stream cannot take bytes back. The
+    /// good copy is NOT mixed in over them (it is another age file), and the
+    /// restore fails by name rather than hand back the wrong slice as if it
+    /// were the right one.
+    #[test]
+    fn a_wrong_age_file_streamed_to_dar_is_refused_by_name_never_taken_as_the_slice() {
+        let (mut fx, st) = two_copies(true);
+        fx.replace_slice(A, &st, 3, &nearly_plain(&st));
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let err = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .expect_err("a wrong file must not come back as the slice")
+            .to_string();
+        assert!(err.contains("slice 3"), "{err}");
+        assert!(err.contains("different age file"), "{err}");
+        assert!(
+            err.contains("matches the catalog"),
+            "the good copy is said to be the slice: {err}"
+        );
+        assert!(err.contains("--spool"), "the way out is named: {err}");
+        assert_eq!(bay.asked_labels(), [B]);
+        let rows = crate::volume::restore_record::rows(&fx.conn).unwrap();
+        assert_eq!(rows[0].outcome, "failed");
+    }
+
+    /// A wrong file dar gives up on as soon as it reads it (noise where a dar
+    /// slice should be) is refused all the same: either dar swallows the lot
+    /// and the next copy is refused as another age file, or dar closes the
+    /// pipe and the slice goes on the books as unproven. Never a restore that
+    /// reports success.
+    #[test]
+    fn a_wrong_age_file_dar_gives_up_on_is_never_a_successful_restore() {
+        let (mut fx, st) = two_copies(true);
+        fx.replace_slice(A, &st, 3, &wrong_plain(&st));
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let err = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .expect_err("a wrong file must not come back as the slice")
+            .to_string();
+        assert!(err.contains("slice 3"), "{err}");
+        assert!(
+            err.contains("different age file") || err.contains("unproven"),
+            "{err}"
+        );
+    }
+
+    /// The spooled counterpart of the refusal above, where the wrong file
+    /// cannot be told by its plaintext (no checksum recorded): it is
+    /// unproven, a copy that hashes as the catalog recorded is the slice, and
+    /// the part spooled from the first is dropped for it.
+    #[test]
+    fn an_unproven_spooled_slice_gives_way_to_a_copy_that_hashes_as_recorded() {
+        let (mut fx, st) = two_copies(false);
+        fx.forget_plain_sha(&st, 3);
+        fx.replace_slice(A, &st, 3, &nearly_plain(&st));
+        let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+        let dest = TempDir::new().unwrap();
+        let report = fx
+            .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        fx.assert_restored(dest.path());
+        assert_eq!(bay.asked_labels(), [B]);
+        assert_eq!(
+            report
+                .substitutions
+                .iter()
+                .map(|s| (s.slice_number, s.supplied_by.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, B)]
+        );
+    }
+
+    /// The mirror of the acceptance test for slices bad in different chunks
+    /// (A bad late, B bad early): spooled, the two together are whole and
+    /// proven by the slice's plaintext checksum, and the operator is asked for
+    /// B once. Streamed, the bytes A gave went to dar before anything was
+    /// hashing them, so the slice cannot be proven — it is restored (every file
+    /// in it checks out), said to be unproven, and the operator is not sent
+    /// back to a cartridge that could not prove it anyway.
+    #[test]
+    fn a_slice_bad_late_on_the_first_copy_and_early_on_the_second_is_proven_only_when_spooled() {
+        for catalogue in [false, true] {
+            let (mut fx, st) = two_copies(catalogue);
+            assert!(st.chunks_of(2) >= 3, "{}", st.chunks_of(2));
+            fx.corrupt(A, &st, 2, 2);
+            fx.corrupt(B, &st, 2, 0);
+            let mut bay = fx.bay(A, true, &[Reply::Load(B), Reply::Load(A)]);
+            let dest = TempDir::new().unwrap();
+            fx.restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+                .unwrap_or_else(|e| panic!("catalogue={catalogue}: {e}"));
+            fx.assert_restored(dest.path());
+            assert_eq!(bay.asked_labels(), [B], "catalogue={catalogue}");
+            let said_unproven = fx
+                .contacts()
+                .iter()
+                .any(|c| c.2.as_deref().unwrap_or("").contains("slice 2 unproven"));
+            assert_eq!(said_unproven, catalogue, "catalogue={catalogue}");
+        }
+    }
+
+    /// Spooled, with no other copy: the wrong file is no use to dar, so the
+    /// slice is a hole from end to end, the restore says why in the words of
+    /// the finding, and the files that were not in that slice are whole.
+    #[test]
+    fn a_wrong_age_file_on_the_only_copy_is_a_whole_slice_of_hole_when_spooled() {
+        let mut fx = Fixture::new(&[A], tree());
+        let st = fx.stage(&tree(), "150k", false);
+        fx.write(&st, A);
+        let wrong = wrong_plain(&st);
+        fx.replace_slice(A, &st, 3, &wrong);
+        let mut mem = clone_mem(&fx.mems[A]);
+        let dest = TempDir::new().unwrap();
+        let dest_str = dest.path().to_string_lossy().into_owned();
+        let err = restore_unit_from_store(
+            &fx.conn,
+            &fx.paths,
+            &Config::default(),
+            &fx.unit,
+            A,
+            1,
+            RestoreTarget::Unit {
+                dest_dir: &dest_str,
+            },
+            &RestoreOptions::default(),
+            &mut mem,
+            site(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("INCOMPLETE"), "{err}");
+        assert!(err.contains("slice 3 on L6-0001"), "{err}");
+        assert!(
+            err.contains("does not match the checksum recorded for the slice"),
+            "{err}"
+        );
+        assert!(err.contains("unproven"), "{err}");
+        let differing = fx.differing(dest.path());
+        assert!(
+            !differing.is_empty(),
+            "the wrong slice restored nothing true"
+        );
+        for path in &differing {
+            assert!(err.contains(path.as_str()), "{path} is named: {err}");
+        }
+        // Not a byte of the wrong file is anywhere in what came back: sample
+        // 64-byte runs of it and look for each.
+        let samples: Vec<&[u8]> = (0..8)
+            .map(|k| &wrong[k * (wrong.len() / 9)..][..64])
+            .collect();
+        for (path, _) in &fx.files {
+            let got = fs::read(dest.path().join(path)).unwrap_or_default();
+            for sample in &samples {
+                assert!(
+                    !got.windows(64).any(|w| w == *sample),
+                    "{path} carries bytes of the wrong file"
+                );
+            }
+        }
+    }
+
+    /// Streamed, with no other copy: nothing was hashing the plaintext as it
+    /// went to dar, so the slice is unproven — not "whole" — and the restore
+    /// says so and judges the files in it one by one.
+    #[test]
+    fn a_wrong_age_file_streamed_from_the_only_copy_is_unproven_and_the_files_decide() {
+        let mut fx = Fixture::new(&[A], tree());
+        let st = fx.stage(&tree(), "150k", true);
+        fx.write(&st, A);
+        let wrong = wrong_plain(&st);
+        fx.replace_slice(A, &st, 3, &wrong);
+        let mut mem = clone_mem(&fx.mems[A]);
+        let dest = TempDir::new().unwrap();
+        let dest_str = dest.path().to_string_lossy().into_owned();
+        let err = restore_unit_from_store(
+            &fx.conn,
+            &fx.paths,
+            &Config::default(),
+            &fx.unit,
+            A,
+            1,
+            RestoreTarget::Unit {
+                dest_dir: &dest_str,
+            },
+            &RestoreOptions::default(),
+            &mut mem,
+            site(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("slice 3 on L6-0001"), "{err}");
+        assert!(err.contains("unproven"), "{err}");
+        let differing = fx.differing(dest.path());
+        assert!(!differing.is_empty());
+        for path in &differing {
+            assert!(
+                err.contains(path.as_str()) || err.contains("dar stopped reading"),
+                "{path} is named, or dar's giving up is: {err}"
+            );
+        }
+    }
+
+    /// The other side of the same check, spooled: a different age file whose
+    /// PLAINTEXT is the slice (re-encrypted: other key, header, nonce, so the
+    /// ciphertext hash is not the recorded one) IS the slice, because the
+    /// recorded plaintext checksum says so. Nothing is unproven, nobody is
+    /// asked for another cartridge, and the restore is whole. The same slice
+    /// with no plaintext checksum recorded (a catalog that never had one) is
+    /// unproven — still restored, since every file in it checks out — and the
+    /// cartridge's record says so.
+    #[test]
+    fn a_reencrypted_slice_is_whole_by_its_plaintext_checksum_and_unproven_without_one() {
+        for recorded in [true, false] {
+            let mut fx = Fixture::new(&[A], tree());
+            let st = fx.stage(&tree(), "150k", false);
+            fx.write(&st, A);
+            fx.replace_slice(A, &st, 3, &st.plains[2].clone());
+            if !recorded {
+                fx.forget_plain_sha(&st, 3);
+            }
+            let mut mem = clone_mem(&fx.mems[A]);
+            let dest = TempDir::new().unwrap();
+            let dest_str = dest.path().to_string_lossy().into_owned();
+            restore_unit_from_store(
+                &fx.conn,
+                &fx.paths,
+                &Config::default(),
+                &fx.unit,
+                A,
+                1,
+                RestoreTarget::Unit {
+                    dest_dir: &dest_str,
+                },
+                &RestoreOptions::default(),
+                &mut mem,
+                site(),
+            )
+            .unwrap_or_else(|e| panic!("recorded={recorded}: {e}"));
+            fx.assert_restored(dest.path());
+            let detail = fx.contacts()[0].2.clone().unwrap_or_default();
+            assert_eq!(
+                detail.contains("slice 3 unproven"),
+                !recorded,
+                "recorded={recorded}: {detail}"
+            );
+        }
+    }
+
+    /// One slice is one age file. Copy A is good for slice 2's first two
+    /// chunks and bad after; copy B is a clean, complete age file of the same
+    /// plaintext — but another file, with its own header and nonce. Its
+    /// chunks authenticate under its own key and prove nothing about the part
+    /// A gave, so they are never mixed into the same slice: the restore
+    /// refuses, by name, both ways dar can be fed.
+    #[test]
+    fn chunks_of_two_age_files_are_never_mixed_into_one_slice() {
+        for catalogue in [true, false] {
+            let (mut fx, st) = two_copies(catalogue);
+            assert!(st.chunks_of(2) >= 3, "{}", st.chunks_of(2));
+            fx.corrupt(A, &st, 2, 2);
+            fx.replace_slice(B, &st, 2, &st.plains[1].clone());
+            let mut bay = fx.bay(A, true, &[Reply::Load(B)]);
+            let dest = TempDir::new().unwrap();
+            let err = fx
+                .restore(A, &mut bay, dest.path(), &RestoreOptions::default())
+                .expect_err(&format!(
+                    "catalogue={catalogue}: mixed chunks must be refused"
+                ))
+                .to_string();
+            assert!(err.contains("slice 2"), "catalogue={catalogue}: {err}");
+            assert!(
+                err.contains("different age file") && err.contains("never mixed"),
+                "catalogue={catalogue}: {err}"
+            );
+            assert_eq!(bay.asked_labels(), [B], "catalogue={catalogue}");
+            assert!(
+                !dest.path().join(SCRATCH_NAME).exists(),
+                "catalogue={catalogue}: no decrypted slice is left behind"
             );
         }
     }

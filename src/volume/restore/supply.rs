@@ -800,6 +800,11 @@ enum Attempt {
     SinkGone,
     /// It stopped, and why.
     Stopped(Defect),
+    /// Every chunk the sink lacked authenticated and was written, but the
+    /// copy does not hash and the plaintext could not be shown to be the
+    /// slice (and why). The slice is delivered in full; only a copy that
+    /// hashes as written could still prove it.
+    Unproven(Defect, &'static str),
 }
 
 /// The restore's reads of slices: the cartridge in the drive, what it has
@@ -816,6 +821,10 @@ pub(crate) struct Supply<'c, 's, 'b> {
     /// had been delivered when they were: a volume is asked again only once
     /// another has delivered past that.
     bad: HashMap<(i64, String), u64>,
+    /// Volumes whose copy of a slice did not hash as written. Such a copy can
+    /// never prove a delivered slice whole, which is all a slice already
+    /// delivered in full is waiting for.
+    hash_bad: std::collections::HashSet<(i64, String)>,
     /// The tape file the last attempt read on `here`, for a salvage pass.
     last_position: Option<u32>,
     /// Whether a stage set has no other copy anywhere, per cartridge.
@@ -856,6 +865,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 notes: Vec::new(),
             }),
             bad: HashMap::new(),
+            hash_bad: std::collections::HashSet::new(),
             last_position: None,
             sole: HashMap::new(),
             subject: String::new(),
@@ -982,19 +992,28 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         // The first cartridge it failed on and why: what a substitution, a
         // refusal or a hole is described by.
         let mut first: Option<(String, Defect)> = None;
+        // The slice is delivered in full and nothing has shown it to be the
+        // slice: where, and why. Only a copy that hashes as written can still
+        // settle it.
+        let mut unproven: Option<(String, String)> = None;
         let mut tried = false;
         // With no other copy anywhere there is nothing to wait for: one pass,
         // holes where the chunks do not authenticate.
         let sole = self.sole_copy(wp)?;
         loop {
-            match self.choose(wp, out.delivered, tried, &mut holders)? {
+            match self.choose(wp, out.delivered, tried, unproven.is_some(), &mut holders)? {
                 Choice::Here(position) => {
                     tried = true;
                     self.last_position = Some(position);
                     if sole {
                         break;
                     }
-                    match self.attempt(position, wp, identities, out)? {
+                    let attempt = self.attempt(position, wp, identities, out)?;
+                    let why_unproven = match &attempt {
+                        Attempt::Unproven(_, why) => Some(*why),
+                        _ => None,
+                    };
+                    match attempt {
                         Attempt::Complete => {
                             if let Some((damaged_on, defect)) = &first {
                                 self.supplied(wp, damaged_on, defect);
@@ -1002,7 +1021,7 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                             return Ok(());
                         }
                         Attempt::SinkGone => return Ok(()),
-                        Attempt::Stopped(defect) => {
+                        Attempt::Stopped(defect) | Attempt::Unproven(defect, _) => {
                             let label = self.here_label().unwrap_or_default();
                             warn!(
                                 slice = wp.slice_number,
@@ -1018,6 +1037,20 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                                 short_cause(&defect)
                             ));
                             self.mark_bad(&wp.sha256_encrypted, out.delivered);
+                            if matches!(defect, Defect::Hash { .. }) {
+                                if let Some(volume) = self.here_volume() {
+                                    self.hash_bad.insert((volume, wp.sha256_encrypted.clone()));
+                                }
+                            }
+                            if let Some(why) = why_unproven {
+                                unproven = Some((
+                                    label.clone(),
+                                    format!(
+                                        "{label}: {}; every chunk authenticates, but {why}",
+                                        defect.describe(wp)
+                                    ),
+                                ));
+                            }
                             let substitutable = defect.substitutable();
                             first.get_or_insert((label, defect));
                             if !substitutable {
@@ -1047,6 +1080,12 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                 }
                 Choice::Nowhere => break,
             }
+        }
+        if let Some((on, reason)) = unproven {
+            // Already delivered in full: reading it again could only say the
+            // same.
+            self.record_damage(wp, on, reason, Vec::new());
+            return Ok(());
         }
         self.salvage(wp, identities, out, first)
     }
@@ -1106,21 +1145,28 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             )));
         }
         if ended.other_file {
-            return Err(TapectlError::Other(format!(
-                "slice {} of {} cannot be completed: the cartridge in the drive holds a \
-                 different age file for it (another header and nonce) from the part already \
-                 read, and chunks of two files are never mixed{}",
-                wp.slice_number,
-                self.subject,
-                described(&cause)
-                    .map(|d| format!(" ({d})"))
-                    .unwrap_or_default(),
-            )));
+            // The cartridge in the drive is not the file the slice was begun
+            // from. One that hashes as recorded is the slice, and a spooled
+            // part that came from elsewhere is dropped for it.
+            if hash_ok && matches!(out.sink, SliceSink::File(_)) {
+                out.reset();
+                return self.salvage(wp, identities, out, cause);
+            }
+            return Err(self.other_file_error(wp, hash_ok, described(&cause)));
         }
         let new_holes: Vec<Range<u64>> = out.holes[before_holes..].to_vec();
         if ended.sink_gone && new_holes.is_empty() {
-            // dar stopped reading mid-slice: the slice is incomplete, and
-            // there is nothing to vouch for (`read_slice` says dar is gone).
+            // dar stopped reading mid-slice. Over a slice that hashes as
+            // written that is dar's own doing (`read_slice` says dar is gone,
+            // and the restore says why). Over one that does not, the slice is
+            // why, and it goes on the books, as a hole would.
+            if !hash_ok {
+                let reason = format!(
+                    "{}; dar stopped reading it",
+                    described(&cause).unwrap_or_else(|| format!("slice {}", wp.slice_number)),
+                );
+                self.record_damage(wp, label, reason, Vec::new());
+            }
             return Ok(());
         }
         if new_holes.is_empty() {
@@ -1257,12 +1303,19 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
         wp: &WritePositionInfo,
         delivered: u64,
         tried: bool,
+        awaiting_proof: bool,
         holders: &mut Option<Vec<Holder>>,
     ) -> Result<Choice> {
         let sha = &wp.sha256_encrypted;
+        // A volume is usable for a slice until it failed it, and again once
+        // another has delivered past where it failed. A slice already
+        // delivered in full awaits only a copy that hashes as written, which
+        // a volume that did not hash cannot be.
+        let hash_bad = &self.hash_bad;
         let usable = |bad: &HashMap<(i64, String), u64>, volume: i64| {
             bad.get(&(volume, sha.clone()))
                 .is_none_or(|&at| delivered > at)
+                && !(awaiting_proof && hash_bad.contains(&(volume, sha.clone())))
         };
         let parse = |position: &str| -> Result<u32> {
             position.parse().map_err(|_| {
@@ -1406,9 +1459,32 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             };
         }
         if ended.sink_gone {
+            // dar stopped reading, so nothing more can be delivered, from this
+            // copy or any other. Over a slice that hashes as written that is
+            // dar's own doing; over one that does not, the slice is why, and
+            // it goes on the books as unproven.
+            if !hash_ok {
+                let on = self.here_label().unwrap_or_default();
+                let reason = format!(
+                    "{on}: {}; dar stopped reading it, so no other copy could be tried (a \
+                     spooled restore, --spool, can)",
+                    defect.map_or_else(|| format!("slice {}", wp.slice_number), |d| d.describe(wp)),
+                );
+                self.record_damage(wp, on, reason, Vec::new());
+            }
             return Ok(Attempt::SinkGone);
         }
         if ended.other_file {
+            if hash_ok {
+                // This copy hashes as the catalog recorded: it IS the slice,
+                // and the file the part already read came from is not.
+                if matches!(out.sink, SliceSink::File(_)) {
+                    // Spooled: drop that part and read this copy afresh.
+                    out.reset();
+                    return self.attempt(position, wp, identities, out);
+                }
+                return Err(self.other_file_error(wp, true, None));
+            }
             return Ok(Attempt::Stopped(Defect::OtherFile));
         }
         if ended.stopped {
@@ -1458,12 +1534,38 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
             Proof::Unproven(why) => {
                 info!(
                     slice = wp.slice_number,
-                    "{} — every chunk authenticates but {why}: another copy is tried",
+                    "{} — every chunk authenticates but {why}",
                     defect.describe(wp)
                 );
-                Ok(Attempt::Stopped(defect))
+                Ok(Attempt::Unproven(defect, why))
             }
         }
+    }
+
+    /// The refusal when the cartridge in the drive holds another age file
+    /// than the one that began the slice. `matches_catalog`: this copy's own
+    /// checksum is the recorded one, so it is the slice and the part already
+    /// read is not.
+    fn other_file_error(
+        &self,
+        wp: &WritePositionInfo,
+        matches_catalog: bool,
+        cause: Option<String>,
+    ) -> TapectlError {
+        let verdict = if matches_catalog {
+            "this copy's checksum matches the catalog, so the part already read is not the slice"
+        } else {
+            "neither can be shown to be the slice"
+        };
+        TapectlError::Other(format!(
+            "slice {} of {} cannot be completed: the cartridge in the drive holds a different \
+             age file for it (another header and nonce) from the part already read, and chunks \
+             of two files are never mixed — {verdict}{}. A streamed restore cannot take back \
+             what it has fed to dar: restore again with --spool, or from another cartridge",
+            wp.slice_number,
+            self.subject,
+            cause.map(|d| format!(" ({d})")).unwrap_or_default(),
+        ))
     }
 
     /// The refusal for a streamed slice whose plaintext is not the slice:
