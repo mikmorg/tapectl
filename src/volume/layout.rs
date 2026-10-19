@@ -13139,7 +13139,13 @@ sha256_encrypted = \"bbb\"
         let mut at = 0;
         while let Some(i) = flat[at..].find("catalogue") {
             let i = at + i;
-            let before = &flat[i.saturating_sub(24)..i];
+            // The 24 characters before it (not bytes: the guide has dashes).
+            let before: String = {
+                let mut v: Vec<char> = flat[..i].chars().rev().take(24).collect();
+                v.reverse();
+                v.into_iter().collect()
+            };
+            let after: String = flat[i + 9..].chars().take(40).collect();
             let ok = [
                 "dar ",
                 "Kit's ",
@@ -13154,11 +13160,7 @@ sha256_encrypted = \"bbb\"
             .iter()
             .any(|p| before.ends_with(p))
                 || flat[i..].starts_with("catalogues");
-            assert!(
-                ok,
-                "a bare 'catalogue': ...{before}[catalogue]{}",
-                &flat[i + 9..(i + 50).min(flat.len())]
-            );
+            assert!(ok, "a bare 'catalogue': ...{before}[catalogue]{after}");
             at = i + 9;
         }
         // The operator's name and the dar catalogue's stem are not both NAME.

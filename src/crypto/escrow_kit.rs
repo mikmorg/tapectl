@@ -182,15 +182,7 @@ fn program_file_name() -> String {
 /// from a best-effort chmod), and return the sha256 and size of the file as
 /// it now lies in the kit. A half-written copy is removed.
 fn copy_program(program: &Path, dest: &Path) -> Result<(String, u64)> {
-    use std::os::unix::fs::PermissionsExt;
-    let copied = (|| -> Result<(String, u64)> {
-        fs::copy(program, dest)?;
-        fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
-        let mut hashing = crate::util::HashingReader::new(fs::File::open(dest)?);
-        let bytes = std::io::copy(&mut hashing, &mut std::io::sink())?;
-        Ok((hashing.finalize_hex(), bytes))
-    })();
-    copied.map_err(|e| {
+    copy_and_hash(program, dest).map_err(|e| {
         let _ = fs::remove_file(dest);
         TapectlError::Other(format!(
             "could not copy the tapectl program {} into the kit as {}: {e}",
@@ -198,6 +190,15 @@ fn copy_program(program: &Path, dest: &Path) -> Result<(String, u64)> {
             dest.display()
         ))
     })
+}
+
+fn copy_and_hash(program: &Path, dest: &Path) -> std::io::Result<(String, u64)> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::copy(program, dest)?;
+    fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
+    let mut hashing = crate::util::HashingReader::new(fs::File::open(dest)?);
+    let bytes = std::io::copy(&mut hashing, &mut std::io::sink())?;
+    Ok((hashing.finalize_hex(), bytes))
 }
 
 /// Snapshot the live database and encrypt it to the escrow recipient.
