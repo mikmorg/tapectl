@@ -433,6 +433,10 @@ survives the machine: a printed cover sheet naming the escrow identity, with a b
 where you copy the secret by hand, plus the whole catalog encrypted to the escrow
 recipient.
 
+From 1.4.0 File 1 on every tape says how to open the catalog ("The Heir Kit's catalogue"):
+`age -d -i escrow.key -o catalog.db catalog.db.age`, then `sqlite3`. Only the escrow secret
+opens it, and it is as of the day the kit was made.
+
 ```text
 $ tapectl key escrow-kit --out ~/heir-kit
 heir kit written to ~/heir-kit

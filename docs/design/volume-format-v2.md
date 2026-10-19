@@ -726,6 +726,19 @@ for every manual step, the UNSEALED and DAMAGED sections, a completeness check, 
 box", hardware, and rung 3's stopping point. Fixed points (item 81): `requires` stays empty and
 `die_newer_needed` stays "tapectl 1.1.0".
 
+**Since 1.4.0** (ADR-0012 items 105 and 107, #481; no golden pin moves: RESTORE.sh and
+MANIFEST.toml are byte-identical to 1.3.0). File 1 and RECOVERY.md text only. File 1 gained "The
+Heir Kit's catalogue" (opening `catalog.db.age` with the escrow key, as of the day the kit was made,
+with two `sqlite3` queries), "tapectl itself" (the repository https://github.com/mikmorg/tapectl,
+the release tag, `cargo build`, `init` with the escrow PUBLIC key, `catalog rebuild --from-volume
+--key`, `restore unit --key`, so an escrow-only heir gets tapectl's chunk salvage and file fill),
+telling a bad key file from a tape of another installation, "A renamed unit" and "Two units of one
+name" (a directory per unit uuid where names recur across tapes), "When no envelope reads",
+package names with one `apt` line and the oldest age tried (1.0.0-rc.1, linking age's release
+page), IR and IT defined, internal versus external drives and the USB/Thunderbolt answer, the disk
+chosen after the units are listed on a Linux filesystem, one disk-space rule, and a manual slice
+step that stops on a failed hash. "Start here" may run to 60 lines.
+
 ## 7. Block mode
 
 Fixed-block mode, 512 KB (decision D7). Plan-first depends on deterministic block
