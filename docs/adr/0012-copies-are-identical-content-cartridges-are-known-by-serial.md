@@ -1822,3 +1822,16 @@ Ruled 2026-10-19, after v1.3.0 was tagged:
      do not move). The rest are #485, for the next re-pin. 1.4.0 is tagged without a sixth read:
      every fresh read finds new edges, so a read that finds no serious gap left unfixed is the
      stopping rule.
+
+Ruled 2026-10-19, after v1.4.0 was tagged:
+
+109. **1.5.0, a re-pin for #485** (CTO, 2026-10-19). The fifth fresh read's remaining findings ship
+     now, as 1.5.0, instead of waiting for the short seal. File 1 and RECOVERY.md text only:
+     RESTORE.sh's bytes do not move, so the one finding that would have moved them (a `dar_command`
+     column in `--find-envelope`'s table, for an escrow-only heir judging a unit's disk room) is met
+     in File 1 by a shorter manual route instead. #485's item 5 (tapectl reachable only from its
+     repository) is met outside the tape: the Heir Kit carries a copy of the tapectl binary that
+     generated it. Each finding is fixed, or ruled out with its reason on #485; then one fresh read,
+     under item 108's stopping rule. home2 installs 1.5.0 instead of 1.4.0, and the on-tape
+     authorizations of 1.2.0 through 1.5.0 (items 72, 81, 104, 105 and this one) all end when it
+     is installed.
