@@ -427,7 +427,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let given = KeyFile::read_all(&[escrow_key.clone()]).unwrap();
+        let given = KeyFile::read_all(std::slice::from_ref(&escrow_key)).unwrap();
 
         // The heir's home owns no key that wrote this tape.
         let homes_publics: Vec<String> = home

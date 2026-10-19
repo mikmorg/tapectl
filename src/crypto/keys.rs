@@ -914,7 +914,12 @@ mod tests {
         let (good, _) = keygen_file(tmp.path(), "good.key");
         let bad = tmp.path().join("bad.key");
         fs::write(&bad, "not a key\n").unwrap();
-        assert_eq!(KeyFile::read_all(&[good.clone()]).unwrap().len(), 1);
+        assert_eq!(
+            KeyFile::read_all(std::slice::from_ref(&good))
+                .unwrap()
+                .len(),
+            1
+        );
         let err = KeyFile::read_all(&[good, bad]).unwrap_err().to_string();
         assert!(err.contains("bad.key"), "{err}");
     }
