@@ -7597,9 +7597,41 @@ sha256_encrypted = \"bbb\"
         assert_eq!(nums[0], listed.len(), "errors named: {c}");
         assert_eq!(nums[2], 0, "none left unnamed: {c}");
         assert_eq!(nums[3], listed.len(), "dar's own failed count: {c}");
-        assert!(
-            listed.iter().any(|l| l == "we ird : name.bin"),
-            "a name holding the separator keeps its whole name: {listed:?}"
+        // Which files the flips above damage depends on dar's file order, which
+        // is the file system's directory order (ext4 here, another on CI): the
+        // last slice is left whole, so whatever lands in it is not damaged. The
+        // name holding the separator is checked from real dar output when it was
+        // damaged, and always from a line in dar's own form below.
+        if want.iter().any(|w| w == "we ird : name.bin") {
+            assert!(
+                listed.iter().any(|l| l == "we ird : name.bin"),
+                "a name holding the separator keeps its whole name: {listed:?}"
+            );
+        }
+        let crafted_log = dir.join("crafted.log");
+        std::fs::write(
+            &crafted_log,
+            format!(
+                "Error while restoring {}/we ird : name.bin : Bad CRC, data corruption occurred\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        let o = Command::new("awk")
+            .arg(AWK_DAR_DAMAGED)
+            .arg(&crafted_log)
+            .env("DAMAGED_ROOT", &out)
+            .env("DAMAGED_SKIPS", "0")
+            .env("DAMAGED_COUNTS", dir.join("crafted.counts"))
+            .output()
+            .expect("awk");
+        assert!(o.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["we ird : name.bin"],
+            "a name holding the separator keeps its whole name (the reason follows the LAST ' : ')"
         );
 
         // The other form dar prints: a slice that was never there.
