@@ -2438,7 +2438,8 @@ was written; what was restored before that slice stays.
 
 ```text
 restore of unit "<unit>" v<v> into <dest> is INCOMPLETE
-  slice <n> on <label>: <k> hole(s) of zeros, <bytes> byte(s) in all, at plaintext byte(s) <a>..<b> — …
+  slice <n> on <label>: <k> hole(s) of zeros, <bytes> byte(s) in all, at plaintext byte(s) <a>..<b> — …; the slice as a whole is unproven, …
+  slice <n> on <label>: unproven, not shown to be the slice the catalog recorded — …
   <m> file(s) damaged or missing:
     <path> (<why>)
 ```
@@ -2451,6 +2452,37 @@ lines "does not match the version's recorded checksum … not kept" and "another
 copy could not be used" say what happened. Restore the lost paths from another
 cartridge, or replace the file from the source. All lost paths are in the
 session log.
+
+### A slice is "unproven"
+
+A line that says a slice is unproven means tapectl could not show it to be the
+slice the catalog recorded. A chunk's tag proves only that it was encrypted for
+one of your keys; any other age file written for the same key authenticates
+just as well. So a slice is whole only when its checksum matches the one
+recorded at staging or, if that does not match, when its decrypted contents
+match the plaintext checksum recorded for it. It stays unproven when it has
+holes, when the catalog records no plaintext checksum for it, or when the
+restore was streamed into dar (the default) and the first read of the slice
+went into dar before anything was hashing it.
+
+Unproven is not lost. The files in the slice are checked one by one against
+the sha256 recorded for each (dar's own check where none is recorded), and the
+restore ends whole only if they all match. Trust the file list, not the slice.
+To have the slice itself proven, or another copy tried in its place, restore
+again with `--spool`.
+
+### `slice <n> of unit … cannot be completed: the cartridge in the drive holds a different age file for it`
+
+A slice is one age file, and it is read from one file only: chunks of two files
+are never mixed, because each authenticates under its own key and neither
+vouches for the other. This copy's file has a different header and nonce from
+the part already read. If the message says "this copy's checksum matches the
+catalog, so the part already read is not the slice", the first read was the
+wrong file (a wrong tape position or a wrong catalog entry) and its bytes are
+already in dar, which cannot take them back in a streamed restore. Restore
+again with `--spool`, which drops the wrong part and reads this copy afresh, or
+restore from that cartridge directly with `--from`. Otherwise neither copy can
+be shown to be the slice; restore from another cartridge.
 
 ### `… file(s) can be filled from another copy of this version, held by …`
 
