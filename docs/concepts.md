@@ -385,6 +385,7 @@ the factory, and no drive can use it again.
   $ tapectl volume init L8-0001
   cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
   volume "L8-0001" initialized (id=1)
+  medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
   ```
 
   Only when no chip serial can be read does the barcode you give
@@ -395,6 +396,10 @@ the factory, and no drive can use it again.
   nothing about the tape in it. `volume init` detects the medium's generation
   from the cartridge itself, refuses if the drive cannot write that medium
   (`--force` never overrides this), and fixes the volume's capacity from it.
+  Init prints the result on its last line (the `medium:` line above: the
+  generation, the capacity, and whether the chip's density code, the drive's
+  density register or a declaration decided it), and `volume list` shows the
+  GENERATION and CAPACITY of every volume afterwards.
   Capacity is decided once, at init, and stored on the volume. Cartridge
   capacities are decimal (as printed on the box); data sizes are binary
   (KiB, MiB).

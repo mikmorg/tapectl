@@ -316,6 +316,7 @@ tapectl volume verify L8-0001 --full
 ```text
 cartridge E01001L8_1775794348 auto-registered from MAM (barcode = medium serial)
 volume "L8-0001" initialized (id=1)
+medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
 
 about to write to volume "L8-0001":
   family/letters v1: 1 slices, 1.8 KiB
@@ -444,6 +445,7 @@ tapectl report copies
 ```text
 cartridge E01003L8_1775794348 auto-registered from MAM (barcode = medium serial)
 volume "L8-0002" initialized (id=2)
+medium: LTO-8, 12.00 TB (the cartridge chip's medium density code 0x5e)
 ...
 volume "L8-0002" write completed
 verify L8-0002 (full tier): 13 checked, 13 passed, 0 failed
