@@ -76,6 +76,9 @@ struct UnitPlain {
     tenant_id: i64,
     /// The unit's files as the catalog's `paths` record them.
     file_names: Vec<String>,
+    /// The sha256 of each of `file_names`' bytes, in the same order: what the
+    /// catalog recorded for them and the index carries.
+    file_hashes: Vec<String>,
     plaintext: Vec<u8>,
     /// The `sha256_plain` the catalog recorded for the unit's one slice: the
     /// real hash of `plaintext` when the build asked for it
@@ -184,26 +187,37 @@ fn insert_tenant(conn: &rusqlite::Connection, name: &str, is_operator: bool) -> 
 }
 
 /// `files` (and one `extra`) as the paths of `snapshot_id`, regular files.
+/// Each of `files` records the sha256 of its bytes in `dir` (what staging
+/// records: the index carries it, ADR-0012 item 103); the `extra` records
+/// none.
 fn insert_paths(
     conn: &rusqlite::Connection,
     snapshot_id: i64,
+    dir: &std::path::Path,
     files: &[(String, u64)],
     extra: Option<(&str, u64)>,
 ) {
     let entries = files
         .iter()
-        .map(|(n, size)| (n.clone(), *size))
-        .chain(extra.map(|(n, size)| (n.to_string(), size)));
+        .map(|(n, size)| {
+            let hash = sha256_hex(&std::fs::read(dir.join(n)).unwrap());
+            (
+                n.clone(),
+                *size,
+                Some(db::files::sha256_from_hex(&hash).unwrap()),
+            )
+        })
+        .chain(extra.map(|(n, size)| (n.to_string(), size, None)));
     db::files::insert_version(
         conn,
         snapshot_id,
-        entries.map(|(path, size)| {
+        entries.map(|(path, size, sha256)| {
             Ok(db::files::FileEntry {
                 path,
                 kind: db::files::FileKind::Regular,
                 size_bytes: size as i64,
                 mtime_ns: None,
-                sha256: None,
+                sha256,
                 link_target: None,
             })
         }),
@@ -309,7 +323,8 @@ fn build_sealed_harness_from(
     let half = fixtures.len() / 2;
     let mut build_units = Vec::with_capacity(fixtures.len());
     let mut units_plain = Vec::with_capacity(fixtures.len());
-    let mut unit_rows: Vec<(i64, Vec<(String, u64)>)> = Vec::with_capacity(fixtures.len());
+    let mut unit_rows: Vec<(i64, std::path::PathBuf, Vec<(String, u64)>)> =
+        Vec::with_capacity(fixtures.len());
 
     for (i, fixture) in fixtures.iter().enumerate() {
         let tenant = if i < half { &tenants[0] } else { &tenants[1] };
@@ -340,8 +355,8 @@ fn build_sealed_harness_from(
         )
         .unwrap();
         let snapshot_id = conn.last_insert_rowid();
-        insert_paths(&conn, snapshot_id, &fixture.files, None);
-        unit_rows.push((unit_id, fixture.files.clone()));
+        insert_paths(&conn, snapshot_id, &fixture.path, &fixture.files, None);
+        unit_rows.push((unit_id, fixture.path.clone(), fixture.files.clone()));
         conn.execute(
             "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 10485760)",
             rusqlite::params![snapshot_id],
@@ -418,6 +433,11 @@ fn build_sealed_harness_from(
             unit_uuid,
             tenant_id: tenant.tenant_id,
             file_names: fixture.files.iter().map(|(n, _)| n.clone()).collect(),
+            file_hashes: fixture
+                .files
+                .iter()
+                .map(|(n, _)| sha256_hex(&std::fs::read(fixture.path.join(n)).unwrap()))
+                .collect(),
             plaintext,
             sha256_plain: sha_plain,
         });
@@ -437,7 +457,7 @@ fn build_sealed_harness_from(
         )
         .unwrap();
         let hist_volume = conn.last_insert_rowid();
-        let (unit_id, files) = &unit_rows[which];
+        let (unit_id, fixture_dir, files) = &unit_rows[which];
         conn.execute(
             "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
              VALUES (?1, 2, 'current', '/hist', ?2, 1)",
@@ -448,6 +468,7 @@ fn build_sealed_harness_from(
         insert_paths(
             &conn,
             hist_snapshot,
+            fixture_dir,
             files,
             Some(("history-only.dat", 4242)),
         );
@@ -2154,6 +2175,23 @@ fn a_tenants_paths_cover_every_listed_version() {
         let mut want: Vec<&str> = u.file_names.iter().map(String::as_str).collect();
         want.sort_unstable();
         assert_eq!(v1, want, "{} v1: sorted, every file, once", u.unit_name);
+        // Item 103: a regular file's row carries its recorded sha256, 64
+        // lowercase hex characters, equal to the staged file's own hash.
+        for (name, hash) in u.file_names.iter().zip(&u.file_hashes) {
+            let row = rows
+                .iter()
+                .find(|r| r.unit == u.unit_name && r.version == 1 && &r.path == name)
+                .unwrap();
+            assert_eq!(&row.sha256, hash, "{} v1 {name}", u.unit_name);
+            assert_eq!(row.sha256.len(), 64, "{name}: hex, not a prefix");
+            assert!(
+                row.sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "{name}: lowercase hex: {}",
+                row.sha256
+            );
+        }
         let v2: Vec<&str> = rows
             .iter()
             .filter(|r| r.unit == u.unit_name && r.version == 2)
@@ -2172,6 +2210,14 @@ fn a_tenants_paths_cover_every_listed_version() {
         }
     }
     assert!(rows.iter().all(|r| r.kind == "f"));
+    // A path with no hash recorded states none (the column is empty, not a
+    // placeholder), and the control: it is the only such path.
+    let unhashed: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.sha256.is_empty())
+        .map(|r| r.path.as_str())
+        .collect();
+    assert_eq!(unhashed, vec!["history-only.dat"]);
 }
 
 /// The index reaches the leak scan's three claims at once: it is in the

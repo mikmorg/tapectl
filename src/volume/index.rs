@@ -11,7 +11,9 @@
 //!   every tenant's, with a leading `tenant` column. The rows and who holds
 //!   them are [`coverage::index_versions`]'s.
 //! - **`index/paths.tsv`**, tenant envelopes only: one row per path of each
-//!   version listed in that tenant's `units.tsv`.
+//!   version listed in that tenant's `units.tsv`, with a regular file's
+//!   recorded sha256 (1.3.0, ADR-0012 item 103: RESTORE.sh checks every file
+//!   it restores against it).
 //!
 //! **Built in the tapectl home's work dir, never under staging** (ADR-0012
 //! 2026-10-06 item 4): it is every path of the archive in plaintext, until
@@ -58,10 +60,24 @@ pub const UNITS_COLUMNS: [&str; 13] = [
     "sealed_at",
 ];
 
-/// `paths.tsv`'s columns (§1.5).
-pub const PATHS_COLUMNS: [&str; 5] = ["unit", "version", "kind", "size_bytes", "path"];
+/// `paths.tsv`'s columns (§1.5). `sha256` is the file's recorded content hash
+/// (ADR-0012 item 103: RESTORE.sh checks every restored regular file against
+/// it); empty where none is recorded and for anything but a regular file.
+pub const PATHS_COLUMNS: [&str; 6] = ["unit", "version", "kind", "size_bytes", "sha256", "path"];
 
 // ── escaping ──
+
+/// `bytes` as lowercase hex (a `sha256` column: 64 characters for 32 bytes).
+fn write_hex<W: Write + ?Sized>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    debug_assert!(bytes.len() * 2 <= out.len());
+    for (i, b) in bytes.iter().enumerate() {
+        out[2 * i] = DIGITS[(b >> 4) as usize];
+        out[2 * i + 1] = DIGITS[(b & 15) as usize];
+    }
+    w.write_all(&out[..bytes.len() * 2])
+}
 
 /// Write `field` with the four escapes (§1.5): backslash as `\\`, TAB as
 /// `\t`, LF as `\n`, CR as `\r`, and nothing else. All four are ASCII, so a
@@ -243,7 +259,7 @@ struct ListedVersion<'a> {
 /// the outer loop, so SQLite needs no sorter, and a sorter is what it would
 /// spill to a temporary file outside the tapectl home, in plaintext, for a
 /// version of any size. [`write_paths`] checks the order anyway.
-const VERSION_PATHS_SQL: &str = "SELECT fv.kind, fv.size_bytes, p.path
+const VERSION_PATHS_SQL: &str = "SELECT fv.kind, fv.size_bytes, p.path, fv.sha256
      FROM paths p CROSS JOIN file_versions fv
           ON fv.snapshot_id = ?1 AND fv.path_id = p.id
      WHERE p.unit_id = ?2
@@ -271,6 +287,14 @@ fn write_paths<W: Write + ?Sized>(
             let path = row.get_ref(2)?.as_str().map_err(|e| {
                 TapectlError::Other(format!("cross-volume index: a path is not text: {e}"))
             })?;
+            // Only a regular file states a hash (§1.5): whatever the column
+            // holds for a directory, a symlink or a special file is not a
+            // content claim the format makes. The column's CHECK admits NULL
+            // or 32 bytes.
+            let sha256 = match (kind, row.get_ref(3)?) {
+                ('f', rusqlite::types::ValueRef::Blob(b)) if b.len() == 32 => Some(b),
+                _ => None,
+            };
             // The contract is a bytewise order (§1.5); a plan that stopped
             // delivering it must fail here, not write an unsorted file.
             if !first && previous.as_str() >= path {
@@ -285,6 +309,10 @@ fn write_paths<W: Write + ?Sized>(
             previous.push_str(path);
             w.write_all(unit.as_bytes())?;
             write!(w, "\t{}\t{kind}\t{size}\t", v.version)?;
+            if let Some(hash) = sha256 {
+                write_hex(w, hash)?;
+            }
+            w.write_all(b"\t")?;
             write_escaped(w, path)?;
             w.write_all(b"\n")?;
         }
@@ -512,6 +540,10 @@ pub struct PathsRow {
     /// `d`, `f`, `l` or `s`, as written.
     pub kind: String,
     pub size_bytes: Option<i64>,
+    /// The file's recorded content hash, 64 lowercase hex characters; empty
+    /// for a directory, a symlink, a special file, an older writer's tape
+    /// (the column is new in 1.3.0) or where none was recorded.
+    pub sha256: String,
     pub path: String,
 }
 
@@ -636,6 +668,7 @@ pub fn parse_paths(text: &str) -> Result<Vec<PathsRow>> {
             })?,
             kind: text_of("kind"),
             size_bytes: int_field(FILE, n, "size_bytes", &text_of("size_bytes"))?,
+            sha256: text_of("sha256"),
             path: text_of("path"),
         });
     }
@@ -711,7 +744,7 @@ mod tests {
         );
         assert_eq!(
             PATHS_COLUMNS.join("\t"),
-            "unit\tversion\tkind\tsize_bytes\tpath"
+            "unit\tversion\tkind\tsize_bytes\tsha256\tpath"
         );
         let mut operator = Vec::new();
         write_header(&mut operator, &UNITS_COLUMNS, Some("tenant")).unwrap();
@@ -889,21 +922,37 @@ mod tests {
 
     #[test]
     fn paths_round_trip_through_the_parser() {
-        let text = "unit\tversion\tkind\tsize_bytes\tpath\n\
-                    docs\t1\td\t0\tsub\n\
-                    docs\t1\tf\t12\tsub/a\\tb\\nc\\\\d\n\
-                    docs\t1\tl\t9\tsub/link\n";
-        let rows = parse_paths(text).unwrap();
+        let hash = "ab".repeat(32);
+        let text = format!(
+            "unit\tversion\tkind\tsize_bytes\tsha256\tpath\n\
+             docs\t1\td\t0\t\tsub\n\
+             docs\t1\tf\t12\t{hash}\tsub/a\\tb\\nc\\\\d\n\
+             docs\t1\tl\t9\t\tsub/link\n"
+        );
+        let rows = parse_paths(&text).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1].path, "sub/a\tb\nc\\d");
         assert_eq!(rows[1].kind, "f");
         assert_eq!(rows[1].size_bytes, Some(12));
+        assert_eq!(rows[1].sha256, hash);
+        assert_eq!(rows[0].sha256, "");
         assert_eq!(rows[2].kind, "l");
+        // A tape written before 1.3.0 has no such column: the parser reads it
+        // as "not recorded", it does not refuse the file.
+        let old = parse_paths("unit\tversion\tkind\tsize_bytes\tpath\ndocs\t1\tf\t3\ta\n").unwrap();
+        assert_eq!(old[0].sha256, "");
+        assert_eq!(old[0].path, "a");
     }
     // ── over a catalog ──
 
+    use crate::db::files::fixture::set_sha256;
     use crate::db::files::FileKind::{Dir, Regular, Special, Symlink};
     use crate::policy::coverage::tests::{IndexCatalog, THIS};
+
+    /// A recorded content hash: 64 lowercase hex characters, `n` repeated.
+    fn hash(n: u8) -> String {
+        format!("{n:02x}").repeat(32)
+    }
 
     /// alpha's `photos` (v1 on L6-0001, v2 carried by this write) and a
     /// second alpha unit `notes` carried by this write (its stage sets are the
@@ -926,6 +975,7 @@ mod tests {
         let (s1, p1) = c.version(photos, 1, "current", &[1000]);
         c.write(p1, l1, "completed");
         c.paths(s1, &[("a.jpg", Regular, 10), ("album", Dir, 0)]);
+        set_sha256(&c.conn, s1, "a.jpg", Some(&hash(0xa1)));
         let (s2, p2) = c.version(photos, 2, "staged", &[2000, 500]);
         c.paths(
             s2,
@@ -936,11 +986,15 @@ mod tests {
                 ("link", Symlink, 5),
             ],
         );
+        set_sha256(&c.conn, s2, "a.jpg", Some(&hash(0xa2)));
+        // `album/b.jpg` has none recorded: the column stays empty.
         let (sn, pn) = c.version(notes, 1, "staged", &[7]);
         c.paths(sn, &[("todo.txt", Regular, 7), ("pipe", Special, 0)]);
+        set_sha256(&c.conn, sn, "todo.txt", Some(&hash(0xb1)));
         let (sd, pd) = c.version(docs, 1, "current", &[300]);
         c.write(pd, l2, "completed");
         c.paths(sd, &[("secret-bravo-report.pdf", Regular, 300)]);
+        set_sha256(&c.conn, sd, "secret-bravo-report.pdf", Some(&hash(0xee)));
         (c, vec![p2, pn])
     }
 
@@ -1030,26 +1084,42 @@ mod tests {
         // sorted by unit, version, then path.
         let paths = read(&files.tenants[&alpha].paths);
         assert_eq!(paths.lines().next().unwrap(), PATHS_COLUMNS.join("\t"));
-        let rows: Vec<(String, i64, String, i64, String)> = parse_paths(&paths)
+        let rows: Vec<(String, i64, String, i64, String, String)> = parse_paths(&paths)
             .unwrap()
             .into_iter()
-            .map(|r| (r.unit, r.version, r.kind, r.size_bytes.unwrap(), r.path))
+            .map(|r| {
+                (
+                    r.unit,
+                    r.version,
+                    r.kind,
+                    r.size_bytes.unwrap(),
+                    r.sha256,
+                    r.path,
+                )
+            })
             .collect();
-        let p = |u: &str, v: i64, k: &str, n: i64, path: &str| {
-            (u.to_string(), v, k.to_string(), n, path.to_string())
+        let p = |u: &str, v: i64, k: &str, n: i64, sha: String, path: &str| {
+            (u.to_string(), v, k.to_string(), n, sha, path.to_string())
         };
+        let none = String::new;
         assert_eq!(
             rows,
             vec![
-                p("notes", 1, "s", 0, "pipe"),
-                p("notes", 1, "f", 7, "todo.txt"),
-                p("photos", 1, "f", 10, "a.jpg"),
-                p("photos", 1, "d", 0, "album"),
-                p("photos", 2, "f", 11, "a.jpg"),
-                p("photos", 2, "d", 0, "album"),
-                p("photos", 2, "f", 12, "album/b.jpg"),
-                p("photos", 2, "l", 5, "link"),
+                p("notes", 1, "s", 0, none(), "pipe"),
+                p("notes", 1, "f", 7, hash(0xb1), "todo.txt"),
+                p("photos", 1, "f", 10, hash(0xa1), "a.jpg"),
+                p("photos", 1, "d", 0, none(), "album"),
+                p("photos", 2, "f", 11, hash(0xa2), "a.jpg"),
+                p("photos", 2, "d", 0, none(), "album"),
+                p("photos", 2, "f", 12, none(), "album/b.jpg"),
+                p("photos", 2, "l", 5, none(), "link"),
             ]
+        );
+        // The file's own line, as the format spells it: the hash sits between
+        // the size and the path.
+        assert!(
+            paths.contains(&format!("\nnotes\t1\tf\t7\t{}\ttodo.txt\n", hash(0xb1))),
+            "{paths}"
         );
     }
 
@@ -1081,6 +1151,7 @@ mod tests {
 
         // alpha's two files name none of bravo's: its unit, its file, the
         // volume only bravo's data is on.
+        let bravo_hash = hash(0xee);
         for text in [
             read(&files.tenants[&alpha].units),
             read(&files.tenants[&alpha].paths),
@@ -1091,6 +1162,7 @@ mod tests {
                 "L6-0002",
                 "uuid-L6-0002",
                 "bravo",
+                bravo_hash.as_str(),
             ] {
                 assert!(
                     !text.contains(forbidden),
@@ -1107,6 +1179,26 @@ mod tests {
             );
         }
         assert!(!op.contains("secret-bravo-report.pdf") && !op.contains("a.jpg"));
+        // Nor does it carry any file's hash: a content claim is the tenant's.
+        for h in [hash(0xa1), hash(0xa2), hash(0xb1), hash(0xee)] {
+            assert!(!op.contains(&h), "a file hash in the operator map:\n{op}");
+        }
+        // Positive control: bravo's hash is in bravo's own paths.tsv.
+        let bravo_dir = tempfile::tempdir().unwrap();
+        let docs_set: i64 = c
+            .conn
+            .query_row(
+                "SELECT ss.id FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+                 JOIN units u ON u.id = s.unit_id WHERE u.name = 'docs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let bravo_files = generate_to(bravo_dir.path(), &c, &[docs_set]);
+        assert!(
+            read(&bravo_files.tenants[&bravo].paths).contains(&bravo_hash),
+            "bravo's own index lists its hash"
+        );
     }
 
     #[test]
@@ -1184,20 +1276,65 @@ mod tests {
         let entries: Vec<(&str, crate::db::files::FileKind, i64)> =
             names.iter().map(|n| (*n, Regular, 1)).collect();
         c.paths(snap, &entries);
+        // Each name's own hash, so a row that lost its path's escapes would
+        // carry another file's.
+        for (i, n) in names.iter().enumerate() {
+            set_sha256(&c.conn, snap, n, Some(&hash(i as u8 + 1)));
+        }
         let dir = tempfile::tempdir().unwrap();
         let files = generate_to(dir.path(), &c, &[ss]);
         let text = read(&files.tenants[&c.tenant("alpha")].paths);
         // One line per path plus the header, whatever the names hold.
         assert_eq!(text.matches('\n').count(), names.len() + 1);
-        let got: Vec<String> = parse_paths(&text)
-            .unwrap()
-            .into_iter()
-            .map(|r| r.path)
-            .collect();
+        let parsed = parse_paths(&text).unwrap();
+        let got: Vec<String> = parsed.iter().map(|r| r.path.clone()).collect();
         let mut want: Vec<String> = names.iter().map(|n| n.to_string()).collect();
         want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         assert_eq!(got, want);
+        for r in &parsed {
+            let i = names.iter().position(|n| *n == r.path).unwrap();
+            assert_eq!(r.sha256, hash(i as u8 + 1), "{:?}", r.path);
+        }
         assert_eq!(parse_paths(&text).unwrap()[0].unit, "odd/unit\tname");
+    }
+
+    #[test]
+    fn only_a_regular_file_states_a_hash() {
+        // The format says empty for a directory, a symlink and a special
+        // file (section 1.5). A catalog that holds a hash on one anyway (the
+        // column does not forbid it) is not repeated into the index.
+        let c = IndexCatalog::new();
+        let u = c.unit("alpha", "mixed");
+        let (snap, ss) = c.version(u, 1, "staged", &[1]);
+        c.paths(
+            snap,
+            &[
+                ("dir", Dir, 0),
+                ("file", Regular, 5),
+                ("link", Symlink, 4),
+                ("nohash", Regular, 6),
+                ("pipe", Special, 0),
+            ],
+        );
+        for n in ["dir", "file", "link", "pipe"] {
+            set_sha256(&c.conn, snap, n, Some(&hash(0x5c)));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let files = generate_to(dir.path(), &c, &[ss]);
+        let text = read(&files.tenants[&c.tenant("alpha")].paths);
+        let by_path: BTreeMap<String, (String, String)> = parse_paths(&text)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.path, (r.kind, r.sha256)))
+            .collect();
+        let kv = |k: &str, h: String| (k.to_string(), h);
+        assert_eq!(by_path["file"], kv("f", hash(0x5c)), "positive control");
+        assert_eq!(by_path["nohash"], kv("f", String::new()));
+        assert_eq!(by_path["dir"], kv("d", String::new()));
+        assert_eq!(by_path["link"], kv("l", String::new()));
+        assert_eq!(by_path["pipe"], kv("s", String::new()));
+        // The row, byte for byte: six fields, the fifth empty.
+        assert!(text.contains("\nmixed\t1\td\t0\t\tdir\n"), "{text}");
     }
 
     #[test]
