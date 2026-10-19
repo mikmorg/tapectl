@@ -140,9 +140,10 @@ file beside it.
   `enospc_buffer`, and an archive set's `slice_size`. `K`, `M`, `G` and `T` (or
   `KB`…`TB`, in any case) mean powers of 1024. A bare number is bytes, and decimals
   such as `1.5G` are allowed. `GiB`-style suffixes are **not** accepted.
-- *Cartridge capacities* are **decimal**, as printed on the cartridge:
-  `capacity_override`. `K`…`T` mean powers of 1000, so `2.5T` is 2,500,000,000,000
-  bytes.
+- *Cartridge capacities and measured tape room* are **decimal**, as printed on the
+  cartridge and as log page 0x0c states them: `capacity_override` and
+  `post_warning_bytes`. `K`…`T` mean powers of 1000, so `2.5T` is 2,500,000,000,000
+  bytes and `99008M` is 99,008,000,000.
 
 **Adding array tables by hand.** Append `[[archive_sets]]`, `[[collections]]` and
 `[[backends.lto]]` tables to the end of the file. A `config.toml` written by this
@@ -333,6 +334,7 @@ tapectl config check
 | `generation` | string | *required* | The generation the drive natively writes, such as `"LTO-6"` or `"LTO-8"`. `LTO-5`, `L5` and `lto5` are all accepted. `"LTO-7-M8"` is refused here: it is a cartridge format, and the drive that writes it declares `LTO-8`. |
 | `capacity_override` | size (**decimal**) | unset | **Virtual drives only** (mhvtl, test harnesses). It overrides the capacity for every cartridge this drive touches. A real drive gets its capacity from the loaded cartridge's detected generation, so leave this unset. `config check` warns whenever it is set. |
 | `fill_ceiling` | float | `0.97` | The **fill ceiling**: the fraction of a cartridge's capacity a write may fill, above 0 and at most 1. The pre-write capacity check of every write refuses a layout above it and says by how much; planning sizes tapes with it. `--fill-ceiling` on `volume write`, `volume plan`, `collection plan` and `collection run` overrides it for one command (`0.99` or `99%`). It was called `usable_capacity_factor` (default `0.92`) until issue #391; a config that still uses that name is refused, naming the new key. Each completed write records the capacity it used (a `write_capacity_used` event in `report events`), so the ceiling can be tuned from what writes really take. |
+| `post_warning_bytes` | size (**decimal**) | unset | The room, measured by `scripts/lto-profile.sh`, from this drive's early warning to the hard end of the medium: the lower of the walk it makes to the hard end and the drive's own page 0x0c figure ("minimum native capacity from EW to EOP"). With it set on any drive, a slice plus the seal must fit in **half of the smallest such room** (ADR-0012 item 100): `config check` reports a `[defaults]` or archive-set `slice_size` that does not as an `error:` line and exits non-zero, `config set` refuses an edit that breaks it, and `stage create` refuses the slice size in force for the unit, naming the key, the drive and the numbers. Every other command still loads the file. Above zero. Absent means nothing is checked. See [`docs/lto-profiling.md`](lto-profiling.md). |
 | `enospc_buffer` | size (binary) | `"50M"` | Headroom kept free before end of tape. The pre-write capacity check reserves it, and `collection plan` and `collection run` subtract it from each tape's budget. |
 
 Which commands read which keys:
@@ -377,6 +379,9 @@ Which commands read which keys:
 - **`enospc_buffer`** is read by the pre-write capacity check of `volume write` (so
   also `volume compact-write`, `volume compact`, `collection run` and
   `quick-archive`), and by `collection plan` and `collection run` budgeting.
+- **`post_warning_bytes`** is read by `config check`, `config set` and `stage create`, to refuse a
+  `slice_size` whose slice plus the seal does not fit in half the room. It sets nothing else, and
+  `Config::load` (every other command) does not refuse on it.
 
 ### `[[archive_sets]]`
 
@@ -694,6 +699,7 @@ device_tape = "/dev/tape/by-id/scsi-<SERIAL>-nst"
 device_sg = "/dev/sg1"
 generation = "LTO-6"
 fill_ceiling = 0.97
+# post_warning_bytes = "99008M"   # measured by scripts/lto-profile.sh; absent = nothing is checked
 enospc_buffer = "50M"
 
 # Policies. These take effect after `tapectl archive-set sync`.
@@ -1036,7 +1042,8 @@ How to read it:
 
 | Line | Meaning |
 |---|---|
-| `config: valid` / `config: INVALID` followed by `- …` lines | Whether every other command can load the file. This is the **only** line that sets the exit code: **0** when valid, **2** when invalid. |
+| `config: valid` / `config: INVALID` followed by `- …` lines | Whether every other command can load the file. With the slice cap's `error:` line below, it is what sets the exit code: **0** when valid, **2** when invalid. |
+| `error: … defaults.slice_size = … is too large for backends.lto["…"].post_warning_bytes = …` (after `config: valid`) | The file loads and every command runs, but a `slice_size` cannot be sealed after the drive's early warning (ADR-0012 item 100); `config check` exits non-zero. The line names the largest `slice_size` that fits; lower it (`config set defaults.slice_size 512M`) or correct a mis-measured `post_warning_bytes`. `stage create` and `config set` refuse the same value. |
 | `dar: …` | The dar binary was found, and its version meets the minimum. Otherwise you get a warning saying why not. |
 | `staging: …` | The staging directory exists and is writable. |
 | `warning: staging … has N GB free; one LTO-6 cartridge is up to 2.5 TB — a tape filled in one session will not fit …` | Staging is smaller than one cartridge of the configured drive's generation, so you cannot stage a full tape's worth before a write. `stage create` checks each unit before it runs dar: it refuses when the space is certainly too small, and asks when it may be (see [`[staging]`](#staging)). A stage can run out of space partway only if you answer yes, or pass `--yes`, at that question. |

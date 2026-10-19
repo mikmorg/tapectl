@@ -191,6 +191,8 @@ device_tape = "/dev/tape/by-id/scsi-XXXXXXXX-nst"   # by-id: /dev/nstN moves acr
 # device_sg = "/dev/sg1"    # optional: derived from device_tape when absent (#431)
 generation = "LTO-6"        # what the DRIVE is, not what you feed it
 # capacity_override = "2400M"   # virtual drives and test harnesses only
+# fill_ceiling = 0.97           # measured values come from scripts/lto-profile.sh (docs/lto-profiling.md)
+# post_warning_bytes = "99008M" # measured room past early warning; caps slice_size
 
 [staging]
 directory = "/mnt/staging"  # Peak need: one unit's encrypted slices (no plaintext is written here)
@@ -2136,6 +2138,13 @@ pid and command, nothing sent to the drive. Once it has the drive it holds the d
 until it exits. An empty drive is not an error (exit 0, nothing recorded); a cartridge in a
 drive that is not ready is refused (exit 2). It needs a configured backend; without one
 `mt -f <device> offline` still works and the catalog is not told.
+
+#### Profiling a drive
+
+To measure a new drive model, firmware or cartridge generation and get its `[[backends.lto]]`
+block, use `scripts/lto-profile.sh` on a test cartridge (it erases it); see
+[Profiling an LTO drive](lto-profiling.md). Stop `tapectl-drive-poll.timer` first; the script
+refuses while it is active.
 
 #### Cleaning the drive
 

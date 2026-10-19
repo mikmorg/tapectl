@@ -382,14 +382,16 @@ source, was 1.7x) and a write's feed ratio with and without vm-desk1 busy (#432)
 None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369, #371,
 #393, #416 and #425 closed between 2026-10-13 and 2026-10-15):
 - **#420:** the short seal. Its measurement is yours to run on home2 with the test cartridge:
-  `scripts/lto6-fill.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst
+  `scripts/lto-profile.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst
   --i-will-lose-the-cartridge EW7VWMVKF6` from a separate worktree of master (about 5 h; it walks
-  past early warning to the hard end, ADR-0012 item 100; `docs/lto6-validation-checklist.md`
-  "Past the early warning"). Send back its run directory. The short seal is then a CTO-ruled
+  past early warning to the hard end, ADR-0012 item 100; `docs/lto-profiling.md`). The old
+  `scripts/lto6-fill.sh` still works as a wrapper. Send back its run directory
+  (`profile-<stamp>-<serial>/`, the fill's files in `fill/`); `--emit` on it prints the drive's
+  `[[backends.lto]]` block. The short seal is then a CTO-ruled
   on-tape change with its own re-pin; item 99 makes every write fill to early warning with it.
 - **#478, spanning:** designed and ruled (ADR-0012 items 76-77, 82-100), built right after #420.
-- **#479, the profiling toolkit:** a script that measures a drive and emits its
-  `[[backends.lto]]` block (items 96-98, 100); built next, its real-drive run is yours.
+- **#479, the profiling toolkit:** built in 1.4.0: `scripts/lto-profile.sh` and
+  `docs/lto-profiling.md`; its real-drive run is the same run as #420's.
 - **Shipped in 1.3.0:** #418 R4 (the cross-volume index), #476, #477 (File 1), #480 (restore
   repairs, slice replacement and the heir's per-file sha256 check). #409 closed 2026-10-17 as an
   accepted cost (item 91).

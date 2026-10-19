@@ -634,7 +634,7 @@ warns `another process has held this drive's lock` and carries on, so a second
 command still meets the kernel's "busy". The file `/tmp/tapectl-tape.lock`
 belongs to the test harnesses (`scripts/mhvtl-verify-gate.sh`,
 `scripts/lifecycle-suite.sh`, `scripts/lto6-measure.sh`,
-`scripts/lto6-fill.sh`) and to `first-run.sh` step 13 (the step-12 rehearsal
+`scripts/lto6-fill.sh`, `scripts/lto-profile.sh`) and to `first-run.sh` step 13 (the step-12 rehearsal
 takes it through `lifecycle-suite.sh`); a plain `tapectl` command neither
 takes nor checks it. The
 [operator guide](operator-guide.md#a-quiet-host-while-the-tape-runs) asks you
