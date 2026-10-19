@@ -213,3 +213,41 @@ fn a_catalog_with_no_recorded_ratio_prints_no_block_and_an_empty_array() {
         serde_json::json!([])
     );
 }
+
+/// `report events --json` carries each event's `details`, parsed when it is
+/// JSON: what a command recorded beyond field/old/new (`volume rewrite`'s
+/// window in which staging holds the only copy, a feed ratio's assessment)
+/// is otherwise readable only from the database.
+#[test]
+fn report_events_json_carries_each_events_details() {
+    let home = seeded_home();
+    let ev = json(
+        home.path(),
+        &["report", "events", "--entity", "volume", "--json"],
+    );
+    let rows = ev.as_array().expect("an array of events");
+    let ratios: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|r| r["action"] == EVENT_ACTION)
+        .collect();
+    assert_eq!(ratios.len(), 3, "{ev:#}");
+    for r in ratios {
+        assert!(r["details"].is_object(), "details parsed as JSON: {r:#}");
+    }
+    let conn = rusqlite::Connection::open(home.path().join("tapectl.db")).unwrap();
+    let stored: String = conn
+        .query_row(
+            "SELECT details FROM events WHERE action = ?1 AND entity_label = 'L6-BAD'",
+            [EVENT_ACTION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let bad = rows
+        .iter()
+        .find(|r| r["entity_label"] == "L6-BAD")
+        .expect("L6-BAD's event");
+    assert_eq!(
+        bad["details"],
+        serde_json::from_str::<serde_json::Value>(&stored).unwrap()
+    );
+}

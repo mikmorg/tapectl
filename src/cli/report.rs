@@ -2751,7 +2751,7 @@ fn report_events(
     json_output: bool,
 ) -> Result<()> {
     let mut sql = String::from(
-        "SELECT timestamp, entity_type, entity_label, action, field, old_value, new_value
+        "SELECT timestamp, entity_type, entity_label, action, field, old_value, new_value, details
          FROM events WHERE 1=1",
     );
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -2775,6 +2775,7 @@ fn report_events(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     );
     let rows: Vec<Row> = stmt
         .query_map(params_ref.as_slice(), |row| {
@@ -2786,19 +2787,27 @@ fn report_events(
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if json_output {
-        let json: Vec<serde_json::Value> = rows.iter().map(|(ts, etype, label, action, field, old, new)| {
-            serde_json::json!({"timestamp": ts, "entity_type": etype, "entity_label": label, "action": action, "field": field, "old_value": old, "new_value": new})
+        // `details` is the event's own record (`volume rewrite` names the
+        // window in which staging holds the only copy there): JSON when it
+        // was written as JSON, else the text as stored.
+        let json: Vec<serde_json::Value> = rows.iter().map(|(ts, etype, label, action, field, old, new, details)| {
+            let details = details.as_deref().map(|d| {
+                serde_json::from_str::<serde_json::Value>(d)
+                    .unwrap_or_else(|_| serde_json::Value::String(d.to_string()))
+            });
+            serde_json::json!({"timestamp": ts, "entity_type": etype, "entity_label": label, "action": action, "field": field, "old_value": old, "new_value": new, "details": details})
         }).collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if rows.is_empty() {
         println!("no events found");
     } else {
-        for (ts, etype, label, action, field, old, new) in &rows {
+        for (ts, etype, label, action, field, old, new, _details) in &rows {
             println!(
                 "  {}",
                 event_line(

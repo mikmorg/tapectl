@@ -7778,7 +7778,7 @@ fn file_1_says_how_to_tell_a_compressed_unit_and_it_works() {
     let disk = guide_section(&guide, "Disk space");
     let f = flat(&disk);
     for needle in [
-        "up to about TWICE a unit's size",
+        "need more room, for a unit's slices beside its restored files",
         "Doing it by hand (\"Manual Recovery Steps\") is the same",
         "For a whole box, the destination needs the sum of the sizes of the units you restore",
         "**Compressed units.**",
