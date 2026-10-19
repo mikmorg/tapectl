@@ -1201,14 +1201,16 @@ impl<'c, 's, 'b> Supply<'c, 's, 'b> {
                          expects",
                         described(&cause).unwrap_or_else(|| format!("slice {}", wp.slice_number)),
                     );
-                    return Ok(self.record_damage(wp, label, reason, out.holes.clone()));
+                    self.record_damage(wp, label, reason, out.holes.clone());
+                    return Ok(());
                 }
                 Proof::Unproven(why) => {
                     let reason = format!(
                         "{}; every chunk authenticates, but {why}",
                         described(&cause).unwrap_or_else(|| format!("slice {}", wp.slice_number)),
                     );
-                    return Ok(self.record_damage(wp, label, reason, Vec::new()));
+                    self.record_damage(wp, label, reason, Vec::new());
+                    return Ok(());
                 }
             }
         }
