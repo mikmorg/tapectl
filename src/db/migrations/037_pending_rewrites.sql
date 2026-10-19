@@ -62,6 +62,9 @@ CREATE TABLE pending_rewrites (
     -- `typed_flag` (`--only-copy-on-staging`, matching it).
     consent           TEXT NOT NULL
                       CHECK(consent IN ('copies_elsewhere', 'typed_label', 'typed_flag')),
+    -- `--with-staged`: the write carries whatever else is staged beside the
+    -- rewrite's own sets. Kept so `--resume` writes what the first run meant.
+    with_staged       INTEGER NOT NULL DEFAULT 0 CHECK(with_staged IN (0, 1)),
     -- How far the command got. `staged`: the slices are staged and verified
     -- and nothing destructive has happened. `retired`: the source is retired.
     -- `erased`: its cartridge is erased (the window is open). `initialized`:

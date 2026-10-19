@@ -1,0 +1,84 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH tapectl-volume-rewrite 1  "tapectl-volume-rewrite " 
+.SH NAME
+tapectl\-volume\-rewrite \- Compact a volume IN PLACE, on its own cartridge (stage, retire, erase, write back)
+.SH SYNOPSIS
+\fBtapectl volume rewrite\fR [\fB\-\-json\fR] [\fB\-\-label\fR] [\fB\-\-dry\-run\fR] [\fB\-\-resume\fR] [\fB\-\-only\-copy\-on\-staging\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-\-device\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-allow\-missing\-escrow\fR] [\fB\-y\fR|\fB\-\-yes\fR] [\fB\-\-config\fR] [\fB\-\-prewrite\-hash\fR] [\fB\-\-fill\-ceiling\fR] [\fB\-\-home\fR] [\fB\-\-with\-staged\fR] [\fB\-\-keep\-staging\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fISOURCE\fR] 
+.SH DESCRIPTION
+Compact a volume IN PLACE, on its own cartridge (stage, retire, erase, write back)
+.PP
+Reads the live slices into staging, retires the volume, erases its cartridge and writes the slices back to the same cartridge as a new volume. One drive (`\-\-device`), the source loaded. The space held by reclaimable and purged versions is freed without a second cartridge, even when the volume holds the only copy of a unit. In order:
+.PP
+1. Checks that need no tape: the source is sealed and trusted, `\-\-label` is free, the cartridge carries no other live volume, the drive can write its generation, the live data fits one tape, and staging has room for it. A consent the run could never be given is refused here, before anything is read.
+.PP
+2. The live slices are read into staging (`compact\-read`\*(Aqs read), then each is read back from the staging disk and matched against its recorded hash. A mismatch refuses, the source untouched.
+.PP
+3. Consent. If every live slice has a copy on another sealed volume, the usual Tier\-2 prompt for a version left below its policy (a terminal asks; the global `\-\-yes` confirms in advance; no terminal and no `\-\-yes` refuses). If some live slice has NO copy anywhere else, the retire family\*(Aqs zero floor is amended for this command alone: the units and versions, the staging path and the window are shown, and the source\*(Aqs label must be typed at a terminal, or given as `\-\-only\-copy\-on\-staging LABEL` for an unattended run. `\-\-yes` does not give it. Every other way to retire a volume keeps its absolute floor.
+.PP
+4. The source is retired, its cartridge erased (`cartridge erase`\*(Aqs own checks), `NEW` initialised on it, the staged slices written with the FULL confirm (every file read back), and only then is staging released.
+.PP
+From the erase until `NEW` passes that readback the staging disk may hold the ONLY copy of some units. That window is named in the events and the session log. If the command stops in it, the staged slices stay staged and nothing releases them (`staging clean \-\-force` included); the error names the command that finishes the job: `volume rewrite \-\-resume NEW`.
+.PP
+`\-\-dry\-run` runs the checks of step 1 and shows the plan and the consent it would need, touching nothing.
+.PP
+Exit status: `volume write`\*(Aqs (0 sealed and confirmed, 2 refused with the tape untouched, 3 confirm inconclusive, 4 stopped after the tape was touched and resumable, 5 aborted, 6 quarantined, 75 catalog busy).
+.SH OPTIONS
+.TP
+\fB\-\-json\fR
+Output in JSON format
+.TP
+\fB\-\-label\fR \fI<NEW>\fR
+The label of the NEW volume that will carry the slices on the same cartridge (not with \-\-resume)
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done without making changes. Commands that cannot preview refuse the flag rather than ignore it
+.TP
+\fB\-\-resume\fR \fI<NEW>\fR
+Finish the rewrite that was to write NEW and stopped: erase, init and write from wherever the catalog says it stopped, then lift the hold on the staged slices once NEW has passed a full readback
+.TP
+\fB\-\-only\-copy\-on\-staging\fR \fI<SOURCE_LABEL>\fR
+Consent, for an unattended run, to rewriting a volume that holds the only copy of some unit: the SOURCE volume\*(Aqs label, exactly. A different label refuses. `\-\-yes` does not give this consent
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Enable verbose output
+.TP
+\fB\-\-device\fR \fI<DEVICE>\fR
+Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+No live progress on stderr. Long operations (stage create, volume write/resume/verify/read\-slices, restore) still write their session log under <home>/logs/
+.TP
+\fB\-\-allow\-missing\-escrow\fR
+See `volume write \-\-allow\-missing\-escrow`
+.TP
+\fB\-y\fR, \fB\-\-yes\fR
+Skip ADR\-0008 Tier\-2 confirmation prompts. It never reaches a Tier\-3 refusal — those are facts, not risks to accept
+.TP
+\fB\-\-config\fR \fI<CONFIG>\fR
+Path to config file.
+
+NOTE: on its own this ALSO relocates the whole tapectl home to the config file\*(Aqs parent directory — database, keys, staging, stage reports. That is how every test harness gets an isolated home, so it still works, but it is surprising enough that it now warns. Use \-\-home when you mean "operate on a different archive", and \-\-config only to point at a config file inside that home.
+.TP
+\fB\-\-prewrite\-hash\fR
+See `volume write \-\-prewrite\-hash`
+.TP
+\fB\-\-fill\-ceiling\fR \fI<FILL_CEILING>\fR
+See `volume write \-\-fill\-ceiling`: this command only
+.TP
+\fB\-\-home\fR \fI<HOME>\fR
+tapectl home directory: database, keys, catalogs, stage\-reports, logs.
+
+Defaults to ~/.tapectl. The config file is taken from <home>/config.toml unless \-\-config overrides it. Also settable as TAPECTL_HOME.
+.TP
+\fB\-\-with\-staged\fR
+Write whatever else is staged beside the rewrite\*(Aqs slices. Without it the new volume carries the rewrite\*(Aqs slices and nothing else
+.TP
+\fB\-\-keep\-staging\fR
+Release nothing from staging after the full readback
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+[\fISOURCE\fR]
+Source volume label (not with \-\-resume)

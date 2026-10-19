@@ -521,38 +521,38 @@ pub enum VolumeCommands {
         force: bool,
     },
 
-    /// Compact a volume IN PLACE: read its live slices into staging, retire
-    /// it, erase its cartridge and write the slices back to the same
-    /// cartridge as a new volume
+    /// Compact a volume IN PLACE, on its own cartridge (stage, retire, erase, write back)
     ///
-    /// One drive (`--device`), the source loaded. The space held by
+    /// Reads the live slices into staging, retires the volume, erases its
+    /// cartridge and writes the slices back to the same cartridge as a new
+    /// volume. One drive (`--device`), the source loaded. The space held by
     /// reclaimable and purged versions is freed without a second cartridge,
     /// even when the volume holds the only copy of a unit. In order:
     ///
     /// 1. Checks that need no tape: the source is sealed and trusted, `--label`
-    /// is free, the cartridge carries no other live volume, the drive can
-    /// write its generation, the live data fits one tape, and staging has
-    /// room for it. A consent the run could never be given is refused here,
-    /// before anything is read.
+    ///    is free, the cartridge carries no other live volume, the drive can
+    ///    write its generation, the live data fits one tape, and staging has
+    ///    room for it. A consent the run could never be given is refused here,
+    ///    before anything is read.
     ///
     /// 2. The live slices are read into staging (`compact-read`'s read), then
-    /// each is read back from the staging disk and matched against its
-    /// recorded hash. A mismatch refuses, the source untouched.
+    ///    each is read back from the staging disk and matched against its
+    ///    recorded hash. A mismatch refuses, the source untouched.
     ///
     /// 3. Consent. If every live slice has a copy on another sealed volume,
-    /// the usual Tier-2 prompt for a version left below its policy (a
-    /// terminal asks; the global `--yes` confirms in advance; no terminal and
-    /// no `--yes` refuses). If some live slice has NO copy anywhere else,
-    /// the retire family's zero floor is amended for this command alone: the
-    /// units and versions, the staging path and the window are shown, and the
-    /// source's label must be typed at a terminal, or given as
-    /// `--only-copy-on-staging LABEL` for an unattended run. `--yes` does not
-    /// give it. Every other way to retire a volume keeps its absolute floor.
+    ///    the usual Tier-2 prompt for a version left below its policy (a
+    ///    terminal asks; the global `--yes` confirms in advance; no terminal and
+    ///    no `--yes` refuses). If some live slice has NO copy anywhere else,
+    ///    the retire family's zero floor is amended for this command alone: the
+    ///    units and versions, the staging path and the window are shown, and the
+    ///    source's label must be typed at a terminal, or given as
+    ///    `--only-copy-on-staging LABEL` for an unattended run. `--yes` does not
+    ///    give it. Every other way to retire a volume keeps its absolute floor.
     ///
     /// 4. The source is retired, its cartridge erased (`cartridge erase`'s
-    /// own checks), `NEW` initialised on it, the staged slices written with
-    /// the FULL confirm (every file read back), and only then is staging
-    /// released.
+    ///    own checks), `NEW` initialised on it, the staged slices written with
+    ///    the FULL confirm (every file read back), and only then is staging
+    ///    released.
     ///
     /// From the erase until `NEW` passes that readback the staging disk may
     /// hold the ONLY copy of some units. That window is named in the events

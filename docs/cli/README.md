@@ -86,6 +86,7 @@ Accepted by every command, before or after the subcommand.
 | &nbsp;&nbsp;[`volume plan`](volume.md#tapectl-volume-plan) | Show bin-packing plan for pending staged data |
 | &nbsp;&nbsp;[`volume compact-finish`](volume.md#tapectl-volume-compact-finish) | Retire source volume after compaction (compaction step 3) |
 | &nbsp;&nbsp;[`volume compact`](volume.md#tapectl-volume-compact) | Interactive compaction: read + write + finish in one flow |
+| &nbsp;&nbsp;[`volume rewrite`](volume.md#tapectl-volume-rewrite) | Compact a volume IN PLACE, on its own cartridge (stage, retire, erase, write back) |
 | &nbsp;&nbsp;[`volume deposit`](volume.md#tapectl-volume-deposit) | Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006) |
 | &nbsp;&nbsp;[`volume list`](volume.md#tapectl-volume-list) | List every volume, most recently written first |
 | &nbsp;&nbsp;[`volume info`](volume.md#tapectl-volume-info) | The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits |

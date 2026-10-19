@@ -780,6 +780,7 @@ fn cmd_run(
                 "copies_written": report.copies_written,
                 "staging_released": report.cleaned.is_some(),
                 "stage_sets_released": report.cleaned.as_ref().map_or(0, |c| c.sets_cleaned),
+                "held_by_pending_rewrite": report.cleaned.as_ref().map_or(0, |c| c.held_by_pending_rewrite.len()),
                 "under_copied": report.under_copied.iter().map(|p| serde_json::json!({
                     "unit": p.unit_name,
                     "copies": p.copies,
@@ -802,11 +803,18 @@ fn cmd_run(
         eprintln!("{warning}");
     } else {
         match &report.cleaned {
-            Some(cleaned) => println!(
-                "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} copy/copies \
-                 written, {} stage set(s) released",
-                report.units_staged, report.copies_written, cleaned.sets_cleaned,
-            ),
+            Some(cleaned) => {
+                println!(
+                    "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} copy/copies \
+                     written, {} stage set(s) released",
+                    report.units_staged, report.copies_written, cleaned.sets_cleaned,
+                );
+                // Issue #483: a pending `volume rewrite` holds its staged
+                // slices; say why a set was not released.
+                for (id, hold) in &cleaned.held_by_pending_rewrite {
+                    println!("  {}", hold.describe(*id));
+                }
+            }
             None => {
                 println!(
                     "collection \"{collection_name}\" batch {batch_idx}: {} unit(s) staged, {} \

@@ -26,6 +26,7 @@ tapectl volume [OPTIONS] <COMMAND>
 - [`plan`](#tapectl-volume-plan) — Show bin-packing plan for pending staged data
 - [`compact-finish`](#tapectl-volume-compact-finish) — Retire source volume after compaction (compaction step 3)
 - [`compact`](#tapectl-volume-compact) — Interactive compaction: read + write + finish in one flow
+- [`rewrite`](#tapectl-volume-rewrite) — Compact a volume IN PLACE, on its own cartridge (stage, retire, erase, write back)
 - [`deposit`](#tapectl-volume-deposit) — Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006)
 - [`list`](#tapectl-volume-list) — List every volume, most recently written first
 - [`info`](#tapectl-volume-info) — The dossier for one volume: capacity, media generation, cartridge binding, location, units carried, writes, verification history, warehouse deposits
@@ -311,6 +312,46 @@ tapectl volume compact [OPTIONS] <LABEL>
 - `--fill-ceiling <FILL_CEILING>` — See `volume write --fill-ceiling` (step 2's write)
 - `--full-confirm` — See `volume write --full-confirm` (step 2's write)
 - `--force` — See `volume compact-finish --force` — step 3's ADR-0008 Tier-2 gate. With this (or the global `--yes`) step 3 asks nothing; the cartridge swap after step 1 still waits for you
+
+### tapectl volume rewrite
+
+Compact a volume IN PLACE, on its own cartridge (stage, retire, erase, write back)
+
+Reads the live slices into staging, retires the volume, erases its cartridge and writes the slices back to the same cartridge as a new volume. One drive (`--device`), the source loaded. The space held by reclaimable and purged versions is freed without a second cartridge, even when the volume holds the only copy of a unit. In order:
+
+1. Checks that need no tape: the source is sealed and trusted, `--label` is free, the cartridge carries no other live volume, the drive can write its generation, the live data fits one tape, and staging has room for it. A consent the run could never be given is refused here, before anything is read.
+
+2. The live slices are read into staging (`compact-read`'s read), then each is read back from the staging disk and matched against its recorded hash. A mismatch refuses, the source untouched.
+
+3. Consent. If every live slice has a copy on another sealed volume, the usual Tier-2 prompt for a version left below its policy (a terminal asks; the global `--yes` confirms in advance; no terminal and no `--yes` refuses). If some live slice has NO copy anywhere else, the retire family's zero floor is amended for this command alone: the units and versions, the staging path and the window are shown, and the source's label must be typed at a terminal, or given as `--only-copy-on-staging LABEL` for an unattended run. `--yes` does not give it. Every other way to retire a volume keeps its absolute floor.
+
+4. The source is retired, its cartridge erased (`cartridge erase`'s own checks), `NEW` initialised on it, the staged slices written with the FULL confirm (every file read back), and only then is staging released.
+
+From the erase until `NEW` passes that readback the staging disk may hold the ONLY copy of some units. That window is named in the events and the session log. If the command stops in it, the staged slices stay staged and nothing releases them (`staging clean --force` included); the error names the command that finishes the job: `volume rewrite --resume NEW`.
+
+`--dry-run` runs the checks of step 1 and shows the plan and the consent it would need, touching nothing.
+
+Exit status: `volume write`'s (0 sealed and confirmed, 2 refused with the tape untouched, 3 confirm inconclusive, 4 stopped after the tape was touched and resumable, 5 aborted, 6 quarantined, 75 catalog busy).
+
+```text
+tapectl volume rewrite [OPTIONS] [SOURCE]
+```
+
+**Arguments**
+
+- `[SOURCE]` — Source volume label (not with --resume)
+
+**Options**
+
+- `--label <NEW>` — The label of the NEW volume that will carry the slices on the same cartridge (not with --resume)
+- `--resume <NEW>` — Finish the rewrite that was to write NEW and stopped: erase, init and write from wherever the catalog says it stopped, then lift the hold on the staged slices once NEW has passed a full readback
+- `--only-copy-on-staging <SOURCE_LABEL>` — Consent, for an unattended run, to rewriting a volume that holds the only copy of some unit: the SOURCE volume's label, exactly. A different label refuses. `--yes` does not give this consent
+- `--device <DEVICE>` — Tape device (by-id path). Defaults to the only configured drive; required when more than one is configured
+- `--allow-missing-escrow` — See `volume write --allow-missing-escrow`
+- `--prewrite-hash` — See `volume write --prewrite-hash`
+- `--fill-ceiling <FILL_CEILING>` — See `volume write --fill-ceiling`: this command only
+- `--with-staged` — Write whatever else is staged beside the rewrite's slices. Without it the new volume carries the rewrite's slices and nothing else
+- `--keep-staging` — Release nothing from staging after the full readback
 
 ### tapectl volume deposit
 

@@ -11705,7 +11705,7 @@ mod tests {
         )
         .unwrap();
         let tenant_id = conn.last_insert_rowid();
-        let mut make = |name: &str, on_disk: bool| -> i64 {
+        let make = |name: &str, on_disk: bool| -> i64 {
             conn.execute(
                 "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
                  VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",

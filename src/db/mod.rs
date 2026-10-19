@@ -5302,6 +5302,7 @@ mod tests {
                 "destination_label",
                 "cartridge_serial",
                 "consent",
+                "with_staged",
                 "state",
                 "started_at",
                 "window_opened_at",

@@ -245,6 +245,7 @@ struct Pending {
     destination: String,
     cartridge_serial: Option<String>,
     consent: Consent,
+    with_staged: bool,
     state: State,
     stage_set_ids: Vec<i64>,
 }
@@ -258,7 +259,7 @@ fn load_open(
         .query_row(
             &format!(
                 "SELECT r.id, r.source_volume_id, sv.label, r.destination_label,
-                        r.cartridge_serial, r.consent, r.state
+                        r.cartridge_serial, r.consent, r.state, r.with_staged
                  FROM pending_rewrites r JOIN volumes sv ON sv.id = r.source_volume_id
                  WHERE r.finished_at IS NULL AND {where_sql}"
             ),
@@ -272,11 +273,14 @@ fn load_open(
                     r.get::<_, Option<String>>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, bool>(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((id, source_id, source, destination, cartridge_serial, consent, state)) = row else {
+    let Some((id, source_id, source, destination, cartridge_serial, consent, state, with_staged)) =
+        row
+    else {
         return Ok(None);
     };
     let stage_set_ids = conn
@@ -293,6 +297,7 @@ fn load_open(
         destination,
         cartridge_serial,
         consent: Consent::parse(&consent)?,
+        with_staged,
         state: State::parse(&state)?,
         stage_set_ids,
     }))
@@ -312,14 +317,21 @@ fn insert_pending(
     destination: &str,
     cartridge_serial: Option<&str>,
     consent: Consent,
+    with_staged: bool,
     stage_set_ids: &[i64],
 ) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO pending_rewrites
-            (source_volume_id, destination_label, cartridge_serial, consent)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![source_id, destination, cartridge_serial, consent.as_str()],
+            (source_volume_id, destination_label, cartridge_serial, consent, with_staged)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            source_id,
+            destination,
+            cartridge_serial,
+            consent.as_str(),
+            with_staged
+        ],
     )?;
     let id = tx.last_insert_rowid();
     for ss in stage_set_ids {
@@ -1160,6 +1172,10 @@ pub struct RewriteReport {
     pub resumed: bool,
     /// What happened to the staged slices after the full readback.
     pub release: Option<crate::cli::volume::StagingRelease>,
+    /// Set when `--resume` found nothing left to write and closed the record
+    /// instead: the staged slices were released because every one has a
+    /// fully read back copy on another volume.
+    pub closed_without_writing: Option<String>,
 }
 
 /// Keep `err`'s write-family classification (so its exit code stands) and
@@ -1293,6 +1309,7 @@ pub fn rewrite(
         destination,
         Some(chip.as_str()),
         consent_kind,
+        opts.with_staged,
         &read.staged_sets,
     )?;
 
@@ -1436,16 +1453,9 @@ pub fn rewrite(
         reclaimed_bytes: plan.reclaimable_bytes,
         resumed: false,
         release: None,
+        closed_without_writing: None,
     };
-    finish_from(
-        conn,
-        config,
-        steps,
-        pending,
-        opts.with_staged,
-        opts.keep_staging,
-        &mut report,
-    )?;
+    finish_from(conn, config, steps, pending, opts.keep_staging, &mut report)?;
     Ok(report)
 }
 
@@ -1493,6 +1503,7 @@ pub fn resume(
         reclaimed_bytes: 0,
         resumed: true,
         release: None,
+        closed_without_writing: None,
     };
     record_step(
         conn,
@@ -1501,16 +1512,78 @@ pub fn resume(
         "rewrite_resumed",
         serde_json::json!({"destination": destination, "state": pending.state.as_str()}),
     )?;
-    finish_from(
-        conn,
-        config,
-        steps,
-        pending,
-        false,
-        keep_staging,
-        &mut report,
-    )?;
+
+    // The hold may have lifted on another volume: a fully read back copy
+    // exists elsewhere (the copies-elsewhere shape, `staging clean` then
+    // legitimately released the slices; or the slices were written to another
+    // cartridge by hand and verified). If the slices are gone there is
+    // nothing to write: the record is closed, and the cartridge is free.
+    let held = holds(conn)?;
+    let any_held = pending.stage_set_ids.iter().any(|id| held.contains_key(id));
+    if !any_held {
+        let mut still_staged = true;
+        for ss in &pending.stage_set_ids {
+            let status: String = conn.query_row(
+                "SELECT status FROM stage_sets WHERE id = ?1",
+                params![ss],
+                |r| r.get(0),
+            )?;
+            if status != "staged" {
+                still_staged = false;
+            }
+        }
+        if !still_staged {
+            let elsewhere = fully_read_back_holders(conn, &pending.stage_set_ids)?;
+            close(conn, pending.id, "abandoned")?;
+            let why = format!(
+                "the staged slices of the rewrite of \"{}\" were released because every one has \
+                 a fully read back copy on {}, so there is nothing to write to \"{destination}\" \
+                 and the record is closed. The cartridge of \"{}\" is retired{}; `tapectl \
+                 volume init <LABEL>` and a normal write reuse it",
+                pending.source,
+                if elsewhere.is_empty() {
+                    "another volume".to_string()
+                } else {
+                    format!("volume(s) {}", elsewhere.join(", "))
+                },
+                pending.source,
+                if pending.state >= State::Erased {
+                    " and erased"
+                } else {
+                    " (its tape is not yet erased: `tapectl cartridge erase`)"
+                },
+            );
+            record_step(
+                conn,
+                pending.source_id,
+                &pending.source,
+                "rewrite_abandoned",
+                serde_json::json!({"destination": destination, "reason": why}),
+            )?;
+            report.closed_without_writing = Some(why);
+            return Ok(report);
+        }
+    }
+    finish_from(conn, config, steps, pending, keep_staging, &mut report)?;
     Ok(report)
+}
+
+/// Labels of the eligible volumes carrying a fully read back copy of any of
+/// `stage_sets`, for the sentence that says where the data went.
+fn fully_read_back_holders(conn: &Connection, stage_sets: &[i64]) -> Result<Vec<String>> {
+    let mut labels = std::collections::BTreeSet::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT hv.label FROM writes hw JOIN volumes hv ON hv.id = hw.volume_id
+         WHERE hw.stage_set_id = ?1 AND hw.status = 'completed' AND hw.write_verified = 1
+           AND {}",
+        coverage::eligible("hv")
+    ))?;
+    for ss in stage_sets {
+        for label in stmt.query_map(params![ss], |r| r.get::<_, String>(0))? {
+            labels.insert(label?);
+        }
+    }
+    Ok(labels.into_iter().collect())
 }
 
 /// The destination volume's catalog facts, for the continuation.
@@ -1590,7 +1663,6 @@ fn finish_from(
     config: &Config,
     steps: &dyn RewriteSteps,
     pending: Pending,
-    with_staged: bool,
     keep_staging: bool,
     report: &mut RewriteReport,
 ) -> Result<()> {
@@ -1625,7 +1697,10 @@ fn finish_from(
         let erased = steps.erase(&source);
         let erase_report = match erased {
             Ok(r) => r,
-            Err(e) => return Err(stopped(e, false, &note)),
+            // `true` whatever the erase said: the source is already retired
+            // and its cartridge `pending_erase`, so "refused, nothing
+            // changed" (exit 2) would be untrue; resume is the remedy.
+            Err(e) => return Err(stopped(e, true, &note)),
         };
         window_phase.item("erased");
         for w in &erase_report.warnings {
@@ -1724,7 +1799,7 @@ fn finish_from(
         let writing = if dest.resumable_writes > 0 {
             steps.resume_write(&destination)
         } else if dest.status == "initialized" {
-            let only = if with_staged {
+            let only = if pending.with_staged {
                 None
             } else {
                 Some(scope.as_slice())
@@ -1925,8 +2000,6 @@ mod tests {
     /// One version of a unit: its snapshot, a `cleaned` stage set (staging
     /// released, as a written copy leaves it) and its slices.
     struct Version {
-        unit: String,
-        version: i64,
         snapshot_id: i64,
         stage_set_id: i64,
         slice_ids: Vec<i64>,
@@ -1985,8 +2058,6 @@ mod tests {
             slice_ids.push(c.last_insert_rowid());
         }
         Version {
-            unit: unit.to_string(),
-            version,
             snapshot_id,
             stage_set_id,
             slice_ids,
@@ -2470,6 +2541,7 @@ mod tests {
             dest,
             Some(SERIAL),
             Consent::TypedFlag,
+            false,
             &[v.stage_set_id],
         )
         .unwrap();
@@ -3695,5 +3767,78 @@ mod tests {
             1
         );
         assert_eq!(volume_status(&s.w.conn, "NEW"), "sealed");
+    }
+
+    /// The hold lifted elsewhere: `--resume` has nothing to write and says
+    /// where the data is, rather than failing forever.
+    #[test]
+    fn resume_closes_a_rewrite_whose_slices_were_released_because_a_copy_exists_elsewhere() {
+        use crate::staging::clean::{clean_staging, CleanScope};
+        // Shape (a): a copies-elsewhere rewrite fails at the init; the other
+        // copy is fully read back, so `staging clean` releases the slices.
+        let s = scene(1);
+        copy_elsewhere(&s, &s.keepsake, &[1, 2], true, "OTHER-A");
+        copy_elsewhere(&s, &s.docs, &[3], true, "OTHER-B");
+        let fake = Fake::new(&s);
+        fake.fail_init.set(true);
+        rewrite(&s.w.conn, &s.w.config, &fake, &opts("SRC", "NEW")).unwrap_err();
+        assert!(
+            holds(&s.w.conn).unwrap().is_empty(),
+            "a fully read back copy exists: nothing is held"
+        );
+        let report = clean_staging(&s.w.conn, &s.w.config, false, CleanScope::Whole).unwrap();
+        assert_eq!(
+            report.sets_cleaned, 2,
+            "released: they are not the only copy"
+        );
+
+        fake.fail_init.set(false);
+        let before = fake.calls().len();
+        let report = resume(&s.w.conn, &s.w.config, &fake, "NEW", false).unwrap();
+        let said = report.closed_without_writing.expect("closed, not written");
+        assert!(
+            said.contains("OTHER-A") && said.contains("OTHER-B") && said.contains("erased"),
+            "{said}"
+        );
+        assert_eq!(fake.calls().len(), before, "no drive step ran");
+        let outcome: String = scalar(&s.w.conn, "SELECT outcome FROM pending_rewrites");
+        assert_eq!(outcome, "abandoned");
+        assert_eq!(events_of(&s.w.conn, "rewrite_abandoned"), 1);
+        // The record is closed: the label is free again for a later rewrite.
+        assert!(resume(&s.w.conn, &s.w.config, &fake, "NEW", false)
+            .unwrap_err()
+            .to_string()
+            .contains("no unfinished rewrite"));
+    }
+
+    /// `--with-staged` is the first run's decision and `--resume` keeps it.
+    #[test]
+    fn resume_writes_what_the_first_run_meant_with_staged_included() {
+        let s = scene(1);
+        let extra = add_version(&s.w, "extra", 1, "current", &data("extra", 1));
+        s.w.conn
+            .execute(
+                "UPDATE stage_sets SET status = 'staged' WHERE id = ?1",
+                params![extra.stage_set_id],
+            )
+            .unwrap();
+        let fake = Fake::new(&s);
+        fake.fail_write.set(true);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        o.with_staged = true;
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap_err();
+        assert_eq!(*fake.written_scope.borrow(), None);
+        let with: bool = scalar(&s.w.conn, "SELECT with_staged FROM pending_rewrites");
+        assert!(with);
+
+        fake.fail_write.set(false);
+        *fake.written_scope.borrow_mut() = Some(vec![]);
+        resume(&s.w.conn, &s.w.config, &fake, "NEW", false).unwrap();
+        assert_eq!(
+            *fake.written_scope.borrow(),
+            None,
+            "the resume wrote every staged set, as the first run asked"
+        );
     }
 }

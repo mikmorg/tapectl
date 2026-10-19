@@ -160,9 +160,16 @@ tapectl report events [OPTIONS]
 
 Volumes flagged for compaction
 
+With `--plan`, also groups the flagged volumes whose live data fits one destination tape, largest reclaim first, and says how to compact each group (`volume rewrite` for one volume, in place; `--with-staged` to carry the others onto its cartridge).
+
 ```text
 tapectl report compaction-candidates [OPTIONS]
 ```
+
+**Options**
+
+- `--plan` — Group the candidates by what fits one destination tape
+- `--generation <GENERATION>` — Plan for destination tapes of this generation (e.g. LTO-6, LTO-7) instead of the drive's own. Only with --plan
 
 ### tapectl report supersedable
 
