@@ -188,8 +188,11 @@ impl Hold {
 
 /// Every stage set a pending rewrite holds right now, by stage set id.
 ///
-/// A set is held while its rewrite is open (`finished_at IS NULL`) AND no
-/// eligible volume carries a completed, fully read back copy of it
+/// A set is held while its rewrite is open (`finished_at IS NULL`), has got
+/// as far as retiring the source (`state` past `staged`: until then the
+/// source is intact and the staged slices are a second copy, so a rewrite a
+/// hard kill left at `staged` never blocks a release) AND no eligible volume
+/// carries a completed, fully read back copy of it
 /// ([`coverage::fully_read_back_copy`]). One query, however many candidates
 /// the caller has.
 pub fn holds(conn: &Connection) -> Result<HashMap<i64, Hold>> {
@@ -198,7 +201,7 @@ pub fn holds(conn: &Connection) -> Result<HashMap<i64, Hold>> {
          FROM pending_rewrite_sets prs
          JOIN pending_rewrites r ON r.id = prs.rewrite_id
          JOIN volumes sv ON sv.id = r.source_volume_id
-         WHERE r.finished_at IS NULL AND NOT {}",
+         WHERE r.finished_at IS NULL AND r.state <> 'staged' AND NOT {}",
         coverage::fully_read_back_copy("prs.stage_set_id")
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1257,11 +1260,18 @@ pub fn rewrite(
     let phase = progress::phase("rewrite-read", Some(plan.live_bytes.max(0) as u64));
     let read = steps.read(source)?;
     phase.done();
-    if read.staged_sets.is_empty() || read.slices_skipped > 0 {
+    if read.staged_sets.is_empty()
+        || read.slices_skipped > 0
+        || read.staged.len() != plan.slices.len()
+    {
+        restore_staging(conn, &read.staged, &prior_status, &plan.compact_dir);
         return Err(TapectlError::Other(format!(
             "volume rewrite refused: the read of \"{source}\" did not stage every live slice \
-             ({} read, {} skipped). Nothing destructive was done.",
-            read.slices_read, read.slices_skipped
+             ({} staged of {} live, {} skipped). Nothing destructive was done and staging was \
+             put back as it was.",
+            read.staged.len(),
+            plan.slices.len(),
+            read.slices_skipped
         )));
     }
 
@@ -2454,7 +2464,7 @@ mod tests {
                 params![s.src],
             )
             .unwrap();
-        insert_pending(
+        let id = insert_pending(
             &s.w.conn,
             s.src,
             dest,
@@ -2463,6 +2473,7 @@ mod tests {
             &[v.stage_set_id],
         )
         .unwrap();
+        set_state(&s.w.conn, id, State::Erased).unwrap();
         paths
     }
 
@@ -3648,5 +3659,41 @@ mod tests {
         let said = plan.describe("SRC", "NEW").join("\n");
         assert!(said.contains("consent: none needed"), "{said}");
         assert_eq!(plan.to_json("SRC", "NEW")["consent"], "none");
+    }
+
+    /// A rewrite a hard kill left at `staged` (the source not yet retired)
+    /// holds nothing: the source is an intact copy, the staged slices are a
+    /// second one, and `staging clean` may release them.
+    #[test]
+    fn a_rewrite_left_at_staged_by_a_hard_kill_holds_nothing() {
+        use crate::staging::clean::{clean_staging, CleanScope};
+        let s = scene(1);
+        let files = held_after_erase(&s, &s.keepsake, "NEW");
+        s.w.conn
+            .execute(
+                "UPDATE volumes SET status = 'sealed' WHERE id = ?1",
+                params![s.src],
+            )
+            .unwrap();
+        s.w.conn
+            .execute("UPDATE pending_rewrites SET state = 'staged'", [])
+            .unwrap();
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+        let report = clean_staging(&s.w.conn, &s.w.config, true, CleanScope::Whole).unwrap();
+        assert_eq!(report.sets_cleaned, 1);
+        assert!(files.iter().all(|f| !f.exists()));
+        // ... and the next `volume rewrite` of the volume replaces the stale record.
+        let fake = Fake::new(&s);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+        assert_eq!(
+            scalar::<i64>(
+                &s.w.conn,
+                "SELECT COUNT(*) FROM pending_rewrites WHERE outcome = 'abandoned'"
+            ),
+            1
+        );
+        assert_eq!(volume_status(&s.w.conn, "NEW"), "sealed");
     }
 }
