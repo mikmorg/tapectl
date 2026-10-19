@@ -55,6 +55,7 @@ SCENARIO_NAMES=(
     tape-only-and-reclaim compaction retire-and-reuse db-loss
     escrow-ordering restore-file-and-catalog quick-archive collection permute
     stale-catalog-sealed-tape cartridge-displacement collection-second-copy
+    rewrite-in-place
 )
 SCENARIO_DESCS=(
     "Baseline multi-tenant archive: escrow BEFORE staging, 3 units, 1 volume, full restore matrix"
@@ -73,6 +74,7 @@ SCENARIO_DESCS=(
     "issue #208: a sealed tape refuses a write the CATALOG still thinks is allowed"
     "issue #226: ADR-0010 re-init displaces a bound volume and names who lost their last copy"
     "issue #226/#229: the per-copy flow -- one collection run, staging retained, a second volume write"
+    "issue #483: compact a single cartridge in place (volume rewrite), the only copy of a unit on it, then restore"
 )
 
 usage() {
@@ -4560,6 +4562,252 @@ scenario_collection_second_copy() {
     restore_matrix VOL-CS2 media/alpha alice "$SRC/col-root/alpha" csc-alpha
 
     check csc.staging_released    csc_staging_released
+}
+# ============================================================
+# Scenario: rewrite-in-place
+# ============================================================
+# Issue #483, ADR-0012 2026-10-19 item 106: `volume rewrite` compacts a tape
+# on the cartridge it is on, even when that tape holds the only copy of a
+# unit. ONE cartridge, ONE volume: it carries `photos` v1, `docs` v1 and
+# `big` v1 and v2 -- so `big` v1, once released and purged, is 12 MB of
+# reclaimable space -- and every unit has exactly one copy (this suite's
+# min_copies is 2, so `docs` is marked tape-only with --yes, the operator
+# accepting that margin, and is the unit whose only copy the rewrite must
+# carry across the erase).
+#
+# The order is the command's own: refused without the typed label (and
+# `--yes` is passed to the refusal on purpose: it must not give that
+# consent), then run with `--only-copy-on-staging VOL-R`, which reads the
+# live slices into staging, re-reads them from the disk, retires VOL-R,
+# erases the cartridge, initialises VOL-R2 on it, writes the staged slices
+# with the FULL confirm and only then releases staging. Afterwards:
+# VOL-R is erased and VOL-R2 sealed on the SAME cartridge, `report capacity`
+# shows the reclaimed space, the window is in the events, and every restore
+# method recovers `docs` (the only copy) and `big` (its latest version) from
+# the rewritten tape.
+#
+# It runs under --single-cartridge too (that is what the command is for):
+# there is one next_tape, and the cartridge never changes.
+rw_setup() {
+    bootstrap_config || return 1
+    TCTL location add vault --description "Home vault" || return 1
+    TCTL tenant add alice || return 1
+    TCTL tenant add bob || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+        TCTL key generate --escrow
+    else
+        TCTL key generate --escrow >"$RUN/log-_bootstrap_escrow.txt" 2>&1 || return 1
+        capture_escrow_secret _bootstrap_escrow
+    fi
+    make_source "$SRC/photos" "plain+links" "$CANARY" || return 1
+    make_source "$SRC/docs" "unicode+deep" || return 1
+    make_source "$SRC/big" "big" || return 1
+    TCTL unit init "$SRC/photos" --tenant alice --name photos || return 1
+    TCTL unit init "$SRC/docs" --tenant bob --name docs || return 1
+    TCTL unit init "$SRC/big" --tenant alice --name big || return 1
+    TCTL snapshot create photos || return 1
+    TCTL snapshot create docs || return 1
+    TCTL snapshot create big || return 1
+    TCTL stage create photos || return 1
+    TCTL stage create docs || return 1
+    TCTL stage create big || return 1
+    # A second version of `big`, staged beside the first: ONE write puts both
+    # on the one volume (bootstrap_two_volumes' idiom), so v1 can become
+    # reclaimable space on the very cartridge that carries v2.
+    mutate_source "$SRC/big" "$SEED" modify || return 1
+    TCTL snapshot create big || return 1
+    TCTL stage create big || return 1
+    next_tape VOL-R || return 1
+    vinit VOL-R || return 1
+    TCTL volume write VOL-R --device "$TAPE_DEV" --yes
+}
+
+# `docs` becomes tape-only with --yes: one copy against this suite's
+# min_copies = 2 and its places, accepted in advance (ADR-0012 2026-10-12
+# item 47). The source stays where it is -- the comparison below needs it --
+# so what makes VOL-R the only copy is the catalog, which is what the
+# typed consent reads.
+rw_mark_docs_tape_only() { TCTL unit mark-tape-only docs --yes; }
+
+# The reclaimable space. `--force` because the version that supersedes
+# `big` v1 has one copy against min_copies 2 -- the operator giving v1 up on
+# purpose (the same reasoning as cp_write_photos_v2_second_copy, which gave
+# v2 its second copy instead; here there is one cartridge, so there cannot be one).
+rw_reclaim_big_v1() {
+    TCTL snapshot mark-reclaimable --version 1 big --force \
+        && TCTL snapshot purge --version 1 big
+}
+
+# Release what the write left staged (it stays staged at 1/2 copies), so the
+# rewrite's own read is the only thing in staging -- before the reclaim, the
+# order the compaction scenario uses.
+rw_release_staging() { TCTL staging clean --force; }
+
+rw_volume_status() { # rw_volume_status <label> -> prints its catalog status
+    TCTL volume list --json 2>/dev/null | python3 -c '
+import json, sys
+label = sys.argv[1]
+rows = [r for r in json.load(sys.stdin) if r["label"] == label]
+print(rows[0]["status"] if rows else "(none)")
+' "$1"
+}
+
+rw_written_bytes() { # rw_written_bytes <label> -> bytes written, from report capacity
+    TCTL report capacity --per-volume --json 2>/dev/null | python3 -c '
+import json, sys
+label = sys.argv[1]
+rows = [r for r in json.load(sys.stdin) if r["volume"] == label]
+print(rows[0]["written"] if rows else "none")
+' "$1"
+}
+
+rw_planner_names_the_volume() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: tapectl report compaction-candidates --json (assert VOL-R flagged); --plan --json (assert VOL-R in one group, reclaimable > 0); --plan (assert the in-place command is named)"
+        return 0
+    fi
+    local f="$RUN/log-rw.candidates.json" p="$RUN/log-rw.plan.json" t="$RUN/log-rw.plan.txt"
+    TCTL report compaction-candidates --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
+    python3 - "$f" <<'PY' || { cat "$f"; return 1; }
+import json, sys
+rows = [r for r in json.load(open(sys.argv[1])) if r["volume"] == "VOL-R"]
+assert rows and rows[0]["flagged"] and rows[0]["reclaimable_bytes"] > 0, rows
+PY
+    TCTL report compaction-candidates --plan --json >"$p" 2>"$p.err" || { cat "$p.err" "$p"; return 1; }
+    python3 - "$p" <<'PY' || { cat "$p"; return 1; }
+import json, sys
+d = json.load(open(sys.argv[1]))
+groups = [g for g in d["groups"] if "VOL-R" in g["volumes"]]
+assert len(groups) == 1 and groups[0]["reclaimable_bytes"] > 0, d
+assert groups[0]["live_bytes"] <= d["destination"]["budget_bytes"], d
+PY
+    TCTL report compaction-candidates --plan >"$t" 2>&1 || { cat "$t"; return 1; }
+    grep -q "tapectl volume rewrite VOL-R --label" "$t" || { echo "the plan does not name the in-place command:"; cat "$t"; return 1; }
+}
+
+# The Tier-3 amendment is for the typed label alone. `--yes` is passed on
+# purpose -- it answers the quiet-host question and the Tier-2 prompt, and it
+# must not give this consent -- and nothing may have changed afterwards.
+rw_refused_without_the_label() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: tapectl volume rewrite VOL-R --label VOL-R2 --yes (expect REFUSED naming --only-copy-on-staging VOL-R); with --only-copy-on-staging WRONG (expect REFUSED, does not match); assert VOL-R still sealed and VOL-R2 absent"
+        return 0
+    fi
+    local out rc
+    out="$(TCTL volume rewrite VOL-R --label VOL-R2 --device "$TAPE_DEV" --yes 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "volume rewrite ran on a volume holding the only copy with --yes alone: $out"; return 1; }
+    grep -q -- "--only-copy-on-staging VOL-R" <<<"$out" || { echo "the refusal does not name the consent it needs: $out"; return 1; }
+    grep -q 'unit "docs"' <<<"$out" || { echo "the refusal does not name the unit whose only copy is at stake: $out"; return 1; }
+    out="$(TCTL volume rewrite VOL-R --label VOL-R2 --only-copy-on-staging VOL-X --device "$TAPE_DEV" --yes 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] || { echo "volume rewrite accepted a label that is not the source's: $out"; return 1; }
+    grep -q "does not match" <<<"$out" || { echo "a wrong label was refused, but not as a mismatch: $out"; return 1; }
+    [ "$(rw_volume_status VOL-R)" = sealed ] || { echo "VOL-R is no longer sealed after two refusals"; return 1; }
+    [ "$(rw_volume_status VOL-R2)" = "(none)" ] || { echo "VOL-R2 exists after two refusals"; return 1; }
+}
+
+rw_dry_run_shows_the_plan() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: tapectl volume rewrite VOL-R --label VOL-R2 --dry-run (expect the plan and the typed consent it needs; nothing changes)"
+        return 0
+    fi
+    local out
+    out="$(TCTL volume rewrite VOL-R --label VOL-R2 --device "$TAPE_DEV" --dry-run 2>&1)" || { echo "$out"; return 1; }
+    grep -q "NO copy on any other volume" <<<"$out" || { echo "the dry run does not say a typed consent is needed: $out"; return 1; }
+    grep -q "DRY RUN" <<<"$out" || { echo "$out"; return 1; }
+    [ "$(rw_volume_status VOL-R)" = sealed ] || { echo "a dry run changed VOL-R"; return 1; }
+}
+
+rw_capacity_before() {
+    if [ "$DRY_RUN" = 1 ]; then echo "PLAN: tapectl report capacity --per-volume --json (record VOL-R's written bytes)"; return 0; fi
+    local w; w="$(rw_written_bytes VOL-R)"
+    case "$w" in ''|none|*[!0-9]*) echo "no written figure for VOL-R in report capacity: '$w'"; return 1 ;; esac
+    [ "$w" -gt 12000000 ] || { echo "VOL-R's written bytes ($w) are below what two 12 MB versions of big weigh: the fixture did not write them"; return 1; }
+    echo "$w" >"$RUN/rw-written-before"
+}
+
+rw_rewrite() {
+    if [ "$DRY_RUN" = 1 ]; then
+        TCTL volume rewrite VOL-R --label VOL-R2 --only-copy-on-staging VOL-R --device "$TAPE_DEV" --yes
+        return 0
+    fi
+    local f="$RUN/log-rw.rewrite.json" e="$RUN/log-rw.rewrite.err"
+    TCTL volume rewrite VOL-R --label VOL-R2 --only-copy-on-staging VOL-R \
+        --device "$TAPE_DEV" --yes --json >"$f" 2>"$e" || { cat "$e" "$f"; return 1; }
+    python3 - "$f" <<'PY' || { cat "$e" "$f"; return 1; }
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["status"] == "completed" and d["consent"] == "typed_flag", d
+assert d["source"] == "VOL-R" and d["destination"] == "VOL-R2" and d["resumed"] is False, d
+assert d["slices"] > 0 and d["reclaimed_bytes"] > 10000000, d
+PY
+}
+
+rw_catalog_after() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "PLAN: tapectl volume list --json (VOL-R erased, VOL-R2 sealed, both on the SAME barcode); report events (rewrite_window_opened .. rewrite_window_closed)"
+        return 0
+    fi
+    local f="$RUN/log-rw.volumes.json"
+    TCTL volume list --json >"$f" 2>"$f.err" || { cat "$f.err" "$f"; return 1; }
+    python3 - "$f" <<'PY' || { cat "$f"; return 1; }
+import json, sys
+rows = {r["label"]: r for r in json.load(open(sys.argv[1]))}
+assert rows["VOL-R"]["status"] == "erased", rows["VOL-R"]
+assert rows["VOL-R2"]["status"] == "sealed" and rows["VOL-R2"]["condition"] == "ok", rows["VOL-R2"]
+assert rows["VOL-R"]["cartridge"] == rows["VOL-R2"]["cartridge"], (
+    "the rewrite is in place: the same cartridge", rows)
+PY
+    local ev="$RUN/log-rw.events.json"
+    TCTL report events --entity volume --json >"$ev" 2>"$ev.err" || { cat "$ev.err" "$ev"; return 1; }
+    local a
+    for a in rewrite_started rewrite_staged_verified rewrite_consent rewrite_window_opened rewrite_erased rewrite_initialized rewrite_written rewrite_window_closed; do
+        grep -q "\"$a\"" "$ev" || { echo "no $a event: the rewrite's steps are not all recorded"; return 1; }
+    done
+    grep -q "holds the only copy of these" "$ev" || { echo "the window is not named in the events"; return 1; }
+}
+
+# The reclaimed space is the point of the command: the rewritten volume
+# carries less than the one it replaced by (most of) the 12 MB of `big` v1,
+# and the erased one no longer counts as in service.
+rw_capacity_after() {
+    if [ "$DRY_RUN" = 1 ]; then echo "PLAN: tapectl report capacity --per-volume --json (VOL-R2 written < VOL-R's before by about big v1; VOL-R not in service)"; return 0; fi
+    local before after
+    before="$(cat "$RUN/rw-written-before" 2>/dev/null)"; after="$(rw_written_bytes VOL-R2)"
+    case "$before$after" in ''|*[!0-9]*) echo "figures missing: before='$before' after='$after'"; return 1 ;; esac
+    [ "$((before - after))" -ge 6000000 ] || { echo "the rewrite freed too little: VOL-R carried $before bytes, VOL-R2 carries $after"; return 1; }
+    [ "$(rw_written_bytes VOL-R)" = none ] || { echo "the erased VOL-R is still counted in report capacity"; return 1; }
+    echo "freed $((before - after)) bytes: VOL-R $before -> VOL-R2 $after"
+    TCTL report capacity --per-volume
+}
+
+rw_hold_is_gone() {
+    if [ "$DRY_RUN" = 1 ]; then echo "PLAN: tapectl staging clean --force (expect no 'held by the rewrite' line: the rewrite is finished)"; return 0; fi
+    local out
+    out="$(TCTL staging clean --force 2>&1)" || { echo "$out"; return 1; }
+    if grep -q "held by the rewrite" <<<"$out"; then
+        echo "a finished rewrite still holds staged slices: $out"; return 1
+    fi
+}
+
+scenario_rewrite_in_place() {
+    check rw.setup                  rw_setup
+    check rw.release_staging        rw_release_staging
+    check rw.mark_docs_tape_only    rw_mark_docs_tape_only
+    check rw.reclaim_big_v1         rw_reclaim_big_v1
+    check rw.planner                rw_planner_names_the_volume
+    check rw.capacity_before        rw_capacity_before
+    check rw.refused_without_label  rw_refused_without_the_label
+    check rw.dry_run                rw_dry_run_shows_the_plan
+    check rw.rewrite                rw_rewrite
+    check rw.catalog_after          rw_catalog_after
+    check rw.capacity_after         rw_capacity_after
+    check rw.hold_is_gone           rw_hold_is_gone
+
+    # The only copy of `docs` went through staging while its cartridge was
+    # erased; it is on the rewritten tape, and every restore method gets it
+    # back. `big` is the unit whose reclaimable version was dropped.
+    restore_matrix VOL-R2 docs bob   "$SRC/docs" rw-docs alice
+    restore_matrix VOL-R2 big  alice "$SRC/big"  rw-big  bob
 }
 run_scenario() { # run_scenario <name>
     local name="$1" fn="scenario_${1//-/_}"
