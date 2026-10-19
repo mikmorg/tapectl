@@ -862,7 +862,7 @@ def commas(v):
     return "n/a" if v is None else "{:,}".format(v)
 
 
-def make_summary(run, prior):
+def make_summary(run, prior, nominal=2.5e12):
     def load(name):
         try:
             with open(os.path.join(run, name)) as f:
@@ -876,7 +876,7 @@ def make_summary(run, prior):
     target = res.get("slice_target_blocks", SLICE_BLOCKS)
     out = []
     p = out.append
-    p("== lto6-fill summary (issue #420: what st and the drive do after the first write refusal) ==")
+    p("== lto fill summary (issue #420: what st and the drive do after the first write refusal) ==")
     p("run directory: %s" % run)
     stage, end = res.get("stage"), fill.get("end")
     if end == "cap":
@@ -916,8 +916,8 @@ def make_summary(run, prior):
     written = (fill.get("bytes") or 0) + ((sl or {}).get("accepted", 0) + (res.get("hard_end") or {}).get("accepted", 0)
                                           + (1 if (res.get("seal") or {}).get("ok") else 0)) * bs
     if fill.get("bytes") and b_max:
-        p("bytes accepted / MAM maximum capacity (%s MiB): %.4f; / the 2.5 TB planning figure: %.4f"
-          % (commas(b_max), fill["bytes"] / (b_max * 1048576.0), fill["bytes"] / 2.5e12))
+        p("bytes accepted / MAM maximum capacity (%s MiB): %.4f; / the generation table's %s planning figure: %.4f"
+          % (commas(b_max), fill["bytes"] / (b_max * 1048576.0), "{:,} B".format(int(nominal)), fill["bytes"] / float(nominal)))
     if used and written:
         p("native capacity used per data byte, all data blocks written (page 0x17 after rewind %s MB / %s bytes): %.4f"
           % (commas(used), commas(written), used * 1e6 / written))
@@ -1288,7 +1288,7 @@ def cmd_verify(a):
 
 def cmd_summary(a):
     try:
-        text = make_summary(a.run, a.reference_bytes)
+        text = make_summary(a.run, a.reference_bytes, a.nominal_bytes)
     except Exception:
         text = "THE SUMMARY ITSELF FAILED; send the whole directory (result.json has the numbers):\n" + traceback.format_exc()
     with open(os.path.join(a.run, "summary.txt"), "w") as f:
@@ -1317,7 +1317,10 @@ def parser():
             p.add_argument("--progress-s", type=float, default=300.0)
     p = sub.add_parser("summary")
     p.add_argument("--run", required=True)
-    p.add_argument("--reference-bytes", type=int, default=PRIOR_FILL_BYTES)
+    p.add_argument("--reference-bytes", type=int, default=PRIOR_FILL_BYTES,
+                   help="a prior fill of this cartridge to compare with; 0 for none")
+    p.add_argument("--nominal-bytes", type=int, default=2500000000000,
+                   help="the generation table's marketed capacity of the medium (default: LTO-6's)")
     sub.add_parser("selftest")
     return ap
 
