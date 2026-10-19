@@ -1788,3 +1788,19 @@ Ruled 2026-10-19, after v1.3.0 was tagged:
      authorizations of 1.2.0, 1.3.0 and 1.4.0 (items 72, 81, 104, 105) all end when the release
      home2 installs is installed. 1.4.0 also carries #479 (the profiling toolkit and item 100's
      post-warning key), which changes nothing on tape.
+106. **A tape may be rewritten in place, even when it holds the only copy** (CTO, 2026-10-19). A
+     `volume rewrite SOURCE` command reads the source's live slices into staging, retires the source,
+     erases its cartridge, initialises a new volume on the same cartridge and writes the staged
+     slices to it, so the space reclaimable and purged versions held is freed without a second
+     cartridge. When every live slice on the source has a copy on another volume, it runs under the
+     usual consent (ADR-0008 Tier 2 when the retirement leaves a version below its policy). When some
+     live slice has no copy anywhere else, the retire family's absolute zero floor (2026-09-14) is
+     amended for this one command only: it proceeds after every staged slice has been re-read from
+     the staging disk and matched against its recorded ciphertext hash, and only on an explicit typed
+     consent that names the risk (from the erase until the new volume seals and passes a full
+     readback, the staging disk holds the only copy of those units) — the source's label typed at a
+     terminal, or a flag that names the label for an unattended run; `--yes` and `--force` do not pass
+     it. The write's confirm is the full readback, and the staged slices are released only after it
+     passes; until then no release path may free them, and a failure after the erase leaves them
+     staged with the command that resumes the write named. Every other retire path keeps the absolute
+     floor. A candidate planner suggests which compaction candidates to merge onto one destination.
