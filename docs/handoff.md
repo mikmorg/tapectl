@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgrades it to 1.3.0). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgrades it to 1.4.0). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -40,7 +40,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (c) | The fresh start on home2 | **you** (sudo, the escrow key, the cartridges) |
 | (d) | `keepsake` on two cartridges the same day, then the Heir Kit | **you** |
 | (e) | The backlog | agents, in the order below |
-| (f) | Upgrade home2 to 1.3.0, in place | **you**, once `v1.3.0` is tagged |
+| (f) | Upgrade home2 to 1.4.0, in place | **you**, once `v1.4.0` is tagged |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -298,19 +298,19 @@ same day:
 `audit` warns `escrow_kit_stale` after every write session: that is the cue for the next
 refresh.
 
-## (f) Upgrade home2 to 1.3.0, in place
+## (f) Upgrade home2 to 1.4.0, in place
 
-home2 runs 1.1.0; go straight to 1.3.0, which contains 1.1.1, 1.1.2 and 1.2.0
-(`docs/releases/1.1.1.md`, `1.1.2.md`, `1.2.0.md`, `1.3.0.md`). The 1.1.x releases are patches.
-1.2.0 and 1.3.0 change what tapectl writes onto a tape (RESTORE.sh, File 1, RECOVERY.md, and in
-1.3.0 the cross-volume index in the envelopes); the layout, the front index, MANIFEST.toml and
-`requires` (still empty) are unchanged, so there is no fresh start: a 1.1.x RESTORE.sh reads a
-1.3.0 tape and the reverse, and L6-0001 and L6-0002 stay as they are. 1.1.1 adds one catalog
-migration (036, a new table), applied the first time the new binary opens the catalog; 1.1.2,
-1.2.0 and 1.3.0 add none. There is no downgrade past 036: a 1.1.0 binary refuses a catalog that
-is ahead of its migration list, so the rollback is the 1.1.0 binary kept in step 3 plus `db
-import` of the backup from step 1, losing whatever the catalog recorded in between. Wait for
-`v1.3.0` to be tagged (the whole chain
+home2 runs 1.1.0; go straight to 1.4.0, which contains 1.1.1, 1.1.2, 1.2.0 and 1.3.0
+(`docs/releases/1.1.1.md`, `1.1.2.md`, `1.2.0.md`, `1.3.0.md`, `1.4.0.md`). The 1.1.x releases
+are patches. 1.2.0, 1.3.0 and 1.4.0 change what tapectl writes onto a tape (RESTORE.sh, File 1,
+RECOVERY.md, and in 1.3.0 the cross-volume index in the envelopes); the layout, the front index,
+MANIFEST.toml and `requires` (still empty) are unchanged, so there is no fresh start: a 1.1.x
+RESTORE.sh reads a 1.4.0 tape and the reverse, and L6-0001 and L6-0002 stay as they are. Two
+catalog migrations apply the first time the new binary opens the catalog: 036 (1.1.1, a new
+table) and 037 (1.4.0, `volume rewrite`'s record). There is no downgrade past them: a 1.1.0
+binary refuses a catalog that is ahead of its migration list, so the rollback is the 1.1.0 binary
+kept in step 3 plus `db import` of the backup from step 1, losing whatever the catalog recorded in
+between. Wait for `v1.4.0` to be tagged (the whole chain
 on its commit, then the tag; the reviews behind 1.1.2 are
 `docs/audits/2026-10-15-design-review.md` and `docs/audits/2026-10-15-1.1-diff-review.md`).
 
@@ -320,14 +320,14 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
 `~/.tapectl` of its own, the pointer is bypassed even on 1.1.1: rename it first.
 
 1. **Back up the catalog with 1.1.0:** `tapectl-op db backup --to
-   /srv/local_backup/tapectl/tapectl-pre-1.3.0.db` (`--to` is required; the daily backup's
+   /srv/local_backup/tapectl/tapectl-pre-1.4.0.db` (`--to` is required; the daily backup's
    pruning never touches a file named like this), or `sudo systemctl start
    tapectl-backup.service`.
-2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.3.0`.
+2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.4.0`.
 3. **Keep the old binary, then build and install:** `sudo cp -p /usr/local/bin/tapectl
    /usr/local/bin/tapectl-1.1.0`, then `scripts/first-run.sh --profile
    contrib/hosts/home2.profile --from 3 --to 3` (a release build on home2 from the checkout,
-   installed to `/usr/local/bin`; `tapectl --version` should read `1.3.0 (v1.3.0, <date>)`).
+   installed to `/usr/local/bin`; `tapectl --version` should read `1.4.0 (v1.4.0, <date>)`).
    The timers pick the new binary up at their next firing.
 4. **Step 7 again** (`--from 7 --to 7`): it finds the home initialised, skips init, and goes on
    to the ops-group block, which now writes the home pointer `/etc/tapectl/home`, so a plain
@@ -395,6 +395,9 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
 - **Shipped in 1.3.0:** #418 R4 (the cross-volume index), #476, #477 (File 1), #480 (restore
   repairs, slice replacement and the heir's per-file sha256 check). #409 closed 2026-10-17 as an
   accepted cost (item 91).
+- **Shipped in 1.4.0:** #481 (File 1, two more fresh reads), #483 (`volume rewrite`, compaction in
+  place on one cartridge), #479 (the profiling toolkit and `post_warning_bytes`), and `restore
+  --key` (item 107). After installing, `scripts/lto-profile.sh` is the run #420 needs.
 - **#388:** Logical Block Protection. The research note is
   `docs/research/2026-10-16-logical-block-protection.md`: the HP LTO-6 offers Reed-Solomon
   only, the setting is not saved across sessions, mhvtl emulates it. The prototype on
@@ -472,6 +475,6 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
   which records the full readback as part of the write; or pass `--keep-staging` to the
   write that completes a unit's copies and run `volume verify --full` before `staging
   clean`. On 1.1.1 the write that completes the policy releases staging itself otherwise.
-- **The on-tape authorizations of 1.2.0 and 1.3.0 end when v1.3.0 is installed** (ADR-0012
-  items 72 and 81; the 2026-10-07 one ended with the v1.1.0 install, item 40). After it, a failing
+- **The on-tape authorizations of 1.2.0, 1.3.0 and 1.4.0 end when v1.4.0 is installed** (ADR-0012
+  items 72, 81, 104 and 105; the 2026-10-07 one ended with the v1.1.0 install, item 40). After it, a failing
   `tests/on_tape_golden.rs` is a CTO decision, never an agent's re-pin.
