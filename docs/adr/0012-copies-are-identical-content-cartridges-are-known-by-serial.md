@@ -1757,3 +1757,12 @@ Ruled 2026-10-17, measuring drives instead of assuming them:
      second run against another tape restores only those paths, overwriting only them, matched
      by unit and version and confirmed by dar's own per-file checks. Other versions are not used
      as sources, even where a file is unchanged. Item 81's 1.3.0 re-pin covers RESTORE.sh's half.
+103. **The heir checks every restored file against its recorded sha256** (1.3.0, same re-pin).
+     dar's per-file check is a short checksum, not a hash: two equal byte flips can cancel, and a
+     test restored a damaged file with no error. tapectl's own restore checks the sha256 staging
+     recorded for every file (item 102); RESTORE.sh had no such record. Each tenant's
+     `index/paths.tsv` (item 79) gains a `sha256` column (the file's recorded content hash, empty
+     where none was recorded), and after every RESTORE.sh restore and fill each restored regular
+     file is checked with `sha256sum` against it; a mismatch goes on the damaged-file list, so
+     `--fill-from` can repair it from another copy. `--no-file-check` skips the check. The column
+     needs no `requires` entry (a reader ignores a column it does not know).
