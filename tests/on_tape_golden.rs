@@ -196,6 +196,34 @@
 //! `requires` (empty) and `KNOWN_FEATURES=""`. The MANIFEST.toml pin did not
 //! move.
 //!
+//! **The 1.3.0 pin WIDENED A THIRD TIME, 2026-10-19, under the CTO's ruling
+//! on the third fresh read of File 1 ("fix the two, then tag", #477),** within
+//! the same bound: this pin only, ending when v1.3.0 is installed. The previous
+//! pin was `072b0c6e…`; this one is `95862b49…`. A reader who held a whole box
+//! could not list it: `--find-envelope` shows only the loaded tape's units, and
+//! the only way to see the index was `--where` with a name it lacked, which
+//! printed "the first 40". ADDED: `--where --all`, a form of `--where` (a bare
+//! `--where` stays a usage error): `do_where` takes `--all` and calls
+//! `where_every_unit`, which reads each `index/units.tsv` whole through a new
+//! named awk fragment, `AWK_INDEX_ALL`, and prints EVERY unit the index names
+//! with no limit: the summary, the units whose newest version this tape does not
+//! hold (with the tapes that do), then each unit with its newest version (the
+//! highest by number, keyed by tenant, name and unit uuid, so a name made twice
+//! is two units), whether this tape holds it, and every version with each
+//! holder as `--where` prints them. It reads the same envelopes with the same
+//! keys as `--where UNIT` (the operator envelope's map for an escrow or operator
+//! key, each tenant's for tenant keys), reads forward from one rewind, and
+//! exits 1 on a tape with no index. It takes its tools from the same per-mode
+//! row as `--where` and `--find` (`TOOLS_INDEX`); no tool was added. The usage
+//! line, the header comment, `--help` and `--info`'s closing hints name it.
+//! CHANGED: the `--where` usage and error messages say `UNIT|--all`; the miss
+//! path of `--where UNIT` no longer pipes the units it names through
+//! `head -n 40` (it names every one, and points at `--where --all`). The
+//! `Requirements:` lines, the five `TOOLS_*` sets and every ruled item below are
+//! byte-identical. The fixed points did not move and are asserted below:
+//! "tapectl 1.1.0" in `die_newer_needed`, `requires` (empty) and
+//! `KNOWN_FEATURES=""`. The MANIFEST.toml pin did not move.
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -212,7 +240,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "072b0c6ef7d7639274d194ee8fea3f382ad6ed4e320c80ec515fc3e1d99d08f4";
+const RESTORE_SH_SHA256: &str = "95862b49b0621e5970ebd91c49a353231725009e1f527c691cf98b3a116a6315";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -346,6 +374,12 @@ fn restore_sh_bytes_are_pinned() {
         "finish_damage() { # <destination> <slices not available, or empty>\n",
         "  file_check \"$root\" \"$WORK/fill.restored\"\n",
         "  (cd \"$destdir\" && sha256sum -c --quiet) <\"$WORK/check.sums\"",
+        // 1.3.0, widened a third time (the third read of File 1, #477): every
+        // unit the index names, with no cap
+        "where_every_unit() {\n",
+        "  if [ \"$unit\" = --all ]; then\n    where_every_unit\n    return 0\n  fi\n",
+        "do_where() { # <unit, or --all for every unit>\n",
+        "--where needs a unit name, or --all for every unit the index names",
     ] {
         assert_eq!(script.matches(ruled).count(), 1, "ruled item {ruled:?}");
     }
