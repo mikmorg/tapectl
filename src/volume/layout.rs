@@ -355,8 +355,20 @@ fn guide_drive_section(media_type: &str) -> String {
          generations still work together, at the slower speed.",
         "The cable must fit both ends, and the connectors differ: external drives \
          commonly use SFF-8088 or the newer SFF-8644, and an adapter cable joins one \
-         to the other. The maker's data sheets for the drive and for the adapter \
-         name their connectors.",
+         to the other. An internal drive commonly has the SAS drive connector \
+         (SFF-8482, the one on a SAS disk) and is joined to the adapter's internal \
+         port, commonly SFF-8087 or the newer SFF-8643, by a cable that ends in \
+         drive connectors; whether the drive takes its power through that connector \
+         or from a plug of its own depends on the model. The maker's data sheets for \
+         the drive and for the adapter name their connectors, and they, not this \
+         text, decide.",
+        "A Fibre Channel drive needs a Fibre Channel host adapter (a SAS adapter \
+         cannot drive it), a fibre-optic cable with the connectors both ends take \
+         (commonly LC), and a link speed both ends support. With a Fibre Channel \
+         switch in between, the switch must let the computer see the drive (it is \
+         \"zoned\" to it). Linux drives such adapters with the modules `qla2xxx` \
+         (QLogic) and `lpfc` (Emulex); once the link is up `lsscsi -g` lists the \
+         drive like any other.",
         "Use a plain host adapter (HBA), not a RAID controller. RAID firmware \
          often does not present a tape drive to the operating system at all, and \
          many on-board SAS ports are RAID controllers.",
@@ -381,11 +393,70 @@ fn guide_drive_section(media_type: &str) -> String {
         .map(|b| wrap_words(&format!("- {b}"), 72, "  "))
         .collect();
     format!(
-        "## The tape drive\n\n{}\n\n{}\n\n{}\n\n{}\n",
+        "## The tape drive\n\n{}\n\n{}\n\n{}\n\n{}\n\n{}\n",
         wrap_words(&which, 72, ""),
+        guide_box_drives(),
         wrap_words(interface, 72, ""),
         bullets.join("\n"),
         wrap_words(firm, 72, "")
+    )
+}
+
+/// The cartridge generations File 1's box table lists: what an LTO tape drive
+/// of today is likely to be asked to read, in release order.
+const BOX_TABLE_MEDIA: [crate::media::Generation; 7] = {
+    use crate::media::Generation::*;
+    [Lto5, Lto6, Lto7, Lto7M8, Lto8, Lto9, Lto10]
+};
+
+/// "LTO-7 Type M" for what `Generation::as_str` calls `LTO-7-M8`.
+fn guide_generation_name(g: crate::media::Generation) -> &'static str {
+    match g {
+        crate::media::Generation::Lto7M8 => "LTO-7 Type M",
+        other => other.as_str(),
+    }
+}
+
+/// "LTO-6 or LTO-7", "LTO-5, LTO-6 or LTO-7": the drive generations in `drives`.
+fn guide_drive_list(drives: &[crate::media::Generation]) -> String {
+    let names: Vec<&str> = drives.iter().map(|g| g.as_str()).collect();
+    match names.as_slice() {
+        [] => "no current drive".to_string(),
+        [one] => (*one).to_string(),
+        [init @ .., last] => format!("{} or {last}", init.join(", ")),
+    }
+}
+
+/// File 1's table of which drive generation reads which cartridge generation
+/// (M7 of the 2026-10-19 read): a box can hold tapes of several generations,
+/// and the heir must pick one drive for it. Drawn from
+/// [`Generation::can_read`] through the cover sheet's own list, so the two
+/// cannot disagree.
+fn guide_box_drives() -> String {
+    use crate::crypto::escrow_kit::drives_that_read;
+    let mut rows = String::from("    Cartridge       Read by a drive of\n");
+    for media in BOX_TABLE_MEDIA {
+        rows.push_str(&format!(
+            "    {:<14}  {}\n",
+            guide_generation_name(media),
+            guide_drive_list(&drives_that_read(media))
+        ));
+    }
+    let lead = "A box can hold cartridges of several generations, and one drive may \
+                not read them all. This is which drive generation reads which \
+                cartridge:";
+    let after = "No drive reads every generation. An LTO-7 drive reads LTO-5, LTO-6 \
+                 and LTO-7 cartridges, an LTO-8 drive reads LTO-7, LTO-7 Type M and \
+                 LTO-8 cartridges, and a box that holds both an LTO-6 and an LTO-8 \
+                 cartridge needs two drives, one after the other. Pick the single \
+                 drive that reads the most of the cartridges you hold, and read those \
+                 first. A generation not in the table: the maker's compatibility \
+                 table.";
+    format!(
+        "{}\n\n{}\n{}",
+        wrap_words(lead, 72, ""),
+        rows,
+        wrap_words(after, 72, "")
     )
 }
 
@@ -410,15 +481,19 @@ fn guide_capacity(media_type: &str) -> String {
     let text = match crate::media::Generation::parse(media_type) {
         Some(g) => format!(
             "As a ceiling: this tape is {}, which holds {} of data as the makers \
-             count it (decimal, uncompressed), so all of its units restored together \
-             need no more than that, unless they were stored compressed.",
+             count it (decimal, uncompressed), so everything on it takes at most \
+             that on the tape. Restored, its files take about as much room as they \
+             took on the tape, and more for a unit that was stored compressed \
+             (\"Compressed units\", below).",
             g.as_str(),
             tb(g.native_capacity_bytes())
         ),
         None => "As a ceiling: a tape holds at most its generation's native capacity \
-                 (LTO-6 2.5 TB, LTO-7 6 TB, LTO-8 12 TB, LTO-9 18 TB, decimal), so all \
-                 of its units restored together need no more than that, unless they \
-                 were stored compressed. The generation is printed on the cartridge."
+                 (LTO-6 2.5 TB, LTO-7 6 TB, LTO-8 12 TB, LTO-9 18 TB, decimal), so \
+                 everything on it takes at most that on the tape. Restored, its files \
+                 take about as much room as they took on the tape, and more for a \
+                 unit that was stored compressed (\"Compressed units\", below). The \
+                 generation is printed on the cartridge."
             .to_string(),
     };
     wrap_words(&text, 72, "")
@@ -441,7 +516,13 @@ fn guide_drive_basics() -> String {
          PC without one cannot use it: borrow a desktop or a server.",
         "An adapter sold with LSI or Broadcom RAID firmware must run the plain \
          \"IT\" (initiator-target, pass-through) firmware, not the RAID one, or the \
-         drive does not appear as a tape drive.",
+         drive does not appear as a tape drive. To see what a card is: `lspci -k` \
+         names the kernel driver in use under each adapter. `mpt3sas` (`mpt2sas` on \
+         older cards) is the driver of LSI and Broadcom host adapters, and \
+         `megaraid_sas` is the driver of their RAID controllers, which are the wrong \
+         kind of card. A card on `mpt3sas` can still carry RAID (\"IR\") firmware: \
+         the maker's flash tool says which (`sas3flash -list`, or `sas2flash -list` \
+         on older cards, prints a Firmware Product ID tagged (IT) or (IR)).",
         "Slide the write-protect tab on the cartridge to the protected position \
          before you load it. Reading needs no writing, and RESTORE.sh never writes \
          to the tape, so nothing can be lost by mistake.",
@@ -510,9 +591,49 @@ This document describes how to recover data from this tape without
 {intro_tools}
 
 Besides those it uses `bash`, `awk` and the basic tools every Linux system
-has (`sed`, `grep`, `tr`, `cut`, `sort`, `stat`, `df`, `wc`, `od`, `mktemp`),
-and `gpg` if your dar was built with GPG support ("Tools Required" says
-what each is for).
+has (`sed`, `grep`, `tr`, `cut`, `sort`, `stat`, `df`, `wc`, `tail`, `od`,
+`mktemp`), and `gpg` if your dar was built with GPG support ("Tools
+Required" says what each is for, and names the few more that only finding
+the drive and checking a key use).
+
+## Start here
+
+The whole job in order. Each step names the section that has its commands.
+
+1. Check your key: "Which file is your key". A tenant's key opens that
+   tenant's units only; the operator key and the escrow key open every
+   tenant's.
+2. Get a drive that reads this tape and a computer it connects to: "The
+   tape drive" and "Loading the tape, and a drive that does not show up".
+   Choose a disk with room for the restored files before you start:
+   "Disk space".
+3. Load the tape, find the drive's device name ("Which device?") and read
+   RESTORE.sh, File 2, off the tape: the first commands of "Automated
+   Recovery (recommended)". Set `TAPE_DEVICE` to the same device once, so
+   RESTORE.sh reads the drive your `mt` and `dd` commands read.
+4. Run `./RESTORE.sh --info` on EVERY tape you hold, one after another. It
+   needs no key and shows each tape's label, when it was sealed and its
+   `Verdict:`; for anything but SEALED see "If the verdict is UNSEALED or
+   DAMAGED". With more than one tape, "The rest of the box" says what the
+   others are.
+5. Start from the NEWEST tape (the latest "Sealed at"). `./RESTORE.sh
+   --find-envelope --key YOUR_KEY.age.key` lists the units on it, and
+   `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` shows, for a unit,
+   every version and every tape that holds it.
+6. Restore. From one tape with the escrow or operator key, `--all` restores
+   every unit on it ("Automated Recovery (recommended)"). From several
+   tapes, restore each unit's NEWEST version once, from a tape that holds
+   it, into a directory of its own (`/destination/UNIT`), with that tape's
+   own RESTORE.sh, and never an older version first ("The rest of the
+   box").
+7. Check each restore: "Did the restore get everything?". A slice or a file
+   that is damaged: "If a slice or a file is damaged".
+8. Know when you are done: the units the newest index lists are all
+   restored, and every tape in the box has been looked at. That is all a
+   box can show you about itself; "The rest of the box" says what it cannot.
+
+RESTORE.sh or its tools are not available: "Manual Recovery Steps" does the
+same job by hand. The tape's map is lost: "If All Else Fails".
 
 ## Words this guide uses
 
@@ -520,6 +641,18 @@ what each is for).
   counted from File 0 and each ended by a filemark. They are not files on
   a disk: `mt` moves from one to the next and one `dd` reads one. "File 3"
   always means tape file 3.
+- **ID thunk (File 0)**: the first tape file, plain text, that says which
+  tape this is: its `label`, `uuid`, `media_type` (the LTO generation),
+  `cartridge_serial` and `tapectl_version`, where the front index and the
+  seal marker are (`front_index`, `seal_marker`) and `requires` (below). It
+  also prints the commands that read the next file, this guide: "File 0's
+  commands" in this guide means those.
+- **`requires`**: a line in File 0 and in the seal marker that lists the
+  features a reader must understand to read the tape correctly. It is empty
+  (`requires = []`) on the tapes written so far (older tapes have no such
+  line), which means nothing special is needed. A RESTORE.sh that meets a feature it does not know
+  refuses by name and points to the RESTORE.sh stored on that tape, or a
+  newer tapectl.
 - **Unit**: one archived folder tree, the thing you restore by name (for
   example `photos/2019`). A unit can be stored in several versions, one
   each time it was archived again after its contents had changed. Unless
@@ -528,7 +661,13 @@ what each is for).
   version N instead, and `--find-envelope` shows which versions this tape
   holds. Every version is a FULL archive of the unit as it was: the newest
   version alone holds every file, and an older one is never needed to
-  complete it.
+  complete it. A version is also called a snapshot: MANIFEST.toml states it
+  as `snapshot_version`, RECOVERY.md as "snapshot v2" and RESTORE.sh as
+  "snapshot version". Versions are numbered 1, 2, 3 ... for each unit in
+  the order they were made, so the highest number is the newest. A unit is
+  identified by its `uuid`: it can be renamed, and tapes from different
+  times or installations can use one name for different units, so version
+  numbers compare only between archives with the same uuid.
 - **Tenant**: an owner of units. One tape can carry several tenants'
   units; each tenant has its own key, and one tenant's key cannot read
   another's data.
@@ -537,6 +676,17 @@ what each is for).
   **escrow key**, a permanent spare made when the archive was set up and
   kept apart from the rest. Whichever of the three you hold, it is "your
   key" in this guide.
+- **Installation**: one tapectl setup, with its own catalogue and its own
+  keys (an operator key, the tenants' keys and one escrow key). Every tape
+  an installation writes is encrypted to that installation's keys, so a
+  tape from another installation needs that installation's keys.
+- **Heir Kit, cover sheet**: the papers and files the operator prepares
+  for the person who inherits the archive and keeps with the tapes (or
+  apart from them): a cover sheet (`COVER.txt`, also as a printable page)
+  that names the escrow key's public half, where the tapes are kept and
+  which drives read them, and `catalog.db.age`, the whole catalogue
+  encrypted to the escrow key. It records the archive as of the day it was
+  made, which may be before the newest tape was written. You may have none.
 - **`YOUR_KEY.age.key`**: the one name this guide uses for your key file,
   an age identity file (a text file with a line that starts
   `AGE-SECRET-KEY-`). Replace it with your own file's name, whether it
@@ -594,6 +744,15 @@ repeated); then ask whether this tape was written by another installation,
 whose escrow is a different key. The keys that opened an envelope are
 printed with it.
 
+Nothing on a tape says which keys it was written for. `./RESTORE.sh --info`,
+File 0 and the front index name no recipient (the plaintext parts of a tape
+show its structure only: "What the unencrypted parts of this tape reveal"),
+and an age file does not carry the name of the key it is for. So no tape
+can be asked which key it wants: try your key on each tape, which
+`--find-envelope` does. A key that opens one tape of a box may not open
+another, because tapes written at different times were sealed to the keys
+of their time, and tapes from another installation to its keys.
+
 ## Quick Reference
 
 This volume uses layout v2. Tape files are laid out in this fixed order:
@@ -634,6 +793,12 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
   the envelope has none for that unit, or dar refuses the one it has
   because it was cut from another run of the same snapshot. RESTORE.sh
   says so when that happens.
+- Only for finding the drive and checking a key, never for the restore
+  itself: `ls`, `lsscsi`, `lspci`, `dmesg`, `lsmod`, `modprobe`, `sudo` and
+  `usermod` (to find the drive, load its driver and get permission to use
+  it: "Loading the tape, and a drive that does not show up"), and
+  `age-keygen`, which comes with `age` ("Which file is your key"). Each is
+  named where this guide uses it.
 
 RESTORE.sh checks for the tools each mode runs, before it reads the tape,
 and names any that is missing: `--info` and `--verify` need only {read_only}.
@@ -650,22 +815,41 @@ RESTORE.sh streams each slice from the tape through `age` into `dar`, so
 `--to` needs room for about the size of the units you restore: one
 unit's size for one unit, the sum of them with `--all` (each unit's
 slices as stored on tape; a unit that was archived compressed restores
-larger). `--find-envelope` lists each unit with its size. Nothing
-else is large: the decrypted envelopes (the operator envelope's
-`catalog.db` and the dar catalogues, which grow with the number of files)
-go to a work directory under `$TMPDIR` (default `/tmp`; set `TMPDIR` to
-move it). `/tmp` is a small RAM disk on many systems (`df -h /tmp` says),
-and no data slice ever goes there, but a unit of millions of files has a
-large catalogue: if `/tmp` is small, set `TMPDIR` to a directory on a real
-disk with some GiB free (`TMPDIR=/big/disk/tmp ./RESTORE.sh ...`). Two
-cases keep slices on disk as well, in a scratch directory
-inside `--to` unless `--scratch DIR` names another disk: `--path` (the few
-slices that hold the path) and the older-dar fallback above (all of the
-unit's slices, then the restored files: about twice its size). Asking for a
-replacement slice (`--slices-from`, `--swap-tapes`: "If a slice or a file is
-damaged") restores the same way, so it needs that room too. The
-script checks the space
-before it reads any slice.
+larger: "Compressed units", below). `--find-envelope` lists each unit with
+its size, and so does `--where`. Nothing else is large: the decrypted
+envelopes (the operator envelope's `catalog.db` and the dar catalogues,
+which grow with the number of files) go to a work directory under
+`$TMPDIR` (default `/tmp`; set `TMPDIR` to move it). `/tmp` is a small RAM
+disk on many systems (`df -h /tmp` says), and no data slice ever goes
+there, but a unit of millions of files has a large catalogue: if `/tmp`
+is small, set `TMPDIR` to a directory on a real disk with some GiB free
+(`TMPDIR=/big/disk/tmp ./RESTORE.sh ...`).
+
+Some ways of restoring keep the slices on disk as well, in a scratch
+directory inside `--to` unless `--scratch DIR` names another disk, and
+then need more room, up to about TWICE a unit's size (its slices, then
+its restored files): the older-dar fallback above (all of the unit's
+slices), `--path` (only the few slices that hold the path), and asking
+for a replacement slice (`--slices-from`, `--swap-tapes`: "If a slice or
+a file is damaged"). Doing it by hand ("Manual Recovery Steps") is the
+same: the decrypted slices and the restored files, about twice the unit's
+size; delete a unit's slices once it is restored. The script checks the
+space before it reads any slice.
+
+For a whole box, the destination needs the sum of the sizes of the units
+you restore, whichever tapes they come from; the extra room for slices is
+needed for one unit at a time.
+
+**Compressed units.** A unit restores to more than its slices' size if it
+was stored compressed, by an amount that depends on the files (text
+compresses a lot, photos and video hardly at all). MANIFEST.toml records
+the dar command of each unit, in its `dar_command` line (unpacked
+envelope: `grep '^dar_command' env/MANIFEST.toml`; `--find-envelope` with
+a tenant's key prints the whole MANIFEST.toml). An argument that starts
+`-z`, as in `\"-zgzip\"` or `\"-zzstd\"`, means the unit was compressed,
+and none means it was not. The dar catalogue cannot tell you: `dar -l`
+of the catalogue in the envelope shows `-----` in its compression column
+either way. With no `dar_command` line, allow generously.
 
 ## Which device?
 
@@ -710,15 +894,22 @@ last file, which are plain text too. It is NEVER safe for an encrypted
 file, an envelope or a slice: ciphertext holds zero bytes of its own, and
 deleting them destroys it (see "If All Else Fails").
 
+If your drive is not `/dev/nst0` ("Which device?"), put your own device in
+the `mt` and `dd` lines below, and set `TAPE_DEVICE` to the same device
+once, with `export TAPE_DEVICE=/dev/nstN` (a by-id name works too). The
+`./RESTORE.sh` lines further down read `TAPE_DEVICE`, and without it they
+read `/dev/nst0`, which may be another drive or another tape.
+
     mt -f /dev/nst0 setblk 524288
     mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf 2
     dd if=/dev/nst0 bs=512k | tr -d '\0' > RESTORE.sh
     chmod +x RESTORE.sh
 
 The first line sets the drive to the tape's 512 KiB blocks. Repeating it
-is harmless, and it is not needed if you have just run File 0's commands,
-which set it: the drive keeps the setting until the tape is unloaded or
-the drive is reset, and RESTORE.sh sets it itself. Only mt-st's `mt` can do it (GNU cpio's cannot;
+is harmless, and it is not needed if you have just run File 0's commands
+(the ones File 0 prints for reading this guide), which set it: the drive
+keeps the setting until the tape is unloaded or the drive is reset, and
+RESTORE.sh sets it itself. Only mt-st's `mt` can do it (GNU cpio's cannot;
 the line then fails, and the rest still works while the drive is in its
 default mode, where `dd bs=512k` reads each 512 KiB block whole). If a
 `dd` fails, this is the first thing to try. What `dd` says:
@@ -756,11 +947,13 @@ Then, with `YOUR_KEY.age.key` your own key file:
     ./RESTORE.sh --where UNIT --key YOUR_KEY.age.key
     ./RESTORE.sh --find some/file --key YOUR_KEY.age.key
 
-    # Full restore to an EMPTY directory: --all restores every unit
-    # your key opens, each into /destination/UNIT. Each slice streams
-    # from the tape through age into dar, so /destination needs about
-    # those units' size free; the script checks first. --overwrite
-    # finishes a restore that stopped part way.
+    # Full restore of THIS tape to an EMPTY directory: --all restores
+    # every unit your key opens, each into /destination/UNIT. Each slice
+    # streams from the tape through age into dar, so /destination needs
+    # about those units' size free; the script checks first. --overwrite
+    # finishes a restore that stopped part way, never one over an older
+    # version. With other tapes in the box, read "The rest of the box"
+    # before this: a second --all into the same /destination is refused.
     ./RESTORE.sh --restore --key YOUR_KEY.age.key --all --to /destination
 
     # Just one file or folder: reads only the slices that hold it
@@ -775,9 +968,10 @@ holds first, then restore all of it:
     ./RESTORE.sh --restore --key YOUR_KEY.age.key --all --to /destination
 
 --all restores every unit of the envelope that lists the most units among
-those your key opens, each in /destination/UNIT: with the escrow or
-operator key that is the operator envelope, which lists every unit on the
-tape; with a tenant's key it is that tenant's envelope. Without --all or
+those your key opens, each in /destination/UNIT (a single unit goes
+straight into /destination): with the escrow or operator key that is the
+operator envelope, which lists every unit on the tape; with a tenant's key
+it is that tenant's envelope. Without --all or
 --unit, --restore takes the first envelope your key opens and, if that
 lists one unit, restores only that unit (it tells you what else the key
 opened). If that envelope lists SEVERAL units it will not guess: it
@@ -819,43 +1013,101 @@ index and says so. The index is plain text in the envelope (`index/` in
 the unpacked envelope; RECOVERY.md shows how to read it with `awk`), so it
 needs no tapectl either.
 
+**Is the box complete?** Nothing on a tape can name tapes written after
+it, so the newest tape you hold may not be the newest ever written, and no
+tape can tell you that. What you can do is compare. The newest index lists
+every unit the archive's catalogue knew when its tape was written,
+including units held only on OTHER tapes (`units.tsv` has a row for each
+tape that holds each version, and `--where UNIT` prints those rows). List
+the units the newest index has and the tapes that hold them, and set that
+against the tapes in the box: a holder the index names that you do not have
+is a tape to look for, and a unit, or the newest version of a unit, whose
+every holder is missing is not in this box. To see every unit the index
+lists, ask `--where` for a name it does not have: it answers that the name
+is not in the index and prints the units it does list (the first 40).
+Then ask whoever kept the archive. The Heir Kit, if you have one ("Words
+this guide uses"), records the archive as of the day it was made, including
+where the tapes are kept; one made after your newest tape was written may
+name tapes this box lacks.
+
 The whole box, in short:
 
-1. Name every cartridge. Load each in turn and run `./RESTORE.sh --info`:
+1. Name every cartridge. Load each in turn and run `./RESTORE.sh --info`
+   (any copy of RESTORE.sh will do for this: see the end of this list):
    its label is "Tape identifies as" (File 0's label is the authority; a
    sticker on the case can have been replaced) and its sealed date is
    "Sealed at". The generation is printed on the cartridge (L6 is LTO-6)
    and stated in File 0 as `media_type`; tapes of different generations
-   need different drives.
+   need different drives ("The tape drive" has a table, so that you can
+   choose one drive for the box).
 2. Start from the newest tape. List its units with `./RESTORE.sh
    --find-envelope --key YOUR_KEY.age.key`, then run `./RESTORE.sh --where
-   UNIT --key YOUR_KEY.age.key` for each unit you want.
-3. For each unit restore the newest version from a tape that holds it,
+   UNIT --key YOUR_KEY.age.key` for each unit you want. `--where` prints a
+   "Version N" for each version of the unit, with the tapes that hold it;
+   the highest N is the newest.
+3. For each unit restore its newest version from a tape that holds it,
    each unit into a directory of its own so that tapes never overwrite one
    another: `./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT
-   --to /destination/UNIT` (a directory that is not empty is refused). Use
-   THAT tape's own RESTORE.sh, File 2 of the tape in the drive, which reads
-   that tape's format; another tape's script warns "WRONG TAPE?" and goes
-   on.
-4. Stop when every unit the newest index lists is restored. An older
-   version is wanted only if you ask for it (`--version N`).
+   --to /destination/UNIT`. `--to` must be empty or new (a directory that
+   is not empty is refused), which is why each unit has its own directory
+   under /destination and not /destination itself. A tape that holds the
+   newest version needs no `--version`: a restore takes the newest version
+   on the tape. Use THAT tape's own RESTORE.sh, File 2 of the tape in the
+   drive, which reads that tape's format.
+4. Do not restore an older version first and then a newer one into the
+   same directory: it is refused as not empty, and `--overwrite` would keep
+   the files that only the older version had. If a directory already holds
+   an older version, move it aside and restore the newer version into an
+   empty one. An older version is wanted only if you ask for it
+   (`--version N`), and then in a directory of its own.
 5. A tape the index names that you do not have: use another holder it
-   lists. A unit all of whose holders are missing cannot be restored from
-   this box.
+   lists. If no holder of a unit's newest version is in the box, the
+   highest version you can reach is the best this box can give, and whoever
+   uses it should be told so. A unit all of whose holders are missing
+   cannot be restored from this box.
+6. You are done when every unit the newest index lists is restored at its
+   newest version (or the best you could reach) and every tape in the box
+   has been looked at. That is the most a box can show about itself:
+   "Is the box complete?" above says what it cannot.
+
+The modes that only read the tape (`--info`, `--verify`, `--find-envelope`,
+`--list`, `--where`, `--find`) describe the tape that is in the drive,
+whichever tape's RESTORE.sh runs them. A RESTORE.sh written for another
+tape prints a "WRONG TAPE?" box first, and for these modes it is only a
+reminder that the script was written for another volume: what follows is
+about the tape in the drive (the label printed is that tape's own). For a
+restore use the loaded tape's own RESTORE.sh, which was written for that
+tape's format, and take "WRONG TAPE?" during a restore as a sign that the
+script or the tape is the wrong one. To get a tape's own script, load that
+tape and run the four commands at the start of "Automated Recovery
+(recommended)"; they read File 2 of whatever tape is in the drive. Keep
+each tape's script under its own name.
 
 In the index's `state` column, `sealed` is a tape whose write finished and
 was sealed, `quarantined` is a sealed tape whose medium a verify proved bad
 (it may still read in part, so prefer another holder), and `this-tape` is
-the tape the index is on. A retired or erased tape is not listed.
+the tape the index is on. A tape that was already retired or erased when
+the index was written is not listed, and one that is listed may have been
+retired or erased since. A cartridge that was erased and written again
+carries a NEW volume: File 0 then shows another label and another `uuid`
+on the same `cartridge_serial`, and the index row for the old volume names
+data that is gone. So match a tape to an index row by its label AND its
+uuid (`--where` prints the uuid; File 0 shows it):
+
+    mt -f /dev/nst0 rewind
+    dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(label|uuid|media_type|cartridge_serial) ='
 
 To take stock of a box without relying on the index, load each tape in
 turn, run `./RESTORE.sh --info` (its label and when it was sealed) and
 `./RESTORE.sh --find-envelope --key YOUR_KEY.age.key` (its units, their
 versions, slices and sizes), and write them down. A unit that appears at
-the same version on two tapes has two copies: they are the same content,
-and either restores it. Cartridges are found by their label; the
-cartridge's chip serial is in File 0 (`cartridge_serial`) and in the
-index, and a sticker can have been replaced.
+the same version AND with the same unit uuid on two tapes has two copies:
+they are the same content, and either restores it. A name and a version
+number alone prove nothing; the uuid is in MANIFEST.toml (`--find-envelope`
+with a tenant's key prints it) and, on a tape with an index, in `--where`.
+Cartridges are found by their label; the cartridge's chip serial is in
+File 0 (`cartridge_serial`) and in the index, and a sticker can have been
+replaced.
 
 ## If the verdict is UNSEALED or DAMAGED
 
@@ -906,11 +1158,17 @@ marker's copy of it, with a warning (rung 2 of "If All Else Fails").
   Look for another copy first ("The rest of the box"; "If a slice or a
   file is damaged" says how RESTORE.sh takes the failed slice from it); a
   cartridge that failed here may read in another drive. With no other copy,
-  the slices that did PASS are intact, and files that lie wholly inside
-  them may be recoverable by hand (decrypt them as in "Manual Recovery
-  Steps" and try dar on them), but nothing here promises it.
+  the slices that did PASS are intact, and the files that lie wholly
+  inside them can be restored by hand: "If a slice or a file is damaged"
+  has the commands under "No other copy". The files in the failed slices
+  are lost.
 
 ## Did the restore get everything?
+
+These checks are for ONE restore, of one unit or one tape's worth, from one
+tape. They say nothing about the other tapes and units of a box: a box is
+complete only when the procedure in "The rest of the box" has been followed
+to its end.
 
 A restore went right only if all of these hold:
 
@@ -931,6 +1189,9 @@ A restore went right only if all of these hold:
 
    Every line but the first must be 0. "Overwriting policy decision" means
    dar left a file that was already there: the destination was not empty.
+   "Ignored (excluded by filters)" above 0 in a whole-unit restore means dar
+   skipped files, as it does for a slice that was left out ("No other
+   copy" in "If a slice or a file is damaged").
 3. The count matches the catalogue. The inodes (files and directories) a
    unit's catalogue lists are the lines of `--list` that begin with a status
    such as `[Saved]` or `[InRef]`:
@@ -989,8 +1250,8 @@ Either option restores slice by slice onto disk, as with an older dar, so
 another disk). Each tape is read forward from one rewind. A slice RESTORE.sh
 cannot replace is left out: the files in it are not restored but listed,
 below. RESTORE.sh runs the `age` program, which stops at the first damaged
-part of a slice, so it cannot save the good parts of a slice; only tapectl's
-own restore can.
+part of a slice, so it cannot save the good parts of a slice; tapectl's own
+restore can ("No other copy", below).
 
 **A file fails.** When dar names files it could not restore (a checksum that
 failed, a slice that was not there), RESTORE.sh restores the rest, ends
@@ -1024,6 +1285,55 @@ one read of the restored files from disk and none of the tape; with `--path`
 only the paths restored are checked. A file with no sha256 recorded is not
 checked, and a tape written before 1.3.0 has no index and is not checked at
 all; RESTORE.sh says both. `--no-file-check` skips the check.
+
+**No other copy.** If a slice fails and no other tape or directory has a
+copy of it, the slices that passed are intact, and the files that lie wholly
+inside them can still be restored; the files that touch a failed slice are
+lost.
+
+RESTORE.sh does this for you: run the `--swap-tapes` restore above and type
+`done` when it asks for another cartridge. It restores the files it can,
+lists the others in `.tapectl-damaged-files.txt` ("A file fails", above) and
+ends `RESTORE INCOMPLETE`. It needs the room of a replacement-slice restore
+("Disk space").
+
+By hand, without RESTORE.sh, do the steps of "Manual Recovery Steps" for the
+unit, but leave the failed slices out: do not decrypt them, and do not put
+empty files in their place. The decrypted slices keep their own numbers
+(`restore.1.dar`, `restore.2.dar`, `restore.4.dar` ..., a gap where the
+failed slice was); this is the one time a gap in the numbering is right.
+Then, into an empty directory:
+
+    dar -x restore -R /destination -O -Q -N > dar.log 2>&1
+    echo $?
+    grep 'not restored (user choice)' dar.log
+
+dar does not stop at the gap. It restores every file whose slices are all
+there. For each of the others it prints `PATH not restored (user choice)`
+(the last command lists them) and leaves a file of that name that is EMPTY
+or short: that is not the real file, so delete it, or fill it from another
+copy later. The exit status is 0 and the summary counts those files under
+"ignored (excluded by filters)", so a status of 0 does not mean the unit is
+whole. If a directory's own entry lies in a lost slice, dar skips
+everything under it ("No file in this directory will be restored"). On a
+tape with an index, the `sha256sum` line in RECOVERY.md ("If a slice or a
+file is damaged" there) names every restored file that does not match,
+the empty leftovers included. `dar -l env/catalogs/NAME -T slice -N -Q`
+(NAME as under "Words this guide uses") shows which slices hold each file,
+so you can see beforehand what a lost slice costs. If the failed slice is
+the LAST one, dar stops at once ("The last file of the set is not present",
+exit status 4) and restores nothing; add `-0` (sequential read) and it
+restores the files in order up to the first missing slice, then stops with
+status 4. The file it was in the middle of is left short and named, and
+those after it are not named at all, so compare with the catalogue's list.
+
+Neither way can read around a damaged part of a slice: the `age` program
+stops at the first damaged piece. tapectl can. tapectl is the program that wrote this tape (File 0 names its release
+in `tapectl_version`); it is open-source software, and its own restore
+reads around a damaged 64 KiB piece of a slice, loses only the files in that
+piece and names them. To use it you need a copy of tapectl and a catalogue
+rebuilt from the tape with the operator or escrow key (`tapectl catalog
+rebuild --from-volume`); nothing else in this guide needs it.
 
 ## Manual Recovery Steps
 
@@ -1076,9 +1386,18 @@ exact size with `truncate` instead, never with `tr`.
    damaged: see "If the verdict is UNSEALED or DAMAGED". An unsealed tape
    may lack its last data slices (the front index still lists them), and
    every file that is there can be checked against the index.
-5. Find and open your envelope. Its entries in the front index have type
-   `tenant_envelope` or `operator_envelope` (and a `_backup` for each).
-   For each in turn, with POSITION and SIZE from its entry:
+5. Find and open an envelope. Its entries in the front index have type
+   `tenant_envelope` (one for each tenant, the first envelopes on the tape)
+   or `operator_envelope` (and a `_backup` for each). Which one to open
+   depends on your key. A tenant's key opens that tenant's
+   `tenant_envelope` and no other, so the first that decrypts is yours. The
+   operator key and the escrow key open EVERY envelope, and the tenant
+   envelopes come first: the first that decrypts is then one tenant's, and
+   its MANIFEST.toml lists that tenant's units and no one else's. For all
+   the units on the tape open the `operator_envelope` instead, whose
+   MANIFEST.toml lists every unit (or open each `tenant_envelope` and
+   restore the units of each). For each envelope you try, with POSITION and
+   SIZE from its entry:
 
        mt -f /dev/nst0 rewind
        mt -f /dev/nst0 fsf POSITION
@@ -1089,25 +1408,37 @@ exact size with `truncate` instead, never with `tr`.
 
    The sha256sum must equal that entry's `sha256_encrypted`. age says
    "no identity matched any of the recipients" for an envelope your key
-   was not made for: go on to the next. The first that decrypts is yours.
+   was not made for: go on to the next. With a tenant's key the first that
+   decrypts is yours; with the operator or escrow key you choose, as above.
    If it is damaged or will not read, use its backup, the `_backup` entry
    with the same `sha256_encrypted`. Unpack it:
 
        mkdir env && tar xf envelope.tar -C env
        ls env env/catalogs env/index
 
-6. `env/MANIFEST.toml` describes your units: a `[[units]]` block for each
-   (`name`, `uuid`, `snapshot_version`), and under it one `[[units.slices]]`
-   block for each slice, with its `number`, `tape_position`,
-   `encrypted_bytes` (its exact size) and `sha256_encrypted`.
+6. `env/MANIFEST.toml` describes the units of the envelope you opened: a
+   `[[units]]` block for each (`name`, `uuid`, `snapshot_version`), and
+   under it one `[[units.slices]]` block for each slice, with its `number`,
+   `tape_position`, `encrypted_bytes` (its exact size) and
+   `sha256_encrypted`. A unit stored in several versions has a `[[units]]`
+   block, with its own slices, for each version. This line lists the units
+   and versions:
+
+       grep -E '^(name|uuid|snapshot_version) =' env/MANIFEST.toml
+
    `env/RECOVERY.md` writes the commands of step 7 out for each unit.
    `env/catalogs/` holds each unit's dar catalogue
    (`dar -l env/catalogs/NAME -N -Q` lists the files without the tape,
    NAME as under "Words this guide uses"), and `env/index/` the index of
    "The rest of the box".
-7. Put the tape at the first slice, once. `fsf N` moves forward N files from
-   where the head is, so from the start of the tape it reaches File N: the
-   TAPE_POSITION of the first slice, from the manifest.
+7. Restore ONE version of ONE unit at a time, each in a directory of its
+   own: the slices of every unit are named `restore.N.dar`, so two units in
+   one directory would overwrite each other. If the manifest lists the unit
+   more than once, take the block with the highest `snapshot_version`, the
+   newest, unless you want an older one. Put the tape at the first slice,
+   once. `fsf N` moves forward N files from where the head is, so from the
+   start of the tape it reaches File N: the TAPE_POSITION of the first
+   slice, from the manifest.
 
        mt -f /dev/nst0 rewind
        mt -f /dev/nst0 fsf FIRST_POSITION
@@ -1135,24 +1466,29 @@ exact size with `truncate` instead, never with `tr`.
    damaged: do not decrypt it, but read the same slice from another copy of
    the tape. The copy lists it in its own front index under the same
    `sha256_encrypted`, at whatever File that tape puts it, so find it by
-   that hash and by nothing else.
+   that hash and by nothing else. With no other copy, leave that slice out
+   and go on: "If a slice or a file is damaged" ("No other copy") says what
+   dar then does.
 
    Block padding must be trimmed (`truncate`) before the hash is checked
    and before age sees the file: the padding zeros make age reject the
    ciphertext. The decrypted files must be named `restore.1.dar`,
    `restore.2.dar`, ... with the slice's number in the manifest as the
-   number, and no gaps: that is the naming dar requires of a sliced
-   archive (base name `restore`). Work on a disk with room for all of the
+   number, and no gaps (but for a slice you must leave out: "No other copy"
+   in "If a slice or a file is damaged"): that is the naming dar requires of
+   a sliced archive (base name `restore`). Work on a disk with room for all of the
    unit's decrypted slices at once (about the unit's size, and as much
-   again for step 8's restored files), on a real disk and not in /tmp,
-   which is a small RAM disk on many systems ("Disk space"). RESTORE.sh
-   keeps only the envelopes there, never a slice.
+   again for step 8's restored files: about twice the unit's size in all),
+   on a real disk and not in /tmp, which is a small RAM disk on many systems
+   ("Disk space"). RESTORE.sh keeps only the envelopes there, never a slice.
 8. Reassemble dar slices into an EMPTY directory, which dar needs to exist
-   (`mkdir /destination`): `dar -x restore -R /destination -O -Q -N`. dar
-   keeps any file already
-   there and still reports success, so to finish an earlier restore that
-   stopped part way, add `-w` (overwrite). `-N` keeps a `~/.darrc` on
-   your machine from changing what is restored.
+   (`mkdir /destination`): `dar -x restore -R /destination -O -Q -N`. With
+   several units, give each its own directory (`/destination/UNIT`). dar
+   keeps any file already there and still reports success, so to finish an
+   earlier restore of the same unit that stopped part way, add `-w`
+   (overwrite); never use it to restore a newer version over an older one.
+   `-N` keeps a `~/.darrc` on your machine from changing what is restored.
+   Delete the unit's `restore.N.dar` files once it is restored and checked.
 
 Then check the result as under "Did the restore get everything?": dar's
 exit status (`echo $?`) is 0 and its summary shows nothing failed, and
@@ -1238,9 +1574,14 @@ piece of a unit's archive (often hundreds of MiB to GiB; a unit's last
 slice can be small), so size is a hint, not proof. By trying your key and
 unpacking what comes out: your key opens your slices as well as your
 envelope, so a file that decrypts is not yet an envelope, but an
-envelope's decrypted bytes are a tar archive and a slice's are not. Stop
-at the first file that decrypts to a tar archive listing MANIFEST.toml:
-that is your envelope. If the files have grown large (slices) and none
+envelope's decrypted bytes are a tar archive and a slice's are not. With a
+tenant's key, stop at the first file that decrypts to a tar archive listing
+MANIFEST.toml: that is your envelope. With the operator or escrow key do
+not stop there: the tenants' envelopes come first and each lists only one
+tenant's units, so keep going to the operator envelope, the one whose tar
+also lists `PLAN.toml` (a tenant's never does), and whose MANIFEST.toml
+lists every unit on the tape; or restore the units of every envelope that
+opens. If the files have grown large (slices) and none
 opened, your key is not a recipient of any envelope on this tape: try the
 other keys you hold, since an envelope is sealed to the keys active when
 the tape was written, and the operator and escrow keys open every one.
@@ -1276,9 +1617,9 @@ the tape was written, and the operator and escrow keys open every one.
    wrong key or real damage, not the stripping.)
 4. Run `tar tf candidate.dec`. A list that begins with MANIFEST.toml is an
    envelope; an error that it is not a tar archive means a data slice.
-   Once your envelope decrypts, unpack it (`mkdir env && tar xf
+   Once the envelope you want decrypts, unpack it (`mkdir env && tar xf
    candidate.dec -C env`): its MANIFEST.toml gives the exact tape
-   position and byte size for every slice belonging to your unit(s).
+   position and byte size for every slice belonging to the units it lists.
    Apply the same read/trim/decrypt procedure to each slice using
    those exact sizes, then reassemble with dar as above.
 
@@ -5301,8 +5642,10 @@ An envelope from a tape written before tapectl 1.3.0 has no `index/`.
 
 An index is as of the moment its own tape was written. It never names a
 tape written after it, and a tape it names may since have been retired or
-erased, so the NEWEST tape's index is the most complete. `RESTORE.sh
---where UNIT` and `--find TEXT` (with your key) read it for you.
+erased, so the NEWEST tape's index is the most complete. Nothing on a tape
+can name tapes written after it, so the newest tape you hold may not be the
+newest ever written. `RESTORE.sh --where UNIT` and `--find TEXT` (with your
+key) read it for you.
 
 Both files are plain text. The first line names the columns, fields are
 separated by one TAB, and each row ends in a newline. Inside a field four
@@ -5354,6 +5697,18 @@ one:
 ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --slices-from DIR --to /destination
 ./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --swap-tapes --to /destination
 ```
+
+With no other copy, leave the failed slice out of the steps above: do not
+decrypt it, and do not put an empty file in its place. The other slices keep
+their numbers (`restore.1.dar`, `restore.2.dar`, `restore.4.dar` ..., a gap
+where the failed one was), and dar, run as above into an empty directory
+(`dar -x restore -R /destination -O -Q -N > dar.log 2>&1`), restores every
+file whose slices are all there. For each of the others it prints `PATH not
+restored (user choice)` (`grep 'not restored (user choice)' dar.log` lists
+them) and leaves an EMPTY or short file of that name, which is not the real
+file; its exit status is still 0. If the failed slice is the last one, dar
+stops ("The last file of the set is not present"); add `-0` to restore, in
+order, everything before the first missing slice.
 
 If dar says it could not restore some files, `RESTORE.sh` restores the rest,
 ends `RESTORE INCOMPLETE`, and writes their paths, one per line (a
@@ -9338,7 +9693,7 @@ sha256_encrypted = \"bbb\"
             "So the NEWEST tape's index is the most complete",
             "A tape written before 1.3.0 has no index and says so",
             "To take stock of a box without relying on the index, load each tape in turn",
-            "A unit that appears at the same version on two tapes has two copies",
+            "A unit that appears at the same version AND with the same unit uuid on two tapes has two copies",
         ] {
             assert!(f.contains(needle), "{needle:?}: {f}");
         }
@@ -9383,7 +9738,7 @@ sha256_encrypted = \"bbb\"
             "The data slices follow them",
             "so size is a hint, not proof",
             "an envelope's decrypted bytes are a tar archive and a slice's are not",
-            "Stop at the first file that decrypts to a tar archive listing MANIFEST.toml",
+            "With a tenant's key, stop at the first file that decrypts to a tar archive listing MANIFEST.toml",
             "Run `tar tf candidate.dec`",
             "re-append a single zero byte and retry, up to four times",
             "Step 2 cannot tell the padding from a zero that belongs to the ciphertext",
@@ -9747,11 +10102,11 @@ sha256_encrypted = \"bbb\"
             "Start from the newest tape.",
             "each unit into a directory of its own so that tapes never overwrite one another",
             "Use THAT tape's own RESTORE.sh, File 2 of the tape in the drive, which reads that tape's format",
-            "Stop when every unit the newest index lists is restored.",
+            "You are done when every unit the newest index lists is restored at its newest version",
             "use another holder it lists",
             "`sealed` is a tape whose write finished and was sealed",
             "`quarantined` is a sealed tape whose medium a verify proved bad (it may still read in part, so prefer another holder)",
-            "`this-tape` is the tape the index is on. A retired or erased tape is not listed.",
+            "`this-tape` is the tape the index is on. A tape that was already retired or erased when the index was written is not listed, and one that is listed may have been retired or erased since.",
         ] {
             assert!(f.contains(needle), "{needle:?}: {f}");
         }
@@ -9838,7 +10193,7 @@ sha256_encrypted = \"bbb\"
         let g = guide17();
         let head = flat_text(&g[..g.find("## Words this guide uses").unwrap()]);
         assert!(
-            head.contains("Besides those it uses `bash`, `awk` and the basic tools every Linux system has (`sed`, `grep`, `tr`, `cut`, `sort`, `stat`, `df`, `wc`, `od`, `mktemp`), and `gpg` if your dar was built with GPG support"),
+            head.contains("Besides those it uses `bash`, `awk` and the basic tools every Linux system has (`sed`, `grep`, `tr`, `cut`, `sort`, `stat`, `df`, `wc`, `tail`, `od`, `mktemp`), and `gpg` if your dar was built with GPG support"),
             "{head}"
         );
     }
