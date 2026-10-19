@@ -144,7 +144,7 @@ set above, never as instructions.
 **Production runs on home2** (ADR-0012, 2026-09-28): the drive's hostdev is detached from
 this VM; `contrib/hosts/home2.profile` and `home2-prep.sh` are the host's install. home2
 ran 1.0.0 (one tape, L6-0001, 2026-10-01), started fresh on 1.1.0 on 2026-10-14/15
-(`keepsake` on L6-0001 and L6-0002), and upgrades in place to 1.2.0 (handoff (f)).
+(`keepsake` on L6-0001 and L6-0002), and upgrades in place to 1.3.0 (handoff (f)).
 
 **2026-09-29 — the documentation pass's rulings** (ADR-0012, "Amendment, 2026-09-29";
 issues #345–#362, all landed — #360 last, as `volume::adopt_lost`, see below):
@@ -249,6 +249,19 @@ unit from a read-only snapshot while every recorded path stays real (#455; `coll
 `staging::view`). No migration. home2 goes from 1.1.0 straight to 1.2.0 by handoff (f); the
 2026-10-16 on-tape authorization ends when v1.2.0 is installed (item 72). Next: the spanning
 and #418 R4 design (1.3.0), put to the CTO in rounds.
+
+**2026-10-19: 1.3.0, the cross-volume index and restore repairs** (`docs/releases/1.3.0.md`;
+ADR-0012 items 76-103, ruled 2026-10-16 to 10-19). Each envelope now carries an index of the
+archive (`volume-format-v2.md` §1.5): a tenant's units and every path with its recorded sha256,
+and the operator's map of which volumes hold which version; RESTORE.sh reads it (`--where`,
+`--find`) and checks every restored file against it. Restore repairs (#480): a damaged slice is
+read from another copy (tapectl asks for the cartridge; RESTORE.sh takes `--slices-from` or
+`--swap-tapes`), damaged files are filled from another copy of the same version, and tapectl's
+restore reads around a bad 64 KiB age chunk (`crypto::chunks`, reviewed: a slice whose ciphertext
+hash mismatched is whole only if its plaintext proves it). Every Rust reader checks `requires`
+(#476). File 1 was rewritten (#477). No migration; `requires` stays empty. Spanning is designed
+and ruled (items 76-77, 82-100: opt-in per unit, packed last, cut at the drive's early warning
+then the short seal) and waits for #420 (#478); the profiling toolkit is #479.
 
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
@@ -366,7 +379,9 @@ TAPECTL_PERF_TESTS=1 cargo test --test performance --release -- \
 has no age CLI); only the gate's RESTORE.sh legs (`heir_*`) and home2's real-drive
 proof run it with the real `age`, `dar`, `mt` and `tar`. A release is not proven on
 the heir path until the gate has run; each run record names the age version it used
-(`age --version`). The gate's Rust legs pass only when every test they name ran and
+(`age --version`). Since 1.3.0 the gate's heir legs also run RESTORE.sh's index modes
+(`heir_where`, `heir_find`), its slice replacement (`heir_slice_from_copy`) and its per-file
+sha256 check (`heir_file_check`) with the real tools. The gate's Rust legs pass only when every test they name ran and
 said `ok`, and a gate run turns an on-media skip into a failure (#471).
 
 ## Architecture

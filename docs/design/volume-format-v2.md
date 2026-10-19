@@ -371,6 +371,12 @@ tape carries it twice, §1.3).
 - RESTORE.sh: `--where UNIT` prints the rows of `units.tsv` for a unit (every version and the
   tapes holding it); `--find PATH` prints the rows of `paths.tsv` whose path contains the text
   given, with the holders of each match. Both read the envelopes the key opens.
+- RESTORE.sh `--restore` and `--fill-from`: after each unit is extracted, read the `sha256`
+  column of the `paths.tsv` of the tenant envelope that lists the unit and version (an escrow or
+  operator key finds it among the envelopes the walk opened; the operator envelope has none), check
+  each restored regular file with `sha256sum`, and put a mismatch, or a listed file that is
+  missing, on the damaged-file list (§1.6; ADR-0012 item 103). A file with an empty `sha256` is not
+  checked; a tape with no index is not checked at all. `--no-file-check` skips it.
 - `catalog rebuild --from-volume` reads the operator envelope's `units.tsv` and reports the
   volumes it names that the catalog lacks, as a to-do list for disaster recovery. It never
   creates a row from it (item 78; ADR-0001: a claim about a tape needs contact with that tape).
