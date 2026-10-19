@@ -749,7 +749,8 @@ read without a drive and one working setup; after a failed `dd`, a rewind and `f
 wanted position; glossary entries "Index" and "Catalogue" and the placeholders `OPERATOR_NAME` and
 `FIRST_TAPE_POSITION`; and "tapectl itself" sends the heir to the Heir Kit's copy of the program
 first (a kit made by 1.5.0 or later carries `tapectl-<version>`, named on its cover sheet with its
-sha256). "Start here" may run to 64 lines.
+sha256). After the sixth read, "done" also checks the Heir Kit's catalogue, and a unit whose
+every copy is damaged has a done state. "Start here" may run to 64 lines.
 
 ## 7. Block mode
 

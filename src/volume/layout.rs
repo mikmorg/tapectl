@@ -681,9 +681,9 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
 
 1. Check your key: "Which file is your key". A tenant's key opens that
    tenant's units only; the operator key and the escrow key open every
-   tenant's. Check it against the cover sheet's `age1...` line
-   (`age-keygen -y`); with only a key file, the check is that it opens an
-   envelope (`--find-envelope`, step 5).
+   tenant's. With `age` installed (step 2), check it against the cover
+   sheet's `age1...` line (`age-keygen -y`); with only a key file, the
+   check is that it opens an envelope (`--find-envelope`, step 5).
 2. Get a drive that reads this tape and a computer it connects to: "The
    tape drive" and "Loading the tape, and a drive that does not show up".
    The programs it needs, with their package names: "Tools Required".
@@ -715,25 +715,25 @@ Unit, envelope, index, cover sheet: "Words this guide uses" says what each is.
    ("The rest of the box").
 6. Restore. From one tape with the escrow or operator key, `--all` restores
    every unit on it ("Automated Recovery (recommended)"); check that it did
-   (item 4 of "Did the restore get everything?"). From several
-   tapes, restore each unit's NEWEST version once, from a tape that holds
-   it, into a directory of its own (`/destination/UNIT`), with that tape's
-   own RESTORE.sh, and never an older version first ("The rest of the
-   box"). A renamed unit has the name each tape shows. Two units of one
-   name (compare the uuids `--where --all` prints) go in different
-   directories: `/destination/UNIT-` and the first 8 characters of the uuid.
+   (item 4 of "Did the restore get everything?"). From several tapes,
+   restore each unit's NEWEST version once, from a tape that holds it, into
+   a directory of its own (`/destination/UNIT`), with that tape's own
+   RESTORE.sh, saved as `RESTORE-<label>.sh`, and never an older version
+   first ("The rest of the box" says how to do both). A renamed unit has
+   the name each tape shows. Two units of one name (compare the uuids
+   `--where --all` prints) go in different directories:
+   `/destination/UNIT-` and the first 8 characters of the uuid.
 7. Check each restore: "Did the restore get everything?". A slice or a file
    that is damaged: "If a slice or a file is damaged".
 8. Know when you are done: every tape you hold opened with your key and
    the newest version of every unit any of them lists restored; every
-   unit `--where --all` names on the newest readable index restored, or
-   named as held only on tapes you do not have; and any tape your key
-   cannot open named, never counted as looked at. That is done over the
-   tapes you hold: no tape names one written after it, and a tape from
-   before 1.3.0 has no index to check against. "The rest of the box" has
-   the whole rule and what a box cannot show you. With nobody left to ask,
-   the Heir Kit's catalogue may name tapes the index cannot: "The Heir
-   Kit's catalogue".
+   unit `--where --all` names on the newest readable index, and every unit
+   the Heir Kit's catalogue lists on a sealed tape, restored or named as
+   held only on tapes you do not have; and any tape your key cannot open
+   named, never counted as looked at. No tape names one written after it,
+   and a tape from before 1.3.0 has no index: a kit made later can name
+   such tapes ("The Heir Kit's catalogue"). "The rest of the box" has the
+   whole rule, a damaged unit's place in it, and what a box cannot show.
 
 No RESTORE.sh or tools: "Manual Recovery Steps" does the same job by hand.
 The tape's map is lost: "If All Else Fails". A slice damaged in the middle,
@@ -857,7 +857,9 @@ An age identity file is a text file with a line `AGE-SECRET-KEY-1...`
 `#` comment lines, which do no harm). That line is the SECRET half, and the
 only thing that decrypts. A line `age1...` is the PUBLIC half (a recipient): it names who a
 file was encrypted for and decrypts nothing, so a file holding only that is
-not a key. If you copied a secret by hand, check the copy: type the line
+not a key. After `AGE-SECRET-KEY-1` the letters B, I, O and the digit 1
+never occur, so a doubtful character on paper is one of the others. If
+you copied a secret by hand, check the copy: type the line
 alone into a file and run `age-keygen -y YOUR_KEY.age.key`; it prints the
 public `age1...` that goes with it, which must equal the one on the cover
 sheet or record you have. A character miscopied is refused with "invalid
@@ -1088,8 +1090,11 @@ Recovery Steps":
     truncate -s SIZE envelope.raw
     age -d -i YOUR_KEY.age.key envelope.raw | tar -xOf - MANIFEST.toml | grep -E '^(name|snapshot_version|dar_command) ='
 
-It prints each unit's name and version with its `dar_command`. If the
-envelope will not read, use its backup (step 5 of "Manual Recovery Steps").
+It prints each unit's name and version with its `dar_command`. Without the
+last `grep` it prints the whole MANIFEST.toml: every unit with its uuid,
+its slices and their tape files, which is what the other places in this
+guide that unpack the operator envelope by hand read. If the envelope will
+not read, use its backup (step 5 of "Manual Recovery Steps").
 
 "Three times" is a rule of thumb for mixed files, not a ceiling: text,
 source code, logs and database dumps compress ten times or more, so a
@@ -1178,6 +1183,11 @@ default mode, where `dd bs=512k` reads each 512 KiB block whole). If a
   cleaning cartridge is the usual cure), or a damaged tape. Rewind and try
   again, then another drive, and then the other copies of the tape, before
   you decide anything is lost.
+
+Reading a whole tape takes hours, and the drive shows little while it
+works: a full LTO-6 tape reads in about four and a half hours (2.5 TB at
+about 160 MB/s), a full LTO-8 in about nine. `--verify` and `--all` read
+the whole tape; a restore of one unit reads only that unit's slices.
 
 Then, with `YOUR_KEY.age.key` your own key file:
 
@@ -1318,7 +1328,8 @@ your newest tape was written may name tapes this box lacks.
 The whole box, in short:
 
 1. Name every cartridge. Load each in turn and run `./RESTORE.sh --info`
-   (any copy of RESTORE.sh will do for this: see the end of this list):
+   (any copy of RESTORE.sh will do for this: see "The modes that only read
+   the tape", after this list):
    its label is "Tape identifies as" (File 0's label is the authority; a
    sticker on the case can have been replaced) and its sealed date is
    "Sealed at" (`unknown (tape not sealed)` there means the tape is
@@ -1365,6 +1376,20 @@ The whole box, in short:
    - Every unit the newest readable index names (`--where --all`) is
      restored at its newest version, or you have written down that it is
      held only on tapes you do not have.
+   - With a Heir Kit: every unit the Heir Kit's catalogue lists on a tape
+     whose status is `sealed` ("Which tapes hold which units", in "The
+     Heir Kit's catalogue") is restored at the newest version the kit
+     names, or you have written down that it is held only on tapes you do
+     not have. A kit made after your newest tape is the one thing you hold
+     that can name a tape written after it, so the two checks above do not
+     cover this one.
+   - A unit whose every copy in the box is damaged counts once it is
+     restored as far as its copies allow ("If a slice or a file is
+     damaged": RESTORE.sh, then tapectl's own restore, which saves more of
+     a damaged slice), its `.tapectl-damaged-files.txt` is kept beside it,
+     and you have written down that the files on that list are lost. An
+     older version, restored into a directory of its own, may hold older
+     copies of them.
    - A tape your key cannot open is NOT done. `./RESTORE.sh` ends with "no
      envelope matched the key provided" (or "any of the N keys provided"), and
      `--info`, which needs no key, shows only the tape's label, dates and
@@ -1431,7 +1456,8 @@ A unit stored without its dar catalogue has no `catalogs/` name to read:
 "Manual Recovery Steps" (step 6) reads it from an unpacked envelope, each
 unit's `name` beside its `uuid`; with an escrow or operator key
 `--find-envelope` prints only a table of units (see "Tools Required"), so
-unpack the operator envelope by hand, or take the uuid from `--where --all`.
+take the uuid from `--where --all`, or print the operator envelope's
+MANIFEST.toml ("The short way", in "Compressed units").
 
 **Two units of one name.** A name is unique inside one installation's
 catalogue, but it can recur across tapes: a unit renamed and its old name
@@ -1475,7 +1501,7 @@ data that is gone. So match a tape to an index row by its label AND its
 uuid (`--where` prints the uuid; File 0 shows it):
 
     mt -f /dev/nst0 rewind
-    dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(label|uuid|media_type|cartridge_serial|created_at) ='
+    dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(label|uuid|media_type|cartridge_serial|created_at|tapectl_version) ='
 
 To take stock of a box without relying on the index, load each tape in
 turn, run `./RESTORE.sh --info` (its label and when it was sealed) and
@@ -1524,7 +1550,7 @@ Which tapes hold which units, version by version. To look for one unit,
 add `AND u.name LIKE '%word%'` before `ORDER BY`; for one tape, add `AND
 v.label = 'TAPE'`:
 
-    sqlite3 -header -column catalog.db "SELECT u.name AS unit, s.version,
+    sqlite3 -header -column catalog.db "SELECT u.name AS unit, u.uuid, s.version,
       v.label AS tape, v.status, v.observed_condition AS condition
       FROM writes w
       JOIN stage_sets ss ON ss.id = w.stage_set_id
@@ -1542,7 +1568,8 @@ never finished, or that tapectl did not write: count on nothing from it.
 `tape` is the tape's label, the one File 0 shows. The sticker is the barcode
 on the cartridge, which can have been replaced; the chip serial is File 0's
 `cartridge_serial`. A unit is listed by the name it had on the day the kit
-was made ("A renamed unit", in "The rest of the box"). If a query fails
+was made ("A renamed unit", in "The rest of the box"), beside its uuid,
+which `--where --all` prints as "unit uuid": match a unit by its uuid. If a query fails
 because a table or column is missing, the kit came from another tapectl
 release: `sqlite3 catalog.db .schema` shows the tables it has.
 
@@ -1594,15 +1621,17 @@ marker's copy of it, with a warning (rung 2 of "If All Else Fails").
   RESTORE.sh stops at the first slice that fails its check and says which.
   `--all` restores the units in their order on the tape, so it stops there
   too: the units before that one are restored, that unit and every unit
-  after it are not. Restore those after it with `--unit` (repeat it for
-  several) into another empty directory, and the damaged one as below.
+  after it are not. Restore each unit after it in a run of its own,
+  `--unit UNIT --to /destination/UNIT` (as in item 4 of "Did the restore
+  get everything?"), and the damaged one as below.
   Look for another copy first ("The rest of the box"; "If a slice or a
   file is damaged" says how RESTORE.sh takes the failed slice from it); a
   cartridge that failed here may read in another drive. With no other copy,
   the slices that did PASS are intact, and the files that lie wholly
-  inside them can be restored by hand: "If a slice or a file is damaged"
-  has the commands under "No other copy". The files in the failed slices
-  are lost.
+  inside them can still be restored: RESTORE.sh does it (`--swap-tapes`,
+  then type `done`), and "No other copy", in "If a slice or a file is
+  damaged", has that and the commands by hand. The files in the failed
+  slices are lost.
 
 ## Did the restore get everything?
 
@@ -1642,7 +1671,10 @@ A restore went right only if all of these hold:
 
    That number should equal the "inode(s) restored" figure of a whole-unit
    restore. For a few files, compare their sizes and a checksum with any
-   record of your own.
+   record of your own. A unit stored without its dar catalogue has no
+   listing (`--list` says "no dar catalogue"): for it, items 1 and 2 are
+   the check, with RESTORE.sh's sha256 check of every file on a tape
+   written since 1.3.0 ("A file fails its hash").
 4. After `--all`, every unit of the tape was restored, not only one
    envelope's. `--all` restores the units of ONE envelope, the one that
    lists the most: with the escrow or operator key that is the operator
@@ -1650,8 +1682,10 @@ A restore went right only if all of these hold:
    envelope and its backup will not read it is a tenant's, and only that
    tenant's units are restored, while items 1 to 3 still pass. Every unit
    that `./RESTORE.sh --find-envelope --key YOUR_KEY.age.key` lists, under
-   any envelope, must be a directory of the `--all` destination. Restore each one that is not in a run of its own,
-   `./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to
+   any envelope, must be a directory of the `--all` destination (a tape of
+   one unit puts that unit's files in the destination itself, and that is
+   the unit's directory). Restore each one that is not in a run of its
+   own, `./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to
    /destination/UNIT` (the script finds the envelope that lists it), and
    check that run the same way.
 
@@ -1664,7 +1698,11 @@ everything under a directory you asked for; "inode(s) ignored (excluded by
 filters)" then counts every other inode of the unit, which is expected and
 not a failure. What to check there is that "failed to restore" and "not
 restored" are 0, and that "restored" is the number of inodes you asked
-for, the path and the directories above it.
+for, the path and the directories above it. `--fill-from` restores only
+the files on its list, and a `--swap-tapes` restore where you typed `done`
+leaves out the files of the missing slices, so lines after the first are
+above 0 there by design: check instead that every file it did not restore
+is on `.tapectl-damaged-files.txt` (item 1).
 
 ## If a slice or a file is damaged
 
@@ -1806,8 +1844,12 @@ file named `tapectl-` and its version, `tapectl-X.Y.Z` below (such as
 the file against the sheet with `sha256sum`) and says it is for Linux on
 one machine type (`uname -m` says yours). It needs no building: run it as
 `./tapectl-X.Y.Z` wherever this section says `tapectl`, after
-`./tapectl-X.Y.Z --version` has shown it starts. Its release must be File 0's `tapectl_version` or newer; a kit made
-before the tape was written can hold an older one. With no kit, a copy that
+`./tapectl-X.Y.Z --version` has shown it starts. Copy it to a Linux disk
+first and run `chmod +x` on it: from a USB stick formatted FAT or exFAT,
+or mounted `noexec`, it answers "Permission denied". Its release must be
+File 0's `tapectl_version` or newer (the `grep` of File 0 in "The rest of
+the box" prints it); a kit made before the tape was written can hold an
+older one. With no kit, a copy that
 is too old, or one that will not run on your machine, read on.
 
 tapectl is open-source software, and its source is at
@@ -1829,10 +1871,11 @@ network connection to download its libraries, and `dar`, `mt-st` and
 Then use it in a new home made for this recovery: set the environment
 variable `TAPECTL_HOME` to an empty directory once (`export
 TAPECTL_HOME=/recovery/tapectl-home`), or give `--home DIR` right after
-`tapectl` on each command. ESCROW_PUBLIC is the `age1...` line of the cover
-sheet, the escrow key's public half (with only the key file, `age-keygen -y
-escrow.key` prints it), and YOUR_KEY.age.key is your key file, the escrow
-key's included:
+`tapectl` on each command; under `sudo`, which drops the variable, give
+`--home DIR`. ESCROW_PUBLIC is the `age1...` line of the cover sheet, the
+escrow key's public half (with only the key file, `age-keygen -y
+YOUR_KEY.age.key` prints it), and YOUR_KEY.age.key is your key file, the
+escrow key's included:
 
     tapectl init --operator OPERATOR_NAME --escrow-public-key ESCROW_PUBLIC
     tapectl catalog rebuild --from-volume --device /dev/nst0 --key YOUR_KEY.age.key
@@ -1841,9 +1884,10 @@ key's included:
 `init` makes the home and registers the escrow PUBLIC key, which decrypts
 nothing; run it once. OPERATOR_NAME is the operator's name where you know it
 (the Heir Kit's catalogue has it: `sqlite3 catalog.db "SELECT name FROM
-tenants WHERE is_operator = 1;"`); otherwise leave `--operator` off and
-`init` names the operator after your login, because the rebuild takes the
-tenants' names from the tape. `catalog rebuild` reads the loaded tape and
+tenants WHERE is_operator = 1;"`); otherwise give any name, your own say,
+because the rebuild takes the tenants' names from the tape. (Run as an
+ordinary user, `init` without `--operator` names the operator after your
+login; run as root, under `sudo`, it refuses without one.) `catalog rebuild` reads the loaded tape and
 puts what it says into tapectl's own catalogue (its database, in the new
 home); run it once for each tape. `restore unit`
 restores the newest version of a unit on the loaded tape into an empty
@@ -11015,7 +11059,7 @@ sha256_encrypted = \"bbb\"
             "check that it did (item 4 of \"Did the restore get everything?\")",
             "Start from the NEWEST tape",
             "`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` shows, for a unit, every version and every tape that holds it",
-            "restore each unit's NEWEST version once, from a tape that holds it, into a directory of its own (`/destination/UNIT`), with that tape's own RESTORE.sh, and never an older version first",
+            "restore each unit's NEWEST version once, from a tape that holds it, into a directory of its own (`/destination/UNIT`), with that tape's own RESTORE.sh, saved as `RESTORE-<label>.sh`, and never an older version first",
             "Check each restore: \"Did the restore get everything?\"",
             "Know when you are done",
             "\"Manual Recovery Steps\" does the same job by hand",
@@ -11206,7 +11250,7 @@ sha256_encrypted = \"bbb\"
         let g = guide17();
         let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
         assert!(
-            verdict.contains("the files that lie wholly inside them can be restored by hand: \"If a slice or a file is damaged\" has the commands under \"No other copy\""),
+            verdict.contains("the files that lie wholly inside them can still be restored: RESTORE.sh does it (`--swap-tapes`, then type `done`), and \"No other copy\", in \"If a slice or a file is damaged\", has that and the commands by hand"),
             "{verdict}"
         );
         assert!(
@@ -11457,7 +11501,7 @@ sha256_encrypted = \"bbb\"
             "A tape that was already retired or erased when the index was written is not listed, and one that is listed may have been retired or erased since",
             "A cartridge that was erased and written again carries a NEW volume: File 0 then shows another label and another `uuid` on the same `cartridge_serial`, and the index row for the old volume names data that is gone",
             "So match a tape to an index row by its label AND its uuid (`--where` prints the uuid; File 0 shows it)",
-            "dd if=/dev/nst0 bs=512k | tr -d '\\0' | grep -E '^(label|uuid|media_type|cartridge_serial|created_at) ='",
+            "dd if=/dev/nst0 bs=512k | tr -d '\\0' | grep -E '^(label|uuid|media_type|cartridge_serial|created_at|tapectl_version) ='",
             "A unit that appears at the same version AND with the same unit uuid on two tapes has two copies",
             "A name and a version number alone prove nothing",
         ] {
@@ -11484,7 +11528,7 @@ sha256_encrypted = \"bbb\"
             "The rest of the box: other tapes, copies and the index",
         ));
         for needle in [
-            "(any copy of RESTORE.sh will do for this: see the end of this list)",
+            "(any copy of RESTORE.sh will do for this: see \"The modes that only read the tape\", after this list)",
             "The modes that only read the tape (`--info`, `--verify`, `--find-envelope`, `--list`, `--where`, `--find`) describe the tape that is in the drive, whichever tape's RESTORE.sh runs them (`--where` and `--find` need the script of a tape written by tapectl 1.3.0 or later; an older one answers `Unknown mode`)",
             "it is only a reminder that the script was written for another volume",
             "the `Tape identifies as:` line, which every mode prints, is that tape's own label; the heading `--verify` prints names the script's volume, but it checks the tape in the drive",
@@ -11632,7 +11676,7 @@ sha256_encrypted = \"bbb\"
             "If the newest tape in the box will not read, the older tapes' indexes cannot see what was written after them: say that some units may be unknown",
             "The newest version of a unit holds the files that version had. A file deleted before it was made exists only in an older version, so restore an older version (`--version N`, into a directory of its own) only if you want such files",
             "(`unknown (tape not sealed)` there means the tape is unsealed: File 0's `created_at`, from the `grep` below, says when it was written)",
-            "grep -E '^(label|uuid|media_type|cartridge_serial|created_at) ='",
+            "grep -E '^(label|uuid|media_type|cartridge_serial|created_at|tapectl_version) ='",
         ] {
             assert!(bx.contains(needle), "{needle:?}: {bx}");
         }
@@ -11641,7 +11685,7 @@ sha256_encrypted = \"bbb\"
         let start = flat_text(guide_section(&g, "Start here"));
         for needle in [
             "Know when you are done: every tape you hold opened with your key and the newest version of every unit any of them lists restored",
-            "every unit `--where --all` names on the newest readable index restored, or named as held only on tapes you do not have",
+            "every unit `--where --all` names on the newest readable index, and every unit the Heir Kit's catalogue lists on a sealed tape, restored or named as held only on tapes you do not have",
             "any tape your key cannot open named, never counted as looked at",
         ] {
             assert!(start.contains(needle), "{needle:?}: {start}");
@@ -11994,12 +12038,23 @@ sha256_encrypted = \"bbb\"
         // version on each tape that holds it, the erased tape marked.
         let mut stmt = conn.prepare(&sqls[1]).unwrap();
         let cols: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
-        assert_eq!(cols, ["unit", "version", "tape", "status", "condition"]);
+        assert_eq!(
+            cols,
+            ["unit", "uuid", "version", "tape", "status", "condition"]
+        );
         let rows: Vec<(String, i64, String, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .query_map([], |r| Ok((r.get(0)?, r.get(2)?, r.get(3)?, r.get(4)?)))
             .unwrap()
             .collect::<std::result::Result<_, _>>()
             .unwrap();
+        // The uuid beside each name (#485, the sixth read): a renamed unit is
+        // matched to `--where --all`'s "unit uuid" by it.
+        let uuids: Vec<String> = stmt
+            .query_map([], |r| r.get(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(uuids.iter().all(|u| u.len() == 36), "{uuids:?}");
         assert_eq!(
             rows,
             [
@@ -12031,7 +12086,7 @@ sha256_encrypted = \"bbb\"
         // The Start here and glossary point at it.
         let start = flat_text(guide_section(&g, "Start here"));
         assert!(
-            start.contains("With nobody left to ask, the Heir Kit's catalogue may name tapes the index cannot: \"The Heir Kit's catalogue\""),
+            start.contains("every unit the Heir Kit's catalogue lists on a sealed tape, restored or named as held only on tapes you do not have"),
             "{start}"
         );
         let words = flat_text(guide_section(&g, "Words this guide uses"));
@@ -12370,7 +12425,7 @@ sha256_encrypted = \"bbb\"
         let start = flat_text(guide_section(&g, "Start here"));
         assert!(
             start.contains(
-                "(\"The rest of the box\"). A renamed unit has the name each tape shows."
+                "(\"The rest of the box\" says how to do both). A renamed unit has the name each tape shows."
             ),
             "{start}"
         );
@@ -12537,7 +12592,7 @@ sha256_encrypted = \"bbb\"
         }
         for needle in [
             "YOUR_KEY.age.key is your key file, the escrow key's included",
-            "otherwise leave `--operator` off and `init` names the operator after your login, because the rebuild takes the tenants' names from the tape",
+            "otherwise give any name, your own say, because the rebuild takes the tenants' names from the tape. (Run as an ordinary user, `init` without `--operator` names the operator after your login; run as root, under `sudo`, it refuses without one.)",
             "The alternative, with the operator's key file",
         ] {
             assert!(f.contains(needle), "{needle:?}: {f}");
@@ -12568,7 +12623,7 @@ sha256_encrypted = \"bbb\"
         );
         let bx = box_section(&g);
         assert!(
-            bx.contains("(any copy of RESTORE.sh will do for this: see the end of this list)"),
+            bx.contains("(any copy of RESTORE.sh will do for this: see \"The modes that only read the tape\", after this list)"),
             "{bx}"
         );
     }
@@ -12683,7 +12738,7 @@ sha256_encrypted = \"bbb\"
         );
         let bx = box_section(&g);
         assert!(
-            bx.contains("with an escrow or operator key `--find-envelope` prints only a table of units (see \"Tools Required\"), so unpack the operator envelope by hand, or take the uuid from `--where --all`"),
+            bx.contains("with an escrow or operator key `--find-envelope` prints only a table of units (see \"Tools Required\"), so take the uuid from `--where --all`, or print the operator envelope's MANIFEST.toml (\"The short way\", in \"Compressed units\")"),
             "{bx}"
         );
         // The script: more than one envelope opened prints the table only.
@@ -12813,7 +12868,7 @@ sha256_encrypted = \"bbb\"
         let g = guide17();
         let start = flat_text(guide_section(&g, "Start here"));
         assert!(
-            start.contains("Check your key: \"Which file is your key\". A tenant's key opens that tenant's units only; the operator key and the escrow key open every tenant's. Check it against the cover sheet's `age1...` line (`age-keygen -y`); with only a key file, the check is that it opens an envelope (`--find-envelope`, step 5)"),
+            start.contains("Check your key: \"Which file is your key\". A tenant's key opens that tenant's units only; the operator key and the escrow key open every tenant's. With `age` installed (step 2), check it against the cover sheet's `age1...` line (`age-keygen -y`); with only a key file, the check is that it opens an envelope (`--find-envelope`, step 5)"),
             "{start}"
         );
     }
@@ -12830,8 +12885,8 @@ sha256_encrypted = \"bbb\"
         let start = flat_text(guide_section(&g, "Start here"));
         let step8 = &start[start.find("8. Know when you are done").unwrap()..];
         for needle in [
-            "That is done over the tapes you hold: no tape names one written after it, and a tape from before 1.3.0 has no index to check against",
-            "\"The rest of the box\" has the whole rule and what a box cannot show you",
+            "No tape names one written after it, and a tape from before 1.3.0 has no index: a kit made later can name such tapes (\"The Heir Kit's catalogue\")",
+            "\"The rest of the box\" has the whole rule, a damaged unit's place in it, and what a box cannot show",
         ] {
             assert!(step8.contains(needle), "{needle:?}: {step8}");
         }
@@ -12966,7 +13021,8 @@ sha256_encrypted = \"bbb\"
         for needle in [
             "The short way to the `dar_command` lines, with an escrow or operator key and no unpacking of the whole envelope. `--find-envelope` prints \"Decrypted envelope at file N (tenant: operator)\" for the operator envelope, the one that lists every unit; call that N POSITION below. Read File 3 into `front_index.toml` (step 3 of \"Manual Recovery Steps\") and run `grep -A3 '^position = POSITION$' front_index.toml`: the entry it prints has the `size_bytes` that is SIZE below",
             "mt -f /dev/nst0 rewind mt -f /dev/nst0 fsf POSITION dd if=/dev/nst0 bs=512k of=envelope.raw truncate -s SIZE envelope.raw age -d -i YOUR_KEY.age.key envelope.raw | tar -xOf - MANIFEST.toml | grep -E '^(name|snapshot_version|dar_command) ='",
-            "It prints each unit's name and version with its `dar_command`. If the envelope will not read, use its backup (step 5 of \"Manual Recovery Steps\")",
+            "It prints each unit's name and version with its `dar_command`. Without the last `grep` it prints the whole MANIFEST.toml",
+            "If the envelope will not read, use its backup (step 5 of \"Manual Recovery Steps\")",
             "text, source code, logs and database dumps compress ten times or more",
             "and nothing on the tape says how much more",
         ] {
@@ -13000,7 +13056,8 @@ sha256_encrypted = \"bbb\"
             "A kit made by tapectl 1.5.0 or later holds a copy of the program that made it, in the folder with `catalog.db.age`: a file named `tapectl-` and its version, `tapectl-X.Y.Z` below (such as `tapectl-1.5.0`)",
             "The cover sheet names it with its size and sha256 (check the file against the sheet with `sha256sum`) and says it is for Linux on one machine type (`uname -m` says yours)",
             "It needs no building: run it as `./tapectl-X.Y.Z` wherever this section says `tapectl`, after `./tapectl-X.Y.Z --version` has shown it starts",
-            "Its release must be File 0's `tapectl_version` or newer; a kit made before the tape was written can hold an older one",
+            "Copy it to a Linux disk first and run `chmod +x` on it: from a USB stick formatted FAT or exFAT, or mounted `noexec`, it answers \"Permission denied\"",
+            "Its release must be File 0's `tapectl_version` or newer (the `grep` of File 0 in \"The rest of the box\" prints it); a kit made before the tape was written can hold an older one",
             "With no kit, a copy that is too old, or one that will not run on your machine, read on",
         ] {
             assert!(sec.contains(needle), "{needle:?}: {sec}");
@@ -13203,6 +13260,75 @@ sha256_encrypted = \"bbb\"
         assert!(
             r.contains("If dar cannot read the catalogue at the end of the last slice, `-A catalogs/aaaaaaaa_v2` gives it this envelope's dar catalogue instead"),
             "{r}"
+        );
+    }
+
+    // ---- The sixth read (1.5.0, #485, ADR-0012 item 109): what it found ----
+
+    /// S1: "done" checks the Heir Kit's catalogue, the one thing an heir holds
+    /// that can name a tape written after the newest in the box; S2: a unit
+    /// whose every copy is damaged has a done state; and the minors that
+    /// changed what an heir types or where they look.
+    #[test]
+    fn reread7_done_checks_the_kit_and_has_a_place_for_a_damaged_unit() {
+        let g = guide17();
+        let bx = box_section(&g);
+        for needle in [
+            "With a Heir Kit: every unit the Heir Kit's catalogue lists on a tape whose status is `sealed` (\"Which tapes hold which units\", in \"The Heir Kit's catalogue\") is restored at the newest version the kit names, or you have written down that it is held only on tapes you do not have",
+            "A unit whose every copy in the box is damaged counts once it is restored as far as its copies allow",
+            "its `.tapectl-damaged-files.txt` is kept beside it, and you have written down that the files on that list are lost",
+            "|tapectl_version) =",
+        ] {
+            assert!(bx.contains(needle), "{needle:?}: {bx}");
+        }
+        let start = flat_text(guide_section(&g, "Start here"));
+        assert!(
+            start.contains(
+                "With `age` installed (step 2), check it against the cover sheet's `age1...` line"
+            ),
+            "{start}"
+        );
+        assert!(guide_section(&g, "Start here").lines().count() <= 64);
+        let kit = flat_text(guide_section(&g, "The Heir Kit's catalogue"));
+        assert!(
+            kit.contains("SELECT u.name AS unit, u.uuid, s.version"),
+            "{kit}"
+        );
+        assert!(kit.contains("match a unit by its uuid"), "{kit}");
+        let check = flat_text(guide_section(&g, "Did the restore get everything?"));
+        for needle in [
+            "(a tape of one unit puts that unit's files in the destination itself, and that is the unit's directory)",
+            "A unit stored without its dar catalogue has no listing",
+            "`--fill-from` restores only the files on its list, and a `--swap-tapes` restore where you typed `done` leaves out the files of the missing slices",
+        ] {
+            assert!(check.contains(needle), "{needle:?}: {check}");
+        }
+        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
+        assert!(
+            verdict.contains("Restore each unit after it in a run of its own, `--unit UNIT --to /destination/UNIT`"),
+            "{verdict}"
+        );
+        let words = flat_text(guide_section(&g, "Which file is your key"));
+        assert!(
+            words.contains(
+                "After `AGE-SECRET-KEY-1` the letters B, I, O and the digit 1 never occur"
+            ),
+            "{words}"
+        );
+        let itself = flat_text(guide_section(&g, "tapectl itself"));
+        for needle in [
+            "under `sudo`, which drops the variable, give `--home DIR`",
+            "`age-keygen -y YOUR_KEY.age.key` prints it",
+            "run as root, under `sudo`, it refuses without one",
+            "from a USB stick formatted FAT or exFAT, or mounted `noexec`, it answers \"Permission denied\"",
+        ] {
+            assert!(itself.contains(needle), "{needle:?}: {itself}");
+        }
+        assert!(!itself.contains("escrow.key"), "one name for the key file");
+        let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"));
+        assert!(
+            auto.contains("a full LTO-6 tape reads in about four and a half hours"),
+            "{auto}"
         );
     }
 }
