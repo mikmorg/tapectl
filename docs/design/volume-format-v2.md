@@ -354,6 +354,7 @@ in that tenant's `units.tsv`. Sorted by `unit`, `version`, then `path` (bytewise
 | `version` | the version's ordinal |
 | `kind` | `d` directory, `f` regular file, `l` symlink, `s` special (FIFO, socket, device) |
 | `size_bytes` | lstat's size; 0 for a directory |
+| `sha256` | the file's content hash as staging recorded it, 64 lowercase hex characters; empty for a directory, a symlink, a special file, or where none was recorded (1.3.0, ADR-0012 item 103: RESTORE.sh checks every restored regular file against it) |
 | `path` | relative to the unit's root, escaped as above |
 
 **Staleness.** An index is as of its own tape's write: it never names a tape written after it,
