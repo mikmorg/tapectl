@@ -8916,9 +8916,9 @@ sha256_encrypted = \"bbb\"
         generate_system_guide_v2_for_media("READ17", 30, "LTO-6")
     }
 
-    /// 1. `fsf` is relative: step 7 puts the tape at the first slice once and
-    /// shows the arithmetic for a gap, and no longer tells the reader to
-    /// `fsf` an absolute TAPE_POSITION from the middle of the tape.
+    // 1. `fsf` is relative: step 7 puts the tape at the first slice once and
+    // shows the arithmetic for a gap, and no longer tells the reader to
+    // `fsf` an absolute TAPE_POSITION from the middle of the tape.
     #[test]
     fn file_1_fix_1_fsf_is_relative_and_the_gap_arithmetic_is_shown() {
         let g = guide17();
@@ -8944,8 +8944,8 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// 2. /tmp: said once, in "Disk space", that it may be a small RAM disk and
-    /// TMPDIR moves the work directory; step 7 agrees and does not contradict.
+    // 2. /tmp: said once, in "Disk space", that it may be a small RAM disk and
+    // TMPDIR moves the work directory; step 7 agrees and does not contradict.
     #[test]
     fn file_1_fix_2_tmp_is_one_story() {
         let g = guide17();
@@ -8966,10 +8966,10 @@ sha256_encrypted = \"bbb\"
         assert!(manual.contains("RESTORE.sh keeps only the envelopes there, never a slice"));
     }
 
-    /// 3. The damaged-tape contradictions: (a) the front index lists the
-    /// slices an unsealed tape lacks; (b) a disagreement of the ends is
-    /// reconciled with "restoring is sound"; (c) an escrow-key holder is told
-    /// how to get the slice table; (d) RESTORE.sh's own fallback is stated.
+    // 3. The damaged-tape contradictions: (a) the front index lists the
+    // slices an unsealed tape lacks; (b) a disagreement of the ends is
+    // reconciled with "restoring is sound"; (c) an escrow-key holder is told
+    // how to get the slice table; (d) RESTORE.sh's own fallback is stated.
     #[test]
     fn file_1_fix_3_the_damaged_tape_sections_agree_with_themselves() {
         let g = guide17();
@@ -9012,8 +9012,8 @@ sha256_encrypted = \"bbb\"
         );
     }
 
-    /// 4. A restore with no --unit and no --all: one unit restores, several are
-    /// listed and refused, and "the largest envelope" is defined.
+    // 4. A restore with no --unit and no --all: one unit restores, several are
+    // listed and refused, and "the largest envelope" is defined.
     #[test]
     fn file_1_fix_4_the_default_restore_and_the_largest_envelope_are_defined() {
         let g = guide17();
@@ -9033,9 +9033,9 @@ sha256_encrypted = \"bbb\"
         );
     }
 
-    /// 5. Versions: the option is named with the modes that take it, and a
-    /// version is a full archive, so the newest alone is complete; `[InRef]`
-    /// is explained.
+    // 5. Versions: the option is named with the modes that take it, and a
+    // version is a full archive, so the newest alone is complete; `[InRef]`
+    // is explained.
     #[test]
     fn file_1_fix_5_versions_are_selectable_and_complete() {
         let g = guide17();
@@ -9051,7 +9051,7 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// 6. The completeness check for --path and --all.
+    // 6. The completeness check for --path and --all.
     #[test]
     fn file_1_fix_6_the_completeness_check_covers_path_and_all() {
         let g = guide17();
@@ -9066,7 +9066,7 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// 7. The zero-byte retry has a command and is cumulative.
+    // 7. The zero-byte retry has a command and is cumulative.
     #[test]
     fn file_1_fix_7_the_zero_byte_retry_is_a_command_and_adds_up() {
         let g = guide17();
@@ -9081,7 +9081,7 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// 8 and 9. The whole box as a short procedure; the index's `state` values.
+    // 8 and 9. The whole box as a short procedure; the index's `state` values.
     #[test]
     fn file_1_fix_8_and_9_the_whole_box_and_the_states() {
         let g = guide17();
@@ -9105,7 +9105,7 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// 10. Which file is a key; a passphrase-protected key; the escrow key fails.
+    // 10. Which file is a key; a passphrase-protected key; the escrow key fails.
     #[test]
     fn file_1_fix_10_the_key_file_is_told_from_a_public_key() {
         let g = guide17();
@@ -9123,7 +9123,7 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// 11. Drive and host basics.
+    // 11. Drive and host basics.
     #[test]
     fn file_1_fix_11_drive_and_host_basics() {
         let g = guide17();
@@ -9150,8 +9150,8 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// 12. Disk space up front: the capacity ceiling, the placeholder, how to
-    /// read the dar version and what "without its catalogue" means.
+    // 12. Disk space up front: the capacity ceiling, the placeholder, how to
+    // read the dar version and what "without its catalogue" means.
     #[test]
     fn file_1_fix_12_disk_space_is_stated_up_front() {
         let g = guide17();
@@ -9180,7 +9180,7 @@ sha256_encrypted = \"bbb\"
         }
     }
 
-    /// 13. The opening names the basic tools as well as the listed ones.
+    // 13. The opening names the basic tools as well as the listed ones.
     #[test]
     fn file_1_fix_13_the_opening_names_the_basic_tools() {
         let g = guide17();
@@ -9191,9 +9191,9 @@ sha256_encrypted = \"bbb\"
         );
     }
 
-    /// ADR-0012 items 101 and 102: File 1 and RECOVERY.md each have a section
-    /// on a damaged slice or file, with the two commands and the rule that only
-    /// the same unit and version is used.
+    // ADR-0012 items 101 and 102: File 1 and RECOVERY.md each have a section
+    // on a damaged slice or file, with the two commands and the rule that only
+    // the same unit and version is used.
     #[test]
     fn file_1_and_recovery_md_say_what_to_do_for_a_damaged_slice_or_file() {
         let g = guide17();
