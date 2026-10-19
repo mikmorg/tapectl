@@ -1813,3 +1813,12 @@ Ruled 2026-10-19, after v1.3.0 was tagged:
      gets tapectl's chunk-level salvage and file fill, which RESTORE.sh cannot do. File 1's "tapectl
      itself" section says so. File 1 may also link age's release page (github.com/FiloSottile/age)
      for the `age` tool, which Debian 10 does not package.
+108. **The fifth fresh read of File 1 is the last before v1.4.0** (CTO, 2026-10-19). Read as an heir
+     holding only the escrow key, the 1.4.0 guide drew "mostly", one SERIOUS finding and eleven
+     minor ones. The serious one: with the operator envelope and its backup unreadable, `--all`
+     restores one tenant's units and every check in "Did the restore get everything?" still passes;
+     the checklist gains a fourth item comparing the destination with `--find-envelope`. The
+     minors that were wrong or confusing are fixed with it (File 1 text only; RESTORE.sh's bytes
+     do not move). The rest are #485, for the next re-pin. 1.4.0 is tagged without a sixth read:
+     every fresh read finds new edges, so a read that finds no serious gap left unfixed is the
+     stopping rule.

@@ -649,18 +649,21 @@ The whole job in order. Each step names the section that has its commands.
    `RESTORE-{label}.sh`: the first commands of "Automated Recovery
    (recommended)". Set `TAPE_DEVICE` to the same device once, so RESTORE.sh
    reads the drive your `mt` and `dd` commands read.
-4. Run `./RESTORE.sh --info` on EVERY tape you hold, one after another. It
-   needs no key and shows each tape's label, when it was sealed and its
+4. Run `--info` on EVERY tape you hold (this tape's script is
+   `./RESTORE-{label}.sh`; this guide writes `./RESTORE.sh` for any tape's).
+   It needs no key and shows each tape's label, when it was sealed and its
    `Verdict:`; for anything but SEALED see "If the verdict is UNSEALED or
-   DAMAGED". Any tape's RESTORE.sh does for `--info`, `--where` and
-   `--find-envelope` (they describe the tape in the drive); a restore needs
-   the script of the tape it reads.
+   DAMAGED". Any tape's script reads the tape in the drive for `--info` and
+   `--find-envelope`, one from a tape written by 1.3.0 or later for
+   `--where`; a restore needs the script of the tape it reads.
 5. Start from the NEWEST tape (the latest "Sealed at"; File 0's
    `created_at` dates an unsealed one). `./RESTORE.sh --where --all --key
    YOUR_KEY.age.key` lists EVERY unit the archive's index names, with its
    newest version and the tapes that hold it, and `./RESTORE.sh --where
    UNIT --key YOUR_KEY.age.key` shows, for a unit, every version and every
    tape that holds it. `--find-envelope` lists the units on this tape.
+   They decrypt into `$TMPDIR` (default `/tmp`; if `/tmp` is small, set
+   `TMPDIR` to a directory on a real disk first: "Disk space").
    Those listings give each unit's size, so choose the disk now: a Linux
    filesystem (ext4 or xfs; not FAT, exFAT or NTFS) with room for the units
    you will restore: "Disk space". If the newest tape needs a drive you do
@@ -668,7 +671,8 @@ The whole job in order. Each step names the section that has its commands.
    newest index is out of reach: get that drive, or say what may be missing
    ("The rest of the box").
 6. Restore. From one tape with the escrow or operator key, `--all` restores
-   every unit on it ("Automated Recovery (recommended)"). From several
+   every unit on it ("Automated Recovery (recommended)"); check that it did
+   (item 4 of "Did the restore get everything?"). From several
    tapes, restore each unit's NEWEST version once, from a tape that holds
    it, into a directory of its own (`/destination/UNIT`), with that tape's
    own RESTORE.sh, and never an older version first ("The rest of the
@@ -950,8 +954,8 @@ another filesystem afterwards if you must.
 restore, as `--find-envelope` and `--where` print them (each unit's slices
 as stored on tape); three times that when you cannot tell that a unit was
 stored uncompressed ("Compressed units", below), and watch `df` while it
-runs; and about twice a unit's size for the ways of restoring that keep its
-slices on disk as well (below). The rest of this section says why.
+runs; and, for the ways of restoring that keep its slices on disk as well
+(below), one more unit's size, for the slices of the unit being restored. The rest of this section says why.
 
 {capacity}
 
@@ -971,13 +975,13 @@ is small, set `TMPDIR` to a directory on a real disk with some GiB free
 
 Some ways of restoring keep the slices on disk as well, in a scratch
 directory inside `--to` unless `--scratch DIR` names another disk, and
-then need more room, up to about TWICE a unit's size (its slices, then
-its restored files): the older-dar fallback above (all of the unit's
+then need more room, for a unit's slices beside its restored files: the older-dar fallback above (all of the unit's
 slices), `--path` (only the few slices that hold the path), and asking
 for a replacement slice (`--slices-from`, `--swap-tapes`: "If a slice or
 a file is damaged"). Doing it by hand ("Manual Recovery Steps") is the
-same: the decrypted slices and the restored files, about twice the unit's
-size; delete a unit's slices once it is restored. The script checks the
+same: the decrypted slices (the unit's size) beside the restored files
+(the unit's size, more if it was stored compressed); delete a unit's slices
+once it is restored. The script checks the
 space before it reads any slice.
 
 For a whole box, the destination needs the sum of the sizes of the units
@@ -1149,9 +1153,9 @@ tenant's units and nobody else's.
 If the operator envelope and its backup will not read, the biggest envelope
 that does read may be a tenant's, and --all then restores only that
 tenant's units, with the DAMAGED warnings the script printed as the only
-sign. The script names the file it used ("Decrypted envelope at file N"): compare it
-with `--find-envelope`, which lists the units of every envelope that
-opened, and with the units `--where --all` names.
+sign. The script names the file it used ("Decrypted envelope at file N"). Item 4
+of "Did the restore get everything?" is the check, and what to do when
+it fails.
 
 The script reads the tape forward from one rewind, and says what it
 needs if it meets a tape newer than itself (`requires` in File 0).
@@ -1324,7 +1328,9 @@ with the manual path always into a new, empty directory.
 
 The modes that only read the tape (`--info`, `--verify`, `--find-envelope`,
 `--list`, `--where`, `--find`) describe the tape that is in the drive,
-whichever tape's RESTORE.sh runs them. A RESTORE.sh written for another
+whichever tape's RESTORE.sh runs them (`--where` and `--find` need the
+script of a tape written by tapectl 1.3.0 or later; an older one answers
+`Unknown mode`). A RESTORE.sh written for another
 tape prints a "WRONG TAPE?" box first, and for these modes it is only a
 reminder that the script was written for another volume: what follows is
 about the tape in the drive (the `Tape identifies as:` line, which every mode
@@ -1468,6 +1474,10 @@ marker's copy of it, with a warning (rung 2 of "If All Else Fails").
   index, it does not matter which for restoring, and restoring is sound.
 - A unit with a FAIL slice cannot be restored whole from this tape.
   RESTORE.sh stops at the first slice that fails its check and says which.
+  `--all` restores the units in their order on the tape, so it stops there
+  too: the units before that one are restored, that unit and every unit
+  after it are not. Restore those after it with `--unit` (repeat it for
+  several) into another empty directory, and the damaged one as below.
   Look for another copy first ("The rest of the box"; "If a slice or a
   file is damaged" says how RESTORE.sh takes the failed slice from it); a
   cartridge that failed here may read in another drive. With no other copy,
@@ -1515,6 +1525,17 @@ A restore went right only if all of these hold:
    That number should equal the "inode(s) restored" figure of a whole-unit
    restore. For a few files, compare their sizes and a checksum with any
    record of your own.
+4. After `--all`, every unit of the tape was restored, not only one
+   envelope's. `--all` restores the units of ONE envelope, the one that
+   lists the most: with the escrow or operator key that is the operator
+   envelope, which lists every unit on the tape, but when the operator
+   envelope and its backup will not read it is a tenant's, and only that
+   tenant's units are restored, while items 1 to 3 still pass. Every unit
+   that `./RESTORE.sh --find-envelope --key YOUR_KEY.age.key` lists, under
+   any envelope, must be a directory of the `--all` destination. Restore each one that is not in a run of its own,
+   `./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to
+   /destination/UNIT` (the script finds the envelope that lists it), and
+   check that run the same way.
 
 Two restores print a different summary. With `--all`, or `--unit` given
 more than once, dar runs once for each unit and prints one summary for
@@ -1559,7 +1580,8 @@ file in THAT tape's front index (File 3) by its sha256, then:
     dd if=/dev/nst0 bs=512k of=slice-copy.bin
 
 Either option restores slice by slice onto disk, as with an older dar, so
-`--to` needs about twice the unit's size (`--scratch DIR` puts the slices on
+`--to` needs room for the unit's slices beside its restored files ("How much
+room, in one place", in "Disk space"; `--scratch DIR` puts the slices on
 another disk). Each tape is read forward from one rewind. A slice RESTORE.sh
 cannot replace is left out: the files in it are not restored but listed,
 below. RESTORE.sh runs the `age` program, which stops at the first damaged
@@ -1674,10 +1696,13 @@ network connection to download its libraries, and `dar`, `mt-st` and
     cd tapectl && git checkout vX.Y.Z      # X.Y.Z: the tapectl_version
     cargo build --release                  # the program: target/release/tapectl
 
-Then use it in a new home made for this recovery (`--home DIR` on each
-command, or the environment variable `TAPECTL_HOME`). ESCROW_PUBLIC is the
-`age1...` line of the cover sheet, the escrow key's public half, and
-YOUR_KEY.age.key is your key file, the escrow key's included:
+Then use it in a new home made for this recovery: set the environment
+variable `TAPECTL_HOME` to an empty directory once (`export
+TAPECTL_HOME=/recovery/tapectl-home`), or give `--home DIR` right after
+`tapectl` on each command. ESCROW_PUBLIC is the `age1...` line of the cover
+sheet, the escrow key's public half (with only the key file, `age-keygen -y
+escrow.key` prints it), and YOUR_KEY.age.key is your key file, the escrow
+key's included:
 
     tapectl init --operator NAME --escrow-public-key ESCROW_PUBLIC
     tapectl catalog rebuild --from-volume --device /dev/nst0 --key YOUR_KEY.age.key
@@ -1857,9 +1882,9 @@ exact size with `truncate` instead, never with `tr`.
    number, and no gaps (but for a slice you must leave out: "No other copy"
    in "If a slice or a file is damaged"): that is the naming dar requires of
    a sliced archive (base name `restore`). Work on a disk with room for all of the
-   unit's decrypted slices at once (about the unit's size, and as much
-   again for step 8's restored files: about twice the unit's size in all),
-   on a real disk and not in /tmp, which is a small RAM disk on many systems
+   unit's decrypted slices at once (about the unit's size) and for step 8's
+   restored files beside them (the unit's size again, more if it was stored
+   compressed: "How much room, in one place", in "Disk space"), on a real disk and not in /tmp, which is a small RAM disk on many systems
    ("Disk space"). RESTORE.sh keeps only the envelopes there, never a slice.
 8. Reassemble dar slices into an EMPTY directory, which dar needs to exist
    (`mkdir /destination`): `dar -x restore -R /destination -O -Q -N`. With
@@ -10773,7 +10798,7 @@ sha256_encrypted = \"bbb\"
             "`RESTORE INCOMPLETE` with exit status 1",
             "Only a tape whose envelope lists the same unit, with the same uuid, at the same version is used",
             "another version can differ in the very files that are damaged",
-            "so `--to` needs about twice the unit's size",
+            "so `--to` needs room for the unit's slices beside its restored files",
         ] {
             assert!(f.contains(needle), "{needle:?}: {f}");
         }
@@ -10822,7 +10847,10 @@ sha256_encrypted = \"bbb\"
         let sec = flat_text(guide_section(&g, "Start here"));
         for needle in [
             "Check your key: \"Which file is your key\". A tenant's key opens that tenant's units only; the operator key and the escrow key open every tenant's",
-            "Run `./RESTORE.sh --info` on EVERY tape you hold",
+            "Run `--info` on EVERY tape you hold (this tape's script is `./RESTORE-",
+            "this guide writes `./RESTORE.sh` for any tape's",
+            "They decrypt into `$TMPDIR` (default `/tmp`; if `/tmp` is small, set `TMPDIR` to a directory on a real disk first: \"Disk space\")",
+            "check that it did (item 4 of \"Did the restore get everything?\")",
             "Start from the NEWEST tape",
             "`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` shows, for a unit, every version and every tape that holds it",
             "restore each unit's NEWEST version once, from a tape that holds it, into a directory of its own (`/destination/UNIT`), with that tape's own RESTORE.sh, and never an older version first",
@@ -10859,8 +10887,10 @@ sha256_encrypted = \"bbb\"
         // fifth (read4-fixes), which added what a reader needs to start
         // right: which RESTORE.sh a survey takes, the newest tape the drive
         // reads, a key checked without a cover sheet, and two units of one
-        // name in different directories.
-        assert!(guide_section(&g, "Start here").lines().count() <= 60);
+        // name in different directories; 60 until the fifth read's fixes
+        // (#481), which named the script step 3 saved, put `$TMPDIR` before
+        // the first listing that fills it, and pointed `--all` at its check.
+        assert!(guide_section(&g, "Start here").lines().count() <= 64);
     }
 
     /// S1: with the escrow or operator key the first envelope that opens is a
@@ -10982,9 +11012,9 @@ sha256_encrypted = \"bbb\"
             "so everything stored on it takes at most that on the tape. A unit stored uncompressed restores to about that size; a unit stored compressed restores larger, and the capacity is no ceiling for it",
             "`--to` needs room for about the size of the units you restore",
             "`--find-envelope` lists each unit with its size, and so does `--where`",
-            "need more room, up to about TWICE a unit's size (its slices, then its restored files)",
+            "need more room, for a unit's slices beside its restored files",
             "the older-dar fallback above (all of the unit's slices), `--path` (only the few slices that hold the path), and asking for a replacement slice",
-            "Doing it by hand (\"Manual Recovery Steps\") is the same: the decrypted slices and the restored files, about twice the unit's size; delete a unit's slices once it is restored",
+            "Doing it by hand (\"Manual Recovery Steps\") is the same: the decrypted slices (the unit's size) beside the restored files (the unit's size, more if it was stored compressed); delete a unit's slices once it is restored",
             "For a whole box, the destination needs the sum of the sizes of the units you restore, whichever tapes they come from; the extra room for slices is needed for one unit at a time",
             "**Compressed units.**",
             "The dar catalogue cannot tell you",
@@ -10996,7 +11026,7 @@ sha256_encrypted = \"bbb\"
         assert!(!disk.contains("As a ceiling"), "{disk}");
         let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
         assert!(
-            manual.contains("about the unit's size, and as much again for step 8's restored files: about twice the unit's size in all"),
+            manual.contains("unit's decrypted slices at once (about the unit's size) and for step 8's restored files beside them (the unit's size again, more if it was stored compressed"),
             "{manual}"
         );
         // The unknown-generation ceiling says the same.
@@ -11293,7 +11323,7 @@ sha256_encrypted = \"bbb\"
         ));
         for needle in [
             "(any copy of RESTORE.sh will do for this: see the end of this list)",
-            "The modes that only read the tape (`--info`, `--verify`, `--find-envelope`, `--list`, `--where`, `--find`) describe the tape that is in the drive, whichever tape's RESTORE.sh runs them",
+            "The modes that only read the tape (`--info`, `--verify`, `--find-envelope`, `--list`, `--where`, `--find`) describe the tape that is in the drive, whichever tape's RESTORE.sh runs them (`--where` and `--find` need the script of a tape written by tapectl 1.3.0 or later; an older one answers `Unknown mode`)",
             "it is only a reminder that the script was written for another volume",
             "the `Tape identifies as:` line, which every mode prints, is that tape's own label; the heading `--verify` prints names the script's volume, but it checks the tape in the drive",
             "For a restore use the loaded tape's own RESTORE.sh, which was written for that tape's format",
@@ -12294,10 +12324,26 @@ sha256_encrypted = \"bbb\"
         let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"));
         for needle in [
             "If the operator envelope and its backup will not read, the biggest envelope that does read may be a tenant's, and --all then restores only that tenant's units, with the DAMAGED warnings the script printed as the only sign",
-            "The script names the file it used (\"Decrypted envelope at file N\"): compare it with `--find-envelope`, which lists the units of every envelope that opened, and with the units `--where --all` names",
+            "The script names the file it used (\"Decrypted envelope at file N\"). Item 4 of \"Did the restore get everything?\" is the check, and what to do when it fails",
         ] {
             assert!(auto.contains(needle), "{needle:?}: {auto}");
         }
+        // The fifth fresh read (#481): the check is in the checklist itself,
+        // where an heir who believes the restore finished will look.
+        let check = flat_text(guide_section(&g, "Did the restore get everything?"));
+        for needle in [
+            "4. After `--all`, every unit of the tape was restored, not only one envelope's",
+            "when the operator envelope and its backup will not read it is a tenant's, and only that tenant's units are restored, while items 1 to 3 still pass",
+            "Every unit that `./RESTORE.sh --find-envelope --key YOUR_KEY.age.key` lists, under any envelope, must be a directory of the `--all` destination",
+            "`./RESTORE.sh --restore --key YOUR_KEY.age.key --unit UNIT --to /destination/UNIT` (the script finds the envelope that lists it)",
+        ] {
+            assert!(check.contains(needle), "{needle:?}: {check}");
+        }
+        let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
+        assert!(
+            verdict.contains("`--all` restores the units in their order on the tape, so it stops there too: the units before that one are restored, that unit and every unit after it are not"),
+            "{verdict}"
+        );
         let script = generate_restore_script_v2("M3", 20);
         for said in [
             "info \"Decrypted envelope at file $CHOSEN_POS\"",
@@ -12355,7 +12401,7 @@ sha256_encrypted = \"bbb\"
         let g = guide17();
         let start = flat_text(guide_section(&g, "Start here"));
         assert!(
-            start.contains("Any tape's RESTORE.sh does for `--info`, `--where` and `--find-envelope` (they describe the tape in the drive); a restore needs the script of the tape it reads"),
+            start.contains("Any tape's script reads the tape in the drive for `--info` and `--find-envelope`, one from a tape written by 1.3.0 or later for `--where`; a restore needs the script of the tape it reads"),
             "{start}"
         );
         let bx = box_section(&g);
@@ -12407,7 +12453,7 @@ sha256_encrypted = \"bbb\"
         let g = guide17();
         let disk = flat_text(guide_section(&g, "Disk space"));
         for needle in [
-            "**How much room, in one place:** the sum of the sizes of the units you restore, as `--find-envelope` and `--where` print them (each unit's slices as stored on tape); three times that when you cannot tell that a unit was stored uncompressed (\"Compressed units\", below), and watch `df` while it runs; and about twice a unit's size for the ways of restoring that keep its slices on disk as well (below)",
+            "**How much room, in one place:** the sum of the sizes of the units you restore, as `--find-envelope` and `--where` print them (each unit's slices as stored on tape); three times that when you cannot tell that a unit was stored uncompressed (\"Compressed units\", below), and watch `df` while it runs; and, for the ways of restoring that keep its slices on disk as well (below), one more unit's size, for the slices of the unit being restored",
             "The tape's capacity bounds what is stored on it, not what a restore writes",
             "a unit stored compressed restores larger, and the capacity is no ceiling for it (\"Compressed units\", below)",
             "take the three times above (more for mostly text)",
