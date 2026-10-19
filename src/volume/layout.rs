@@ -10274,10 +10274,7 @@ sha256_encrypted = \"bbb\"
             assert!(sec.contains(needle), "{needle:?}: {sec}");
         }
         // Every quoted section name is a heading (or a prefix of one).
-        let headings: Vec<&str> = g
-            .lines()
-            .filter_map(|l| l.strip_prefix("## "))
-            .collect();
+        let headings: Vec<&str> = g.lines().filter_map(|l| l.strip_prefix("## ")).collect();
         let mut named = 0;
         for quoted in sec.split('"').skip(1).step_by(2) {
             if ["Sealed at", "Verdict:"].contains(&quoted) || quoted.starts_with("`") {
@@ -10335,7 +10332,10 @@ sha256_encrypted = \"bbb\"
         );
         // The slice-table hint of the verdict section already says the same.
         let verdict = flat_text(guide_section(&g, "If the verdict is UNSEALED or DAMAGED"));
-        assert!(verdict.contains("decrypt the operator envelope by hand"), "{verdict}");
+        assert!(
+            verdict.contains("decrypt the operator envelope by hand"),
+            "{verdict}"
+        );
     }
 
     /// S2: the per-tape checks say they are per tape, and the automated recipe
@@ -10351,8 +10351,8 @@ sha256_encrypted = \"bbb\"
         ] {
             assert!(done.contains(needle), "{needle:?}: {done}");
         }
-        let auto = flat_text(guide_section(&g, "Automated Recovery (recommended)"))
-            .replace(" # ", " ");
+        let auto =
+            flat_text(guide_section(&g, "Automated Recovery (recommended)")).replace(" # ", " ");
         for needle in [
             "Full restore of THIS tape to an EMPTY directory",
             "With other tapes in the box, read \"The rest of the box\" before this: a second --all into the same /destination is refused",
@@ -10449,7 +10449,10 @@ sha256_encrypted = \"bbb\"
             verdict.contains("the files that lie wholly inside them can be restored by hand: \"If a slice or a file is damaged\" has the commands under \"No other copy\""),
             "{verdict}"
         );
-        assert!(!verdict.contains("but nothing here promises it"), "{verdict}");
+        assert!(
+            !verdict.contains("but nothing here promises it"),
+            "{verdict}"
+        );
         let sec = guide_section(&g, "If a slice or a file is damaged");
         let f = flat_text(sec);
         for needle in [
@@ -10468,8 +10471,8 @@ sha256_encrypted = \"bbb\"
             assert!(f.contains(needle), "{needle:?}: {f}");
         }
         assert!(
-            sec.lines().any(|l| l.trim()
-                == "dar -x restore -R /destination -O -Q -N > dar.log 2>&1"),
+            sec.lines()
+                .any(|l| l.trim() == "dar -x restore -R /destination -O -Q -N > dar.log 2>&1"),
             "{sec}"
         );
         assert!(
@@ -10481,8 +10484,14 @@ sha256_encrypted = \"bbb\"
         // The manual path points here at the slice that fails its hash, and
         // its "no gaps" rule has the one exception.
         let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
-        assert!(manual.contains("With no other copy, leave that slice out and go on"), "{manual}");
-        assert!(manual.contains("and no gaps (but for a slice you must leave out"), "{manual}");
+        assert!(
+            manual.contains("With no other copy, leave that slice out and go on"),
+            "{manual}"
+        );
+        assert!(
+            manual.contains("and no gaps (but for a slice you must leave out"),
+            "{manual}"
+        );
         let done = flat_text(guide_section(&g, "Did the restore get everything?"));
         assert!(done.contains("\"Ignored (excluded by filters)\" above 0 in a whole-unit restore means dar skipped files"), "{done}");
     }
@@ -10604,7 +10613,10 @@ sha256_encrypted = \"bbb\"
             cartridge_identity_source: None,
         });
         for word in ["recipient", "age1", "AGE-"] {
-            assert!(!thunk.contains(word), "File 0 names no key ({word}): {thunk}");
+            assert!(
+                !thunk.contains(word),
+                "File 0 names no key ({word}): {thunk}"
+            );
         }
     }
 
@@ -10637,8 +10649,19 @@ sha256_encrypted = \"bbb\"
         }
         // Everything those lines name is something the guide says to run.
         let all = flat_text(&g);
-        for tool in ["lsscsi", "lspci", "dmesg", "lsmod", "modprobe", "usermod", "age-keygen"] {
-            assert!(all.matches(tool).count() >= 2, "{tool} is named where it is used");
+        for tool in [
+            "lsscsi",
+            "lspci",
+            "dmesg",
+            "lsmod",
+            "modprobe",
+            "usermod",
+            "age-keygen",
+        ] {
+            assert!(
+                all.matches(tool).count() >= 2,
+                "{tool} is named where it is used"
+            );
         }
     }
 
@@ -10680,9 +10703,15 @@ sha256_encrypted = \"bbb\"
         ] {
             assert!(bx.contains(needle), "{needle:?}: {bx}");
         }
-        assert!(!bx.contains("A retired or erased tape is not listed."), "{bx}");
+        assert!(
+            !bx.contains("A retired or erased tape is not listed."),
+            "{bx}"
+        );
         // The File 0 line has `mt -f` and does not trip the tr-for-plain-text count.
-        assert!(!g.contains("tr -d '\\0' | grep") || g.lines().filter(|l| l.contains("| tr -d '\\0' >")).count() == 4);
+        assert!(
+            !g.contains("tr -d '\\0' | grep")
+                || g.lines().filter(|l| l.contains("| tr -d '\\0' >")).count() == 4
+        );
     }
 
     /// M6: which RESTORE.sh to use for the survey and for the restore, how to
@@ -10720,9 +10749,15 @@ sha256_encrypted = \"bbb\"
         }
         // It comes before the first RESTORE.sh command.
         let raw = guide_section(&g, "Automated Recovery (recommended)");
-        assert!(raw.find("export TAPE_DEVICE=/dev/nstN").unwrap() < raw.find("./RESTORE.sh --info").unwrap());
+        assert!(
+            raw.find("export TAPE_DEVICE=/dev/nstN").unwrap()
+                < raw.find("./RESTORE.sh --info").unwrap()
+        );
         let start = flat_text(guide_section(&g, "Start here"));
-        assert!(start.contains("Set `TAPE_DEVICE` to the same device once"), "{start}");
+        assert!(
+            start.contains("Set `TAPE_DEVICE` to the same device once"),
+            "{start}"
+        );
     }
 
     /// RECOVERY.md repeats the staleness rule honestly and carries the

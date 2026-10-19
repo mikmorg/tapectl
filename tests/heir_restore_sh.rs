@@ -6695,7 +6695,14 @@ fn manual_read_slice(
 /// guide's `dar -l CATALOGUE -T slice -N -Q`.
 fn files_touching_slice(work: &Path, stem: &str, lost: i64) -> Vec<String> {
     let o = Command::new("dar")
-        .args(["-l", &format!("env/catalogs/{stem}"), "-T", "slice", "-N", "-Q"])
+        .args([
+            "-l",
+            &format!("env/catalogs/{stem}"),
+            "-T",
+            "slice",
+            "-N",
+            "-Q",
+        ])
         .current_dir(work)
         .output()
         .expect("dar -l");
@@ -6756,10 +6763,7 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
     ] {
         assert!(g.contains(needle), "{needle:?}: {g}");
     }
-    assert!(
-        !g.contains("http"),
-        "no URL is given for tapectl: {g}"
-    );
+    assert!(!g.contains("http"), "no URL is given for tapectl: {g}");
 
     // Alice's envelope, by the guide's step 5, then the manifest.
     let work = manual_front(&h, &manual, "manual-gap");
@@ -6857,7 +6861,10 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
     let log = std::fs::read_to_string(dir.join("dar.log")).unwrap();
     let ignored: usize = log
         .lines()
-        .find_map(|l| l.trim().strip_suffix(" inode(s) ignored (excluded by filters)"))
+        .find_map(|l| {
+            l.trim()
+                .strip_suffix(" inode(s) ignored (excluded by filters)")
+        })
         .expect("dar's summary line")
         .trim()
         .parse()
@@ -6866,7 +6873,13 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
     // Every other file is exactly the source; the named ones are empty or short.
     let src = &unit_on_tape("photos/2019").src;
     let mut intact = 0;
-    for f in ["file0.bin", "file1.bin", "file2.bin", "file3.bin", "file4.bin"] {
+    for f in [
+        "file0.bin",
+        "file1.bin",
+        "file2.bin",
+        "file3.bin",
+        "file4.bin",
+    ] {
         let (a, b) = (src.join(f), Path::new(&dest).join(f));
         if named.iter().any(|n| n == f) {
             let len = std::fs::metadata(&b).map(|m| m.len()).unwrap_or(0);
@@ -6875,7 +6888,11 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
                 "{f}: a leftover, not the file"
             );
         } else {
-            assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap(), "{f}");
+            assert_eq!(
+                std::fs::read(&a).unwrap(),
+                std::fs::read(&b).unwrap(),
+                "{f}"
+            );
             intact += 1;
         }
     }
@@ -6887,7 +6904,10 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
         .lines()
         .find(|l| l.starts_with("V=1 U="))
         .expect("RECOVERY.md's by-hand line")
-        .replace("V=1 U='photos/2019'", &format!("V={} U='photos/2019'", unit.snapshot_version))
+        .replace(
+            "V=1 U='photos/2019'",
+            &format!("V={} U='photos/2019'", unit.snapshot_version),
+        )
         .replace("/destination", &dest);
     let (_, text) = run_guide(&h, &work.join("env"), &[line], &[], false);
     let failed: Vec<&str> = text
@@ -6897,9 +6917,16 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
         .collect();
     let mut failed: Vec<String> = failed.iter().map(|s| s.to_string()).collect();
     failed.sort();
-    let mut want_files: Vec<String> = named.iter().filter(|n| n.ends_with(".bin")).cloned().collect();
+    let mut want_files: Vec<String> = named
+        .iter()
+        .filter(|n| n.ends_with(".bin"))
+        .cloned()
+        .collect();
     want_files.sort();
-    assert_eq!(failed, want_files, "the hash check names the leftovers: {text}");
+    assert_eq!(
+        failed, want_files,
+        "the hash check names the leftovers: {text}"
+    );
 
     // The LAST slice gone: dar stops at once; -0 restores up to the break.
     let last = unit.slices.last().unwrap();
@@ -6912,7 +6939,8 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
     let dest2 = h.sub("gap-last-restored");
     std::fs::create_dir_all(&dest2).unwrap();
     let dar = |extra: &str, to: &str| -> (bool, String) {
-        let cmd = format!("dar -x restore {extra} -R {to} -O -Q -N > dar.log 2>&1; echo $?; cat dar.log");
+        let cmd =
+            format!("dar -x restore {extra} -R {to} -O -Q -N > dar.log 2>&1; echo $?; cat dar.log");
         run_guide(&h, &dir2, &[cmd], &[], false)
     };
     let (_, text) = dar("", &dest2);
@@ -6929,10 +6957,19 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
     let dest3 = h.sub("gap-last-sequential");
     std::fs::create_dir_all(&dest3).unwrap();
     let (_, text) = dar("-0", &dest3);
-    assert!(text.lines().next() != Some("0"), "stops at the break: {text}");
+    assert!(
+        text.lines().next() != Some("0"),
+        "stops at the break: {text}"
+    );
     let mut whole = 0;
     let mut absent = 0;
-    for f in ["file0.bin", "file1.bin", "file2.bin", "file3.bin", "file4.bin"] {
+    for f in [
+        "file0.bin",
+        "file1.bin",
+        "file2.bin",
+        "file3.bin",
+        "file4.bin",
+    ] {
         let (a, b) = (src.join(f), Path::new(&dest3).join(f));
         match std::fs::read(&b) {
             Ok(bytes) if bytes == std::fs::read(&a).unwrap() => whole += 1,
@@ -6944,7 +6981,10 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
         }
     }
     assert!(whole >= 1, "files before the break come back whole: {text}");
-    assert!(absent >= 1 || text.contains("not restored (user choice)"), "{text}");
+    assert!(
+        absent >= 1 || text.contains("not restored (user choice)"),
+        "{text}"
+    );
 }
 
 fn unit_on_tape(name: &str) -> UnitOnTape {
@@ -7041,7 +7081,10 @@ fn file_1_says_how_to_tell_a_compressed_unit_and_it_works() {
         let marked = out.contains(&format!("\\\"-z{compression}\\\""));
         assert_eq!(marked, expect, "{compression}: {out}");
         if !expect {
-            assert!(!out.contains("\\\"-z"), "no -z argument when uncompressed: {out}");
+            assert!(
+                !out.contains("\\\"-z"),
+                "no -z argument when uncompressed: {out}"
+            );
         }
     }
 
@@ -7049,20 +7092,35 @@ fn file_1_says_how_to_tell_a_compressed_unit_and_it_works() {
     let dir = h.dir.join("compress-cat");
     std::fs::create_dir_all(&dir).unwrap();
     let run = |args: &[&str]| {
-        let o = Command::new("dar").args(args).current_dir(&dir).output().unwrap();
+        let o = Command::new("dar")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         String::from_utf8_lossy(&o.stdout).to_string()
     };
-    run(&["-c", "arch", "-R", src.to_str().unwrap(), "-zgzip", "-N", "-Q"]);
+    run(&[
+        "-c",
+        "arch",
+        "-R",
+        src.to_str().unwrap(),
+        "-zgzip",
+        "-N",
+        "-Q",
+    ]);
     run(&["-C", "cat", "-A", "arch", "-N", "-Q"]);
     let listing = run(&["-l", "cat", "-N", "-Q"]);
     assert!(
-        listing.lines().any(|l| l.contains("text.txt") && l.contains("[-----]")),
+        listing
+            .lines()
+            .any(|l| l.contains("text.txt") && l.contains("[-----]")),
         "{listing}"
     );
     let real = run(&["-l", "arch", "-N", "-Q"]);
     assert!(
-        real.lines().any(|l| l.contains("text.txt") && !l.contains("[-----]")),
+        real.lines()
+            .any(|l| l.contains("text.txt") && !l.contains("[-----]")),
         "the archive itself does show a ratio, which the envelope lacks: {real}"
     );
 }
