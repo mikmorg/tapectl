@@ -459,7 +459,7 @@ fn cannot_write_message(
 ) -> String {
     format!(
         "an {drive_gen} drive cannot write {medium_gen} media. This is a physical \
-         limit of the drive, not a policy — --force does not override it. Load a \
+         limit of the drive, not a policy — --force does not override it. Load an \
          {drive_gen}-writable cartridge, or write this one in a drive that can.\n\n\
          If this drive is not really an {drive_gen}, `generation` in the \
          [[backends.lto]] block named \"{name}\" ({tape}) is wrong — correct it with \
@@ -1174,5 +1174,44 @@ mod tests {
             !prod.contains("probe_no_medium("),
             "write.rs must use ensure_medium_loaded, not the bare probe"
         );
+    }
+
+    // ---- issue #482: the article ----
+
+    /// "an LTO-N", always: every generation's name starts with a vowel
+    /// sound. `cannot_write_message` said "Load a LTO-7-writable
+    /// cartridge" until #482 -- the one message that put a generation after
+    /// a bare "a" -- so this pins the sentence for every generation, and the
+    /// absence of the wrong article in the whole message.
+    #[test]
+    fn the_refusals_say_an_lto_n_for_every_generation() {
+        let backend = test_backend("lto7", "/dev/tape/by-id/scsi-EXAMPLE-nst", "LTO-7");
+        for g in [
+            Generation::Lto1,
+            Generation::Lto2,
+            Generation::Lto3,
+            Generation::Lto4,
+            Generation::Lto5,
+            Generation::Lto6,
+            Generation::Lto7,
+            Generation::Lto7M8,
+            Generation::Lto8,
+            Generation::Lto9,
+            Generation::Lto10,
+        ] {
+            for msg in [
+                cannot_write_message(g, Generation::Lto5, &backend),
+                cannot_read_message(g, Generation::Lto5, &backend),
+            ] {
+                assert!(msg.starts_with(&format!("an {g} drive")), "{msg}");
+                assert!(!msg.contains(&format!(" a {g}")), "{msg}");
+                assert!(!msg.contains("a LTO"), "{msg}");
+            }
+            let msg = cannot_write_message(g, Generation::Lto5, &backend);
+            assert!(
+                msg.contains(&format!("Load an {g}-writable cartridge")),
+                "{msg}"
+            );
+        }
     }
 }
