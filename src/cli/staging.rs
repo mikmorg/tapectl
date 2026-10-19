@@ -488,6 +488,16 @@ pub fn run(
                             "stage_set_id": id,
                             "volumes": labels,
                         })).collect::<Vec<_>>(),
+                        // Issue #483: stage sets a pending `volume rewrite`
+                        // holds (they may be the only copy until its new
+                        // volume has passed a full readback), never
+                        // released, `--force` or not.
+                        "held_by_pending_rewrite": report.held_by_pending_rewrite.iter().map(|(id, hold)| serde_json::json!({
+                            "stage_set_id": id,
+                            "source": hold.source,
+                            "destination": hold.destination,
+                            "resume": hold.resume_command(),
+                        })).collect::<Vec<_>>(),
                         // Issue #262: units whose staged bytes were
                         // retained because they have not met their
                         // resolved min_copies. Always present (empty when
@@ -536,6 +546,11 @@ pub fn run(
                          (`--force` does not apply; run this again once it has finished)",
                         labels.join(", ")
                     );
+                }
+                // Issue #483 (ADR-0012 2026-10-19 item 106): a pending
+                // rewrite's staged slices may be the only copy of a unit.
+                for (id, hold) in &report.held_by_pending_rewrite {
+                    println!("  {}", hold.describe(*id));
                 }
                 // Issue #108: `staging clean` nulls `staging_path` before it
                 // unlinks, so a file whose unlink failed can never be found

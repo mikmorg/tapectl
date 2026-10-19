@@ -68,7 +68,20 @@ pub enum ReportCommands {
         days: Option<i64>,
     },
     /// Volumes flagged for compaction
-    CompactionCandidates,
+    ///
+    /// With `--plan`, also groups the flagged volumes whose live data fits
+    /// one destination tape, largest reclaim first, and says how to compact
+    /// each group (`volume rewrite` for one volume, in place; `--with-staged`
+    /// to carry the others onto its cartridge).
+    CompactionCandidates {
+        /// Group the candidates by what fits one destination tape
+        #[arg(long)]
+        plan: bool,
+        /// Plan for destination tapes of this generation (e.g. LTO-6, LTO-7)
+        /// instead of the drive's own. Only with --plan.
+        #[arg(long, requires = "plan")]
+        generation: Option<String>,
+    },
     /// Superseded snapshot versions that could be marked reclaimable
     Supersedable,
 }
@@ -103,9 +116,14 @@ pub fn run(
         ReportCommands::Events { entity, days } => {
             report_events(conn, entity.as_deref(), *days, json_output)
         }
-        ReportCommands::CompactionCandidates => {
-            report_compaction_candidates(conn, config, json_output)
-        }
+        ReportCommands::CompactionCandidates {
+            plan: false,
+            generation: _,
+        } => report_compaction_candidates(conn, config, json_output),
+        ReportCommands::CompactionCandidates {
+            plan: true,
+            generation,
+        } => report_compaction_plan(conn, config, generation.as_deref(), json_output),
         ReportCommands::Supersedable => report_supersedable(conn, config, json_output),
     }
 }
@@ -2931,6 +2949,302 @@ fn report_compaction_candidates(
         }
     }
     Ok(())
+}
+
+// ── The compaction planner (issue #483; ADR-0012 2026-10-19 item 106) ──
+
+/// A flagged volume as the planner sees it: its label, the live slices it
+/// would have to carry (by slice id, so a version held by two candidates is
+/// carried once), and the reclaimable bytes it would free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanCandidate {
+    pub label: String,
+    pub live: std::collections::BTreeMap<i64, i64>,
+    pub reclaimable_bytes: i64,
+}
+
+/// Candidates whose union of live slices fits one destination tape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanGroup {
+    pub members: Vec<PlanCandidate>,
+}
+
+impl PlanGroup {
+    /// Live bytes the destination carries: the union of the members' slices.
+    pub fn live_bytes(&self) -> i64 {
+        self.union().values().sum()
+    }
+
+    pub fn reclaimable_bytes(&self) -> i64 {
+        self.members.iter().map(|m| m.reclaimable_bytes).sum()
+    }
+
+    fn union(&self) -> std::collections::BTreeMap<i64, i64> {
+        let mut all = std::collections::BTreeMap::new();
+        for m in &self.members {
+            all.extend(m.live.iter().map(|(k, v)| (*k, *v)));
+        }
+        all
+    }
+
+    fn live_bytes_with(&self, extra: &PlanCandidate) -> i64 {
+        let mut all = self.union();
+        all.extend(extra.live.iter().map(|(k, v)| (*k, *v)));
+        all.values().sum()
+    }
+
+    /// The member to rewrite in place: the one freeing the most, then by
+    /// label. Its cartridge hosts the group.
+    pub fn host(&self) -> &PlanCandidate {
+        self.members
+            .iter()
+            .max_by(|a, b| {
+                a.reclaimable_bytes
+                    .cmp(&b.reclaimable_bytes)
+                    .then_with(|| b.label.cmp(&a.label))
+            })
+            .expect("a group has a member")
+    }
+}
+
+/// What the planner decided.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CompactionPlan {
+    /// Largest reclaim first.
+    pub groups: Vec<PlanGroup>,
+    /// Candidates whose live data alone exceeds one destination tape.
+    pub too_large: Vec<PlanCandidate>,
+}
+
+/// Group `candidates` by what fits one destination of `budget_bytes`:
+/// first-fit over the candidates in descending reclaim (ties by label), a
+/// slice held by two members counted once. A candidate that does not fit a
+/// tape on its own is set aside. Groups are returned largest reclaim first
+/// (ties by their first member's label), so the plan is deterministic.
+pub(crate) fn plan_compaction(
+    mut candidates: Vec<PlanCandidate>,
+    budget_bytes: u64,
+) -> CompactionPlan {
+    candidates.sort_by(|a, b| {
+        b.reclaimable_bytes
+            .cmp(&a.reclaimable_bytes)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    let budget = i64::try_from(budget_bytes).unwrap_or(i64::MAX);
+    let mut plan = CompactionPlan::default();
+    for cand in candidates {
+        let alone: i64 = cand.live.values().sum();
+        if alone > budget {
+            plan.too_large.push(cand);
+            continue;
+        }
+        match plan
+            .groups
+            .iter_mut()
+            .find(|g| g.live_bytes_with(&cand) <= budget)
+        {
+            Some(group) => group.members.push(cand),
+            None => plan.groups.push(PlanGroup {
+                members: vec![cand],
+            }),
+        }
+    }
+    plan.groups.sort_by(|a, b| {
+        b.reclaimable_bytes()
+            .cmp(&a.reclaimable_bytes())
+            .then_with(|| a.members[0].label.cmp(&b.members[0].label))
+    });
+    plan
+}
+
+/// The destination tape the planner packs against: `generation` (or the
+/// drive's own) at the drive's fill ceiling, less its end-of-tape reserve —
+/// `collection plan`'s budget. With no drive configured the generation is
+/// required and the defaults apply.
+fn planner_budget(config: &Config, generation: Option<&str>) -> Result<crate::config::TapeBudget> {
+    use crate::error::TapectlError;
+    match config.backends.lto.as_slice() {
+        [] => {
+            let Some(text) = generation else {
+                return Err(TapectlError::Other(
+                    "report compaction-candidates --plan: no drive is configured, so there is no \
+                     generation to plan destination tapes for — pass --generation LTO-N"
+                        .into(),
+                ));
+            };
+            let generation = crate::media::parse_generation_or_error(text)?;
+            Ok(crate::config::TapeBudget::new(
+                format!("one {generation} tape"),
+                generation.native_capacity_bytes(),
+                crate::config::DEFAULT_FILL_CEILING,
+                crate::staging::parse_size_to_bytes("50M")?.max(0) as u64,
+                false,
+            ))
+        }
+        [one] => one.planning_tape_budget(generation),
+        many => {
+            let Some(text) = generation else {
+                return Err(TapectlError::Other(
+                    "report compaction-candidates --plan: several drives are configured; pass \
+                     --generation LTO-N to say which destination tape to plan for"
+                        .into(),
+                ));
+            };
+            let wanted = crate::media::parse_generation_or_error(text)?;
+            let backend = many
+                .iter()
+                .find(|b| {
+                    b.native_generation()
+                        .is_ok_and(|g| crate::media::Generation::can_write(g, wanted))
+                })
+                .unwrap_or(&many[0]);
+            backend.planning_tape_budget(generation)
+        }
+    }
+}
+
+/// The flagged volumes as planner candidates.
+fn plan_candidates(conn: &Connection, config: &Config) -> Result<Vec<PlanCandidate>> {
+    let threshold = config.compaction.utilization_threshold;
+    let mut out = Vec::new();
+    for row in compaction_candidate_rows(conn)?
+        .into_iter()
+        .filter(|r| r.is_candidate(threshold))
+    {
+        // The live slices `compact-read` would stage: a completed write of a
+        // snapshot that is neither reclaimable nor purged.
+        let mut stmt = conn.prepare(
+            "SELECT sl.id, sl.encrypted_bytes
+             FROM volumes v
+             JOIN writes w ON w.volume_id = v.id AND w.status = 'completed'
+             JOIN stage_sets sts ON sts.id = w.stage_set_id
+             JOIN snapshots s ON s.id = sts.snapshot_id
+             JOIN stage_slices sl ON sl.stage_set_id = sts.id
+             WHERE v.label = ?1 AND s.status NOT IN ('reclaimable', 'purged')",
+        )?;
+        let live = stmt
+            .query_map([&row.label], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()?;
+        out.push(PlanCandidate {
+            label: row.label,
+            live,
+            reclaimable_bytes: row.reclaimable_bytes,
+        });
+    }
+    Ok(out)
+}
+
+/// `report compaction-candidates --plan`.
+fn report_compaction_plan(
+    conn: &Connection,
+    config: &Config,
+    generation: Option<&str>,
+    json_output: bool,
+) -> Result<()> {
+    let budget = planner_budget(config, generation)?;
+    let plan = plan_compaction(plan_candidates(conn, config)?, budget.bytes);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&compaction_plan_json(&plan, &budget)).unwrap()
+        );
+    } else {
+        for line in compaction_plan_lines(&plan, &budget) {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+fn compaction_plan_json(
+    plan: &CompactionPlan,
+    budget: &crate::config::TapeBudget,
+) -> serde_json::Value {
+    let member = |m: &PlanCandidate| {
+        serde_json::json!({
+            "volume": m.label,
+            "live_bytes": m.live.values().sum::<i64>(),
+            "reclaimable_bytes": m.reclaimable_bytes,
+        })
+    };
+    serde_json::json!({
+        "destination": {
+            "subject": budget.subject,
+            "capacity_bytes": budget.capacity_bytes,
+            "fill_ceiling": budget.fill_ceiling,
+            "reserve_bytes": budget.reserve_bytes,
+            "budget_bytes": budget.bytes,
+        },
+        "groups": plan.groups.iter().map(|g| serde_json::json!({
+            "volumes": g.members.iter().map(|m| m.label.clone()).collect::<Vec<_>>(),
+            "members": g.members.iter().map(member).collect::<Vec<_>>(),
+            "live_bytes": g.live_bytes(),
+            "reclaimable_bytes": g.reclaimable_bytes(),
+            "fill": g.live_bytes() as f64 / budget.bytes.max(1) as f64,
+            "host": g.host().label,
+        })).collect::<Vec<_>>(),
+        "too_large": plan.too_large.iter().map(member).collect::<Vec<_>>(),
+    })
+}
+
+fn compaction_plan_lines(plan: &CompactionPlan, budget: &crate::config::TapeBudget) -> Vec<String> {
+    use crate::util::format_bytes_binary as fmt;
+    let mut lines = vec![format!("compaction plan — {}", budget.describe())];
+    if plan.groups.is_empty() && plan.too_large.is_empty() {
+        lines.push("  no compaction candidates to group".to_string());
+        return lines;
+    }
+    for (i, g) in plan.groups.iter().enumerate() {
+        let labels: Vec<&str> = g.members.iter().map(|m| m.label.as_str()).collect();
+        lines.push(format!(
+            "  group {}: {} — live {} ({:.0}% of one tape), frees {} of reclaimable data",
+            i + 1,
+            labels.join(", "),
+            fmt(g.live_bytes()),
+            100.0 * g.live_bytes() as f64 / budget.bytes.max(1) as f64,
+            fmt(g.reclaimable_bytes()),
+        ));
+        let host = g.host();
+        if g.members.len() == 1 {
+            lines.push(format!(
+                "    in place: tapectl volume rewrite {} --label <NEW>",
+                host.label
+            ));
+        } else {
+            let others: Vec<&str> = g
+                .members
+                .iter()
+                .filter(|m| m.label != host.label)
+                .map(|m| m.label.as_str())
+                .collect();
+            lines.push(format!(
+                "    onto {}'s cartridge: tapectl volume compact-read {} (each, its tape \
+                 loaded), then with {} loaded: tapectl volume rewrite {} --label <NEW> \
+                 --with-staged, then tapectl volume compact-finish {}",
+                host.label,
+                others.join(" / "),
+                host.label,
+                host.label,
+                others.join(" / "),
+            ));
+        }
+    }
+    for m in &plan.too_large {
+        lines.push(format!(
+            "  {} does not fit one {} tape on its own (live {}); compact it in place with \
+             `tapectl volume rewrite {} --label <NEW>` or onto a larger generation (--generation)",
+            m.label,
+            budget
+                .subject
+                .trim_start_matches("one ")
+                .trim_end_matches(" tape"),
+            fmt(m.live.values().sum()),
+            m.label,
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -5780,6 +6094,225 @@ Read error counter page  [0x3]
             );
             assert_eq!(render_feed_ratio_lines(&[], false), "");
             assert!(!said.to_lowercase().contains("receipt"), "{said}");
+        }
+    }
+
+    /// Issue #483: `report compaction-candidates --plan` groups the flagged
+    /// volumes by what fits one destination tape, largest reclaim first.
+    mod compaction_plan {
+        use super::*;
+        use crate::config::TapeBudget;
+        use std::collections::BTreeMap;
+
+        fn cand(label: &str, live: &[(i64, i64)], reclaimable_bytes: i64) -> PlanCandidate {
+            PlanCandidate {
+                label: label.to_string(),
+                live: live.iter().copied().collect::<BTreeMap<_, _>>(),
+                reclaimable_bytes,
+            }
+        }
+
+        fn labels(plan: &CompactionPlan) -> Vec<Vec<&str>> {
+            plan.groups
+                .iter()
+                .map(|g| g.members.iter().map(|m| m.label.as_str()).collect())
+                .collect()
+        }
+
+        #[test]
+        fn candidates_whose_live_data_fits_one_tape_share_a_group_largest_reclaim_first() {
+            // A 100-byte tape. By reclaim: A 50, B 40, C 10, D 5.
+            let plan = plan_compaction(
+                vec![
+                    cand("D", &[(4, 30)], 5),
+                    cand("C", &[(3, 50)], 10),
+                    cand("B", &[(2, 30)], 40),
+                    cand("A", &[(1, 60)], 50),
+                ],
+                100,
+            );
+            // A (60) + B (30) = 90 fit; C would make 140; C (50) + D (30) = 80.
+            assert_eq!(labels(&plan), [vec!["A", "B"], vec!["C", "D"]]);
+            assert_eq!(plan.groups[0].live_bytes(), 90);
+            assert_eq!(plan.groups[0].reclaimable_bytes(), 90);
+            assert_eq!(plan.groups[1].reclaimable_bytes(), 15);
+            assert!(plan.too_large.is_empty());
+            // No group is over the tape.
+            assert!(plan.groups.iter().all(|g| g.live_bytes() <= 100));
+        }
+
+        #[test]
+        fn a_slice_two_candidates_hold_is_carried_once() {
+            // Both carry slice 1 (a version copied to two tapes): 40 + 20 and
+            // 40 + 30 sum to 130 but the destination carries 90.
+            let plan = plan_compaction(
+                vec![
+                    cand("A", &[(1, 40), (2, 20)], 9),
+                    cand("B", &[(1, 40), (3, 30)], 8),
+                ],
+                100,
+            );
+            assert_eq!(labels(&plan), [vec!["A", "B"]]);
+            assert_eq!(plan.groups[0].live_bytes(), 90);
+        }
+
+        #[test]
+        fn a_candidate_larger_than_a_tape_is_set_aside_not_dropped() {
+            let plan = plan_compaction(
+                vec![cand("BIG", &[(1, 150)], 99), cand("SMALL", &[(2, 10)], 1)],
+                100,
+            );
+            assert_eq!(labels(&plan), [vec!["SMALL"]]);
+            assert_eq!(plan.too_large.len(), 1);
+            assert_eq!(plan.too_large[0].label, "BIG");
+        }
+
+        #[test]
+        fn equal_reclaim_is_ordered_by_label_so_the_plan_is_deterministic() {
+            let one = plan_compaction(
+                vec![cand("B", &[(2, 60)], 7), cand("A", &[(1, 60)], 7)],
+                100,
+            );
+            let other = plan_compaction(
+                vec![cand("A", &[(1, 60)], 7), cand("B", &[(2, 60)], 7)],
+                100,
+            );
+            assert_eq!(labels(&one), [vec!["A"], vec!["B"]]);
+            assert_eq!(one, other);
+        }
+
+        #[test]
+        fn the_host_of_a_group_is_the_member_freeing_the_most() {
+            let plan = plan_compaction(
+                vec![cand("A", &[(1, 10)], 3), cand("B", &[(2, 10)], 8)],
+                100,
+            );
+            assert_eq!(plan.groups[0].host().label, "B");
+        }
+
+        /// From a catalog: only volumes flagged under the threshold are
+        /// candidates, their live slices come from the catalog, and the
+        /// rendering names the command for a group of one and for a group
+        /// of several.
+        #[test]
+        fn the_plan_comes_from_the_catalog_and_names_the_commands() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tid = conn.last_insert_rowid();
+            let mut n = 0;
+            let mut volume = |label: &str, live: i64, reclaimable: i64| {
+                conn.execute(
+                    "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                          capacity_bytes, status)
+                     VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                    params![label],
+                )
+                .unwrap();
+                let vol_id = conn.last_insert_rowid();
+                for (snap_status, bytes) in [("current", live), ("reclaimable", reclaimable)] {
+                    if bytes == 0 {
+                        continue;
+                    }
+                    n += 1;
+                    conn.execute(
+                        "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                         VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+                        params![format!("{label}-{snap_status}"), tid],
+                    )
+                    .unwrap();
+                    let unit_id = conn.last_insert_rowid();
+                    conn.execute(
+                        "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                         VALUES (?1, 1, 'full', ?2, '/src')",
+                        params![unit_id, snap_status],
+                    )
+                    .unwrap();
+                    let snap_id = conn.last_insert_rowid();
+                    conn.execute(
+                        "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                         VALUES (?1, 'cleaned', 524288)",
+                        params![snap_id],
+                    )
+                    .unwrap();
+                    let ss = conn.last_insert_rowid();
+                    conn.execute(
+                        "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                                   encrypted_bytes, sha256_plain, sha256_encrypted)
+                         VALUES (?1, 1, ?2, ?2, ?3, ?3)",
+                        params![ss, bytes, format!("h{n}")],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                         VALUES (?1, ?2, ?3, 'completed')",
+                        params![ss, snap_id, vol_id],
+                    )
+                    .unwrap();
+                }
+            };
+            // 1.3 TB live of 2.9 TB; 0.9 TB live of 1.0 TB (not flagged at
+            // 0.50); 0.1 TB live of 1.0 TB; 0.2 TB live of 0.7 TB.
+            volume("L6-0001", 1_300_000_000_000, 1_600_000_000_000);
+            volume("L6-0002", 900_000_000_000, 100_000_000_000);
+            volume("L6-0003", 100_000_000_000, 900_000_000_000);
+            volume("L6-0004", 200_000_000_000, 500_000_000_000);
+
+            let mut config = Config::default();
+            config.compaction.utilization_threshold = 0.50;
+            let budget = planner_budget(&config, Some("LTO-6")).unwrap();
+            assert_eq!(budget.capacity_bytes, 2_500_000_000_000);
+            let plan = plan_compaction(plan_candidates(&conn, &config).unwrap(), budget.bytes);
+            // L6-0001 (reclaim 1.6 TB), L6-0003 (0.9), L6-0004 (0.5); L6-0002
+            // is above the threshold. 1.3 + 0.1 + 0.2 = 1.6 TB fits one
+            // 2.42 TB tape: one group of three.
+            assert_eq!(labels(&plan), [vec!["L6-0001", "L6-0003", "L6-0004"]]);
+
+            let lines = compaction_plan_lines(&plan, &budget).join("\n");
+            assert!(
+                lines.contains("group 1: L6-0001, L6-0003, L6-0004"),
+                "{lines}"
+            );
+            assert!(
+                lines.contains("tapectl volume compact-read L6-0003 / L6-0004")
+                    && lines.contains("tapectl volume rewrite L6-0001 --label <NEW> --with-staged"),
+                "the group is hosted on the volume freeing the most: {lines}"
+            );
+
+            // LTO-5 tapes (1.46 TB budget): 1.3 + 0.1 fit, 0.2 more do not.
+            let lto5 = planner_budget(&config, Some("LTO-5")).unwrap();
+            assert_eq!(lto5.capacity_bytes, 1_500_000_000_000);
+            let plan = plan_compaction(plan_candidates(&conn, &config).unwrap(), lto5.bytes);
+            assert_eq!(
+                labels(&plan),
+                [vec!["L6-0001", "L6-0003"], vec!["L6-0004"]],
+                "{:?}",
+                labels(&plan)
+            );
+            let lines = compaction_plan_lines(&plan, &lto5).join("\n");
+            assert!(
+                lines.contains("in place: tapectl volume rewrite"),
+                "{lines}"
+            );
+
+            let json = compaction_plan_json(&plan, &lto5);
+            assert_eq!(json["destination"]["capacity_bytes"], 1_500_000_000_000u64);
+            assert!(json["groups"][0]["host"].is_string());
+        }
+
+        #[test]
+        fn without_a_drive_the_generation_is_required() {
+            let config = Config::default();
+            assert!(planner_budget(&config, None)
+                .unwrap_err()
+                .to_string()
+                .contains("--generation"));
+            let b = planner_budget(&config, Some("LTO-7")).unwrap();
+            assert_eq!(b.capacity_bytes, 6_000_000_000_000);
+            assert!(TapeBudget::new("x".into(), 100, 0.5, 10, false).bytes == 40);
         }
     }
 }

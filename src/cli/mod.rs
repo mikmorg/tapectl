@@ -567,7 +567,9 @@ pub fn invocation_contract(args: &[std::ffi::OsString]) -> crate::error::ErrorCo
     match matches.subcommand() {
         Some(("volume", volume)) => match volume.subcommand_name() {
             Some("verify") => ErrorContract::Verify,
-            Some("write" | "resume" | "compact-write" | "compact") => ErrorContract::Write,
+            Some("write" | "resume" | "compact-write" | "compact" | "rewrite") => {
+                ErrorContract::Write
+            }
             _ => ErrorContract::Ordinary,
         },
         Some(("collection", c)) if c.subcommand_name() == Some("run") => ErrorContract::Write,
@@ -618,6 +620,16 @@ pub fn progress_session_name(command: &Commands) -> Option<String> {
                 format!("volume compact-write {destination}")
             }
             V::Compact { label, .. } => format!("volume compact {label}"),
+            V::Rewrite {
+                source,
+                label,
+                resume,
+                ..
+            } => match (resume, source, label) {
+                (Some(new), _, _) => format!("volume rewrite --resume {new}"),
+                (None, Some(source), _) => format!("volume rewrite {source}"),
+                _ => "volume rewrite".to_string(),
+            },
             _ => return None,
         },
         Commands::Restore { command } => match command {
@@ -729,6 +741,8 @@ mod tests {
             (&["volume", "resume", "L"], Write),
             (&["volume", "compact-write", "--destination", "L"], Write),
             (&["volume", "compact", "S", "--to", "L"], Write),
+            (&["volume", "rewrite", "S", "--label", "L"], Write),
+            (&["volume", "rewrite", "--resume", "L"], Write),
             (
                 &["collection", "run", "--collection", "c", "--label", "L"],
                 Write,

@@ -521,6 +521,101 @@ pub enum VolumeCommands {
         force: bool,
     },
 
+    /// Compact a volume IN PLACE: read its live slices into staging, retire
+    /// it, erase its cartridge and write the slices back to the same
+    /// cartridge as a new volume
+    ///
+    /// One drive (`--device`), the source loaded. The space held by
+    /// reclaimable and purged versions is freed without a second cartridge,
+    /// even when the volume holds the only copy of a unit. In order:
+    ///
+    /// 1. Checks that need no tape: the source is sealed and trusted, `--label`
+    /// is free, the cartridge carries no other live volume, the drive can
+    /// write its generation, the live data fits one tape, and staging has
+    /// room for it. A consent the run could never be given is refused here,
+    /// before anything is read.
+    ///
+    /// 2. The live slices are read into staging (`compact-read`'s read), then
+    /// each is read back from the staging disk and matched against its
+    /// recorded hash. A mismatch refuses, the source untouched.
+    ///
+    /// 3. Consent. If every live slice has a copy on another sealed volume,
+    /// the usual Tier-2 prompt for a version left below its policy (a
+    /// terminal asks; the global `--yes` confirms in advance; no terminal and
+    /// no `--yes` refuses). If some live slice has NO copy anywhere else,
+    /// the retire family's zero floor is amended for this command alone: the
+    /// units and versions, the staging path and the window are shown, and the
+    /// source's label must be typed at a terminal, or given as
+    /// `--only-copy-on-staging LABEL` for an unattended run. `--yes` does not
+    /// give it. Every other way to retire a volume keeps its absolute floor.
+    ///
+    /// 4. The source is retired, its cartridge erased (`cartridge erase`'s
+    /// own checks), `NEW` initialised on it, the staged slices written with
+    /// the FULL confirm (every file read back), and only then is staging
+    /// released.
+    ///
+    /// From the erase until `NEW` passes that readback the staging disk may
+    /// hold the ONLY copy of some units. That window is named in the events
+    /// and the session log. If the command stops in it, the staged slices
+    /// stay staged and nothing releases them (`staging clean --force`
+    /// included); the error names the command that finishes the job:
+    /// `volume rewrite --resume NEW`.
+    ///
+    /// `--dry-run` runs the checks of step 1 and shows the plan and the
+    /// consent it would need, touching nothing.
+    ///
+    /// Exit status: `volume write`'s (0 sealed and confirmed, 2 refused with
+    /// the tape untouched, 3 confirm inconclusive, 4 stopped after the tape
+    /// was touched and resumable, 5 aborted, 6 quarantined, 75 catalog busy).
+    Rewrite {
+        /// Source volume label (not with --resume)
+        #[arg(required_unless_present = "resume", conflicts_with = "resume")]
+        source: Option<String>,
+        /// The label of the NEW volume that will carry the slices on the
+        /// same cartridge (not with --resume)
+        #[arg(
+            long,
+            value_name = "NEW",
+            required_unless_present = "resume",
+            conflicts_with = "resume"
+        )]
+        label: Option<String>,
+        /// Finish the rewrite that was to write NEW and stopped: erase, init
+        /// and write from wherever the catalog says it stopped, then lift
+        /// the hold on the staged slices once NEW has passed a full readback
+        #[arg(
+            long,
+            value_name = "NEW",
+            conflicts_with_all = ["source", "label", "only_copy_on_staging", "with_staged"]
+        )]
+        resume: Option<String>,
+        /// Consent, for an unattended run, to rewriting a volume that holds
+        /// the only copy of some unit: the SOURCE volume's label, exactly. A
+        /// different label refuses. `--yes` does not give this consent.
+        #[arg(long, value_name = "SOURCE_LABEL", requires = "label")]
+        only_copy_on_staging: Option<String>,
+        /// Tape device (by-id path). Defaults to the only configured drive;
+        /// required when more than one is configured.
+        #[arg(long)]
+        device: Option<String>,
+        /// See `volume write --allow-missing-escrow`.
+        #[arg(long)]
+        allow_missing_escrow: bool,
+        /// See `volume write --prewrite-hash`.
+        #[arg(long)]
+        prewrite_hash: bool,
+        /// See `volume write --fill-ceiling`: this command only.
+        #[arg(long, value_parser = crate::config::parse_fill_ceiling)]
+        fill_ceiling: Option<f64>,
+        /// Write whatever else is staged beside the rewrite's slices. Without
+        /// it the new volume carries the rewrite's slices and nothing else.
+        #[arg(long)]
+        with_staged: bool,
+        /// Release nothing from staging after the full readback.
+        #[arg(long)]
+        keep_staging: bool,
+    },
+
     /// Record and inspect WAREHOUSE DEPOSITS of sealed volumes (ADR-0006).
     ///
     /// tapectl does NOT move the bytes: an operator copies a sealed
@@ -889,6 +984,9 @@ fn print_staging_release(label: &str, release: &StagingRelease) {
                     "  stage set {id} kept: a live session is using it on volume(s) {}",
                     labels.join(", ")
                 );
+            }
+            for (id, hold) in &r.held_by_pending_rewrite {
+                println!("  {}", hold.describe(*id));
             }
             if !r.stranded.is_empty() {
                 // `staging_path` is nulled before the unlink (issue #108), so
@@ -1378,6 +1476,27 @@ fn write_done_json(label: &str, done: &WriteDone) -> serde_json::Value {
         obj.insert("volumes_moved".into(), volumes.into());
     }
     base
+}
+
+/// `volume rewrite`'s options as the library takes them.
+fn rewrite_options<'a>(
+    source: &'a str,
+    destination: &'a str,
+    device: &'a str,
+    only_copy_on_staging: Option<&'a str>,
+    assume_yes: bool,
+    with_staged: bool,
+    keep_staging: bool,
+) -> crate::volume::rewrite::RewriteOptions<'a> {
+    crate::volume::rewrite::RewriteOptions {
+        source,
+        destination,
+        device,
+        only_copy_on_staging,
+        assume_yes,
+        with_staged,
+        keep_staging,
+    }
 }
 
 /// Run a volume subcommand. Returns the process exit code (issue #45/H10),
@@ -2494,6 +2613,122 @@ pub fn run(
             }
         }
 
+        VolumeCommands::Rewrite {
+            source,
+            label,
+            resume,
+            only_copy_on_staging,
+            device,
+            allow_missing_escrow,
+            prewrite_hash,
+            fill_ceiling,
+            with_staged,
+            keep_staging,
+        } => {
+            use crate::volume::rewrite;
+            // Strict, as every write path: a rewrite erases and writes.
+            let device = write_device(config, device.as_deref())?;
+            // Issue #391: `--fill-ceiling` for this command only (the
+            // capacity check and the write).
+            let config = &config.with_fill_ceiling(*fill_ceiling);
+            let opts = |src, dest| {
+                rewrite_options(
+                    src,
+                    dest,
+                    device.as_str(),
+                    only_copy_on_staging.as_deref(),
+                    // The global `--yes` answers the Tier-2 prompt and the
+                    // quiet-host question. It never reaches the typed consent.
+                    yes,
+                    *with_staged,
+                    *keep_staging,
+                )
+            };
+            if dry_run {
+                let (Some(src), Some(dest)) = (source.as_deref(), label.as_deref()) else {
+                    return Err(crate::cli::refuse_dry_run(
+                        "volume rewrite --resume",
+                        "what it would do depends on what the drive and the catalog say \
+                         when it runs; `tapectl staging status` shows the held slices.",
+                    ));
+                };
+                let plan = rewrite::plan(conn, config, &opts(src, dest))?;
+                if json_output {
+                    println!("{}", plan.to_json(src, dest));
+                } else {
+                    for line in plan.describe(src, dest) {
+                        println!("{line}");
+                    }
+                    println!("\n  DRY RUN — nothing read, nothing changed.");
+                }
+                return Ok(exit_code);
+            }
+            let steps = rewrite::DriveRewriteSteps {
+                conn,
+                paths,
+                config,
+                device: device.as_str(),
+                allow_missing_escrow: *allow_missing_escrow,
+                prewrite_hash: *prewrite_hash,
+                assume_yes: yes,
+            };
+            let report = match (resume.as_deref(), source.as_deref(), label.as_deref()) {
+                (Some(dest), _, _) => rewrite::resume(conn, config, &steps, dest, *keep_staging)?,
+                (None, Some(src), Some(dest)) => {
+                    rewrite::rewrite(conn, config, &steps, &opts(src, dest))?
+                }
+                _ => {
+                    return Err(TapectlError::Other(
+                        "volume rewrite needs SOURCE and --label NEW, or --resume NEW".into(),
+                    ))
+                }
+            };
+            if json_output {
+                let mut base = serde_json::json!({
+                    "source": report.source,
+                    "destination": report.destination,
+                    "status": "completed",
+                    "consent": report.consent.as_str(),
+                    "slices": report.slices,
+                    "bytes": report.bytes,
+                    "reclaimed_bytes": report.reclaimed_bytes,
+                    "resumed": report.resumed,
+                });
+                if let Some(release) = &report.release {
+                    base = staging_release_json(base, release);
+                }
+                println!("{base}");
+            } else {
+                println!(
+                    "volume rewrite \"{}\" -> \"{}\" complete: {} slice(s){}, sealed and fully \
+                     read back{}",
+                    report.source,
+                    report.destination,
+                    report.slices,
+                    if report.bytes > 0 {
+                        format!(" ({})", crate::util::format_bytes_binary(report.bytes))
+                    } else {
+                        String::new()
+                    },
+                    if report.resumed { " (resumed)" } else { "" },
+                );
+                if report.reclaimed_bytes > 0 {
+                    println!(
+                        "  freed on the cartridge: {} (reclaimable and purged versions)",
+                        crate::util::format_bytes_binary(report.reclaimed_bytes)
+                    );
+                }
+                println!(
+                    "  \"{}\" is retired and erased; the window is closed — the new volume is \
+                     the copy of record",
+                    report.source
+                );
+                if let Some(release) = &report.release {
+                    print_staging_release(&report.destination, release);
+                }
+            }
+        }
+
         VolumeCommands::Deposit { command } => run_deposit(conn, command, json_output, dry_run)?,
 
         VolumeCommands::List { status } => {
@@ -3016,7 +3251,8 @@ pub fn error_contract(command: &VolumeCommands) -> crate::error::ErrorContract {
         VolumeCommands::Write { .. }
         | VolumeCommands::Resume { .. }
         | VolumeCommands::CompactWrite { .. }
-        | VolumeCommands::Compact { .. } => crate::error::ErrorContract::Write,
+        | VolumeCommands::Compact { .. }
+        | VolumeCommands::Rewrite { .. } => crate::error::ErrorContract::Write,
         _ => crate::error::ErrorContract::Ordinary,
     }
 }

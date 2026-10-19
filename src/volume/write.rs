@@ -6709,7 +6709,21 @@ pub(crate) fn write_catalog_preflight(
     label: &str,
     allow_missing_escrow: bool,
 ) -> Result<()> {
-    let units = checked_staged_units(conn, None)?;
+    write_catalog_preflight_in(conn, label, allow_missing_escrow, None)
+}
+
+/// [`write_catalog_preflight`] for a write of only `only` (a `volume
+/// rewrite`'s own stage sets, issue #483; `None` is every staged set). A
+/// rewrite asks it after its slices are staged and verified and BEFORE it
+/// retires anything: the write that follows the erase must not be able to
+/// refuse for a reason the catalog and the disk already knew.
+pub(crate) fn write_catalog_preflight_in(
+    conn: &Connection,
+    label: &str,
+    allow_missing_escrow: bool,
+    only: Option<&[i64]>,
+) -> Result<()> {
+    let units = checked_staged_units(conn, only)?;
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let session = assemble_keys_for_units(conn, &units, &stage_set_ids)?;
     // The write's `validate` also checks keys, escrow and per-set escrow

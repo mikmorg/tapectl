@@ -411,7 +411,6 @@ pub struct RewriteOptions<'a> {
 #[derive(Debug)]
 pub(crate) struct Plan {
     pub source_id: i64,
-    pub cartridge_id: i64,
     pub cartridge_barcode: String,
     pub cartridge_serial: Option<String>,
     pub slices: Vec<write::RecoverySlice>,
@@ -428,7 +427,6 @@ pub(crate) struct Plan {
     pub last_copy_versions: Vec<(String, i64)>,
     /// The Tier-2 facts (empty: nothing falls below policy).
     pub tier2_facts: Vec<String>,
-    pub staging_dir: PathBuf,
     pub compact_dir: PathBuf,
 }
 
@@ -499,6 +497,15 @@ pub(crate) fn preflight(
     config: &Config,
     opts: &RewriteOptions<'_>,
 ) -> Result<Plan> {
+    let plan = plan(conn, config, opts)?;
+    // A run that can never be consented to refuses now, before the read.
+    check_consent_obtainable(&plan, opts)?;
+    Ok(plan)
+}
+
+/// [`preflight`] without the consent check: what the catalog says about this
+/// rewrite, for `--dry-run` to show and for [`preflight`] to refuse on.
+pub(crate) fn plan(conn: &Connection, config: &Config, opts: &RewriteOptions<'_>) -> Result<Plan> {
     let source = opts.source;
     let destination = opts.destination;
 
@@ -658,6 +665,36 @@ pub(crate) fn preflight(
         )));
     }
 
+    // `--with-staged` carries whatever else is staged beside the live
+    // slices; it must fit the same tape, or the write after the erase would
+    // refuse for capacity.
+    if opts.with_staged {
+        let live_sets: Vec<i64> = slices.iter().map(|s| s.stage_set_id).collect();
+        let extra: i64 = {
+            let mut stmt = conn.prepare(
+                "SELECT ss.id, COALESCE(SUM(sl.encrypted_bytes), 0)
+                 FROM stage_sets ss JOIN stage_slices sl ON sl.stage_set_id = ss.id
+                 WHERE ss.status = 'staged' GROUP BY ss.id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .filter(|(id, _)| !live_sets.contains(id))
+                .map(|(_, bytes)| bytes)
+                .sum()
+        };
+        if (live_bytes + extra) as u64 > budget_bytes {
+            return Err(TapectlError::Other(format!(
+                "volume rewrite refused: --with-staged adds {} of other staged data to the {}                  of live data, which does not fit one tape at the {}% fill ceiling ({}).                  Nothing was changed.",
+                crate::util::format_bytes_binary(extra),
+                crate::util::format_bytes_binary(live_bytes),
+                (backend.fill_ceiling * 100.0).round() as i64,
+                crate::util::format_bytes_binary(budget_bytes as i64),
+            )));
+        }
+    }
+
     // Staging has room for the live slices, before a block is read.
     let staging_dir = PathBuf::from(&config.staging.directory);
     let compact_dir = staging_dir.join(format!("compact-{source}"));
@@ -714,9 +751,8 @@ pub(crate) fn preflight(
         }
     }
 
-    let plan = Plan {
+    Ok(Plan {
         source_id,
-        cartridge_id,
         cartridge_barcode,
         cartridge_serial,
         slices,
@@ -725,13 +761,79 @@ pub(crate) fn preflight(
         sole,
         last_copy_versions,
         tier2_facts,
-        staging_dir,
         compact_dir,
-    };
+    })
+}
 
-    // A run that can never be consented to refuses now, before the read.
-    check_consent_obtainable(&plan, opts)?;
-    Ok(plan)
+impl Plan {
+    /// What `--dry-run` shows: the plan and the consent it would need.
+    pub(crate) fn describe(&self, source: &str, destination: &str) -> Vec<String> {
+        use crate::util::format_bytes_binary as fmt;
+        let mut lines = vec![
+            format!(
+                "volume rewrite \"{source}\" -> \"{destination}\" on cartridge {}{}",
+                self.cartridge_barcode,
+                self.cartridge_serial
+                    .as_deref()
+                    .map(|s| format!(" (chip serial {s})"))
+                    .unwrap_or_default()
+            ),
+            format!(
+                "  live data: {} slice(s), {}, read into staging at {}",
+                self.slices.len(),
+                fmt(self.live_bytes),
+                self.compact_dir.display()
+            ),
+            format!(
+                "  freed on the cartridge: {} (reclaimable and purged versions)",
+                fmt(self.reclaimable_bytes)
+            ),
+        ];
+        if self.needs_typed_consent() {
+            lines.push(
+                "  consent: some live data has NO copy on any other volume — the source's \
+                 label typed, or --only-copy-on-staging, would be required (--yes does not \
+                 give it):"
+                    .to_string(),
+            );
+            lines.extend(self.typed_facts(source, destination));
+        } else if self.tier2_facts.is_empty() {
+            lines.push(
+                "  consent: none needed — every live slice has a copy on another volume and \
+                 no version falls below its policy"
+                    .to_string(),
+            );
+        } else {
+            lines.push("  consent: the usual Tier-2 prompt (or --yes):".to_string());
+            lines.extend(self.tier2_facts.iter().map(|f| format!("    {f}")));
+        }
+        lines
+    }
+
+    pub(crate) fn to_json(&self, source: &str, destination: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dry_run": true,
+            "source": source,
+            "destination": destination,
+            "cartridge": self.cartridge_barcode,
+            "cartridge_serial": self.cartridge_serial,
+            "live_slices": self.slices.len(),
+            "live_bytes": self.live_bytes,
+            "reclaimable_bytes": self.reclaimable_bytes,
+            "staging": self.compact_dir.display().to_string(),
+            "consent": if self.needs_typed_consent() {
+                "typed_label"
+            } else if self.tier2_facts.is_empty() {
+                "none"
+            } else {
+                "tier2"
+            },
+            "only_copy": self.sole_versions().into_iter().map(|(unit, version, slices, bytes)| {
+                serde_json::json!({"unit": unit, "version": version, "slices": slices, "bytes": bytes})
+            }).collect::<Vec<_>>(),
+            "tier2_facts": self.tier2_facts,
+        })
+    }
 }
 
 /// The non-interactive half of the consent, asked before anything is read:
@@ -773,6 +875,16 @@ fn check_consent_obtainable(plan: &Plan, opts: &RewriteOptions<'_>) -> Result<()
 
 /// The steps of a rewrite that touch the drive.
 pub trait RewriteSteps {
+    /// The quiet-host question `volume write` asks (ADR-0012 2026-09-24 item
+    /// 7), asked ONCE here, before the read and long before the erase: the
+    /// write after the erase must never be refused over it.
+    fn host_preflight(&self, what: &str) -> Result<()>;
+    /// What the write would refuse from the catalog and the staged files
+    /// alone — a staged set not whole on disk, a tenant or the operator
+    /// without a key, a missing escrow recipient — for a write of only
+    /// `only_stage_sets` (`None`: every staged set). Asked after the slices
+    /// are staged and before anything is retired.
+    fn write_preflight(&self, label: &str, only_stage_sets: Option<&[i64]>) -> Result<()>;
     /// `compact-read` the source's live slices into staging.
     fn read(&self, source: &str) -> Result<CompactReadReport>;
     /// `cartridge erase` (short) of the cartridge in the drive, confirmed
@@ -805,6 +917,22 @@ pub struct DriveRewriteSteps<'a> {
 }
 
 impl RewriteSteps for DriveRewriteSteps<'_> {
+    fn host_preflight(&self, what: &str) -> Result<()> {
+        progress::waited(
+            || "the operator to answer the quiet-host check".to_string(),
+            || crate::host_check::preflight(&self.config.host_check(), what, self.assume_yes),
+        )
+    }
+
+    fn write_preflight(&self, label: &str, only_stage_sets: Option<&[i64]>) -> Result<()> {
+        write::write_catalog_preflight_in(
+            self.conn,
+            label,
+            self.allow_missing_escrow,
+            only_stage_sets,
+        )
+    }
+
     fn read(&self, source: &str) -> Result<CompactReadReport> {
         use crate::store::TapeStore;
         use crate::tape::contact::{ContactSite, Medium, Operation};
@@ -871,7 +999,10 @@ impl RewriteSteps for DriveRewriteSteps<'_> {
             self.allow_missing_escrow,
             self.prewrite_hash,
             true,
-            self.assume_yes,
+            // The quiet-host question was asked once, at the start (see
+            // `host_preflight`); it is not asked again with the cartridge
+            // erased and the slices staged.
+            true,
             only_stage_sets,
         )
     }
@@ -1070,6 +1201,14 @@ pub fn rewrite(
     let source = opts.source;
     let destination = opts.destination;
 
+    // Everything the run can know before it reads or destroys anything is
+    // asked now: the quiet-host question (so the write after the erase is
+    // never refused over it) and the chip in the drive (`cartridge erase`
+    // refuses without a serial, and the cartridge in the drive must be the
+    // one the catalog has the source on).
+    steps.host_preflight(&format!("volume rewrite \"{source}\""))?;
+    let chip = require_chip(steps, &plan, source)?;
+
     // A stale record of an earlier rewrite of this volume that never got past
     // staging: nothing destructive happened, so it is simply replaced.
     if let Some(stale) = open_for_source(conn, plan.source_id)? {
@@ -1142,7 +1281,7 @@ pub fn rewrite(
         conn,
         plan.source_id,
         destination,
-        plan.cartridge_serial.as_deref(),
+        Some(chip.as_str()),
         consent_kind,
         &read.staged_sets,
     )?;
@@ -1177,6 +1316,22 @@ pub fn rewrite(
             "staging": plan.compact_dir.display().to_string(),
         }),
     )?;
+
+    // The write that follows the erase must not be able to refuse for
+    // anything the catalog and the staged files already show: whole on disk,
+    // every key, the escrow recipient.
+    let scope: Option<&[i64]> = if opts.with_staged {
+        None
+    } else {
+        Some(read.staged_sets.as_slice())
+    };
+    if let Err(e) = steps.write_preflight(destination, scope) {
+        abandon("the write would be refused");
+        return Err(TapectlError::Other(format!(
+            "volume rewrite refused: the write of \"{destination}\" would be refused — {e}. \
+             Nothing destructive was done and staging was put back as it was."
+        )));
+    }
 
     // 4. Consent.
     let action = format!(
@@ -1640,6 +1795,31 @@ fn mark_window_open(conn: &Connection, pending: &Pending, window: &str) -> Resul
     )
 }
 
+/// The chip serial of the cartridge in the drive, required: `cartridge
+/// erase` refuses without one, and it must be the cartridge the catalog has
+/// the source on. Asked before anything is read.
+fn require_chip(steps: &dyn RewriteSteps, plan: &Plan, source: &str) -> Result<String> {
+    let Some(have) = steps.chip_serial() else {
+        return Err(TapectlError::Other(format!(
+            "volume rewrite refused: the chip serial of the cartridge in the drive could not \
+             be read (the MAM read through device_sg failed: sg permissions, sg3-utils not \
+             installed, or a device_sg that is not this drive's). `cartridge erase` refuses \
+             without it, and nothing else proves after the erase that the cartridge erased \
+             is \"{source}\"'s. `tapectl volume identify` shows what the chip reports. \
+             Nothing was changed."
+        )));
+    };
+    match plan.cartridge_serial.as_deref() {
+        Some(want) if want != have => Err(TapectlError::Other(format!(
+            "volume rewrite refused: the cartridge in the drive reports chip serial {have}, \
+             but the catalog has volume \"{source}\" on cartridge {} (serial {want}). Load \
+             that cartridge. Nothing was changed.",
+            plan.cartridge_barcode
+        ))),
+        _ => Ok(have),
+    }
+}
+
 /// The cartridge in the drive is the one the rewrite recorded — by its chip
 /// serial. A recorded serial the chip cannot confirm refuses; so does a
 /// different one.
@@ -1937,6 +2117,9 @@ mod tests {
         serial: RefCell<Option<String>>,
         /// What the stage sets passed to the write were.
         written_scope: RefCell<Option<Vec<i64>>>,
+        /// The catalog-only asks, in order (`host ...`, `write_preflight ...`).
+        asked: RefCell<Vec<String>>,
+        fail_write_preflight: Cell<bool>,
     }
 
     impl<'a> Fake<'a> {
@@ -1954,6 +2137,8 @@ mod tests {
                 corrupt_a_staged_slice: Cell::new(false),
                 serial: RefCell::new(Some(SERIAL.to_string())),
                 written_scope: RefCell::new(None),
+                asked: RefCell::new(Vec::new()),
+                fail_write_preflight: Cell::new(false),
             }
         }
 
@@ -1984,6 +2169,24 @@ mod tests {
     }
 
     impl RewriteSteps for Fake<'_> {
+        fn host_preflight(&self, what: &str) -> Result<()> {
+            self.asked.borrow_mut().push(format!("host {what}"));
+            Ok(())
+        }
+
+        fn write_preflight(&self, label: &str, only: Option<&[i64]>) -> Result<()> {
+            self.asked.borrow_mut().push(format!(
+                "write_preflight {label} {}",
+                if only.is_some() { "scoped" } else { "all" }
+            ));
+            if self.fail_write_preflight.get() {
+                return Err(TapectlError::Other(
+                    "refusing to write: these staged sets are not whole on disk".into(),
+                ));
+            }
+            Ok(())
+        }
+
         fn read(&self, source: &str) -> Result<CompactReadReport> {
             self.log.borrow_mut().push("read".into());
             let last = self.files.iter().map(|(p, _)| *p).max().unwrap();
@@ -1994,7 +2197,17 @@ mod tests {
                     .iter()
                     .find(|(q, _)| *q == p)
                     .map(|(_, b)| b.clone())
-                    .unwrap_or_else(|| vec![b'f'; 16]);
+                    .unwrap_or_else(|| {
+                        if p == 0 {
+                            // File 0 states the format this tapectl reads and
+                            // nothing about the volume (as write.rs's recovery
+                            // read fixtures do): no identity to corroborate.
+                            b"[volume]\nmagic = \"tapectl-volume-v2\"\nlayout_version = 2\nrequires = []\n"
+                                .to_vec()
+                        } else {
+                            vec![0u8]
+                        }
+                    });
                 store
                     .execute(&mut Cursor::new(bytes.clone()), bytes.len() as u64, false)
                     .unwrap();
@@ -2641,5 +2854,688 @@ mod tests {
             "{msg}"
         );
         assert!(fake.calls().is_empty());
+    }
+
+    // ── the command: consent ────────────────────────────────────────────────
+
+    /// Every live slice has a copy on another eligible volume, and with
+    /// `min_copies` 2 the retirement leaves each version at one copy: the
+    /// usual ADR-0008 Tier-2 gate. No terminal and no `--yes` refuses before
+    /// anything is read; `--yes` confirms in advance.
+    #[test]
+    fn copies_elsewhere_below_policy_is_the_usual_tier_two_gate() {
+        let s = scene(2);
+        copy_elsewhere(&s, &s.keepsake, &[1, 2], true, "OTHER-A");
+        copy_elsewhere(&s, &s.docs, &[3], true, "OTHER-B");
+
+        // No terminal, no --yes: refuses, naming the version it would leave short.
+        let fake = Fake::new(&s);
+        let o = opts("SRC", "NEW");
+        let msg = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("refused: non-interactive session")
+                && msg.contains("--yes")
+                && msg.contains("below its policy of 2"),
+            "{msg}"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "refused before the read: {:?}",
+            fake.calls()
+        );
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
+        assert_eq!(
+            scalar::<i64>(&s.w.conn, "SELECT COUNT(*) FROM pending_rewrites"),
+            0
+        );
+
+        // --yes (or --force, which the CLI folds into the same flag).
+        let mut o = opts("SRC", "NEW");
+        o.assume_yes = true;
+        let report = rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+        assert_eq!(report.consent, Consent::CopiesElsewhere);
+        assert_eq!(fake.calls(), ["read", "erase SRC", "init NEW", "write NEW"]);
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "erased");
+        assert_eq!(volume_status(&s.w.conn, "NEW"), "sealed");
+        let (consent, outcome): (String, String) =
+            s.w.conn
+                .query_row("SELECT consent, outcome FROM pending_rewrites", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+        assert_eq!(
+            (consent.as_str(), outcome.as_str()),
+            ("copies_elsewhere", "completed")
+        );
+        // The new volume carries the live versions and not the reclaimable one.
+        let scope = fake.written_scope.borrow().clone().unwrap();
+        assert_eq!(
+            scope,
+            vec![s.keepsake.stage_set_id, s.docs.stage_set_id],
+            "only the rewrite's own sets, never `old` (reclaimable)"
+        );
+        assert_eq!(report.reclaimed_bytes, s.old.data[0].len() as i64);
+        // OTHER-x + NEW = 2 copies: policy met, so staging is released.
+        assert!(
+            staged_files(&s.w.config).is_empty(),
+            "{:?}",
+            staged_files(&s.w.config)
+        );
+        assert_eq!(set_status(&s.w.conn, s.keepsake.stage_set_id), "cleaned");
+    }
+
+    #[test]
+    fn copies_elsewhere_and_within_policy_asks_nothing() {
+        let s = scene(1);
+        copy_elsewhere(&s, &s.keepsake, &[1, 2], true, "OTHER-A");
+        copy_elsewhere(&s, &s.docs, &[3], true, "OTHER-B");
+        let fake = Fake::new(&s);
+        let report = rewrite(&s.w.conn, &s.w.config, &fake, &opts("SRC", "NEW")).unwrap();
+        assert_eq!(report.consent, Consent::CopiesElsewhere);
+        assert_eq!(fake.calls().len(), 4);
+    }
+
+    /// Some live slice has no copy anywhere else: the amended floor. Not
+    /// `--yes`, not `--force` (the CLI folds both into `assume_yes`), not a
+    /// wrong label; before anything is read.
+    #[test]
+    fn a_single_copy_is_refused_without_the_typed_label_whatever_yes_says() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+
+        let mut o = opts("SRC", "NEW");
+        let msg = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("--only-copy-on-staging SRC"), "{msg}");
+        assert!(
+            msg.contains("unit \"keepsake\" v1") && msg.contains("unit \"docs\" v1"),
+            "the units and versions at stake are named: {msg}"
+        );
+        assert!(msg.contains("THE WINDOW"), "{msg}");
+        assert!(
+            msg.contains("holds the only copy of these"),
+            "the window sentence: {msg}"
+        );
+        assert!(
+            msg.contains(&s.w.config.staging.directory),
+            "the staging path is named: {msg}"
+        );
+
+        // --yes / --force (assume_yes) do not pass it.
+        o.assume_yes = true;
+        let msg = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("--yes") && msg.contains("do not give it"),
+            "--yes does not stand in for the typed label: {msg}"
+        );
+
+        // A wrong label, even with --yes.
+        o.only_copy_on_staging = Some("SRC2");
+        let msg = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("\"SRC2\"")
+                && msg.contains("\"SRC\"")
+                && msg.contains("Nothing was changed"),
+            "{msg}"
+        );
+
+        assert!(
+            fake.calls().is_empty(),
+            "no drive step ran: {:?}",
+            fake.calls()
+        );
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
+        assert_eq!(
+            scalar::<i64>(&s.w.conn, "SELECT COUNT(*) FROM pending_rewrites"),
+            0
+        );
+        assert!(staged_files(&s.w.config).is_empty());
+        assert_eq!(
+            scalar::<String>(&s.w.conn, "SELECT status FROM cartridges"),
+            "in_use"
+        );
+    }
+
+    #[test]
+    fn a_single_copy_rewrite_runs_with_the_label_and_records_the_window() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let report = rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+
+        assert_eq!(report.consent, Consent::TypedFlag);
+        assert_eq!(
+            fake.calls(),
+            ["read", "erase SRC", "init NEW", "write NEW"],
+            "read, erase, init, write, in that order"
+        );
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "erased");
+        assert_eq!(volume_status(&s.w.conn, "NEW"), "sealed");
+        // The same cartridge: the one open mount is NEW's, on CART-1.
+        let barcode: String =
+            s.w.conn
+                .query_row(
+                    "SELECT c.barcode FROM cartridge_volumes cv
+                 JOIN cartridges c ON c.id = cv.cartridge_id
+                 JOIN volumes v ON v.id = cv.volume_id
+                 WHERE v.label = 'NEW' AND cv.unmounted_at IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        assert_eq!(barcode, "CART-1");
+        // NEW is the only copy and it was fully read back: staging released.
+        assert_eq!(set_status(&s.w.conn, s.keepsake.stage_set_id), "cleaned");
+        assert!(staged_files(&s.w.config).is_empty());
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+
+        // Every step is an event on the source volume, the window named in
+        // both of its ends.
+        for action in [
+            "rewrite_started",
+            "rewrite_staged_verified",
+            "rewrite_consent",
+            "retired",
+            "rewrite_window_opened",
+            "rewrite_erased",
+            "rewrite_initialized",
+            "rewrite_written",
+            "rewrite_window_closed",
+        ] {
+            assert_eq!(events_of(&s.w.conn, action), 1, "event {action}");
+        }
+        let opened: String = scalar(
+            &s.w.conn,
+            "SELECT details FROM events WHERE action = 'rewrite_window_opened'",
+        );
+        assert!(
+            opened.contains("holds the only copy of these") && opened.contains("\"NEW\""),
+            "{opened}"
+        );
+        let consent: String = scalar(
+            &s.w.conn,
+            "SELECT details FROM events WHERE action = 'rewrite_consent'",
+        );
+        assert!(consent.contains("typed_flag"), "{consent}");
+        let (state, window): (String, Option<String>) =
+            s.w.conn
+                .query_row(
+                    "SELECT state, window_opened_at FROM pending_rewrites",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+        assert_eq!(state, "written");
+        assert!(window.is_some(), "the window's opening is stamped");
+    }
+
+    // ── the command: a refusal before the erase ─────────────────────────────
+
+    #[test]
+    fn a_staged_slice_that_does_not_match_its_hash_refuses_before_the_erase() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        fake.corrupt_a_staged_slice.set(true);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let msg = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+
+        assert!(msg.contains("not what the catalog recorded"), "{msg}");
+        assert_eq!(fake.calls(), ["read"], "the erase never ran");
+        // Nothing destructive: the source is sealed and its cartridge in use.
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
+        assert_eq!(
+            scalar::<String>(&s.w.conn, "SELECT status FROM cartridges"),
+            "in_use"
+        );
+        // Staging was put back: no file, the sets released as they were.
+        assert!(
+            staged_files(&s.w.config).is_empty(),
+            "{:?}",
+            staged_files(&s.w.config)
+        );
+        for v in [&s.keepsake, &s.docs] {
+            assert_eq!(set_status(&s.w.conn, v.stage_set_id), "cleaned");
+        }
+        assert_eq!(
+            scalar::<i64>(
+                &s.w.conn,
+                "SELECT COUNT(*) FROM stage_slices WHERE staging_path IS NOT NULL"
+            ),
+            0
+        );
+        // The hold was closed, not left behind.
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+        let outcome: String = scalar(&s.w.conn, "SELECT outcome FROM pending_rewrites");
+        assert_eq!(outcome, "abandoned");
+        assert_eq!(events_of(&s.w.conn, "rewrite_abandoned"), 1);
+        assert_eq!(events_of(&s.w.conn, "retired"), 0);
+    }
+
+    // ── the command: a failure after the erase ──────────────────────────────
+
+    /// The failure that item 106 is about: the write fails after the
+    /// cartridge was erased. The slices stay staged, held, with the command
+    /// that resumes it named, and no release path will free them.
+    #[test]
+    fn a_write_that_fails_after_the_erase_leaves_the_slices_held_and_names_the_resume() {
+        use crate::staging::clean::{clean_staging, CleanScope};
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        fake.fail_write.set(true);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let err = rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap_err();
+
+        // The error is the write's own, classified (interrupted: exit 4),
+        // and names what finishes it.
+        let msg = err.to_string();
+        assert!(matches!(err, TapectlError::WriteInterrupted(_)), "{msg}");
+        assert!(
+            msg.contains("tapectl volume rewrite --resume NEW")
+                && msg.contains("held")
+                && msg.contains("`--force` included"),
+            "{msg}"
+        );
+        assert_eq!(
+            crate::error::WriteOutcome::of(&anyhow::Error::from(err)),
+            Some(crate::error::WriteOutcome::Interrupted)
+        );
+
+        // The destructive part happened; the data did not leave staging.
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "erased");
+        assert_eq!(volume_status(&s.w.conn, "NEW"), "initialized");
+        let files = staged_files(&s.w.config);
+        assert_eq!(files.len(), 3, "keepsake x2 and docs x1: {files:?}");
+        for v in [&s.keepsake, &s.docs] {
+            assert_eq!(set_status(&s.w.conn, v.stage_set_id), "staged");
+        }
+        let state: String = scalar(&s.w.conn, "SELECT state FROM pending_rewrites");
+        assert_eq!(state, "initialized");
+        assert_eq!(holds(&s.w.conn).unwrap().len(), 2);
+        assert_eq!(events_of(&s.w.conn, "rewrite_stopped"), 1);
+
+        // Nothing releases them: not `staging clean` (force or not), not the
+        // release after a write, not the unit-scoped forms.
+        let force = clean_staging(&s.w.conn, &s.w.config, true, CleanScope::Whole).unwrap();
+        assert_eq!(force.sets_cleaned, 0, "{force:?}");
+        assert_eq!(force.held_by_pending_rewrite.len(), 2);
+        let unit_ids: Vec<i64> =
+            s.w.conn
+                .prepare("SELECT id FROM units WHERE name IN ('keepsake', 'docs')")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+        let out =
+            crate::staging::release::release_if_covered(&s.w.conn, &s.w.config, &unit_ids).unwrap();
+        assert!(out.cleaned.is_none_or(|c| c.sets_cleaned == 0));
+        assert_eq!(
+            staged_files(&s.w.config).len(),
+            3,
+            "every slice is still on the disk"
+        );
+
+        // Resume completes it and clears the hold only after the full confirm.
+        fake.fail_write.set(false);
+        let report = resume(&s.w.conn, &s.w.config, &fake, "NEW", false).unwrap();
+        assert!(report.resumed);
+        assert_eq!(
+            fake.calls(),
+            ["read", "erase SRC", "init NEW", "write NEW", "write NEW"],
+            "the resume wrote; it did not read, erase or init again"
+        );
+        assert_eq!(volume_status(&s.w.conn, "NEW"), "sealed");
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+        let outcome: String = scalar(&s.w.conn, "SELECT outcome FROM pending_rewrites");
+        assert_eq!(outcome, "completed");
+        assert!(
+            staged_files(&s.w.config).is_empty(),
+            "released after the readback"
+        );
+        assert_eq!(events_of(&s.w.conn, "rewrite_resumed"), 1);
+        assert_eq!(events_of(&s.w.conn, "rewrite_window_closed"), 1);
+    }
+
+    #[test]
+    fn a_quick_confirm_does_not_end_the_window() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        fake.quick_write.set(true);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let err = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fully read back"), "{err}");
+        assert_eq!(holds(&s.w.conn).unwrap().len(), 2, "still held");
+        assert_eq!(staged_files(&s.w.config).len(), 3);
+        assert_eq!(events_of(&s.w.conn, "rewrite_window_closed"), 0);
+
+        // Resuming a sealed but not fully read back volume says what to run.
+        let err = resume(&s.w.conn, &s.w.config, &fake, "NEW", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("volume verify NEW --full"), "{err}");
+
+        // The full readback, by whichever command (here: `volume verify
+        // --full` marking the writes verified), lifts the hold; resume
+        // finishes without writing again.
+        s.w.conn
+            .execute(
+                "UPDATE writes SET write_verified = 1 WHERE status = 'completed'",
+                [],
+            )
+            .unwrap();
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+        let calls_before = fake.calls().len();
+        let report = resume(&s.w.conn, &s.w.config, &fake, "NEW", false).unwrap();
+        assert!(report.resumed);
+        assert_eq!(fake.calls().len(), calls_before, "no drive step ran");
+        assert!(staged_files(&s.w.config).is_empty());
+    }
+
+    #[test]
+    fn a_failed_erase_and_a_failed_init_are_resumed_from_where_they_stopped() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        fake.fail_erase.set(true);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let err = rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap_err();
+        // The erase may have touched the tape: interrupted, resumable.
+        assert!(matches!(err, TapectlError::WriteInterrupted(_)), "{err}");
+        assert!(err.to_string().contains("--resume NEW"));
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "retired");
+        let state: String = scalar(&s.w.conn, "SELECT state FROM pending_rewrites");
+        assert_eq!(state, "retired");
+        assert_eq!(holds(&s.w.conn).unwrap().len(), 2);
+
+        // A different cartridge in the drive is refused, with nothing run.
+        *fake.serial.borrow_mut() = Some("SOME-OTHER-TAPE".into());
+        fake.fail_erase.set(false);
+        let before = fake.calls().len();
+        let err = resume(&s.w.conn, &s.w.config, &fake, "NEW", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("SOME-OTHER-TAPE") && err.contains(SERIAL),
+            "both serials are named: {err}"
+        );
+        assert_eq!(fake.calls().len(), before);
+        *fake.serial.borrow_mut() = None;
+        assert!(resume(&s.w.conn, &s.w.config, &fake, "NEW", false)
+            .unwrap_err()
+            .to_string()
+            .contains("could not be read"));
+
+        // The init fails once; the erase is not repeated.
+        *fake.serial.borrow_mut() = Some(SERIAL.into());
+        fake.fail_init.set(true);
+        let err = resume(&s.w.conn, &s.w.config, &fake, "NEW", false).unwrap_err();
+        assert!(err.to_string().contains("--resume NEW"));
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "erased");
+        let state: String = scalar(&s.w.conn, "SELECT state FROM pending_rewrites");
+        assert_eq!(state, "erased");
+        fake.fail_init.set(false);
+        let report = resume(&s.w.conn, &s.w.config, &fake, "NEW", false).unwrap();
+        assert!(report.resumed);
+        let calls = fake.calls();
+        assert_eq!(calls.iter().filter(|c| c.starts_with("erase")).count(), 2);
+        assert_eq!(volume_status(&s.w.conn, "NEW"), "sealed");
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resume_has_nothing_to_do_without_a_pending_rewrite() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        let msg = resume(&s.w.conn, &s.w.config, &fake, "NEW", false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("no unfinished rewrite"), "{msg}");
+
+        // A record that never got past staging has nothing destructive to resume.
+        held_after_erase(&s, &s.keepsake, "NEW");
+        s.w.conn
+            .execute("UPDATE pending_rewrites SET state = 'staged'", [])
+            .unwrap();
+        let msg = resume(&s.w.conn, &s.w.config, &fake, "NEW", false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("nothing is lost"), "{msg}");
+    }
+
+    // ── what the new volume carries ─────────────────────────────────────────
+
+    #[test]
+    fn the_new_volume_carries_only_the_rewrites_slices_unless_with_staged() {
+        let build = || {
+            let s = scene(1);
+            let extra = add_version(&s.w, "extra", 1, "current", &data("extra", 1));
+            s.w.conn
+                .execute(
+                    "UPDATE stage_sets SET status = 'staged' WHERE id = ?1",
+                    params![extra.stage_set_id],
+                )
+                .unwrap();
+            (s, extra)
+        };
+        let (s, _extra) = build();
+        let fake = Fake::new(&s);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+        let scope = fake.written_scope.borrow().clone();
+        assert_eq!(
+            scope,
+            Some(vec![s.keepsake.stage_set_id, s.docs.stage_set_id]),
+            "an unrelated staged set is not written"
+        );
+
+        let (s, _extra) = build();
+        let fake = Fake::new(&s);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        o.with_staged = true;
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+        assert_eq!(
+            *fake.written_scope.borrow(),
+            None,
+            "--with-staged: no scope"
+        );
+    }
+
+    #[test]
+    fn keep_staging_keeps_the_slices_after_the_full_readback() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        o.keep_staging = true;
+        let report = rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+        assert!(matches!(
+            report.release,
+            Some(crate::cli::volume::StagingRelease::Kept)
+        ));
+        assert_eq!(staged_files(&s.w.config).len(), 3);
+        // The window is closed all the same: the hold lifted by the readback.
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+    }
+
+    // ── every other retire path keeps the absolute floor ────────────────────
+
+    /// The amendment is for `volume rewrite` alone. On the same single-copy
+    /// volume, `volume retire`, `volume compact-finish`, `cartridge retire`
+    /// and `cartridge mark-erased` refuse outright, `--yes` and `--force`
+    /// both given, and change nothing.
+    #[test]
+    fn every_other_retire_path_still_refuses_a_single_copy_volume() {
+        let s = scene(1);
+        let c = &s.w.conn;
+        let msg = crate::cli::operations::volume_retire(c, &s.w.config, "SRC", true, false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("LAST eligible copy"), "volume retire: {msg}");
+        let msg = write::compact_finish(c, &s.w.config, "SRC", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("no copy on another volume"),
+            "compact-finish: {msg}"
+        );
+        let msg = crate::cli::operations::cartridge_retire(
+            c,
+            &s.w.config,
+            "CART-1",
+            None,
+            true,
+            true,
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            msg.contains("LAST eligible copy"),
+            "cartridge retire: {msg}"
+        );
+        let msg =
+            crate::cli::operations::cartridge_mark_erased(c, "CART-1", true, true, false, false)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            msg.contains("LAST eligible copy"),
+            "cartridge mark-erased: {msg}"
+        );
+
+        assert_eq!(volume_status(c, "SRC"), "sealed");
+        assert_eq!(
+            scalar::<String>(c, "SELECT status FROM cartridges"),
+            "in_use"
+        );
+        assert_eq!(scalar::<i64>(c, "SELECT COUNT(*) FROM pending_rewrites"), 0);
+    }
+
+    // ── everything knowable is asked before anything is destroyed ───────────
+
+    #[test]
+    fn the_host_and_the_write_are_asked_about_before_the_read_and_the_retire() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+        assert_eq!(
+            *fake.asked.borrow(),
+            ["host volume rewrite \"SRC\"", "write_preflight NEW scoped"],
+            "the quiet-host question once, and the write's catalog checks for the \
+             rewrite's own sets"
+        );
+
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        o.with_staged = true;
+        rewrite(&s.w.conn, &s.w.config, &fake, &o).unwrap();
+        assert_eq!(fake.asked.borrow()[1], "write_preflight NEW all");
+    }
+
+    /// A write that would be refused for something the catalog and the staged
+    /// files already show — a missing key, a staged set not whole, no escrow
+    /// recipient — is found after the read and before the retire, with
+    /// staging put back.
+    #[test]
+    fn a_write_that_would_be_refused_is_found_before_anything_is_destroyed() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        fake.fail_write_preflight.set(true);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        let msg = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("would be refused") && msg.contains("Nothing destructive"),
+            "{msg}"
+        );
+        assert_eq!(fake.calls(), ["read"]);
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
+        assert!(staged_files(&s.w.config).is_empty());
+        assert!(holds(&s.w.conn).unwrap().is_empty());
+        assert_eq!(events_of(&s.w.conn, "retired"), 0);
+    }
+
+    #[test]
+    fn the_cartridge_in_the_drive_must_be_readable_and_the_sources_before_the_read() {
+        let s = scene(1);
+        let fake = Fake::new(&s);
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+
+        *fake.serial.borrow_mut() = None;
+        let msg = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("chip serial") && msg.contains("could not be read"),
+            "{msg}"
+        );
+
+        *fake.serial.borrow_mut() = Some("SOMEONE-ELSES".into());
+        let msg = rewrite(&s.w.conn, &s.w.config, &fake, &o)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("SOMEONE-ELSES") && msg.contains(SERIAL) && msg.contains("CART-1"),
+            "{msg}"
+        );
+        assert!(
+            fake.calls().is_empty(),
+            "no drive step ran: {:?}",
+            fake.calls()
+        );
+        assert_eq!(volume_status(&s.w.conn, "SRC"), "sealed");
+    }
+
+    #[test]
+    fn the_with_staged_fit_check_counts_the_other_staged_data() {
+        let s = scene(1);
+        let extra = add_version(&s.w, "extra", 1, "current", &data("extra", 3));
+        s.w.conn
+            .execute(
+                "UPDATE stage_sets SET status = 'staged' WHERE id = ?1",
+                params![extra.stage_set_id],
+            )
+            .unwrap();
+        let bytes = |v: &Version| v.data.iter().map(Vec::len).sum::<usize>();
+        let live = bytes(&s.keepsake) + bytes(&s.docs);
+        let extra_bytes = bytes(&extra);
+        // A tape that takes the live data and half of the extra data (the
+        // volume's capacity is 100 MB in this catalog).
+        let mut c = s.w.config.clone();
+        c.backends.lto[0].fill_ceiling = (live + extra_bytes / 2) as f64 / 100_000_000.0;
+
+        let mut o = opts("SRC", "NEW");
+        o.only_copy_on_staging = Some("SRC");
+        plan(&s.w.conn, &c, &o).expect("the live data alone fits");
+        o.with_staged = true;
+        let msg = plan(&s.w.conn, &c, &o).unwrap_err().to_string();
+        assert!(
+            msg.contains("--with-staged adds") && msg.contains("does not fit one tape"),
+            "{msg}"
+        );
     }
 }
