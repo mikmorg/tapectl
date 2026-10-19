@@ -1,0 +1,11 @@
+Sequential access device page (ssc-3)
+  Data bytes received with WRITE commands: 0 GB
+  Data bytes written to media by WRITE commands: 0 GB
+  Data bytes read from media by READ commands: 0 GB
+  Data bytes transferred by READ commands: 0 GB
+  Native capacity from BOP to EOD: 23 MB
+  Native capacity from BOP to EW of current partition: 2624517 MB
+  Minimum native capacity from EW to EOP of current partition: 99008 MB
+  Native capacity from BOP to current position: 22 MB
+  Maximum native capacity in device object buffer: 418 MB
+  Cleaning action not required (or completed)

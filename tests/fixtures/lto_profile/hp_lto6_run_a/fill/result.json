@@ -1,0 +1,98 @@
+{
+ "block_size": 524288,
+ "filemark1": {
+  "attempts": [
+   "ok"
+  ],
+  "ok": true,
+  "op": "MTWEOFI"
+ },
+ "filemark2": {
+  "attempts": [
+   "ok"
+  ],
+  "ok": true,
+  "op": "MTWEOF"
+ },
+ "fill": {
+  "blocks": 4772177,
+  "bytes": 2501995134976,
+  "end": "refusal",
+  "mb_per_s": 162.99642573133548,
+  "seconds": 15350.0,
+  "start": "2026-09-23T20:05:00.000000Z",
+  "stop": "2026-09-24T00:20:50.000000Z"
+ },
+ "finished": "2026-09-24T01:35:00.000000Z",
+ "first_refusal": {
+  "bytes_accepted": 2501995134976,
+  "errno": 28,
+  "fill_blocks": 4772177,
+  "outcome": "ENOSPC",
+  "ret": null,
+  "time": "2026-09-24T00:20:50.000000Z"
+ },
+ "hard_end": {
+  "accepted": 187500,
+  "attempts": 187508,
+  "bytes_past_first_refusal": 99377741824,
+  "first_block": 4774225,
+  "max_consecutive_refusals": 8,
+  "outcome_totals": {
+   "ENOSPC": 8,
+   "ok": 187500
+  },
+  "outcomes_rle": [
+   [
+    "ok",
+    187500
+   ],
+   [
+    "ENOSPC",
+    8
+   ]
+  ],
+  "outcomes_runs": 2,
+  "refusals": 8,
+  "region": "hard",
+  "seconds": 700.0,
+  "stop": "refusal-run(8)"
+ },
+ "refusal_run_limit": 8,
+ "seal": {
+  "attempts": [
+   "ok"
+  ],
+  "ok": true
+ },
+ "slice": {
+  "accepted": 2048,
+  "attempts": 2049,
+  "first_block": 4772177,
+  "max_consecutive_refusals": 1,
+  "outcome_totals": {
+   "ENOSPC": 1,
+   "ok": 2048
+  },
+  "outcomes_rle": [
+   [
+    "ENOSPC",
+    1
+   ],
+   [
+    "ok",
+    2048
+   ]
+  ],
+  "outcomes_runs": 2,
+  "refusals": 1,
+  "region": "slice",
+  "seconds": 7.0,
+  "stop": "complete"
+ },
+ "slice_target_blocks": 2048,
+ "src_blocks": 4096,
+ "stage": "done",
+ "started": "2026-09-23T20:05:00.000000Z",
+ "version": 1
+}

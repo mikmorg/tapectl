@@ -1,0 +1,9 @@
+{
+ "checks": [
+  {
+   "name": "slice-all-blocks",
+   "status": "PASS",
+   "detail": "2048 of 2048 blocks read, 0 differ"
+  }
+ ]
+}

@@ -1,0 +1,12 @@
+$ sg_inq /dev/sg0
+standard INQUIRY:
+  PQual=0  PDT=1  RMB=1  LU_CONG=0  hot_pluggable=0  version=0x06  [SPC-4]
+  [AERC=0]  [TrmTsk=0]  NormACA=0  HiSUP=0  Resp_data_format=2
+  SCCS=0  ACC=0  TPGS=0  3PC=0  Protect=0  [BQue=0]
+  EncServ=0  MultiP=0  [MChngr=0]  [ACKREQQ=0]  Addr16=0
+  [RelAdr=0]  WBus16=0  Sync=0  [Linked=0]  [TranDis=0]  CmdQue=1
+    length=96 (0x60)   Peripheral device type: tape
+ Vendor identification: HP      
+ Product identification: Ultrium 6-SCSI  
+ Product revision level: 35GD
+ Unit serial number: HUJ808A5L4

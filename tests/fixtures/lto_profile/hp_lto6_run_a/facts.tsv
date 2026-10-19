@@ -1,0 +1,7 @@
+payload_location	/dev/shm (tmpfs)
+payload_mib	2048
+source_read_mib_s	2100.0
+mam_write_ok	1
+mam_payload_bytes	21474836480
+fill_writer_rc	0
+fill_verify_rc	0

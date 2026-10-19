@@ -1,0 +1,29 @@
+Attribute values:
+  Remaining capacity in partition [MiB]: 101850
+  Maximum capacity in partition [MiB]: 2499053
+  TapeAlert flags: 0
+  Load count: 4
+  MAM space remaining [B]: 3062
+  Assigning organization: LTO-CVE 
+  Format density code: 0x5a
+  Initialization count: 0
+  Volume identifier: 
+  Volume change reference: 0x0
+  Density vendor/serial number at last load: HP      HUJ808A5L4                      
+  Density vendor/serial number at load-1: HP      
+  Density vendor/serial number at load-2: HP      
+  Density vendor/serial number at load-3: HP      
+  Total MiB written in medium life: 2531000
+  Total MiB read in medium life: 14
+  Total MiB written in current/last load: 2500000
+  Total MiB read in current/last load: 0
+  Medium manufacturer: FUJIFILM
+  Medium serial number: EW7VWMVKF6                      
+  Medium length [m]: 846
+  Medium width [0.1 mm]: 127
+  Assigning organization: LTO-CVE 
+  Medium density code: 0x5a
+  Medium manufacture date: 20170824
+  MAM capacity [B]: 16384
+  Medium type: 0x0
+  Medium type information: 0x0

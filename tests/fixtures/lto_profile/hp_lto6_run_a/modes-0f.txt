@@ -1,0 +1,11 @@
+$ sg_modes --page=0x0f /dev/sg0
+    HP        Ultrium 6-SCSI    35GD   peripheral_type: tape [0x1]
+Mode parameter header from MODE SENSE(10):
+  Mode data length=32, medium type=0x00, specific param=0x10, longlba=0
+  Block descriptor length=8
+> General mode parameter block descriptors:
+   Density code=0x5a
+ 00     5a 00 00 00 00 08 00 00
+
+>> Data Compression, page_control: current
+ 00     0f 0e 40 80 ff ff ff ff  ff ff ff ff 00 00 00 00

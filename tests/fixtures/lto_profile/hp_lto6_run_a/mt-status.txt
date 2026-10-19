@@ -1,0 +1,7 @@
+$ mt -f /dev/tape/by-id/scsi-HUJ808A5L4-nst status
+SCSI 2 tape drive:
+File number=0, block number=0, partition=0.
+Tape block size 524288 bytes. Density code 0x5a (LTO-6).
+Soft error count since last status=0
+General status bits on (41010000):
+ BOT ONLINE IM_REP_EN

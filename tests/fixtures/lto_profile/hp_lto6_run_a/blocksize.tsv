@@ -1,0 +1,4 @@
+512K (pass 1)	524288	accepted	114.0	18.0	
+1M (pass 1)	1048576	accepted	114.4	17.9	
+1M (pass 2)	1048576	accepted	114.3	17.9	
+512K (pass 2)	524288	accepted	114.1	17.9	
