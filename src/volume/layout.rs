@@ -518,7 +518,7 @@ fn guide_drive_basics() -> String {
          \"IT\" (initiator-target, pass-through) firmware, not the RAID one, or the \
          drive does not appear as a tape drive. To see what a card is: `lspci -k` \
          names the kernel driver in use under each adapter. `mpt3sas` (`mpt2sas` on \
-         older cards) is the driver of LSI and Broadcom host adapters, and \
+         older kernels) is the driver of LSI and Broadcom host adapters, and \
          `megaraid_sas` is the driver of their RAID controllers, which are the wrong \
          kind of card. A card on `mpt3sas` can still carry RAID (\"IR\") firmware: \
          the maker's flash tool says which (`sas3flash -list`, or `sas2flash -list` \
@@ -1075,7 +1075,9 @@ The modes that only read the tape (`--info`, `--verify`, `--find-envelope`,
 whichever tape's RESTORE.sh runs them. A RESTORE.sh written for another
 tape prints a "WRONG TAPE?" box first, and for these modes it is only a
 reminder that the script was written for another volume: what follows is
-about the tape in the drive (the label printed is that tape's own). For a
+about the tape in the drive (the `Tape identifies as:` line, which every mode
+prints, is that tape's own label; the heading `--verify` prints names the
+script's volume, but it checks the tape in the drive). For a
 restore use the loaded tape's own RESTORE.sh, which was written for that
 tape's format, and take "WRONG TAPE?" during a restore as a sign that the
 script or the tape is the wrong one. To get a tape's own script, load that
@@ -10565,7 +10567,7 @@ sha256_encrypted = \"bbb\"
         for needle in [
             "must run the plain \"IT\" (initiator-target, pass-through) firmware",
             "`lspci -k` names the kernel driver in use under each adapter",
-            "`mpt3sas` (`mpt2sas` on older cards) is the driver of LSI and Broadcom host adapters, and `megaraid_sas` is the driver of their RAID controllers",
+            "`mpt3sas` (`mpt2sas` on older kernels) is the driver of LSI and Broadcom host adapters, and `megaraid_sas` is the driver of their RAID controllers",
             "A card on `mpt3sas` can still carry RAID (\"IR\") firmware: the maker's flash tool says which (`sas3flash -list`, or `sas2flash -list` on older cards, prints a Firmware Product ID tagged (IT) or (IR))",
         ] {
             assert!(load.contains(needle), "{needle:?}: {load}");
@@ -10727,6 +10729,7 @@ sha256_encrypted = \"bbb\"
             "(any copy of RESTORE.sh will do for this: see the end of this list)",
             "The modes that only read the tape (`--info`, `--verify`, `--find-envelope`, `--list`, `--where`, `--find`) describe the tape that is in the drive, whichever tape's RESTORE.sh runs them",
             "it is only a reminder that the script was written for another volume",
+            "the `Tape identifies as:` line, which every mode prints, is that tape's own label; the heading `--verify` prints names the script's volume, but it checks the tape in the drive",
             "For a restore use the loaded tape's own RESTORE.sh, which was written for that tape's format",
             "take \"WRONG TAPE?\" during a restore as a sign that the script or the tape is the wrong one",
             "To get a tape's own script, load that tape and run the four commands at the start of \"Automated Recovery (recommended)\"",

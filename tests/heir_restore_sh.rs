@@ -6659,6 +6659,20 @@ fn file_1_another_tapes_script_surveys_the_loaded_tape() {
     let (code, text) = h.run(&["--find-envelope", "--key", &h.key("esc")]);
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("ledgers"), "{text}");
+    // Every mode prints the loaded tape's own label; --verify's heading is the
+    // script's (the guide says so) while it checks the tape in the drive.
+    let (code, text) = h.run(&["--verify"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("WRONG TAPE?"), "{text}");
+    assert!(
+        text.contains(&format!("Tape identifies as: {LABEL}")),
+        "{text}"
+    );
+    assert!(
+        text.contains("=== keyless integrity walk: OTHER99 ==="),
+        "{text}"
+    );
+    assert!(!text.contains("FAIL "), "the loaded tape passes: {text}");
 }
 
 /// Read slice `n` of `unit` with the guide's step 7 commands, leaving
