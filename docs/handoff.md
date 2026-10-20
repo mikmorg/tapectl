@@ -358,10 +358,12 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
    binary (`docs/runs/2026-10-20-1.5.0-step12-rehearsal.md`): RESTORE.sh restored three units off
    the tape with the real `age` (v1.3.2), `dar`, `mt` and `tar`, with its per-file sha256 check,
    and the fresh write proved #460's END OF DATA fact on the HP drive. It did NOT exercise the
-   proven-blank `volume init` (the suite blanks with `mt weof` and inits with `--force`): #444's
-   two proofs and the sub-MiB chip measurement need a run of their own. Until the verified-erase
-   proof has run here, expect to need `--force` on a new cartridge if the chip's lifetime figures
-   read differently from the fixtures (ADR-0012 item 57). RESTORE.sh's index modes and slice
+   proven-blank `volume init` (the suite blanks with `mt weof` and inits with `--force`). #444's
+   verified-erase proof and its chip measurement ran right after, on the same cartridge, and hold
+   on the HP drive (same run record): after `cartridge erase`, `volume init` needs no `--force`.
+   The chip proof (a never-written cartridge) has not run on the HP drive. On a NEW cartridge,
+   expect to need `--force` if the chip reads differently from the fixtures (ADR-0012 item 57),
+   and record what `volume init` says on #444. RESTORE.sh's index modes and slice
    replacement run with the real tools only in the mhvtl gate's heir legs (ADR-0012 item 70).
 8. **Regenerate the Heir Kit** with the installed binary (`scripts/first-run.sh --profile
    contrib/hosts/home2.profile --from 9 --to 9`, which hands the kit directory to the service
