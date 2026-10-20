@@ -849,6 +849,140 @@ pub fn temperature_history(conn: &Connection) -> Result<Vec<TemperatureReading>>
         .collect())
 }
 
+// ── HP page 0x34, Performance Data (issue #488) ──────────────────────────
+
+/// HP's vendor-specific Performance Data log page (issue #488; the
+/// write-shaping note, `docs/research/2026-10-20-write-shaping.md` §6).
+///
+/// The HP LTO Ultrium 6 Technical Reference Manual, volume 3 (October 2012),
+/// p91, defines five two-byte parameters. The one that matters is parameter
+/// 0, "Repositions per 100 MB": "Number of tape direction changes per 100 MB
+/// written. The higher the figure the more wear occurs." It is the drive's
+/// own count of the stop-and-back-up the feed ratio
+/// ([`crate::tape::feed_ratio`]) sees only as extra tape.
+///
+/// **Keyed on vendor HP** ([`is_hp_vendor`]). Another vendor's page 0x34 is
+/// something else: sg3-utils itself decodes it as IBM's "Read forward
+/// errors" (and then cannot), which is why this parses the raw bytes the
+/// sweep journals and never sg_logs's text.
+///
+/// **What the figure is, and is not, known to mean.** HP: "All the
+/// parameters relate to the current tape. They are all cleared at the start
+/// of tape load, except Parameter 4", updated "after each 100 MB physically
+/// written". Whether it is an average since load or a recent window is NOT
+/// established (the note's §10, P0, settles it on the drive). The sweep that
+/// journals it runs after the command's confirm, whose rewinds and spaces may
+/// count too if the drive counts direction changes outside writes (§6's
+/// caveat): read it as what the drive said after the whole command, not as
+/// the write alone. A two-byte integer per 100 MB has a floor: one reposition
+/// a GB reads 0 or 1.
+pub const HP_PERFORMANCE_PAGE: u8 = 0x34;
+
+/// Page 0x34 decoded: each parameter as the drive gave it, `None` when the
+/// page did not carry it. The rates are in HP's units, 100 KB/s (see
+/// [`HpPerformance::mb_per_s`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct HpPerformance {
+    /// Parameter 0: tape direction changes per 100 MB written.
+    pub repositions_per_100mb: Option<u32>,
+    /// Parameter 1: the data rate into the buffer after compression, "the
+    /// true 'tape' data rate", 100 KB/s units.
+    pub data_rate_into_buffer: Option<u32>,
+    /// Parameter 2: the most the data's compressibility would allow, 100
+    /// KB/s units.
+    pub maximum_data_rate: Option<u32>,
+    /// Parameter 3: the rate accepted before compression, 100 KB/s units.
+    pub current_data_rate: Option<u32>,
+    /// Parameter 4: the drive's native rate for the medium, 100 KB/s units
+    /// (0x0640, 160 MB/s, on the HP LTO-6 in both captures).
+    pub native_data_rate: Option<u32>,
+}
+
+impl HpPerformance {
+    /// Parse page 0x34's raw LOG SENSE bytes. `None` for bytes that are not
+    /// page 0x34 (or are too short for its header). A parameter whose value
+    /// is not 1-4 bytes is left `None` rather than guessed at; parameters
+    /// past 4 are ignored.
+    pub fn parse(raw: &[u8]) -> Option<HpPerformance> {
+        if raw.len() < 4 || raw[0] & 0x3f != HP_PERFORMANCE_PAGE {
+            return None;
+        }
+        let end = (4 + u16::from_be_bytes([raw[2], raw[3]]) as usize).min(raw.len());
+        let mut out = HpPerformance::default();
+        let mut at = 4;
+        while at + 4 <= end {
+            let code = u16::from_be_bytes([raw[at], raw[at + 1]]);
+            let len = raw[at + 3] as usize;
+            let Some(value) = raw.get(at + 4..at + 4 + len) else {
+                break;
+            };
+            let number = (1..=4)
+                .contains(&len)
+                .then(|| value.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)));
+            match code {
+                0 => out.repositions_per_100mb = number,
+                1 => out.data_rate_into_buffer = number,
+                2 => out.maximum_data_rate = number,
+                3 => out.current_data_rate = number,
+                4 => out.native_data_rate = number,
+                _ => {}
+            }
+            at += 4 + len;
+        }
+        Some(out)
+    }
+
+    /// A rate parameter (100 KB/s units) in decimal MB/s.
+    pub fn mb_per_s(units_of_100kb: u32) -> f64 {
+        f64::from(units_of_100kb) / 10.0
+    }
+}
+
+/// Whether `vendor` (the drive's INQUIRY vendor, `drives.vendor`) is HP, the
+/// vendor whose page 0x34 [`HpPerformance`] decodes. Exactly "HP" after
+/// trimming, any case. An unknown vendor (no drive identity) is not HP.
+pub fn is_hp_vendor(vendor: Option<&str>) -> bool {
+    vendor.is_some_and(|v| v.trim().eq_ignore_ascii_case("HP"))
+}
+
+/// Page 0x34 from `vendor`'s drive: decoded only when the drive is HP.
+pub fn decode_hp_performance(vendor: Option<&str>, raw: &[u8]) -> Option<HpPerformance> {
+    is_hp_vendor(vendor)
+        .then(|| HpPerformance::parse(raw))
+        .flatten()
+}
+
+/// The page 0x34 THIS contact's sweep journalled, decoded — `None` when the
+/// sweep read no page 0x34 (or the read failed), or the contact's drive is
+/// not known to be HP (`cartridge_contacts.drive_id` → `drives.vendor`).
+///
+/// The same rule [`crate::tape::feed_ratio::journalled_0x0c_decode`] uses for
+/// page 0x0c: one sweep per contact (migration 023), so at most one such
+/// row; the newest is taken should a future change ever leave two. The feed
+/// ratio and this figure therefore come from the same sweep, read at the
+/// same moment — which is why a `write_feed_ratio` event's `contact_id` is
+/// the right key to find its page 0x34 by.
+pub fn journalled_hp_performance(
+    conn: &Connection,
+    contact_id: i64,
+) -> Result<Option<HpPerformance>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(Vec<u8>, Option<String>)> = conn
+        .query_row(
+            "SELECT j.raw, d.vendor
+               FROM log_page_journal j
+               LEFT JOIN cartridge_contacts c ON c.id = j.contact_id
+               LEFT JOIN drives d ON d.id = c.drive_id
+              WHERE j.contact_id = ?1 AND j.page_code = ?2 AND j.subpage_code = 0
+                AND j.ok = 1 AND j.raw IS NOT NULL
+              ORDER BY j.id DESC LIMIT 1",
+            params![contact_id, HP_PERFORMANCE_PAGE],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(raw, vendor)| decode_hp_performance(vendor.as_deref(), &raw)))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2592,5 +2726,116 @@ pub(crate) mod tests {
             n += 1;
         }
         assert_eq!(n, LISTED.len(), "positive control: every page was decoded");
+    }
+
+    // ── HP page 0x34 (issue #488) ──
+
+    const HP_0X34_NOMEDIA: &[u8] =
+        include_bytes!("../../tests/fixtures/sg_logs/hp_lto6_sg0_nomedia/page_0x34.bin");
+    const HP_0X34_LOADED: &[u8] =
+        include_bytes!("../../tests/fixtures/sg_logs/hp_lto6_sg0_fuji_ew7vwmvkf6/page_0x34.bin");
+
+    /// The real HP LTO-6's page 0x34, both captures: with no medium, the
+    /// state an earlier tape left (5 repositions per 100 MB, 89.5 MB/s into
+    /// the buffer); with the test cartridge just loaded, all cleared but
+    /// parameter 4, the native 160 MB/s.
+    #[test]
+    fn the_hp_performance_page_decodes_from_both_real_captures() {
+        let none = HpPerformance::parse(HP_0X34_NOMEDIA).unwrap();
+        assert_eq!(
+            none,
+            HpPerformance {
+                repositions_per_100mb: Some(5),
+                data_rate_into_buffer: Some(0x037f),
+                maximum_data_rate: Some(0x1f40),
+                current_data_rate: Some(0x037e),
+                native_data_rate: Some(0x0640),
+            }
+        );
+        assert_eq!(HpPerformance::mb_per_s(0x037f), 89.5);
+        assert_eq!(HpPerformance::mb_per_s(0x0640), 160.0);
+        let loaded = HpPerformance::parse(HP_0X34_LOADED).unwrap();
+        assert_eq!(
+            loaded,
+            HpPerformance {
+                repositions_per_100mb: Some(0),
+                data_rate_into_buffer: Some(0),
+                maximum_data_rate: Some(0),
+                current_data_rate: Some(0),
+                native_data_rate: Some(0x0640),
+            }
+        );
+    }
+
+    /// Not page 0x34, too short, or a parameter that is not 1-4 bytes: no
+    /// guess. A missing parameter is `None`, not 0.
+    #[test]
+    fn the_hp_performance_parse_refuses_what_is_not_page_0x34() {
+        assert_eq!(HpPerformance::parse(&[]), None);
+        assert_eq!(HpPerformance::parse(&[0x34, 0, 0]), None);
+        assert_eq!(
+            HpPerformance::parse(&[0x0d, 0, 0, 6, 0, 0, 0x60, 2, 0, 38]),
+            None
+        );
+        let only_p1 = HpPerformance::parse(&[0x34, 0, 0, 6, 0, 1, 0x60, 2, 0x01, 0x02]).unwrap();
+        assert_eq!(only_p1.repositions_per_100mb, None);
+        assert_eq!(only_p1.data_rate_into_buffer, Some(0x0102));
+        let wide = HpPerformance::parse(&[0x34, 0, 0, 9, 0, 0, 0x60, 5, 1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(
+            wide.repositions_per_100mb, None,
+            "five bytes is not HP's layout"
+        );
+    }
+
+    /// Keyed on vendor HP: the same bytes from any other drive, or from a
+    /// drive whose identity is unknown, decode to nothing.
+    #[test]
+    fn the_hp_performance_page_is_decoded_only_for_an_hp_drive() {
+        assert!(is_hp_vendor(Some("HP")));
+        assert!(is_hp_vendor(Some("HP      ")), "INQUIRY pads the vendor");
+        assert!(!is_hp_vendor(Some("IBM")));
+        assert!(!is_hp_vendor(Some("HPE")), "not documented for HPE drives");
+        assert!(!is_hp_vendor(None));
+        assert!(decode_hp_performance(Some("HP"), HP_0X34_NOMEDIA).is_some());
+        assert_eq!(decode_hp_performance(Some("IBM"), HP_0X34_NOMEDIA), None);
+        assert_eq!(decode_hp_performance(None, HP_0X34_NOMEDIA), None);
+    }
+
+    /// A contact's journalled page 0x34 is found by its contact id and
+    /// decoded when its drive is HP — the route a `write_feed_ratio` event
+    /// written before #488 takes back to its sweep. Positive control: the
+    /// same row on an IBM drive's contact, and a contact with no 0x34 row,
+    /// give nothing.
+    #[test]
+    fn a_contacts_journalled_page_0x34_is_read_back_for_an_hp_drive() {
+        let conn = crate::db::open_memory().unwrap();
+        let drive = |serial: &str, vendor: &str| {
+            conn.execute(
+                "INSERT INTO drives (serial, vendor, model) VALUES (?1, ?2, 'm')",
+                params![serial, vendor],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let (hp, ibm) = (drive("HUJ808A5L4", "HP"), drive("IBMSERIAL", "IBM"));
+        let contact = |drive_id: i64| {
+            conn.execute(
+                "INSERT INTO cartridge_contacts (operation, device, drive_id)
+                 VALUES ('volume write', '/dev/null', ?1)",
+                [drive_id],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let (on_hp, on_ibm, bare) = (contact(hp), contact(ibm), contact(hp));
+        let mut src = hp_source();
+        src.bytes.insert(0x34, HP_0X34_NOMEDIA.to_vec());
+        let s = sweep(&mut src);
+        record_sweep(&conn, Some(on_hp), "volume write", None, &s);
+        record_sweep(&conn, Some(on_ibm), "volume write", None, &s);
+        let got = journalled_hp_performance(&conn, on_hp).unwrap().unwrap();
+        assert_eq!(got.repositions_per_100mb, Some(5));
+        assert_eq!(journalled_hp_performance(&conn, on_ibm).unwrap(), None);
+        assert_eq!(journalled_hp_performance(&conn, bare).unwrap(), None);
     }
 }

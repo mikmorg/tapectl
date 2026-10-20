@@ -1141,7 +1141,14 @@ The write itself needs no supervision once it is streaming; the drive's
 counters afterwards say whether the feed held: `tapectl volume info <label>`
 shows each write's feed ratio (native tape bytes per data byte sent, judged
 against 1.05), and `tapectl report health` lists every recorded write, the
-uneven feeds first.
+uneven feeds first. On an HP drive each line also gives the drive's own wear
+count, `repositions per 100 MB` (its log page 0x34: "tape direction changes per
+100 MB written. The higher the figure the more wear occurs"), and `tapectl report
+events` shows it on the `write_feed_ratio` line. A write recorded before the figure
+was kept still has the page's raw bytes in the catalog, so it is decoded for those too. The
+drive reads it after the whole command, the confirm's rewinds included; it is
+not yet known whether it averages since the cartridge was loaded or over the
+last stretch written (`docs/research/2026-10-20-write-shaping.md` §6).
 
 ### Check what's pending
 

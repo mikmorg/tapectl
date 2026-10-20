@@ -56,6 +56,16 @@
 //! a decode without the line (the no-medium capture has none), makes the
 //! ratio `None` — nothing recorded, nothing warned.
 //!
+//! **Beside it, the drive's own wear figure** (issue #488). An HP drive's
+//! page 0x34, parameter 0, counts "tape direction changes per 100 MB
+//! written" ([`crate::tape::log_pages::HpPerformance`]). The same sweep that
+//! journalled the 0x0c this ratio comes from journalled 0x34 too, so the
+//! row's `details` carries it as `repositions_per_100mb` whenever the drive
+//! is HP and the page was read; the key is ABSENT otherwise (another
+//! vendor's page 0x34 means something else). It is what the drive said after
+//! the whole command, confirm's rewinds included: see the page's own
+//! documentation for what is and is not known about the figure.
+//!
 //! **Recording and warning are split** ([`Suppression`]). mhvtl DOES list
 //! page 0x0c and reports a BOP→EOD of 500 MB beside "0 GB written" — a
 //! figure with no relation to any write, which against a 30 MB gate write
@@ -212,6 +222,18 @@ impl Assessment {
     /// query for `json_extract(details, '$.suppressed')` finds exactly the
     /// suppressed ones.
     pub fn details_json(&self, contact_id: i64) -> String {
+        self.details_json_with_wear(contact_id, None)
+    }
+
+    /// [`Assessment::details_json`], plus the drive's own wear figure when
+    /// there is one (issue #488): `repositions_per_100mb`, HP page 0x34's
+    /// parameter 0, from the same sweep as the ratio. ABSENT, not null, when
+    /// `wear` is `None` or carries no parameter 0.
+    pub fn details_json_with_wear(
+        &self,
+        contact_id: i64,
+        wear: Option<&crate::tape::log_pages::HpPerformance>,
+    ) -> String {
         let mut details = serde_json::json!({
             "source_page": "0x0c",
             "native_bop_to_eod_mb": self.ratio.native_bop_to_eod_mb,
@@ -224,9 +246,16 @@ impl Assessment {
         if let Some(s) = self.suppressed {
             details["suppressed"] = serde_json::Value::String(s.as_str().to_string());
         }
+        if let Some(n) = wear.and_then(|w| w.repositions_per_100mb) {
+            details[REPOSITIONS_KEY] = n.into();
+        }
         details.to_string()
     }
 }
+
+/// The `details` key the drive's repositions per 100 MB are recorded under
+/// (issue #488), and that `report` reads back.
+pub const REPOSITIONS_KEY: &str = "repositions_per_100mb";
 
 /// The ratio from a page 0x0c decode (or its absence) and the write's bytes.
 /// `None` when there is no decode, no BOP→EOD line in it, or nothing was
@@ -287,6 +316,13 @@ pub fn assess_and_record(
     };
     let ratio = from_decoded_0x0c(decoded.as_deref(), data_bytes)?;
     let assessment = Assessment { ratio, suppressed };
+    // Issue #488: the same sweep's page 0x34, when the drive is HP. A failed
+    // read of it costs only the figure, never the ratio.
+    let wear =
+        crate::tape::log_pages::journalled_hp_performance(conn, contact_id).unwrap_or_else(|e| {
+            warn!(err = %e, contact_id, "log_page_journal read for page 0x34 failed");
+            None
+        });
     if let Err(e) = events::log_event(
         conn,
         "volume",
@@ -296,7 +332,7 @@ pub fn assess_and_record(
         Some(EVENT_FIELD),
         None,
         Some(&format!("{:.4}", ratio.ratio())),
-        Some(&assessment.details_json(contact_id)),
+        Some(&assessment.details_json_with_wear(contact_id, wear.as_ref())),
         None,
     ) {
         warn!(err = %e, "events insert for the feed ratio failed");
@@ -695,6 +731,98 @@ mod tests {
             details.get("suppressed").is_none(),
             "an unsuppressed row has NO `suppressed` key, not a null one"
         );
+    }
+
+    /// Page 0x34 as an HP drive's sweep journals it: `repositions`
+    /// repositions per 100 MB, the other four parameters as the real
+    /// drive's no-medium capture.
+    fn journal_0x34(conn: &Connection, contact_id: i64, repositions: u8) {
+        let mut raw =
+            include_bytes!("../../tests/fixtures/sg_logs/hp_lto6_sg0_nomedia/page_0x34.bin")
+                .to_vec();
+        raw[9] = repositions; // parameter 0's value, low byte
+        let row = JournalRow {
+            captured_at: "2026-09-23 14:50:00".into(),
+            contact_id: Some(contact_id),
+            device_sg: "/dev/sg0".into(),
+            device_tape: Some("/dev/nst0".into()),
+            trigger: "volume write".into(),
+            page_code: 0x34,
+            subpage_code: 0,
+            ok: true,
+            error: None,
+            tool_argv: "[\"sg_logs\"]".into(),
+            tool_version: None,
+            raw: rusqlite::types::Value::Blob(raw),
+            decoded: Some("Unable to decode Read forward errors (lto-5) [rfe_]".into()),
+            tapectl_version: crate::build_info::VERSION,
+        };
+        log_pages::insert(conn, &row).unwrap();
+    }
+
+    /// A contact on a drive of `vendor`.
+    fn contact_on(conn: &Connection, vendor: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO drives (serial, vendor, model)
+             SELECT 'SER-' || (COUNT(*) + 1), ?1, 'Ultrium 6-SCSI' FROM drives",
+            [vendor],
+        )
+        .unwrap();
+        let drive_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO cartridge_contacts (operation, device, drive_id)
+             VALUES ('volume write', '/dev/null', ?1)",
+            [drive_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Issue #488: on an HP drive the event carries the drive's own wear
+    /// figure — page 0x34's repositions per 100 MB from THIS contact's
+    /// sweep, not another's. Positive control for the absence below: the
+    /// key is there when it should be.
+    #[test]
+    fn an_hp_write_records_its_repositions_beside_the_ratio() {
+        let conn = crate::db::open_memory().unwrap();
+        let vid = volume(&conn, "L6-W");
+        let cid = contact_on(&conn, "HP");
+        let other = contact_on(&conn, "HP");
+        journal_0x34(&conn, other, 99);
+        journal_0x0c(&conn, cid, Some(&synthetic_0x0c(1_505)), true);
+        journal_0x34(&conn, cid, 7);
+        journal_0x34(&conn, other, 99);
+        assess_and_record(&conn, Some(cid), vid, "L6-W", 1_000_000_000, None).unwrap();
+        let details: serde_json::Value =
+            serde_json::from_str(events_for(&conn, vid)[0].2.as_deref().unwrap()).unwrap();
+        assert_eq!(details[REPOSITIONS_KEY], 7, "{details}");
+        assert_eq!(details["ratio"], 1.505);
+    }
+
+    /// The figure is absent — the key, not a null — when the drive is not
+    /// HP (another vendor's page 0x34 is something else), when its identity
+    /// is unknown, or when the sweep journalled no page 0x34. The ratio is
+    /// recorded either way.
+    #[test]
+    fn the_repositions_are_absent_unless_an_hp_drive_journalled_page_0x34() {
+        let conn = crate::db::open_memory().unwrap();
+        let ibm = contact_on(&conn, "IBM");
+        let unknown = contact(&conn);
+        let hp_no_page = contact_on(&conn, "HP");
+        for (i, cid) in [ibm, unknown, hp_no_page].into_iter().enumerate() {
+            let label = format!("L6-A{i}");
+            let vid = volume(&conn, &label);
+            journal_0x0c(&conn, cid, Some(&synthetic_0x0c(1_000)), true);
+            if cid != hp_no_page {
+                journal_0x34(&conn, cid, 7);
+            }
+            assess_and_record(&conn, Some(cid), vid, &label, 1_000_000_000, None).unwrap();
+            let rows = events_for(&conn, vid);
+            assert_eq!(rows.len(), 1, "the ratio is recorded regardless");
+            let details: serde_json::Value =
+                serde_json::from_str(rows[0].2.as_deref().unwrap()).unwrap();
+            assert!(details.get(REPOSITIONS_KEY).is_none(), "{label}: {details}");
+        }
     }
 
     #[test]

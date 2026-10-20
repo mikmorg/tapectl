@@ -1903,6 +1903,61 @@ pub(crate) struct FeedRatioRow {
     pub(crate) suppressed: Option<String>,
     pub(crate) native_bop_to_eod_mb: Option<u64>,
     pub(crate) data_bytes: Option<u64>,
+    /// The drive's own wear figure beside the ratio (issue #488): HP page
+    /// 0x34's tape direction changes per 100 MB written, from the same sweep.
+    /// ABSENT from `--json`, not null, when there is none (not an HP drive,
+    /// no page 0x34 read, or an older event whose journal row is gone).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repositions_per_100mb: Option<u32>,
+    /// Where `repositions_per_100mb` came from: [`RepositionsFrom`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) repositions_from: Option<RepositionsFrom>,
+}
+
+/// Where a write's repositions figure was read from (issue #488).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RepositionsFrom {
+    /// The event's own `details.repositions_per_100mb`, recorded by the
+    /// write (`feed_ratio::assess_and_record`, since #488).
+    Event,
+    /// Decoded now from the page 0x34 the event's contact journalled: an
+    /// event written before #488 recorded none, but its sweep kept the bytes.
+    Journal,
+}
+
+/// A `write_feed_ratio` event's repositions figure (issue #488): its own
+/// `details` key when the write recorded one, else HP page 0x34 decoded from
+/// the journal row of the contact `details.contact_id` names — the contact
+/// whose sweep the ratio itself was computed from
+/// (`log_pages::journalled_hp_performance`, keyed on vendor HP). A journal
+/// read that fails costs only the figure.
+fn feed_ratio_repositions(
+    conn: &Connection,
+    details: Option<&serde_json::Value>,
+) -> Option<(u32, RepositionsFrom)> {
+    use crate::tape::feed_ratio::REPOSITIONS_KEY;
+    let get = |k: &str| details.and_then(|d| d.get(k));
+    if let Some(n) = get(REPOSITIONS_KEY)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+    {
+        return Some((n, RepositionsFrom::Event));
+    }
+    let contact_id = get("contact_id").and_then(serde_json::Value::as_i64)?;
+    crate::tape::log_pages::journalled_hp_performance(conn, contact_id)
+        .ok()
+        .flatten()
+        .and_then(|p| p.repositions_per_100mb)
+        .map(|n| (n, RepositionsFrom::Journal))
+}
+
+/// `", repositions per 100 MB: N"`, or nothing when there is no figure —
+/// so a line without one reads exactly as it did before #488.
+fn repositions_clause(repositions: Option<u32>) -> String {
+    repositions
+        .map(|n| format!(", repositions per 100 MB: {n}"))
+        .unwrap_or_default()
 }
 
 impl FeedRatioRow {
@@ -1943,6 +1998,8 @@ impl FeedRatioRow {
             suppressed,
             native_bop_to_eod_mb: get("native_bop_to_eod_mb").and_then(serde_json::Value::as_u64),
             data_bytes: get("data_bytes").and_then(serde_json::Value::as_u64),
+            repositions_per_100mb: None,
+            repositions_from: None,
         })
     }
 
@@ -2003,7 +2060,17 @@ pub(crate) fn feed_ratio_rows(
     Ok(rows
         .into_iter()
         .filter_map(|(volume, at, new_value, details)| {
-            FeedRatioRow::from_event(volume, at, new_value.as_deref(), details.as_deref())
+            let mut row =
+                FeedRatioRow::from_event(volume, at, new_value.as_deref(), details.as_deref())?;
+            // Issue #488: the drive's wear figure beside the ratio.
+            let d: Option<serde_json::Value> = details
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
+            if let Some((n, from)) = feed_ratio_repositions(conn, d.as_ref()) {
+                row.repositions_per_100mb = Some(n);
+                row.repositions_from = Some(from);
+            }
+            Some(row)
         })
         .collect())
 }
@@ -2034,9 +2101,10 @@ pub(crate) fn render_feed_ratio_lines(rows: &[FeedRatioRow], written: bool) -> S
             " ".repeat(LABEL.len())
         };
         out.push_str(&format!(
-            "{lead}{:.4} ({}), recorded {}\n",
+            "{lead}{:.4} ({}){}, recorded {}\n",
             r.ratio,
             r.verdict_text(),
+            repositions_clause(r.repositions_per_100mb),
             r.at
         ));
     }
@@ -2062,11 +2130,12 @@ pub(crate) fn feed_ratio_block(rows: &[FeedRatioRow]) -> Vec<String> {
         .chain(rows.iter().filter(|r| !starved(r)))
     {
         out.push(format!(
-            "  {}{}: {:.4} ({}), {}",
+            "  {}{}: {:.4} ({}){}, {}",
             if starved(&r) { "!! " } else { "   " },
             r.volume,
             r.ratio,
             r.verdict_text(),
+            repositions_clause(r.repositions_per_100mb),
             r.at
         ));
     }
@@ -2792,24 +2861,45 @@ fn report_events(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
+    // Issue #488: a `write_feed_ratio` event shows the drive's repositions
+    // per 100 MB beside the ratio — recorded in its `details` since #488,
+    // decoded from its contact's journalled page 0x34 before that.
+    let repositions = |action: &str, details: &Option<String>| {
+        if action != crate::tape::feed_ratio::EVENT_ACTION {
+            return None;
+        }
+        let d: Option<serde_json::Value> = details
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        feed_ratio_repositions(conn, d.as_ref())
+    };
+
     if json_output {
         // `details` is the event's own record (`volume rewrite` names the
         // window in which staging holds the only copy there): JSON when it
         // was written as JSON, else the text as stored.
         let json: Vec<serde_json::Value> = rows.iter().map(|(ts, etype, label, action, field, old, new, details)| {
+            let wear = repositions(action, details);
             let details = details.as_deref().map(|d| {
                 serde_json::from_str::<serde_json::Value>(d)
                     .unwrap_or_else(|_| serde_json::Value::String(d.to_string()))
             });
-            serde_json::json!({"timestamp": ts, "entity_type": etype, "entity_label": label, "action": action, "field": field, "old_value": old, "new_value": new, "details": details})
+            let mut v = serde_json::json!({"timestamp": ts, "entity_type": etype, "entity_label": label, "action": action, "field": field, "old_value": old, "new_value": new, "details": details});
+            // Additive, and only where there is a figure: `details` stays the
+            // row as stored, so a decoded figure sits beside it.
+            if let Some((n, from)) = wear {
+                v["repositions_per_100mb"] = n.into();
+                v["repositions_from"] = serde_json::to_value(from).expect("an enum serializes");
+            }
+            v
         }).collect();
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else if rows.is_empty() {
         println!("no events found");
     } else {
-        for (ts, etype, label, action, field, old, new, _details) in &rows {
+        for (ts, etype, label, action, field, old, new, details) in &rows {
             println!(
-                "  {}",
+                "  {}{}",
                 event_line(
                     ts,
                     etype,
@@ -2818,7 +2908,8 @@ fn report_events(
                     field.as_deref(),
                     old.as_deref(),
                     new.as_deref()
-                )
+                ),
+                repositions_clause(repositions(action, details).map(|(n, _)| n))
             );
         }
     }
@@ -6103,6 +6194,158 @@ Read error counter page  [0x3]
             );
             assert_eq!(render_feed_ratio_lines(&[], false), "");
             assert!(!said.to_lowercase().contains("receipt"), "{said}");
+        }
+    }
+
+    /// Issue #488: the drive's repositions per 100 MB beside each write's
+    /// feed ratio — from the event's own `details` when the write recorded
+    /// it, else decoded from the page 0x34 its contact's sweep journalled.
+    mod feed_ratio_repositions {
+        use super::*;
+        use crate::db::events;
+        use crate::tape::feed_ratio::{Assessment, FeedRatio, EVENT_ACTION, EVENT_FIELD};
+        use crate::tape::log_pages::{self, HpPerformance, JournalRow};
+
+        const NOMEDIA_0X34: &[u8] =
+            include_bytes!("../../tests/fixtures/sg_logs/hp_lto6_sg0_nomedia/page_0x34.bin");
+
+        /// A volume, a contact on a drive of `vendor`, and that contact's
+        /// journalled page 0x34 (the real capture: 5 repositions per 100 MB)
+        /// unless `journal` is false. Returns `(volume id, contact id)`.
+        fn written(conn: &Connection, label: &str, vendor: &str, journal: bool) -> (i64, i64) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed')",
+                [label],
+            )
+            .unwrap();
+            let vid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO drives (serial, vendor, model) VALUES (?1, ?2, 'Ultrium 6-SCSI')",
+                rusqlite::params![format!("S-{label}"), vendor],
+            )
+            .unwrap();
+            let drive = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO cartridge_contacts (operation, device, drive_id)
+                 VALUES ('volume write', '/dev/null', ?1)",
+                [drive],
+            )
+            .unwrap();
+            let cid = conn.last_insert_rowid();
+            if journal {
+                log_pages::insert(
+                    conn,
+                    &JournalRow {
+                        captured_at: "2026-10-14 08:59:00".into(),
+                        contact_id: Some(cid),
+                        device_sg: "/dev/sg0".into(),
+                        device_tape: None,
+                        trigger: "volume write".into(),
+                        page_code: 0x34,
+                        subpage_code: 0,
+                        ok: true,
+                        error: None,
+                        tool_argv: "[\"sg_logs\"]".into(),
+                        tool_version: None,
+                        raw: rusqlite::types::Value::Blob(NOMEDIA_0X34.to_vec()),
+                        decoded: None,
+                        tapectl_version: crate::build_info::VERSION,
+                    },
+                )
+                .unwrap();
+            }
+            (vid, cid)
+        }
+
+        fn event(conn: &Connection, vid: i64, label: &str, details: &str) {
+            events::log_event(
+                conn,
+                "volume",
+                vid,
+                Some(label),
+                EVENT_ACTION,
+                Some(EVENT_FIELD),
+                None,
+                Some("1.0040"),
+                Some(details),
+                None,
+            )
+            .unwrap();
+        }
+
+        fn ratio() -> Assessment {
+            Assessment {
+                ratio: FeedRatio::new(1_004, 1_000_000_000).unwrap(),
+                suppressed: None,
+            }
+        }
+
+        #[test]
+        fn an_event_written_before_488_reads_its_repositions_from_the_journal() {
+            let conn = crate::db::open_memory().unwrap();
+            let (vid, cid) = written(&conn, "V-OLD", "HP", true);
+            // The shape `assess_and_record` wrote before #488: no key.
+            event(&conn, vid, "V-OLD", &ratio().details_json(cid));
+            let rows = feed_ratio_rows(&conn, Some("V-OLD")).unwrap();
+            assert_eq!(rows[0].repositions_per_100mb, Some(5));
+            assert_eq!(rows[0].repositions_from, Some(RepositionsFrom::Journal));
+            let line = render_feed_ratio_lines(&rows, true);
+            assert!(
+                line.contains("(streamed, within 1.05), repositions per 100 MB: 5, recorded "),
+                "{line}"
+            );
+            let v = serde_json::to_value(&rows[0]).unwrap();
+            assert_eq!(v["repositions_per_100mb"], 5);
+            assert_eq!(v["repositions_from"], "journal");
+        }
+
+        #[test]
+        fn an_event_that_recorded_its_repositions_is_read_as_recorded() {
+            let conn = crate::db::open_memory().unwrap();
+            let (vid, cid) = written(&conn, "V-NEW", "HP", true);
+            let wear = HpPerformance {
+                repositions_per_100mb: Some(9),
+                ..HpPerformance::default()
+            };
+            event(
+                &conn,
+                vid,
+                "V-NEW",
+                &ratio().details_json_with_wear(cid, Some(&wear)),
+            );
+            let rows = feed_ratio_rows(&conn, Some("V-NEW")).unwrap();
+            // The event's own figure, not the journal's 5.
+            assert_eq!(rows[0].repositions_per_100mb, Some(9));
+            assert_eq!(rows[0].repositions_from, Some(RepositionsFrom::Event));
+            let block = feed_ratio_block(&rows);
+            assert!(
+                block[1].contains("1.0040 (streamed, within 1.05), repositions per 100 MB: 9, "),
+                "{block:?}"
+            );
+        }
+
+        /// No figure — another vendor's drive, or an HP drive whose sweep
+        /// journalled no page 0x34 — and the line and the JSON read exactly
+        /// as before #488.
+        #[test]
+        fn without_a_figure_the_line_and_the_json_are_unchanged() {
+            let conn = crate::db::open_memory().unwrap();
+            for (label, vendor, journal) in [("V-IBM", "IBM", true), ("V-NOPAGE", "HP", false)] {
+                let (vid, cid) = written(&conn, label, vendor, journal);
+                event(&conn, vid, label, &ratio().details_json(cid));
+                let rows = feed_ratio_rows(&conn, Some(label)).unwrap();
+                assert_eq!(rows[0].repositions_per_100mb, None, "{label}");
+                let line = render_feed_ratio_lines(&rows, true);
+                assert!(
+                    line.starts_with("  Feed ratio:  1.0040 (streamed, within 1.05), recorded "),
+                    "{line}"
+                );
+                let v = serde_json::to_value(&rows[0]).unwrap();
+                assert!(v.get("repositions_per_100mb").is_none(), "{v}");
+                assert!(v.get("repositions_from").is_none(), "{v}");
+            }
         }
     }
 
