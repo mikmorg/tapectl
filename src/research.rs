@@ -198,7 +198,7 @@ impl Knobs {
             ignore(
                 CROSSFILE_ENV,
                 &v,
-                "not built: carrying the queue across files needs the write session (#488)",
+                "not built: carrying the queue across files needs the write session",
             );
         }
         k.queue_bytes = queue_bytes;
@@ -218,7 +218,7 @@ impl Knobs {
     /// The banner's lines: what is in force, then what was ignored.
     pub fn describe(&self) -> Vec<String> {
         let mut out = vec![
-            "RESEARCH BUILD (cargo feature `research`, #488): the write-shaping knobs are live; \
+            "RESEARCH BUILD (cargo feature `research`): the write-shaping knobs are live; \
              never use this binary for a production write"
                 .to_string(),
         ];
@@ -312,7 +312,7 @@ pub fn announcement(built: bool, knobs: &Knobs, set: &[&str]) -> Vec<String> {
             .map(|var| {
                 format!(
                     "warning: {var} is set, but this build ignores it: the write-shaping \
-                     knobs exist only in a build with the cargo feature `research` (#488)"
+                     knobs exist only in a build with the cargo feature `research`"
                 )
             })
             .collect()
