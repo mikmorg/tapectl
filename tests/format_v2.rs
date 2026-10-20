@@ -1579,30 +1579,38 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
     assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
 }
 
-/// ADR-0012 2026-10-16 item 73, from a REAL `build()`: the 1.2.0 re-pin
-/// changes generated text, not what a reader must understand. File 0 and the
-/// seal marker still say `requires = []`, and the File 2 the build wrote still
-/// knows no feature and still names "tapectl 1.1.0" as the version a newer
-/// tape would need.
+/// ADR-0012 item 111, from a REAL `build()`: every tape 1.6.0 writes fences
+/// out older readers. File 0 states `requires = ["short-seal"]` on the line
+/// after `layout_version`, File 3 states `may_end_early = true`
+/// (`volume-format-v2.md` §1.7), and the File 2 the
+/// build wrote knows `short-seal` and names "tapectl 1.6.0" as the version a
+/// newer tape would need (§6 "Since 1.6.0"). (Until 1.6.0 this test pinned
+/// item 73's fixed points: `requires = []` and "tapectl 1.1.0". The seal's
+/// own `requires` is the seal generator's, and is pinned with it.)
 #[test]
-fn the_re_pin_leaves_requires_empty_and_the_newer_tape_text_at_1_1_0() {
+fn a_built_tape_requires_short_seal_and_its_restore_sh_knows_it() {
     let h = shared_harness();
     let text_of = |pos: usize| {
         String::from_utf8_lossy(&h.store.files[pos])
             .trim_end_matches('\0')
             .to_string()
     };
-    let last = h.store.files.len() - 1;
-    assert!(text_of(0).contains("\nrequires = []\n"), "File 0");
-    assert!(text_of(last).contains("\nrequires = []\n"), "seal marker");
-    let restore_sh = text_of(2);
     assert!(
-        restore_sh.contains("\nKNOWN_FEATURES=\"\"\n"),
-        "RESTORE.sh knows no feature"
+        text_of(0).contains("\nlayout_version = 2\nrequires = [\"short-seal\"]\n"),
+        "File 0"
     );
     assert!(
-        restore_sh.contains("This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely"),
-        "die_newer_needed says 1.1.0"
+        text_of(3).contains("\nlayout_version = 2\nmay_end_early = true\n"),
+        "File 3"
+    );
+    let restore_sh = text_of(2);
+    assert!(
+        restore_sh.contains("\nKNOWN_FEATURES=\"short-seal\"\n"),
+        "RESTORE.sh knows short-seal"
+    );
+    assert!(
+        restore_sh.contains("This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely"),
+        "die_newer_needed says 1.6.0"
     );
 }
 
