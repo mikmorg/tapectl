@@ -2813,33 +2813,24 @@ impl SealedPending {
             Tier::Integrity => plan.checkpointing(&record),
             Tier::Navigable => plan,
         };
-        let plan = plan.with_seal(self.seal_bytes.as_deref());
-        if self.warning_in_data && tier == Tier::Navigable {
-            // #420: the chain walk does not yet take the ending, so the
-            // navigable tier reads no content file; item 114's readback of
-            // entry `ended_after` waits on it (store.rs). Said loudly.
-            tracing::warn!(
-                label = %self.built.layout.label,
-                "this write met the drive's early warning, and its quick confirm does not yet \
-                 read back the file before the seal (ADR-0012 item 114 is not built in the chain \
-                 walk); run `tapectl volume verify` on this volume"
-            );
-        }
-        let evidence = match self.ending {
-            Ending::Full => store.confirm_with(&self.built.layout, plan)?,
-            // #420: the seal is at K+1, and positions after K are not on
-            // the tape (§4.2). See `ShortEndingReads`: what the walk does not
-            // yet know of the ending, this keeps from reading.
-            Ending::Short { ended_after } => {
-                let planned_seal = planned_seal_position(&self.built.layout)?;
-                ShortEndingReads {
-                    inner: store,
-                    ended_after,
-                    planned_seal,
-                }
-                .confirm_with(&self.built.layout, plan)?
+        // #420: the walk reads the seal at K+1 on a short ending and nothing
+        // after K (§4.2, §5), and after a warning in a data slice it reads
+        // back the entry at `ended_after` (K, or M-1 when the warning came in
+        // the last slice) under every tier (§4.3 W9, ADR-0012 item 114).
+        let ended_after = self.ending.recorded_ended_after();
+        let readback = if self.warning_in_data {
+            match ended_after {
+                Some(k) => Some(k),
+                None => Some(planned_seal_position(&self.built.layout)? - 1),
             }
+        } else {
+            None
         };
+        let plan = plan
+            .with_seal(self.seal_bytes.as_deref())
+            .with_ending(ended_after)
+            .reading_back(readback);
+        let evidence = store.confirm_with(&self.built.layout, plan)?;
         phase.done();
         let passed = evidence.mismatches.is_empty();
         // ADR-0012's 2026-09-18 amendment: a mismatch alone is not a
@@ -3750,86 +3741,6 @@ fn recorded_ending(
         ended_after,
         warning_at,
     })
-}
-
-/// The bridge that confirms a SHORT-sealed tape through today's chain walk
-/// (#420), which knows only the planned seal position M and every planned
-/// file. Over the store it wraps:
-/// - a read of M reads K+1, where the short seal is (§1.2 rule 6: a catalog
-///   reader that knows `ended_after` reads the seal at `ended_after + 1`);
-/// - a read of any other position after K fails, naming it not on this tape
-///   (§4.2 R3: never read a position after `ended_after` for data). The walk
-///   reports that as `ContentUnreadable`, which proves nothing about the
-///   medium, so an Integrity-tier short confirm is inconclusive — it fails
-///   closed — until the walk itself skips those positions;
-/// - everything else passes through.
-///
-/// What it does NOT do, and the chain walk must (`store.rs`, routed): skip
-/// positions after `ended_after` at step 4, check the seal's `ended_after`
-/// against the session's (`ended_after_disagrees`, §5 step 3), and read back
-/// entry `ended_after` under the navigable tier (§5, ADR-0012 item 114).
-/// Remove this when `ConfirmPlan` carries the ending.
-struct ShortEndingReads<'s> {
-    inner: &'s mut dyn Store,
-    ended_after: u32,
-    planned_seal: u32,
-}
-
-impl ShortEndingReads<'_> {
-    /// The position on the medium a read of `position` is, or why there is
-    /// none.
-    fn on_tape(&self, position: u32) -> Result<u32> {
-        if position == self.planned_seal {
-            Ok(self.ended_after + 1)
-        } else if position > self.ended_after {
-            Err(TapectlError::Other(format!(
-                "tape file {position} is after ended_after = {}: the tape ended before it, so it \
-                 is not on this tape (volume-format-v2.md §4.2)",
-                self.ended_after
-            )))
-        } else {
-            Ok(position)
-        }
-    }
-}
-
-impl Store for ShortEndingReads<'_> {
-    fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
-        self.inner.capacity()
-    }
-    fn execute(&mut self, _src: &mut dyn std::io::Read, _len: u64, _sync: bool) -> Result<u64> {
-        Err(TapectlError::Other(
-            "a confirm reads; it never writes".to_string(),
-        ))
-    }
-    fn early_warning(&self) -> Option<EarlyWarning> {
-        self.inner.early_warning()
-    }
-    fn read_file(&mut self, position: u32, sink: &mut dyn std::io::Write) -> Result<u64> {
-        let at = self.on_tape(position)?;
-        self.inner.read_file(at, sink)
-    }
-    fn read_file_head(
-        &mut self,
-        position: u32,
-        max_bytes: u64,
-        sink: &mut dyn std::io::Write,
-    ) -> Result<u64> {
-        let at = self.on_tape(position)?;
-        self.inner.read_file_head(at, max_bytes, sink)
-    }
-    fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
-        self.inner.reposition_for_resume(file_index)
-    }
-    fn blank_at_bot(&mut self) -> Result<bool> {
-        self.inner.blank_at_bot()
-    }
-    fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
-        self.inner.eod_at_or_before(position)
-    }
-    fn files_on_medium(&mut self) -> Result<Option<u32>> {
-        self.inner.files_on_medium()
-    }
 }
 
 /// Move this session's `write_positions` at Layout position `from` or later
@@ -10582,8 +10493,7 @@ mod tests {
         /// `layout-session.md` "Transitions": a mismatch that proves the
         /// medium bad quarantines and aborts the session). Not sealed, not
         /// completed, and no row `cut` — `cut` is written only by a passing
-        /// confirm. (Under today's bridge the positions after K also show as
-        /// unreadable; they prove nothing and do not change the verdict.)
+        /// confirm. The positions after K are not read (§5 step 4).
         #[test]
         fn a_refused_block_that_was_written_is_caught_by_a_full_confirm_and_quarantines() {
             let s = three_units();
@@ -10627,8 +10537,6 @@ mod tests {
         /// The same hazard under the DEFAULT quick confirm: item 114 reads
         /// entry K back under every tier, so it quarantines here too.
         #[test]
-        #[ignore = "#420: needs the chain walk to take the ending (store.rs, routed in E's \
-                    report): the navigable tier reads no content file today"]
         fn a_refused_block_that_was_written_is_caught_by_the_quick_confirm_readback() {
             let s = three_units();
             let k = slice_at(&s, 1, 0);
@@ -10647,8 +10555,6 @@ mod tests {
         /// still reads the last slice back (item 114: "whether the tape then
         /// sealed short or … full").
         #[test]
-        #[ignore = "#420: needs the chain walk to take the ending (store.rs, routed in E's \
-                    report): the navigable tier reads no content file today"]
         fn the_quick_confirm_after_a_warning_in_the_last_slice_reads_that_slice_back() {
             let s = three_units();
             let k = slice_at(&s, 2, 0);
@@ -10667,10 +10573,6 @@ mod tests {
         /// A full confirm of a short tape hashes files 0 to K and reads
         /// nothing after K (§5 step 4), and passes.
         #[test]
-        #[ignore = "#420: needs the chain walk to take the ending (store.rs, routed in E's \
-                    report): today the walk asks for every planned file, and the bridge \
-                    keeps it from reading past K, so a full confirm of a short tape is \
-                    inconclusive (it fails closed)"]
         fn a_full_confirm_of_a_short_tape_hashes_through_ended_after_and_passes() {
             let s = three_units();
             let k = slice_at(&s, 1, 0);
