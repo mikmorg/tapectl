@@ -22290,7 +22290,14 @@ mod tests {
             /// `ended_after` stays NULL; the warning is still recorded.
             #[test]
             fn a_warning_in_the_last_slice_seals_full_and_cuts_nothing() {
-                let f = fixture(ABC, &["SE-L"]);
+                let mut f = fixture(ABC, &["SE-L"]);
+                // The drive's measured room past the warning reaches the
+                // event's wear record (`write_budget` -> the session).
+                f.config.backends.lto[0].post_warning_bytes = Some("1G".into());
+                let room = f.config.backends.lto[0]
+                    .post_warning_room_bytes()
+                    .unwrap()
+                    .unwrap();
                 let mut store = ArmedAt::new(C_ONLY, warning);
                 let (r, code) = write(&f, "SE-L", &mut store, false);
                 r.expect("seals");
@@ -22315,6 +22322,14 @@ mod tests {
                         .as_deref()
                         .unwrap_or("")
                         .contains("\"seal\": \"full\""),
+                    "{warned:?}"
+                );
+                assert!(
+                    warned[0]
+                        .1
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains(&format!("\"post_warning_bytes\": {room},")),
                     "{warned:?}"
                 );
                 assert_eq!(events(&f, "SE-L", "write_completed"), vec![(None, None)]);
