@@ -242,7 +242,7 @@ It refuses (exit 2, nothing touched) when any of these fails:
 |---|---|---|
 | 1 setup | no tape. The home, the config (`post_warning_bytes = "99008M"`, item 118's figure; `min_copies = 1`), four units staged, the filler's rows | ~10 min |
 | 2 erase, `volume init SSA-0001` | whatever the cartridge held is erased by this home's `cartridge erase` (File 0's label confirmed), so init needs no `--force`; the medium line's capacity is the registered 2.55 TB | ~5 min |
-| 3 `volume write` | exit 0, `"ending": "short"`, `ended_after` K, cut `ssa-m-filler` and `ssa-z-tail`; the volume `sealed` with `ended_after` K; `completed` and `cut` rows; the `write_early_warning` event; the whole units' staging released (`min_copies = 1`) and the cut units' kept | ~4.5-5 h |
+| 3 `volume write` | exit 0, `"ending": "short"`, `ended_after` K, cut `ssa-m-filler` and `ssa-z-tail`; the volume `sealed` with `ended_after` K; `completed` and `cut` rows; the `write_early_warning` event; the confirm phase's bytes (`phase_timings`) cover the slice at file K and the seal, item 114's readback; the whole units' staging released (`min_copies = 1`) and the cut units' kept | ~4.5-5 h |
 | 4 verify | `volume verify --full` exit 0; RESTORE.sh `--info` "Verdict: SEALED" and "ended early, after file K"; `--verify` "VERIFY: PASS" with the planned files after K marked NOT ON TAPE | ~9-10 h |
 | 5 restore | `ssa-b-photos` (two slices) by `restore unit` and by RESTORE.sh, each identical to its source; the cut unit refused by both | ~15 min |
 | 6 rebuild | `catalog rebuild --from-volume` into a second bare home; `short_seal_filler compare` agrees on the volume, its units, every write's status and every slice on the tape | ~15 min |
@@ -253,8 +253,9 @@ About 14-16 hours of drive time in all. Step 4's two whole-tape reads are most o
 - [ ] Record: K, the `write_early_warning` event's `bytes_at` and `refusals` beside the profile's
       first refusal (2,502,136,168,448), the `write_feed_ratio` event, and each step's duration
       (`steps.tsv`).
-- [ ] Record the readback past the warning: the write's confirm read the slice the warning landed
-      in and the seal (item 114). Steps 4 and 6 read them again.
+- [ ] Record the readback past the warning (item 114): the step-3 log line "item 114: the confirm
+      read back N bytes", from the confirm phase's own byte count. Steps 4 and 6 read the slice and
+      the seal again.
 - [ ] A FAIL stops the run and leaves the cartridge as that step left it. Read the failure first
       (`RESULT.txt`, the step's `.err` and `.out` files, `drive-at-fail/`), and keep the cartridge
       unwritten until it is understood (#420's lost readback). On a FAIL in step 3 or 4,

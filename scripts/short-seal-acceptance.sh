@@ -625,6 +625,21 @@ VOL_ROW="$(dbq "$DB" "SELECT status, ended_after, observed_condition FROM volume
 WRITES="$(dbq "$DB" "SELECT u.name || '=' || w.status FROM writes w JOIN volumes v ON v.id = w.volume_id
     JOIN snapshots s ON s.id = w.snapshot_id JOIN units u ON u.id = s.unit_id WHERE v.label = ? ORDER BY u.name" "$LABEL1" | tr '\n' ' ')"
 [ "$WRITES" = "$UNIT_A=completed $UNIT_B=completed $UNIT_F=cut $UNIT_Z=cut " ] || fail "write rows are '$WRITES'"
+# Item 114: the confirm read back what was written past the warning, the slice at file K and
+# the seal, whatever the tier. The confirm phase's bytes (phase_timings, the session's own
+# count) hold at least that slice, block-padded, and the seal's block; a quick confirm that
+# skipped it reads only the front index and the seal.
+CONFIRM_BYTES="$(dbq "$DB" "SELECT pt.bytes FROM phase_timings pt JOIN volumes v ON v.id = pt.volume_id
+    WHERE v.label = ? AND pt.operation = 'volume write' AND pt.phase = 'confirm' ORDER BY pt.id DESC LIMIT 1" "$LABEL1")"
+K_BYTES="$(dbq "$DB" "SELECT sl.encrypted_bytes FROM write_positions wp JOIN writes w ON w.id = wp.write_id
+    JOIN volumes v ON v.id = w.volume_id JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+    WHERE v.label = ? AND wp.position = ?" "$LABEL1" "$K" | head -1)"
+case "$CONFIRM_BYTES" in ''|*[!0-9]*) fail "no byte count for the write's confirm phase (phase_timings)" ;; esac
+case "$K_BYTES" in ''|*[!0-9]*) fail "no slice recorded at file $K" ;; esac
+BLOCK=524288
+K_PADDED=$(( (K_BYTES + BLOCK - 1) / BLOCK * BLOCK ))
+[ "$CONFIRM_BYTES" -ge $(( K_PADDED + BLOCK )) ] || fail "the confirm read $CONFIRM_BYTES bytes, less than the slice at file $K ($K_PADDED padded) and the seal: item 114's readback past the warning did not run"
+log "  item 114: the confirm read back $CONFIRM_BYTES bytes, including the slice at file $K ($K_PADDED bytes on tape) and the seal"
 dbq "$DB" "SELECT e.timestamp, e.field, e.new_value, e.details FROM events e JOIN volumes v ON v.id = e.entity_id
     WHERE e.action = 'write_early_warning' AND e.entity_type = 'volume' AND v.label = ?" "$LABEL1" > "$STEP_DIR/early-warning-event.tsv"
 [ -s "$STEP_DIR/early-warning-event.tsv" ] || fail "no write_early_warning event for $LABEL1"
