@@ -763,6 +763,13 @@ fn dispatch(
                 obj["recorded_as_unsealed"] =
                     serde_json::json!(report.volume_inserted && report.unsealed_reason.is_some());
                 obj["found_volume_status"] = serde_json::json!(report.found_volume_status);
+                // #420: additive. Where a short tape ended, the units it
+                // cut, and what was recorded of the ending on a found row.
+                obj["ended_after"] = serde_json::json!(report.ended_after);
+                obj["cut_units"] = serde_json::json!(report.cut_units);
+                obj["ended_after_recorded"] = serde_json::json!(report.ended_after_recorded);
+                obj["volume_ended_after_mismatch"] =
+                    serde_json::json!(report.volume_ended_after_mismatch);
                 // Issue #451: additive. Tenant envelopes no copy of which
                 // could be read, which the rebuild went on without.
                 obj["unreadable_tenant_envelopes"] =
@@ -864,6 +871,11 @@ fn dispatch(
                 // as the warnings below: a second run over the same unsealed
                 // tape changes nothing and must say so every time.
                 for line in unsealed_tape_lines(&report) {
+                    println!("{line}");
+                }
+                // #420, outside the is_noop() branch for the same reason: a
+                // tape that ended early says so on every run.
+                for line in short_tape_lines(&report) {
                     println!("{line}");
                 }
                 // Outside the is_noop() branch on purpose: a second rebuild
@@ -1196,6 +1208,53 @@ fn escrow_unknown_lines(report: &RebuildReport, escrow_registered: bool) -> Vec<
             "  escrow: {} rebuilt stage set(s) on this volume still report `?` (unknown) — \
              the escrow key found nothing new to attest this run",
             report.unknown_remaining
+        ));
+    }
+    lines
+}
+
+/// What `catalog rebuild` prints for a tape that sealed short (#420,
+/// `volume-format-v2.md` §4.2): where it ended, the units it cut, and an
+/// ending this catalog recorded differently. Empty for a full seal that
+/// agrees with the catalog.
+fn short_tape_lines(report: &RebuildReport) -> Vec<String> {
+    let label = &report.label;
+    let mut lines = Vec::new();
+    if let Some(k) = report.ended_after {
+        lines.push(format!(
+            "  note: volume \"{label}\" is SEALED SHORT: the drive's early warning ended it \
+             after tape file {k}, and every file its plan lists after that is not on it \
+             (volume-format-v2.md §4.2)"
+        ));
+        if !report.cut_units.is_empty() {
+            lines.push(format!(
+                "    cut by the early end, recorded \"cut\" and NOT a copy on this tape: {}. \
+                 Each is restorable only from another tape that holds it whole; `tapectl \
+                 catalog locate <UNIT>` names the ones this catalog knows",
+                report.cut_units.join(", ")
+            ));
+        }
+        if report.ended_after_recorded {
+            lines.push(format!(
+                "    the ending was recorded on the existing row of \"{label}\", so `tapectl \
+                 volume verify {label}` reads the seal where the tape ended"
+            ));
+        }
+    }
+    if let Some(recorded) = &report.volume_ended_after_mismatch {
+        let recorded = if recorded == "none" {
+            "no early end (a full seal)".to_string()
+        } else {
+            format!("an end after file {recorded}")
+        };
+        let tape = report.ended_after.map_or_else(
+            || "it sealed full".to_string(),
+            |k| format!("it ended after file {k}"),
+        );
+        lines.push(format!(
+            "  warning: this catalog records {recorded} for \"{label}\", but its seal says \
+             {tape} — the rebuild left the row's ending alone; run `tapectl volume verify \
+             {label}`"
         ));
     }
     lines
@@ -1600,6 +1659,44 @@ mod tests {
             super::index_json(&broken)["problem"],
             "units.tsv: the header has no `volume` column"
         );
+    }
+
+    /// #420: a tape that sealed short says where it ended and names the units
+    /// it cut as not copies; a full seal that agrees says nothing; a row
+    /// whose recorded ending disagrees is warned about either way.
+    #[test]
+    fn a_short_tape_is_named_with_its_cut_units() {
+        use crate::volume::rebuild::RebuildReport;
+        let full = RebuildReport {
+            label: "L6-0042".to_string(),
+            ..Default::default()
+        };
+        assert!(super::short_tape_lines(&full).is_empty());
+
+        let short = RebuildReport {
+            label: "L6-0042".to_string(),
+            ended_after: Some(17),
+            cut_units: vec!["bravo v1".to_string(), "charlie v1".to_string()],
+            ended_after_recorded: true,
+            ..Default::default()
+        };
+        let text = super::short_tape_lines(&short).join("\n");
+        assert!(text.contains("SEALED SHORT"), "{text}");
+        assert!(text.contains("after tape file 17"), "{text}");
+        assert!(text.contains("bravo v1, charlie v1"), "{text}");
+        assert!(text.contains("NOT a copy"), "{text}");
+        assert!(text.contains("tapectl volume verify L6-0042"), "{text}");
+        assert!(text.contains("tapectl catalog locate <UNIT>"), "{text}");
+        assert!(!text.contains("warning:"), "{text}");
+
+        let disagrees = RebuildReport {
+            label: "L6-0042".to_string(),
+            volume_ended_after_mismatch: Some("12".to_string()),
+            ..Default::default()
+        };
+        let text = super::short_tape_lines(&disagrees).join("\n");
+        assert!(text.contains("an end after file 12"), "{text}");
+        assert!(text.contains("it sealed full"), "{text}");
     }
 
     /// Issue #458: a tape with no valid seal is said to be unsealed and not a
