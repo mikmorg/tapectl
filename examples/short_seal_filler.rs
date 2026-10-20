@@ -259,8 +259,13 @@ fn fill(raw: &[String]) -> Result<i32> {
         .collect::<std::result::Result<_, _>>()?;
     let (set_id, slice_size, _num_slices) = match sets.as_slice() {
         [one] => *one,
-        [] => bail!("unit {unit:?} has no staged stage set: run `tapectl stage create {unit}` first"),
-        _ => bail!("unit {unit:?} has {} staged stage sets; the filler needs exactly one", sets.len()),
+        [] => {
+            bail!("unit {unit:?} has no staged stage set: run `tapectl stage create {unit}` first")
+        }
+        _ => bail!(
+            "unit {unit:?} has {} staged stage sets; the filler needs exactly one",
+            sets.len()
+        ),
     };
 
     let rows: Vec<SliceRow> = conn
@@ -285,7 +290,10 @@ fn fill(raw: &[String]) -> Result<i32> {
         bail!("stage set {set_id} of {unit:?} has no slice rows");
     };
     if template.number != 1 {
-        bail!("stage set {set_id}'s first slice is number {}, not 1", template.number);
+        bail!(
+            "stage set {set_id}'s first slice is number {}, not 1",
+            template.number
+        );
     }
     if template.size_bytes != slice_size {
         bail!(
@@ -359,7 +367,10 @@ fn fill(raw: &[String]) -> Result<i32> {
         (Some(n), None) => {
             let n = n as usize;
             if n < rows.len() {
-                bail!("--slices {n} is fewer than the {} the set already has", rows.len());
+                bail!(
+                    "--slices {n} is fewer than the {} the set already has",
+                    rows.len()
+                );
             }
             (n - tail.len()) as u64
         }
@@ -593,7 +604,10 @@ fn compare(raw: &[String]) -> Result<i32> {
     let label = args.need("--label")?;
     let ro = OpenFlags::SQLITE_OPEN_READ_ONLY;
     let a = volume_rows(&open_catalog(Path::new(args.need("--home")?), ro)?, label)?;
-    let b = volume_rows(&open_catalog(Path::new(args.need("--rebuilt")?), ro)?, label)?;
+    let b = volume_rows(
+        &open_catalog(Path::new(args.need("--rebuilt")?), ro)?,
+        label,
+    )?;
 
     let mut ok = true;
     match (&a.volume, &b.volume) {
@@ -608,7 +622,11 @@ fn compare(raw: &[String]) -> Result<i32> {
             println!("DIFFER volume {label}: writer {x:?}, rebuilt {y:?}");
         }
     }
-    ok &= same("units on the volume (name, uuid, tenant)", &a.units, &b.units);
+    ok &= same(
+        "units on the volume (name, uuid, tenant)",
+        &a.units,
+        &b.units,
+    );
     ok &= same("writes (unit, version, status)", &a.writes, &b.writes);
     ok &= same(
         "slices on the tape (unit, version, slice, position)",
