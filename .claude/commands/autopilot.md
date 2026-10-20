@@ -30,6 +30,8 @@ the normative design set named in the Policy block below.
   home2 (still 1.1.0) goes straight to 1.5.0 by handoff (f), whose new step 8 regenerates the kit;
   the authorizations of 1.2.0-1.5.0 end at that install. Open, all needing the real drive: #420,
   #478 (after #420), #482, #444, #388. The goal "no issue open except drive-bound" is MET.
+  #486 (a static musl tapectl in the Heir Kit) is DEFERRED by the CTO (2026-10-20: "build from
+  source for now"; label `deferred`): not queue work until they lift it.
   Lessons: a File 1 literal of the current version goes stale on the next release (write
   `tapectl-X.Y.Z`, "such as 1.5.0"); edit text fixes in a separate worktree while a chain builds
   from the land tree, then fast-forward.
