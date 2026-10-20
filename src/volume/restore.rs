@@ -17,6 +17,8 @@ use crate::tape::contact::{self, ContactSite, Operation};
 use crate::volume::restore_record::{self, RestoreRecord};
 
 mod fill;
+#[cfg(test)]
+pub(crate) mod short_tape;
 mod supply;
 #[cfg(test)]
 use supply::FixedBay;
