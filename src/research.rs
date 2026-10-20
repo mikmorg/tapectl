@@ -764,7 +764,7 @@ mod tests {
     #[cfg(not(feature = "research"))]
     #[test]
     fn a_production_build_has_no_knobs() {
-        assert!(!BUILT);
+        const { assert!(!BUILT) };
         assert_eq!(knobs(), &Knobs::default());
     }
 }
