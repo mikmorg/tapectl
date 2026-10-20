@@ -1872,10 +1872,11 @@ Ruled 2026-10-20, on #420's build plan (the forks the plan found that items 76-1
      Whole units are added past the ceiling while the plan's end stays at or below the cartridge's
      nominal capacity, and only when the drive declares `post_warning_bytes`. Without it, plans stop
      at the ceiling as today, but an unexpected early warning still seals short.
-114. **A short-sealed write always reads back what it wrote past the warning.** At most one slice
-     and the seal. This happens under every confirm tier, so a block st refused but the drive kept
-     is caught on every short tape, not only in item 110's acceptance run. (Coordinator's call
-     within item 110; not a CTO fork.)
+114. **A write that saw the early warning always reads back what it wrote past it.** At most
+     one slice and the seal, whether the tape then sealed short or (the warning landing in the last
+     slice) full. This happens under every confirm tier, so a block st refused but the drive kept
+     is caught on every such tape, not only in item 110's acceptance run. (Coordinator's call
+     within item 110, not a CTO fork; `volume-format-v2.md` §4.3 W9.)
 115. **The acceptance run fills with a synthetic stage set.** home2's staging area is smaller than
      one cartridge. In a throwaway home, a test fixture adds one stage set whose slice rows all
      point to one real 1 GiB ciphertext file, placed between real units. The write reaches the
