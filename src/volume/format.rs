@@ -1112,14 +1112,31 @@ mod forward_compat_tests {
         })
     }
 
+    /// A seal's embedded copy that keeps §4.1's rules S4 and S5 (Files 0-3,
+    /// one data slice, the seal), so these fixtures stay seals whether the
+    /// generator writes a 1.5.0 seal or a 1.6.0 one.
+    fn seal_files() -> Vec<FrontIndexFile> {
+        [
+            "id_thunk",
+            "system_guide",
+            "restore_sh",
+            "front_index",
+            "data_slice",
+            "seal_marker",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, type_label)| FrontIndexFile {
+            position: i as i32,
+            type_label,
+            size_bytes: (type_label != "seal_marker").then_some(10),
+            sha256_encrypted: (type_label != "seal_marker").then(|| "h".to_string()),
+        })
+        .collect()
+    }
+
     fn seal() -> String {
-        let files = vec![FrontIndexFile {
-            position: 0,
-            type_label: "seal_marker",
-            size_bytes: None,
-            sha256_encrypted: None,
-        }];
-        generate_seal_marker("FC01", 1, "h", &files)
+        generate_seal_marker("FC01", 6, "h", &seal_files())
     }
 
     /// Issue #458: the one seal judgement. A seal that binds the front index
@@ -1131,13 +1148,7 @@ mod forward_compat_tests {
         use sha2::Digest;
         let front_index = b"[index]\nvolume = \"FC01\"\nlayout_version = 2\n";
         let hash = format!("{:x}", sha2::Sha256::digest(front_index));
-        let files = vec![FrontIndexFile {
-            position: 0,
-            type_label: "seal_marker",
-            size_bytes: None,
-            sha256_encrypted: None,
-        }];
-        let bound = generate_seal_marker("FC01", 1, &hash, &files);
+        let bound = generate_seal_marker("FC01", 6, &hash, &seal_files());
         // The tape returns block-padded reads; the judgement is on true bytes.
         let mut padded = bound.clone().into_bytes();
         padded.extend_from_slice(&[0; 40]);
@@ -1185,6 +1196,7 @@ mod forward_compat_tests {
         let s = parse_seal_marker(&seal()).unwrap();
         assert!(s.requires.is_empty());
         assert_eq!(s.refusal(), None);
+        assert_eq!(s.check_parse_rules(), Ok(()), "the fixture keeps S4 and S5");
     }
 
     /// Every tape before 1.1.0 (L6-0001 among them) has no `requires`:
@@ -2253,7 +2265,8 @@ total_files = 10
     /// reaches a caller in the catalog's form.
     #[test]
     fn a_generated_seal_marker_yields_a_catalog_sealed_at() {
-        let seal = generate_seal_marker("RT12", 10, &"ab".repeat(32), &sample_files());
+        let files = sample_files();
+        let seal = generate_seal_marker("RT12", files.len() as i32, &"ab".repeat(32), &files);
         let parsed = parse_seal_marker(&seal).unwrap();
         let catalog = catalog_timestamp(&parsed.sealed_at).expect("RFC 3339");
         assert_eq!(catalog.len(), "2026-07-22 20:09:00".len());
