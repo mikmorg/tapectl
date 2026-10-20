@@ -225,16 +225,11 @@ impl BuiltLayout {
         if let Err(mut e) = self.validate(keys, slice_check) {
             errs.append(&mut e);
         }
-        if let Ok(needed) = self.layout.on_tape_bytes() {
-            if let Ok(report) = store.capacity() {
-                if needed + self.layout.budget.reserve_bytes > report.usable_bytes {
-                    errs.push(LayoutError::CapacityExceeded {
-                        needed,
-                        reserve: self.layout.budget.reserve_bytes,
-                        available: report.usable_bytes,
-                    });
-                }
-            }
+        // The same gate as `validate`'s, against the live fill budget, so a
+        // plan past the fill ceiling that the pre-flight accepted (ADR-0012
+        // item 113) is not refused here.
+        if let Ok(report) = store.capacity() {
+            errs.extend(self.layout.capacity_errors_against(report.usable_bytes));
         }
         if errs.is_empty() {
             Ok(ValidatedLayout { built: self })
