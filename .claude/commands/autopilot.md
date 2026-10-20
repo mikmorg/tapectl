@@ -19,7 +19,21 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-19 late (NEWEST) — v1.4.0 TAGGED on master `e4b3b7a`** (whole chain
+- **QUEUE STATE 2026-10-20 (NEWEST) — v1.5.0 TAGGED on master `f24f0cb`** (whole chain green
+  on f8c866b: unit 3829/0/21, gate 47/47, lifecycle --all 472/0/15, fr414 17/17, erase proof,
+  pscan; f24f0cb is File 1 text + tests on top, unit 3830/0/21 + lint + check-docs there; CI green).
+  #485 CLOSED: the fifth read's eight findings (File 1 + RECOVERY.md text only, RESTORE.sh's bytes
+  and both golden pins unmoved, ADR-0012 item 109) and the Heir Kit's fourth file, a copy of the
+  running tapectl (`escrow_kit::generate`). The sixth fresh read ("mostly", two SERIOUS: "done"
+  never checked the Heir Kit's catalogue; no done state for a unit whose every copy is damaged)
+  went to the CTO, who ruled "fix both + minors, tag" with no seventh read (item 108).
+  home2 (still 1.1.0) goes straight to 1.5.0 by handoff (f), whose new step 8 regenerates the kit;
+  the authorizations of 1.2.0-1.5.0 end at that install. Open, all needing the real drive: #420,
+  #478 (after #420), #482, #444, #388. The goal "no issue open except drive-bound" is MET.
+  Lessons: a File 1 literal of the current version goes stale on the next release (write
+  `tapectl-X.Y.Z`, "such as 1.5.0"); edit text fixes in a separate worktree while a chain builds
+  from the land tree, then fast-forward.
+- **QUEUE STATE 2026-10-19 late — v1.4.0 TAGGED on master `e4b3b7a`** (whole chain
   green there: unit 3813/0/21, gate 47/47, lifecycle --all 472/0/15 skipped incl. rewrite-in-place,
   fr414, erase proof, pscan; CI 39329793470 green). Closed: #479 (toolkit; its real-drive run is
   #420's measurement), #481 (File 1 after reads 3-5; ADR-0012 item 108 is the stopping rule: no sixth
