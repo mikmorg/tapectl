@@ -37,6 +37,9 @@ pub(crate) const TENANT: &str = "family";
 /// its first slice, `charlie` planned after it.
 pub(crate) const UNITS: [&str; 3] = ["alpha", "bravo", "charlie"];
 
+/// One unit version's files: `(path, bytes)`.
+pub(crate) type Files = Vec<(String, Vec<u8>)>;
+
 /// A written tape and the home that wrote it.
 pub(crate) struct ShortTape {
     /// The home's catalog: the one that wrote the tape.
@@ -53,7 +56,7 @@ pub(crate) struct ShortTape {
     /// Each unit and its slices' planned tape positions, in slice order.
     pub positions: Vec<(String, Vec<u32>)>,
     /// Each unit and the files its version holds.
-    pub files: Vec<(String, Vec<(String, Vec<u8>)>)>,
+    pub files: Vec<(String, Files)>,
     /// The catalog as a backup taken after `volume init` and before the
     /// write left it (#360's "lost write").
     pub backup: PathBuf,
