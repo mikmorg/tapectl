@@ -2857,7 +2857,7 @@ pub fn select_write_positions(
     // picks it (the newest on the tape, or `--version`) and then refused by
     // name: it is not on this tape whole (`volume-format-v2.md` §4.2 R4).
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT s.version, ss.id, w.status = 'cut'
+        "SELECT DISTINCT s.version, ss.id, w.status = 'cut', v.ended_after
          FROM writes w
          JOIN stage_sets ss ON ss.id = w.stage_set_id
          JOIN snapshots s ON s.id = ss.snapshot_id
@@ -2871,7 +2871,12 @@ pub fn select_write_positions(
     )?;
     let candidates = stmt
         .query_map(params![unit.id, volume_label], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, bool>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -2884,8 +2889,8 @@ pub fn select_write_positions(
     // The versions this volume holds whole: what `--version` may name.
     let mut versions_on_volume: Vec<i64> = candidates
         .iter()
-        .filter(|(_, _, cut)| !cut)
-        .map(|(v, _, _)| *v)
+        .filter(|(_, _, cut, _)| !cut)
+        .map(|(v, _, _, _)| *v)
         .collect();
     versions_on_volume.sort_unstable();
     versions_on_volume.dedup();
@@ -2893,9 +2898,9 @@ pub fn select_write_positions(
     // `candidates` is ordered newest-first, so the first match is the pick.
     let picked = match want {
         None => candidates.first(),
-        Some(want) => candidates.iter().find(|(v, _, _)| *v == want),
+        Some(want) => candidates.iter().find(|(v, _, _, _)| *v == want),
     };
-    let Some(&(version, stage_set_id, cut)) = picked else {
+    let Some(&(version, stage_set_id, cut, ended_after)) = picked else {
         let listed: Vec<String> = versions_on_volume.iter().map(i64::to_string).collect();
         return Err(TapectlError::Other(format!(
             "unit \"{unit_name}\" has no version {} on volume \"{volume_label}\"; \
@@ -2926,7 +2931,7 @@ pub fn select_write_positions(
     // construction (confirm, rebuild and adoption all split the rows so, and
     // `audit` names a catalog that does not); refused here rather than read
     // past the seal if one ever does not.
-    if let Some((k, wp)) = ended_after_of(conn, volume_label)?.and_then(|k| {
+    if let Some((k, wp)) = ended_after.and_then(|k| {
         positions
             .iter()
             .find(|wp| wp.position.parse::<i64>().map_or(true, |p| p > k))
