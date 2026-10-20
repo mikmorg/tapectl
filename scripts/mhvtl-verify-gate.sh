@@ -22,9 +22,10 @@
 #      seeded non-zero TapeAlert on a COPY of the catalog, and none on the
 #      real one.
 #
-# The `check` lines below are the list (47 since item 103's heir_file_check; 46 since #480: heir_where, heir_find and
-# heir_slice_from_copy join the 43 of #444; #400 is not exercisable on mhvtl, see its
-# section). The verdict judges each by NAME against the manifest, never by a total (#471).
+# The `check` lines below are the list (52 since #420's heir_short_seal, heir_short_info,
+# heir_short_verify, heir_short_restore and heir_short_cut_refused; 47 since item 103's
+# heir_file_check; 46 since #480: heir_where, heir_find and heir_slice_from_copy join the
+# 43 of #444; #400 is not exercisable on mhvtl, see its section). The verdict judges each by NAME against the manifest, never by a total (#471).
 #
 # EXPECTED_FAIL manifest: checks named there MUST fail (they pin known,
 # ticketed defects). The gate exits non-zero on any unexpected failure OR any
@@ -1960,6 +1961,150 @@ step_erase_then_init_no_force() {
 }
 check erase_then_init_no_force step_erase_then_init_no_force
 
+# ---------- heir_short_*: a tape the early warning ended, read by the heir (1.6.0; #420) ----------
+# ADR-0012 item 70: the gate is the heir path's only test with the real age, dar,
+# mt and tar, and from 1.6.0 a tape may end before its plan (volume-format-v2.md
+# §4.1-§4.3): the drive's early warning comes in data slice K, the write finishes
+# it and seals short at K+1, and every unit with a slice after K is cut (§4.2).
+# mhvtl's own early warning comes only near its 500 MB end, where it then loses
+# what is written (tests/mhvtl_e2e.rs proves that case), so the tape here is made
+# with the test hook TAPECTL_TEST_EARLY_WARNING_AT: from 30 MiB written, the write
+# store answers as st does past a warning (store::TapeStore::open), and everything
+# written reads back. A throwaway home, alice's three units in plan order: sa-whole
+# (whole), sb-cut (40 MiB in 4 MiB slices, the warning inside them) and sc-after
+# (planned after it, so cut too). Then the RESTORE.sh on that tape: --info and
+# --verify say where it ended, a whole unit restores byte for byte, and the cut
+# unit is refused by name before any slice is read.
+SS="$RUN/short-seal"
+SS_LABEL="SS-0001"
+SSC() { "$BIN" --home "$SS/home" "$@"; }
+# volumes.ended_after of the short tape: K, the last file before its seal.
+ss_ended_after() {
+    python3 - "$SS/home/tapectl.db" "$SS_LABEL" <<'PY'
+import sqlite3, sys
+row = sqlite3.connect(sys.argv[1]).execute(
+    "SELECT ended_after FROM volumes WHERE label = ?", (sys.argv[2],)).fetchone()
+assert row is not None, f"no volumes row for {sys.argv[2]}"
+assert row[0] is not None, f"{sys.argv[2]}: volumes.ended_after is NULL, the tape sealed full"
+print(row[0])
+PY
+}
+step_heir_short_seal() {
+    local u k verify
+    rm -rf "$SS"; mkdir -p "$SS/src/sa-whole/nested" "$SS/src/sb-cut" "$SS/src/sc-after" "$SS/home/staging" "$SS/heir"
+    echo "short-seal whole unit $CANARY" >"$SS/src/sa-whole/whole.txt"
+    head -c 700000 /dev/urandom >"$SS/src/sa-whole/nested/blob.bin"
+    head -c 41943040 /dev/urandom >"$SS/src/sb-cut/forty-megs.bin"
+    echo "planned after the cut" >"$SS/src/sc-after/after.txt"
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase || { echo "mt erase failed"; return 1; }
+    # init without --no-escrow registers a throwaway escrow recipient (ADR-0005),
+    # its secret going only to this run's log.
+    SSC init --operator gate-s \
+        && SSC backend add --name mhvtl --device-tape "$TAPE_DEV" --generation LTO-8 \
+        && SSC config set staging.directory "$SS/home/staging" \
+        && SSC config set defaults.slice_size 4M \
+        && SSC tenant add alice \
+        || { echo "home: init/backend add/config set/tenant add failed"; return 1; }
+    for u in sa-whole sb-cut sc-after; do
+        SSC unit init "$SS/src/$u" --tenant alice --name "$u" && SSC snapshot create "$u" && SSC stage create "$u" \
+            || { echo "unit $u: init/snapshot/stage failed"; return 1; }
+    done
+    SSC volume init "$SS_LABEL" --device "$TAPE_DEV" || return 1
+    TAPECTL_TEST_EARLY_WARNING_AT=31457280 SSC volume write "$SS_LABEL" --device "$TAPE_DEV" --yes >"$SS/write.out" 2>&1 \
+        || { tail -n 30 "$SS/write.out"; echo "volume write exited non-zero: a short seal is a success"; return 1; }
+    cat "$SS/write.out"
+    grep -F "TAPECTL_TEST_EARLY_WARNING_AT=31457280 is set" "$SS/write.out" >/dev/null \
+        || { echo "the write did not announce the test hook"; return 1; }
+    grep -F "volume \"$SS_LABEL\" sealed short:" "$SS/write.out" >/dev/null \
+        || { echo "the write did not say it sealed short"; return 1; }
+    grep -F "Cut (not on this tape, still staged): sb-cut, sc-after." "$SS/write.out" >/dev/null \
+        || { echo "the write did not name the cut units sb-cut and sc-after"; return 1; }
+    k="$(ss_ended_after)" || return 1
+    # The rows: sa-whole a copy, the other two cut, and K one of sb-cut's slices
+    # before its last (else the hook's figure no longer lands where this leg says).
+    python3 - "$SS/home/tapectl.db" "$SS_LABEL" "$k" <<'PY' || return 1
+import sqlite3, sys
+db, label, k = sys.argv[1], sys.argv[2], int(sys.argv[3])
+c = sqlite3.connect(db)
+rows = dict(c.execute(
+    "SELECT u.name, w.status FROM writes w JOIN volumes v ON v.id = w.volume_id "
+    "JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id "
+    "JOIN units u ON u.id = s.unit_id WHERE v.label = ?", (label,)).fetchall())
+assert rows == {"sa-whole": "completed", "sb-cut": "cut", "sc-after": "cut"}, rows
+pos = [p for (p,) in c.execute(
+    "SELECT CAST(wp.position AS INTEGER) FROM write_positions wp JOIN writes w ON w.id = wp.write_id "
+    "JOIN volumes v ON v.id = w.volume_id JOIN stage_slices sl ON sl.id = wp.stage_slice_id "
+    "JOIN stage_sets ss ON ss.id = w.stage_set_id JOIN snapshots s ON s.id = ss.snapshot_id "
+    "JOIN units u ON u.id = s.unit_id WHERE v.label = ? AND u.name = 'sb-cut' ORDER BY sl.slice_number",
+    (label,))]
+assert pos and pos[0] <= k < pos[-1], f"K = {k} is not inside sb-cut's slices {pos}"
+print(f"{label}: ended_after = {k}; sb-cut's slices at {pos}; rows {rows}")
+PY
+    # tapectl's own full readback of the short tape, before the heir reads it.
+    verify="$(SSC volume verify "$SS_LABEL" --device "$TAPE_DEV" --json)" \
+        || { printf '%s\n' "$verify"; echo "volume verify of the short tape failed"; return 1; }
+    python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("failed",1)==0 and d.get("passed",0)>0, d' "$verify" \
+        || return 1
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" fsf 2 \
+        && dd if="$TAPE_DEV" bs=512k 2>/dev/null | tr -d '\0' >"$SS/heir/RESTORE.sh" \
+        && chmod +x "$SS/heir/RESTORE.sh" && bash -n "$SS/heir/RESTORE.sh" \
+        || { echo "cannot read RESTORE.sh off the short tape"; return 1; }
+}
+step_heir_short_info() {
+    local k out
+    k="$(ss_ended_after)" || return 1
+    out="$(cd "$SS/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --info 2>&1)" || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out"
+    grep -q "Tape identifies as: $SS_LABEL\$" <<<"$out" || { echo "heir_short_info: not volume $SS_LABEL"; return 1; }
+    grep -F "Verdict: SEALED" >/dev/null <<<"$out" || { echo "heir_short_info: a short tape is SEALED"; return 1; }
+    grep -F "The tape ended early, after file $k: its seal marker, the last file, is" >/dev/null <<<"$out" \
+        || { echo "heir_short_info: no line saying the tape ended after file $k"; return 1; }
+    grep -F "(planned; NOT ON TAPE)" >/dev/null <<<"$out" \
+        || { echo "heir_short_info: the file map marks no planned file NOT ON TAPE"; return 1; }
+}
+step_heir_short_verify() {
+    local k out rc
+    k="$(ss_ended_after)" || return 1
+    out="$(cd "$SS/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --verify 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    [ "$rc" -eq 0 ] || { echo "heir_short_verify: RESTORE.sh --verify exited $rc, want 0"; return 1; }
+    grep -F "VERIFY: PASS — every file on this tape matches the front index. The tape ended early, after" >/dev/null <<<"$out" \
+        || { echo "heir_short_verify: no PASS verdict naming the early end"; return 1; }
+    grep -E "^NOT ON TAPE  file +$((k + 1))  " >/dev/null <<<"$out" \
+        || { echo "heir_short_verify: file $((k + 1)), planned, is not reported NOT ON TAPE"; return 1; }
+    if grep -E "^FAIL " <<<"$out"; then echo "heir_short_verify: a FAIL line"; return 1; fi
+    # The control: the last file on the tape, K, was hashed, and none after it.
+    grep -E "^PASS  file +$k  data_slice" >/dev/null <<<"$out" \
+        || { echo "heir_short_verify: file $k, the last data slice on the tape, was not hashed"; return 1; }
+    if grep -E "^PASS  file +$((k + 1))  " <<<"$out"; then echo "heir_short_verify: file $((k + 1)) was hashed"; return 1; fi
+}
+step_heir_short_restore() {
+    (cd "$SS/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sa-whole \
+        --key "$SS/home/keys/alice-primary.age.key" --to "$SS/heir/recovered-whole") \
+        && diff -r "$SS/src/sa-whole" "$SS/heir/recovered-whole"
+}
+step_heir_short_cut_refused() {
+    local out rc want
+    out="$(cd "$SS/heir" && TAPE_DEVICE="$TAPE_DEV" ./RESTORE.sh --restore --unit sb-cut \
+        --key "$SS/home/keys/alice-primary.age.key" --to "$SS/heir/recovered-cut" 2>&1)"; rc=$?
+    printf '%s\n' "$out"
+    [ "$rc" -ne 0 ] || { echo "heir_short_cut_refused: the cut unit was restored from a tape that does not hold it whole"; return 1; }
+    for want in "unit 'sb-cut' (version 1) is not on this tape whole: the tape ended early," \
+        "--where 'sb-cut'" "No slice has been read."; do
+        grep -F -- "$want" >/dev/null <<<"$out" || { echo "heir_short_cut_refused: the refusal lacks \"$want\""; return 1; }
+    done
+    if [ -d "$SS/heir/recovered-cut" ] && [ -n "$(ls -A "$SS/heir/recovered-cut")" ]; then
+        echo "heir_short_cut_refused: something of the cut unit was restored"; return 1
+    fi
+    mt -f "$TAPE_DEV" rewind && mt -f "$TAPE_DEV" erase
+}
+echo "gate: heir_short_* — a short tape, read by RESTORE.sh with the real tools (#420)"
+check heir_short_seal      step_heir_short_seal
+check heir_short_info      step_heir_short_info
+check heir_short_verify    step_heir_short_verify
+check heir_short_restore   step_heir_short_restore
+check heir_short_cut_refused step_heir_short_cut_refused
+
 # ---------- leg 6: the Rust on-media suite (issue #259) ----------
 # This gate ran five legs of bash and never once invoked tests/mhvtl_e2e.rs --
 # the only place in the tree that produces medium evidence on real media. So
@@ -2005,8 +2150,11 @@ cargo_leg() { # cargo_leg <log> <want-count> <test-file> cargo-args...: run, the
     # shellcheck disable=SC2086 # one name per word, by construction
     ran_ok "$log" $names
 }
+# 14 since #420 (the short seal at the test hook's warning, and the seal lost past
+# the cartridge's end): ignored_tests names every one, and the floor catches an
+# extraction that found too few.
 step_rust_e2e() {
-    cargo_leg "$RUN/rust-e2e.out" 12 tests/mhvtl_e2e.rs --test mhvtl_e2e -- --ignored --nocapture
+    cargo_leg "$RUN/rust-e2e.out" 14 tests/mhvtl_e2e.rs --test mhvtl_e2e -- --ignored --nocapture
 }
 check rust_e2e          step_rust_e2e
 
