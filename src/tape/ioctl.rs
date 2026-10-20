@@ -86,15 +86,132 @@ pub enum ReadEnd {
     Stopped,
 }
 
-/// A tape write error: ENOSPC — the drive's early-warning point, a full
-/// medium — is [`TapectlError::MediumFull`], the one store failure a write
-/// session aborts on; anything else is [`TapectlError::TapeIo`] (issue #408).
-fn write_error(what: &str, e: &io::Error) -> TapectlError {
-    if e.raw_os_error() == Some(28) {
+/// A tape write error: ENOSPC — a full medium — is
+/// [`TapectlError::MediumFull`], the one store failure a write session aborts
+/// on; anything else is [`TapectlError::TapeIo`] (issue #408). Since 1.6.0
+/// (#420) a block write's ENOSPC reaches here only at the hard end: the early
+/// warning's refusals are retried by [`write_block_retrying`] first.
+pub(crate) fn write_error(what: &str, e: &io::Error) -> TapectlError {
+    if e.raw_os_error() == Some(nix::libc::ENOSPC) {
         TapectlError::MediumFull(format!("{what}: {e}"))
     } else {
         TapectlError::TapeIo(format!("{what}: {e}"))
     }
+}
+
+/// More than this many refusals of one block in a row is the hard end
+/// (`volume-format-v2.md` §4.3 W2): the medium has no room left, and the
+/// write fails as [`TapectlError::MediumFull`]. The measured runs past the
+/// early warning were at most 3 (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`).
+pub const MAX_REFUSALS_IN_A_ROW: u32 = 16;
+
+/// The drive's early warning, as a store saw it (`volume-format-v2.md` §4.3
+/// W1; `layout-session.md`, the Store seam): the first block write st
+/// refused with ENOSPC. `None` until then, and from then on `Some` for the
+/// rest of the store's life — sticky, because the warning is a fact about
+/// where the medium is, and the drive keeps refusing about one block write in
+/// two past it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarlyWarning {
+    /// The bytes the store had accepted since it was OPENED, before its
+    /// first refused block write — block-padded bytes of data, filemarks
+    /// adding nothing. Not counted from the beginning of the tape: a store
+    /// opened to resume a session starts at the cursor, and the session adds
+    /// the Layout's padded sizes of every file before the first entry this
+    /// process wrote (`layout-session.md`, "The `write_early_warning`
+    /// event").
+    pub bytes_at: u64,
+    /// Every refused block write the store has retried, its whole life. A
+    /// refusal that made the hard end was not retried and is not counted.
+    pub refusals: u64,
+}
+
+/// A device's record of its own block writes, for [`write_block_retrying`]:
+/// the bytes accepted since it opened, and the [`EarlyWarning`] once it
+/// came. One per open device (`TapeDevice`), and one per test double.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EarlyWarningState {
+    accepted: u64,
+    warning: Option<EarlyWarning>,
+}
+
+impl EarlyWarningState {
+    /// The warning, once the first block write was refused.
+    pub(crate) fn warning(&self) -> Option<EarlyWarning> {
+        self.warning
+    }
+
+    /// Every byte a block write has accepted since the device opened.
+    pub(crate) fn accepted(&self) -> u64 {
+        self.accepted
+    }
+
+    /// The refusals retried so far: 0 before the warning.
+    pub(crate) fn refusals(&self) -> u64 {
+        self.warning.map_or(0, |w| w.refusals)
+    }
+}
+
+/// Write one tape block whole through `write` — one `write(2)` per call —
+/// retrying a block st refuses past the early warning (`volume-format-v2.md`
+/// §4.3 W1, W2). The one implementation: `TapeDevice` runs its block writes
+/// through it, and so do the test doubles (`MemStore`, the in-memory
+/// `FakeTape`), so a test of either runs the real retry.
+///
+/// - **ENOSPC** is a refusal: st refused the block without sending it, and
+///   nothing of it was written. The first of the device's life records the
+///   [`EarlyWarning`] in `state`, at the bytes accepted before it. Every
+///   refusal is counted and the same bytes are written again. More than
+///   [`MAX_REFUSALS_IN_A_ROW`] refusals of this block in a row is the hard
+///   end: that last ENOSPC is returned, which [`write_error`] makes
+///   [`TapectlError::MediumFull`].
+/// - **A short write** keeps `write_all`'s handling, as before: the rest is
+///   written by the next call, a write of 0 bytes is a `WriteZero` error,
+///   and EINTR is retried.
+/// - **Any other error** is returned unchanged, and records nothing.
+///
+/// Block writes only. A filemark is never retried (W3): a retried filemark
+/// that had in fact been written would add an empty file and move every
+/// later position, so a refused filemark stays the medium-full error.
+pub(crate) fn write_block_retrying(
+    mut write: impl FnMut(&[u8]) -> io::Result<usize>,
+    buf: &[u8],
+    state: &mut EarlyWarningState,
+) -> io::Result<()> {
+    let mut rest = buf;
+    let mut in_a_row = 0u32;
+    while !rest.is_empty() {
+        match write(rest) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ))
+            }
+            Ok(n) => {
+                state.accepted += n as u64;
+                rest = &rest[n..];
+                in_a_row = 0;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.raw_os_error() == Some(nix::libc::ENOSPC) => {
+                in_a_row += 1;
+                if in_a_row > MAX_REFUSALS_IN_A_ROW {
+                    return Err(e);
+                }
+                let bytes_at = state.accepted;
+                state
+                    .warning
+                    .get_or_insert(EarlyWarning {
+                        bytes_at,
+                        refusals: 0,
+                    })
+                    .refusals += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// What an `MTIOCTOP` op does, for the session log's wait lines.
@@ -918,5 +1035,185 @@ mod density_tests {
     fn status_of_a_nonexistent_node_is_its_errno_not_a_panic() {
         let err = status_nonblocking("/nonexistent/tapectl-drive-status-test/nst0").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    // --- the early warning's retry (#420, `volume-format-v2.md` §4.3) -----
+
+    fn enospc() -> io::Error {
+        io::Error::from_raw_os_error(nix::libc::ENOSPC)
+    }
+
+    /// A scripted st: each block `write(2)` takes the next answer — `true`
+    /// accepts the whole buffer, `false` refuses it with ENOSPC — and every
+    /// accepted buffer is recorded. Past the script, every write is accepted.
+    struct Scripted {
+        answers: std::collections::VecDeque<bool>,
+        attempts: usize,
+        written: Vec<Vec<u8>>,
+    }
+
+    impl Scripted {
+        fn new(answers: &[bool]) -> Self {
+            Self {
+                answers: answers.iter().copied().collect(),
+                attempts: 0,
+                written: Vec::new(),
+            }
+        }
+
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.attempts += 1;
+            if self.answers.pop_front().unwrap_or(true) {
+                self.written.push(buf.to_vec());
+                Ok(buf.len())
+            } else {
+                Err(enospc())
+            }
+        }
+    }
+
+    /// W1/W2: st alternates past the early warning. The block that crosses
+    /// it is accepted; the next is refused at once, retried with the same
+    /// bytes and accepted; and so on. Every block lands once, the warning is
+    /// recorded at the bytes accepted before the first refusal, and it
+    /// stays, counting every refusal after it.
+    #[test]
+    fn a_refused_block_is_written_again_and_the_warning_is_recorded_once() {
+        let mut st = Scripted::new(&[true, true, false, true, false, true, false, true]);
+        let mut state = EarlyWarningState::default();
+        for i in 0..2u8 {
+            write_block_retrying(|b| st.write(b), &[i; 4], &mut state).unwrap();
+        }
+        assert_eq!(state.warning(), None, "no refusal yet");
+        assert_eq!(state.accepted(), 8);
+        for i in 2..5u8 {
+            write_block_retrying(|b| st.write(b), &[i; 4], &mut state).unwrap();
+        }
+        assert_eq!(
+            st.written,
+            (0..5u8).map(|i| vec![i; 4]).collect::<Vec<_>>(),
+            "every block once, in order: a refused block wrote nothing"
+        );
+        assert_eq!(st.attempts, 8, "three blocks retried once each");
+        assert_eq!(
+            state.warning(),
+            Some(EarlyWarning {
+                bytes_at: 8,
+                refusals: 3
+            })
+        );
+        assert_eq!((state.accepted(), state.refusals()), (20, 3));
+
+        // Sticky: blocks accepted at once after it leave it as it was, and
+        // `bytes_at` never moves.
+        write_block_retrying(|b| st.write(b), &[9; 4], &mut state).unwrap();
+        assert_eq!(state.warning().unwrap().bytes_at, 8);
+        assert_eq!(state.refusals(), 3);
+    }
+
+    /// The measured runs were up to 3 refusals of one block in a row; a run
+    /// of any length up to [`MAX_REFUSALS_IN_A_ROW`] is retried, and the
+    /// run counter starts again with each block.
+    #[test]
+    fn runs_of_refusals_up_to_the_limit_are_retried() {
+        let mut answers = vec![false, false, true, false, false, false, true];
+        answers.extend(std::iter::repeat_n(false, MAX_REFUSALS_IN_A_ROW as usize));
+        answers.push(true);
+        let mut st = Scripted::new(&answers);
+        let mut state = EarlyWarningState::default();
+        for i in 0..3u8 {
+            write_block_retrying(|b| st.write(b), &[i; 2], &mut state).unwrap();
+        }
+        assert_eq!(st.written.len(), 3);
+        assert_eq!(
+            state.warning(),
+            Some(EarlyWarning {
+                bytes_at: 0,
+                refusals: 2 + 3 + u64::from(MAX_REFUSALS_IN_A_ROW)
+            })
+        );
+    }
+
+    /// More than [`MAX_REFUSALS_IN_A_ROW`] refusals of one block in a row is
+    /// the hard end: the last ENOSPC comes back, a full medium; the refusal
+    /// that made it was not retried and is not counted.
+    #[test]
+    fn more_than_sixteen_refusals_of_one_block_is_the_hard_end() {
+        let refusals = MAX_REFUSALS_IN_A_ROW as usize + 1;
+        let mut st = Scripted::new(&[true]);
+        st.answers.extend(std::iter::repeat_n(false, refusals));
+        let mut state = EarlyWarningState::default();
+        write_block_retrying(|b| st.write(b), &[1; 4], &mut state).unwrap();
+        let err = write_block_retrying(|b| st.write(b), &[2; 4], &mut state).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(nix::libc::ENOSPC));
+        assert_eq!(st.attempts, 1 + refusals, "17 attempts, then no more");
+        assert_eq!(st.written, vec![vec![1; 4]]);
+        assert_eq!(
+            state.warning(),
+            Some(EarlyWarning {
+                bytes_at: 4,
+                refusals: u64::from(MAX_REFUSALS_IN_A_ROW)
+            })
+        );
+        assert!(matches!(
+            write_error("write", &err),
+            TapectlError::MediumFull(_)
+        ));
+    }
+
+    /// Any error but ENOSPC (and EINTR) comes back at once, unchanged, and
+    /// records no warning: a medium error is not the early warning.
+    #[test]
+    fn any_other_error_passes_through_and_records_nothing() {
+        let mut state = EarlyWarningState::default();
+        let mut attempts = 0;
+        let err = write_block_retrying(
+            |_| {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(nix::libc::EIO))
+            },
+            &[1; 4],
+            &mut state,
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(nix::libc::EIO));
+        assert_eq!(attempts, 1);
+        assert_eq!(state, EarlyWarningState::default());
+        assert!(matches!(write_error("write", &err), TapectlError::TapeIo(_)));
+    }
+
+    /// A short write keeps `write_all`'s handling: the rest goes in the next
+    /// call, EINTR is retried, and a write of nothing is `WriteZero` — none
+    /// of them a refusal.
+    #[test]
+    fn a_short_write_keeps_write_alls_handling() {
+        let mut state = EarlyWarningState::default();
+        let mut got = Vec::new();
+        let mut calls = 0;
+        write_block_retrying(
+            |b| {
+                calls += 1;
+                match calls {
+                    1 => Err(io::Error::from(io::ErrorKind::Interrupted)),
+                    2 => {
+                        got.extend_from_slice(&b[..3]);
+                        Ok(3)
+                    }
+                    _ => {
+                        got.extend_from_slice(b);
+                        Ok(b.len())
+                    }
+                }
+            },
+            &[7; 8],
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!((got, calls), (vec![7; 8], 3));
+        assert_eq!((state.accepted(), state.warning()), (8, None));
+
+        let err = write_block_retrying(|_| Ok(0), &[7; 8], &mut state).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(state.warning(), None);
     }
 }
