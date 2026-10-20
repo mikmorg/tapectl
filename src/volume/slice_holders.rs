@@ -31,6 +31,19 @@ pub enum Standing {
     Quarantined,
 }
 
+/// The slice at `wp.position` lies on its volume's tape: at or before the
+/// volume's `ended_after` when the tape sealed short (#420). A repair source
+/// is only ever a slice of a `completed` write, which holds every slice at
+/// or before `ended_after` by construction; this says so in the query too,
+/// so a catalog that broke that (which `audit` names) sends no read past
+/// the seal of the other tape (`volume-format-v2.md` §4.2 R5). A `cut`
+/// write's slices are never a source, even those at or before
+/// `ended_after`: §4.2 "Nothing of a cut unit counts on this tape, and no
+/// reader restores it from this tape, even though its slices at or before
+/// `ended_after` are present and hash correctly".
+const ON_TAPE: &str =
+    "(v.ended_after IS NULL OR CAST(wp.position AS INTEGER) <= v.ended_after)";
+
 /// One volume holding a completed, written copy of a slice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Holder {
@@ -54,8 +67,10 @@ pub fn holders_of(conn: &Connection, sha256_encrypted: &str) -> Result<Vec<Holde
            JOIN volumes v ON v.id = w.volume_id
           WHERE sl.sha256_encrypted = ?1
             AND w.status = 'completed' AND wp.status = 'written'
+            AND {on_tape}
             AND ({in_service} OR {bytes})
           ORDER BY (NOT {in_service}), v.id",
+        on_tape = ON_TAPE,
         bytes = coverage::holds_bytes_to_verify("v"),
     ))?;
     let rows = stmt.query_map(params![sha256_encrypted], |r| {
@@ -105,7 +120,9 @@ pub fn other_copies_exist(conn: &Connection, stage_set_id: i64, volume_id: i64) 
                    JOIN volumes v ON v.id = w.volume_id
                   WHERE mine.stage_set_id = ?1 AND w.volume_id <> ?2
                     AND w.status = 'completed' AND wp.status = 'written'
+                    AND {on_tape}
                     AND ({in_service} OR {bytes}))",
+            on_tape = ON_TAPE,
             bytes = coverage::holds_bytes_to_verify("v"),
         ),
         params![stage_set_id, volume_id],

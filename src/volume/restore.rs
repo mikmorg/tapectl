@@ -2850,22 +2850,28 @@ pub fn select_write_positions(
     let unit = queries::get_unit_by_name(conn, unit_name)?
         .ok_or_else(|| TapectlError::UnitNotFound(unit_name.to_string()))?;
 
-    // Every (version, stage set) of this unit with written slices on this
-    // volume — newest version first, later stage set first within one.
+    // Every (version, stage set) of this unit on this volume — newest
+    // version first, later stage set first within one — whose write is a
+    // copy here (`completed`, with written slices) or was cut by the early
+    // end of the tape (#420, `cut`). A cut version is picked as RESTORE.sh
+    // picks it (the newest on the tape, or `--version`) and then refused by
+    // name: it is not on this tape whole (`volume-format-v2.md` §4.2 R4).
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT s.version, ss.id
-         FROM write_positions wp
-         JOIN writes w ON w.id = wp.write_id
-         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-         JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        "SELECT DISTINCT s.version, ss.id, w.status = 'cut'
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
          JOIN snapshots s ON s.id = ss.snapshot_id
          JOIN volumes v ON v.id = w.volume_id
-         WHERE s.unit_id = ?1 AND v.label = ?2 AND w.status = 'completed' AND wp.status = 'written'
+         WHERE s.unit_id = ?1 AND v.label = ?2
+           AND (w.status = 'cut'
+                OR (w.status = 'completed'
+                    AND EXISTS (SELECT 1 FROM write_positions wp
+                                 WHERE wp.write_id = w.id AND wp.status = 'written')))
          ORDER BY s.version DESC, ss.id DESC",
     )?;
     let candidates = stmt
         .query_map(params![unit.id, volume_label], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -2875,32 +2881,227 @@ pub fn select_write_positions(
         )));
     }
 
-    let mut versions_on_volume: Vec<i64> = candidates.iter().map(|(v, _)| *v).collect();
+    // The versions this volume holds whole: what `--version` may name.
+    let mut versions_on_volume: Vec<i64> = candidates
+        .iter()
+        .filter(|(_, _, cut)| !cut)
+        .map(|(v, _, _)| *v)
+        .collect();
     versions_on_volume.sort_unstable();
     versions_on_volume.dedup();
 
     // `candidates` is ordered newest-first, so the first match is the pick.
     let picked = match want {
         None => candidates.first(),
-        Some(want) => candidates.iter().find(|(v, _)| *v == want),
+        Some(want) => candidates.iter().find(|(v, _, _)| *v == want),
     };
-    let Some(&(version, stage_set_id)) = picked else {
+    let Some(&(version, stage_set_id, cut)) = picked else {
         let listed: Vec<String> = versions_on_volume.iter().map(i64::to_string).collect();
         return Err(TapectlError::Other(format!(
             "unit \"{unit_name}\" has no version {} on volume \"{volume_label}\"; \
              version(s) on it: {} — pass one of those with --version",
             want.unwrap_or_default(),
-            listed.join(", "),
+            if listed.is_empty() {
+                "none whole".to_string()
+            } else {
+                listed.join(", ")
+            },
         )));
     };
+    if cut {
+        return Err(cut_refusal(
+            conn,
+            unit_name,
+            unit.id,
+            volume_label,
+            version,
+            stage_set_id,
+            &versions_on_volume,
+        )?);
+    }
 
     let positions = get_write_positions(conn, stage_set_id, volume_label)?;
+    // R3 (`volume-format-v2.md` §4.2): nothing past where the tape ended is
+    // read. A completed write holds every slice at or before it by
+    // construction (confirm, rebuild and adoption all split the rows so, and
+    // `audit` names a catalog that does not); refused here rather than read
+    // past the seal if one ever does not.
+    if let Some((k, wp)) = ended_after_of(conn, volume_label)?.and_then(|k| {
+        positions
+            .iter()
+            .find(|wp| wp.position.parse::<i64>().map_or(true, |p| p > k))
+            .map(|wp| (k, wp))
+    }) {
+        return Err(TapectlError::Other(format!(
+            "unit \"{unit_name}\" version {version}: the catalog records its slice {} at tape \
+             file {} of volume \"{volume_label}\", but that tape ended after file {k} (its \
+             seal says so). The catalog disagrees with the tape; `tapectl audit` names the \
+             rows. Nothing was read from tape.",
+            wp.slice_number, wp.position
+        )));
+    }
     Ok(RestoreSelection {
         version,
         stage_set_id,
         versions_on_volume,
         positions,
     })
+}
+
+/// `volumes.ended_after` of `volume_label`: where its tape ended, when it
+/// sealed short (#420). `None` for a full seal and for an unknown label.
+fn ended_after_of(conn: &Connection, volume_label: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT ended_after FROM volumes WHERE label = ?1",
+            params![volume_label],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// The refusal for a version the early end of `volume_label`'s tape cut
+/// (#420; `volume-format-v2.md` §4.2 R4: name it, never restore it from this
+/// tape, say where its copies are). Where: a volume in service that holds
+/// the same version whole, from the catalog
+/// ([`crate::policy::coverage::in_service_copy_of_version_excluding`], this
+/// volume excluded), or, when none does, that it is still to be written.
+fn cut_refusal(
+    conn: &Connection,
+    unit_name: &str,
+    unit_id: i64,
+    volume_label: &str,
+    version: i64,
+    stage_set_id: i64,
+    whole_here: &[i64],
+) -> Result<TapectlError> {
+    let volume_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![volume_label],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let ended_after = ended_after_of(conn, volume_label)?;
+    let last: Option<i64> = conn.query_row(
+        "SELECT MAX(CAST(wp.position AS INTEGER)) FROM write_positions wp
+           JOIN writes w ON w.id = wp.write_id
+          WHERE w.stage_set_id = ?1 AND w.volume_id = ?2",
+        params![stage_set_id, volume_id],
+        |r| r.get(0),
+    )?;
+    let holder = crate::policy::coverage::in_service_copy_of_version_excluding(
+        conn, unit_id, version, volume_id,
+    )?;
+    let ended = match (ended_after, last) {
+        (Some(k), Some(last)) => format!(
+            "the tape ended early, after tape file {k} (its seal says so), and the slices of \
+             this version run to tape file {last}"
+        ),
+        (Some(k), None) => format!("the tape ended early, after tape file {k}"),
+        _ => "the tape ended early".to_string(),
+    };
+    let elsewhere = match holder {
+        Some(label) => format!(
+            "volume \"{label}\" holds it whole: `tapectl restore unit --unit {unit_name} --from \
+             {label} --version {version} --to <DIR>`"
+        ),
+        None => "no volume this catalog knows holds it whole yet: it is written whole by an \
+                 ordinary `tapectl volume write` onto another cartridge while it is still \
+                 staged, or `tapectl catalog rebuild --from-volume` of the tape that holds it \
+                 brings that tape into the catalog"
+            .to_string(),
+    };
+    let older = if whole_here.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Version(s) {} of it are whole on \"{volume_label}\": pass one with --version.",
+            whole_here
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Ok(TapectlError::Other(format!(
+        "unit \"{unit_name}\" version {version} is not on volume \"{volume_label}\" whole: \
+         {ended}. It was cut by the end of the tape and is never restored from it \
+         (volume-format-v2.md §4.2); {elsewhere}.{older} Nothing was read from tape."
+    )))
+}
+
+/// One unit the early end of a volume's tape cut (#420): what `restore
+/// volume` names instead of restoring it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutUnit {
+    pub unit_name: String,
+    pub version: i64,
+    /// A volume in service that holds this version whole, if the catalog
+    /// knows one.
+    pub whole_on: Option<String>,
+}
+
+impl CutUnit {
+    /// `"bravo" v1, whole on "L6-0002"`, or where none is known, that it is
+    /// still to be written.
+    pub fn describe(&self) -> String {
+        format!(
+            "\"{}\" v{}, {}",
+            self.unit_name,
+            self.version,
+            match &self.whole_on {
+                Some(label) => format!("whole on \"{label}\""),
+                None => "whole on no volume this catalog knows yet".to_string(),
+            }
+        )
+    }
+}
+
+/// Every unit version recorded `cut` on `volume_label` (#420), in the order
+/// it was planned on the tape, each with a volume that holds it whole when
+/// the catalog knows one. Empty for a tape that sealed full. `restore
+/// volume` names these: the tape does not hold them whole, so they are not
+/// in [`units_on_volume`]'s set (`volume-format-v2.md` §4.2, "`restore
+/// volume` names the cut units").
+pub fn cut_units_on_volume(conn: &Connection, volume_label: &str) -> Result<Vec<CutUnit>> {
+    let mut stmt = conn.prepare(
+        "SELECT u.id, u.name, s.version, v.id,
+                (SELECT MIN(CAST(wp.position AS INTEGER)) FROM write_positions wp
+                  WHERE wp.write_id = w.id) AS first
+         FROM writes w
+         JOIN stage_sets ss ON ss.id = w.stage_set_id
+         JOIN snapshots s ON s.id = ss.snapshot_id
+         JOIN units u ON u.id = s.unit_id
+         JOIN volumes v ON v.id = w.volume_id
+         WHERE v.label = ?1 AND w.status = 'cut'
+         ORDER BY first, u.name, s.version",
+    )?;
+    let rows = stmt
+        .query_map(params![volume_label], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(unit_id, unit_name, version, volume_id)| {
+            Ok(CutUnit {
+                whole_on: crate::policy::coverage::in_service_copy_of_version_excluding(
+                    conn,
+                    unit_id,
+                    version,
+                    Some(volume_id),
+                )?,
+                unit_name,
+                version,
+            })
+        })
+        .collect()
 }
 
 /// Every unit with a live copy on `volume_label` — written slices of a
@@ -2943,6 +3144,18 @@ pub fn units_on_volume(conn: &Connection, volume_label: &str) -> Result<Vec<Stri
         .query_map(params![volume_label], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if names.is_empty() {
+        // #420: a tape that ended inside its first unit holds none whole.
+        let cut = cut_units_on_volume(conn, volume_label)?;
+        if !cut.is_empty() {
+            return Err(TapectlError::Other(format!(
+                "volume \"{volume_label}\" holds no unit whole: its tape ended early, and every \
+                 unit on it was cut by the end of the tape ({}). Nothing was read from tape.",
+                cut.iter()
+                    .map(CutUnit::describe)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
         return Err(TapectlError::Other(format!(
             "volume \"{volume_label}\" holds no unit with written slices. Nothing was read \
              from tape."
@@ -7762,6 +7975,249 @@ mod tests {
                 assert_eq!(restores.len(), 1, "{restores:?}");
                 assert_eq!(restores[0].outcome, "failed");
             }
+        }
+    }
+
+    /// #420: restore through tapectl from a tape that ended early
+    /// (`volume-format-v2.md` §4.2 R3-R5), on the shared fixture: `alpha`
+    /// whole, `bravo` cut with its first slice on the tape, `charlie` cut.
+    mod short_ending {
+        use super::*;
+        use crate::volume::restore::short_tape::{self, ShortTape, LABEL};
+
+        fn files_under(root: &Path) -> Vec<(String, Vec<u8>)> {
+            let mut out: Vec<(String, Vec<u8>)> = fs::read_dir(root)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        fs::read(e.path()).unwrap(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        fn expected(t: &ShortTape, unit: &str) -> Vec<(String, Vec<u8>)> {
+            let mut files = t
+                .files
+                .iter()
+                .find(|(u, _)| u == unit)
+                .unwrap()
+                .1
+                .clone();
+            files.sort();
+            files
+        }
+
+        /// A second volume in service holding `unit`'s version 1 whole: the
+        /// place a refusal sends the operator.
+        fn whole_elsewhere(conn: &Connection, unit: &str, label: &str) {
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                      capacity_bytes, status, sealed_at)
+                 VALUES (?1, 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', datetime('now'))",
+                params![label],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 SELECT ss.id, s.id, (SELECT id FROM volumes WHERE label = ?2), 'completed'
+                   FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
+                   JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
+                params![unit, label],
+            )
+            .unwrap();
+        }
+
+        /// A whole unit restores from a short tape as from any other, every
+        /// file back as it was.
+        #[test]
+        fn a_whole_unit_restores_from_a_short_tape() {
+            let mut t = short_tape::short_tape();
+            let dest = TempDir::new().unwrap();
+            let dest_str = dest.path().to_string_lossy().to_string();
+            let report = restore_unit_from_store(
+                &t.conn,
+                &t.paths,
+                &Config::default(),
+                "alpha",
+                LABEL,
+                1,
+                RestoreTarget::Unit {
+                    dest_dir: &dest_str,
+                },
+                &RestoreOptions::default(),
+                &mut t.store,
+                site(Operation::RestoreUnit),
+            )
+            .expect("a whole unit restores");
+            assert_eq!(report.slices, 2);
+            assert_eq!(files_under(dest.path()), expected(&t, "alpha"));
+        }
+
+        /// R4: a cut unit is refused by name before any slice is read, says
+        /// where the tape ended and where its version is whole — from the
+        /// catalog: a volume in service with a completed write of the same
+        /// version (`coverage::in_service_copy_of_version_excluding`), or,
+        /// with none, that it is still to be written.
+        #[test]
+        fn a_cut_unit_is_refused_by_name_and_points_at_the_volume_that_holds_it_whole() {
+            let mut t = short_tape::short_tape();
+            let k = t.ended_after;
+            let last = t.positions_of("bravo")[1];
+            let err = select_write_positions(&t.conn, "bravo", LABEL, None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("unit \"bravo\" version 1 is not on volume \"{LABEL}\" whole")),
+                "{err}"
+            );
+            assert!(err.contains(&format!("after tape file {k}")), "{err}");
+            assert!(err.contains(&format!("run to tape file {last}")), "{err}");
+            assert!(err.contains("no volume this catalog knows holds it whole yet"), "{err}");
+            assert!(err.contains("Nothing was read from tape"), "{err}");
+            // --version names it too, and charlie (nothing of it on the
+            // tape) is refused the same way.
+            let err = select_write_positions(&t.conn, "bravo", LABEL, Some(1))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("is not on volume"), "{err}");
+            let err = select_write_positions(&t.conn, "charlie", LABEL, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unit \"charlie\" version 1 is not on volume"), "{err}");
+
+            whole_elsewhere(&t.conn, "bravo", "WHOLE02");
+            let err = select_write_positions(&t.conn, "bravo", LABEL, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("volume \"WHOLE02\" holds it whole"), "{err}");
+            assert!(
+                err.contains("tapectl restore unit --unit bravo --from WHOLE02 --version 1"),
+                "{err}"
+            );
+
+            // Through the store seam: refused, and nothing restored.
+            let dest = TempDir::new().unwrap();
+            let dest_str = dest.path().to_string_lossy().to_string();
+            let err = restore_unit_from_store(
+                &t.conn,
+                &t.paths,
+                &Config::default(),
+                "bravo",
+                LABEL,
+                1,
+                RestoreTarget::Unit {
+                    dest_dir: &dest_str,
+                },
+                &RestoreOptions::default(),
+                &mut t.store,
+                site(Operation::RestoreUnit),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("is not on volume"), "{err}");
+            assert!(files_under(dest.path()).is_empty());
+
+            // The positive control: the version restores from where it IS
+            // whole once the catalog knows nothing cut of it here.
+            assert!(select_write_positions(&t.conn, "alpha", LABEL, None).is_ok());
+        }
+
+        /// `restore volume` with no unit named restores every unit the tape
+        /// holds whole and names the cut ones; a tape that ended inside its
+        /// first unit holds none whole and says so.
+        #[test]
+        fn restore_volume_restores_the_whole_units_and_names_the_cut_ones() {
+            let mut t = short_tape::short_tape();
+            assert_eq!(units_on_volume(&t.conn, LABEL).unwrap(), vec!["alpha"]);
+            let cut = cut_units_on_volume(&t.conn, LABEL).unwrap();
+            assert_eq!(
+                cut.iter()
+                    .map(|c| (c.unit_name.as_str(), c.version, c.whole_on.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("bravo", 1, None), ("charlie", 1, None)]
+            );
+            let lines = crate::cli::restore::cut_units_lines(&cut, LABEL).join("\n");
+            assert!(lines.contains("not on this tape whole: \"bravo\" v1"), "{lines}");
+            assert!(lines.contains("2 unit(s) left out"), "{lines}");
+
+            let dest = TempDir::new().unwrap();
+            let report = restore_units_from_loaded_store(
+                &t.conn,
+                &t.paths,
+                &Config::default(),
+                &[],
+                &dest.path().to_string_lossy(),
+                &RestoreOptions::default(),
+                false,
+                &mut t.store,
+                site(Operation::RestoreVolume),
+            )
+            .unwrap();
+            assert_eq!(report.failed(), 0);
+            assert_eq!(
+                report.units.iter().map(|u| u.unit_name.as_str()).collect::<Vec<_>>(),
+                vec!["alpha"]
+            );
+            assert_eq!(files_under(&dest.path().join("alpha")), expected(&t, "alpha"));
+            assert!(!dest.path().join("bravo").exists());
+
+            // Every unit cut: the volume holds none whole, and says which.
+            t.conn
+                .execute("UPDATE writes SET status = 'cut'", [])
+                .unwrap();
+            let err = units_on_volume(&t.conn, LABEL).unwrap_err().to_string();
+            assert!(err.contains("holds no unit whole"), "{err}");
+            assert!(err.contains("\"alpha\" v1"), "{err}");
+        }
+
+        /// The repair source (#480, §4.2 R5): a cut write's slices are never
+        /// one, even its slice at `ended_after` that is on the tape and hashes
+        /// right; and a completed write's slice recorded past its own tape's
+        /// `ended_after` (a catalog `audit` names) is no source either.
+        #[test]
+        fn a_cut_writes_slices_are_never_a_repair_source() {
+            let t = short_tape::short_tape();
+            let k = t.ended_after;
+            let sha_at = |position: u32| -> String {
+                t.conn
+                    .query_row(
+                        "SELECT sl.sha256_encrypted FROM write_positions wp
+                           JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                          WHERE CAST(wp.position AS INTEGER) = ?1",
+                        params![position],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            // bravo's first slice is on the tape at K; its write is cut.
+            assert_eq!(t.positions_of("bravo")[0], k);
+            let bravo_first = sha_at(k);
+            assert!(crate::volume::slice_holders::holders_of(&t.conn, &bravo_first)
+                .unwrap()
+                .is_empty());
+            // alpha's slices are a source on this tape (the positive control).
+            let alpha_first = sha_at(t.positions_of("alpha")[0]);
+            let holders = crate::volume::slice_holders::holders_of(&t.conn, &alpha_first).unwrap();
+            assert_eq!(holders.len(), 1);
+            assert_eq!(holders[0].label, LABEL);
+
+            // A completed row whose position the catalog records past its
+            // volume's end: not a source.
+            t.conn
+                .execute(
+                    "UPDATE volumes SET ended_after = ?1 WHERE label = ?2",
+                    params![t.positions_of("alpha")[0] - 1, LABEL],
+                )
+                .unwrap();
+            assert!(crate::volume::slice_holders::holders_of(&t.conn, &alpha_first)
+                .unwrap()
+                .is_empty());
         }
     }
 }

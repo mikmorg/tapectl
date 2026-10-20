@@ -493,10 +493,24 @@ pub fn run(
                 }
             };
 
+            // #420 (`volume-format-v2.md` §4.2): with no unit named, the set
+            // is every unit the volume holds whole; a tape that ended early
+            // also names the units it cut, and where each is whole. A unit
+            // named that the tape cut was refused, by name, before the drive.
+            let cut = if units.is_empty() {
+                volume::restore::cut_units_on_volume(conn, &report.volume_label)?
+            } else {
+                Vec::new()
+            };
             if json_output {
-                println!("{}", units_report_json(&report));
+                let mut obj = units_report_json(&report);
+                obj["cut"] = cut_units_json(&cut);
+                println!("{obj}");
             } else {
                 for line in units_report_lines(&report) {
+                    println!("{line}");
+                }
+                for line in cut_units_lines(&cut, &report.volume_label) {
                     println!("{line}");
                 }
             }
@@ -727,6 +741,48 @@ pub(crate) fn units_report_lines(report: &volume::restore::UnitsReport) -> Vec<S
         )
     });
     lines
+}
+
+/// The units the early end of `label`'s tape cut (#420), one line each, for
+/// `restore volume` with no unit named: not restored, and not a failure —
+/// the tape does not hold them whole by design (`volume-format-v2.md` §4.2).
+pub(crate) fn cut_units_lines(cut: &[volume::restore::CutUnit], label: &str) -> Vec<String> {
+    let mut lines: Vec<String> = cut
+        .iter()
+        .map(|c| {
+            format!(
+                "not on this tape whole: {} — cut by the early end of \"{label}\"'s tape{}",
+                c.describe(),
+                match &c.whole_on {
+                    Some(other) => format!(
+                        "; restore it with `tapectl restore unit --unit {} --from {other} \
+                         --version {} --to <DIR>`",
+                        c.unit_name, c.version
+                    ),
+                    None => String::new(),
+                }
+            )
+        })
+        .collect();
+    if !lines.is_empty() {
+        lines.push(format!(
+            "{} unit(s) left out: \"{label}\" ended early and does not hold them whole",
+            cut.len()
+        ));
+    }
+    lines
+}
+
+fn cut_units_json(cut: &[volume::restore::CutUnit]) -> serde_json::Value {
+    cut.iter()
+        .map(|c| {
+            serde_json::json!({
+                "unit": c.unit_name,
+                "version": c.version,
+                "whole_on": c.whole_on,
+            })
+        })
+        .collect()
 }
 
 /// `restore volume --json`: the units in tape order, each with its outcome.
