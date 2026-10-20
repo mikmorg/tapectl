@@ -102,15 +102,23 @@ fn noise(len: usize, seed: u32) -> Vec<u8> {
 
 /// The tape that ended early: see the module doc.
 pub(crate) fn short_tape() -> ShortTape {
-    written_tape(true)
+    written_tape(Some(1))
 }
 
 /// The same three units on a tape that sealed full: the control.
 pub(crate) fn full_tape() -> ShortTape {
-    written_tape(false)
+    written_tape(None)
 }
 
-fn written_tape(warning: bool) -> ShortTape {
+/// The same write with the early warning in `alpha`'s first slice: a sealed
+/// volume that holds no unit whole, every write on it `cut`.
+pub(crate) fn cut_only_tape() -> ShortTape {
+    written_tape(Some(0))
+}
+
+/// `warning`: the index in [`UNITS`] of the unit in whose first slice the
+/// early warning comes, or `None` for a tape that seals full.
+fn written_tape(warning: Option<usize>) -> ShortTape {
     let home = TempDir::new().unwrap();
     let paths = TapectlPaths::new(home.path().join(".tapectl"));
     paths.ensure_dirs().unwrap();
@@ -342,20 +350,21 @@ fn written_tape(warning: bool) -> ShortTape {
         .find(|e| matches!(e.kind, ZoneKind::SealMarker))
         .expect("a planned seal")
         .position as u32;
-    // The warning one byte into bravo's first slice: its first block reaches
-    // it, its second is the first refused, and K is that slice.
-    let bravo_first = positions[1].1[0];
-    let bytes_before: u64 = built
-        .layout
-        .entries
-        .iter()
-        .filter(|e| (e.position as u32) < bravo_first)
-        .map(|e| e.on_tape_bytes(BS).unwrap())
-        .sum();
-    let mut store = if warning {
-        MemStore::new(BS as usize).with_early_warning_after(bytes_before + 1)
-    } else {
-        MemStore::new(BS as usize)
+    // The warning one byte into the unit's first slice: its first block
+    // reaches it, its second is the first refused, and K is that slice.
+    let warned_at = warning.map(|u| positions[u].1[0]);
+    let mut store = match warned_at {
+        Some(k) => {
+            let bytes_before: u64 = built
+                .layout
+                .entries
+                .iter()
+                .filter(|e| (e.position as u32) < k)
+                .map(|e| e.on_tape_bytes(BS).unwrap())
+                .sum();
+            MemStore::new(BS as usize).with_early_warning_after(bytes_before + 1)
+        }
+        None => MemStore::new(BS as usize),
     };
 
     // The backup, taken between `volume init` and `volume write`.
@@ -383,12 +392,9 @@ fn written_tape(warning: bool) -> ShortTape {
     };
     let sealed = ready.seal(&mut store).unwrap();
     let ending = sealed.ending();
-    let expected = if warning {
-        Ending::Short {
-            ended_after: bravo_first,
-        }
-    } else {
-        Ending::Full
+    let expected = match warned_at {
+        Some(ended_after) => Ending::Short { ended_after },
+        None => Ending::Full,
     };
     assert_eq!(ending, expected, "the fixture's ending");
     // What `write::finish_session` records once `seal()` returns.
@@ -407,11 +413,7 @@ fn written_tape(warning: bool) -> ShortTape {
         paths,
         store,
         volume_id,
-        ended_after: if warning {
-            bravo_first
-        } else {
-            planned_seal - 1
-        },
+        ended_after: warned_at.unwrap_or(planned_seal - 1),
         planned_seal,
         positions,
         files: files_by_unit,
