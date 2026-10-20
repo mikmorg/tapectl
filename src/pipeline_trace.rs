@@ -577,12 +577,11 @@ impl Sampler {
     fn run(mut self, out: &mut impl Write, stop: &(Mutex<bool>, Condvar)) {
         let mut prev = self.read();
         let started = Instant::now();
-        let mut k = 1u32;
+        let mut due = SAMPLE_INTERVAL;
         loop {
             let stopping = {
                 let (lock, cv) = stop;
                 let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
-                let due = SAMPLE_INTERVAL * k;
                 while !*stopped {
                     let elapsed = started.elapsed();
                     if elapsed >= due {
@@ -604,9 +603,14 @@ impl Sampler {
             if stopping {
                 return;
             }
-            // Never fall behind into a burst of rows: the next due time is
-            // the next multiple of the interval after now.
-            k = (started.elapsed().as_nanos() / SAMPLE_INTERVAL.as_nanos()) as u32 + 1;
+            // On time, the rows keep to the interval's beat. A row taken late
+            // (the sampler descheduled on a loaded host) never leaves a short
+            // row or a burst behind it: the next is a whole interval on.
+            due += SAMPLE_INTERVAL;
+            let elapsed = started.elapsed();
+            if due < elapsed + SAMPLE_INTERVAL / 2 {
+                due = elapsed + SAMPLE_INTERVAL;
+            }
         }
     }
 

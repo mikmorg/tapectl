@@ -187,13 +187,14 @@ fn a_traced_write_leaves_a_sane_tsv_beside_its_session_log() {
     assert!(sum("writer_run_ms") > 0.0, "the writer thread was followed");
     assert!(sum("hasher_busy_ms") > 0.0 && sum("hasher_run_ms") > 0.0);
     assert!(sum("reader_run_ms") > 0.0);
-    // One row per 250 ms: never a burst of short rows, and the typical row
-    // on time (a loaded host may delay the odd one; the last is partial).
+    // One row per 250 ms: never a row shorter than half the interval (the
+    // sampler's rule when a row is taken late), and the typical row on time
+    // (a loaded host may delay the odd one; the last is partial).
     let mut spans: Vec<f64> = rows[..rows.len() - 1]
         .iter()
         .map(|r| num(r, "sample_ms"))
         .collect();
-    assert!(spans.iter().all(|s| *s >= 200.0), "{tsv}");
+    assert!(spans.iter().all(|s| *s >= 125.0), "{tsv}");
     spans.sort_by(f64::total_cmp);
     let median = spans[spans.len() / 2];
     assert!((245.0..=320.0).contains(&median), "median {median}:\n{tsv}");

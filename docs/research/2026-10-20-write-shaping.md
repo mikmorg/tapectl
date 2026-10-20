@@ -642,7 +642,7 @@ be constructed. Semantics as built (decimal MB/s throughout):
   it applies to every hash in the process.
 - `TAPECTL_EXP_CROSSFILE`: not built (below); set, it is reported as ignored.
 
-**Item 7, the dry run.** `tests/pipeline_trace.rs`, ungated (about 3 s): four 20 MiB files from
+**Item 7, the dry run.** `tests/pipeline_trace.rs`, ungated (about 6 s): four 20 MiB files from
 a real disk through `write_verified` (reader through `DropBehind`, the hash, `MemStore` behind a
 throttle), the trace on, and the TSV checked for its header, strictly monotonic times, bytes
 that end at the total, a queue within the pool, timed blocks, followed threads, about 250 ms a
