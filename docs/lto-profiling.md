@@ -107,8 +107,9 @@ It has two routes (`--route`, default `auto`):
   and read on from there: those 4 fill blocks (`fill-tail-blocks`), the slice, the filemark, the
   seal block, the filemark, and the walk's first block; then SPACE on through the walk and read its
   last block. It needs neither READ POSITION nor LOCATE.
-  SPACE(6) takes a 24-bit count and st passes it on unchecked, so the route spaces in commands of at
-  most 8,000,000 blocks (`--space-chunk`). An LTO-8 fill is more than 8.4 million blocks.
+  SPACE(6)'s count field is 24 bits, signed (SSC; at most 8,388,607 blocks), so the route spaces in
+  commands of at most 8,000,000 blocks (`--space-chunk`). An LTO-8 fill is more than 8.4 million
+  blocks.
 
 `auto` takes **locate** when the writer recorded a block address, and **spacing** when it recorded
 none (`setup.lba0` is null) or the LOCATE to the slice fails. A slice that LOCATE reached but that
