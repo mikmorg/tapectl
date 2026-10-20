@@ -594,7 +594,9 @@ Everything off the tape thread. A sampler thread writes one line per 250 ms; the
   #426's unit, 16.2 GiB in 17 slices, would do; 20 GiB synthetic is better.
 - Write each run with `--keep-staging`, so the set is staged once.
 - Make a 20 GB load file on the same array for the I/O load.
-- Build the research binary (static musl, debug, as home2's experiment binaries are).
+- Build the research binary as a static musl **release** build, approved for measuring only,
+  as #426's was. A debug build's hash and copy loops are not production's, and this protocol
+  measures rates.
 
 **Each run,** about 8 minutes of drive time: a short erase, init, a 20 GiB write (2.5 min at 146
 MB/s, 3.6 at 100), the seal, and the quick confirm (about 3.2 min, RECORD #426):
@@ -693,7 +695,8 @@ tapectl --home "$H" volume write "$LABEL" --device /dev/tape/by-id/scsi-HUJ808A5
 1. Approve the instrumentation (§9), including the HP 0x34 decoder and the repositions field in
    the `write_feed_ratio` event, and a research build with environment-variable knobs.
 2. Approve the drive phase: EW7VWMVKF6, about 2 hours of drive time, about 16 writes of 20 GiB,
-   and the loads of §10 on home2 and vm-desk1. Some of them, the java service (L3) and pinning
+   a release build of the research branch for measuring only, and the loads of §10 on home2
+   and vm-desk1. Some of them, the java service (L3) and pinning
    (R11), need the host owner too.
 3. Approve R0: the operator decodes page 0x34 and 0x14 rows from a copy of the production
    catalog.
