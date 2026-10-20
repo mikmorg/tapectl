@@ -35,7 +35,14 @@ total, not an end-reservation).
 **Validation predicate** (all must hold before a session may start):
 1. Capacity: Σ block-padded sizes + ENOSPC buffer ≤ available (per-store
    capacity oracle; tape = §2.8 formula via #28, until then nominal-capacity
-   config). This pre-flight gate is the sole capacity defense (ADR-0007).
+   config). Until 1.6.0 this pre-flight gate was the sole capacity defense
+   (ADR-0007). Since 1.6.0 an early warning ends the tape with a short seal
+   ("The short ending" below), and a plan may reach past the fill ceiling
+   (ADR-0012 item 113): units stay in the caller's order; the prefix that
+   fits the fill budget is gated as before; further whole units are appended
+   while the plan's end stays at or below 100% of the cartridge's nominal
+   capacity, and only when the drive declares `post_warning_bytes`. Without
+   that key the plan stops at the fill ceiling as before.
 2. Every staged slice exists on disk at its recorded encrypted size, and has a
    recorded sha256. Under `--prewrite-hash` it must also match that sha256 (a
    full streamed hash); by default it is not read (ADR-0012, "Amendment,
@@ -91,17 +98,20 @@ transition.
 
 ## Session states and persistence (children #22, #25, #26)
 
-The existing schema already carries the vocabulary; **no new `writes` states
-are needed**. Mapping (one session = the set of `writes` rows sharing a
-volume + started_at, driven as a unit; `write_positions` rows are the cursor):
+The schema carried the vocabulary when v2 was designed, and one `writes`
+state has been added since: **`cut`** (migration 038, 1.6.0, ADR-0012 item
+112), for the short ending. Mapping (one session = the set of `writes` rows
+sharing a volume + started_at, driven as a unit; `write_positions` rows are
+the cursor):
 
 | State | `writes.status` | Meaning / entry condition |
 |---|---|---|
 | Planned | `planned` | Layout validated, rows inserted, nothing on tape. |
 | Executing | `in_progress` | Store is executing entries; `write_positions` advances `pending → writing → written`. |
 | Interrupted | `interrupted` | SIGINT (clean mark) **or** startup sweep found an orphaned `in_progress` row whose volume lock is free (crash, #376). Resumable while the Layout revalidates. |
-| Sealed | `completed` | Confirm readback passed. Terminal. |
-| Aborted | `aborted` | Operator explicitly abandoned an interrupted session; resume revalidation failed unrecoverably; **or** a real EOT was hit mid-write (MAM over-reported capacity — clean abort, no salvage). Terminal; the tape is not a copy. |
+| Sealed | `completed` | Confirm readback passed. Terminal. On a short-sealed volume, only a stage set whose every slice is at or before `ended_after`. |
+| Cut | `cut` | (1.6.0) Confirm readback passed on a **short-sealed** volume, and this stage set has a slice planned after `ended_after`: the one the early warning interrupted, and every one planned after it. Terminal. **Never a copy.** Its `write_positions` rows stay as written: slices that reached the tape stay recorded (spanning, #478, uses them). It does not block releasing staging once the version has a `completed` write elsewhere. Exists only on a sealed volume with `ended_after` set; an aborted session is never `cut`. |
+| Aborted | `aborted` | Operator explicitly abandoned an interrupted session; resume revalidation failed unrecoverably; **or** the tape ended where no seal can follow: the hard end inside a slice or a seal (more than 16 refusals of one block in a row), a refused filemark, or an early warning before the first data slice (`volume-format-v2.md` §4.3 W6; clean abort, no salvage). An early warning anywhere else seals short ("The short ending" below). Terminal; the tape is not a copy. |
 | Failed | `failed` | Store error other than EOT/interrupt (device gone, I/O error) with no transition available. Terminal unless operator retries → new validation → resume semantics. |
 
 Volume status: migration 003 added **`sealed`** and **`quarantined`** to
@@ -137,6 +147,16 @@ quarantined volume would silently become a legal write target again.
 describing a tape written elsewhere, and this write path never produces it.
 `blank` and `missing` (migration 026) and `full` (migration 032, ADR-0012
 amendment 2026-10-07 item 16) left the schema: none ever had a writer.
+
+**`volumes.ended_after`** (migration 038, 1.6.0, ADR-0012 item 112) is the
+`ended_after` of a volume's **short** seal: set only on a short-sealed volume,
+NULL on every other (unsealed, sealed before 1.6.0, or sealed full by 1.6.0,
+whose `ended_after` is the Layout's M-1 and is not stored). It is written in
+the same transaction as `sealed_at`, from the seal the session wrote or, on a
+resume or a rebuild, from the seal it located (`volume-format-v2.md` §1.2 rule
+6). Invariants `audit` checks: a `cut` row exists only on a volume with
+`ended_after` set, and every `completed` row there has all its slices at
+positions at or before it.
 
 ADR-0012: `initialized` is the only status `volume write` and `volume resume`
 may target. Every other status is refused by status, before either command does
@@ -176,7 +196,11 @@ refusing it, on all of the following, refusing by the first unmet one:
    the rebuild made from the tape never satisfies it — that would be the tape
    vouching for itself); the catalog records no slice of the volume at a
    position the front index does not list; and every stage set on the volume
-   is whole on it.
+   is whole on it. On a tape that ended early (1.6.0), the seal is located by
+   `volume-format-v2.md` §1.2 rule 6, the hashes are compared only at or
+   before its `ended_after`, and a stage set with a slice after it is not
+   whole but cut: adoption records it `cut` and records `ended_after`, as a
+   passing short confirm does ("The short ending" below).
 
 Adoption writes what a passing confirm writes — `status = 'sealed'`,
 `sealed_at` from the seal marker's own time, the write bookkeeping, the
@@ -203,25 +227,58 @@ constraint error, fixed structurally.)
                                         ▼               yes │       │ no
                                      Aborted                ▼       ▼
                                                          Sealed  volume
-            real EOT during a slice                             QUARANTINED,
-            (only if MAM over-reported capacity)                session
-  Executing ───────────────► ABORT. No overwrite, no sacrifice. Aborted
+            the hard end inside a slice or a seal,              QUARANTINED,
+            a refused filemark, or an early warning             session
+            before the first data slice                         Aborted
+  Executing ───────────────► ABORT. No overwrite, no sacrifice.
                              Volume stays UNSEALED (no seal marker).
                              Operator reloads a fresh cartridge and
-                             re-plans. The pre-flight capacity gate (#28)
-                             is the real defense; this is the rare-miss
-                             backstop (ADR-0007).
+                             re-plans. Since 1.6.0 an early warning in a
+                             data slice is not an abort: it seals (below).
+```
+
+The ending after an early warning (1.6.0, #420; the rules are "The short
+ending" below, the bytes `volume-format-v2.md` §4.1–§4.3):
+
+```
+               early warning first seen in data slice K;
+               slice K finished (st's refusals retried)
+  Executing ─────────────────────────────────────────► write_early_warning
+                                                        event, committed
+                                                             │
+                              K = M-1 ┌──────────────────────┴───────┐ K ≤ M-2
+                                      ▼                              ▼
+                              full seal at M               Sealing short: the short
+                              (ended_after = M-1)          seal at K+1 (ended_after = K)
+                                      │                              │
+                                      └──────────────┬───────────────┘
+                                                     ▼
+                                     Confirming: entry K and the seal are read
+                                     back under every tier (item 114); a short
+                                     seal is confirmed over positions 0..K only
+                                        pass │                 │ mismatch: as above
+                                             ▼                 ▼ (quarantine or
+                                     Sealed. Short: each stage    inconclusive)
+                                     set wholly at or before K
+                                     → completed, every other →
+                                     cut; volumes.ended_after = K.
+                                     Full: as before.
 ```
 
 Rules that hold in every path:
 - **Metadata is generated from the Layout, never from what happened to get
   written.** The front index, seal marker, planning header, and envelope
-  manifests all come from the Layout (#24). (v2 has no truncate transition that
-  rewrites the Layout mid-session — an EOT aborts cleanly — so the only path
-  that revalidates is resume, against the unchanged Layout.)
+  manifests all come from the Layout (#24). The short seal (1.6.0) is no
+  exception in source: it is the Layout's entries 0..K plus its own, and its
+  one fact from the session is `ended_after = K`. File 0, File 3 and the
+  envelopes stay the plan. (v2 has no transition that rewrites the Layout
+  mid-session — a hard end aborts, and an early warning ends the session at a
+  position of the unchanged Layout — so the only path that revalidates is
+  resume, against the unchanged Layout.)
 - **Interrupt/abort skips the seal marker entirely** — an interrupted or
-  EOT-aborted tape has no seal marker and is self-evidently not sealed; that is
-  what Unsealed means. It is never recorded `completed`, and snapshots are not
+  aborted tape has no seal marker and is self-evidently not sealed; that is
+  what Unsealed means. A short seal is not an abort: it is a seal, and the
+  tape it ends is Sealed. It is never recorded `completed`, and snapshots are not
   flipped `current`. (The front index may already be on tape at File 3, but
   without a seal marker binding it the tape is unsealed — `volume-format-v2.md`
   §4.)
@@ -307,7 +364,9 @@ Rules that hold in every path:
   (`volume verify`, a resume whose recorded seal did not read) it is read
   first and alone, so an unsealed tape stops at one read. The navigable tier
   always reads File 3, then spaces forward to the seal: one rewind, two
-  forward spaces. Wherever it is read, the seal is *judged* first (§2.5's
+  forward spaces. After an early warning (1.6.0) it also reads the entry at
+  `ended_after` between them (item 114, "The short ending"): one rewind,
+  three forward spaces. Wherever it is read, the seal is *judged* first (§2.5's
   precedence): a seal that is absent, unparseable or refused is the whole
   verdict and whatever was read after it is discarded, so both orders reach
   the same evidence. `TapeStore` tracks which file the head
@@ -363,6 +422,114 @@ Rules that hold in every path:
 - **Snapshot lifecycle transitions happen only at Sealed**, inside the same
   transaction that records evidence, and are event-logged (#58).
 
+## The short ending (#420, tapectl 1.6.0)
+
+Ruled 2026-10-20 (ADR-0012 items 9, 99, 110-115). What reaches the tape, and
+the writer's obligations at the early warning (W1-W9), are
+`volume-format-v2.md` §4.1-§4.3; this section is the session's side.
+
+**Deciding the ending.** After each entry's `Written` verdict, the session asks
+the store for `early_warning()` (Store seam, below). The first time it is
+`Some` after a data slice at position K:
+- K ≤ M-2: the session writes no further data entry and moves to **sealing
+  short**: the short seal at K+1, `ended_after = K`.
+- K = M-1 (the last data slice): the full seal at M, as planned.
+- Before the first data slice the store's warning ends the session as an
+  abort (`aborted` rows, `write_aborted` naming the warning, the tape
+  unsealed). So does the hard end, or a refused filemark, anywhere: the store
+  returns its medium-full error, and the session never sees `Written`.
+- A warning first seen in the seal's own blocks changes nothing: the session
+  writes no event and seals as it was going to, and its session log names the
+  warning.
+
+Sealing short is not a `writes` status: the rows stay `in_progress` until
+confirm, and what makes the ending durable is the event.
+
+**The `write_early_warning` event.** One row in `events`, committed after
+entry K's cursor row is `written` and before the seal's first block goes to the
+store, for both endings that follow a warning (K ≤ M-2 and K = M-1):
+
+| Column | Value |
+|---|---|
+| `entity_type` | `'volume'` |
+| `entity_id`, `entity_label` | the volume's id and label |
+| `action` | `'write_early_warning'` |
+| `field` | `'ended_after'` |
+| `old_value` | NULL |
+| `new_value` | K, as decimal text: the `ended_after` the session will seal at |
+| `details` | one JSON object: `{"bytes_at": B, "refusals": R, "post_warning_bytes": P, "seal": "short"}`, with `"seal": "full"` when K = M-1 |
+
+- `bytes_at` counts on-tape bytes from the beginning of the tape to the first
+  refused block: the Layout's block-padded sizes of every file before the
+  first entry this process wrote, plus the store's own `bytes_at`. Filemarks
+  add nothing.
+- `refusals` is the store's count of refused blocks, every one retried, up to
+  the end of entry K.
+- `post_warning_bytes` is the drive's configured key in bytes, or JSON `null`
+  when the drive declares none.
+- The reader that decides anything reads only `new_value`. The rest is the
+  wear record of ADR-0012 item 98.
+
+**Resume after a crash past the warning.** The rehydrated session also reads
+`volumes.ended_after` and the latest `write_early_warning` event for the volume
+whose `timestamp` is at or after the session's `started_at`. Then, in order:
+1. `sealed_at` is recorded: re-enter confirm (the rule in "Transitions"), with
+   the ending from `volumes.ended_after` (NULL: full).
+2. Otherwise locate the seal (`volume-format-v2.md` §1.2 rule 6). If it parses
+   (§4.1 S1-S6) and binds this session's File 3, the tape is sealed: record
+   `sealed_at` from the seal's own time and, for a short seal, `ended_after`
+   from it; re-enter confirm. Never write.
+3. Otherwise, with the event: the ending is decided. Count the files on the
+   medium by filemarks (`reposition_at_most(K+1)`, which never moves past
+   K+1): N. The seal goes at P = min(K+1, N), with `ended_after = P-1`:
+   - P-1 before the first data slice: abort.
+   - P-1 = M-1 (only when the event's K was M-1): the full seal at M.
+   - Otherwise the short seal at P.
+
+   Resume writes no data entry. When P-1 is below the event's K (the medium
+   lost files the catalog had recorded written, #403), the seal and
+   `volumes.ended_after` state P-1 and the session log names both numbers; no
+   second event is written. A seal torn by the crash may have been closed by
+   st's filemark on close and so counted at K+1. Writing the seal at P replaces
+   it, because a write at a position ends the recorded data there.
+4. Otherwise (no event): the cursor rule in "Transitions", as before. The
+   medium is past the warning, so the drive reports it again on the first
+   write there, and the session takes the transitions above afresh.
+
+**Confirm of a short ending.** The confirm plan carries the ending (`ended_after`
+and the kind). The byte checks are `volume-format-v2.md` §5: the seal's
+`ended_after` must equal the session's, positions after it are not read, and
+entry K and the seal are read back under every tier (item 114). A pass commits,
+in one transaction:
+- the `verification_sessions` row, stating the tier;
+- `volumes.status = 'sealed'` (with `sealed_at` and `ended_after`, recorded
+  when `seal()` returned);
+- each stage set on the volume whose every slice is at or before `ended_after`:
+  `writes.status = 'completed'`, and its snapshot promoted `current` as today;
+- every other stage set of the session: `writes.status = 'cut'`. That covers
+  the one the warning interrupted and every one planned after it, whether or
+  not any of its slices reached the tape;
+- a `write_completed` event naming the short ending and the cut units.
+
+A mismatch takes the three outcomes in "Transitions" (quarantine, inconclusive,
+pass). An `ended_after` disagreement (`ended_after_disagrees`) is inconclusive.
+
+**After a short seal.** The command exits 0 (a short seal is a success), names
+the cut units and says what writes them: an ordinary `volume write` of the same
+staged sets onto another cartridge. The staging release (#440,
+`staging::release`) and `staging clean` treat a `cut` row as no write: it
+neither counts as a copy nor holds the staging as an unfinished write would.
+So a cut unit stays staged until its version has a `completed` write, and from
+then on it is released by the same rule as any other (ADR-0012 item 112).
+
+**Later contacts.** `volume verify` reads `ended_after` from
+`volumes.ended_after` and walks positions 0 to it (`volume-format-v2.md` §5).
+`catalog rebuild` and the adoption of a lost write locate the seal, record
+`ended_after` from a short one, and split the rows `completed`/`cut` by the same
+rule as confirm. `volume rewrite` (#483) reads only `completed` writes; when its
+destination seals short, the rewrite stays open, the cut slices stay pinned in
+staging, and the command names `volume write` for them.
+
 ## Store seam (child #71)
 
 The session owns the state machine; the store executes entries and reports.
@@ -370,8 +537,33 @@ The trait surface the children build toward: `validate`-time capacity oracle;
 `execute(entry) → Written | MediumEvent(EotReached)` (medium events are
 *transition requests* — the session decides, the store never self-recovers; in
 v2 `EotReached`'s only outcome is abort-to-unsealed, not salvage);
-`confirm(layout) → Evidence`; `read(entry)` for verify/restore legs. `execute`
-and `read` are **streaming** (they take/return a `Read` plus a known length, not
+`confirm(layout) → Evidence`; `read(entry)` for verify/restore legs.
+
+**`early_warning() → Option<EarlyWarning>`** (1.6.0, #420) is a sticky fact,
+not a medium event. It is `None` until the store's first refused data block;
+from then on it is `Some(EarlyWarning { bytes_at, refusals })` for the rest of
+the store's life: `bytes_at` is the bytes the store had accepted since it was
+opened, before the first refusal, and `refusals` counts every refusal it has
+retried. The store retries refusals itself (`volume-format-v2.md` §4.3 W2) and
+returns `Written` for an entry whose blocks and filemark were all accepted. It
+returns `EotReached` (the medium-full error) only when it could not finish: the
+hard end, or a refused filemark. In v2 that still has one outcome, the abort;
+the early warning is never `EotReached`. The session asks after every
+`Written`. The trait's default is `None`, for a store with no early warning (the
+`eod_at_or_before` pattern); `TapeStore` (through one retrying block-write
+function in `tape::ioctl`), `MemStore` and `FakeTape` implement it, the doubles
+from a configured warning point and hard end.
+
+**`store::locate_seal`** (1.6.0) is the one implementation of
+`volume-format-v2.md` §1.2 rule 6 over the trait, shared by every Rust reader
+that needs the seal: the chain walk, the contact check (`probe_seal`), resume,
+`catalog rebuild` and the adoption of a lost write. It reads the planned
+position; when that read fails and the store shows END OF DATA at or before it
+(`eod_at_or_before`), it reads the last file, numbered from the store's own
+count of the files on the medium (the count `reposition_at_most` already takes
+from st). It never asks for a block address.
+
+`execute` and `read` are **streaming** (they take/return a `Read` plus a known length, not
 a whole `&[u8]` buffered in RAM) so peak memory tracks block size, not slice
 size — the H9 fix (age's STREAM already gives constant-memory encryption;
 `volume-format-v2.md` §7). Since 1.0.6 (#390) the write session's execute and
@@ -388,7 +580,8 @@ same signatures without violence (#72, phase 3).
 
 ## Out of scope here
 
-Multi-volume spanning (not in the design), warehouse mechanics (phase 3,
+Multi-volume spanning (designed in ADR-0012 items 82-95 and built after the
+short ending, #478; not here), warehouse mechanics (phase 3,
 ADR-0006), compaction's use of sessions (compaction writes are ordinary
 sessions; `compact-finish`'s extra guards are unchanged), and exact Rust types
 (children's work).
@@ -400,7 +593,10 @@ sessions; `compact-finish`'s extra guards are unchanged), and exact Rust types
   raise a real EOT reliably (the 2026-07-20 drill: it silently corrupts overflow
   rather than returning ENOSPC), which is *why* the pre-flight gate (#28) is the
   real defense and the abort is only a rare-miss backstop. #26 becomes: on write
-  ENOSPC, stop, leave the tape unsealed, mark the session `aborted`.
+  ENOSPC, stop, leave the tape unsealed, mark the session `aborted`. *Superseded
+  in 1.6.0 (#420):* ENOSPC is first the early warning, which the store retries
+  and the session ends with a seal ("The short ending"); only the hard end, a
+  refused filemark, or a warning before the first data slice aborts.
 - #28 decides where the capacity oracle reads MAM vs config when hardware is
   absent (mhvtl MAM answers are recorded by #8 for later hardware diffing). Its
   `reserve_bytes` is just the ENOSPC buffer now (no manifest reserve).

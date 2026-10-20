@@ -58,6 +58,15 @@ filemark), in this fixed order:
     op  = operator recipients.  t = the owning tenant's recipients.
 ```
 
+**A tape that ended early (since 1.6.0, §4.1–§4.3).** The positions above are
+the **plan**. When the drive reports its early warning (CONTEXT.md "Early
+warning") in data slice K before the last one, the writer finishes slice K and
+writes a **short seal** at K+1 instead of File M. Files K+2 to M are then not on
+the tape. File 0's `seal_marker` and `total_files`, File 3, and every envelope
+still describe the plan; the short seal says where the tape really ended
+(`ended_after = K`). A short tape loses only trailing slices, as the bulk-zone
+note says, and every unit wholly at or before K is on it whole (§4.2).
+
 **Rationale for the order** (full derivation in ADR-0007 / the research note
 `docs/research/2026-07-21-ontape-format-and-write-design.md`):
 
@@ -127,7 +136,36 @@ requires = []
 ```
 
 `requires` lists the features a reader must understand to read this tape
-correctly. 1.1.0 knows none, and requires none. The rules every reader keeps
+correctly. 1.1.0 knows none, and requires none.
+
+**From 1.6.0, every tape requires `short-seal`** (ADR-0012 item 111, #420).
+File 0's `[volume]` and the seal's `[seal]` both state it, on every tape 1.6.0
+or later writes, whether the tape sealed full or short:
+
+```toml
+requires = ["short-seal"]
+```
+
+The line is spelled exactly so: one feature, double-quoted, no spaces inside
+the brackets, on the line after `layout_version` as before. `short-seal` means:
+this tape may end before the last file its plan lists; its seal states
+`ended_after`, the last file before the seal; and a reader finds the seal by
+rule 6 and trusts it over the plan (§4.1, §4.2). A reader that knows the
+feature lists it: `KNOWN_FEATURES = &["short-seal"]` in `format.rs`,
+`KNOWN_FEATURES="short-seal"` in RESTORE.sh.
+
+**A reader that does not know `short-seal` refuses the tape at File 0, by
+name** (rule 1). RESTORE.sh has since 1.1.0, and so has every tapectl reader
+rule 1 lists, the restore and verify readers since #476 (1.3.0): tapectl's
+`FormatClaims::refusal` and RESTORE.sh's `check_requires` name the feature and
+send the reader to the RESTORE.sh at the tape's own file 2, or to a newer
+tapectl. It never half-reads the tape. When File 0 is unreadable, the same
+refusal comes from the seal, which states the same `requires` (rule 1 checks
+both). The fence holds from 1.1.0 on: a reader before 1.1.0 predates
+`requires` and does not check it. The full and the short seal are fenced
+alike; fencing only short tapes was considered and not chosen (item 111).
+
+The rules every reader keeps
 — tapectl's (`format::FormatClaims`, checked by `restore raw-volume`,
 `catalog rebuild`, and, since #476, `restore unit`, `restore file`, `restore volume`,
 `volume verify`, `volume read-slices`, `volume compact-read` (and `volume compact`'s
@@ -152,7 +190,8 @@ seal's) and RESTORE.sh's
    writer may add keys to any table; a reader that does not know one reads
    on. A writer that adds anything a 1.1.0 reader would *misread* — not
    merely not know — lists a feature for it in `requires` (the short seal,
-   #420, will be `requires = ["short-seal"]` with an `ended_after` field). A
+   #420, is `requires = ["short-seal"]` with an `ended_after` field: 1.6.0,
+   §4.1). A
    change no `requires` can fence (a different byte layout of the slices,
    say #370's "tapectl cuts the slices") bumps `layout_version` and `magic`.
 4. **A key's meaning never changes.** New meaning, new key.
@@ -161,14 +200,61 @@ seal's) and RESTORE.sh's
    else is trusted and no other table uses the name. A v3 File 0 must not
    carry `front_index`/`seal_marker` as bare integers a v2 RESTORE.sh could
    read and follow.
-6. **The seal marker is the last file, found as such.** Readers locate it by
-   spacing to end of data and back two filemarks (`mt eod`, `mt bsfm 2`;
-   GNU mt spells end of data `eom`), and use File 0's `seal_marker` as a
-   cross-check and a fallback, never the only route. RESTORE.sh does; a
-   disagreement is named. The Rust chain walk takes the seal's position from
-   the catalog's own Layout, which is authoritative for a tape this catalog
-   wrote; the write path's contact check still follows File 0's pointer
-   (open item, `docs/design/v2-open-questions.md` §10).
+6. **The seal marker is the last file, found as such, and never by a block
+   address** (rewritten for 1.6.0: ADR-0012 items 110-111, #420). The
+   **planned position** is File 0's `[layout] seal_marker` (always
+   `total_files - 1`), File 3's `seal_marker` entry, or, for tapectl, the
+   catalog's Layout. A reader finds the seal:
+   - **at the planned position**, when the tape holds a file there; or
+   - **when the medium ends before it**, as the **last file before end of
+     data**: file N-1, where N is the number of files the tape holds, counted
+     by the filemarks spaced over from the beginning of the tape. A file with
+     no filemark after it is no file: a seal counts only once its closing
+     filemark is on the tape.
+
+   Both routes space by filemarks, and they reach the same file. tapectl
+   spaces to the planned position; when st reports END OF DATA first, it takes
+   N from st's own file count (`MTIOCGET`'s `mt_fileno`, the count
+   `Store::reposition_at_most` and `Store::eod_at_or_before` already read) and
+   reads file N-1. RESTORE.sh spaces to end of data and back over two
+   filemarks (`mt eod`, `mt bsfm 2`; GNU mt spells end of data `eom`), which
+   leaves the head at the start of that same last file, and it falls back to
+   File 0's pointer only when mt cannot space to end of data. **No reader
+   finds the seal, or any file, by READ POSITION or LOCATE** (`MTIOCPOS`,
+   `mt tell`, `mt seek`, and the SCSI commands behind them): READ POSITION
+   never answered through st on home2's HP LTO-6
+   (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`).
+
+   Which seal a reader accepts:
+   - **At the planned position:** a seal whose `file_count` is the planned
+     count (§4.1 "full").
+   - **Before it:** only on a tape that requires `short-seal` (File 0's
+     `requires`, or the seal's own when File 0 is unreadable), and only a seal
+     that itself requires `short-seal`, keeps §4.1's parse rules and states
+     `file_count = N`. Anything else is no seal. tapectl then reads the tape as
+     unsealed. RESTORE.sh keeps its degraded reading for an heir: it uses the
+     last file and warns that it disagrees with File 0, as it has since 1.1.0.
+     On a tape that requires `short-seal`, a seal before the planned position
+     is the normal short ending and draws no warning.
+   - **After it:** never accepted by tapectl. RESTORE.sh warns, as since 1.1.0.
+
+   A read at or before the planned position that fails without st reporting
+   END OF DATA at or before it is **unreadable, not absent** (#460): tapectl
+   never reads it as "unsealed", and a fresh write refuses the cartridge.
+
+   tapectl's catalog readers that know a volume's `ended_after`
+   (`volumes.ended_after`, `layout-session.md`) read its seal at
+   `ended_after + 1` directly, and check that the seal states the same
+   `ended_after` (§5).
+
+   **The write path's contact check keeps the same rule.** Before 1.6.0 it
+   read only File 0's pointer, and END OF DATA there read as "no seal": on a
+   short-sealed cartridge that would let `--force` overwrite a sealed volume
+   (ADR-0003). From 1.6.0, when the planned position is at or past end of
+   data, the contact check reads the last file on the medium before it
+   concludes there is no seal, and a seal marker there refuses the write as
+   any seal does. This closes `docs/design/v2-open-questions.md` §10's open
+   item.
 
 Unknown front-index `type`s are not refused by the 1.1.0 readers: a future
 file type arrives with a `requires`, which is refused first.
@@ -399,6 +485,78 @@ unit's root, escaped as §1.5 escapes. A fill (`--fill-from LIST`) uses a tape o
 lists the same unit uuid at the same version, restores only the listed paths, and rewrites the
 list with the paths still damaged, or removes it.
 
+### 1.7 What a 1.6.0 tape declares up front (normative, tapectl 1.6.0)
+
+Ruled 2026-10-20 (ADR-0012 item 111, #420). Everything before the first data slice is written
+before the writer can know whether the tape will end early, so every 1.6.0 tape declares that it
+**may**, in every file that describes the plan, and only the seal says whether it **did**
+(§4.1). These declarations are the same on a tape that seals full and on one that seals short.
+
+| File | Declaration | Where |
+|---|---|---|
+| File 0 | `requires = ["short-seal"]` | `[volume]`, the line after `layout_version` (§1.2) |
+| File 3 | `may_end_early = true`, and a header paragraph | `[index]`, the line after `layout_version` (§3) |
+| each envelope's `MANIFEST.toml` | `may_end_early = true` | `[manifest]`, the line after `created_at` (below) |
+| each envelope's `RECOVERY.md` | a section on reading the seal | text (below) |
+| File 1 | the same, for the heir | text (below) |
+| the seal | `requires = ["short-seal"]` and `ended_after` | `[seal]` (§4.1) |
+
+**File 0 is the plan.** Its `[layout] seal_marker` and `total_files` are the planned seal
+position M and the planned count M+1 on every tape. On a short tape they name a position past
+end of data; a reader treats them as the plan, never as damage (§1.2 rule 6). Nothing else in
+File 0 changes, its human-readable header included.
+
+**MANIFEST.toml.** From 1.6.0 the `[manifest]` table ends with one more line:
+
+```toml
+[manifest]
+volume = "{label}"
+tenant = "{tenant}"
+created_at = "{created_at}"
+may_end_early = true
+```
+
+- The line is the literal `may_end_early = true`, the last key of `[manifest]`, followed by the
+  blank line that precedes `[[units]]` as today. It is in every envelope of every 1.6.0 tape: each
+  tenant envelope, the operator envelope, and their backups (byte copies, §1.3).
+- The name is File 3's, for the one fact. It collides with no `[[units]]` or `[[units.slices]]`
+  key, which matters because RESTORE.sh reads `[manifest]` with its table-blind,
+  first-match-wins `toml_val`.
+- Absent means false: every envelope before 1.6.0.
+- **It decides nothing.** A manifest's `tape_position` values are the plan. The seal's
+  `ended_after` decides which of them are on the tape (§4.2). tapectl's `Manifest` reads the key
+  as a bool (absent: false) and still ignores keys it does not know (#134). A 1.5.0 reader would
+  ignore it, but it never reaches it: File 0 refuses the tape first.
+- `MANIFEST.toml`'s golden pin moves with this line (item 111).
+
+**RECOVERY.md.** Each envelope's RECOVERY.md gains a section, after the "Units in this envelope"
+table and before the first unit's section, that says:
+1. The tape may end before the last tape file the write planned, because the drive reached the
+   end of its medium. The units table is the plan, written before any slice was.
+2. The seal marker, the last file on the tape, says where it ended: its `ended_after` is the last
+   tape file before the seal. Every tape file after `ended_after` is not on this tape.
+3. How to read it by hand, with no key:
+
+   ```bash
+   mt -f /dev/nst0 setblk 524288
+   mt -f /dev/nst0 eod          # GNU mt: eom
+   mt -f /dev/nst0 bsfm 2
+   dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(file_count|ended_after) ='
+   ```
+
+   with the `/dev/nst0` caution the rest of RECOVERY.md gives.
+4. The rule for a unit: when the last tape file of a unit (its "Tape files" column) is after
+   `ended_after`, this tape does not hold the unit whole. Do not start reading its slices: it is
+   restorable only from another tape. The index (`index/units.tsv`, §1.5) and RESTORE.sh's
+   `--where` name the tapes that hold it.
+5. RESTORE.sh does all of this by itself: `--info` and `--verify` report where the tape ended.
+
+**File 1** (the system guide) says the same for the heir: what `requires = ["short-seal"]` means
+(its glossary entry for `requires` stops saying the list is empty); that the seal's
+`ended_after` says where the tape ended; how to read it by hand (the four lines above); that a
+unit whose slices run past it is not on this tape whole and where to look for it; and that
+RESTORE.sh prints `NOT ON TAPE` for each planned file past the end (§4.2).
+
 ## 2. Plaintext vs encrypted, and the isolation invariant
 
 | Zone | On tape | Why |
@@ -440,7 +598,8 @@ a third:
 1. **Data.** Every unit on it is restorable by its tenant with that tenant's
    key and standard tools — `mt`, `dd`, `age`, `dar`, `sha256sum` and a few
    coreutils (§6) — with no tapectl and no database (`RESTORE.sh`, tape file 2). This is the heir path
-   and it is proven on real hardware.
+   and it is proven on real hardware. On a tape that ended early, "every unit on it" is every
+   unit wholly at or before the seal's `ended_after` (§4.2).
 2. **Catalog.** With the operator or escrow key, `catalog rebuild --from-volume`
    reconstructs everything the catalog knew about this write *at staging
    time*: volume identity, units, snapshots, the slice map and plaintext
@@ -501,14 +660,47 @@ plaintext file for leaks. For v2 it MUST be updated to: (a) treat
 for the sentinel **filenames and the expected `sha256_plain` hex** as well as
 tenant/unit names, asserting all are absent; (c) permit `sha256_encrypted` and
 on-tape sizes to appear; and (d) reflect the v2 order (envelopes precede slices).
-This test is D4's real enforcement — the prose above is only its statement.
+This test is D4's real enforcement — the prose above is only its statement. On a
+short tape (§4.1) the plaintext positions are `{0, 1, 2, 3, ended_after + 1}`, and
+the scan covers the short seal like a full one (#420).
 
 ## 3. The front index (File 3)
 
-Plaintext TOML. One entry per tape file, in position order:
+Plaintext TOML. File 3 is the **plan**: it is written before any slice, so it lists every
+file the write meant to put on the tape, whether or not the tape ends early (§4.1).
+
+**The `[index]` table.** `volume`, then `layout_version = 2`, then, from 1.6.0, on every
+tape 1.6.0 writes (ADR-0012 item 111):
+
+```toml
+[index]
+volume = "{label}"
+layout_version = 2
+may_end_early = true
+```
+
+- `may_end_early = true` is the literal line, directly after `layout_version`. It declares
+  that the tape may end before the last file listed, and that the seal says where. Absent
+  means false (every tape before 1.6.0).
+- **It decides nothing for a reader.** `requires` (File 0, the seal) and the seal's
+  `ended_after` do (§1.2, §4.1). File 3 carries no `requires`: no reader before 1.6.0 checks
+  it there, so it could fence nothing.
+- The human-readable header of a 1.6.0 File 3 gains one paragraph, after the paragraph that
+  ends "see the system guide." and before the `MACHINE-READABLE DATA` rule, exactly:
+
+  ```
+  This tape may end early. The list below is the plan: every file the
+  write meant to put on the tape. The seal marker, the LAST file on the
+  tape, says where the tape really ended (its ended_after). A file listed
+  after that position is not on this tape.
+  ```
+
+Then one entry per planned tape file, in position order:
 
 - `position` — tape file number (0..M). Present for **every** file (navigation is
-  total: the heir can jump straight to any file, including the seal marker).
+  total: the heir can jump straight to any file, including the seal marker). On a
+  short tape, positions after the seal's `ended_after` are planned files that are not
+  on the tape, and the `seal_marker` entry at M is the planned seal (§4.2).
 - `type` — on-tape zone kind: `id_thunk`, `system_guide`, `restore_sh`,
   `front_index`, `tenant_envelope`, `operator_envelope`,
   `operator_envelope_backup`, `tenant_envelope_backup` (1.1.0, §1.3),
@@ -540,12 +732,15 @@ directly when the index is built.
 
 ## 4. The seal marker (File M) and the integrity chain
 
-Plaintext TOML, one tape file, written last: a `[seal]` section — `{ layout_version,
-file_count = M+1, sealed_at (RFC 3339), front_index_sha256 }` — followed by a **full
-embedded copy of the front index** (`[[files]]` entries in the same grammar as
-File 3). Its **presence** is the assertion "every file before me is present and this
-is a sealed volume"; its **absence** means the tape is self-evidently unsealed
-(interrupted or aborted — see layout-session.md).
+Plaintext TOML, one tape file, written last: a `[seal]` section — `{ volume,
+layout_version, requires, file_count = M+1, sealed_at (RFC 3339), front_index_sha256 }`,
+and from 1.6.0 `ended_after` (§4.1) — followed by a **full embedded copy of the front
+index** (`[[files]]` entries in the same grammar as File 3). Its **presence** is the
+assertion "every file before me is present and this is a sealed volume"; its **absence**
+means the tape is self-evidently unsealed (interrupted or aborted — see
+layout-session.md). From 1.6.0 the seal may come early: a **short seal** at K+1, whose
+embedded copy stops at itself (§4.1). Everything this section says of the seal holds of
+a short one, over the files it covers.
 
 **The embedded copy** (ratified 2026-07-22) mirrors LTFS's front-copy-plus-end-index
 redundancy without partitioning: damage at either end of the tape is survivable —
@@ -581,7 +776,235 @@ Verifying the chain proves byte-integrity of the entire tape without any key:
 hash File 3, compare to the seal marker's `front_index_sha256`; then for every other
 file, hash it and compare to File 3's `sha256_encrypted[i]`. This is what "confirm"
 verifies (§5) and what an heir can independently re-run years later for bit-rot
-detection.
+detection. On a short tape the chain covers files 0 to `ended_after` (§4.2).
+
+### 4.1 The full seal and the short seal (normative, tapectl 1.6.0)
+
+Ruled 2026-10-20 (ADR-0012 items 9, 99, 110-115; #420). From 1.6.0 every seal states
+`ended_after`, the position of the last file before it. A seal is one of two kinds:
+
+| | Position | `file_count` | `ended_after` | Embedded `[[files]]` entries |
+|---|---|---|---|---|
+| **full seal** | M (planned) | M+1 | M-1 | 0 to M, as before 1.6.0 |
+| **short seal** | K+1, with K ≤ M-2 | K+2 | K | 0 to K, then its own entry at K+1 |
+
+Normatively, `ended_after` is the position of the last file before the seal. In the usual
+case K is the data slice in which the drive's early warning came (§4.3). A resume after a
+crash can seal lower, when the medium lost files the catalog had recorded written
+(`layout-session.md`, "The short ending").
+
+**Grammar.** One `key = value` per line (the line-oriented contract of
+`v2-open-questions.md` §3.1), in exactly this order, for both kinds:
+
+```toml
+[seal]
+volume = "{label}"
+layout_version = 2
+requires = ["short-seal"]
+file_count = {file_count}
+ended_after = {ended_after}
+sealed_at = "{sealed_at}"
+front_index_sha256 = "{front_index_sha256}"
+```
+
+- `ended_after` is the one new key. It sits directly after `file_count`, which it is
+  bound to (rule S1 below).
+- `requires = ["short-seal"]` is on **every** 1.6.0 seal, full or short, as it is in File
+  0 (§1.2). The seal has always repeated File 0's `layout_version` and `requires`. It is
+  the fence when File 0 cannot be read.
+- `front_index_sha256` is the hash of File 3's exact bytes (the byte contract below), on
+  both kinds. File 3 is the plan and never changes: a short seal binds the same front index
+  a full one would have.
+- `sealed_at` is the fixed-width timestamp (`YYYY-MM-DDTHH:MM:SSZ`, 20 bytes) as before.
+
+**The embedded copy.**
+- **Full seal:** entries 0 to M, exactly as before 1.6.0. File 3's own entry carries its
+  `size_bytes` and `sha256_encrypted`; the seal's own entry, last, carries `position` and
+  `type` only.
+- **Short seal:** entries 0 to K copied from File 3, with File 3's own entry filled in the
+  same way, then the seal's own entry:
+
+  ```toml
+  [[files]]
+  position = {K+1}
+  type = "seal_marker"
+  ```
+
+  with no `size_bytes` and no `sha256_encrypted` (self-reference, as on a full seal). So
+  entries 0 to K equal File 3's entries 0 to K in `position`, `type`, `size_bytes` and
+  `sha256_encrypted`, except File 3's own entry, which the copy fills in. The entry at K+1
+  differs from File 3's: File 3 plans a data slice there.
+
+**The human-readable header** is the same on both kinds, so it does not change a seal's
+length. From 1.6.0 it reads, exactly:
+
+```
+Volume: {label}
+This file seals the tape: its presence means every file before it is
+present. Its absence means the tape is unsealed (interrupted or aborted).
+The tape may end before the last file the front index plans:
+ended_after below is the last file before this one, and a file the
+front index lists after it is not on this tape. It binds the front
+index by the sha256 below. The [[files]] entries are a copy of the
+front index (File 3) up to this file, usable if File 3 is damaged —
+verify any entry by hashing the file it describes.
+```
+
+**Length.** The build step sizes the seal with a placeholder (`v2-open-questions.md` §9):
+the full seal, with `ended_after = M-1` and a fixed-width `sealed_at`. A full seal must be
+exactly the placeholder's length, as before 1.6.0. A short seal is never longer: its
+`file_count` (K+2 ≤ M+1) and `ended_after` (K ≤ M-1) have no more digits, its own entry's
+`position` (K+1 ≤ M) has no more digits, and it carries at least one data-slice entry fewer.
+The writer checks that a short seal is no longer than the placeholder, never that it is
+equal.
+
+**Parse rules.** Every reader that knows `short-seal` (`format.rs`, RESTORE.sh) keeps these:
+
+- **S1.** `ended_after` is a non-negative integer and `ended_after + 2 == file_count`. The
+  seal's own position is `file_count - 1`, which is `ended_after + 1`. This holds on both
+  kinds: it validates a seal, it does not classify one.
+- **S2.** A seal whose `requires` names `short-seal` carries `ended_after`. A seal that
+  carries `ended_after` keeps S1, whatever its `requires` says.
+- **S3.** A seal with no `ended_after` (every seal before 1.6.0) is a full seal that ended
+  after `file_count - 2`.
+- **S4.** The embedded copy has exactly `file_count` entries: positions 0 to
+  `file_count - 1` in order, one `front_index` entry at 3, one `seal_marker` entry, last
+  (the self-consistency checks of `v2-open-questions.md` §2.5, unchanged).
+- **S5.** The embedded entry at position `ended_after` has `type = "data_slice"`. That holds
+  on a full seal (M-1 is the last data slice) and on a short one (a writer never seals short
+  before the first data slice, §4.3), and fails a seal that ends inside the metadata. Every
+  Layout tapectl writes has at least one data slice: `volume write` refuses a session with
+  nothing staged.
+- **S6.** A seal that breaks S1, S2, S4 or S5 is **unparseable**. By the fail-safe
+  precedence (`v2-open-questions.md` §2.5) that is the unsealed signal: such a seal never
+  reads as sealed.
+
+**Classification.** A seal is **full** when its `file_count` equals the plan's count (File
+0's `total_files`, File 3's entry count, or the Layout's), and **short** when it is less. A
+`file_count` greater than the plan's means the tape's two ends disagree, as a
+`front_index_sha256` mismatch does. A reader with neither File 0 nor File 3 cannot classify
+the seal and needs not: its embedded copy describes what is on the tape.
+
+**No unit identity.** A short seal carries what a full seal carries: positions, kinds,
+on-tape sizes and ciphertext hashes. It adds one position, `ended_after`. Nothing in it
+names a unit, a tenant or a file, or says which unit the end of the tape cut; only an
+envelope the reader can open tells that (§2). The leak scan covers it (§2).
+
+### 4.2 What a short tape promises, and what readers do with it (normative)
+
+**What it promises.**
+- **It is sealed.** The short seal asserts that every file from 0 to `ended_after` is
+  present, and binds File 3 as a full seal does. The keyless chain runs over those files:
+  seal → File 3 → every file at or before `ended_after` except File 3.
+- **Every unit wholly at or before `ended_after` is on it whole**: each such unit's every
+  slice is at a position at or before `ended_after`. It is restorable by the heir path, and
+  the catalog counts it as a Copy (`writes.status = 'completed'`).
+- **Every position after `ended_after` is not on this tape.** A unit with any slice planned
+  after `ended_after` is **cut** (CONTEXT.md "Cut"): the unit the early warning interrupted
+  and every unit planned after it. Nothing of a cut unit counts on this tape, and no reader
+  restores it from this tape, even though its slices at or before `ended_after` are present
+  and hash correctly. The catalog records its row `cut` (ADR-0012 item 112), and the unit is
+  written whole on another cartridge (item 9).
+- **Everything written before the slices is the plan.** File 0, File 3, every envelope's
+  `MANIFEST.toml`, `RECOVERY.md`, `PLAN.toml` and `catalog.db`, and the `index/` members
+  (§1.5) list the cut units and the positions after `ended_after`. The seal withdraws those
+  claims. In particular, an `index/units.tsv` row whose `state` is `this-tape` names a cut
+  version that this tape does not hold. A reader checks a version's slices against
+  `ended_after` before it calls this tape a holder. The indexes of later tapes never name a
+  cut write as a holder: §1.5 lists only completed writes.
+- File 3's hashes for positions after `ended_after` describe files that are not on this tape.
+  No reader compares them with anything on it.
+- **Nothing follows the seal.** End of data comes directly after its closing filemark.
+
+**What readers do on a tape that requires `short-seal`** (tapectl and RESTORE.sh alike):
+- **R1. Learn `ended_after` before reading any data slice.** tapectl takes it from the
+  catalog for a volume this catalog sealed (`volumes.ended_after`; NULL means a full seal, so
+  the planned M-1), and otherwise reads the seal (§1.2 rule 6). A full seal gives
+  `ended_after = M-1`: nothing is withdrawn.
+- **R2. Without a readable seal,** read on as for an unsealed tape (§6 step 3). END OF DATA
+  met at a planned position is the end of the tape: that file and every later one are not on
+  it.
+- **R3. Never read a position after `ended_after` for data.** Report it as not on this tape.
+- **R4. Name a cut unit; never restore it from this tape.** Say where its copies are when the
+  index says (§1.5).
+- **R5. A second tape is read the same way.** A reader that takes slices or files from
+  another tape (RESTORE.sh's `--swap-tapes`, `--slices-from` and `--fill-from`, tapectl's
+  read-from-another-copy, #480) reads that tape's seal first and takes nothing from past its
+  `ended_after`.
+
+RESTORE.sh's modes, in 1.6.0:
+- `--info`: the verdict stays SEALED for both kinds. A short seal adds a line saying that the
+  tape ended after file K and that files K+1 to M-1 of the plan are not on it.
+- `--verify`: hashes files 0 to `ended_after` and prints `NOT ON TAPE` for each planned
+  position after it. A `NOT ON TAPE` line is not a failure.
+- `--restore`, with or without `--path`: refuses a cut unit by name, saying the tape ended
+  before its slices and naming `--where`. `--all` restores every whole unit and names the cut
+  ones.
+- `--list`: still lists a cut unit's files (its catalogue is in the envelope, no slice is
+  read), and says the unit is not on this tape whole.
+- `--where` and `--where --all`: a `this-tape` row of a cut version is printed as cut, not as
+  a holder, and the loaded tape does not count as holding that version.
+- `--find-envelope`: unchanged. Every envelope is before the first data slice.
+
+tapectl, in 1.6.0:
+- The chain walk (confirm, `volume verify`) covers files 0 to `ended_after` (§5).
+- Every reader that reads slices by the catalog (`restore`, `volume read-slices`, `volume
+  compact-read`, `volume rewrite`) reads only `completed` writes, so none reads a cut unit from
+  this tape. `restore volume` names the cut units.
+- `restore raw-volume` reports the positions after `ended_after` as not on this tape.
+- `catalog rebuild` and the adoption of a lost write (`volume::adopt_lost`) locate the seal
+  by §1.2 rule 6. They record `completed` only for a stage set wholly at or before
+  `ended_after`, and `cut` for every other.
+
+### 4.3 The writer at the early warning (normative)
+
+Ruled 2026-10-20 (ADR-0012 items 84, 99-100, 110-114), from the st driver's measured
+behaviour on home2's HP LTO-6 (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`). The session's
+states and records are in `layout-session.md` ("The short ending"); this section fixes what
+reaches the tape.
+
+- **W1. The early warning** is the first block write (`write(2)` of a tape block, as
+  opposed to a filemark) that st refuses with ENOSPC (errno 28) in a session. From then on,
+  st refuses about one block write in two, at once, without sending it to the drive. Measured
+  runs were at most 3 refusals.
+- **W2. Retry a refused block.** Write the same buffer again until st accepts it. More than 16
+  refusals of one block in a row is the **hard end**: the session aborts (W6).
+- **W3. Never retry a filemark.** st's alternation was measured on block writes only: after
+  the warning, the immediate filemark, the seal block and the synchronous filemark were each
+  accepted at once. A refused filemark is therefore taken as the drive's refusal. A retried
+  filemark that had in fact been written would add an empty file and move every later
+  position. A refused filemark aborts the session (W6).
+- **W4. Finish the entry in flight.** The entry in whose blocks the first refusal came is
+  written whole, closing filemark included. Call its position K. Then:
+  - **K is a data slice before the last one** (K ≤ M-2): write no further data entry. Write the
+    short seal at K+1, with `ended_after = K`.
+  - **K is the last data slice** (K = M-1): write the full seal at M, as planned.
+  - **K is before the first data slice** (Files 0 to 3, or an envelope): abort (W6). A tape
+    that ends inside its metadata holds no unit.
+  - **A warning first seen in the seal's own blocks** changes nothing: they are retried like a
+    slice's (W2), and the seal stays the kind it was.
+- **W5. Record the warning before the seal.** The catalog's `write_early_warning` event is
+  committed before the seal's first block goes to the tape (`layout-session.md`).
+- **W6. Abort** as before 1.6.0 on the hard end inside a slice or a seal, on a refused
+  filemark, or on a warning before the first data slice: no seal, the tape unsealed, the rows
+  `aborted`. This is ADR-0007's clean abort. The short seal replaces it only at the early
+  warning.
+- **W7. The seal is written as every seal is:** the data slice before it ends with its
+  immediate filemark, then the seal's blocks, then one synchronous filemark, which flushes the
+  drive's buffer before the catalog records the seal.
+- **W8. The room past the warning is a slice plus the seal, with a margin.** A slice plus the
+  seal must fit in half the smallest post-warning room among the configured drives (ADR-0012
+  item 100). `config check` and `stage create` refuse a larger `slice_size`, which is what
+  makes W4 safe.
+- **W9. Read back what was written past the warning.** A session that saw the warning in a
+  data slice (W4's first two cases) reads back the entry at `ended_after` and the seal, and
+  hashes the entry against File 3, under every confirm tier (§5; ADR-0012 item 114). A block
+  st refused but the drive kept would show there.
+
+A plan may reach past the fill ceiling. It may list whole units up to 100% of the cartridge's
+nominal capacity, but only when the drive declares `post_warning_bytes` (ADR-0012 item 113).
+Units planned past the warning's point are cut (§4.2). Without that key the plan stops at the
+fill ceiling. An unexpected early warning still seals short.
 
 ## 5. What "confirm" verifies (byte level)
 
@@ -590,19 +1013,37 @@ fixes only the *cryptographic content* of the confirm pass, because it is a prop
 of the format. Confirm is a **single forward pass from BOP** (no seek-back — the
 index is at the front):
 
-1. Read the seal marker (last file). Absent ⇒ not sealed; confirm fails.
+1. Read the seal marker (the last file, located by §1.2 rule 6: at `ended_after + 1`
+   when the catalog records the volume short). Absent ⇒ not sealed; confirm fails.
+   It is parsed by §4.1's rules S1–S6.
 2. Hash File 3; compare to the seal marker's `front_index_sha256`. Mismatch ⇒ the
    tape's two ends disagree ⇒ quarantine.
 3. Parse File 3; diff its `{position, type, size_bytes}` entries against the Layout
-   ⇒ **navigable** tier.
-4. For every file except File 3 and the seal marker, read and hash it, compare to
-   File 3's `sha256_encrypted[i]` ⇒ **integrity** tier.
+   ⇒ **navigable** tier. File 3 and the Layout are both the plan, so they are
+   compared whole on a short tape too.
+   - *(1.6.0)* The seal's `ended_after` must equal the catalog's: the session's
+     ending for a write's confirm, `volumes.ended_after` for `volume verify` (NULL
+     means the planned M-1). A disagreement is the mismatch kind
+     `ended_after_disagrees`. It says nothing about the medium, so the confirm is
+     **inconclusive** (never a quarantine), as for any mismatch that does not prove
+     the medium bad.
+4. For every file at or before `ended_after` except File 3 and the seal marker, read
+   and hash it, compare to File 3's `sha256_encrypted[i]` ⇒ **integrity** tier.
+   Positions after `ended_after` are not read (§4.2).
+
+**The readback past the early warning** (1.6.0, ADR-0012 item 114). A write session
+that saw the early warning in a data slice (§4.3 W4) always reads back the entry at
+`ended_after` and the seal, and hashes that entry against File 3, whatever the tier.
+At most one slice and the seal. Under the integrity tier this is already part of
+step 4; under the navigable tier it is the one content file the confirm hashes. A
+session that did not see the warning confirms as before.
 
 **Which tier runs depends on the caller** (ADR-0012, amendment 2026-10-06 item 1,
 #387; v2-open-questions.md §1.2's reversal and §2.4 L3):
 
 - **A write's post-seal confirm is navigable by default** (steps 1–3: File 3 and the
-  seal marker), and a passing one seals. `--full-confirm`, on every command that
+  seal marker, plus the readback past the early warning above when there was one), and a
+  passing one seals. `--full-confirm`, on every command that
   writes a volume, opts in to the integrity tier. What the default gives up is L3 at
   write time — the one host → HBA → drive → medium check (with LBP unreachable
   through `st`, the readback hash is the only control spanning that chain) — so
@@ -649,7 +1090,9 @@ any doubt is a rewind). The manual steps below read in that order.
    says exactly which). If File 3 itself is unreadable, the seal marker's
    **embedded copy** provides the same map (validate its per-file hashes against
    the files themselves before trust). RESTORE.sh `--verify` reads the seal last,
-   at the end of its one ascending pass.
+   at the end of its one ascending pass. On a tape whose File 0 requires
+   `short-seal` (1.6.0), read the seal **before any slice**: its `ended_after`
+   says where the tape ended, and a file after it is not on this tape (§4.2).
 4. For each envelope position: `dd` it out, check its hash against the front
    index, `age -d -i KEY` — the one that decrypts is yours ⇒ `MANIFEST.toml` +
    `RECOVERY.md` + `catalogs/` (each unit's isolated dar catalogue,
@@ -660,7 +1103,9 @@ any doubt is a rewind). The manual steps below read in that order.
    has a backup copy further on (§1.3: the `*_backup` entry with the same
    `sha256_encrypted`): read that one instead. RESTORE.sh does this by
    itself, and skips a backup whose primary already opened.
-5. For each slice position in your manifest, in order: `dd bs=512k` it out;
+5. For each slice position in your manifest, in order (first checking that the
+   unit's last slice is at or before the seal's `ended_after`; if it is not, the
+   unit is cut and not on this tape whole, §4.2): `dd bs=512k` it out;
    `head -c size_bytes` to trim padding; `sha256sum` vs the front index's
    `sha256_encrypted` (**keyless** integrity) and/or the envelope's value;
    `age -d -i KEY` → `base.N.dar`. RESTORE.sh streams this: `dd | head | tee
@@ -752,6 +1197,31 @@ first (a kit made by 1.5.0 or later carries `tapectl-<version>`, named on its co
 sha256). After the sixth read, "done" also checks the Heir Kit's catalogue, and a unit whose
 every copy is damaged has a done state. "Start here" may run to 64 lines.
 
+**Since 1.6.0** (ADR-0012 items 110-115, #420; the golden pins of RESTORE.sh, File 0 and
+MANIFEST.toml move). A tape may end early, at the drive's early warning, with a short seal
+(§4.1–§4.3).
+- **On tape.** File 0 and the seal state `requires = ["short-seal"]` on every tape (§1.2).
+  Every seal states `ended_after` (§4.1). File 3's `[index]` and every envelope's
+  `[manifest]` state `may_end_early = true`, and File 3 has a header paragraph that says so
+  (§1.7, §3). RECOVERY.md and File 1 explain the seal's `ended_after` and how to read it by
+  hand (§1.7).
+- **RESTORE.sh.** `KNOWN_FEATURES="short-seal"`, and the "this tape needs tapectl" text
+  (`die_newer_needed`, fixed at "tapectl 1.1.0" since 2026-10-06 item 20) moves to "tapectl
+  1.6.0", because a new required feature arrived. A seal before File 0's pointer is the normal
+  short ending on a tape that requires `short-seal`, and draws no warning (§1.2 rule 6).
+  `establish_files` reads the seal after File 3 and before any slice. The modes behave as §4.2
+  says: `--info` names where the tape ended, `--verify` prints `NOT ON TAPE` past it,
+  `--restore` and `--list` refuse a cut unit by name, `--where` marks cut versions, and a second
+  tape's seal is read first.
+- **Compatibility.** 1.6.0 reads every tape before it: a seal with no `ended_after` is a full
+  seal (§4.1 S3), and a tape that does not require `short-seal` never ends early. Every reader
+  that checks `requires` (RESTORE.sh since 1.1.0, tapectl's readers as §1.2 rule 1 lists them)
+  refuses every 1.6.0 tape at File 0 and names `short-seal` (§1.2). So the Heir Kit's copy of
+  tapectl must be 1.6.0 or later once a 1.6.0 tape exists, and the kit is regenerated when
+  1.6.0 is installed (item 111). A 1.5.0 tape's
+  own RESTORE.sh refuses a 1.6.0 tape given to it as a second tape (`--swap-tapes`,
+  `--fill-from`) by the same rule.
+
 ## 7. Block mode
 
 Fixed-block mode, 512 KB (decision D7). Plan-first depends on deterministic block
@@ -767,10 +1237,13 @@ LTO-6 validation session, not a format question.
 - The v1 **mid-tape mini-index** — its position/type/size data moves to File 3 and
   gains ciphertext hashes; its generator is repurposed, not deleted.
 - The three-layer **end-of-tape salvage** (v4 §2.9 / Appendix C:
-  overwrite-incomplete, sacrifice-last-slice). A real EOT is a **clean abort to an
-  unsealed tape** (layout-session.md), never a salvaged partial — a partial was
-  never a copy (ADR-0003/0004), and the salvage path is untestable on mhvtl (the
-  2026-07-20 drill) and was a source of the audit's HIGH-severity defects. The
+  overwrite-incomplete, sacrifice-last-slice). Until 1.6.0 a real EOT was a **clean
+  abort to an unsealed tape** (layout-session.md), never a salvaged partial — a partial
+  was never a copy (ADR-0003/0004), and the salvage path is untestable on mhvtl (the
+  2026-07-20 drill) and was a source of the audit's HIGH-severity defects. Since 1.6.0
+  the drive's early warning ends the tape with a **short seal** (§4.1–§4.3). That is
+  not the salvage: nothing is overwritten or sacrificed, no unit is split, and only
+  whole units count. The hard end inside a slice is still the clean abort. The
   `writes.eot_recovery` and `writes.sacrificed_slice_id` columns become inert schema
   reserve (documented dead in `docs/design-errata.md`; not dropped, per the repo's
   inert-reserve convention).

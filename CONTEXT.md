@@ -70,18 +70,19 @@ _Avoid_: plan (collides with `volume plan` capacity preview), file list
 
 **Write Session**:
 One execution of a Layout onto a cartridge at contact, tracked by a cursor.
-Interruption is a Layout transition, not an accident, and a real end-of-tape is
-a clean abort to an unsealed tape (a capacity mis-estimate, defended pre-flight);
-a session ends with the tape truthfully describing itself, or with the catalog
-knowing exactly why not.
+Interruption is a Layout transition, not an accident. The drive's Early warning
+ends a session with a Short seal (1.6.0); the hard end inside a slice is still a
+clean abort to an unsealed tape. A session ends with the tape truthfully
+describing itself, or with the catalog knowing exactly why not.
 _Avoid_: write (the verb), job
 
 **Sealed**:
 The volume state after a session's confirm readback passes: the tape begins with
 a front index describing everything after it and ends with a seal marker
-asserting completeness, and it will never be written again. Only sealed volumes
-contribute claims to derivations. Sealed volumes are immutable; there is no
-append.
+asserting that every file before it is present, and it will never be written
+again. A tape that ended early with a Short seal is sealed too. Only sealed
+volumes contribute claims to derivations. Sealed volumes are immutable; there is
+no append.
 _Avoid_: closed, finalized
 
 **Unsealed**:
@@ -89,6 +90,42 @@ A volume mid-session or after interruption: slices may be on tape but the
 trailing metadata is absent or unconfirmed. Not self-describing, not a copy;
 resumable while the same session's Layout remains valid.
 _Avoid_: open, partial
+
+**Early warning**:
+The drive's signal, near the physical end of a cartridge, that the medium is
+almost full. The st driver reports it by refusing a `write(2)` with ENOSPC; past
+it, st refuses about one write in two at once and accepts the next, so a writer
+that retries can still finish a slice and a seal. The room past it is the
+drive's guaranteed figure or a measured one, the drive's `post_warning_bytes`
+(99,008 MB on the HP LTO-6). It is not the end of the tape: the **hard end** is
+where st refuses every write (more than 16 refusals of one block in a row), and
+a session that meets it inside a slice aborts.
+_Avoid_: EOT and end of tape (they do not say which of the two is meant), EOM,
+full
+
+**Short seal**:
+A seal marker written early (1.6.0): at the Early warning, the slice in flight
+at position K is finished and the seal goes at K+1 instead of the planned
+position, stating `ended_after = K`. The tape is Sealed: every unit whose
+slices all lie at or before K is a Copy, and every planned position after K is
+not on the tape. The front index still lists the whole plan, and the short seal
+still binds it by hash. A seal at the planned position is a **full seal**.
+Every tape written by 1.6.0 carries `requires = ["short-seal"]`, whichever seal
+it ends with, so an older reader refuses it by name.
+_Avoid_: partial seal, truncated tape, salvage (the rejected v4 design
+overwrote or sacrificed slices; a short seal does neither)
+
+**Cut**:
+What a Short seal does to a unit it does not hold whole: a unit with any slice
+planned after `ended_after` is cut. That is the unit the Early warning
+interrupted, and every unit planned after it. A cut unit counts as nothing on
+that tape: its `writes` row is `cut`, never a Copy, though its slices that
+reached the tape stay recorded. It stays staged and is written whole to the next
+cartridge as an ordinary write. Only the drive cuts a unit, and only on a
+sealed tape: an aborted session's rows are `aborted`, never `cut`.
+_Avoid_: split (a cut unit is not divided between tapes: it is written whole
+again; dividing a version is Spanning, and only a unit that allows it spans),
+truncated, partial copy, aborted
 
 **Copy**:
 A claim to the same bytes on another medium: one snapshot Version of a unit,

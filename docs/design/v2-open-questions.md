@@ -732,9 +732,16 @@ The modes above stand; RESTORE.sh also:
   trailing padding (the old `tr -d '\0'` destroyed ciphertext).
 
 A backup copy of each tenant envelope (#412 item 6, research R2) is built in
-1.1.0 (ADR-0012 2026-10-12 item 44; `volume-format-v2.md` §1.3). Open: the
+1.1.0 (ADR-0012 2026-10-12 item 44; `volume-format-v2.md` §1.3). ~~Open: the
 write path's contact check (session.rs) still locates a foreign
-tape's seal by File 0's pointer, not by end of data.
+tape's seal by File 0's pointer, not by end of data.~~ **Resolved
+2026-10-20** (ADR-0012 items 110-111, #420), in the spec, for the 1.6.0
+build: the contact check finds the seal by the same rule as every other
+reader, the planned position or, when the medium ends before it, the last
+file before end of data, counted by filemarks and never by READ POSITION
+(`volume-format-v2.md` §1.2 rule 6; `store::locate_seal`,
+`layout-session.md` "Store seam"). A short-sealed cartridge therefore
+refuses `--force` like any sealed one.
 
 ---
 
