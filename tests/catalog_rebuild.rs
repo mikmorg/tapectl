@@ -4446,7 +4446,11 @@ fn a_seal_marker_naming_another_volume_does_not_seal_the_tape() {
 fn a_seal_marker_requiring_an_unknown_feature_refuses_the_rebuild() {
     let mut vol = build_sealed_volume(true);
     edit_seal_marker(&mut vol, |text| {
-        text.replacen("requires = []", "requires = [\"future-feature\"]", 1)
+        // Since 1.6.0 every seal states `requires = ["short-seal"]`
+        // (ADR-0012 item 111); the edit adds an unknown feature beside it.
+        let anchor = "requires = [\"short-seal\"]";
+        assert_eq!(text.matches(anchor).count(), 1, "{text}");
+        text.replacen(anchor, "requires = [\"short-seal\", \"future-feature\"]", 1)
     });
     let dir = tempfile::tempdir().unwrap();
     let conn = fresh_db(dir.path());
