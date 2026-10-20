@@ -74,7 +74,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::db::busy::{self, BusyPolicy};
 use crate::error::{Result, TapectlError};
 use crate::pipeline::{self, BufferPool, Verdict};
-use crate::store::{Checkpoint, Checkpoints, ConfirmPlan, Evidence, ReadOrder, Store, Tier};
+use crate::store::{
+    Checkpoint, Checkpoints, ConfirmPlan, EarlyWarning, Evidence, ReadOrder, SealLocation, Store,
+    Tier,
+};
 
 use super::build::{BuildUnit, BuiltLayout};
 use super::format;
@@ -82,6 +85,109 @@ use super::layout;
 use super::layout_model::{
     ContentSource, KeyAvailability, LayoutEntry, LayoutError, SliceCheck, ZoneKind,
 };
+
+// ── the ending (#420, 1.6.0) ──
+
+/// How a write session's tape ends (`volume-format-v2.md` §4.1, §4.3 W4;
+/// `layout-session.md` "The short ending"). Decided once: by `run_entries`
+/// after the entry in which the drive's early warning came, by a resume from
+/// the recorded warning or the seal it found, and never changed after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ending {
+    /// The full seal at the planned position M, `ended_after = M-1`: no
+    /// early warning, or one in the last data slice (W4).
+    Full,
+    /// The short seal at K+1, `ended_after = K`: the early warning came in
+    /// data slice K ≤ M-2, and no data entry after it is written (W4).
+    Short { ended_after: u32 },
+}
+
+impl Ending {
+    /// `volumes.ended_after`: K on a short seal, NULL on a full one
+    /// (`layout-session.md`, migration 038).
+    pub fn recorded_ended_after(self) -> Option<u32> {
+        match self {
+            Ending::Full => None,
+            Ending::Short { ended_after } => Some(ended_after),
+        }
+    }
+
+    /// Where the seal goes on a Layout whose planned seal position is
+    /// `planned`: M, or K+1.
+    pub fn seal_position(self, planned: u32) -> u32 {
+        match self {
+            Ending::Full => planned,
+            Ending::Short { ended_after } => ended_after + 1,
+        }
+    }
+
+    /// The ending a catalog row records: `volumes.ended_after` (NULL is a
+    /// full seal).
+    fn from_recorded(ended_after: Option<i64>) -> Ending {
+        match ended_after.and_then(|k| u32::try_from(k).ok()) {
+            Some(ended_after) => Ending::Short { ended_after },
+            None => Ending::Full,
+        }
+    }
+}
+
+/// Test support (#420): the embedded copy of a seal that keeps
+/// `volume-format-v2.md` §4.1's rules S1-S5, for fixtures that put a seal on
+/// a tape by hand: Files 0-2, File 3 (filled in), data slices from 4, through
+/// `ended_after`. A 1.6.0 seal with an empty or inconsistent copy is
+/// unparseable (rule S6), which is the unsealed signal, so a fixture that
+/// means "sealed" needs one of these.
+#[cfg(test)]
+pub(crate) fn fixture_seal_files(ended_after: u32) -> Vec<layout::FrontIndexFile> {
+    assert!(ended_after >= 4, "a data slice at 4 or after");
+    (0..=ended_after as i32)
+        .map(|position| layout::FrontIndexFile {
+            position,
+            type_label: match position {
+                0 => "id_thunk",
+                1 => "system_guide",
+                2 => "restore_sh",
+                3 => "front_index",
+                _ => "data_slice",
+            },
+            size_bytes: Some(1000 + position as u64),
+            sha256_encrypted: Some(format!("{position:064x}")),
+        })
+        .collect()
+}
+
+/// Test support (#420): a full 1.6.0 seal at `seal_position` (≥ 5) binding
+/// `front_index_sha256`, over [`fixture_seal_files`]; unpadded bytes.
+#[cfg(test)]
+pub(crate) fn fixture_seal(label: &str, seal_position: u32, front_index_sha256: &str) -> Vec<u8> {
+    let mut files = fixture_seal_files(seal_position - 1);
+    files.push(layout::FrontIndexFile {
+        position: seal_position as i32,
+        type_label: "seal_marker",
+        size_bytes: None,
+        sha256_encrypted: None,
+    });
+    layout::generate_seal_marker(
+        label,
+        seal_position as i32 + 1,
+        front_index_sha256,
+        &files,
+    )
+    .into_bytes()
+}
+
+/// Test support (#420): a short 1.6.0 seal at `ended_after + 1` binding
+/// `front_index_sha256`, over [`fixture_seal_files`]; unpadded bytes.
+#[cfg(test)]
+pub(crate) fn fixture_short_seal(label: &str, ended_after: u32, front_index_sha256: &str) -> Vec<u8> {
+    layout::generate_short_seal_marker(
+        label,
+        ended_after as i32,
+        front_index_sha256,
+        &fixture_seal_files(ended_after),
+    )
+    .into_bytes()
+}
 
 // ── ValidatedLayout ──
 
@@ -152,6 +258,23 @@ pub struct PlannedSession {
     /// `stage_slice_id -> write_id`, so `execute` knows which `writes` row's
     /// `write_positions` cursor row to update for each slice entry.
     slice_write_id: HashMap<i64, i64>,
+    /// The drive's configured `post_warning_bytes`, for the
+    /// `write_early_warning` event's wear record (#420). `None` (JSON
+    /// `null`) unless [`Self::with_post_warning_bytes`] set it.
+    post_warning_bytes: Option<u64>,
+}
+
+impl PlannedSession {
+    /// The drive's `[[backends.lto]] post_warning_bytes`, in bytes, which the
+    /// `write_early_warning` event records (`layout-session.md`, "The
+    /// `write_early_warning` event"). The session has no `Config`; the
+    /// command that opened the drive passes it.
+    pub fn with_post_warning_bytes(self, post_warning_bytes: Option<u64>) -> Self {
+        Self {
+            post_warning_bytes,
+            ..self
+        }
+    }
 }
 
 impl ValidatedLayout {
@@ -231,6 +354,7 @@ impl ValidatedLayout {
             volume_id,
             write_ids,
             slice_write_id,
+            post_warning_bytes: None,
         })
     }
 }
@@ -438,6 +562,19 @@ pub struct ReadyToSeal {
     built: BuiltLayout,
     volume_id: i64,
     write_ids: Vec<(i64, i64)>,
+    /// Which seal [`Self::seal`] writes: full at M, or short at K+1.
+    ending: Ending,
+    /// The drive's early warning came in a data slice (W4's first two
+    /// cases): the confirm reads back the entry at `ended_after` and the
+    /// seal under every tier (§4.3 W9, ADR-0012 item 114).
+    warning_in_data: bool,
+}
+
+impl ReadyToSeal {
+    /// The seal this session will write.
+    pub fn ending(&self) -> Ending {
+        self.ending
+    }
 }
 
 /// SIGINT (or a startup-sweep-detected crash) stopped execution between
@@ -459,6 +596,24 @@ pub struct InterruptedSession {
     /// drive failed mid-write (issue #408). `None` for an interrupt and for
     /// a session rehydrated from the catalog.
     reason: Option<String>,
+    /// What the catalog records of this session's ending (#420), read by
+    /// [`Self::rehydrate`]: `volumes.ended_after`, and the `ended_after` (K)
+    /// of the latest `write_early_warning` event at or after the session
+    /// started. Both `None` on a session `run_entries` handed back, which
+    /// stops only before a warning.
+    recorded: RecordedEnding,
+    /// The drive's `post_warning_bytes`, for a warning met while resuming.
+    post_warning_bytes: Option<u64>,
+}
+
+/// What the catalog says about how a session ended (#420,
+/// `layout-session.md` "Resume after a crash past the warning").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RecordedEnding {
+    /// `volumes.ended_after`: set only with a short seal's `sealed_at`.
+    ended_after: Option<i64>,
+    /// The `write_early_warning` event's K: the ending was decided.
+    warning_at: Option<u32>,
 }
 
 /// Terminal, not resumable: the tape is not a copy
@@ -518,6 +673,38 @@ pub struct QuarantinedSession {
 pub struct SealedSession {
     pub volume_id: i64,
     pub label: String,
+    /// How the tape ended (#420).
+    pub ending: Ending,
+    /// The units whose rows the pass made `cut`, by name, in plan order:
+    /// on a short seal, the unit the early warning interrupted and every unit
+    /// planned after it (`layout-session.md`, "Confirm of a short ending").
+    /// Empty on a full seal.
+    pub cut_units: Vec<String>,
+}
+
+impl SealedSession {
+    /// What the operator is told after a short seal (`layout-session.md`,
+    /// "After a short seal"): where the tape ended, the cut units, and the
+    /// command that writes them. `None` on a full seal. A short seal is a
+    /// success: the command exits 0.
+    pub fn short_ending_report(&self) -> Option<String> {
+        let Ending::Short { ended_after } = self.ending else {
+            return None;
+        };
+        let units = if self.cut_units.is_empty() {
+            "none".to_string()
+        } else {
+            self.cut_units.join(", ")
+        };
+        Some(format!(
+            "volume \"{label}\" sealed short: the drive's early warning came in tape file \
+             {ended_after}, so the tape ends after it. Every unit wholly before it is on this \
+             tape and counts as a copy. Cut (not on this tape, still staged): {units}. Write \
+             them whole onto another cartridge with an ordinary `tapectl volume write <label>` \
+             (`--init` initialises a new one).",
+            label = self.label,
+        ))
+    }
 }
 
 /// Confirm's readback did not succeed, but nothing it saw proves the medium
@@ -674,9 +861,16 @@ pub(crate) struct ContactFacts {
     identity: Option<format::IdThunkIdentity>,
     /// File 0's own `[layout] seal_marker` pointer, when it parsed.
     seal_pointer: Option<i64>,
-    /// Every seal position probed, and what the probe found there. Each
-    /// position is read at most once per contact.
-    seal_reads: HashMap<u32, SealRead>,
+    /// File 0's `requires`, when File 0 read and its claims parsed (#420):
+    /// `volume-format-v2.md` §1.2 rule 6 accepts a seal before the planned
+    /// position only on a tape that requires `short-seal`. `None` when File
+    /// 0 did not read or parse; the seal's own `requires` then decides.
+    file0_requires: Option<Vec<String>>,
+    /// Every PLANNED seal position probed, where rule 6 found the seal's
+    /// file for it (the planned position, or the last file on a medium that
+    /// ends before it, `store::locate_seal`), and what was read there. Each
+    /// planned position is located at most once per contact.
+    seal_reads: HashMap<u32, (u32, SealRead)>,
 }
 
 /// What reading one seal position found (issue #460).
@@ -699,63 +893,115 @@ enum SealRead {
 /// [`ContactFacts::probe_seal`]'s answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SealProbe {
-    /// The position holds a parsing seal marker.
-    Parses,
-    /// It does not hold one, and positively so.
+    /// A seal marker that `volume-format-v2.md` §1.2 rule 6 accepts is at
+    /// `position`: the planned one, or K+1 on a tape that ended early.
+    Parses { position: u32 },
+    /// There is none, and positively so.
     Absent,
-    /// It could not be read, and the tape is not shown to end before it.
-    Unreadable(String),
+    /// The file at `position` could not be read, and the tape is not shown
+    /// to end before it.
+    Unreadable { position: u32, error: String },
 }
 
 impl ContactFacts {
-    /// What `position` holds -- reading it only the first time it is asked
-    /// about (issue #403: resume used to read the same seal position up to
-    /// three times, each a long locate).
+    /// Whether the tape holds a seal marker for the PLANNED seal position
+    /// `planned` -- locating it only the first time it is asked about
+    /// (issue #403: resume used to read the same seal position up to three
+    /// times, each a long locate).
+    ///
+    /// The seal is found by `volume-format-v2.md` §1.2 rule 6
+    /// ([`crate::store::locate_seal`], #420): at `planned`, or, when the
+    /// medium ends before it, as the last file on the medium. Before 1.6.0
+    /// END OF DATA at `planned` read as "no seal", so a cartridge sealed
+    /// short (its seal at K+1, before the planned M) looked unsealed and
+    /// `volume write --force` could overwrite it (ADR-0003). A seal before
+    /// `planned` counts only as rule 6 accepts it ([`Self::accepts`]).
     ///
     /// A failed read is [`SealProbe::Absent`] only on positive evidence
     /// (issue #460): the medium is blank at BOT (`medium_blank`, already
-    /// proved by the caller), or reports END OF DATA at or before the
-    /// position. Any other failure is [`SealProbe::Unreadable`]; before
-    /// #460 every failure read as "no seal", which is right for a blank
-    /// tape (its positions do not read) and wrong for a sealed one whose
-    /// seal does not.
-    fn probe_seal(
-        &mut self,
-        store: &mut dyn Store,
-        position: u32,
-        medium_blank: bool,
-    ) -> SealProbe {
-        let read = self.seal_reads.entry(position).or_insert_with(|| {
-            // Bounded (issue #400): an oversized file is no seal marker.
-            match crate::store::read_small(store, position) {
-                Ok(crate::store::SmallRead::Bytes(bytes)) => SealRead::Bytes(bytes),
-                Ok(crate::store::SmallRead::Oversized) => SealRead::Absent,
-                Err(e) => {
-                    if medium_blank || store.eod_at_or_before(position).unwrap_or(false) {
-                        SealRead::Absent
-                    } else {
-                        SealRead::Unreadable(e.to_string())
+    /// proved by the caller), or it holds no file at all. Any other failure
+    /// is [`SealProbe::Unreadable`]; before #460 every failure read as "no
+    /// seal", which is right for a blank tape (its positions do not read)
+    /// and wrong for a sealed one whose seal does not.
+    fn probe_seal(&mut self, store: &mut dyn Store, planned: u32, medium_blank: bool) -> SealProbe {
+        if !self.seal_reads.contains_key(&planned) {
+            let located = if medium_blank {
+                // Issue #400: a medium blank at BOT holds no file anywhere.
+                // One bounded read, as before #420; a failure is absent.
+                match crate::store::read_small(store, planned) {
+                    Ok(crate::store::SmallRead::Bytes(bytes)) => (planned, SealRead::Bytes(bytes)),
+                    Ok(crate::store::SmallRead::Oversized) | Err(_) => (planned, SealRead::Absent),
+                }
+            } else {
+                match crate::store::locate_seal(store, planned) {
+                    SealLocation::File { position, bytes } => (position, SealRead::Bytes(bytes)),
+                    // Bounded (issue #400): an oversized file is no seal.
+                    SealLocation::Oversized { position } => (position, SealRead::Absent),
+                    SealLocation::Absent => (planned, SealRead::Absent),
+                    SealLocation::Unreadable { position, error } => {
+                        (position, SealRead::Unreadable(error))
                     }
                 }
-            }
-        });
-        match read {
-            SealRead::Bytes(bytes)
-                if format::parse_seal_marker(&String::from_utf8_lossy(bytes)).is_ok() =>
-            {
-                SealProbe::Parses
-            }
-            SealRead::Bytes(_) | SealRead::Absent => SealProbe::Absent,
-            SealRead::Unreadable(error) => SealProbe::Unreadable(error.clone()),
+            };
+            self.seal_reads.insert(planned, located);
+        }
+        match &self.seal_reads[&planned] {
+            (position, SealRead::Bytes(_)) => match self.accepted_seal(planned) {
+                Some(_) => SealProbe::Parses {
+                    position: *position,
+                },
+                None => SealProbe::Absent,
+            },
+            (_, SealRead::Absent) => SealProbe::Absent,
+            (position, SealRead::Unreadable(error)) => SealProbe::Unreadable {
+                position: *position,
+                error: error.clone(),
+            },
         }
     }
 
-    /// The bytes this contact read at `position`, if it read them.
-    pub(crate) fn seal_bytes(&self, position: u32) -> Option<Vec<u8>> {
-        match self.seal_reads.get(&position) {
-            Some(SealRead::Bytes(bytes)) => Some(bytes.clone()),
-            Some(SealRead::Absent | SealRead::Unreadable(_)) | None => None,
+    /// The seal located for the planned position `planned`, when it parses
+    /// and rule 6 accepts it: where it is, and what it says.
+    fn accepted_seal(&self, planned: u32) -> Option<(u32, format::ParsedSeal)> {
+        let (position, SealRead::Bytes(bytes)) = self.seal_reads.get(&planned)? else {
+            return None;
+        };
+        let seal = format::parse_seal_marker(&String::from_utf8_lossy(bytes)).ok()?;
+        self.accepts(&seal, *position, planned)
+            .then_some((*position, seal))
+    }
+
+    /// `volume-format-v2.md` §1.2 rule 6, "Which seal a reader accepts", for
+    /// a seal found at `position` for the planned position `planned`:
+    /// - at the planned position, any seal that parses, as before 1.6.0
+    ///   (the contact check refuses on it; confirm judges it);
+    /// - before it, only on a tape that requires `short-seal` (File 0's
+    ///   `requires`, or the seal's own when File 0 did not parse), a seal
+    ///   that itself requires it, keeps §4.1's rules (it parsed) and states
+    ///   `file_count = N` for the N files on the medium (`position = N-1`);
+    /// - before it, too, a seal this tapectl must not interpret (a feature it
+    ///   does not know, §1.2 rule 1): it may be a newer tapectl's sealed
+    ///   tape, and a write fails closed on it (ADR-0003).
+    fn accepts(&self, seal: &format::ParsedSeal, position: u32, planned: u32) -> bool {
+        if position >= planned || seal.refusal().is_some() {
+            return true;
         }
+        let tape_requires_short_seal = match &self.file0_requires {
+            Some(requires) => requires.iter().any(|f| f == format::SHORT_SEAL),
+            None => true,
+        };
+        tape_requires_short_seal
+            && seal.requires_short_seal()
+            && i64::from(seal.file_count) == i64::from(position) + 1
+    }
+
+    /// The bytes this contact read at tape position `position`, if it read
+    /// them there.
+    pub(crate) fn seal_bytes(&self, position: u32) -> Option<Vec<u8>> {
+        self.seal_reads.values().find_map(|(at, read)| match read {
+            SealRead::Bytes(bytes) if *at == position => Some(bytes.clone()),
+            _ => None,
+        })
     }
 
     /// File 0's bytes, when this contact read them (not oversized).
@@ -783,6 +1029,11 @@ pub(crate) fn contact_report(
         Ok(crate::store::SmallRead::Bytes(id_thunk_bytes)) => {
             facts.file0 = Some(id_thunk_bytes.clone());
             let text = String::from_utf8_lossy(&id_thunk_bytes);
+            // #420: what File 0 requires decides whether a seal before its
+            // own pointer can be this tape's (rule 6).
+            facts.file0_requires = format::parse_id_thunk_claims(&text)
+                .ok()
+                .map(|claims| claims.requires);
             let identity = format::parse_id_thunk_identity(&text);
             facts.identity = identity.as_ref().ok().cloned();
             let matches = matches!(
@@ -821,7 +1072,7 @@ pub(crate) fn contact_report(
                     let position = pointers.seal_marker as u32;
                     // File 0 read, so the tape is not blank at BOT.
                     match facts.probe_seal(store, position, false) {
-                        SealProbe::Parses => {
+                        SealProbe::Parses { position } => {
                             return (
                                 ContactOutcome::AlreadySealed {
                                     seal_position: position,
@@ -833,7 +1084,7 @@ pub(crate) fn contact_report(
                         // foreign File 0 whose seal does not read is not a
                         // plain mismatch `--force` may overwrite, and a
                         // matching one is not `Matches`.
-                        SealProbe::Unreadable(error) => {
+                        SealProbe::Unreadable { position, error } => {
                             return (ContactOutcome::SealUnreadable { position, error }, facts);
                         }
                         SealProbe::Absent => {}
@@ -880,22 +1131,16 @@ pub(crate) fn contact_report(
     // pointer, probed just above (issue #403).
     if let Some(seal_pos) = seal_position {
         match facts.probe_seal(store, seal_pos, blank) {
-            SealProbe::Parses => {
+            SealProbe::Parses { position } => {
                 return (
                     ContactOutcome::AlreadySealed {
-                        seal_position: seal_pos,
+                        seal_position: position,
                     },
                     facts,
                 );
             }
-            SealProbe::Unreadable(error) => {
-                return (
-                    ContactOutcome::SealUnreadable {
-                        position: seal_pos,
-                        error,
-                    },
-                    facts,
-                );
+            SealProbe::Unreadable { position, error } => {
+                return (ContactOutcome::SealUnreadable { position, error }, facts);
             }
             SealProbe::Absent => {}
         }
@@ -937,29 +1182,43 @@ pub(crate) fn contact_report(
 ///
 /// Any failure — File 0 unreadable, unparseable, a non-matching identity, no
 /// recorded pointer, a pointer that disagrees with this session's Layout, or
-/// a position that does not parse as a seal marker — returns `false`, and
+/// a position that does not parse as a seal marker — returns `None`, and
 /// the caller keeps today's behaviour: quarantine, never proceed.
+///
+/// From 1.6.0 condition 3 is "the seal rule 6 locates for that position"
+/// (#420): the planned position M, or K+1 on a tape that ended early. The
+/// answer is the ending the seal states, which the confirm then checks: a
+/// seal at M is the full ending; one before it must be the short seal at
+/// K+1 (`ended_after = K`, classified short against the plan's count),
+/// else this is not this session's seal.
 fn resume_reconfirm_eligible(
     facts: &ContactFacts,
     expected_label: &str,
     expected_uuid: &str,
     expected_seal_position: Option<u32>,
-) -> bool {
-    let Some(expected_seal_position) = expected_seal_position else {
-        return false;
-    };
-    let Some(identity) = &facts.identity else {
-        return false;
-    };
+) -> Option<Ending> {
+    let expected_seal_position = expected_seal_position?;
+    let identity = facts.identity.as_ref()?;
     if identity.label != expected_label || identity.uuid != expected_uuid {
-        return false;
+        return None;
     }
     if facts.seal_pointer != Some(i64::from(expected_seal_position)) {
-        return false;
+        return None;
     }
-    facts
-        .seal_bytes(expected_seal_position)
-        .is_some_and(|bytes| format::parse_seal_marker(&String::from_utf8_lossy(&bytes)).is_ok())
+    let (position, seal) = facts.accepted_seal(expected_seal_position)?;
+    if position == expected_seal_position {
+        return Some(Ending::Full);
+    }
+    match seal.ending(u64::from(expected_seal_position) + 1) {
+        format::SealEnding::Short { ended_after }
+            if u64::from(position) == ended_after + 1 && seal.refusal().is_none() =>
+        {
+            Some(Ending::Short {
+                ended_after: u32::try_from(ended_after).ok()?,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Whether THIS volume's own `seal()` already ran — `volumes.sealed_at`
@@ -1000,19 +1259,27 @@ fn seal_recorded(conn: &Connection, volume_id: i64) -> Result<bool> {
 /// `AlreadySealed` arm that passed [`resume_reconfirm_eligible`] calls this --
 /// a tape that merely looks sealed (a foreign one, a position that disagrees)
 /// is quarantined and must not stamp this volume's row.
+///
+/// From 1.6.0 (#420) a short seal's `ended_after` is recorded with it, in the
+/// same statement (`layout-session.md`: "written in the same transaction as
+/// `sealed_at` … on a resume … from the seal it located"); a full one leaves
+/// `volumes.ended_after` as it is (NULL).
 fn record_seal_found_at_resume(
     conn: &Connection,
     volume_id: i64,
     seal_bytes: Option<&[u8]>,
+    ending: Ending,
 ) -> Result<()> {
     let sealed_at = seal_bytes
         .and_then(|b| format::parse_seal_marker(&String::from_utf8_lossy(b)).ok())
         .and_then(|seal| format::catalog_timestamp(&seal.sealed_at));
+    let ended_after = ending.recorded_ended_after();
     busy::retry(BusyPolicy::DEFAULT, "the seal", || {
         Ok(conn.execute(
-            "UPDATE volumes SET sealed_at = COALESCE(sealed_at, COALESCE(?2, datetime('now')))
+            "UPDATE volumes SET sealed_at = COALESCE(sealed_at, COALESCE(?2, datetime('now'))),
+                    ended_after = COALESCE(?3, ended_after)
              WHERE id = ?1",
-            params![volume_id, sealed_at],
+            params![volume_id, sealed_at, ended_after],
         )?)
     })?;
     Ok(())
@@ -1469,6 +1736,7 @@ impl PlannedSession {
             0,
             &mut is_interrupted,
             park_marker_from_env(),
+            self.post_warning_bytes,
         )
     }
 }
@@ -1485,6 +1753,16 @@ impl InterruptedSession {
     /// full medium. `None` for SIGINT.
     pub fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
+    }
+
+    /// The drive's `post_warning_bytes`, for the `write_early_warning`
+    /// event of a warning this resume meets: [`PlannedSession::
+    /// with_post_warning_bytes`].
+    pub fn with_post_warning_bytes(self, post_warning_bytes: Option<u64>) -> Self {
+        Self {
+            post_warning_bytes,
+            ..self
+        }
     }
 
     pub fn layout(&self) -> &super::layout_model::Layout {
@@ -1663,6 +1941,8 @@ impl InterruptedSession {
             }
         }
 
+        let recorded = recorded_ending(conn, volume_id, &write_ids)?;
+
         Ok(Some(InterruptedSession {
             built: BuiltLayout {
                 layout,
@@ -1673,6 +1953,8 @@ impl InterruptedSession {
             slice_write_id,
             adopted_from_aborted: status == "aborted",
             reason: None,
+            recorded,
+            post_warning_bytes: None,
         }))
     }
 
@@ -1835,10 +2117,20 @@ impl InterruptedSession {
             seal_position,
         );
         phase.done();
-        // Issue #403: whatever this contact already read at the seal
+        // #420 step 1 (`layout-session.md`, "Resume after a crash past the
+        // warning"): a recorded seal re-enters confirm with the ending
+        // `volumes.ended_after` records (NULL: full), and owes the readback
+        // past the warning when the warning was recorded.
+        let recorded_ending = Ending::from_recorded(self.recorded.ended_after);
+        let warning_in_data = self.recorded.warning_at.is_some();
+        // Issue #403: whatever this contact already read at the seal's
         // position goes to confirm, so a re-confirming resume locates the
-        // seal once, not again for the chain walk.
-        let seal_bytes = seal_position.and_then(|p| facts.seal_bytes(p));
+        // seal once, not again for the chain walk — but only bytes read
+        // where this ending puts the seal (#420: M, or K+1).
+        let seal_bytes_for = |ending: Ending| {
+            seal_position.and_then(|p| facts.seal_bytes(ending.seal_position(p)))
+        };
+        let seal_bytes = seal_bytes_for(recorded_ending);
         match contact {
             ContactOutcome::Blank | ContactOutcome::Matches => {
                 // ADR-0012's 2026-09-21 correction "the seal is RECORDED,
@@ -1867,6 +2159,8 @@ impl InterruptedSession {
                         // found at one read, not after the whole pass.
                         seal_order: ReadOrder::SealFirst,
                         seal_bytes,
+                        ending: recorded_ending,
+                        warning_in_data,
                     }));
                 }
                 // sealed_at is NULL: the seal is still genuinely owed.
@@ -1887,6 +2181,8 @@ impl InterruptedSession {
                         // first, as for a recorded seal that did not read.
                         seal_order: ReadOrder::SealFirst,
                         seal_bytes,
+                        ending: recorded_ending,
+                        warning_in_data,
                     }));
                 }
                 // An unsealed one would write. A read error is not proof
@@ -1923,6 +2219,8 @@ impl InterruptedSession {
                         write_ids: self.write_ids,
                         seal_order: ReadOrder::SealFirst,
                         seal_bytes,
+                        ending: recorded_ending,
+                        warning_in_data,
                     }));
                 }
                 // NOT recorded: whether `seal()` already ran is exactly what
@@ -1984,18 +2282,27 @@ impl InterruptedSession {
                 // `check_tape_contact` reports this same shape for a
                 // genuinely FOREIGN sealed tape too (its own seal probe runs
                 // "whether or not the identity matched", issue #208).
-                if resume_reconfirm_eligible(
+                if let Some(ending) = resume_reconfirm_eligible(
                     &facts,
                     &self.built.layout.label,
                     &self.built.layout.volume_uuid,
                     seal_position,
                 ) {
+                    // #420: the already-sealed path takes the ending from
+                    // the seal's own bytes (step 2), whatever the catalog
+                    // recorded.
+                    let seal_bytes = seal_bytes_for(ending);
                     // Issue #460: this tape IS this session's sealed tape, so
                     // the fact `finish_session` records where `seal()`
                     // returns is recorded here too -- by a process that died
                     // between the two it never was, and a later resume that
                     // cannot read the seal would be told it is still owed.
-                    record_seal_found_at_resume(conn, self.volume_id, seal_bytes.as_deref())?;
+                    record_seal_found_at_resume(
+                        conn,
+                        self.volume_id,
+                        seal_bytes.as_deref(),
+                        ending,
+                    )?;
                     return Ok(ResumeOutcome::Confirming(SealedPending {
                         built: self.built,
                         volume_id: self.volume_id,
@@ -2005,6 +2312,8 @@ impl InterruptedSession {
                         // is read last, in the forward pass (issue #397).
                         seal_order: ReadOrder::SealLast,
                         seal_bytes,
+                        ending,
+                        warning_in_data,
                     }));
                 }
 
@@ -2038,6 +2347,14 @@ impl InterruptedSession {
                  a sealed tape is never rewritten (ADR-0003). Nothing was written.",
                 self.volume_id
             )));
+        }
+
+        // #420 step 3 (`layout-session.md`, "Resume after a crash past the
+        // warning"): no seal is recorded or on the tape, and the early
+        // warning is — the ending was decided. Resume writes no data entry:
+        // it seals at P = min(K+1, the files on the medium).
+        if let Some(warned_at) = self.recorded.warning_at {
+            return self.seal_after_recorded_warning(conn, store, warned_at);
         }
 
         // 3. Two-case cursor rule (`write_positions.stage_slice_id` is NOT
@@ -2116,9 +2433,105 @@ impl InterruptedSession {
             // execute it exists to make reachable.
             &mut is_interrupted,
             park_marker_from_env(),
+            self.post_warning_bytes,
         )
         .map_err(in_session)?;
         Ok(outcome.into())
+    }
+
+    /// Step 3 of `layout-session.md`'s "Resume after a crash past the
+    /// warning": the `write_early_warning` event recorded the warning in data
+    /// slice `warned_at` (K), and neither the catalog nor the tape holds a
+    /// seal. Counts the files on the medium by filemarks
+    /// ([`Store::reposition_at_most`]`(K+1)`, which never moves past K+1):
+    /// N. The seal goes at P = min(K+1, N), `ended_after = P-1`, and no data
+    /// entry is written:
+    /// - P-1 before the first data slice: abort;
+    /// - P-1 = M-1 (only when K was M-1): the full seal at M;
+    /// - otherwise the short seal at P.
+    ///
+    /// When P-1 is below K (the medium lost files the catalog recorded
+    /// written, #403) the positions from P go back to `pending`, the seal
+    /// states P-1, and the session log names both numbers; no second event is
+    /// written. A seal torn by the crash and counted at K+1 is replaced: a
+    /// write at a position ends the recorded data there.
+    fn seal_after_recorded_warning(
+        self,
+        conn: &Connection,
+        store: &mut dyn Store,
+        warned_at: u32,
+    ) -> Result<ResumeOutcome> {
+        let planned_seal = planned_seal_position(&self.built.layout)?;
+        let label = self.built.layout.label.clone();
+        let in_session = |e: TapectlError| e.in_write_session(&label);
+        let phase = crate::progress::phase("positioning", None);
+        let seal_at = store.reposition_at_most(warned_at.saturating_add(1).min(planned_seal))?;
+        phase.done();
+
+        let ended_after = seal_at.checked_sub(1);
+        let at = ended_after.and_then(|k| {
+            self.built
+                .layout
+                .entries
+                .iter()
+                .find(|e| e.position as u32 == k)
+        });
+        let Some(ended_after) = ended_after.filter(|_| {
+            at.is_some_and(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+        }) else {
+            // W6: a tape that ends inside its metadata holds no unit.
+            let reason = format!(
+                "the drive's early warning was recorded in tape file {warned_at}, but the tape \
+                 holds only {seal_at} file(s), so a seal now would end it before its first data \
+                 slice: a tape that ends inside its metadata holds no unit (volume-format-v2.md \
+                 §4.3 W6). The session aborts and the tape is left unsealed; write these units \
+                 to another cartridge"
+            );
+            crate::progress::log(&reason);
+            mark_writes(conn, &self.write_ids, "aborted").map_err(in_session)?;
+            return Ok(ResumeOutcome::Aborted(AbortedSession {
+                volume_id: self.volume_id,
+                reason,
+            }));
+        };
+        let ending = if ended_after + 1 == planned_seal {
+            Ending::Full
+        } else {
+            Ending::Short { ended_after }
+        };
+        if ended_after < warned_at {
+            tracing::warn!(
+                warned_at,
+                ended_after,
+                "the tape holds fewer files than the catalog recorded written past the early \
+                 warning; sealing after the last file it holds"
+            );
+            crate::progress::log(&format!(
+                "the early warning was recorded in file {warned_at}, but the tape holds \
+                 {seal_at} file(s); sealing at file {seal_at} with ended_after = {ended_after}"
+            ));
+            demote_positions_from(conn, &self.write_ids, seal_at as usize).map_err(in_session)?;
+        } else {
+            crate::progress::log(&format!(
+                "the early warning was recorded in file {warned_at}; resuming to the seal at file \
+                 {} with no further data slice",
+                ending.seal_position(planned_seal)
+            ));
+        }
+        for (write_id, _) in &self.write_ids {
+            conn.execute(
+                "UPDATE writes SET status = 'in_progress' WHERE id = ?1",
+                params![write_id],
+            )
+            .map_err(|e| in_session(e.into()))?;
+        }
+        Ok(ResumeOutcome::Ready(ReadyToSeal {
+            built: self.built,
+            volume_id: self.volume_id,
+            write_ids: self.write_ids,
+            ending,
+            warning_in_data: true,
+        }))
     }
 }
 
@@ -2176,27 +2589,86 @@ impl ReadyToSeal {
             })
             .collect();
 
-        let real_seal_bytes = layout::generate_seal_marker(
-            &self.built.layout.label,
-            self.built.layout.entries.len() as i32,
-            &fi_hash,
-            &seal_files,
-        );
-
-        if real_seal_bytes.len() as u64 != placeholder_len {
-            return Err(TapectlError::Other(format!(
-                "seal: real seal marker ({} bytes) != frozen placeholder ({placeholder_len} \
-                 bytes) — the placeholder-sizing trick broke; generate_seal_marker's timestamp \
-                 must render at fixed width",
-                real_seal_bytes.len()
-            )));
-        }
+        let real_seal_bytes = match self.ending {
+            Ending::Full => {
+                let real = layout::generate_seal_marker(
+                    &self.built.layout.label,
+                    self.built.layout.entries.len() as i32,
+                    &fi_hash,
+                    &seal_files,
+                );
+                if real.len() as u64 != placeholder_len {
+                    return Err(TapectlError::Other(format!(
+                        "seal: real seal marker ({} bytes) != frozen placeholder \
+                         ({placeholder_len} bytes) — the placeholder-sizing trick broke; \
+                         generate_seal_marker's timestamp must render at fixed width",
+                        real.len()
+                    )));
+                }
+                real
+            }
+            // §4.1: the plan's entries 0 to K (File 3's filled in), then the
+            // seal's own at K+1. The Layout — File 3 — is unchanged: a short
+            // seal binds the same front index a full one would have.
+            Ending::Short { ended_after } => {
+                let planned = seal_entry.position;
+                let at_k = seal_files.iter().find(|f| f.position as u32 == ended_after);
+                if ended_after + 2 > planned as u32
+                    || at_k.map(|f| f.type_label) != Some("data_slice")
+                {
+                    return Err(TapectlError::Other(format!(
+                        "seal: a short seal ends after a data slice before the last one \
+                         (volume-format-v2.md §4.1), but ended_after = {ended_after} is {} on a \
+                         Layout whose seal is planned at {planned}",
+                        at_k.map_or("not a position of the Layout", |f| f.type_label)
+                    )));
+                }
+                let through_k: Vec<layout::FrontIndexFile> = seal_files
+                    .into_iter()
+                    .filter(|f| f.position as u32 <= ended_after)
+                    .collect();
+                let real = layout::generate_short_seal_marker(
+                    &self.built.layout.label,
+                    ended_after as i32,
+                    &fi_hash,
+                    &through_k,
+                );
+                // §4.1 "Length": never longer than the placeholder build
+                // sized; never required to be equal.
+                if real.len() as u64 > placeholder_len {
+                    return Err(TapectlError::Other(format!(
+                        "seal: the short seal ({} bytes) is longer than the frozen placeholder \
+                         ({placeholder_len} bytes) build sized for the full one — \
+                         volume-format-v2.md §4.1 says it never is",
+                        real.len()
+                    )));
+                }
+                real
+            }
+        };
 
         store.execute(
             &mut Cursor::new(real_seal_bytes.as_bytes()),
             real_seal_bytes.len() as u64,
             true,
         )?;
+
+        // `layout-session.md`: a warning first seen in the seal's own blocks
+        // changes nothing — the store retried them (W2), no event is
+        // written, and the seal stays the kind it was. The session log says so.
+        if !self.warning_in_data {
+            if let Some(warning) = store.early_warning() {
+                crate::progress::log(&format!(
+                    "the drive's early warning came in the seal marker's own blocks ({} \
+                     block write(s) refused and retried); the seal stays the {} seal it was",
+                    warning.refusals,
+                    match self.ending {
+                        Ending::Full => "full",
+                        Ending::Short { .. } => "short",
+                    }
+                ));
+            }
+        }
 
         Ok(SealedPending {
             built: self.built,
@@ -2207,6 +2679,8 @@ impl ReadyToSeal {
             // its one forward pass (issue #397).
             seal_order: ReadOrder::SealLast,
             seal_bytes: None,
+            ending: self.ending,
+            warning_in_data: self.warning_in_data,
         })
     }
 }
@@ -2224,9 +2698,30 @@ pub struct SealedPending {
     /// (a resume's contact check, issue #403) — `confirm` starts from them
     /// instead of locating the seal a second time. `None` after `seal()`.
     seal_bytes: Option<Vec<u8>>,
+    /// How the tape ended: the seal is at M (full) or K+1 (short).
+    ending: Ending,
+    /// The early warning came in a data slice: the readback past it is owed
+    /// under every tier (§4.3 W9, ADR-0012 item 114).
+    warning_in_data: bool,
 }
 
 impl SealedPending {
+    /// How the tape ended: what `write::finish_session` records as
+    /// `volumes.ended_after` beside `sealed_at` when `seal()` returns
+    /// ([`Ending::recorded_ended_after`]; `layout-session.md`: "written in
+    /// the same transaction as `sealed_at`").
+    pub fn ending(&self) -> Ending {
+        self.ending
+    }
+
+    /// Whether the drive's early warning came in a data slice of this
+    /// session (§4.3 W4's first two cases), so its confirm owes the readback
+    /// of the entry at `ended_after` and the seal under every tier (§4.3 W9,
+    /// ADR-0012 item 114).
+    pub fn readback_past_warning(&self) -> bool {
+        self.warning_in_data
+    }
+
     /// `SealedPending -> ConfirmOutcome`. Runs `store.confirm` (the §5 chain
     /// walk), records a `verification_sessions` row (`verify_type`:
     /// Integrity -> 'full', Navigable -> 'quick', ADR-0001), then three
@@ -2327,7 +2822,32 @@ impl SealedPending {
             Tier::Navigable => plan,
         };
         let plan = plan.with_seal(self.seal_bytes.as_deref());
-        let evidence = store.confirm_with(&self.built.layout, plan)?;
+        if self.warning_in_data && tier == Tier::Navigable {
+            // #420: the chain walk does not yet take the ending, so the
+            // navigable tier reads no content file; item 114's readback of
+            // entry `ended_after` waits on it (store.rs). Said loudly.
+            tracing::warn!(
+                label = %self.built.layout.label,
+                "this write met the drive's early warning, and its quick confirm does not yet \
+                 read back the file before the seal (ADR-0012 item 114 is not built in the chain \
+                 walk); run `tapectl volume verify` on this volume"
+            );
+        }
+        let evidence = match self.ending {
+            Ending::Full => store.confirm_with(&self.built.layout, plan)?,
+            // #420: the seal is at K+1, and positions after K are not on
+            // the tape (§4.2). See `ShortEndingReads`: what the walk does not
+            // yet know of the ending, this keeps from reading.
+            Ending::Short { ended_after } => {
+                let planned_seal = planned_seal_position(&self.built.layout)?;
+                ShortEndingReads {
+                    inner: store,
+                    ended_after,
+                    planned_seal,
+                }
+                .confirm_with(&self.built.layout, plan)?
+            }
+        };
         phase.done();
         let passed = evidence.mismatches.is_empty();
         // ADR-0012's 2026-09-18 amendment: a mismatch alone is not a
@@ -2379,17 +2899,52 @@ impl SealedPending {
             // IMMEDIATE (issue #377: it reads snapshot statuses, then
             // writes) and retried as a whole on a busy catalog — a dropped
             // transaction rolls back, so each attempt starts clean.
-            let promoted = busy::retry(BusyPolicy::DEFAULT, "the seal", || {
+            let (promoted, cut_units) = busy::retry(BusyPolicy::DEFAULT, "the seal", || {
                 let tx = busy::immediate_tx(conn)?;
-                for ((write_id, _), entered) in self.write_ids.iter().zip(&entry_statuses) {
+                // #420 (`layout-session.md`, "Confirm of a short ending"): on
+                // a short seal a stage set is on this tape only when every
+                // slice of it is at or before `ended_after`; every other set
+                // of the session is `cut` — the one the warning interrupted
+                // and every one planned after it. `cut` is written here and
+                // nowhere else in the session.
+                let mut whole_snapshots: Vec<i64> = Vec::with_capacity(self.write_ids.len());
+                let mut cut_units: Vec<String> = Vec::new();
+                for ((write_id, snapshot_id), entered) in self.write_ids.iter().zip(&entry_statuses)
+                {
+                    let whole = match self.ending {
+                        Ending::Full => true,
+                        Ending::Short { ended_after } => last_slice_position(&tx, *write_id)?
+                            .is_none_or(|last| last <= i64::from(ended_after)),
+                    };
                     // ADR-0012 2026-10-06 item 24: `write_verified` means
                     // fully read back — an Integrity confirm, never a quick one.
-                    let completed = tx.execute(
-                        "UPDATE writes SET status = 'completed', completed_at = datetime('now'),
-                                write_verified = ?3
-                         WHERE id = ?1 AND status = ?2",
-                        params![write_id, entered, tier == Tier::Integrity],
-                    )?;
+                    let completed = if whole {
+                        tx.execute(
+                            "UPDATE writes SET status = 'completed', completed_at = datetime('now'),
+                                    write_verified = ?3
+                             WHERE id = ?1 AND status = ?2",
+                            params![write_id, entered, tier == Tier::Integrity],
+                        )?
+                    } else {
+                        tx.execute(
+                            "UPDATE writes SET status = 'cut' WHERE id = ?1 AND status = ?2",
+                            params![write_id, entered],
+                        )?
+                    };
+                    if whole {
+                        whole_snapshots.push(*snapshot_id);
+                    } else if completed > 0 {
+                        cut_units.push(
+                            tx.query_row(
+                                "SELECT u.name FROM snapshots s JOIN units u ON u.id = s.unit_id
+                                 WHERE s.id = ?1",
+                                params![snapshot_id],
+                                |r| r.get(0),
+                            )
+                            .optional()?
+                            .unwrap_or_else(|| format!("snapshot {snapshot_id}")),
+                        );
+                    }
                     if completed == 0 {
                         // Issue #376 (c): the row moved while confirm read the
                         // tape — an operator's abort got there first. Dropping
@@ -2418,8 +2973,10 @@ impl SealedPending {
                 // update so the event records a real old->new transition
                 // rather than guessing, and so nothing is logged when the
                 // guard matches no row.
+                // Only a set this tape holds whole promotes its snapshot: a
+                // cut one's version is not written yet (#420).
                 let mut promoted: Vec<(i64, String, String, i64)> = Vec::new();
-                for (_, snapshot_id) in &self.write_ids {
+                for snapshot_id in &whole_snapshots {
                     let before: Option<(String, String, i64)> = tx
                         .query_row(
                             "SELECT s.status, u.name, u.tenant_id
@@ -2452,10 +3009,12 @@ impl SealedPending {
                 // clause `adopt_lost` also has is NOT here: the seal is
                 // already recorded on the row by the time confirm runs
                 // (issue #330).
+                // #420: `ended_after` is K on a short seal, NULL on a full
+                // one (migration 038), confirmed by this readback.
                 let sealed = tx.execute(
-                    "UPDATE volumes SET status = 'sealed'
+                    "UPDATE volumes SET status = 'sealed', ended_after = ?2
                      WHERE id = ?1 AND status = 'initialized'",
-                    params![self.volume_id],
+                    params![self.volume_id, self.ending.recorded_ended_after()],
                 )?;
                 if sealed == 0 {
                     // As for the `writes` guard above: dropping `tx` rolls
@@ -2479,7 +3038,7 @@ impl SealedPending {
                     )));
                 }
                 tx.commit()?;
-                Ok(promoted)
+                Ok((promoted, cut_units))
             })?;
 
             // Audit rows are emitted AFTER the commit, deliberately, and a
@@ -2513,10 +3072,17 @@ impl SealedPending {
                     );
                 }
             }
-            Ok(ConfirmOutcome::Sealed(SealedSession {
+            let sealed = SealedSession {
                 volume_id: self.volume_id,
                 label: self.built.layout.label.clone(),
-            }))
+                ending: self.ending,
+                cut_units,
+            };
+            if let Some(report) = sealed.short_ending_report() {
+                tracing::info!(label = %sealed.label, "{report}");
+                crate::progress::log(&report);
+            }
+            Ok(ConfirmOutcome::Sealed(sealed))
         } else if proves_medium_bad {
             // Issue #242: the chain-walk's own quarantine finding is an
             // observed fact too -- `observed_condition`, not `status`. This
@@ -2614,6 +3180,7 @@ fn run_entries(
     start_index: usize,
     is_interrupted: &mut dyn FnMut() -> bool,
     park_marker: Option<String>,
+    post_warning_bytes: Option<u64>,
 ) -> Result<ExecuteOutcome> {
     let content_entries: Vec<&LayoutEntry> = built
         .layout
@@ -2621,6 +3188,15 @@ fn run_entries(
         .iter()
         .filter(|e| !matches!(e.kind, ZoneKind::SealMarker))
         .collect();
+    // #420: the planned seal position M, and the on-tape bytes before the
+    // first entry this call writes — the store counts its early warning's
+    // `bytes_at` from its own open, and the event counts from BOT.
+    let planned_seal = planned_seal_position(&built.layout)?;
+    let block_size = built.layout.block_size.max(1);
+    let bytes_before_this_call: u64 = content_entries[..start_index]
+        .iter()
+        .map(|e| e.on_tape_bytes(block_size).unwrap_or(0))
+        .sum();
 
     // Issue #113: the beginning-of-tape resume arm of the mhvtl gate used to
     // race. It waited on `writes.status='in_progress'` — true from `plan()`,
@@ -2683,6 +3259,8 @@ fn run_entries(
                     slice_write_id,
                     adopted_from_aborted: false,
                     reason: None,
+                    recorded: RecordedEnding::default(),
+                    post_warning_bytes,
                 }));
             }
         }
@@ -2726,6 +3304,8 @@ fn run_entries(
                 slice_write_id,
                 adopted_from_aborted: false,
                 reason: None,
+                recorded: RecordedEnding::default(),
+                post_warning_bytes,
             }));
         }
 
@@ -2901,8 +3481,74 @@ fn run_entries(
                     slice_write_id,
                     adopted_from_aborted: false,
                     reason: Some(reason),
+                    recorded: RecordedEnding::default(),
+                    post_warning_bytes,
                 }));
             }
+        }
+
+        // #420 (`volume-format-v2.md` §4.3 W4; `layout-session.md` "Deciding
+        // the ending"): after every `Written` entry, the store's early
+        // warning. The store retried every refused block itself (W2), so
+        // this entry is whole, its filemark included. The warning is sticky
+        // and this loop ends at the first entry that shows it, so that entry
+        // is the one the warning came in.
+        if let Some(warning) = store.early_warning() {
+            let position = entry.position as u32;
+            if !matches!(entry.kind, ZoneKind::Slice { .. }) {
+                // W6: a tape that ends inside its metadata holds no unit.
+                let reason = format!(
+                    "the drive's early warning (the end of the medium is near) came in tape \
+                     file {position} ({}), before the first data slice: a tape that ends inside \
+                     its metadata holds no unit, so the session aborts and the tape is left \
+                     unsealed (volume-format-v2.md §4.3 W6). {} block write(s) were refused and \
+                     retried; the warning came {} bytes into the tape. Write these units to \
+                     another cartridge",
+                    entry.kind.type_label(),
+                    warning.refusals,
+                    bytes_before_this_call + warning.bytes_at,
+                );
+                crate::progress::log(&reason);
+                mark_writes(conn, &write_ids, "aborted")?;
+                return Ok(ExecuteOutcome::Aborted(AbortedSession { volume_id, reason }));
+            }
+            let ending = if position + 1 == planned_seal {
+                Ending::Full
+            } else {
+                Ending::Short {
+                    ended_after: position,
+                }
+            };
+            // W5: committed before the seal's first block goes to the store.
+            record_early_warning(
+                conn,
+                volume_id,
+                &built.layout.label,
+                position,
+                &warning,
+                bytes_before_this_call,
+                post_warning_bytes,
+                ending,
+            )?;
+            crate::progress::log(&match ending {
+                Ending::Full => format!(
+                    "the drive's early warning came in the last data slice (file {position}); \
+                     sealing full at file {planned_seal}, as planned"
+                ),
+                Ending::Short { .. } => format!(
+                    "the drive's early warning came in data slice {position}; writing no further \
+                     data slice and sealing short at file {} (ended_after = {position})",
+                    position + 1
+                ),
+            });
+            phase.done();
+            return Ok(ExecuteOutcome::Ready(ReadyToSeal {
+                built,
+                volume_id,
+                write_ids,
+                ending,
+                warning_in_data: true,
+            }));
         }
     }
 
@@ -2911,6 +3557,8 @@ fn run_entries(
         built,
         volume_id,
         write_ids,
+        ending: Ending::Full,
+        warning_in_data: false,
     }))
 }
 
@@ -2974,16 +3622,219 @@ fn record_quarantine(
 /// (issue #377): this records where a tape session stopped, and losing it to
 /// a 5-second lock wait would leave the rows claiming a state the tape is
 /// not in. Idempotent, so safe to retry.
+///
+/// Never a `cut` row, and never TO `cut` (#420, ADR-0012 item 112): `cut`
+/// is terminal and is written only inside a passing confirm's transaction,
+/// so an Inconclusive confirm's `interrupted` (or any later mark) leaves it
+/// as it is.
 fn mark_writes(conn: &Connection, write_ids: &[(i64, i64)], status: &str) -> Result<()> {
+    debug_assert_ne!(status, "cut", "cut is written only by a passing confirm");
     for (write_id, _) in write_ids {
         busy::retry(BusyPolicy::DEFAULT, "a write session's status", || {
             Ok(conn.execute(
-                "UPDATE writes SET status = ?1 WHERE id = ?2",
+                "UPDATE writes SET status = ?1 WHERE id = ?2 AND status <> 'cut'",
                 params![status, write_id],
             )?)
         })?;
     }
     Ok(())
+}
+
+/// The planned seal position M: the Layout's `seal_marker` entry.
+fn planned_seal_position(layout: &super::layout_model::Layout) -> Result<u32> {
+    layout
+        .entries
+        .iter()
+        .find(|e| matches!(e.kind, ZoneKind::SealMarker))
+        .map(|e| e.position as u32)
+        .ok_or_else(|| TapectlError::Other("layout has no seal_marker entry".into()))
+}
+
+/// The Layout position of the last slice of `write_id`'s stage set, from its
+/// `write_positions` rows (`plan` inserts one per slice, at its Layout
+/// position). `None` for a set with no slice.
+fn last_slice_position(conn: &Connection, write_id: i64) -> Result<Option<i64>> {
+    Ok(conn.query_row(
+        "SELECT MAX(CAST(position AS INTEGER)) FROM write_positions WHERE write_id = ?1",
+        params![write_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// The `write_early_warning` event (`layout-session.md`, "The
+/// `write_early_warning` event"; §4.3 W5): one `events` row, committed after
+/// entry K's cursor row is `written` and before the seal's first block goes
+/// to the store. `new_value` is K, the `ended_after` the session seals at;
+/// `details` is the wear record of ADR-0012 item 98, in the spec's key
+/// order. `bytes_at` counts from the beginning of the tape:
+/// `bytes_before_this_call` (the Layout's padded sizes of every file before
+/// the first entry this process wrote) plus the store's own.
+#[allow(clippy::too_many_arguments)]
+fn record_early_warning(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    ended_after: u32,
+    warning: &EarlyWarning,
+    bytes_before_this_call: u64,
+    post_warning_bytes: Option<u64>,
+    ending: Ending,
+) -> Result<()> {
+    let details = format!(
+        "{{\"bytes_at\": {}, \"refusals\": {}, \"post_warning_bytes\": {}, \"seal\": \"{}\"}}",
+        bytes_before_this_call + warning.bytes_at,
+        warning.refusals,
+        post_warning_bytes.map_or_else(|| "null".to_string(), |p| p.to_string()),
+        match ending {
+            Ending::Full => "full",
+            Ending::Short { .. } => "short",
+        }
+    );
+    let new_value = ended_after.to_string();
+    busy::retry(BusyPolicy::DEFAULT, "the early warning's event", || {
+        crate::db::events::log_event(
+            conn,
+            "volume",
+            volume_id,
+            Some(label),
+            "write_early_warning",
+            Some("ended_after"),
+            None,
+            Some(&new_value),
+            Some(&details),
+            None,
+        )
+    })?;
+    Ok(())
+}
+
+/// What the catalog records of how a session on `volume_id` ended (#420,
+/// `layout-session.md` "Resume after a crash past the warning"):
+/// `volumes.ended_after`, and the K of the latest `write_early_warning`
+/// event for the volume whose timestamp is at or after the session's
+/// `started_at` (the earliest of its rows').
+fn recorded_ending(
+    conn: &Connection,
+    volume_id: i64,
+    write_ids: &[(i64, i64)],
+) -> Result<RecordedEnding> {
+    let ended_after: Option<i64> = conn.query_row(
+        "SELECT ended_after FROM volumes WHERE id = ?1",
+        params![volume_id],
+        |r| r.get(0),
+    )?;
+    let mut started_at: Option<String> = None;
+    for (write_id, _) in write_ids {
+        let row: Option<String> = conn.query_row(
+            "SELECT started_at FROM writes WHERE id = ?1",
+            params![write_id],
+            |r| r.get(0),
+        )?;
+        if let Some(row) = row {
+            if started_at.as_ref().is_none_or(|s| row < *s) {
+                started_at = Some(row);
+            }
+        }
+    }
+    let warning_at = match started_at {
+        None => None,
+        Some(started_at) => conn
+            .query_row(
+                "SELECT new_value FROM events
+                 WHERE entity_type = 'volume' AND entity_id = ?1
+                   AND action = 'write_early_warning' AND timestamp >= ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![volume_id, started_at],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .and_then(|k| k.parse::<u32>().ok()),
+    };
+    Ok(RecordedEnding {
+        ended_after,
+        warning_at,
+    })
+}
+
+/// The bridge that confirms a SHORT-sealed tape through today's chain walk
+/// (#420), which knows only the planned seal position M and every planned
+/// file. Over the store it wraps:
+/// - a read of M reads K+1, where the short seal is (§1.2 rule 6: a catalog
+///   reader that knows `ended_after` reads the seal at `ended_after + 1`);
+/// - a read of any other position after K fails, naming it not on this tape
+///   (§4.2 R3: never read a position after `ended_after` for data). The walk
+///   reports that as `ContentUnreadable`, which proves nothing about the
+///   medium, so an Integrity-tier short confirm is inconclusive — it fails
+///   closed — until the walk itself skips those positions;
+/// - everything else passes through.
+///
+/// What it does NOT do, and the chain walk must (`store.rs`, routed): skip
+/// positions after `ended_after` at step 4, check the seal's `ended_after`
+/// against the session's (`ended_after_disagrees`, §5 step 3), and read back
+/// entry `ended_after` under the navigable tier (§5, ADR-0012 item 114).
+/// Remove this when `ConfirmPlan` carries the ending.
+struct ShortEndingReads<'s> {
+    inner: &'s mut dyn Store,
+    ended_after: u32,
+    planned_seal: u32,
+}
+
+impl ShortEndingReads<'_> {
+    /// The position on the medium a read of `position` is, or why there is
+    /// none.
+    fn on_tape(&self, position: u32) -> Result<u32> {
+        if position == self.planned_seal {
+            Ok(self.ended_after + 1)
+        } else if position > self.ended_after {
+            Err(TapectlError::Other(format!(
+                "tape file {position} is after ended_after = {}: the tape ended before it, so it \
+                 is not on this tape (volume-format-v2.md §4.2)",
+                self.ended_after
+            )))
+        } else {
+            Ok(position)
+        }
+    }
+}
+
+impl Store for ShortEndingReads<'_> {
+    fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+        self.inner.capacity()
+    }
+    fn execute(&mut self, _src: &mut dyn std::io::Read, _len: u64, _sync: bool) -> Result<u64> {
+        Err(TapectlError::Other(
+            "a confirm reads; it never writes".to_string(),
+        ))
+    }
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.inner.early_warning()
+    }
+    fn read_file(&mut self, position: u32, sink: &mut dyn std::io::Write) -> Result<u64> {
+        let at = self.on_tape(position)?;
+        self.inner.read_file(at, sink)
+    }
+    fn read_file_head(
+        &mut self,
+        position: u32,
+        max_bytes: u64,
+        sink: &mut dyn std::io::Write,
+    ) -> Result<u64> {
+        let at = self.on_tape(position)?;
+        self.inner.read_file_head(at, max_bytes, sink)
+    }
+    fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+        self.inner.reposition_for_resume(file_index)
+    }
+    fn blank_at_bot(&mut self) -> Result<bool> {
+        self.inner.blank_at_bot()
+    }
+    fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+        self.inner.eod_at_or_before(position)
+    }
+    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+        self.inner.files_on_medium()
+    }
 }
 
 /// Move this session's `write_positions` at Layout position `from` or later
@@ -3289,6 +4140,15 @@ mod tests {
         fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
             self.inner.reposition_for_resume(file_index)
         }
+        fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+            self.inner.early_warning()
+        }
+        fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+            self.inner.eod_at_or_before(position)
+        }
+        fn files_on_medium(&mut self) -> Result<Option<u32>> {
+            self.inner.files_on_medium()
+        }
         fn confirm_with(
             &mut self,
             layout: &crate::volume::layout_model::Layout,
@@ -3455,6 +4315,15 @@ mod tests {
         }
         fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
             self.inner.reposition_for_resume(file_index)
+        }
+        fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+            self.inner.early_warning()
+        }
+        fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+            self.inner.eod_at_or_before(position)
+        }
+        fn files_on_medium(&mut self) -> Result<Option<u32>> {
+            self.inner.files_on_medium()
         }
     }
 
@@ -5112,7 +5981,7 @@ mod tests {
         // state a crash-after-seal leaves behind. Everything up to it is
         // whatever the interrupted execute wrote (or nothing), which is
         // exactly what the sweep would hand back.
-        let seal_bytes = layout::generate_seal_marker("SESSTEST", 1, "deadbeef", &[]).into_bytes();
+        let seal_bytes = fixture_seal("SESSTEST", seal_pos, "deadbeef");
         let mut padded = seal_bytes;
         padded.resize(BS as usize, 0);
         if store.files.len() <= seal_pos as usize {
@@ -5260,7 +6129,7 @@ mod tests {
             store.files[0] = thunk_padded;
         }
 
-        let seal_bytes = layout::generate_seal_marker("WRONGVOL", 1, "deadbeef", &[]).into_bytes();
+        let seal_bytes = fixture_seal("WRONGVOL", seal_pos, "deadbeef");
         let mut seal_padded = seal_bytes;
         seal_padded.resize(BS as usize, 0);
         if store.files.len() <= seal_pos as usize {
@@ -5375,7 +6244,7 @@ mod tests {
 
         // A real, parseable seal marker genuinely sits at `foreign_seal_pos`
         // — File 0 is telling the truth about ITSELF, just not about our plan.
-        let seal_bytes = layout::generate_seal_marker(&label, 1, "deadbeef", &[]).into_bytes();
+        let seal_bytes = fixture_seal(&label, foreign_seal_pos, "deadbeef");
         let mut seal_padded = seal_bytes;
         seal_padded.resize(BS as usize, 0);
         if store.files.len() <= foreign_seal_pos as usize {
@@ -5494,7 +6363,7 @@ mod tests {
         // A real seal marker genuinely sits at OUR Layout's own seal
         // position — the caller-guess fallback inside `check_tape_contact`
         // will find it, since File 0's own pointer could not be read.
-        let seal_bytes = layout::generate_seal_marker(&label, 1, "deadbeef", &[]).into_bytes();
+        let seal_bytes = fixture_seal(&label, seal_pos, "deadbeef");
         let mut seal_padded = seal_bytes;
         seal_padded.resize(BS as usize, 0);
         if store.files.len() <= seal_pos as usize {
@@ -6065,6 +6934,12 @@ mod tests {
         fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
             self.0.eod_at_or_before(position)
         }
+        fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+            self.0.early_warning()
+        }
+        fn files_on_medium(&mut self) -> Result<Option<u32>> {
+            self.0.files_on_medium()
+        }
     }
 
     /// THE headline regression for issue #277. Builds exactly the scenario
@@ -6376,6 +7251,12 @@ mod tests {
         }
         fn reposition_for_resume(&mut self, _file_index: u32) -> Result<()> {
             panic!("issue #460: a resume that cannot read the seal must not reposition");
+        }
+        fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+            self.inner.early_warning()
+        }
+        fn files_on_medium(&mut self) -> Result<Option<u32>> {
+            self.inner.files_on_medium()
         }
     }
 
@@ -7031,8 +7912,7 @@ mod tests {
             0,
             contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 6),
         );
-        let seal_bytes =
-            layout::generate_seal_marker(CONTACT_LABEL, 6, "deadbeef", &[]).into_bytes();
+        let seal_bytes = fixture_seal(CONTACT_LABEL, 5, "deadbeef");
         let mut seal_padded = seal_bytes;
         seal_padded.resize(BS as usize, 0);
         put_file(&mut store, 5, seal_padded);
@@ -7072,8 +7952,7 @@ mod tests {
             0,
             contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 6),
         );
-        let seal_bytes =
-            layout::generate_seal_marker(CONTACT_LABEL, 6, "deadbeef", &[]).into_bytes();
+        let seal_bytes = fixture_seal(CONTACT_LABEL, 5, "deadbeef");
         let mut seal_padded = seal_bytes;
         seal_padded.resize(BS as usize, 0);
         put_file(&mut store, 5, seal_padded);
@@ -7097,8 +7976,7 @@ mod tests {
             0,
             contact_id_thunk_bytes(CONTACT_LABEL, CONTACT_UUID, 6),
         );
-        let seal_bytes =
-            layout::generate_seal_marker(CONTACT_LABEL, 6, "deadbeef", &[]).into_bytes();
+        let seal_bytes = fixture_seal(CONTACT_LABEL, 5, "deadbeef");
         let mut seal_padded = seal_bytes;
         seal_padded.resize(BS as usize, 0);
         put_file(&mut store, 5, seal_padded);
@@ -7134,7 +8012,7 @@ mod tests {
             0,
             contact_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 6),
         );
-        let seal_bytes = layout::generate_seal_marker("WRONGVOL", 6, "deadbeef", &[]).into_bytes();
+        let seal_bytes = fixture_seal("WRONGVOL", 5, "deadbeef");
         let mut seal_padded = seal_bytes;
         seal_padded.resize(BS as usize, 0);
         put_file(&mut store, 5, seal_padded);
@@ -7187,6 +8065,12 @@ mod tests {
             }
             fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
                 self.0.eod_at_or_before(position)
+            }
+            fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+                self.0.early_warning()
+            }
+            fn files_on_medium(&mut self) -> Result<Option<u32>> {
+                self.0.files_on_medium()
             }
         }
         store.syncs.resize(store.files.len(), false);
@@ -7301,6 +8185,7 @@ mod tests {
             0,
             &mut || marker_for_check.exists(),
             Some(marker.to_string_lossy().into_owned()),
+            None,
         )
         .expect("a parked execute must not error");
 
@@ -7355,6 +8240,7 @@ mod tests {
             planned.slice_write_id,
             0,
             &mut || false,
+            None,
             None,
         )
         .expect("execute should not error");
@@ -8071,6 +8957,12 @@ mod tests {
         fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
             self.inner.eod_at_or_before(position)
         }
+        fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+            self.inner.early_warning()
+        }
+        fn files_on_medium(&mut self) -> Result<Option<u32>> {
+            self.inner.files_on_medium()
+        }
     }
 
     fn slice_position(f: &Fixture, slice_id: i64) -> usize {
@@ -8366,6 +9258,15 @@ mod tests {
         }
         fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
             self.inner.reposition_for_resume(file_index)
+        }
+        fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+            self.inner.early_warning()
+        }
+        fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+            self.inner.eod_at_or_before(position)
+        }
+        fn files_on_medium(&mut self) -> Result<Option<u32>> {
+            self.inner.files_on_medium()
         }
     }
 
@@ -9051,6 +9952,1137 @@ mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .unwrap();
             assert_eq!(rows, vec![("completed".to_string(), want)], "{tier:?}");
+        }
+    }
+
+    // ── #420: the short ending (volume-format-v2.md §4.1-§4.3, §5;
+    // layout-session.md "The short ending") ──
+    mod short_ending {
+        use super::*;
+        use crate::store::{Mismatch, MismatchKind};
+
+        /// These tests' block size: small, so a slice is several blocks and
+        /// File 1 more than one. The doubles model st past the early warning
+        /// (`store::MediumEnd`): the block that reaches the warning is
+        /// accepted and arms a refusal of the NEXT block write, and a filemark
+        /// disarms it — so a warning shows only in an entry with a block
+        /// after the one that reached it.
+        const SBS: u64 = 4096;
+        /// The drive's `post_warning_bytes` these sessions are told.
+        const POST_WARNING: u64 = 99_008_000_000;
+
+        /// A session's world: the catalog, the built Layout and what `plan`
+        /// needs, with every unit's name and stage-set id in plan order.
+        struct Short {
+            conn: Connection,
+            built: BuiltLayout,
+            keys: KeyAvailability,
+            units: Vec<BuildUnit>,
+            volume_id: i64,
+            _dirs: (TempDir, TempDir),
+        }
+
+        /// One tenant, `units` in plan order (name, each slice's length in
+        /// bytes), every slice's bytes distinct block by block (so a block
+        /// written twice changes the file's hash), staged on disk.
+        fn short_fixture(units: &[(&'static str, &[usize])]) -> Short {
+            let conn = db::open_memory().unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('operator', 1, 'active')",
+                [],
+            )
+            .unwrap();
+            let operator_id = conn.last_insert_rowid();
+            let op_key = crate::crypto::keys::generate_keypair();
+            conn.execute(
+                "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+                 VALUES (?1, 'operator-key', ?2, ?3, 'primary', 1)",
+                params![operator_id, op_key.fingerprint, op_key.public_key],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('alpha', 0, 'active')",
+                [],
+            )
+            .unwrap();
+            let tenant_id = conn.last_insert_rowid();
+            let tenant_key = crate::crypto::keys::generate_keypair();
+            conn.execute(
+                "INSERT INTO encryption_keys (tenant_id, alias, fingerprint, public_key, key_type, is_active)
+                 VALUES (?1, 'alpha-key', ?2, ?3, 'primary', 1)",
+                params![tenant_id, tenant_key.fingerprint, tenant_key.public_key],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO volumes (label, backend_type, backend_name, media_type, capacity_bytes, status)
+                 VALUES ('SHORT01', 'lto', 'lto0', 'LTO-6', 2500000000000, 'initialized')",
+                [],
+            )
+            .unwrap();
+            let volume_id = conn.last_insert_rowid();
+
+            let slices_dir = tempfile::tempdir().unwrap();
+            let mut build_units = Vec::new();
+            for (u, (name, lengths)) in units.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO units (uuid, name, tenant_id, current_path, status)
+                     VALUES (?1, ?2, ?3, ?4, 'active')",
+                    params![
+                        format!("uuid-{name}"),
+                        name,
+                        tenant_id,
+                        format!("/tmp/{name}")
+                    ],
+                )
+                .unwrap();
+                let unit_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO snapshots (unit_id, version, status, source_path, file_count, total_size)
+                     VALUES (?1, 1, 'staged', ?2, 1, 32)",
+                    params![unit_id, format!("/tmp/{name}")],
+                )
+                .unwrap();
+                let snapshot_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size) VALUES (?1, 'staged', 524288)",
+                    params![snapshot_id],
+                )
+                .unwrap();
+                let stage_set_id = conn.last_insert_rowid();
+                let slices = lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(n, len)| {
+                        let content: Vec<u8> = (0..*len)
+                            .map(|o| (o / SBS as usize + 31 * u + 7 * n) as u8)
+                            .collect();
+                        fake_slice(
+                            &conn,
+                            slices_dir.path(),
+                            stage_set_id,
+                            n as i64 + 1,
+                            &content,
+                        )
+                    })
+                    .collect();
+                build_units.push(BuildUnit {
+                    stage_set_id,
+                    snapshot_id,
+                    unit_name: name.to_string(),
+                    unit_uuid: format!("uuid-{name}"),
+                    tenant_id,
+                    dar_version: Some("2.7.20".to_string()),
+                    dar_command: Some("dar -c base -R /src".to_string()),
+                    catalog_path: None,
+                    snapshot_version: 1,
+                    slices,
+                });
+            }
+
+            let inputs = BuildInputs {
+                label: "SHORT01".to_string(),
+                volume_uuid: "6f9619ff-8b86-d011-b42d-00cf4fc964ff".to_string(),
+                media_type: "LTO-6".to_string(),
+                tapectl_version: "0.1.0-test".to_string(),
+                created_at: "2026-10-20T00:00:00Z".to_string(),
+                block_size: SBS,
+                usable_bytes: 1_000_000 * SBS,
+                enospc_buffer: SBS,
+                nominal_capacity: 2_500_000_000_000,
+                mam_capacity: 0,
+                mam_manufacturer: String::new(),
+                mam_serial: String::new(),
+                cartridge_identity_source: None,
+                mam_length: 0,
+                mam_loads: 0,
+                units: build_units.clone(),
+                tenants: vec![TenantInfo {
+                    tenant_id,
+                    tenant_name: "alpha".to_string(),
+                    public_keys: vec![tenant_key.public_key],
+                }],
+                operator_public_keys: vec![op_key.public_key],
+                escrow_public_key: None,
+                catalog_db_path: None,
+                index: None,
+            };
+            let session_dir = tempfile::tempdir().unwrap();
+            let built = build::build(&inputs, session_dir.path()).unwrap();
+            let keys = KeyAvailability {
+                tenant_ids: vec![tenant_id],
+                tenants_with_active_key: [tenant_id].into_iter().collect(),
+                operator_key_present: true,
+                escrow_recipient_present: None,
+                stage_sets_lacking_escrow: None,
+            };
+            Short {
+                conn,
+                built,
+                keys,
+                units: build_units,
+                volume_id,
+                _dirs: (slices_dir, session_dir),
+            }
+        }
+
+        /// Three blocks less a little: a slice the warning can come in.
+        const SLICE: usize = 3 * SBS as usize - 100;
+
+        /// The plan most tests use: `a` (two slices), `b` (two), `c` (one).
+        fn three_units() -> Short {
+            short_fixture(&[("a", &[SLICE, SLICE]), ("b", &[SLICE, SLICE]), ("c", &[SLICE])])
+        }
+
+        /// The Layout position of unit `unit`'s slice `n` (0-based).
+        fn slice_at(s: &Short, unit: usize, n: usize) -> u32 {
+            let id = s.units[unit].slices[n].slice_id;
+            s.built
+                .layout
+                .entries
+                .iter()
+                .find(|e| matches!(e.kind, ZoneKind::Slice { stage_slice_id } if stage_slice_id == id))
+                .unwrap()
+                .position as u32
+        }
+
+        /// The on-tape bytes before Layout position `position`.
+        fn bytes_before(s: &Short, position: u32) -> u64 {
+            s.built
+                .layout
+                .entries
+                .iter()
+                .filter(|e| (e.position as u32) < position)
+                .map(|e| e.on_tape_bytes(SBS).unwrap())
+                .sum()
+        }
+
+        /// A MemStore whose early warning comes one byte into Layout
+        /// position `position`: that entry's first block reaches it, and its
+        /// second is the first refused.
+        fn warning_in(s: &Short, position: u32) -> MemStore {
+            MemStore::new(SBS as usize).with_early_warning_after(bytes_before(s, position) + 1)
+        }
+
+        fn planned_seal(s: &Short) -> u32 {
+            planned_seal_position(&s.built.layout).unwrap()
+        }
+
+        /// Validate, plan (telling the session the drive's
+        /// `post_warning_bytes`) and execute `s` against `store`.
+        fn execute(s: Short, store: &mut MemStore) -> (Short, ExecuteOutcome) {
+            let Short {
+                conn,
+                built,
+                keys,
+                units,
+                volume_id,
+                _dirs,
+            } = s;
+            let layout = built.layout.clone();
+            let session_dir = built.session_dir.clone();
+            let outcome = built
+                .into_validated(&keys, SliceCheck::Size, store)
+                .unwrap()
+                .plan(&conn, volume_id, &units)
+                .unwrap()
+                .with_post_warning_bytes(Some(POST_WARNING))
+                .execute(&conn, store)
+                .unwrap();
+            (
+                Short {
+                    conn,
+                    built: BuiltLayout {
+                        layout,
+                        session_dir,
+                    },
+                    keys,
+                    units,
+                    volume_id,
+                    _dirs,
+                },
+                outcome,
+            )
+        }
+
+        fn ready(outcome: ExecuteOutcome) -> ReadyToSeal {
+            match outcome {
+                ExecuteOutcome::Ready(r) => r,
+                ExecuteOutcome::Aborted(a) => panic!("expected Ready, got Aborted: {}", a.reason),
+                ExecuteOutcome::Interrupted(_) => panic!("expected Ready, got Interrupted"),
+            }
+        }
+
+        fn sealed(outcome: ConfirmOutcome) -> SealedSession {
+            match outcome {
+                ConfirmOutcome::Sealed(s) => s,
+                ConfirmOutcome::Quarantined(q) => panic!("expected Sealed, got {:?}", q.reason),
+                ConfirmOutcome::Inconclusive(i) => {
+                    panic!("expected Sealed, got Inconclusive: {:?}", i.evidence.mismatches)
+                }
+            }
+        }
+
+        /// Each unit's write status and snapshot status, in plan order.
+        fn rows(s: &Short) -> Vec<(String, String, String)> {
+            s.conn
+                .prepare(
+                    "SELECT u.name, w.status, sn.status FROM writes w
+                     JOIN snapshots sn ON sn.id = w.snapshot_id
+                     JOIN units u ON u.id = sn.unit_id
+                     WHERE w.volume_id = ?1 ORDER BY w.id",
+                )
+                .unwrap()
+                .query_map(params![s.volume_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        fn row(name: &str, write: &str, snapshot: &str) -> (String, String, String) {
+            (name.to_string(), write.to_string(), snapshot.to_string())
+        }
+
+        /// `volumes.status`, `.ended_after`, `.observed_condition`.
+        fn volume(s: &Short) -> (String, Option<i64>, String) {
+            s.conn
+                .query_row(
+                    "SELECT status, ended_after, observed_condition FROM volumes WHERE id = ?1",
+                    params![s.volume_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        }
+
+        /// Every `write_early_warning` event: (field, old, new, details).
+        fn warning_events(s: &Short) -> Vec<(String, Option<String>, String, String)> {
+            s.conn
+                .prepare(
+                    "SELECT field, old_value, new_value, details FROM events
+                     WHERE entity_type = 'volume' AND entity_id = ?1
+                       AND action = 'write_early_warning' ORDER BY id",
+                )
+                .unwrap()
+                .query_map(params![s.volume_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        /// The `write_positions` statuses of unit `unit`, by Layout position.
+        fn positions(s: &Short, unit: usize) -> Vec<(i64, String)> {
+            s.conn
+                .prepare(
+                    "SELECT CAST(wp.position AS INTEGER), wp.status FROM write_positions wp
+                     JOIN writes w ON w.id = wp.write_id
+                     WHERE w.stage_set_id = ?1 ORDER BY 1",
+                )
+                .unwrap()
+                .query_map(params![s.units[unit].stage_set_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        /// File 0 requiring `short-seal`, as every 1.6.0 tape's does (ADR-0012
+        /// item 111) — the rewrite until the generator writes it (worker D),
+        /// a no-op after. Padded back to the length it had.
+        fn requiring_short_seal(file0: &[u8]) -> Vec<u8> {
+            let text = String::from_utf8_lossy(format::without_nul_padding(file0)).to_string();
+            let text = if text.contains("\nrequires = []\n") {
+                text.replacen("\nrequires = []\n", "\nrequires = [\"short-seal\"]\n", 1)
+            } else {
+                assert!(text.contains("\nrequires = [\"short-seal\"]\n"), "{text}");
+                text
+            };
+            let mut bytes = text.into_bytes();
+            bytes.resize(bytes.len().max(file0.len()), 0);
+            bytes
+        }
+
+        fn parsed_seal(bytes: &[u8]) -> format::ParsedSeal {
+            format::parse_seal_marker(&String::from_utf8_lossy(bytes)).unwrap()
+        }
+
+        /// The warning in a unit's FIRST slice: that unit is cut, and so is
+        /// every unit planned after it; the units wholly before it complete.
+        /// The rows, the snapshots, `ended_after`, the event, the seal's
+        /// bytes and the operator's text, through a passing quick confirm.
+        #[test]
+        fn the_early_warning_in_a_units_first_slice_seals_short_and_cuts_it_and_every_unit_after(
+        ) {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let m = planned_seal(&s);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let ready = ready(outcome);
+            assert_eq!(ready.ending(), Ending::Short { ended_after: k });
+
+            // W4: no data entry after K; W5: the event, before the seal.
+            assert_eq!(store.files.len() as u32, k + 1, "files 0 to K, nothing after");
+            let events = warning_events(&s);
+            assert_eq!(events.len(), 1, "{events:?}");
+            let (field, old, new, details) = &events[0];
+            assert_eq!(field, "ended_after");
+            assert_eq!(*old, None);
+            assert_eq!(new, &k.to_string());
+            let details: serde_json::Value = serde_json::from_str(details).unwrap();
+            // From BOT to the first refused block: K's first block went in.
+            assert_eq!(
+                details["bytes_at"].as_u64(),
+                Some(bytes_before(&s, k) + SBS),
+                "{details}"
+            );
+            // K is three blocks: its second and third were each refused once.
+            assert_eq!(details["refusals"].as_u64(), Some(2), "{details}");
+            assert_eq!(details["post_warning_bytes"].as_u64(), Some(POST_WARNING));
+            assert_eq!(details["seal"].as_str(), Some("short"));
+            assert!(
+                events[0].3.starts_with(
+                    "{\"bytes_at\": ",
+                ) && events[0].3.contains(", \"refusals\": ")
+                    && events[0].3.contains(", \"post_warning_bytes\": ")
+                    && events[0].3.ends_with(", \"seal\": \"short\"}"),
+                "the spec's key order: {}",
+                events[0].3
+            );
+
+            // The short seal at K+1, with a synchronous filemark.
+            let pending = ready.seal(&mut store).unwrap();
+            assert_eq!(pending.ending(), Ending::Short { ended_after: k });
+            assert!(pending.readback_past_warning());
+            assert_eq!(store.files.len() as u32, k + 2);
+            assert_eq!(store.syncs.last(), Some(&true));
+            let seal = parsed_seal(&store.files[k as usize + 1]);
+            assert_eq!(seal.ended_after, Some(u64::from(k)));
+            assert_eq!(seal.file_count as u32, k + 2);
+            assert!(seal.requires_short_seal());
+            assert_eq!(
+                seal.ending(u64::from(m) + 1),
+                format::SealEnding::Short {
+                    ended_after: u64::from(k)
+                }
+            );
+            let fi = s
+                .built
+                .layout
+                .entries
+                .iter()
+                .find(|e| matches!(e.kind, ZoneKind::FrontIndex))
+                .unwrap();
+            assert_eq!(Some(&seal.front_index_sha256), fi.sha256.as_ref(), "binds File 3");
+
+            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            assert_eq!(done.ending, Ending::Short { ended_after: k });
+            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(
+                rows(&s),
+                [
+                    row("a", "completed", "current"),
+                    row("b", "cut", "staged"),
+                    row("c", "cut", "staged")
+                ]
+            );
+            assert_eq!(volume(&s), ("sealed".into(), Some(i64::from(k)), "ok".into()));
+            // A cut unit's slice that reached the tape stays recorded; the
+            // ones that did not stay pending.
+            assert_eq!(
+                positions(&s, 1),
+                [
+                    (i64::from(k), "written".to_string()),
+                    (i64::from(k) + 1, "pending".to_string())
+                ]
+            );
+            assert_eq!(positions(&s, 2), [(i64::from(k) + 2, "pending".to_string())]);
+
+            let report = done.short_ending_report().unwrap();
+            assert!(report.contains("sealed short"), "{report}");
+            assert!(report.contains(&format!("tape file {k}")), "{report}");
+            assert!(report.contains("b, c"), "names the cut units: {report}");
+            assert!(report.contains("`tapectl volume write <label>`"), "{report}");
+        }
+
+        /// The warning in a unit's LAST slice: that unit is whole on the
+        /// tape and completes; only the units after it are cut.
+        #[test]
+        fn the_early_warning_in_a_units_last_slice_completes_that_unit() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 1);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let ready = ready(outcome);
+            assert_eq!(ready.ending(), Ending::Short { ended_after: k });
+            let done = sealed(
+                ready
+                    .seal(&mut store)
+                    .unwrap()
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert_eq!(done.cut_units, ["c"]);
+            assert_eq!(
+                rows(&s),
+                [
+                    row("a", "completed", "current"),
+                    row("b", "completed", "current"),
+                    row("c", "cut", "staged")
+                ]
+            );
+            assert_eq!(volume(&s).1, Some(i64::from(k)));
+        }
+
+        /// The warning in the last data slice (K = M-1): the full seal at M,
+        /// as planned, recorded as such in the event; every unit completes
+        /// and `ended_after` stays NULL. The readback past the warning is
+        /// owed (`readback_past_warning`).
+        #[test]
+        fn the_early_warning_in_the_last_data_slice_seals_full() {
+            let s = three_units();
+            let k = slice_at(&s, 2, 0);
+            let m = planned_seal(&s);
+            assert_eq!(k + 1, m, "c's slice is the last data slice");
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let ready = ready(outcome);
+            assert_eq!(ready.ending(), Ending::Full);
+            let events = warning_events(&s);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].2, k.to_string(), "new_value is K = M-1");
+            assert!(events[0].3.ends_with("\"seal\": \"full\"}"), "{}", events[0].3);
+
+            let pending = ready.seal(&mut store).unwrap();
+            assert!(pending.readback_past_warning());
+            let seal = parsed_seal(&store.files[m as usize]);
+            assert_eq!(seal.ended_after, Some(u64::from(m - 1)));
+            assert_eq!(seal.ending(u64::from(m) + 1), format::SealEnding::Full);
+            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            assert_eq!(done.ending, Ending::Full);
+            assert!(done.cut_units.is_empty());
+            assert_eq!(done.short_ending_report(), None);
+            assert!(rows(&s).iter().all(|(_, w, sn)| w == "completed" && sn == "current"));
+            assert_eq!(volume(&s), ("sealed".into(), None, "ok".into()));
+        }
+
+        /// A warning before the first data slice (here in File 1, the system
+        /// guide) aborts (W6): no event, no seal, the tape unsealed, every
+        /// row `aborted`, the reason naming the warning.
+        #[test]
+        fn the_early_warning_before_the_first_data_slice_aborts_unsealed() {
+            let s = three_units();
+            let file1 = &s.built.layout.entries[1];
+            assert!(
+                file1.size_bytes.unwrap() > SBS,
+                "File 1 spans blocks at this block size, so the warning can show in it"
+            );
+            let mut store = warning_in(&s, 1);
+            let (s, outcome) = execute(s, &mut store);
+            let ExecuteOutcome::Aborted(aborted) = outcome else {
+                panic!("a warning before the data zone aborts");
+            };
+            assert!(aborted.reason.contains("early warning"), "{}", aborted.reason);
+            assert!(aborted.reason.contains("tape file 1"), "{}", aborted.reason);
+            assert!(aborted.reason.contains("W6"), "{}", aborted.reason);
+            assert_eq!(store.files.len(), 2, "File 1 written whole; nothing after it");
+            assert!(warning_events(&s).is_empty(), "no event for an abort");
+            assert!(rows(&s).iter().all(|(_, w, _)| w == "aborted"));
+            assert_eq!(volume(&s), ("initialized".into(), None, "ok".into()));
+        }
+
+        /// The hard end inside a slice past the warning (more than 16
+        /// refusals of one block in a row) aborts as before 1.6.0: no event,
+        /// no seal, the slice not recorded, every row `aborted`.
+        #[test]
+        fn the_hard_end_inside_a_slice_past_the_warning_aborts_unsealed() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k)
+                .with_enospc_after(bytes_before(&s, k) + 2 * SBS - 1);
+            let (s, outcome) = execute(s, &mut store);
+            let ExecuteOutcome::Aborted(aborted) = outcome else {
+                panic!("the hard end aborts");
+            };
+            assert!(aborted.reason.contains(&format!("position {k}")), "{}", aborted.reason);
+            assert_eq!(store.files.len() as u32, k, "slice K never recorded");
+            assert!(store.early_warning().is_some(), "the warning came first");
+            assert!(warning_events(&s).is_empty());
+            assert!(rows(&s).iter().all(|(_, w, _)| w == "aborted"));
+            assert_eq!(
+                positions(&s, 1)[0],
+                (i64::from(k), "failed".to_string()),
+                "the slice the hard end stopped"
+            );
+        }
+
+        /// A filemark the drive refuses is never retried (W3) and aborts
+        /// (W6), even past the warning.
+        #[test]
+        fn a_refused_filemark_aborts_unsealed() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store =
+                warning_in(&s, k).with_filemarks_refused_from(bytes_before(&s, k) + SBS);
+            let (s, outcome) = execute(s, &mut store);
+            assert!(matches!(outcome, ExecuteOutcome::Aborted(_)));
+            assert!(warning_events(&s).is_empty());
+            assert!(rows(&s).iter().all(|(_, w, _)| w == "aborted"));
+        }
+
+        /// THE hazard item 114 exists for: a block st reported refused was in
+        /// fact written, so slice K holds one block twice. A full confirm
+        /// hashes K against File 3 and finds it: `ContentHashMismatch`,
+        /// which proves the medium bad, so the volume is QUARANTINED (§5,
+        /// `layout-session.md` "Transitions": a mismatch that proves the
+        /// medium bad quarantines and aborts the session). Not sealed, not
+        /// completed, and no row `cut` — `cut` is written only by a passing
+        /// confirm. (Under today's bridge the positions after K also show as
+        /// unreadable; they prove nothing and do not change the verdict.)
+        #[test]
+        fn a_refused_block_that_was_written_is_caught_by_a_full_confirm_and_quarantines() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k).with_refused_blocks_written();
+            let (s, outcome) = execute(s, &mut store);
+            let ready = ready(outcome);
+            assert!(
+                store.files[k as usize].len() as u64 > 3 * SBS,
+                "the positive control: K holds a block twice"
+            );
+            let outcome = ready
+                .seal(&mut store)
+                .unwrap()
+                .confirm(&s.conn, &mut store, Tier::Integrity)
+                .unwrap();
+            let ConfirmOutcome::Quarantined(q) = outcome else {
+                panic!("the doubled block must be caught");
+            };
+            let QuarantineReason::ConfirmFailed(evidence) = q.reason else {
+                panic!("a confirm finding");
+            };
+            assert!(evidence.mismatches.iter().any(|m| matches!(
+                m,
+                Mismatch {
+                    position,
+                    kind: MismatchKind::ContentHashMismatch,
+                    ..
+                } if *position == k
+            )));
+            assert!(rows(&s).iter().all(|(_, w, sn)| w == "aborted" && sn == "staged"));
+            assert_eq!(
+                volume(&s),
+                ("initialized".into(), None, "quarantined".into()),
+                "not sealed, ended_after not recorded"
+            );
+        }
+
+        /// The same hazard under the DEFAULT quick confirm: item 114 reads
+        /// entry K back under every tier, so it quarantines here too.
+        #[test]
+        #[ignore = "#420: needs the chain walk to take the ending (store.rs, routed in E's \
+                    report): the navigable tier reads no content file today"]
+        fn a_refused_block_that_was_written_is_caught_by_the_quick_confirm_readback() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k).with_refused_blocks_written();
+            let (s, outcome) = execute(s, &mut store);
+            let outcome = ready(outcome)
+                .seal(&mut store)
+                .unwrap()
+                .confirm(&s.conn, &mut store, Tier::Navigable)
+                .unwrap();
+            assert!(matches!(outcome, ConfirmOutcome::Quarantined(_)));
+            assert!(rows(&s).iter().all(|(_, w, _)| w == "aborted"));
+        }
+
+        /// K = M-1 with the hazard: the seal is full, and the quick confirm
+        /// still reads the last slice back (item 114: "whether the tape then
+        /// sealed short or … full").
+        #[test]
+        #[ignore = "#420: needs the chain walk to take the ending (store.rs, routed in E's \
+                    report): the navigable tier reads no content file today"]
+        fn the_quick_confirm_after_a_warning_in_the_last_slice_reads_that_slice_back() {
+            let s = three_units();
+            let k = slice_at(&s, 2, 0);
+            let mut store = warning_in(&s, k).with_refused_blocks_written();
+            let (s, outcome) = execute(s, &mut store);
+            let ready = ready(outcome);
+            assert_eq!(ready.ending(), Ending::Full);
+            let outcome = ready
+                .seal(&mut store)
+                .unwrap()
+                .confirm(&s.conn, &mut store, Tier::Navigable)
+                .unwrap();
+            assert!(matches!(outcome, ConfirmOutcome::Quarantined(_)));
+        }
+
+        /// A full confirm of a short tape hashes files 0 to K and reads
+        /// nothing after K (§5 step 4), and passes.
+        #[test]
+        #[ignore = "#420: needs the chain walk to take the ending (store.rs, routed in E's \
+                    report): today the walk asks for every planned file, and the bridge \
+                    keeps it from reading past K, so a full confirm of a short tape is \
+                    inconclusive (it fails closed)"]
+        fn a_full_confirm_of_a_short_tape_hashes_through_ended_after_and_passes() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let done = sealed(
+                ready(outcome)
+                    .seal(&mut store)
+                    .unwrap()
+                    .confirm(&s.conn, &mut store, Tier::Integrity)
+                    .unwrap(),
+            );
+            assert_eq!(done.cut_units, ["b", "c"]);
+        }
+
+        /// What `volume resume` finds after a crash between the event and
+        /// the seal: the rows swept to `interrupted` (the startup sweep), the
+        /// session rehydrated from the catalog.
+        fn crashed_after_the_warning(s: &Short) -> InterruptedSession {
+            s.conn
+                .execute(
+                    "UPDATE writes SET status = 'interrupted' WHERE volume_id = ?1",
+                    params![s.volume_id],
+                )
+                .unwrap();
+            InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                .unwrap()
+                .expect("the swept session rehydrates")
+        }
+
+        /// A store that refuses every write and reposition but the ones a
+        /// resume past the warning makes: `reposition_at_most` and the seal.
+        /// Writing any data entry panics.
+        struct NoDataWrites {
+            inner: MemStore,
+            planned_seal: u32,
+        }
+
+        impl Store for NoDataWrites {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(&mut self, src: &mut dyn std::io::Read, len: u64, sync: bool) -> Result<u64> {
+                assert!(sync, "a resume past the warning writes only the seal");
+                self.inner.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.inner.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+            fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+                assert!(file_index < self.planned_seal);
+                self.inner.reposition_at_most(file_index)
+            }
+            fn blank_at_bot(&mut self) -> Result<bool> {
+                self.inner.blank_at_bot()
+            }
+            fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+                self.inner.eod_at_or_before(position)
+            }
+            fn files_on_medium(&mut self) -> Result<Option<u32>> {
+                self.inner.files_on_medium()
+            }
+            fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+                self.inner.early_warning()
+            }
+        }
+
+        /// Run `interrupted`'s resume over `store`, expecting it ready to
+        /// seal.
+        fn resume_to_ready(s: &Short, interrupted: InterruptedSession, store: &mut dyn Store) -> ReadyToSeal {
+            match interrupted
+                .resume_checking(&s.conn, &s.keys, SliceCheck::Size, store, || false)
+                .unwrap()
+            {
+                ResumeOutcome::Ready(r) => r,
+                ResumeOutcome::Aborted(a) => panic!("expected Ready, got Aborted: {}", a.reason),
+                ResumeOutcome::Confirming(_) => panic!("expected Ready, got Confirming"),
+                ResumeOutcome::Quarantined(q) => panic!("expected Ready, got {:?}", q.reason),
+                ResumeOutcome::Interrupted(_) => panic!("expected Ready, got Interrupted"),
+            }
+        }
+
+        /// A crash after the warning's event, before the seal: resume reads
+        /// the event, writes no slice, and seals short at K+1 (step 3); the
+        /// confirm splits the rows as if nothing had happened. No second
+        /// event.
+        #[test]
+        fn a_crash_after_the_warning_resumes_to_the_short_seal_without_writing_a_slice() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            drop(ready(outcome)); // the crash: no seal
+            let interrupted = crashed_after_the_warning(&s);
+            let mut store = NoDataWrites {
+                inner: store,
+                planned_seal: planned_seal(&s),
+            };
+            let ready = resume_to_ready(&s, interrupted, &mut store);
+            assert_eq!(ready.ending(), Ending::Short { ended_after: k });
+            let pending = ready.seal(&mut store).unwrap();
+            assert_eq!(store.inner.files.len() as u32, k + 2);
+            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            assert_eq!(done.cut_units, ["b", "c"]);
+            assert_eq!(
+                rows(&s),
+                [
+                    row("a", "completed", "current"),
+                    row("b", "cut", "staged"),
+                    row("c", "cut", "staged")
+                ]
+            );
+            assert_eq!(volume(&s).1, Some(i64::from(k)));
+            assert_eq!(warning_events(&s).len(), 1, "no second event");
+        }
+
+        /// The medium lost files the catalog recorded written (#403): the
+        /// tape holds only up to `a`'s last slice. Resume seals at
+        /// P = min(K+1, N) = N with `ended_after = P-1`, and the positions
+        /// from P go back to `pending`; `a` is whole, `b` and `c` cut.
+        #[test]
+        fn a_resume_after_the_warning_seals_after_the_last_file_the_medium_holds() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let a_last = slice_at(&s, 0, 1);
+            assert_eq!(a_last + 1, k);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            drop(ready(outcome));
+            store.files.truncate(k as usize); // slice K never reached the tape
+            store.syncs.truncate(k as usize);
+            let interrupted = crashed_after_the_warning(&s);
+            let mut store = NoDataWrites {
+                inner: store,
+                planned_seal: planned_seal(&s),
+            };
+            let ready = resume_to_ready(&s, interrupted, &mut store);
+            assert_eq!(ready.ending(), Ending::Short { ended_after: a_last });
+            assert_eq!(
+                positions(&s, 1)[0],
+                (i64::from(k), "pending".to_string()),
+                "K is not on the medium"
+            );
+            let pending = ready.seal(&mut store).unwrap();
+            assert_eq!(store.inner.files.len() as u32, k + 1, "the seal at K");
+            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            assert_eq!(done.ending, Ending::Short { ended_after: a_last });
+            assert_eq!(
+                rows(&s),
+                [
+                    row("a", "completed", "current"),
+                    row("b", "cut", "staged"),
+                    row("c", "cut", "staged")
+                ]
+            );
+            assert_eq!(volume(&s).1, Some(i64::from(a_last)));
+        }
+
+        /// A seal torn by the crash and closed by st's filemark on close is
+        /// a file at K+1 that is no seal: resume writes the seal there,
+        /// replacing it.
+        #[test]
+        fn a_resume_after_the_warning_replaces_a_torn_seal() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            drop(ready(outcome));
+            store.files.push(b"[seal]\nvolume = \"SHORT01\"\nlayout_ver".to_vec());
+            store.syncs.push(false);
+            let interrupted = crashed_after_the_warning(&s);
+            let mut store = NoDataWrites {
+                inner: store,
+                planned_seal: planned_seal(&s),
+            };
+            let ready = resume_to_ready(&s, interrupted, &mut store);
+            assert_eq!(ready.ending(), Ending::Short { ended_after: k });
+            ready.seal(&mut store).unwrap();
+            assert_eq!(store.inner.files.len() as u32, k + 2);
+            assert_eq!(
+                parsed_seal(&store.inner.files[k as usize + 1]).ended_after,
+                Some(u64::from(k))
+            );
+        }
+
+        /// The medium holds nothing past File 3: a seal now would end the
+        /// tape inside its metadata, so resume aborts (W6).
+        #[test]
+        fn a_resume_after_the_warning_aborts_when_the_medium_holds_no_data_slice() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            drop(ready(outcome));
+            store.files.truncate(4);
+            store.syncs.truncate(4);
+            let interrupted = crashed_after_the_warning(&s);
+            let outcome = interrupted
+                .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut store, || false)
+                .unwrap();
+            let ResumeOutcome::Aborted(a) = outcome else {
+                panic!("expected Aborted");
+            };
+            assert!(a.reason.contains("W6"), "{}", a.reason);
+            assert_eq!(store.files.len(), 4, "nothing written");
+            assert!(rows(&s).iter().all(|(_, w, _)| w == "aborted"));
+        }
+
+        /// A short-sealed tape, sealed by this session, whose process died
+        /// before `sealed_at` was recorded. Its File 0 requires `short-seal`
+        /// (every 1.6.0 File 0). Returns the session ready to resume, its
+        /// tape and K.
+        fn sealed_short_unrecorded() -> (Short, InterruptedSession, MemStore, u32) {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            ready(outcome).seal(&mut store).unwrap();
+            store.files[0] = requiring_short_seal(&store.files[0]);
+            let interrupted = crashed_after_the_warning(&s);
+            (s, interrupted, store, k)
+        }
+
+        /// Step 2: the tape is sealed short and `sealed_at` was never
+        /// recorded. Resume locates the seal at K+1 (rule 6), takes K from
+        /// its bytes, records `sealed_at` and `ended_after`, and re-enters
+        /// confirm: it never writes.
+        #[test]
+        fn a_resume_finds_its_own_short_seal_and_reconfirms_it() {
+            let (s, interrupted, store, k) = sealed_short_unrecorded();
+            let mut store = NoWriteStore(store);
+            let outcome = interrupted
+                .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut store, || false)
+                .unwrap();
+            let ResumeOutcome::Confirming(pending) = outcome else {
+                panic!("a resume of its own short-sealed tape re-enters confirm");
+            };
+            assert_eq!(pending.ending(), Ending::Short { ended_after: k });
+            assert!(pending.readback_past_warning());
+            let (sealed_at, ended_after): (Option<String>, Option<i64>) = s
+                .conn
+                .query_row(
+                    "SELECT sealed_at, ended_after FROM volumes WHERE id = ?1",
+                    params![s.volume_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert!(sealed_at.is_some(), "recorded from the seal");
+            assert_eq!(ended_after, Some(i64::from(k)), "recorded with it");
+            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            assert_eq!(done.cut_units, ["b", "c"]);
+        }
+
+        /// Step 1: `sealed_at` and `ended_after` are recorded, and the seal
+        /// does not read just now (the drive): the resume re-enters confirm
+        /// with the RECORDED ending, never writing — and once the seal reads,
+        /// that confirm seals short.
+        #[test]
+        fn a_resume_of_a_recorded_short_seal_confirms_with_the_recorded_ending() {
+            let (s, interrupted, store, k) = sealed_short_unrecorded();
+            s.conn
+                .execute(
+                    "UPDATE volumes SET sealed_at = datetime('now'), ended_after = ?2 WHERE id = ?1",
+                    params![s.volume_id, k],
+                )
+                .unwrap();
+            // Rehydrated after the record, as a real resume would be.
+            drop(interrupted);
+            let interrupted = InterruptedSession::rehydrate(&s.conn, s.volume_id)
+                .unwrap()
+                .unwrap();
+            let mut failing = SealReadFails {
+                inner: store,
+                position: k + 1,
+            };
+            let ResumeOutcome::Confirming(pending) = interrupted
+                .resume_checking(&s.conn, &s.keys, SliceCheck::Size, &mut failing, || false)
+                .unwrap()
+            else {
+                panic!("a recorded seal re-enters confirm");
+            };
+            assert_eq!(pending.ending(), Ending::Short { ended_after: k });
+            assert!(pending.readback_past_warning(), "the event is recorded");
+            let mut store = failing.inner;
+            assert_eq!(store.files.len() as u32, k + 2, "nothing written");
+            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            assert_eq!(done.ending, Ending::Short { ended_after: k });
+            assert_eq!(volume(&s), ("sealed".into(), Some(i64::from(k)), "ok".into()));
+        }
+
+        /// `cut` is written only inside the passing confirm's transaction
+        /// (#420, ADR-0012 item 112). An Inconclusive confirm's
+        /// `interrupted` never overwrites a `cut` row: here the readback
+        /// fails at File 3 (the drive, not the medium), on a session one of
+        /// whose rows is already `cut`.
+        #[test]
+        fn an_inconclusive_confirm_never_overwrites_a_cut_row() {
+            let s = three_units();
+            let k = slice_at(&s, 1, 0);
+            let mut store = warning_in(&s, k);
+            let (s, outcome) = execute(s, &mut store);
+            let pending = ready(outcome).seal(&mut store).unwrap();
+            s.conn
+                .execute(
+                    "UPDATE writes SET status = 'cut' WHERE stage_set_id = ?1",
+                    params![s.units[2].stage_set_id],
+                )
+                .unwrap();
+            let mut failing = unreadable_at(store, 3);
+            let outcome = pending
+                .confirm(&s.conn, &mut failing, Tier::Navigable)
+                .unwrap();
+            assert!(matches!(outcome, ConfirmOutcome::Inconclusive(_)));
+            assert_eq!(
+                rows(&s)
+                    .into_iter()
+                    .map(|(_, w, _)| w)
+                    .collect::<Vec<_>>(),
+                ["interrupted", "interrupted", "cut"]
+            );
+            // And `mark_writes` itself never writes over one.
+            let ids: Vec<(i64, i64)> = s
+                .conn
+                .prepare("SELECT id, snapshot_id FROM writes WHERE volume_id = ?1 ORDER BY id")
+                .unwrap()
+                .query_map(params![s.volume_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            mark_writes(&s.conn, &ids, "aborted").unwrap();
+            assert_eq!(rows(&s)[2].1, "cut");
+        }
+
+        /// A short-sealed cartridge on a MemStore: files 0 to K of a plan
+        /// whose seal is planned at `m`, the short seal at K+1, File 0
+        /// identifying `label`/`uuid` and requiring `requires`.
+        fn short_sealed_cartridge(label: &str, uuid: &str, k: u32, m: u32, file0: &str) -> MemStore {
+            let mut store = MemStore::new(BS as usize);
+            let thunk = contact_id_thunk_bytes(label, uuid, m as i32 + 1);
+            let thunk = match file0 {
+                "short-seal" => requiring_short_seal(&thunk),
+                "nothing" => {
+                    let text = String::from_utf8_lossy(format::without_nul_padding(&thunk))
+                        .replacen("\nrequires = [\"short-seal\"]\n", "\nrequires = []\n", 1);
+                    assert!(text.contains("\nrequires = []\n"));
+                    text.into_bytes()
+                }
+                other => panic!("{other}"),
+            };
+            put_file(&mut store, 0, thunk);
+            for p in 1..=k {
+                put_file(&mut store, p as usize, vec![p as u8; 64]);
+            }
+            put_file(
+                &mut store,
+                k as usize + 1,
+                fixture_short_seal(label, k, "deadbeef"),
+            );
+            store
+        }
+
+        /// `probe_seal` finds the short seal by rule 6 — the last file, at
+        /// K+1, where File 0's pointer (M) is past end of data — so the
+        /// contact check reports the tape sealed, at K+1. Before #420 this
+        /// tape read as `Matches` (no seal at M).
+        #[test]
+        fn the_contact_check_sees_a_short_sealed_tape_as_sealed() {
+            let (k, m) = (6, 12);
+            let mut store = short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "short-seal");
+            assert_eq!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
+                ContactOutcome::AlreadySealed { seal_position: k + 1 }
+            );
+            assert_eq!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None),
+                ContactOutcome::AlreadySealed { seal_position: k + 1 },
+                "File 0's own pointer finds it"
+            );
+
+            // File 0 unreadable: the seal's own `requires` suffices (rule 6).
+            let mut store = unreadable_at(
+                short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "short-seal"),
+                0,
+            );
+            assert_eq!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
+                ContactOutcome::AlreadySealed { seal_position: k + 1 }
+            );
+
+            // A File 0 that does not require short-seal (a tape before
+            // 1.6.0) never has a seal before its planned position: rule 6
+            // reads that file as no seal.
+            let mut store = short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "nothing");
+            assert_eq!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
+                ContactOutcome::Matches
+            );
+
+            // The positive control: the same tape, its seal gone, is
+            // unsealed.
+            let mut store = short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "short-seal");
+            store.files.truncate(k as usize + 1);
+            store.syncs.truncate(k as usize + 1);
+            assert_eq!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
+                ContactOutcome::Matches
+            );
+        }
+
+        /// The ADR-0003 hole #420 closes: a FOREIGN short-sealed cartridge
+        /// under a fresh write. Its File 0 is not this volume's — the
+        /// mismatch `--force` may override — but the contact check finds its
+        /// short seal first and reports `AlreadySealed`, which no flag
+        /// reaches (`write::decide_fresh_write_contact`,
+        /// `decide_fresh_write_contact_already_sealed_refuses_even_with_force`).
+        /// The caller's seal position is its own new Layout's, unrelated to
+        /// the tape. The positive control: without the seal it is the plain
+        /// mismatch.
+        #[test]
+        fn force_cannot_reach_a_foreign_short_sealed_cartridge() {
+            let (k, m) = (6, 12);
+            let foreign = "00000000-0000-0000-0000-000000000000";
+            let mut store = short_sealed_cartridge("WRONGVOL", foreign, k, m, "short-seal");
+            assert_eq!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(30)),
+                ContactOutcome::AlreadySealed { seal_position: k + 1 }
+            );
+            let mut store = short_sealed_cartridge("WRONGVOL", foreign, k, m, "short-seal");
+            store.files.truncate(k as usize + 1);
+            store.syncs.truncate(k as usize + 1);
+            assert!(matches!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(30)),
+                ContactOutcome::IdentityMismatch { .. }
+            ));
+        }
+
+        /// A seal before the planned position that this tapectl must not
+        /// interpret (a feature it does not know) still refuses a write: it
+        /// may be a newer tapectl's sealed tape (ADR-0003 fails closed).
+        #[test]
+        fn a_seal_this_tapectl_cannot_read_before_the_planned_position_still_refuses() {
+            let (k, m) = (6, 12);
+            let mut store = short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "nothing");
+            let seal = String::from_utf8(store.files[k as usize + 1].clone())
+                .unwrap()
+                .replacen(
+                    "requires = [\"short-seal\"]",
+                    "requires = [\"unknown-feature\"]",
+                    1,
+                );
+            store.files[k as usize + 1] = seal.into_bytes();
+            assert_eq!(
+                check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
+                ContactOutcome::AlreadySealed { seal_position: k + 1 }
+            );
         }
     }
 }

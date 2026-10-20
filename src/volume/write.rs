@@ -15357,7 +15357,7 @@ mod tests {
         // still getting refused.
         let mut store = MemStore::new(FW_BS as usize);
         fw_put_file(&mut store, 0, fw_id_thunk_bytes(FW_LABEL, FW_UUID, 6));
-        let seal_bytes = layout::generate_seal_marker(FW_LABEL, 6, "deadbeef", &[]).into_bytes();
+        let seal_bytes = crate::volume::session::fixture_seal(FW_LABEL, 5, "deadbeef");
         let mut seal_padded = seal_bytes;
         seal_padded.resize(FW_BS as usize, 0);
         fw_put_file(&mut store, 5, seal_padded);
@@ -15386,7 +15386,7 @@ mod tests {
             0,
             fw_id_thunk_bytes("WRONGVOL", "00000000-0000-0000-0000-000000000000", 6),
         );
-        let seal_bytes = layout::generate_seal_marker("WRONGVOL", 6, "deadbeef", &[]).into_bytes();
+        let seal_bytes = crate::volume::session::fixture_seal("WRONGVOL", 5, "deadbeef");
         let mut seal_padded = seal_bytes;
         seal_padded.resize(FW_BS as usize, 0);
         fw_put_file(&mut store, 5, seal_padded);
@@ -15573,7 +15573,7 @@ mod tests {
         /// no flag reaches it.
         #[test]
         fn a_seal_that_reads_is_still_already_sealed() {
-            let mut seal = layout::generate_seal_marker(FW_LABEL, 6, "deadbeef", &[]).into_bytes();
+            let mut seal = crate::volume::session::fixture_seal(FW_LABEL, 5, "deadbeef");
             seal.resize(FW_BS as usize, 0);
             let fake = tape(fw_id_thunk_bytes(FW_LABEL, FW_UUID, 6), 6);
             fake.state().files[5] = seal;
