@@ -88,7 +88,7 @@ short seal, then restore, rebuild and rewrite around it. OVERWRITES THE CARTRIDG
   --capacity BYTES               The capacity registered for the cartridge, a plain decimal
                                  byte count (default 2550000000000; --mhvtl 200000000).
   --hook-at BYTES                --mhvtl only: TAPECTL_TEST_EARLY_WARNING_AT for the first
-                                 write (default: 95% of the way through the filler).
+                                 write (default: 98% of the way through the filler).
   --filler-dir DIR               Where the filler's one slice file is read from (default: a
                                  directory on /dev/shm when it has room, else staging).
   --print-plan                   Print what the operator must do and the drive time, and exit.
@@ -561,18 +561,41 @@ while IFS='=' read -r k v; do
 done < "$STEP_DIR/filler.out"
 log "  filler: ${FX_FILLER_SLICES:-?} slices of ${FX_TEMPLATE_PADDED_BYTES:-?} bytes on tape, ${FX_FILLER_PADDED_BYTES:-?} in all; the plan ends near ${FX_PLAN_END_ESTIMATE_BYTES:-?} of $CAPACITY"
 if [ "$MHVTL" = 1 ] && [ -z "$HOOK_AT" ]; then
-    # 95% of the way through the filler, from an estimate of what precedes it (the fixed files
-    # are inside the allowance): inside a 3-block slice, below mhvtl's 500 MB medium end.
-    HOOK_AT=$(( FX_UNITS_BEFORE_PADDED_BYTES + 2 * MiB + FX_FILLER_PADDED_BYTES * 95 / 100 ))
+    # 98% of the way through the filler, from an estimate of what precedes it (the fixed files
+    # are inside the allowance): past the fill ceiling as the real warning is (2.502 TB of a
+    # filler ending near 2.548), inside a 3-block slice, far below mhvtl's 500 MB medium end.
+    HOOK_AT=$(( FX_UNITS_BEFORE_PADDED_BYTES + 2 * MiB + FX_FILLER_PADDED_BYTES * 98 / 100 ))
 fi
 [ "$MHVTL" = 0 ] || log "  rehearsal: TAPECTL_TEST_EARLY_WARNING_AT=$HOOK_AT for the first write only"
-run staging-status 0 tctl --json staging status
-run plan 0 tctl volume plan
+run staging-status any tctl --json staging status
+run plan any tctl volume plan
 end_step
 
 # ------------------------------------------------------------
-begin_step 2 init "volume init $LABEL1, capacity from the cartridge row"
-run init 0 tctl --json volume init "$LABEL1" --device "$TAPE_DEV"
+begin_step 2 init "the cartridge erased from this home, then volume init $LABEL1"
+# Whatever the cartridge holds (an earlier run's volume, sealed or not) belongs to another home.
+# This home's own `cartridge erase` identifies it, asks for the label File 0 names, erases and
+# reads the tape back, and records it: then `volume init` needs no --force (item 57).
+run erase-probe 0 tctl --json cartridge erase --device "$TAPE_DEV" --dry-run
+PROBE="$(json_get "$STEP_DIR/erase-probe.out" 'd["outcome"]')"
+CONFIRM="$(json_get "$STEP_DIR/erase-probe.out" 'd.get("confirm_label")')"
+log "  the cartridge as found: $PROBE (its confirm label: ${CONFIRM:-none})"
+INIT_FORCE=()
+case "$PROBE" in
+    would_erase)
+        [ -n "$CONFIRM" ] || fail "cartridge erase --dry-run names no label to confirm"
+        run erase 0 tctl --json cartridge erase --device "$TAPE_DEV" --confirm-label "$CONFIRM"
+        [ "$(json_get "$STEP_DIR/erase.out" 'd["outcome"]')" = erased ] || fail "cartridge erase did not report erased"
+        ;;
+    nothing_to_erase)
+        # Blank, or File 0 EMPTY: nothing to erase, and nothing this catalog recorded proves
+        # it blank, so init takes the consent this run was given (--i-will-lose-the-cartridge,
+        # or --mhvtl) as --force. --force never overrides a sealed tape (ADR-0003).
+        INIT_FORCE=(--force)
+        ;;
+    *) fail "cartridge erase --dry-run reported '$PROBE'" ;;
+esac
+run init 0 tctl --json volume init "$LABEL1" --device "$TAPE_DEV" "${INIT_FORCE[@]}"
 GOT_CAP="$(json_get "$STEP_DIR/init.out" 'd["medium"]["capacity_bytes"]')"
 [ "$GOT_CAP" = "$CAPACITY" ] || fail "volume init stored capacity $GOT_CAP, not the registered $CAPACITY: the plan bound would not reach the warning"
 end_step
