@@ -501,17 +501,41 @@ impl Evidence {
     /// lives next to the classification rather than as an `any()` at the
     /// call site: one predicate, one place, and adding a caller cannot
     /// reintroduce the blanket rule the amendment rejected.
+    ///
+    /// **Empty whenever the seal and the catalog disagree about where the
+    /// tape ended** ([`Self::ending_disagrees`], #420): `volume-format-v2.md`
+    /// §5 rules that confirm inconclusive, never a quarantine. The tape's own
+    /// seal then says positions past its `ended_after` are not part of it,
+    /// and the walk, reading under the catalog's ending, may have compared
+    /// some of them; a quarantine is the one destructive verdict, and an
+    /// inconclusive one counts no copy and completes no write. Every
+    /// mismatch stays in [`Self::mismatches`] — this withholds the verdict,
+    /// not the findings. (Coordinator's ruling, #420 worker J.)
     pub fn medium_evidence(&self) -> Vec<&Mismatch> {
+        if self.ending_disagrees() {
+            return Vec::new();
+        }
         self.mismatches
             .iter()
             .filter(|m| m.kind.proves_medium_bad())
             .collect()
     }
 
-    /// Whether any mismatch proves the medium is bad — the quarantine
-    /// verdict, as a bool. See [`Evidence::medium_evidence`].
+    /// Whether the evidence proves the medium is bad — the quarantine
+    /// verdict, as a bool: some mismatch proves it, and the seal and the
+    /// catalog agree about where the tape ended. See
+    /// [`Evidence::medium_evidence`].
     pub fn proves_medium_bad(&self) -> bool {
-        self.mismatches.iter().any(|m| m.kind.proves_medium_bad())
+        !self.medium_evidence().is_empty()
+    }
+
+    /// Whether the walk found [`MismatchKind::EndedAfterDisagrees`]: the
+    /// seal states another `ended_after` than the catalog's (#420). Such
+    /// evidence is never a quarantine.
+    pub fn ending_disagrees(&self) -> bool {
+        self.mismatches
+            .iter()
+            .any(|m| m.kind == MismatchKind::EndedAfterDisagrees)
     }
 }
 
@@ -3765,6 +3789,35 @@ mod tests {
         }
     }
 
+    /// #420: an `ended_after_disagrees` withholds the quarantine verdict
+    /// from the whole evidence, whatever else it holds, and keeps every
+    /// mismatch. Without it, the same medium-proving mismatch is the
+    /// verdict.
+    #[test]
+    fn an_ending_disagreement_withholds_the_medium_verdict_but_keeps_the_findings() {
+        let mixed = Evidence {
+            tier: Tier::Integrity,
+            files_checked: 6,
+            mismatches: vec![
+                mismatch_of(MismatchKind::EndedAfterDisagrees),
+                mismatch_of(MismatchKind::ContentHashMismatch),
+                mismatch_of(MismatchKind::FrontIndexDivergesFromSeal),
+            ],
+        };
+        assert!(mixed.ending_disagrees());
+        assert!(!mixed.proves_medium_bad());
+        assert!(mixed.medium_evidence().is_empty());
+        assert_eq!(mixed.mismatches.len(), 3, "the findings stay");
+
+        let without = Evidence {
+            mismatches: mixed.mismatches[1..].to_vec(),
+            ..mixed.clone()
+        };
+        assert!(!without.ending_disagrees());
+        assert!(without.proves_medium_bad());
+        assert_eq!(without.medium_evidence().len(), 2);
+    }
+
     /// `Evidence`'s verdict is "ANY mismatch proves it", not "all of them" —
     /// a tape that is genuinely rotten does not stop being rotten because
     /// the seal was also unreadable.
@@ -5565,14 +5618,15 @@ mod tests {
             }
         }
 
-        /// What the walk ships when the seal disagrees: it does not withdraw
-        /// what it read under the plan's ending. A seal at K+1 stating K-1
-        /// leaves entry K read and hashed against File 3 (the plan said it
-        /// is on the tape), so a wrong entry K still proves the medium bad
-        /// beside the disagreement. Pinned so a change to that rule is a
-        /// deliberate one (the coordinator's question, #420 worker J).
+        /// A seal that disagrees keeps every finding but withholds the
+        /// quarantine (coordinator's ruling on #420, §5: "inconclusive,
+        /// never a quarantine"). A seal at K+1 stating K-1 says entry K is
+        /// not part of the tape; the walk, reading under the catalog's K,
+        /// hashed it anyway, and a wrong entry K is reported — but does not
+        /// prove the medium bad. The control: the same wrong entry under a
+        /// seal that agrees does.
         #[test]
-        fn a_disagreeing_seal_does_not_withdraw_what_the_plan_read() {
+        fn a_disagreeing_seal_keeps_what_the_plan_read_and_never_quarantines() {
             let p = planned();
             let mut store = p.written(MemStore::new(SBS), K, &p.seal(K - 1));
             store.files[K as usize][10] ^= 0xFF;
@@ -5584,9 +5638,23 @@ mod tests {
                 [
                     (K + 1, MismatchKind::EndedAfterDisagrees),
                     (K, MismatchKind::ContentHashMismatch),
-                ]
+                ],
+                "every finding is kept"
             );
-            assert!(evidence.proves_medium_bad());
+            assert!(evidence.ending_disagrees());
+            assert!(!evidence.proves_medium_bad());
+            assert!(evidence.medium_evidence().is_empty());
+
+            let mut agreeing = p.written(MemStore::new(SBS), K, &p.seal(K));
+            agreeing.files[K as usize][10] ^= 0xFF;
+            let control = agreeing
+                .confirm_with(&p.layout, short(Tier::Integrity))
+                .unwrap();
+            assert_eq!(kinds(&control), [(K, MismatchKind::ContentHashMismatch)]);
+            assert!(
+                control.proves_medium_bad(),
+                "positive control: the same wrong entry under an agreeing seal quarantines"
+            );
         }
 
         /// The catalog and the tape ending in different places is, by the

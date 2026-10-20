@@ -8423,6 +8423,52 @@ mod tests {
         }
     }
 
+    /// A wrong slice between the seal's own `ended_after + 1` and the
+    /// catalog's K is reported but never quarantines while the seal and the
+    /// catalog disagree (#420, §5: "inconclusive, never a quarantine";
+    /// `Evidence::medium_evidence`). The control: the same wrong slice under
+    /// a seal that agrees quarantines, through the same seam.
+    #[test]
+    fn a_disagreeing_seal_withholds_the_quarantine_but_reports_the_wrong_slice() {
+        for (seal_states, quarantines) in [(4, false), (5, true)] {
+            let conn = crate::db::open_memory().unwrap();
+            let volume_id = seed_short_volume(&conn, "VR-SHORTQ", Some(5));
+            let mut store = mem_store_short_tape("VR-SHORTQ", seal_states);
+            store.files[5][10] ^= 0xFF;
+            let report = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "VR-SHORTQ",
+                volume_id,
+                4096,
+                Tier::Integrity,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap();
+            let found: Vec<(u32, MismatchKind)> = report
+                .mismatches
+                .iter()
+                .map(|m| (m.position, m.kind))
+                .collect();
+            if quarantines {
+                assert_eq!(found, [(5, MismatchKind::ContentHashMismatch)]);
+                assert!(report.quarantine.is_some(), "positive control");
+                assert_eq!(volume_condition(&conn, "VR-SHORTQ"), "quarantined");
+            } else {
+                assert_eq!(
+                    found,
+                    [
+                        (6, MismatchKind::EndedAfterDisagrees),
+                        (5, MismatchKind::ContentHashMismatch),
+                    ],
+                    "every finding is reported"
+                );
+                assert!(report.failed > 0 && report.quarantine.is_none());
+                assert_eq!(volume_condition(&conn, "VR-SHORTQ"), "ok");
+            }
+        }
+    }
+
     /// A store that has a signal arrive as it reads File 3 for the
     /// `nth` time (issue #410's tests: verify reads it once to rebuild its
     /// Layout and once more in the chain walk).
