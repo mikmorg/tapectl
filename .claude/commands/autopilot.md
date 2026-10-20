@@ -19,7 +19,16 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-20 later (NEWEST) — the real-drive runs on home2, v1.5.0 installed.**
+- **#420 BUILD IN PROGRESS (2026-10-20, 1.6.0).** The CTO ruled items 110-115 (build now, the acceptance run
+  proves the post-warning readback; fence EVERY 1.6.0 tape; `cut` rows by migration 038; the plan reaches
+  100% of nominal only with `post_warning_bytes`; the readback after any warning; a synthetic filler for
+  the acceptance run). The spec is on master (c576ce8). The integration branch is `p420-short-seal`; master stays
+  green until 1.6.0 is whole. Plan and worker rules: scratchpad `p420/plan.md`, `p420/worker-rules.md`.
+  Waves: 1 = A format+manifest, B tape retry + Store seam + `locate_seal`, C migration 038 + staging
+  release (running); then D layout.rs/RESTORE.sh, E session.rs, F planning, G write.rs, H readers, I
+  e2e + gate hook; the golden re-pin goes to the CTO at the end. #487 is landed (the fill readback's spacing route).
+  #488 (write-shaping R&D) desk research is running; drive measurements wait for the go-ahead.
+- **QUEUE STATE 2026-10-20 later — the real-drive runs on home2, v1.5.0 installed.**
   Rehearsal GREEN 53/53, #444's verified-erase proof holds (chip proof waits for a never-written
   cartridge), #420's profile done, #388's prototype done
   (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`). The #420 profile's post-warning readback did
