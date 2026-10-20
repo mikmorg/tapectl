@@ -5538,7 +5538,7 @@ mod tests {
         #[test]
         fn a_seal_stating_another_ended_after_disagrees_and_is_inconclusive() {
             let p = planned();
-            let cases: [(Option<u32>, u32, Vec<u8>, u32, u32); 3] = [
+            let cases = [
                 (Some(K), K, p.seal(K - 1), K + 1, K - 1),
                 (Some(K), K, p.seal(M - 1), K + 1, M - 1),
                 (None, M - 1, p.seal(K), M, K),
