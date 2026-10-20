@@ -2358,10 +2358,11 @@ fewer, and its seal marker says where it ended ("Where the tape ended").
 /// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED, AWK_FILE_CHECK_LIST,
-        AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_ALL,
-        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
-        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED,
+        AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
+        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT,
+        AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST,
+        AWK_UNIT_UUID,
     };
 
     let script = r#"#!/usr/bin/env bash
@@ -7130,10 +7131,11 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED, AWK_FILE_CHECK_LIST,
-        AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_ALL,
-        AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
-        AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED,
+        AWK_FILE_CHECK_LIST, AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE,
+        AWK_INDEX_ALL, AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT,
+        AWK_MT_POSITION, AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST,
+        AWK_UNIT_UUID,
     };
 
     // ---- what a 1.6.0 tape declares up front (volume-format-v2.md §1.7,
@@ -7194,7 +7196,8 @@ mod tests {
             },
         ];
         let s = generate_front_index("ME01", &files);
-        let paragraph = "The trailing seal marker binds this index by hash; see the system guide.\n\
+        let paragraph =
+            "The trailing seal marker binds this index by hash; see the system guide.\n\
                          \n\
                          This tape may end early. The list below is the plan: every file the\n\
                          write meant to put on the tape. The seal marker, the LAST file on the\n\
@@ -7301,7 +7304,9 @@ mod tests {
         let g = generate_system_guide_v2_for_media("SS02", 20, "LTO-6");
         let words = flat_text(guide_section(&g, "Words this guide uses"));
         assert!(
-            words.contains("A tape written by tapectl 1.6.0 or later states `requires = [\"short-seal\"]`"),
+            words.contains(
+                "A tape written by tapectl 1.6.0 or later states `requires = [\"short-seal\"]`"
+            ),
             "{words}"
         );
         assert!(!words.contains("on the tapes written so far"), "{words}");

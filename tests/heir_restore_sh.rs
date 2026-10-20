@@ -332,7 +332,8 @@ enum Era {
 
 /// File 3's paragraph from 1.6.0 (volume-format-v2.md §3), with the blank line
 /// after it.
-const MAY_END_EARLY_PARAGRAPH: &str = "This tape may end early. The list below is the plan: every file the\n\
+const MAY_END_EARLY_PARAGRAPH: &str =
+    "This tape may end early. The list below is the plan: every file the\n\
      write meant to put on the tape. The seal marker, the LAST file on the\n\
      tape, says where the tape really ended (its ended_after). A file listed\n\
      after that position is not on this tape.\n\n";
@@ -340,7 +341,11 @@ const MAY_END_EARLY_PARAGRAPH: &str = "This tape may end early. The list below i
 /// File 0 as `era` writes it.
 fn era_file0(era: Era, text: String) -> String {
     let short = "\nrequires = [\"short-seal\"]\n";
-    assert_eq!(text.matches(short).count(), 1, "this tapectl's File 0:\n{text}");
+    assert_eq!(
+        text.matches(short).count(),
+        1,
+        "this tapectl's File 0:\n{text}"
+    );
     match era {
         Era::V160 => text,
         Era::V150 => text.replace(short, "\nrequires = []\n"),
@@ -350,7 +355,11 @@ fn era_file0(era: Era, text: String) -> String {
 /// File 3 as `era` writes it.
 fn era_front_index(era: Era, text: String) -> String {
     assert_eq!(text.matches(MAY_END_EARLY_PARAGRAPH).count(), 1, "{text}");
-    assert_eq!(text.matches("\nmay_end_early = true\n").count(), 1, "{text}");
+    assert_eq!(
+        text.matches("\nmay_end_early = true\n").count(),
+        1,
+        "{text}"
+    );
     match era {
         Era::V160 => text,
         Era::V150 => text
@@ -361,7 +370,11 @@ fn era_front_index(era: Era, text: String) -> String {
 
 /// An envelope's MANIFEST.toml as `era` writes it.
 fn era_manifest(era: Era, text: String) -> String {
-    assert_eq!(text.matches("\nmay_end_early = true\n").count(), 1, "{text}");
+    assert_eq!(
+        text.matches("\nmay_end_early = true\n").count(),
+        1,
+        "{text}"
+    );
     match era {
         Era::V160 => text,
         Era::V150 => text.replace("\nmay_end_early = true\n", "\n"),
@@ -8542,7 +8555,10 @@ fn file_1_after_a_failed_dd_a_rewind_and_fsf_reads_the_next_slice() {
 fn short_heir() -> (Heir, i64) {
     let h = Heir::new();
     let ledgers = unit("ledgers");
-    assert!(ledgers.positions.len() >= 2, "a unit the end can cut in two");
+    assert!(
+        ledgers.positions.len() >= 2,
+        "a unit the end can cut in two"
+    );
     let k = ledgers.positions[0];
     for u in ["photos/2019", "docs"] {
         assert!(unit(u).positions.iter().all(|p| *p <= k), "{u} is whole");
@@ -8634,7 +8650,10 @@ fn verify_on_a_short_tape_hashes_what_is_on_it_and_names_the_rest_not_on_tape() 
     let (walked, rewinds) = walk(&h);
     assert_eq!(rewinds, 1, "{:#?}", h.ops());
     assert!(ascending(&walked), "{walked:?}");
-    assert!(walked.iter().all(|p| *p <= k), "nothing past the end: {walked:?}");
+    assert!(
+        walked.iter().all(|p| *p <= k),
+        "nothing past the end: {walked:?}"
+    );
     assert_eq!(
         reads(&h).iter().filter(|p| **p == k + 1).count(),
         1,
@@ -8723,7 +8742,11 @@ fn a_whole_unit_restores_from_a_short_tape_and_a_cut_one_is_refused_by_name() {
         text.contains("unit 'ledgers' (version 3) is not on this tape whole"),
         "{text}"
     );
-    assert!(walk(&h).0.iter().all(|p| *p < first_slice), "{:#?}", h.ops());
+    assert!(
+        walk(&h).0.iter().all(|p| *p < first_slice),
+        "{:#?}",
+        h.ops()
+    );
 }
 
 /// `--all` on a short tape restores every unit the tape holds whole and names
@@ -8781,7 +8804,11 @@ fn list_on_a_short_tape_lists_a_cut_units_files_and_says_it_is_not_whole() {
     );
     assert!(text.contains("--where 'ledgers' --key "), "{text}");
     assert!(text.contains("file0.bin"), "its files are listed:\n{text}");
-    assert!(walk(&h).0.iter().all(|p| *p < first_slice), "{:#?}", h.ops());
+    assert!(
+        walk(&h).0.iter().all(|p| *p < first_slice),
+        "{:#?}",
+        h.ops()
+    );
 
     let (code, text) = h.run(&["--list", "--key", &h.key("alice"), "--unit", "docs"]);
     assert_eq!(code, 0, "{text}");
@@ -8810,7 +8837,10 @@ fn where_and_find_on_a_short_tape_mark_this_tapes_cut_versions() {
 
     let (code, text) = h.run(&["--where", "docs", "--key", &h.key("alice")]);
     assert_eq!(code, 0, "{text}");
-    assert!(text.contains(&format!("tape {LABEL}  (this tape)")), "{text}");
+    assert!(
+        text.contains(&format!("tape {LABEL}  (this tape)")),
+        "{text}"
+    );
     assert!(!text.contains("CUT on this tape"), "{text}");
 
     let (code, text) = h.run(&["--where", "--all", "--key", &h.key("esc")]);
@@ -8836,7 +8866,9 @@ fn where_and_find_on_a_short_tape_mark_this_tapes_cut_versions() {
     assert_eq!(code, 0, "{text}");
     let holders = block(&text, "Tapes holding ledgers version 3:");
     assert!(
-        holders.iter().any(|l| l.contains("(CUT on this tape: it ended early")),
+        holders
+            .iter()
+            .any(|l| l.contains("(CUT on this tape: it ended early")),
         "{holders:#?}\n{text}"
     );
 
@@ -8885,7 +8917,11 @@ fn a_fill_from_a_tape_that_cut_the_unit_is_refused_and_the_list_kept() {
     );
     assert_eq!(std::fs::read_to_string(&list).unwrap(), body);
     let first_slice = template().units[0].positions[0];
-    assert!(walk(&h).0.iter().all(|p| *p < first_slice), "{:#?}", h.ops());
+    assert!(
+        walk(&h).0.iter().all(|p| *p < first_slice),
+        "{:#?}",
+        h.ops()
+    );
 }
 
 /// `--swap-tapes` reads the second cartridge's seal before any of its slices,
@@ -8986,7 +9022,10 @@ fn the_1_6_0_script_reads_a_1_5_0_tape_as_before() {
 
     let (code, text) = h.run(&["--where", "docs", "--key", &h.key("alice")]);
     assert_eq!(code, 0, "{text}");
-    assert!(text.contains(&format!("tape {LABEL}  (this tape)")), "{text}");
+    assert!(
+        text.contains(&format!("tape {LABEL}  (this tape)")),
+        "{text}"
+    );
     assert_eq!(h.count("mt eod"), 0, "{:#?}", h.ops());
     assert_eq!(h.count("mt rewind"), 1, "{:#?}", h.ops());
 }
@@ -9021,7 +9060,15 @@ fn the_1_5_0_script_refuses_a_1_6_0_tape_full_or_short_at_file_0_by_name() {
             vec!["--info"],
             vec!["--verify"],
             vec!["--find-envelope", "--key", &alice],
-            vec!["--restore", "--key", &alice, "--unit", "docs", "--to", &dest],
+            vec![
+                "--restore",
+                "--key",
+                &alice,
+                "--unit",
+                "docs",
+                "--to",
+                &dest,
+            ],
             vec!["--where", "docs", "--key", &alice],
         ] {
             let (code, text) = h.run(&args);
@@ -9193,7 +9240,9 @@ fn a_1_6_0_tape_with_no_seal_reads_as_unsealed() {
     ]);
     assert_eq!(code, 0, "{text}");
     assert!(
-        text.contains("this tape requires short-seal, and no valid seal marker was found as its last file"),
+        text.contains(
+            "this tape requires short-seal, and no valid seal marker was found as its last file"
+        ),
         "{text}"
     );
     assert!(same_tree(&docs.src, Path::new(&dest)), "{text}");

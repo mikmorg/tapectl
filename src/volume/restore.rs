@@ -7622,7 +7622,10 @@ mod tests {
             fn a_tape_that_requires_nothing_restores_as_before() {
                 for (what, to) in [
                     ("states requires = [\"short-seal\"]", STATED),
-                    ("states requires = [], as 1.1.0 to 1.5.0", "\nrequires = []\n"),
+                    (
+                        "states requires = [], as 1.1.0 to 1.5.0",
+                        "\nrequires = []\n",
+                    ),
                     ("states no requires, as before 1.1.0", "\n"),
                     (
                         "carries a key nobody requires",
