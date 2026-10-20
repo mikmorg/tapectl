@@ -7384,8 +7384,9 @@ mod tests {
             use crate::tape::fake::Op;
             use crate::volume::restore_record::rows;
 
-            /// How a 1.1.0+ File 0 states that it requires nothing.
-            const STATED: &str = "\nrequires = []\n";
+            /// How a 1.6.0 File 0 states what it requires (ADR-0012 item 111):
+            /// one feature, which this tapectl knows.
+            const STATED: &str = "\nrequires = [\"short-seal\"]\n";
             const UNKNOWN: &str = "\nrequires = [\"unknown-feature\"]\n";
 
             /// [`crate::volume::format::rewrite_file0`], by the name this
@@ -7610,8 +7611,9 @@ mod tests {
                 assert_only_file0_was_read(&m.fake.ops());
             }
 
-            /// The positive controls: a File 0 that states `requires = []`
-            /// (every tape from 1.1.0), states none (every tape before it) or
+            /// The positive controls: a File 0 that states 1.6.0's
+            /// `requires = ["short-seal"]`, states `requires = []` (every tape
+            /// from 1.1.0 to 1.5.0), states none (every tape before it) or
             /// carries a key nobody requires restores exactly as before — on
             /// the unit path and the volume path — and the slices ARE read,
             /// so the refusals above are the fence and not a tape that
@@ -7619,11 +7621,12 @@ mod tests {
             #[test]
             fn a_tape_that_requires_nothing_restores_as_before() {
                 for (what, to) in [
-                    ("states requires = []", STATED),
+                    ("states requires = [\"short-seal\"]", STATED),
+                    ("states requires = [], as 1.1.0 to 1.5.0", "\nrequires = []\n"),
                     ("states no requires, as before 1.1.0", "\n"),
                     (
                         "carries a key nobody requires",
-                        "\nrequires = []\nfuture_key = \"x\"\n",
+                        "\nrequires = [\"short-seal\"]\nfuture_key = \"x\"\n",
                     ),
                 ] {
                     let m = one();

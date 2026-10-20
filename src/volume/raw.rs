@@ -531,8 +531,14 @@ pub(crate) mod tests {
         let data = b"some plaintext".to_vec();
         let mut store = build_synthetic_tape("RAWFC", &data);
         let f0 = String::from_utf8(store.files[0].clone()).unwrap();
+        // From 1.6.0 File 0 states `requires = ["short-seal"]` (ADR-0012
+        // item 111): the fixture is checked to say so before it is edited.
+        assert!(f0.contains("requires = [\"short-seal\"]"), "{f0}");
         store.files[0] = f0
-            .replace("requires = []", "requires = [\"unknown-feature\"]")
+            .replace(
+                "requires = [\"short-seal\"]",
+                "requires = [\"unknown-feature\"]",
+            )
             .into_bytes();
         let tmp = TempDir::new().unwrap();
         let err = restore_raw(&mut store, tmp.path(), None)
@@ -548,7 +554,10 @@ pub(crate) mod tests {
         // Control: an unknown key nobody requires is read past.
         let mut store = build_synthetic_tape("RAWFC", &data);
         store.files[0] = f0
-            .replace("requires = []", "requires = []\nfuture_key = 1")
+            .replace(
+                "requires = [\"short-seal\"]",
+                "requires = [\"short-seal\"]\nfuture_key = 1",
+            )
             .into_bytes();
         let tmp = TempDir::new().unwrap();
         restore_raw(&mut store, tmp.path(), None).unwrap();

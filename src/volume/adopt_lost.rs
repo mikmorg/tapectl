@@ -942,7 +942,8 @@ mod tests {
 
     /// `Lost`'s sealed tape on a `FakeTape`, so the head motion is recorded;
     /// File 0's `requires` line replaced by `to` (`STATED` leaves the tape as
-    /// written, and proves the fixture states `requires = []`).
+    /// written, and proves the fixture states 1.6.0's
+    /// `requires = ["short-seal"]`, ADR-0012 item 111).
     fn on_fake_tape(
         lost: &Lost,
         to: &str,
@@ -954,7 +955,7 @@ mod tests {
         (fake, store)
     }
 
-    const STATED: &str = "\nrequires = []\n";
+    const STATED: &str = "\nrequires = [\"short-seal\"]\n";
 
     /// #476 (ADR-0012 2026-10-06 item 15): File 0 is this volume's and reads,
     /// but states a feature this tapectl does not know — a tape it cannot
@@ -1012,8 +1013,9 @@ mod tests {
         assert_refused_untouched(&lost, &verdict);
     }
 
-    /// The positive control: the same tape on the same fake, `requires = []`,
-    /// is adopted as before — and the front index and seal ARE read.
+    /// The positive control: the same tape on the same fake, requiring only
+    /// what this tapectl knows (`short-seal`), is adopted as before — and the
+    /// front index and seal ARE read.
     #[test]
     fn a_tape_that_requires_nothing_is_adopted_through_the_same_store() {
         use crate::tape::fake::Op;

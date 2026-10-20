@@ -16429,13 +16429,14 @@ mod tests {
         use crate::tape::fake::{FakeTape, Op};
         use crate::volume::format::rewrite_file0;
 
-        /// How a 1.1.0+ File 0 and seal marker state that they require nothing.
-        const STATED: &str = "\nrequires = []\n";
+        /// How a 1.6.0 File 0 states what it requires (ADR-0012 item 111):
+        /// one feature, which this tapectl knows.
+        const STATED: &str = "\nrequires = [\"short-seal\"]\n";
         const UNKNOWN: &str = "\nrequires = [\"unknown-feature\"]\n";
 
         /// [`loaded_fixture`] with File 0's `requires` line replaced by `to`
         /// (`STATED` leaves the tape as written — the positive control, which
-        /// also proves the fixture states `requires = []`).
+        /// also proves the fixture states `requires = ["short-seal"]`).
         fn fixture(label: &str, to: &str) -> (Connection, i64, FakeTape) {
             let (conn, volume_id, fake) = loaded_fixture(label);
             let old = fake.state().files[0].clone();
@@ -16590,8 +16591,9 @@ mod tests {
             assert_eq!(contacts[0].2.as_deref(), Some("failed"));
         }
 
-        /// The positive control: `requires = []` verifies as before, on the
-        /// same fixture, and reads more than File 0.
+        /// The positive control: a File 0 requiring only what this tapectl
+        /// knows verifies as before, on the same fixture, and reads more than
+        /// File 0.
         #[test]
         fn verify_of_a_tape_requiring_nothing_passes_as_before() {
             let (conn, volume_id, fake) = fixture("RQ-VOK", STATED);
@@ -16630,7 +16632,14 @@ mod tests {
             let (conn, volume_id, fake) = fixture("RQ-VS", STATED);
             let seal_position = fake.state().files.len() - 1;
             let old = fake.state().files[seal_position].clone();
-            fake.state().files[seal_position] = rewrite_file0(&old, STATED, UNKNOWN);
+            // The seal states 1.6.0's line once its generator writes 1.6.0
+            // seals, and 1.5.0's `requires = []` before (ADR-0012 item 111).
+            let text = String::from_utf8_lossy(&old).to_string();
+            let stated = [STATED, "\nrequires = []\n"]
+                .into_iter()
+                .find(|s| text.contains(s))
+                .expect("the seal states requires");
+            fake.state().files[seal_position] = rewrite_file0(&old, stated, UNKNOWN);
             let mut store = fake_store(&fake);
             let report = volume_verify_with_store(
                 &conn,
@@ -16694,7 +16703,8 @@ mod tests {
             assert_eq!(contacts[0].2.as_deref(), Some("failed"));
         }
 
-        /// The positive control: `requires = []` reads and stages the slice.
+        /// The positive control: a File 0 requiring only what this tapectl
+        /// knows reads and stages the slice.
         #[test]
         fn read_slices_of_a_tape_requiring_nothing_stages_the_slice_as_before() {
             let (conn, _, fake) = fixture("RQ-RSOK", STATED);
