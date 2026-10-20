@@ -401,7 +401,7 @@ tctl() {
 tctl_hooked() { # the rehearsal's first write: the test hook on this one command line
     env TAPECTL_TEST_EARLY_WARNING_AT="$HOOK_AT" "$TAPECTL_BIN" --home "$TAPECTL_HOME" --config "$CFG" "$@" </dev/null
 }
-rctl() { # the rebuild's bare home (no config, no drive configured: the heir's case)
+rctl() { # the rebuild's second home (no drive configured: the heir's case)
     env -u TAPECTL_TEST_EARLY_WARNING_AT "$TAPECTL_BIN" --home "$REBUILD_HOME" "$@" </dev/null
 }
 
@@ -524,9 +524,12 @@ run init 0 tctl init --operator "$OPERATOR" --no-escrow
 run escrow 0 tctl key generate --escrow
 ESCROW_SECRET="$(grep -oE 'AGE-SECRET-KEY-1[A-Z0-9]+' "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err" | head -1 | sed 's/^[^:]*://')"
 [ -n "$ESCROW_SECRET" ] || fail "key generate --escrow printed no secret"
+ESCROW_PUB="$(grep -ohE 'age1[a-z0-9]+' "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err" | head -1)"
+[ -n "$ESCROW_PUB" ] || fail "key generate --escrow printed no public key"
 mkdir -p "$RUN/keys"; umask_old="$(umask)"; umask 077
 printf '%s\n' "$ESCROW_SECRET" > "$RUN/keys/escrow.key"
 umask "$umask_old"
+printf '%s\n' "$ESCROW_PUB" > "$RUN/keys/escrow.pub"
 chmod 600 "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err"
 run cfg-dar 0 tctl config set dar.binary "\"$DAR_BIN\""
 run cfg-slice 0 tctl config set defaults.slice_size "\"$SLICE_SIZE\""
@@ -682,7 +685,10 @@ begin_step 6 rebuild "catalog rebuild --from-volume into a second home, compared
 OPERATOR_KEY="$TAPECTL_HOME/keys/$OPERATOR-primary.age.key"
 [ -f "$OPERATOR_KEY" ] || fail "the operator key $OPERATOR_KEY is missing"
 mkdir -p "$REBUILD_HOME"
-run rebuild 0 rctl catalog rebuild --from-volume --device "$TAPE_DEV" --key "$OPERATOR_KEY"
+# The DR recipe (ADR-0012, #139): a new home adopting the original escrow recipient, then the
+# rebuild with the operator key. No drive is configured there, as on an heir's machine.
+run rebuild-init 0 rctl init --operator "$OPERATOR" --escrow-public-key "$ESCROW_PUB"
+run rebuild 0 rctl --json catalog rebuild --from-volume --device "$TAPE_DEV" --key "$OPERATOR_KEY" --label "$LABEL1"
 run compare 0 "$FIXTURE_BIN" compare --home "$TAPECTL_HOME" --rebuilt "$REBUILD_HOME" --label "$LABEL1"
 tee -a "$RUN/run.log" < "$STEP_DIR/compare.out"
 end_step
