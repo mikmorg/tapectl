@@ -224,6 +224,22 @@
 //! "tapectl 1.1.0" in `die_newer_needed`, `requires` (empty) and
 //! `KNOWN_FEATURES=""`. The MANIFEST.toml pin did not move.
 //!
+//! **RE-PINNED 2026-10-20 for tapectl 1.6.0, under ADR-0012 item 116** (the CTO
+//! pre-authorized the moves items 111-115 name, and nothing else; the bound ends
+//! when v1.6.0 is installed on home2). The previous RESTORE.sh pin was
+//! `95862b49…` (kept byte for byte as `tests/fixtures/restore_sh_1_5_0/`); this
+//! one is `d9787a4f…`. Every hunk of the diff is the short seal's reading
+//! (`volume-format-v2.md` §4.1, §4.2): `KNOWN_FEATURES="short-seal"` and
+//! "tapectl 1.6.0" in `die_newer_needed` (item 73's fixed points, moved by item
+//! 111); the seal's parse rules S1, S2 and S5; on a tape that requires
+//! short-seal, the seal read right after File 3 by spacing to the end of the data
+//! (R1), the file map trimmed to `ended_after`, NOT ON TAPE for the planned files
+//! after it under `--info` and `--verify` (R3), a cut unit refused or named and
+//! never restored (R4), `--where`/`--find` marking this tape's cut versions, and
+//! a second cartridge's seal read first under `--swap-tapes` (R5). A 1.5.0 tape
+//! reads exactly as before. The MANIFEST.toml pin moved by one line,
+//! `may_end_early = true` after `created_at` (item 111).
+//!
 //! `MANIFEST.toml` carries a `created_at` timestamp; that one line is
 //! normalised before comparison and is the only thing allowed to vary.
 
@@ -240,7 +256,7 @@ fn sha256_hex(s: &str) -> String {
 
 /// The RESTORE.sh a volume labelled GOLD01 with 12 files gets. The script is
 /// pure substitution, so its hash is stable across runs and machines.
-const RESTORE_SH_SHA256: &str = "95862b49b0621e5970ebd91c49a353231725009e1f527c691cf98b3a116a6315";
+const RESTORE_SH_SHA256: &str = "d9787a4ffdd05ba038416696d9866a9a285fc97509c35692a18dc3a9b68f9e9d";
 
 #[test]
 fn restore_sh_bytes_are_pinned() {
@@ -386,13 +402,14 @@ fn restore_sh_bytes_are_pinned() {
     // The two placeholders must both have been substituted.
     assert!(!script.contains("__LABEL__") && !script.contains("__TOTAL_FILES__"));
     assert!(!script.contains("__AWK_") && !script.contains("__TOOLS_"));
-    // ADR-0012 2026-10-16 item 73: the two things the re-pin does not move.
+    // ADR-0012 item 73's two fixed points, moved once by item 111 (1.6.0):
+    // the "needs" text names 1.6.0, and short-seal is the one known feature.
     assert_eq!(
         script
-            .matches("This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely")
+            .matches("This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely")
             .count(),
         1,
-        "die_newer_needed still says tapectl 1.1.0"
+        "die_newer_needed says tapectl 1.6.0"
     );
     assert_eq!(
         script.matches("tapectl 1.").count(),
@@ -400,9 +417,9 @@ fn restore_sh_bytes_are_pinned() {
         "no other version named"
     );
     assert_eq!(
-        script.matches("\nKNOWN_FEATURES=\"\"\n").count(),
+        script.matches("\nKNOWN_FEATURES=\"short-seal\"\n").count(),
         1,
-        "RESTORE.sh still knows no feature a tape could require"
+        "RESTORE.sh knows short-seal and no other feature"
     );
     assert!(script.contains("LABEL=\"GOLD01\""));
     assert!(script.contains("# Total files on tape: 12"));
@@ -476,6 +493,7 @@ const MANIFEST_EXPECTED: &str = r##"[manifest]
 volume = "GOLD01"
 tenant = "alpha"
 created_at = "<normalised>"
+may_end_early = true
 
 [[units]]
 name = "photos/2019"
