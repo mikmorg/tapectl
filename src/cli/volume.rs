@@ -2327,6 +2327,17 @@ pub fn run(
                     "estimated tapes: {tapes_needed} (at the {}% fill ceiling)",
                     (factor * 100.0).round() as i64
                 );
+                // ADR-0012 item 113: only when the drive declares
+                // `post_warning_bytes`; every line above is unchanged.
+                let tape = backend.planning_tape_budget(generation.as_deref())?;
+                let mut in_write_order: Vec<(String, i64, u64)> = rows
+                    .iter()
+                    .map(|(name, ver, _, size)| (name.clone(), *ver, size.unwrap_or(0) as u64))
+                    .collect();
+                in_write_order.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+                for line in plan_bound_lines(&tape, &in_write_order) {
+                    println!("{line}");
+                }
                 if let Some(index) = index {
                     println!("{}", plan_index_line(index));
                 }
@@ -4158,6 +4169,52 @@ fn planned_index_bytes(
     Ok(measured.total_bytes() as i64)
 }
 
+/// `volume plan`'s lines for the plan bound (ADR-0012 item 113): none when
+/// the drive declares no `post_warning_bytes` (the plan stops at the fill
+/// ceiling, as before 1.6.0); otherwise how far a write may plan past the
+/// ceiling, and which staged units one write would plan past it. `units` are
+/// `(name, version, encrypted bytes)` in the order a write takes them (by
+/// unit name). An estimate, as the tape count above it is: each unit is
+/// block-padded whole, and the volume's own files are not counted.
+fn plan_bound_lines(tape: &crate::config::TapeBudget, units: &[(String, i64, u64)]) -> Vec<String> {
+    let Some(bound) = tape.plan_bound_bytes else {
+        return Vec::new();
+    };
+    let dec = |b: u64| crate::util::format_bytes_decimal(i64::try_from(b).unwrap_or(i64::MAX));
+    let mut lines = vec![format!(
+        "past the fill ceiling: a write may plan whole units up to {} ({bound} bytes), the \
+         cartridge's nominal capacity, because the drive declares post_warning_bytes (ADR-0012 \
+         item 113); the tape may end before a unit planned past the ceiling, which is then cut \
+         and written whole onto the next cartridge",
+        dec(bound)
+    )];
+    let padded: Vec<u64> = units
+        .iter()
+        .map(|(_, _, bytes)| {
+            crate::volume::layout_model::pad_to_blocks(*bytes, DEFAULT_BLOCK_SIZE as u64)
+        })
+        .collect();
+    let split = crate::volume::layout_model::CapacityBudget {
+        available_bytes: tape.bytes,
+        reserve_bytes: 0,
+        plan_bound_bytes: Some(bound),
+    }
+    .split(0, &padded);
+    let past = &units[split.past_ceiling()];
+    if !past.is_empty() {
+        lines.push(format!(
+            "planned past the fill ceiling of {} by one write of everything staged (the tape may \
+             end before them): {}",
+            dec(tape.bytes),
+            past.iter()
+                .map(|(name, ver, _)| format!("{name} v{ver}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines
+}
+
 fn staged_plan_rows(
     conn: &Connection,
     config: &Config,
@@ -4210,6 +4267,46 @@ fn staged_plan_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-0012 item 113: `volume plan` says how far a write may plan past
+    /// the fill ceiling, and which units one write would plan past it, in
+    /// the order a write takes them — and says nothing at all without
+    /// `post_warning_bytes`, so its output is as before 1.6.0.
+    #[test]
+    fn the_plan_names_the_units_past_the_fill_ceiling_only_with_a_plan_bound() {
+        let bs = DEFAULT_BLOCK_SIZE as u64;
+        let tape = crate::config::TapeBudget::new("one LTO-6 tape".into(), 10 * bs, 0.5, 0, false);
+        let units = vec![
+            ("a".to_string(), 1, 2 * bs),
+            ("b".to_string(), 2, 4 * bs),
+            ("c".to_string(), 1, 3 * bs),
+            ("d".to_string(), 1, 5 * bs),
+        ];
+        assert!(
+            plan_bound_lines(&tape, &units).is_empty(),
+            "no bound, no lines"
+        );
+
+        let lines = plan_bound_lines(&tape.clone().with_plan_bound(Some(10 * bs)), &units);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("past the fill ceiling: a write may plan whole units up to "));
+        assert!(
+            lines[0].contains(&format!("({} bytes)", 10 * bs)),
+            "{}",
+            lines[0]
+        );
+        // `a` fits the 5-block ceiling; `b` crosses it, and `c` ends at 9 of
+        // the 10 blocks; `d` is beyond the bound.
+        assert!(
+            lines[1].ends_with("(the tape may end before them): b v2, c v1"),
+            "{}",
+            lines[1]
+        );
+
+        // Every unit under the ceiling: the bound is named, no unit is.
+        let lines = plan_bound_lines(&tape.with_plan_bound(Some(10 * bs)), &units[..1]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+    }
 
     /// #418 R4: `volume plan` names the index's size, twice it for the
     /// envelope backups, and calls it an estimate.
