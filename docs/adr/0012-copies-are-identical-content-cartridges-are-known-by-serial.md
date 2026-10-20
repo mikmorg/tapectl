@@ -1849,3 +1849,35 @@ Ruled 2026-10-20, after the #420 profile on home2 (`docs/runs/2026-10-20-lto6-pr
      that spaces by filemarks (proven on mhvtl). #420 is then built. Its real-drive acceptance run
      fills a test cartridge to the warning and must read the post-warning slice and the seal back
      before #420 ships. A failed readback there stops #420; it does not re-scope it.
+
+Ruled 2026-10-20, on #420's build plan (the forks the plan found that items 76-100 did not answer):
+
+111. **Every 1.6.0 tape fences out older readers.** File 0 of every tape written by 1.6.0 or later
+     carries `requires = ["short-seal"]`, whether it sealed full or short. The envelopes' MANIFEST.toml
+     carries the declaration too, so its golden pin moves with RESTORE.sh's. A 1.5.0 reader refuses
+     every 1.6.0 tape by name, never half-reading one. The short seal itself carries
+     `requires = ["short-seal"]` and `ended_after = K`, as `volume-format-v2.md` §1.2 reserved. The
+     front index and RECOVERY.md say the tape may end early and that the seal says where. Considered
+     and not chosen: fencing only a short seal, so 1.5.0 would still read a full 1.6.0 tape. A
+     consequence: the Heir Kit's copy of tapectl must be 1.6.0 or later once a 1.6.0 tape exists,
+     so the kit is regenerated when 1.6.0 is installed.
+112. **A cut unit's rows become `cut`.** Migration 038 adds the write status `cut` and
+     `volumes.ended_after`. A `cut` row is never a copy. Its slices that reached the tape stay
+     recorded (spanning, #478, uses them). It does not block releasing staging once the unit's
+     version is written whole elsewhere. Units planned after the cut also become `cut`. Considered
+     and not chosen: deleting the rows and logging an event.
+113. **A plan reaches past the fill ceiling to 100% of nominal capacity, and only with
+     `post_warning_bytes`.** This resolves item 99's two sentences ("the units staged when a session
+     starts" and "overstates by at most that one unit") for a staging area holding more than one tape.
+     Whole units are added past the ceiling while the plan's end stays at or below the cartridge's
+     nominal capacity, and only when the drive declares `post_warning_bytes`. Without it, plans stop
+     at the ceiling as today, but an unexpected early warning still seals short.
+114. **A short-sealed write always reads back what it wrote past the warning.** At most one slice
+     and the seal. This happens under every confirm tier, so a block st refused but the drive kept
+     is caught on every short tape, not only in item 110's acceptance run. (Coordinator's call
+     within item 110; not a CTO fork.)
+115. **The acceptance run fills with a synthetic stage set.** home2's staging area is smaller than
+     one cartridge. In a throwaway home, a test fixture adds one stage set whose slice rows all
+     point to one real 1 GiB ciphertext file, placed between real units. The write reaches the
+     early warning, the cut is real, and so are the restore, rebuild and rewrite-on-the-next-tape
+     of the real units around it. Considered and not chosen: 2.6 TB of real staged data.
