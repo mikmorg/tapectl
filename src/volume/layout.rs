@@ -752,11 +752,14 @@ which RESTORE.sh cannot read around: "tapectl itself".
   also prints the commands that read the next file, this guide: "File 0's
   commands" in this guide means those.
 - **`requires`**: a line in File 0 and in the seal marker that lists the
-  features a reader must understand to read the tape correctly. It is empty
-  (`requires = []`) on the tapes written so far (older tapes have no such
-  line), which means nothing special is needed. A RESTORE.sh that meets a feature it does not know
-  refuses by name and points to the RESTORE.sh stored on that tape, or a
-  newer tapectl.
+  features a reader must understand to read the tape correctly. A tape
+  written by tapectl 1.6.0 or later states `requires = ["short-seal"]`: the
+  tape may end before the last file the front index plans, and its seal
+  marker says where ("Where the tape ended"). Older tapes state it empty
+  (`requires = []`, from 1.1.0 to 1.5.0) or have no such line, which means
+  nothing special is needed. A RESTORE.sh that meets a feature it does not
+  know refuses by name and points to the RESTORE.sh stored on that tape, or
+  a newer tapectl.
 - **Unit**: one archived folder tree, the thing you restore by name (for
   example `photos/2019`). A unit can be stored in several versions, one
   each time it was archived again after its contents had changed. Unless
@@ -935,7 +938,8 @@ This volume uses layout v2. Tape files are laid out in this fixed order:
   are stored contiguously
 - LAST file (File {last_file} on this tape): SEAL MARKER — asserts the tape
   is complete, and carries a full embedded copy of the front index (used
-  if File 3 is damaged)
+  if File 3 is damaged). A tape that ended early has its seal marker
+  sooner, right after the last data slice written ("Where the tape ended")
 
 The number of the last file is a fact about THIS tape. Another tape of the
 box has its own: File 0 of that tape gives it (`total_files`, and
@@ -1580,7 +1584,8 @@ whole:
 
 - SEALED: the seal marker (the last file) is there and agrees with the
   front index. The write finished and the two ends of the tape match.
-  Carry on.
+  Carry on. A SEALED tape may still have ended early, and `--info` then
+  says after which file: "Where the tape ended".
 - UNSEALED: there is no valid seal marker. The write never finished: it
   was interrupted or aborted, or the tape ran out of room. Envelopes are
   written before slices, and the front index before both, so the front
@@ -1632,6 +1637,46 @@ marker's copy of it, with a warning (rung 2 of "If All Else Fails").
   then type `done`), and "No other copy", in "If a slice or a file is
   damaged", has that and the commands by hand. The files in the failed
   slices are lost.
+
+## Where the tape ended
+
+A tape written by tapectl 1.6.0 or later states `requires = ["short-seal"]`
+in File 0 and in its seal marker. It means the tape may end before the last
+file the front index plans: when the drive reported that its medium was
+nearly full while it wrote a data slice that was not the last, the write
+finished that slice and sealed the tape right after it. File 0, the front
+index and the envelopes were written before that, so they describe the
+plan, and only the seal marker, the last file on the tape, says where the
+tape really ended. Its `ended_after` is the last tape file before the seal
+marker, and its `file_count` is `ended_after` plus 2. Every tape file the
+front index lists after `ended_after` is not on this tape. A tape that
+sealed where the plan said states it too: there it is the file before the
+planned last.
+
+To read it by hand, with no key (`/dev/nst0` is an example: "Which
+device?"):
+
+    mt -f /dev/nst0 setblk 524288
+    mt -f /dev/nst0 eod          # GNU mt: eom
+    mt -f /dev/nst0 bsfm 2
+    dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(file_count|ended_after) ='
+
+A unit whose slices run past `ended_after` (the `tape_position` of its last
+slice in MANIFEST.toml, the last of its "Tape files" in RECOVERY.md, is
+after it) is not on this tape whole: do not start reading its slices. Its
+first slices are there and hash correctly, the rest are not, and it is
+restored only from another tape that holds it whole. The index names that
+tape: `./RESTORE.sh --where UNIT --key YOUR_KEY.age.key` ("The rest of the
+box"). Every unit wholly at or before `ended_after` is on this tape whole
+and restores as usual.
+
+RESTORE.sh does all of this by itself, reading the seal marker before any
+slice (one wind to the end of the tape and a rewind). `--info` says where
+the tape ended (the verdict stays SEALED), and `--verify` prints `NOT ON
+TAPE` for each planned file after `ended_after`, which is not a failure.
+`--restore` refuses a unit the end of the tape cut, by name (`--all`
+restores the others and names it), `--list` says so, and `--where` marks
+this tape `CUT` for that version.
 
 ## Did the restore get everything?
 
@@ -1944,7 +1989,8 @@ exact size with `truncate` instead, never with `tr`.
    Each `[[files]]` entry gives a file's `position`, `type`, exact
    `size_bytes` (without block padding) and `sha256_encrypted`.
 4. Read the seal marker, the last file. This tape has {total_files} files,
-   numbered 0 to {last_file}, so the last is File {last_file}:
+   numbered 0 to {last_file}, so the last is File {last_file}, unless the
+   tape ended early (below):
 
        mt -f /dev/nst0 eod
        mt -f /dev/nst0 bsfm 2
@@ -1955,9 +2001,13 @@ exact size with `truncate` instead, never with `tr`.
    that filemark and the one before it and then steps forward over that
    one, which leaves the head at the START of the last file. (Without
    `eod`, `mt -f /dev/nst0 rewind` then `mt -f /dev/nst0 fsf {last_file}`
-   reaches the same place on this tape.) Check that `front_index_sha256` in seal.toml
+   reaches the same place on this tape, if it did not end early.) Check that `front_index_sha256` in seal.toml
    equals the sha256sum printed in step 3, and that its `file_count` is
-   the number of entries in the front index. If the seal marker is
+   the number of entries in the front index. On a tape that ended early
+   (File 0 and the seal say `requires = ["short-seal"]`, and `file_count`
+   is smaller), the seal marker's `ended_after` is the last file before it,
+   and every entry of the front index after that is not on the tape:
+   "Where the tape ended". If the seal marker is
    missing, or the two hashes disagree, treat the tape as unsealed or
    damaged: see "If the verdict is UNSEALED or DAMAGED". An unsealed tape
    may lack its last data slices (the front index still lists them), and
@@ -2014,7 +2064,10 @@ exact size with `truncate` instead, never with `tr`.
    own: the slices of every unit are named `restore.N.dar`, so two units in
    one directory would overwrite each other. If the manifest lists the unit
    more than once, take the block with the highest `snapshot_version`, the
-   newest, unless you want an older one. Put the tape at the first slice,
+   newest, unless you want an older one. On a tape that ended early (step
+   4), check first that the `tape_position` of the unit's last slice is at
+   or before the seal marker's `ended_after`: if it is after, the tape does
+   not hold the unit whole, so do not start ("Where the tape ended"). Put the tape at the first slice,
    once. `fsf N` moves forward N files from where the head is, so from the
    start of the tape it reaches File N: the `tape_position` of the first
    slice, from the manifest (FIRST_TAPE_POSITION below).
@@ -2231,7 +2284,8 @@ of "Manual Recovery Steps" does.
 
 The files of THIS tape are numbered 0 to {last_file}. File {last_file}, the
 last, is the seal marker. Another tape of the box has its own count: File 0
-of that tape gives it.
+of that tape gives it. That is the plan: a tape that ended early holds
+fewer, and its seal marker says where it ended ("Where the tape ended").
 "#
     )
 }
@@ -6789,6 +6843,39 @@ the unit, into a directory of its own.
 
 "##;
 
+/// RECOVERY.md's section on where the tape ended (`volume-format-v2.md` §1.7,
+/// tapectl 1.6.0, ADR-0012 item 111), after the units table and before the
+/// first unit's section: the table is the plan, the seal marker says where
+/// the tape really ended, the four lines that read it with no key, and the
+/// rule for a unit whose slices run past it. The same in every envelope.
+const RECOVERY_END_SECTION: &str = r##"## Where this tape ended
+
+This tape may end before the last tape file the write planned, because the
+drive reached the end of its medium. The table above is the plan, written
+before any slice was.
+
+The seal marker, the last file on the tape, says where it ended: its
+`ended_after` is the last tape file before the seal, and every tape file
+after `ended_after` is not on this tape. To read it by hand, with no key
+(`/dev/nst0` below is an example — run `ls -l /dev/tape/by-id/` and
+substitute your own drive, or you may read a different tape):
+
+```bash
+mt -f /dev/nst0 setblk 524288
+mt -f /dev/nst0 eod          # GNU mt: eom
+mt -f /dev/nst0 bsfm 2
+dd if=/dev/nst0 bs=512k | tr -d '\0' | grep -E '^(file_count|ended_after) ='
+```
+
+When the last tape file of a unit (the end of its "Tape files" above) is
+after `ended_after`, this tape does not hold the unit whole. Do not start
+reading its slices: it is restorable only from another tape. The index
+(`index/units.tsv`, below) and `RESTORE.sh --where UNIT` name the tapes that
+hold it. `RESTORE.sh` (tape file 2) does all of this by itself: `--info` and
+`--verify` report where the tape ended.
+
+"##;
+
 /// RECOVERY.md's section on a damaged slice or file (ADR-0012 items 101 and
 /// 102, tapectl 1.3.0): the two RESTORE.sh commands and the rule that only
 /// the same unit at the same version is used. Like the index section it
@@ -6914,6 +7001,7 @@ pub fn generate_recovery_md(
         ));
     }
     s.push('\n');
+    s.push_str(RECOVERY_END_SECTION);
 
     for unit in units {
         let stem = catalogue_stem(unit);
@@ -7047,6 +7135,226 @@ mod tests {
         AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
         AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
     };
+
+    // ---- what a 1.6.0 tape declares up front (volume-format-v2.md §1.7,
+    // ADR-0012 item 111, #420) ----
+
+    /// File 0 states `requires = ["short-seal"]` on every 1.6.0 tape, on the
+    /// line after `layout_version` (§1.2), and nothing else of it changes:
+    /// `id_thunk_with_no_identity_source_is_byte_identical_to_the_pre_field_output`
+    /// undoes this one line and gets its old digest back.
+    #[test]
+    fn file_0_requires_short_seal_on_the_line_after_layout_version() {
+        let t = generate_id_thunk_v2(&IdThunkV2Params {
+            label: "SS01",
+            uuid: "u",
+            media_type: "LTO-6",
+            tapectl_version: "1.6.0",
+            nominal_capacity: 1,
+            mam_capacity: 1,
+            total_files: 9,
+            mam_manufacturer: "m",
+            mam_serial: "s",
+            mam_length: 1,
+            mam_loads: 1,
+            created_at: "2026-10-20T00:00:00Z",
+            cartridge_identity_source: None,
+        });
+        assert_eq!(
+            t.matches("\nlayout_version = 2\nrequires = [\"short-seal\"]\n")
+                .count(),
+            1,
+            "{t}"
+        );
+        assert_eq!(t.matches("requires").count(), 1, "{t}");
+        let claims = crate::volume::format::parse_id_thunk_claims(&t).unwrap();
+        assert_eq!(claims.requires, vec!["short-seal".to_string()]);
+        assert_eq!(claims.refusal("File 0"), None, "1.6.0 reads its own tape");
+        // File 0 is the plan: its pointers are the planned seal and count.
+        assert!(t.contains("\nseal_marker = 8\ntotal_files = 9\n"), "{t}");
+    }
+
+    /// File 3's `[index]` states `may_end_early = true` after
+    /// `layout_version`, and its header gains §3's paragraph, word for word,
+    /// after "see the system guide." and before the MACHINE-READABLE rule.
+    #[test]
+    fn file_3_declares_may_end_early_with_the_pinned_paragraph() {
+        let files = vec![
+            FrontIndexFile {
+                position: 3,
+                type_label: "front_index",
+                size_bytes: None,
+                sha256_encrypted: None,
+            },
+            FrontIndexFile {
+                position: 4,
+                type_label: "seal_marker",
+                size_bytes: None,
+                sha256_encrypted: None,
+            },
+        ];
+        let s = generate_front_index("ME01", &files);
+        let paragraph = "The trailing seal marker binds this index by hash; see the system guide.\n\
+                         \n\
+                         This tape may end early. The list below is the plan: every file the\n\
+                         write meant to put on the tape. The seal marker, the LAST file on the\n\
+                         tape, says where the tape really ended (its ended_after). A file listed\n\
+                         after that position is not on this tape.\n\
+                         \n\
+                         ================================================================\n\
+                         \x20             MACHINE-READABLE DATA (TOML)\n";
+        assert_eq!(s.matches(paragraph).count(), 1, "{s}");
+        assert_eq!(
+            s.matches("[index]\nvolume = \"ME01\"\nlayout_version = 2\nmay_end_early = true\n")
+                .count(),
+            1,
+            "{s}"
+        );
+        let doc = crate::volume::format::parse_front_index_document(&s).unwrap();
+        assert!(doc.may_end_early);
+    }
+
+    /// Every envelope's MANIFEST.toml states `may_end_early = true`, the last
+    /// key of `[manifest]`, then the blank line before `[[units]]` (§1.7).
+    #[test]
+    fn every_manifest_states_may_end_early() {
+        let m = generate_manifest_toml(
+            "ME02",
+            "operator",
+            &[ManifestUnit {
+                name: "u".into(),
+                uuid: "uuid-u".into(),
+                snapshot_version: 1,
+                stage_set_id: 1,
+                dar_version: None,
+                dar_command: None,
+                slices: vec![],
+            }],
+        );
+        let created = m.lines().find(|l| l.starts_with("created_at = ")).unwrap();
+        assert!(
+            m.contains(&format!("{created}\nmay_end_early = true\n\n[[units]]\n")),
+            "{m}"
+        );
+        assert!(crate::volume::manifest::Manifest::declares_may_end_early(&m).unwrap());
+    }
+
+    /// RECOVERY.md says where the tape ended, after the units table and
+    /// before the first unit's section (§1.7): the table is the plan, the
+    /// seal says where, the four lines that read it with the device caution,
+    /// the rule for a unit past it, and what RESTORE.sh does.
+    #[test]
+    fn recovery_md_says_where_the_tape_ended_between_the_table_and_the_first_unit() {
+        let units = vec![ManifestUnit {
+            name: "alpha".into(),
+            uuid: "11111111-aaaa".into(),
+            snapshot_version: 2,
+            stage_set_id: 7,
+            dar_version: None,
+            dar_command: None,
+            slices: vec![ManifestSlice {
+                number: 1,
+                tape_position: 9,
+                size_bytes: 10,
+                encrypted_bytes: 30,
+                sha256_plain: "p".into(),
+                sha256_encrypted: "e".into(),
+            }],
+        }];
+        let r = generate_recovery_md("RE01", "alice", &units, &[]);
+        let table = r.find("| alpha | v2 | 1 | 9..9 |").expect("the table");
+        let section = r.find("## Where this tape ended").expect("the section");
+        let first_unit = r.find("## alpha").expect("the unit's section");
+        assert!(table < section && section < first_unit, "{r}");
+        let sec = &r[section..first_unit];
+        assert!(
+            sec.contains(
+                "```bash\n\
+                 mt -f /dev/nst0 setblk 524288\n\
+                 mt -f /dev/nst0 eod          # GNU mt: eom\n\
+                 mt -f /dev/nst0 bsfm 2\n\
+                 dd if=/dev/nst0 bs=512k | tr -d '\\0' | grep -E '^(file_count|ended_after) ='\n\
+                 ```\n"
+            ),
+            "{sec}"
+        );
+        let f = flat_text(sec);
+        for needle in [
+            "This tape may end before the last tape file the write planned, because the drive reached the end of its medium. The table above is the plan, written before any slice was.",
+            "The seal marker, the last file on the tape, says where it ended: its `ended_after` is the last tape file before the seal, and every tape file after `ended_after` is not on this tape.",
+            "`/dev/nst0` below is an example — run `ls -l /dev/tape/by-id/` and substitute your own drive",
+            "When the last tape file of a unit (the end of its \"Tape files\" above) is after `ended_after`, this tape does not hold the unit whole. Do not start reading its slices: it is restorable only from another tape.",
+            "The index (`index/units.tsv`, below) and `RESTORE.sh --where UNIT` name the tapes that hold it.",
+            "`--info` and `--verify` report where the tape ended.",
+        ] {
+            assert!(f.contains(needle), "{needle:?}: {f}");
+        }
+    }
+
+    /// File 1 says the same for the heir (§1.7): what `requires =
+    /// ["short-seal"]` means (the glossary no longer says the list is empty),
+    /// that the seal's `ended_after` says where the tape ended, the four
+    /// lines, that a unit past it is not on this tape whole and where to look,
+    /// and that RESTORE.sh prints NOT ON TAPE. The manual steps check it.
+    #[test]
+    fn file_1_says_where_the_tape_ended_and_how_to_read_the_seal() {
+        let g = generate_system_guide_v2_for_media("SS02", 20, "LTO-6");
+        let words = flat_text(guide_section(&g, "Words this guide uses"));
+        assert!(
+            words.contains("A tape written by tapectl 1.6.0 or later states `requires = [\"short-seal\"]`"),
+            "{words}"
+        );
+        assert!(!words.contains("on the tapes written so far"), "{words}");
+        let sec = guide_section(&g, "Where the tape ended");
+        assert!(
+            sec.contains(
+                "    mt -f /dev/nst0 setblk 524288\n\
+                 \x20   mt -f /dev/nst0 eod          # GNU mt: eom\n\
+                 \x20   mt -f /dev/nst0 bsfm 2\n\
+                 \x20   dd if=/dev/nst0 bs=512k | tr -d '\\0' | grep -E '^(file_count|ended_after) ='\n"
+            ),
+            "{sec}"
+        );
+        let f = flat_text(sec);
+        for needle in [
+            "only the seal marker, the last file on the tape, says where the tape really ended",
+            "Its `ended_after` is the last tape file before the seal marker, and its `file_count` is `ended_after` plus 2",
+            "Every tape file the front index lists after `ended_after` is not on this tape",
+            "is not on this tape whole: do not start reading its slices",
+            "`./RESTORE.sh --where UNIT --key YOUR_KEY.age.key`",
+            "`--verify` prints `NOT ON TAPE` for each planned file after `ended_after`, which is not a failure",
+            "`--restore` refuses a unit the end of the tape cut, by name",
+        ] {
+            assert!(f.contains(needle), "{needle:?}: {f}");
+        }
+        let manual = flat_text(guide_section(&g, "Manual Recovery Steps"));
+        assert!(
+            manual.contains("check first that the `tape_position` of the unit's last slice is at or before the seal marker's `ended_after`"),
+            "{manual}"
+        );
+        assert!(
+            manual.contains("the seal marker's `ended_after` is the last file before it, and every entry of the front index after that is not on the tape"),
+            "{manual}"
+        );
+        // Every section the new text names is a heading of the guide.
+        assert!(g.contains("\n## Which device?\n"), "{g}");
+        assert!(g.contains("\n## The rest of the box"), "{g}");
+    }
+
+    /// RESTORE.sh knows `short-seal`, and the text that says a tape needs a
+    /// newer reader names 1.6.0, the only tapectl version the script names
+    /// (§6 "Since 1.6.0").
+    #[test]
+    fn restore_sh_knows_short_seal_and_says_it_is_1_6_0() {
+        let s = generate_restore_script_v2("SS03", 20);
+        assert_eq!(s.matches("\nKNOWN_FEATURES=\"short-seal\"\n").count(), 1);
+        assert_eq!(
+            s.matches("This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely")
+                .count(),
+            1
+        );
+        assert_eq!(s.matches("tapectl 1.").count(), 1, "no other version named");
+    }
 
     #[test]
     fn front_index_lists_every_file_with_hashes() {
@@ -12077,7 +12385,7 @@ sha256_encrypted = \"bbb\"
         for needle in [
             "**ID thunk (File 0)**: the first tape file, plain text, that says which tape this is: its `label`, `uuid`, `media_type` (the LTO generation), `cartridge_serial` and `tapectl_version`",
             "\"File 0's commands\" in this guide means those",
-            "**`requires`**: a line in File 0 and in the seal marker that lists the features a reader must understand to read the tape correctly. It is empty (`requires = []`)",
+            "**`requires`**: a line in File 0 and in the seal marker that lists the features a reader must understand to read the tape correctly. A tape written by tapectl 1.6.0 or later states `requires = [\"short-seal\"]`: the tape may end before the last file the front index plans, and its seal marker says where (\"Where the tape ended\"). Older tapes state it empty (`requires = []`, from 1.1.0 to 1.5.0) or have no such line",
             "A version is also called a snapshot: MANIFEST.toml states it as `snapshot_version`, RECOVERY.md as \"snapshot v2\" and RESTORE.sh as \"snapshot version\"",
             "so the highest number is the newest",
             "A unit is identified by its `uuid`",
@@ -12485,8 +12793,8 @@ sha256_encrypted = \"bbb\"
         for needle in [
             "LAST file (File 12 on this tape): SEAL MARKER",
             "The number of the last file is a fact about THIS tape. Another tape of the box has its own: File 0 of that tape gives it (`total_files`, and `seal_marker`, the number of its last file)",
-            "This tape has 13 files, numbered 0 to 12, so the last is File 12",
-            "reaches the same place on this tape.)",
+            "This tape has 13 files, numbered 0 to 12, so the last is File 12, unless the tape ended early (below)",
+            "reaches the same place on this tape, if it did not end early.)",
             "## Total files on this tape: 13",
             "The files of THIS tape are numbered 0 to 12. File 12, the last, is the seal marker. Another tape of the box has its own count: File 0 of that tape gives it",
             "This tape is LTO-6 (File 0 says so: media_type)",
