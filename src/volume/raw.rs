@@ -532,13 +532,13 @@ pub(crate) mod tests {
         let mut store = build_synthetic_tape("RAWFC", &data);
         let f0 = String::from_utf8(store.files[0].clone()).unwrap();
         store.files[0] = f0
-            .replace("requires = []", "requires = [\"short-seal\"]")
+            .replace("requires = []", "requires = [\"unknown-feature\"]")
             .into_bytes();
         let tmp = TempDir::new().unwrap();
         let err = restore_raw(&mut store, tmp.path(), None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("\"short-seal\""), "{err}");
+        assert!(err.contains("\"unknown-feature\""), "{err}");
         assert_eq!(
             fs::read_dir(tmp.path()).unwrap().count(),
             0,

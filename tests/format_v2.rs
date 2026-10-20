@@ -1561,12 +1561,13 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
             .expect("Store::confirm reports via Evidence, never Err")
     };
 
-    let evidence = with(seal.replacen("requires = []", "requires = [\"short-seal\"]", 1));
+    let evidence = with(seal.replacen("requires = []", "requires = [\"unknown-feature\"]", 1));
     assert!(
         evidence
             .mismatches
             .iter()
-            .any(|m| m.kind == MismatchKind::SealUnreadable && m.actual.contains("\"short-seal\"")),
+            .any(|m| m.kind == MismatchKind::SealUnreadable
+                && m.actual.contains("\"unknown-feature\"")),
         "{:?}",
         evidence.mismatches
     );
@@ -1574,7 +1575,7 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
 
     // Control: an unknown key that is not required changes nothing (the
     // padded seal bytes are not hashed by anything on the tape).
-    let evidence = with(seal.replacen("requires = []", "requires = []\nended_after = 7", 1));
+    let evidence = with(seal.replacen("requires = []", "requires = []\nfuture_key = 7", 1));
     assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
 }
 
