@@ -1266,7 +1266,10 @@ mod density_tests {
         assert_eq!(err.raw_os_error(), Some(nix::libc::EIO));
         assert_eq!(attempts, 1);
         assert_eq!(state, EarlyWarningState::default());
-        assert!(matches!(write_error("write", &err), TapectlError::TapeIo(_)));
+        assert!(matches!(
+            write_error("write", &err),
+            TapectlError::TapeIo(_)
+        ));
     }
 
     /// A short write keeps `write_all`'s handling: the rest goes in the next
@@ -1317,8 +1320,14 @@ mod density_tests {
         let writer = &body[start..end];
         assert_eq!(writer.matches("write_block_retrying(").count(), 1);
         assert_eq!(writer.matches("(&self.file).write(block)").count(), 1);
-        assert!(!writer.contains("write_all("), "a block bypassing the retry");
-        for filemark in ["self.write_filemark_sync()", "self.write_filemark_immediate()"] {
+        assert!(
+            !writer.contains("write_all("),
+            "a block bypassing the retry"
+        );
+        for filemark in [
+            "self.write_filemark_sync()",
+            "self.write_filemark_immediate()",
+        ] {
             assert_eq!(writer.matches(filemark).count(), 1, "{filemark}");
         }
         let loops: Vec<&str> = writer
