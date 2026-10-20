@@ -1337,8 +1337,12 @@ mod density_tests {
             .collect();
         assert_eq!(
             loops,
-            vec!["while remaining > 0 {", "while got < want {"],
-            "the only loops are the block loop and its source read"
+            vec![
+                "while remaining > 0 {",
+                "while got < want {",
+                "for b in &mut buf[want..] {"
+            ],
+            "the only loops are the block loop, its source read and its padding"
         );
         assert_eq!(
             body.matches("self.file.write").count() + body.matches("(&self.file).write").count(),
