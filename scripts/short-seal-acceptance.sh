@@ -179,9 +179,9 @@ reads at the 140 MiB/s production verify ran at, RECORD #326):
                  diffed against its source; the cut unit refused by RESTORE.sh.     ~15 min
   6 rebuild      catalog rebuild --from-volume into a second home, compared row by row.
                                                                                    ~15 min
-  7 rewrite      the whole units and the filler released, $LABEL1 retired, cartridge
-                 erase (short), $LABEL2 initialised without --force, the cut unit
-                 written whole onto it, verified and restored.                     ~20 min
+  7 rewrite      the filler released, $LABEL1 retired, cartridge erase (short), $LABEL2
+                 initialised without --force, the cut unit written whole onto it,
+                 verified and restored.                                            ~20 min
   In all about 14-16 hours of drive time; step 4's two whole-tape reads are most of it.
 
 THE COMMAND (operator's login on home2):
@@ -630,13 +630,12 @@ log "  write_early_warning: $(tail -1 "$STEP_DIR/early-warning-event.tsv")"
 dbq "$DB" "SELECT action, details FROM events WHERE action IN ('write_feed_ratio', 'write_capacity_used', 'write_completed')
     ORDER BY id" > "$STEP_DIR/write-events.tsv" || true
 log "  feed ratio: $(grep '^write_feed_ratio' "$STEP_DIR/write-events.tsv" | head -1 | cut -f2 || true)"
-# Item 112: the cut sets stay staged and whole. The release after the write is all-or-nothing
-# over the units written (staging::release), so the cut units, with no copy, keep every unit's
-# staging; step 7 releases them one by one.
+# Item 112: a cut set stays staged and whole, and does not hold back the release of the whole
+# units beside it (min_copies = 1, so their one copy releases them).
 STAGED="$(dbq "$DB" "SELECT u.name || '=' || ss.status FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
     JOIN units u ON u.id = s.unit_id ORDER BY u.name" | tr '\n' ' ')"
 log "  stage sets after the write: $STAGED"
-[ "$STAGED" = "$UNIT_A=staged $UNIT_B=staged $UNIT_F=staged $UNIT_Z=staged " ] || fail "stage sets after the write are '$STAGED', expected all four still staged (a cut unit has no copy, so the release keeps them)"
+[ "$STAGED" = "$UNIT_A=cleaned $UNIT_B=cleaned $UNIT_F=staged $UNIT_Z=staged " ] || fail "stage sets after the write are '$STAGED', expected the whole units released and the cut ones staged (item 112)"
 dbq "$DB" "SELECT sl.staging_path FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
     JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id WHERE u.name IN (?, ?)
     GROUP BY sl.staging_path" "$UNIT_F" "$UNIT_Z" > "$STEP_DIR/cut-staged-paths.txt"
@@ -691,9 +690,8 @@ end_step
 # ------------------------------------------------------------
 begin_step 7 rewrite "the cut unit written whole onto the same cartridge as $LABEL2"
 # `volume write` writes every staged set, so before the next one only the cut real unit may be
-# staged. The whole units have their copy (min_copies = 1): a bare clean releases them while a
-# cut sibling stays (item 112). The filler, cut and with no copy anywhere, needs --force.
-run release-whole 0 tctl staging clean --unit "$UNIT_A" --unit "$UNIT_B"
+# staged. The whole units were released after step 3; the filler, cut and with no copy
+# anywhere, is released by hand, which needs --force (ReleaseBlocker::Cut).
 run release-filler 0 tctl staging clean --unit "$UNIT_F" --force
 STAGED="$(dbq "$DB" "SELECT u.name || '=' || ss.status FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
     JOIN units u ON u.id = s.unit_id ORDER BY u.name" | tr '\n' ' ')"
