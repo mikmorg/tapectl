@@ -5997,6 +5997,26 @@ mod tests {
             assert!(short_seal_findings(&t.conn).unwrap().is_empty());
         }
 
+        /// The coordinator's fact: `ended_after` is recorded with
+        /// `sealed_at`, before confirm, so a short write whose confirm
+        /// quarantined it keeps its ending with every row `aborted` and none
+        /// `cut`. That records where the seal physically is, and is no
+        /// finding.
+        #[test]
+        fn an_ending_with_no_cut_rows_on_an_unsealed_volume_is_no_finding() {
+            let t = short_tape::short_tape();
+            t.conn
+                .execute("UPDATE writes SET status = 'aborted'", [])
+                .unwrap();
+            t.conn
+                .execute(
+                    "UPDATE volumes SET status = 'initialized', observed_condition = 'quarantined'",
+                    [],
+                )
+                .unwrap();
+            assert!(short_seal_warnings(&t.conn).is_empty());
+        }
+
         #[test]
         fn a_cut_row_on_a_volume_with_no_ending_is_named() {
             let t = short_tape::short_tape();
