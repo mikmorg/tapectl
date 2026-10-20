@@ -616,6 +616,17 @@ pub fn run(
                         "unverifiable_count": report.unverifiable_count,
                         "all_verified": report.all_verified(),
                         "files": files,
+                        // #420: additive. Where a short tape ended, and the
+                        // planned files after it, not read.
+                        "ended_after": report.ended_after,
+                        "not_on_tape": report
+                            .not_on_tape
+                            .iter()
+                            .map(|(position, kind)| serde_json::json!({
+                                "position": position,
+                                "type": kind,
+                            }))
+                            .collect::<Vec<_>>(),
                     })
                 );
             } else {
@@ -627,6 +638,9 @@ pub fn run(
                     "  verified: {}  mismatched: {}  unverifiable: {}",
                     report.verified_count, report.mismatched_count, report.unverifiable_count
                 );
+                for line in volume::raw::ending_lines(&report) {
+                    println!("{line}");
+                }
                 if !report.all_verified() {
                     for f in report.files.iter().filter(|f| f.verified == Some(false)) {
                         eprintln!(
