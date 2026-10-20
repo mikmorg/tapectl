@@ -29,7 +29,8 @@ use super::build::{self, BuildInputs, BuildSlice, BuildUnit, TenantInfo};
 use super::format;
 use super::layout;
 use super::layout_model::{
-    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, SliceCheck, ZoneKind,
+    CapacityBudget, ContentSource, KeyAvailability, Layout, LayoutEntry, PlanSplit, SliceCheck,
+    ZoneKind,
 };
 use super::loaded;
 use super::session::{
@@ -1310,7 +1311,7 @@ fn volume_write_contacted<'c>(
     // consulted for it again. Reading `backends.lto[].nominal_capacity` here
     // is exactly how issue #141 planned an LTO-5 cartridge as 2.5 TB.
     let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
-    let (usable_bytes, enospc_buffer) = write_budget(backend, nominal_capacity)?;
+    let budget = write_budget(backend, nominal_capacity)?;
 
     let session = assemble_keys_for_units(conn, &units, &stage_set_ids)?;
 
@@ -1408,8 +1409,7 @@ fn volume_write_contacted<'c>(
             volume_id,
             volume_media_type,
             nominal_capacity,
-            usable_bytes,
-            enospc_buffer,
+            budget,
             units,
             stage_set_ids,
             session,
@@ -1513,14 +1513,31 @@ fn volume_write_contacted<'c>(
     result.map(|_| ())
 }
 
-/// The two figures a write's capacity gate is built from: what the volume may
-/// take (its capacity times the drive's fill ceiling) and the end-of-tape
-/// reserve. One definition, for `volume write` and for `volume rewrite`'s
-/// capacity rehearsal (issue #483), so they cannot disagree.
+/// The figures a write's capacity gate is built from. One definition, for
+/// `volume write` and for `volume rewrite`'s capacity rehearsal (issue #483),
+/// so they cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WriteBudget {
+    /// What the volume may take: its capacity times the drive's fill ceiling.
+    usable_bytes: u64,
+    /// The end-of-tape reserve (`enospc_buffer`).
+    enospc_buffer: u64,
+    /// The plan bound (ADR-0012 item 113,
+    /// [`crate::config::LtoBackendConfig::plan_bound_bytes`]): the volume's
+    /// whole capacity when the drive declares `post_warning_bytes`, so a plan
+    /// may reach past the fill ceiling to it; `None` stops it at the ceiling.
+    plan_bound_bytes: Option<u64>,
+    /// The drive's `post_warning_bytes` in bytes, for the session's
+    /// `write_early_warning` event (#420). Parsed here, with the rest of the
+    /// budget, before the drive is touched: a config error after `plan()`
+    /// would leave `planned` rows behind.
+    post_warning_bytes: Option<u64>,
+}
+
 fn write_budget(
     backend: &crate::config::LtoBackendConfig,
     nominal_capacity: i64,
-) -> Result<(u64, u64)> {
+) -> Result<WriteBudget> {
     let usable_bytes = backend.fill_budget_bytes(nominal_capacity as u64);
     // v2 collapses the v1 "manifest reserve" into just the ENOSPC buffer
     // (`volume-format-v2.md` §8) — the old `manifest_reserve` config field is
@@ -1529,7 +1546,55 @@ fn write_budget(
     // `.max(0)` dropped (issue #59): a negative value is now rejected by
     // the parser itself, so a successful `Ok` is already non-negative.
     let enospc_buffer = staging::parse_size_to_bytes(&backend.enospc_buffer)? as u64;
-    Ok((usable_bytes, enospc_buffer))
+    Ok(WriteBudget {
+        usable_bytes,
+        enospc_buffer,
+        plan_bound_bytes: backend.plan_bound_bytes(nominal_capacity.max(0) as u64)?,
+        post_warning_bytes: backend.post_warning_room_bytes()?,
+    })
+}
+
+/// The refusal of a plan that commits nothing (ADR-0012 item 113, the
+/// coordinator's ruling): every staged unit is planned past the fill
+/// ceiling, so the tape may end before any of them. `None` when at least one
+/// unit is committed, or there is nothing to plan. Mostly unreachable: `stage
+/// create` refuses a unit above an empty tape's fill ceiling.
+fn past_ceiling_refusal(label: &str, split: &PlanSplit, units: &[BuildUnit]) -> Option<String> {
+    (split.committed == 0 && split.units > 0).then(|| {
+        format!(
+            "volume \"{label}\": no staged unit fits within the fill ceiling, so this write would \
+             commit nothing: every one of {} is planned past it, and the tape may end before \
+             any of them (ADR-0012 item 113). Nothing was written and no session was recorded. \
+             A unit must fit under the ceiling of the cartridge it is written to",
+            unit_names(units)
+        )
+    })
+}
+
+/// The units a write plans past the fill ceiling, named before the tape
+/// moves (ADR-0012 item 113): "the tape may end before them". `None` when
+/// none is, as on every write whose drive declares no `post_warning_bytes`.
+fn past_ceiling_notice(label: &str, split: &PlanSplit, units: &[BuildUnit]) -> Option<String> {
+    let past = &units[split.past_ceiling()];
+    (!past.is_empty()).then(|| {
+        format!(
+            "volume \"{label}\": {} planned past the fill ceiling; the tape may end before them. \
+             The drive declares post_warning_bytes, so the plan reaches toward the cartridge's \
+             nominal capacity (ADR-0012 item 113): a unit the tape ends before is cut, stays \
+             staged, and is written whole onto another cartridge by the next `tapectl volume \
+             write`",
+            unit_names(past)
+        )
+    })
+}
+
+/// `"a" v1, "b" v2`: units as a message names them.
+fn unit_names(units: &[BuildUnit]) -> String {
+    units
+        .iter()
+        .map(|u| format!("\"{}\" v{}", u.unit_name, u.snapshot_version))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What the build of a write's Layout needs besides the staged batch and its
@@ -1543,6 +1608,10 @@ struct WriteBuild<'a> {
     block_size: u64,
     usable_bytes: u64,
     enospc_buffer: u64,
+    /// The plan bound frozen into the Layout's budget (ADR-0012 item 113):
+    /// `volume write` passes its drive's ([`WriteBudget::plan_bound_bytes`]),
+    /// `volume rewrite`'s rehearsal `None`.
+    plan_bound_bytes: Option<u64>,
     nominal_capacity: i64,
     mam_capacity: i64,
     mam_manufacturer: String,
@@ -1579,6 +1648,7 @@ fn build_write_layout(
         block_size,
         usable_bytes,
         enospc_buffer,
+        plan_bound_bytes,
         nominal_capacity,
         mam_capacity,
         mam_manufacturer,
@@ -1654,7 +1724,7 @@ fn build_write_layout(
         index: Some(index),
     };
 
-    let built = build::build(&inputs, session_dir)?;
+    let built = build::build_with_plan_bound(&inputs, plan_bound_bytes, session_dir)?;
     drop(catalog_work);
     Ok((built, inputs))
 }
@@ -1685,6 +1755,9 @@ pub struct CapacityNumbers {
 impl CapacityNumbers {
     /// The gate the write runs, with the margin added: on-tape total plus the
     /// reserve against the budget.
+    ///
+    /// The fill ceiling's figures, never a plan bound (ADR-0012 item 113): a
+    /// rewrite may hold a unit's only copy, and a cut there leaves it none.
     pub fn fits(&self) -> bool {
         self.staged + self.generated + self.margin + self.reserve <= self.available
     }
@@ -1792,7 +1865,11 @@ pub(crate) fn rehearse_write_capacity(
 ) -> Result<CapacityNumbers> {
     let label = volume.label;
     let backend = crate::config::resolve_lto_backend(config, Some(device))?;
-    let (usable_bytes, enospc_buffer) = write_budget(backend, volume.capacity_bytes)?;
+    let WriteBudget {
+        usable_bytes,
+        enospc_buffer,
+        ..
+    } = write_budget(backend, volume.capacity_bytes)?;
     let units = checked_staged_units(conn, only)?;
     let stage_set_ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
     let SessionKeys {
@@ -1819,6 +1896,10 @@ pub(crate) fn rehearse_write_capacity(
             block_size: block_size as u64,
             usable_bytes,
             enospc_buffer,
+            // Never past the fill ceiling (ADR-0012 item 113, the
+            // coordinator's ruling): the rewrite may hold a unit's only copy,
+            // and a cut there would leave it with none.
+            plan_bound_bytes: None,
             nominal_capacity: volume.capacity_bytes,
             mam_capacity: 0,
             mam_manufacturer: volume.manufacturer.to_string(),
@@ -1873,8 +1954,7 @@ struct StagedWrite<'a> {
     volume_id: i64,
     volume_media_type: Option<String>,
     nominal_capacity: i64,
-    usable_bytes: u64,
-    enospc_buffer: u64,
+    budget: WriteBudget,
     units: Vec<BuildUnit>,
     stage_set_ids: Vec<i64>,
     session: SessionKeys,
@@ -1912,8 +1992,13 @@ fn volume_write_in_contact<'c>(
         volume_id,
         volume_media_type,
         nominal_capacity,
-        usable_bytes,
-        enospc_buffer,
+        budget:
+            WriteBudget {
+                usable_bytes,
+                enospc_buffer,
+                plan_bound_bytes,
+                post_warning_bytes,
+            },
         units,
         stage_set_ids,
         session:
@@ -2025,6 +2110,7 @@ fn volume_write_in_contact<'c>(
             block_size: block_size as u64,
             usable_bytes,
             enospc_buffer,
+            plan_bound_bytes,
             nominal_capacity,
             mam_capacity: mam.max_capacity_bytes.unwrap_or(0),
             mam_manufacturer: mam.manufacturer.clone().unwrap_or_default(),
@@ -2094,6 +2180,21 @@ fn volume_write_in_contact<'c>(
                     .join("; ")
             )));
         }
+    }
+
+    // ADR-0012 item 113: with the drive's plan bound, the units after the
+    // prefix that fits the fill ceiling are planned past it. The pre-flight
+    // above refused a plan beyond the bound (`PlanBoundExceeded`), never
+    // trimming it; here a plan whose every unit is past the ceiling is
+    // refused too (a tape that can only end cut is not a plan), and the
+    // units past it are named before the tape moves. Without a bound the
+    // split is the whole plan, committed, and this says nothing.
+    let split = built.split(&inputs.units);
+    if let Some(refusal) = past_ceiling_refusal(label, &split, &inputs.units) {
+        return Err(TapectlError::Other(refusal));
+    }
+    if let Some(notice) = past_ceiling_notice(label, &split, &inputs.units) {
+        eprintln!("{notice}");
     }
 
     // The tape device opens HERE and not a line earlier (the pre-flight
@@ -2196,7 +2297,10 @@ fn volume_write_in_contact<'c>(
     phase.done();
     // From here the session's `writes` rows exist (issue #408): an error
     // no outcome classifies leaves it resumable — exit 4, never 2.
+    // #420: the drive's `post_warning_bytes`, for the `write_early_warning`
+    // event's wear record (`layout-session.md`), parsed before contact.
     let execute_outcome = planned
+        .with_post_warning_bytes(post_warning_bytes)
         .execute(conn, store)
         .map_err(|e| e.in_write_session(label))?;
 
@@ -2432,6 +2536,10 @@ fn volume_resume_contacted<'c>(
     // a capacity that moved mid-session would be a different plan.
     let (nominal_capacity, volume_media_type) = volume_media(conn, volume_id, label)?;
     let usable_bytes = backend.fill_budget_bytes(nominal_capacity as u64);
+    // #420: the drive's `post_warning_bytes`, for a `write_early_warning`
+    // event the resumed session writes (`layout-session.md`). Parsed here,
+    // before any contact, like `volume write`'s budget.
+    let session = session.with_post_warning_bytes(backend.post_warning_room_bytes()?);
 
     // Corroborate at contact (ADR-0012, issue #193). Resume is a contact
     // under CONTEXT.md's definition and corroborated nothing until now: an
@@ -3311,8 +3419,22 @@ fn finish_session(
         ResumeOutcome::Ready(ready) => {
             let phase = progress::phase("seal", None);
             // Issue #408: a seal that fails leaves the session `in_progress`
-            // (swept to `interrupted`), so `volume resume` writes it again.
-            let sealed_pending = ready.seal(store).map_err(|e| e.in_write_session(label))?;
+            // (swept to `interrupted`), so `volume resume` writes it again —
+            // except on a full medium (#420, `volume-format-v2.md` §4.3 W6):
+            // the hard end inside the seal's blocks, or a refused filemark,
+            // is the tape's end where no seal can follow, and the session
+            // ABORTS as it does on the hard end inside a slice. Nothing was
+            // recorded of the seal (`sealed_at` is written only once
+            // `seal()` returns `Ok`), so the abort leaves an unsealed tape
+            // and `aborted` rows, the clean abort of ADR-0007.
+            let sealed_pending = match ready.seal(store) {
+                Ok(sealed_pending) => sealed_pending,
+                Err(e @ TapectlError::MediumFull(_)) => {
+                    let reason = format!("the seal could not be written: {e}");
+                    return Err(abort_unsealed_session(conn, volume_id, label, &reason));
+                }
+                Err(e) => return Err(e.in_write_session(label)),
+            };
             // ADR-0012's 2026-09-21 correction "the seal is RECORDED, not
             // inferred" (issue #277, migration 018): the moment `seal()`
             // returns `Ok`, that fact must become durable state, because
@@ -3333,11 +3455,19 @@ fn finish_session(
             // so recording it here covers both.
             // Retried on a busy catalog (issue #377): the seal marker is
             // already on tape, and this is the one record of it.
+            //
+            // #420: a short seal's `ended_after` is recorded in the same
+            // statement (`layout-session.md`: "written in the same
+            // transaction as `sealed_at`"), so a resume after a crash here
+            // re-enters the confirm of the seal that is on the tape; a full
+            // seal leaves it NULL (migration 038).
+            let ended_after = sealed_pending.ending().recorded_ended_after();
             crate::db::busy::retry(crate::db::busy::BusyPolicy::DEFAULT, "the seal", || {
                 Ok(conn.execute(
-                    "UPDATE volumes SET sealed_at = COALESCE(sealed_at, datetime('now')) \
+                    "UPDATE volumes SET sealed_at = COALESCE(sealed_at, datetime('now')), \
+                     ended_after = COALESCE(?2, ended_after) \
                      WHERE id = ?1",
-                    params![volume_id],
+                    params![volume_id, ended_after],
                 )?)
             })
             .map_err(|e| e.in_write_session(label))?;
@@ -3454,33 +3584,75 @@ fn finish_session(
                 )),
             })
         }
-        ResumeOutcome::Aborted(a) => {
-            events::log_event(
-                conn,
-                "volume",
-                volume_id,
-                Some(label),
-                "write_aborted",
-                None,
-                None,
-                Some(&a.reason),
-                None,
-                None,
-            )
-            .map_err(|e| {
-                TapectlError::WriteAborted(format!(
-                    "volume \"{label}\" write aborted: {} (recording the abort event failed: \
-                     {e})",
-                    a.reason
-                ))
-            })?;
-            // Exit 5 (issue #408): the session cannot resume.
-            Err(TapectlError::WriteAborted(format!(
-                "volume \"{label}\" write aborted: {}",
-                a.reason
-            )))
-        }
+        ResumeOutcome::Aborted(a) => Err(write_aborted(conn, volume_id, label, &a.reason)),
     }
+}
+
+/// The `write_aborted` event and the error an aborted session exits on —
+/// exit 5 (issue #408): the session cannot resume. The rows are already
+/// `aborted` when this runs.
+fn write_aborted(conn: &Connection, volume_id: i64, label: &str, reason: &str) -> TapectlError {
+    if let Err(e) = events::log_event(
+        conn,
+        "volume",
+        volume_id,
+        Some(label),
+        "write_aborted",
+        None,
+        None,
+        Some(reason),
+        None,
+        None,
+    ) {
+        return TapectlError::WriteAborted(format!(
+            "volume \"{label}\" write aborted: {reason} (recording the abort event failed: {e})"
+        ));
+    }
+    TapectlError::WriteAborted(format!("volume \"{label}\" write aborted: {reason}"))
+}
+
+/// Abort a session whose seal could not be written because the medium is
+/// full (#420, `volume-format-v2.md` §4.3 W6; `layout-session.md`'s Aborted
+/// row: "the hard end inside a slice or a seal … a refused filemark"): its
+/// `writes` rows become `aborted`, the `write_aborted` event names the
+/// reason, and the write exits 5. The tape is left unsealed, as on the hard
+/// end inside a slice; nothing was recorded of the seal, so the next write
+/// of this volume starts it again from the beginning (issue #401).
+///
+/// The session's rows are this volume's unresolved ones — `planned`,
+/// `in_progress` or `interrupted`, the set [`precontact_refusal`] calls one
+/// write session: the volume's session lock is held, and a write refuses
+/// while another session on the volume is unresolved, so there is no other.
+/// No `cut` row exists before a confirm, and `completed` ones are never
+/// touched. The same rows `session::mark_writes` would move, for the one
+/// path where `ReadyToSeal::seal` has consumed the session's own ids.
+fn abort_unsealed_session(
+    conn: &Connection,
+    volume_id: i64,
+    label: &str,
+    reason: &str,
+) -> TapectlError {
+    let marked = crate::db::busy::retry(
+        crate::db::busy::BusyPolicy::DEFAULT,
+        "a write session's status",
+        || {
+            Ok(conn.execute(
+                "UPDATE writes SET status = 'aborted'
+                 WHERE volume_id = ?1 AND status IN ('planned', 'in_progress', 'interrupted')",
+                params![volume_id],
+            )?)
+        },
+    );
+    if let Err(e) = marked {
+        // The rows stay unresolved: the next open's sweep makes them
+        // `interrupted`, and `volume resume` finds the tape unsealed and
+        // meets the same full medium at the seal.
+        return TapectlError::WriteAborted(format!(
+            "volume \"{label}\" write aborted: {reason} (recording the abort failed: {e}; run \
+             `tapectl volume abort {label}` to close the session)"
+        ));
+    }
+    write_aborted(conn, volume_id, label, reason)
 }
 
 /// The ONE place `TAPECTL_TEST_PAUSE_AFTER_SEAL`'s environment variable is
@@ -3617,8 +3789,18 @@ fn finish_confirm(
             // recording what followed is not a write outcome, and `volume
             // resume` has nothing to do (issue #408). It warns and the write
             // exits 0 — the copy stands (ADR-0012 2026-10-07 item 33).
-            if let Some(warning) = record_after_sealed(conn, volume_id, label, layout, block_size) {
+            if let Some(warning) =
+                record_after_sealed(conn, volume_id, label, layout, block_size, &sealed)
+            {
                 eprintln!("{warning}");
+            }
+            // #420 (`layout-session.md`, "After a short seal"): a short seal
+            // is a success and exits 0; the operator is told where the tape
+            // ended, which units it cut, and what writes them. On stderr,
+            // like every other line this layer prints, so `--json` stdout
+            // stays one document.
+            if let Some(report) = sealed.short_ending_report() {
+                eprintln!("{report}");
             }
             info!(label = sealed.label, volume_id, "volume write sealed");
             Ok(())
@@ -4255,8 +4437,10 @@ fn record_after_sealed(
     label: &str,
     layout: &Layout,
     block_size: u64,
+    sealed: &session::SealedSession,
 ) -> Option<String> {
     let policy = crate::db::busy::BusyPolicy::DEFAULT;
+    let details = write_completed_details(sealed);
     let recorded = crate::db::busy::retry(policy, "the volume's write figures", || {
         record_write_bookkeeping(conn, volume_id, layout, block_size)
     })
@@ -4271,7 +4455,7 @@ fn record_after_sealed(
                 None,
                 None,
                 None,
-                None,
+                details.as_deref(),
                 None,
             )
             .map(|_| ())
@@ -4286,6 +4470,25 @@ fn record_after_sealed(
             Some(&finish_figures_command(label)),
         )
     })
+}
+
+/// The `write_completed` event's `details` (#420, `layout-session.md`
+/// "Confirm of a short ending": the event names the short ending and the cut
+/// units): one JSON object, `{"ending": "short", "ended_after": K,
+/// "cut_units": [..]}`. `None` on a full seal, whose event is what it was
+/// before 1.6.0.
+fn write_completed_details(sealed: &session::SealedSession) -> Option<String> {
+    let session::Ending::Short { ended_after } = sealed.ending else {
+        return None;
+    };
+    Some(
+        serde_json::json!({
+            "ending": "short",
+            "ended_after": ended_after,
+            "cut_units": sealed.cut_units,
+        })
+        .to_string(),
+    )
 }
 
 /// The command that records a sealed copy's write figures when the write
@@ -4304,16 +4507,31 @@ pub(crate) fn finish_figures_command(label: &str) -> String {
 /// it only flips `status`. v1 populated these inline as part of the write
 /// loop; this restores that parity for v2-sealed volumes. Deliberately never
 /// touches `status` (confirm's transaction already set it to `sealed`).
+///
+/// #420: on a short-sealed volume the figures are the tape's, not the
+/// plan's — only the data slices at or before `volumes.ended_after` are on
+/// it (`volume-format-v2.md` §4.2). Read from the row, so every caller
+/// counts the same tape: the seal records it before the confirm, and an
+/// adoption (`adopt_lost`) must record it before calling this.
 pub(crate) fn record_write_bookkeeping(
     conn: &Connection,
     volume_id: i64,
     layout: &Layout,
     block_size: u64,
 ) -> Result<()> {
+    let ended_after: Option<i64> = conn
+        .query_row(
+            "SELECT ended_after FROM volumes WHERE id = ?1",
+            params![volume_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
     let slice_entries: Vec<&LayoutEntry> = layout
         .entries
         .iter()
         .filter(|e| matches!(e.kind, ZoneKind::Slice { .. }))
+        .filter(|e| ended_after.is_none_or(|k| i64::from(e.position) <= k))
         .collect();
     let bytes_written: i64 = slice_entries
         .iter()
@@ -6053,6 +6271,11 @@ fn read_slices_contacted(
     // wanted — a `reclaimable` or `purged` one is the operator's "drop this
     // when the volume is compacted", and reading it back to write it again
     // would undo that.
+    //
+    // #420: never a `cut` write's (`volume-format-v2.md` §4.2: no reader
+    // restores a cut unit from the tape that cut it). Its slices before the
+    // short seal are on the tape and recorded `written`, but they are part
+    // of a unit, and staging them would promote a set that is not whole.
     let mut stmt = conn.prepare(
         "SELECT wp.position, wp.sha256_on_volume,
                 ss.encrypted_bytes, ss.sha256_encrypted, ss.stage_set_id,
@@ -6063,6 +6286,7 @@ fn read_slices_contacted(
          JOIN stage_sets sts ON sts.id = w.stage_set_id
          JOIN snapshots sn ON sn.id = sts.snapshot_id
          WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'
+           AND w.status <> 'cut'
            AND CASE WHEN ?3 IS NULL THEN sn.status NOT IN ('reclaimable', 'purged')
                     ELSE sn.version = ?3 END
          ORDER BY CAST(wp.position AS INTEGER)",
@@ -6075,6 +6299,33 @@ fn read_slices_contacted(
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if source_slices.is_empty() {
+        // #420: a unit the tape's short seal cut is named as cut, with where
+        // the tape ended: its slices are not on this tape whole.
+        let cut: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT v.ended_after FROM writes w
+                 JOIN volumes v ON v.id = w.volume_id
+                 JOIN stage_sets sts ON sts.id = w.stage_set_id
+                 JOIN snapshots sn ON sn.id = sts.snapshot_id
+                 WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND w.status = 'cut'
+                   AND (?3 IS NULL OR sn.version = ?3)
+                 LIMIT 1",
+                params![from_vol_id, unit.id, version],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(ended_after) = cut {
+            return Err(TapectlError::Other(format!(
+                "unit \"{unit_name}\"{} is not on volume \"{from_label}\" whole: the tape sealed \
+                 short{} and the unit was cut (volume-format-v2.md §4.2), so no slice of it is \
+                 read from this tape. It is still staged, or written whole on another \
+                 cartridge: `tapectl unit status {unit_name}` says where",
+                version.map(|v| format!(" version {v}")).unwrap_or_default(),
+                ended_after
+                    .map(|k| format!(" after tape file {k}"))
+                    .unwrap_or_default(),
+            )));
+        }
         let message = match version {
             Some(v) => {
                 format!("no slices for unit \"{unit_name}\" version {v} on volume \"{from_label}\"")
@@ -6087,7 +6338,8 @@ fn read_slices_contacted(
                      JOIN writes w ON w.id = wp.write_id
                      JOIN stage_sets sts ON sts.id = w.stage_set_id
                      JOIN snapshots sn ON sn.id = sts.snapshot_id
-                     WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'",
+                     WHERE w.volume_id = ?1 AND sn.unit_id = ?2 AND wp.status = 'written'
+                       AND w.status <> 'cut'",
                     params![from_vol_id, unit.id],
                     |row| row.get(0),
                 )?;
@@ -7708,6 +7960,17 @@ mod tests {
         }
     }
 
+    /// What a passing confirm of a FULL seal hands `finish_confirm`: the
+    /// `write_completed` event it records is the one before 1.6.0.
+    fn full_seal(volume_id: i64, label: &str) -> session::SealedSession {
+        session::SealedSession {
+            volume_id,
+            label: label.to_string(),
+            ending: session::Ending::Full,
+            cut_units: Vec::new(),
+        }
+    }
+
     fn direct_hash(data: &[u8]) -> String {
         let mut h = Sha256::new();
         h.update(data);
@@ -9314,8 +9577,15 @@ mod tests {
         let (volume_id, tape, written) = sealed_copy_without_figures(&conn, "VR-FIG");
 
         conn.execute_batch("PRAGMA query_only = ON").unwrap();
-        let warning = record_after_sealed(&conn, volume_id, "VR-FIG", &written, 4096)
-            .expect("a read-only catalog cannot record, and says so");
+        let warning = record_after_sealed(
+            &conn,
+            volume_id,
+            "VR-FIG",
+            &written,
+            4096,
+            &full_seal(volume_id, "VR-FIG"),
+        )
+        .expect("a read-only catalog cannot record, and says so");
         conn.execute_batch("PRAGMA query_only = OFF").unwrap();
         assert!(
             warning.ends_with("To finish it: tapectl volume verify VR-FIG --full"),
@@ -9391,7 +9661,14 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let (volume_id, tape, written) = sealed_copy_without_figures(&conn, "VR-REC");
         assert_eq!(
-            record_after_sealed(&conn, volume_id, "VR-REC", &written, 4096),
+            record_after_sealed(
+                &conn,
+                volume_id,
+                "VR-REC",
+                &written,
+                4096,
+                &full_seal(volume_id, "VR-REC")
+            ),
             None
         );
         conn.execute(
@@ -9424,7 +9701,14 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let (volume_id, tape, written) = sealed_copy_without_figures(&conn, "VR-WRONG");
         assert_eq!(
-            record_after_sealed(&conn, volume_id, "VR-WRONG", &written, 4096),
+            record_after_sealed(
+                &conn,
+                volume_id,
+                "VR-WRONG",
+                &written,
+                4096,
+                &full_seal(volume_id, "VR-WRONG")
+            ),
             None
         );
         conn.execute(
@@ -15005,6 +15289,28 @@ mod tests {
             "must sum block-PADDED (on-tape) slice bytes, not the true size_bytes"
         );
         assert_eq!(has_manifest, 1);
+
+        // #420: on a short-sealed volume the figures are the tape's — only
+        // the slices at or before `ended_after` are on it.
+        conn.execute(
+            "UPDATE volumes SET ended_after = 1, bytes_written = 0, num_data_files = 0
+             WHERE id = ?1",
+            params![volume_id],
+        )
+        .unwrap();
+        record_write_bookkeeping(&conn, volume_id, &layout, bs).unwrap();
+        let (bytes_written, num_data_files): (i64, i64) = conn
+            .query_row(
+                "SELECT bytes_written, num_data_files FROM volumes WHERE id = ?1",
+                params![volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (bytes_written, num_data_files),
+            (bs as i64, 1),
+            "the slice after ended_after is not on the tape"
+        );
     }
 
     /// Issue #392: `first_write` was stamped when the write session
@@ -15079,8 +15385,15 @@ mod tests {
         };
 
         conn.execute_batch("PRAGMA query_only = ON").unwrap();
-        let warning = record_after_sealed(&conn, volume_id, "BKWARN", &layout, 4096)
-            .expect("a read-only catalog cannot record, and says so");
+        let warning = record_after_sealed(
+            &conn,
+            volume_id,
+            "BKWARN",
+            &layout,
+            4096,
+            &full_seal(volume_id, "BKWARN"),
+        )
+        .expect("a read-only catalog cannot record, and says so");
         assert!(
             warning.starts_with(
                 "warning: volume \"BKWARN\" is sealed and confirmed and counts as a copy, but \
@@ -15093,7 +15406,14 @@ mod tests {
 
         conn.execute_batch("PRAGMA query_only = OFF").unwrap();
         assert_eq!(
-            record_after_sealed(&conn, volume_id, "BKWARN", &layout, 4096),
+            record_after_sealed(
+                &conn,
+                volume_id,
+                "BKWARN",
+                &layout,
+                4096,
+                &full_seal(volume_id, "BKWARN")
+            ),
             None
         );
         let (has_manifest, events): (i64, i64) = conn
@@ -16981,6 +17301,47 @@ mod tests {
                 "the slice was read: {:?}",
                 fake.ops()
             );
+        }
+
+        /// #420 (`volume-format-v2.md` §4.2: no reader restores a cut unit
+        /// from the tape that cut it): the same unit, its write `cut` by a
+        /// short seal, is refused by name — though its slice is on the tape
+        /// and recorded `written` — and no slice is read or staged. The
+        /// test above is the positive control: the same tape, `completed`.
+        #[test]
+        fn read_slices_never_reads_a_unit_its_tapes_short_seal_cut() {
+            let (conn, _, fake) = fixture("RQ-RSCUT", STATED);
+            conn.execute_batch(
+                "UPDATE writes SET status = 'cut';
+                 UPDATE volumes SET ended_after = 4, sealed_at = datetime('now');",
+            )
+            .unwrap();
+            let mut store = fake_store(&fake);
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = config_with_staging(tmp.path());
+            let err = read_slices(
+                &conn,
+                &config,
+                "RQ-RSCUT",
+                "lv-unit",
+                None,
+                &mut store,
+                site(Operation::VolumeReadSlices),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("\"lv-unit\""), "{err}");
+            assert!(err.contains("sealed short after tape file 4"), "{err}");
+            assert!(err.contains("cut"), "{err}");
+            assert!(
+                !fake.ops().contains(&Op::Read(4)),
+                "the slice was not read: {:?}",
+                fake.ops()
+            );
+            let staged: Option<String> = conn
+                .query_row("SELECT staging_path FROM stage_slices", [], |r| r.get(0))
+                .unwrap();
+            assert!(staged.is_none(), "nothing was staged: {staged:?}");
         }
 
         // ── volume compact-read ──
@@ -20372,6 +20733,10 @@ mod tests {
             /// The seal's write (the one synchronous filemark) fails with a
             /// drive error; every other write lands.
             SealIo,
+            /// The seal's write fails as a full medium (#420, §4.3 W6: the
+            /// hard end inside the seal, or its filemark refused); every
+            /// other write lands.
+            SealFull,
             /// Reading File 3 back fails with a drive error.
             ReadFrontIndexIo,
             /// Reading File 3 back returns different bytes from those
@@ -20407,6 +20772,9 @@ mod tests {
                     Fault::SealIo if sync => {
                         Err(TapectlError::TapeIo("injected seal write error".into()))
                     }
+                    Fault::SealFull if sync => Err(TapectlError::MediumFull(
+                        "write: No space left on device (os error 28)".into(),
+                    )),
                     Fault::SignalAfterSeal if sync => {
                         let written = self.inner.execute(src, len, sync);
                         crate::signal::interrupt_this_thread(true);
@@ -20824,6 +21192,26 @@ mod tests {
             let err = r.unwrap_err();
             assert!(matches!(err, TapectlError::WriteAborted(_)), "{err:?}");
             assert_eq!(code, 5, "{err}");
+        }
+
+        /// 5, at the seal (#420, `volume-format-v2.md` §4.3 W6): a full
+        /// medium while the seal is written aborts the session as one inside
+        /// a slice does — not the resumable stop (4) any other seal error
+        /// is (`exit_4_a_write_stopped_part_way_is_resumable`'s `SealIo`).
+        #[test]
+        fn exit_5_a_seal_the_medium_cannot_take() {
+            let mut store = Faulty {
+                inner: MemStore::new(512 * 1024),
+                fault: Fault::SealFull,
+            };
+            let (r, code) = write_outcome("EX-5S", &mut store, false);
+            let err = r.unwrap_err();
+            assert!(matches!(err, TapectlError::WriteAborted(_)), "{err:?}");
+            assert_eq!(code, 5, "{err}");
+            assert!(
+                err.to_string().contains("the seal could not be written"),
+                "{err}"
+            );
         }
 
         /// 6: the confirm's readback proved the medium bad — the volume is
@@ -21413,6 +21801,905 @@ mod tests {
                  decimal parse Config::validate_sizes already applied to the same \
                  string.\n{stmt}"
             );
+        }
+
+        // ── #420: the short ending, through `volume write` itself over an
+        //    injected store ──
+        //
+        // On this tree the confirm of a short seal is E's bridge
+        // (`session::ShortEndingReads`): these writes confirm at the
+        // navigable tier (no `--full-confirm`) and assert nothing of ADR-0012
+        // item 114's readback, which is the chain walk's (worker J).
+        mod short_ending {
+            use super::*;
+            use crate::staging::clean::{release_blocker, ReleaseBlocker};
+
+            const SBS: usize = 4096;
+            /// Three blocks less a little: a slice the early warning can come
+            /// in (its first block reaches the warning, its second is the
+            /// first refused, as `session`'s own short-ending tests have it).
+            const SLICE: usize = 3 * SBS - 100;
+
+            /// How a medium is made to answer from tape file `at` on: the
+            /// `MemStore` in place until then, and `arm` applied to a fresh
+            /// one holding the same files, given the bytes on the medium
+            /// before file `at`.
+            type Arm = fn(MemStore, u64) -> MemStore;
+
+            /// The early warning one byte into the file.
+            fn warning(m: MemStore, before: u64) -> MemStore {
+                m.with_early_warning_after(before + 1)
+            }
+
+            /// The hard end at the file's first block (W2: more than 16
+            /// refusals of one block in a row).
+            fn hard_end(m: MemStore, before: u64) -> MemStore {
+                m.with_enospc_after(before)
+            }
+
+            /// The file's closing filemark refused (W3: never retried).
+            fn filemark_refused(m: MemStore, before: u64) -> MemStore {
+                m.with_filemarks_refused_from(before + 1)
+            }
+
+            /// A `MemStore` standing in for the drive whose medium is armed
+            /// ([`Arm`]) when tape file `at` begins: where the plan puts a
+            /// file is known, the bytes before it are not, until the write
+            /// has laid them down.
+            struct ArmedAt {
+                inner: MemStore,
+                at: usize,
+                arm: Arm,
+                armed: bool,
+                /// A signal arrives once the seal (the one synchronous
+                /// filemark) has landed, before the confirm begins.
+                signal_after_seal: bool,
+            }
+
+            impl ArmedAt {
+                fn new(at: u32, arm: Arm) -> Self {
+                    Self {
+                        inner: MemStore::new(SBS),
+                        at: at as usize,
+                        arm,
+                        armed: false,
+                        signal_after_seal: false,
+                    }
+                }
+            }
+
+            impl Store for ArmedAt {
+                fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                    self.inner.capacity()
+                }
+                fn execute(
+                    &mut self,
+                    src: &mut dyn std::io::Read,
+                    len: u64,
+                    sync: bool,
+                ) -> Result<u64> {
+                    if !self.armed && self.inner.files.len() == self.at {
+                        let before = self.inner.files.iter().map(|f| f.len() as u64).sum();
+                        let mut armed = (self.arm)(MemStore::new(SBS), before);
+                        armed.files = std::mem::take(&mut self.inner.files);
+                        armed.syncs = std::mem::take(&mut self.inner.syncs);
+                        self.inner = armed;
+                        self.armed = true;
+                    }
+                    let written = self.inner.execute(src, len, sync);
+                    if sync && self.signal_after_seal && written.is_ok() {
+                        crate::signal::interrupt_this_thread(true);
+                    }
+                    written
+                }
+                fn early_warning(&self) -> Option<crate::store::EarlyWarning> {
+                    self.inner.early_warning()
+                }
+                fn read_file(
+                    &mut self,
+                    position: u32,
+                    sink: &mut dyn std::io::Write,
+                ) -> Result<u64> {
+                    self.inner.read_file(position, sink)
+                }
+                fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                    self.inner.reposition_for_resume(file_index)
+                }
+                fn reposition_at_most(&mut self, file_index: u32) -> Result<u32> {
+                    self.inner.reposition_at_most(file_index)
+                }
+                fn blank_at_bot(&mut self) -> Result<bool> {
+                    self.inner.blank_at_bot()
+                }
+                fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+                    self.inner.eod_at_or_before(position)
+                }
+                fn files_on_medium(&mut self) -> Result<Option<u32>> {
+                    self.inner.files_on_medium()
+                }
+            }
+
+            struct Fixture {
+                conn: Connection,
+                config: Config,
+                paths: TapectlPaths,
+                _tmp: tempfile::TempDir,
+            }
+
+            /// [`swept_write_fixture`]'s catalog with `units` staged in its
+            /// one unit's place, as `(name, slice sizes)` in name order: real
+            /// slice files whose sha256 is recorded, every set encrypted to
+            /// the escrow recipient; an `initialized` LTO-6 volume for each
+            /// of `labels`; `min_copies = 1`, so one copy releases a unit.
+            fn fixture(units: &[(&str, &[usize])], labels: &[&str]) -> Fixture {
+                let (conn, tenant_id, first_set) = escrow_check_fixture();
+                let escrow_pk = register_escrow(&conn);
+                let receipt = serde_json::to_string(&vec![escrow_pk]).unwrap();
+                let tmp = tempfile::TempDir::new().unwrap();
+                let slices = tmp.path().join("slices");
+                fs::create_dir_all(&slices).unwrap();
+                for (i, (name, sizes)) in units.iter().enumerate() {
+                    let stage_set_id = if i == 0 {
+                        conn.execute(
+                            "UPDATE units SET name = ?1, uuid = ?2 WHERE name = 'photos'",
+                            params![name, format!("u-{name}")],
+                        )
+                        .unwrap();
+                        first_set
+                    } else {
+                        conn.execute(
+                            "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt,
+                                                status)
+                             VALUES (?1, ?2, ?3, 'mtime_size', 1, 'active')",
+                            params![format!("u-{name}"), name, tenant_id],
+                        )
+                        .unwrap();
+                        let unit_id = conn.last_insert_rowid();
+                        conn.execute(
+                            "INSERT INTO snapshots (unit_id, version, status, source_path,
+                                                    file_count, total_size)
+                             VALUES (?1, 1, 'staged', '/tmp/x', 1, 10)",
+                            params![unit_id],
+                        )
+                        .unwrap();
+                        let snapshot_id = conn.last_insert_rowid();
+                        conn.execute(
+                            "INSERT INTO stage_sets (snapshot_id, status, slice_size)
+                             VALUES (?1, 'staged', 524288)",
+                            params![snapshot_id],
+                        )
+                        .unwrap();
+                        conn.last_insert_rowid()
+                    };
+                    set_key_fingerprints(&conn, stage_set_id, Some(&receipt));
+                    for (n, size) in sizes.iter().enumerate() {
+                        let content: Vec<u8> = (0..*size)
+                            .map(|b| (b as u8) ^ (i as u8).wrapping_mul(31) ^ n as u8)
+                            .collect();
+                        let path = slices.join(format!("{name}_{n}.age"));
+                        fs::write(&path, &content).unwrap();
+                        conn.execute(
+                            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes,
+                                                       encrypted_bytes, sha256_plain,
+                                                       sha256_encrypted, staging_path)
+                             VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6)",
+                            params![
+                                stage_set_id,
+                                n as i64 + 1,
+                                content.len() as i64,
+                                direct_hash(b"plaintext hash is not exercised here"),
+                                direct_hash(&content),
+                                path.to_string_lossy(),
+                            ],
+                        )
+                        .unwrap();
+                    }
+                }
+                for label in labels {
+                    conn.execute(
+                        "INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                              capacity_bytes, status)
+                         VALUES (?1, 'lto', 'lto8', 'LTO-6', 2500000000000, 'initialized')",
+                        params![label],
+                    )
+                    .unwrap();
+                }
+                let mut config = lto8_config(tmp.path());
+                config.backends.lto[0].generation = "LTO-6".into();
+                config.defaults.min_copies = 1;
+                let paths = TapectlPaths::new(tmp.path().join("home"));
+                Fixture {
+                    conn,
+                    config,
+                    paths,
+                    _tmp: tmp,
+                }
+            }
+
+            /// The plan [`ABC`] makes on a volume of one tenant: Files 0-3,
+            /// alpha's envelope, the operator's and its backup, alpha's
+            /// backup (4-7), then `a` at 8, `b` at 9 and 10, `c` at 11, and
+            /// the seal planned at 12.
+            const ABC: &[(&str, &[usize])] =
+                &[("a", &[SLICE]), ("b", &[SLICE, SLICE]), ("c", &[SLICE])];
+            const B_FIRST: u32 = 9;
+            const C_ONLY: u32 = 11;
+            const PLANNED_SEAL: u32 = 12;
+
+            /// One `volume write` of `label` over `store`: the result and the
+            /// exit code `main` would give it.
+            fn write(
+                f: &Fixture,
+                label: &str,
+                store: &mut dyn Store,
+                force: bool,
+            ) -> (Result<()>, i32) {
+                let mut slot = ContactSlot::empty();
+                let r = volume_write_contacted(
+                    &f.conn,
+                    &f.paths,
+                    &f.config,
+                    label,
+                    GENCHK_DEVICE,
+                    SBS,
+                    force,
+                    false,
+                    false,
+                    false,
+                    true,
+                    &mut slot,
+                    ContactStore::Injected(store),
+                    None,
+                );
+                let r = slot.finish_result(r).map(|_| ());
+                let code = match &r {
+                    Ok(()) => crate::error::EXIT_SUCCESS,
+                    Err(e) => crate::error::ErrorContract::Write.exit_code(&clone_error(e).into()),
+                };
+                (r, code)
+            }
+
+            fn volume_id(f: &Fixture, label: &str) -> i64 {
+                f.conn
+                    .query_row(
+                        "SELECT id FROM volumes WHERE label = ?1",
+                        params![label],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            }
+
+            /// `(unit, writes.status)` of the volume, by unit name.
+            fn writes_of(f: &Fixture, label: &str) -> Vec<(String, String)> {
+                f.conn
+                    .prepare(
+                        "SELECT u.name, w.status FROM writes w
+                         JOIN volumes v ON v.id = w.volume_id
+                         JOIN stage_sets ss ON ss.id = w.stage_set_id
+                         JOIN snapshots s ON s.id = ss.snapshot_id
+                         JOIN units u ON u.id = s.unit_id
+                         WHERE v.label = ?1 ORDER BY u.name",
+                    )
+                    .unwrap()
+                    .query_map(params![label], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            }
+
+            fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+                rows.iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect()
+            }
+
+            /// `(status, sealed_at IS NOT NULL, ended_after)` of the volume.
+            fn volume_row(f: &Fixture, label: &str) -> (String, bool, Option<i64>) {
+                f.conn
+                    .query_row(
+                        "SELECT status, sealed_at IS NOT NULL, ended_after FROM volumes
+                         WHERE label = ?1",
+                        params![label],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .unwrap()
+            }
+
+            fn events(
+                f: &Fixture,
+                label: &str,
+                action: &str,
+            ) -> Vec<(Option<String>, Option<String>)> {
+                f.conn
+                    .prepare(
+                        "SELECT new_value, details FROM events
+                         WHERE entity_type = 'volume' AND entity_label = ?1 AND action = ?2
+                         ORDER BY id",
+                    )
+                    .unwrap()
+                    .query_map(params![label, action], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap()
+            }
+
+            fn stage_set_of(f: &Fixture, unit: &str) -> i64 {
+                f.conn
+                    .query_row(
+                        "SELECT ss.id FROM stage_sets ss
+                         JOIN snapshots s ON s.id = ss.snapshot_id
+                         JOIN units u ON u.id = s.unit_id WHERE u.name = ?1",
+                        params![unit],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            }
+
+            /// The Layout position the catalog recorded for `unit`'s slice
+            /// `n` (1-based) on `label`.
+            fn position_of(f: &Fixture, label: &str, unit: &str, n: i64) -> u32 {
+                let position: String = f
+                    .conn
+                    .query_row(
+                        "SELECT wp.position FROM write_positions wp
+                         JOIN writes w ON w.id = wp.write_id
+                         JOIN volumes v ON v.id = w.volume_id
+                         JOIN stage_slices sl ON sl.id = wp.stage_slice_id
+                         WHERE v.label = ?1 AND w.stage_set_id = ?2 AND sl.slice_number = ?3",
+                        params![label, stage_set_of(f, unit), n],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                position.parse().unwrap()
+            }
+
+            /// The seal on the tape: the last file, read as the parser reads it.
+            fn last_seal(files: &[Vec<u8>]) -> crate::volume::format::ParsedSeal {
+                let bytes = files.last().expect("a file on the tape");
+                let end = bytes.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+                crate::volume::format::parse_seal_marker(&String::from_utf8_lossy(&bytes[..end]))
+                    .expect("the last file is a seal")
+            }
+
+            /// THE end-to-end case (`layout-session.md`, "The short ending"
+            /// and "After a short seal"): the drive's early warning comes in
+            /// `b`'s first slice, so `b` and `c` are cut and the tape seals
+            /// short after it. The write exits 0; `ended_after` is recorded;
+            /// `a` is the one copy; the figures are the tape's; the
+            /// `write_completed` event names the ending and the cut units;
+            /// the release keeps `b` and `c` staged as `Cut`; and the next
+            /// ordinary `volume write`, onto another cartridge, writes them
+            /// whole.
+            #[test]
+            fn an_early_warning_mid_unit_seals_short_exits_0_and_the_next_write_takes_the_cut_units(
+            ) {
+                let f = fixture(ABC, &["SE-1", "SE-2"]);
+                let mut store = ArmedAt::new(B_FIRST, warning);
+                let (r, code) = write(&f, "SE-1", &mut store, false);
+                r.expect("a short seal is a success");
+                assert_eq!(code, 0);
+                assert_eq!(
+                    position_of(&f, "SE-1", "b", 1),
+                    B_FIRST,
+                    "the fixture's arithmetic"
+                );
+                assert!(store.inner.early_warning().is_some(), "the warning came");
+
+                // The tape: files 0 to K, the short seal at K+1, nothing after.
+                assert_eq!(store.inner.files.len() as u32, B_FIRST + 2);
+                let seal = last_seal(&store.inner.files);
+                assert_eq!(seal.ended_after, Some(u64::from(B_FIRST)));
+                assert_eq!(seal.file_count as u32, B_FIRST + 2);
+
+                // The catalog: sealed, ended_after K, `a` the copy, `b` and
+                // `c` cut.
+                assert_eq!(
+                    volume_row(&f, "SE-1"),
+                    ("sealed".into(), true, Some(i64::from(B_FIRST)))
+                );
+                assert_eq!(
+                    writes_of(&f, "SE-1"),
+                    pairs(&[("a", "completed"), ("b", "cut"), ("c", "cut")])
+                );
+                let warned = events(&f, "SE-1", "write_early_warning");
+                assert_eq!(warned.len(), 1, "{warned:?}");
+                assert_eq!(warned[0].0.as_deref(), Some("9"));
+                let completed = events(&f, "SE-1", "write_completed");
+                assert_eq!(completed.len(), 1, "{completed:?}");
+                let details: serde_json::Value =
+                    serde_json::from_str(completed[0].1.as_deref().expect("details")).unwrap();
+                assert_eq!(
+                    details,
+                    serde_json::json!({
+                        "ending": "short",
+                        "ended_after": 9,
+                        "cut_units": ["b", "c"],
+                    })
+                );
+                // The figures count what is on the tape: `a`'s slice and
+                // `b`'s first, not the plan's four.
+                let figures: (i64, i64) = f
+                    .conn
+                    .query_row(
+                        "SELECT bytes_written, num_data_files FROM volumes WHERE label = 'SE-1'",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(figures, (2 * 3 * SBS as i64, 2));
+
+                // The release `volume write` runs after it: `a` has its one
+                // copy and is released; `b` and `c` are cut, so they are no
+                // copy and keep their staging, named as cut on SE-1.
+                let release = crate::cli::volume::release_staging_after_write(
+                    &f.conn, &f.config, "SE-1", false,
+                );
+                assert!(
+                    matches!(release, crate::cli::volume::StagingRelease::Released(_)),
+                    "{release:?}"
+                );
+                assert_eq!(
+                    crate::staging::release::fixtures::stage_set_status(
+                        &f.conn,
+                        stage_set_of(&f, "a")
+                    ),
+                    "cleaned"
+                );
+                for unit in ["b", "c"] {
+                    let set = stage_set_of(&f, unit);
+                    assert_eq!(
+                        crate::staging::release::fixtures::stage_set_status(&f.conn, set),
+                        "staged",
+                        "{unit}"
+                    );
+                    assert_eq!(
+                        release_blocker(&f.conn, set).unwrap(),
+                        ReleaseBlocker::Cut {
+                            volume_label: Some("SE-1".into())
+                        },
+                        "{unit}"
+                    );
+                }
+
+                // The next ordinary `volume write`, onto another cartridge,
+                // writes the cut units whole, and seals full.
+                let mut next = MemStore::new(SBS);
+                let (r, code) = write(&f, "SE-2", &mut next, false);
+                r.expect("the cut units are written whole on the next cartridge");
+                assert_eq!(code, 0);
+                assert_eq!(
+                    writes_of(&f, "SE-2"),
+                    pairs(&[("b", "completed"), ("c", "completed")])
+                );
+                assert_eq!(volume_row(&f, "SE-2"), ("sealed".into(), true, None));
+                assert_eq!(
+                    events(&f, "SE-2", "write_completed"),
+                    vec![(None, None)],
+                    "a full seal's event is what it was before 1.6.0"
+                );
+                assert_eq!(
+                    release_blocker(&f.conn, stage_set_of(&f, "b")).unwrap(),
+                    ReleaseBlocker::None,
+                    "b is written whole elsewhere: its cut row no longer holds it"
+                );
+            }
+
+            /// W4's second case: the warning in the LAST data slice. The full
+            /// seal goes where it was planned, nothing is cut and
+            /// `ended_after` stays NULL; the warning is still recorded.
+            #[test]
+            fn a_warning_in_the_last_slice_seals_full_and_cuts_nothing() {
+                let f = fixture(ABC, &["SE-L"]);
+                let mut store = ArmedAt::new(C_ONLY, warning);
+                let (r, code) = write(&f, "SE-L", &mut store, false);
+                r.expect("seals");
+                assert_eq!(code, 0);
+                assert_eq!(position_of(&f, "SE-L", "c", 1), C_ONLY);
+                assert!(store.inner.early_warning().is_some(), "the warning came");
+                assert_eq!(store.inner.files.len() as u32, PLANNED_SEAL + 1);
+                assert_eq!(
+                    last_seal(&store.inner.files).ended_after,
+                    Some(u64::from(PLANNED_SEAL - 1))
+                );
+                assert_eq!(volume_row(&f, "SE-L"), ("sealed".into(), true, None));
+                assert_eq!(
+                    writes_of(&f, "SE-L"),
+                    pairs(&[("a", "completed"), ("b", "completed"), ("c", "completed")])
+                );
+                let warned = events(&f, "SE-L", "write_early_warning");
+                assert_eq!(warned.len(), 1, "{warned:?}");
+                assert!(
+                    warned[0]
+                        .1
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("\"seal\": \"full\""),
+                    "{warned:?}"
+                );
+                assert_eq!(events(&f, "SE-L", "write_completed"), vec![(None, None)]);
+            }
+
+            /// W6 for the seal itself: the hard end inside the seal's blocks,
+            /// or its filemark refused, ends the session ABORTED, not
+            /// resumable — exit 5, every row `aborted`, no seal recorded or
+            /// on the tape, and a `write_aborted` event naming the seal. The
+            /// positive control is issue #401's: the next `volume write` of
+            /// the same volume starts it again and seals.
+            #[test]
+            fn the_seals_own_hard_end_aborts_the_session_and_leaves_nothing_to_resume() {
+                for (how, arm) in [
+                    ("hard end", hard_end as Arm),
+                    ("filemark", filemark_refused as Arm),
+                ] {
+                    let f = fixture(ABC, &["SE-H"]);
+                    let mut store = ArmedAt::new(PLANNED_SEAL, arm);
+                    let (r, code) = write(&f, "SE-H", &mut store, false);
+                    let err = r.unwrap_err();
+                    assert!(
+                        matches!(err, TapectlError::WriteAborted(_)),
+                        "{how}: {err:?}"
+                    );
+                    assert_eq!(code, 5, "{how}: {err}");
+                    assert!(
+                        err.to_string().contains("the seal could not be written"),
+                        "{how}: {err}"
+                    );
+                    assert!(!err.to_string().contains("volume resume"), "{how}: {err}");
+
+                    assert_eq!(
+                        store.inner.files.len() as u32,
+                        PLANNED_SEAL,
+                        "{how}: every data file, no seal"
+                    );
+                    assert_eq!(
+                        volume_row(&f, "SE-H"),
+                        ("initialized".into(), false, None),
+                        "{how}"
+                    );
+                    assert_eq!(
+                        writes_of(&f, "SE-H"),
+                        pairs(&[("a", "aborted"), ("b", "aborted"), ("c", "aborted")]),
+                        "{how}"
+                    );
+                    let aborted = events(&f, "SE-H", "write_aborted");
+                    assert_eq!(aborted.len(), 1, "{how}: {aborted:?}");
+                    assert!(
+                        aborted[0].0.as_deref().unwrap_or("").contains("seal"),
+                        "{how}: {aborted:?}"
+                    );
+                    let id = volume_id(&f, "SE-H");
+                    assert!(
+                        !session::resume_would_reconfirm(&f.conn, id).unwrap(),
+                        "{how}: nothing for resume to pick up"
+                    );
+                    assert!(
+                        precontact_refusal(&f.conn, "SE-H", id).unwrap().is_none(),
+                        "{how}: no unresolved session and no recorded seal"
+                    );
+
+                    let mut fresh = MemStore::new(SBS);
+                    let (r, code) = write(&f, "SE-H", &mut fresh, false);
+                    r.expect("issue #401: the next write of the volume starts it again");
+                    assert_eq!(code, 0, "{how}");
+                    assert_eq!(
+                        volume_row(&f, "SE-H"),
+                        ("sealed".into(), true, None),
+                        "{how}"
+                    );
+                }
+            }
+
+            /// Positive control for the test above: the same arms one file
+            /// EARLIER — inside the last data slice — abort as before 1.6.0
+            /// (`run_entries`), so the seal's abort is not a different shape.
+            #[test]
+            fn the_hard_end_inside_a_slice_aborts_the_same_way() {
+                let f = fixture(ABC, &["SE-S"]);
+                let mut store = ArmedAt::new(C_ONLY, hard_end);
+                let (r, code) = write(&f, "SE-S", &mut store, false);
+                let err = r.unwrap_err();
+                assert!(matches!(err, TapectlError::WriteAborted(_)), "{err:?}");
+                assert_eq!(code, 5);
+                assert_eq!(
+                    writes_of(&f, "SE-S"),
+                    pairs(&[("a", "aborted"), ("b", "aborted"), ("c", "aborted")])
+                );
+                assert_eq!(volume_row(&f, "SE-S"), ("initialized".into(), false, None));
+            }
+
+            /// `volumes.ended_after` is recorded with `sealed_at`, the moment
+            /// the short seal is on the tape (`layout-session.md`: "written in
+            /// the same transaction as `sealed_at`"), not by the confirm
+            /// alone: a write stopped between its seal and its confirm leaves
+            /// both, so `volume resume` re-enters the confirm of the seal the
+            /// tape holds. Exit 4, the rows `interrupted`, nothing cut yet.
+            #[test]
+            fn a_write_stopped_after_its_short_seal_has_ended_after_recorded_with_sealed_at() {
+                let f = fixture(ABC, &["SE-I"]);
+                let mut store = ArmedAt::new(B_FIRST, warning);
+                store.signal_after_seal = true;
+                let (r, code) = write(&f, "SE-I", &mut store, false);
+                crate::signal::interrupt_this_thread(false);
+                let err = r.unwrap_err();
+                assert!(matches!(err, TapectlError::WriteInterrupted(_)), "{err:?}");
+                assert_eq!(code, 4, "{err}");
+                assert!(err.to_string().contains("interrupted after seal"), "{err}");
+                assert_eq!(
+                    volume_row(&f, "SE-I"),
+                    ("initialized".into(), true, Some(i64::from(B_FIRST)))
+                );
+                assert_eq!(
+                    writes_of(&f, "SE-I"),
+                    pairs(&[
+                        ("a", "interrupted"),
+                        ("b", "interrupted"),
+                        ("c", "interrupted")
+                    ])
+                );
+            }
+
+            /// The short-sealed tape [`an_early_warning_mid_unit_seals_short_exits_0_and_the_next_write_takes_the_cut_units`]
+            /// leaves on the cartridge: its files.
+            fn short_sealed_tape() -> Vec<Vec<u8>> {
+                let f = fixture(ABC, &["SE-T"]);
+                let mut store = ArmedAt::new(B_FIRST, warning);
+                write(&f, "SE-T", &mut store, false).0.expect("seals short");
+                assert_eq!(volume_row(&f, "SE-T").2, Some(i64::from(B_FIRST)));
+                store.inner.files
+            }
+
+            /// ADR-0003 on a short-sealed cartridge (#420, `probe_seal`): a
+            /// `volume write --force` of another volume onto it is refused —
+            /// the contact finds the short seal before the planned
+            /// position, where END OF DATA ends the medium — and the tape is
+            /// untouched. Before #420 the probe read only the planned
+            /// position, found END OF DATA, and `--force` overwrote a sealed
+            /// tape. Positive control: the same write onto a blank cartridge
+            /// is not refused.
+            #[test]
+            fn volume_write_force_onto_a_short_sealed_cartridge_is_refused() {
+                let tape = short_sealed_tape();
+                let f = fixture(ABC, &["SE-X"]);
+                let mut store = MemStore::new(SBS);
+                store.files = tape.clone();
+                store.syncs = vec![false; tape.len()];
+                let (r, code) = write(&f, "SE-X", &mut store, true);
+                let err = r.unwrap_err().to_string();
+                assert!(err.contains("ADR-0003"), "{err}");
+                assert!(
+                    err.contains(&format!("{}", B_FIRST + 1)),
+                    "the seal's position: {err}"
+                );
+                assert_eq!(code, 2, "a refusal before anything was written: {err}");
+                assert_eq!(store.files, tape, "the sealed tape is untouched");
+                assert!(writes_of(&f, "SE-X").is_empty(), "no session was planned");
+
+                let mut blank = MemStore::new(SBS);
+                let (r, _) = write(&f, "SE-X", &mut blank, true);
+                r.expect("positive control: a blank cartridge takes the write");
+            }
+
+            // ── ADR-0012 item 113: planning past the fill ceiling ──
+
+            /// One slice of [`ABC`], block-padded.
+            const PADDED: u64 = 3 * SBS as u64;
+
+            /// The volume's own files (everything but the data slices),
+            /// block-padded, as a write of `f`'s staged batch onto `label`
+            /// builds them — the same function, keys, catalog and index.
+            /// Another build differs only in the volume's identity (its uuid
+            /// and time), a few bytes; the tests below leave a whole slice
+            /// either side of every figure they place.
+            fn fixed_bytes(f: &Fixture, label: &str) -> u64 {
+                built(f, label, u64::MAX / 4, None)
+                    .0
+                    .layout
+                    .fixed_on_tape_bytes()
+            }
+
+            /// The write's own build of `f`'s staged batch onto `label`, at
+            /// the fill budget `usable` and the plan bound `bound`, and the
+            /// session directory it materialised into.
+            fn built(
+                f: &Fixture,
+                label: &str,
+                usable: u64,
+                bound: Option<u64>,
+            ) -> (build::BuiltLayout, tempfile::TempDir) {
+                let units = checked_staged_units(&f.conn, None).unwrap();
+                let ids: Vec<i64> = units.iter().map(|u| u.stage_set_id).collect();
+                let SessionKeys {
+                    tenants,
+                    operator_public_keys,
+                    escrow_public_key,
+                    ..
+                } = assemble_keys_for_units(&f.conn, &units, &ids).unwrap();
+                let dir = tempfile::TempDir::new().unwrap();
+                let (layout, _) = build_write_layout(
+                    &f.conn,
+                    &f.paths,
+                    WriteBuild {
+                        label,
+                        volume_uuid: Uuid::new_v4().to_string(),
+                        media_type: "LTO-6".into(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        block_size: SBS as u64,
+                        usable_bytes: usable,
+                        enospc_buffer: 0,
+                        plan_bound_bytes: bound,
+                        nominal_capacity: 2_500_000_000_000,
+                        mam_capacity: 0,
+                        mam_manufacturer: String::new(),
+                        mam_length: 0,
+                        mam_loads: 0,
+                        cartridge_identity: CartridgeIdentity {
+                            serial: String::new(),
+                            source: None,
+                        },
+                    },
+                    units,
+                    &ids,
+                    tenants,
+                    operator_public_keys,
+                    escrow_public_key,
+                    dir.path(),
+                )
+                .unwrap();
+                (layout, dir)
+            }
+
+            /// `f`'s volume `label` made `capacity` bytes, and its drive's
+            /// fill ceiling set so the fill budget is `fill` bytes;
+            /// `post_warning_bytes` declared or not.
+            fn budget(f: &mut Fixture, label: &str, capacity: u64, fill: u64, post_warning: bool) {
+                f.conn
+                    .execute(
+                        "UPDATE volumes SET capacity_bytes = ?2 WHERE label = ?1",
+                        params![label, capacity as i64],
+                    )
+                    .unwrap();
+                let backend = &mut f.config.backends.lto[0];
+                backend.fill_ceiling = fill as f64 / capacity as f64;
+                backend.post_warning_bytes = post_warning.then(|| "1G".to_string());
+                let got = backend.fill_budget_bytes(capacity);
+                assert!(got.abs_diff(fill) <= 1, "the fill budget: {got} for {fill}");
+            }
+
+            /// With the drive's `post_warning_bytes`, a plan reaches past the
+            /// fill ceiling: `a` is committed under it, `b` and `c` are
+            /// planned past it, and the write proceeds — this medium has the
+            /// room, so all three are written and the seal is full. The units
+            /// past the ceiling are named before the tape moves (the notice
+            /// is [`past_ceiling_notice`], asked here of the write's own
+            /// build at the same budget).
+            #[test]
+            fn with_post_warning_bytes_a_write_plans_past_the_fill_ceiling_and_names_the_units_there(
+            ) {
+                let mut f = fixture(ABC, &["SE-P"]);
+                let fixed = fixed_bytes(&f, "SE-P");
+                // Under the ceiling: `a` and a slice to spare. The whole
+                // capacity: the plan and a slice to spare.
+                let fill = fixed + 2 * PADDED;
+                let capacity = fixed + 5 * PADDED;
+                budget(&mut f, "SE-P", capacity, fill, true);
+
+                let (layout, _dir) = built(&f, "SE-P", fill, Some(capacity));
+                let units = checked_staged_units(&f.conn, None).unwrap();
+                let split = layout.split(&units);
+                assert_eq!((split.committed, split.planned, split.units), (1, 3, 3));
+                assert!(past_ceiling_refusal("SE-P", &split, &units).is_none());
+                let notice = past_ceiling_notice("SE-P", &split, &units).expect("named");
+                assert!(
+                    notice.starts_with(
+                        "volume \"SE-P\": \"b\" v1, \"c\" v1 planned past the fill ceiling; the \
+                         tape may end before them."
+                    ),
+                    "{notice}"
+                );
+
+                let mut store = MemStore::new(SBS);
+                let (r, code) = write(&f, "SE-P", &mut store, false);
+                r.expect("a plan within the bound is written");
+                assert_eq!(code, 0);
+                assert_eq!(
+                    writes_of(&f, "SE-P"),
+                    pairs(&[("a", "completed"), ("b", "completed"), ("c", "completed")])
+                );
+                assert_eq!(volume_row(&f, "SE-P"), ("sealed".into(), true, None));
+            }
+
+            /// Without `post_warning_bytes`, the same batch on the same
+            /// volume is refused at the fill ceiling exactly as before 1.6.0:
+            /// today's refusal, byte for byte, given the figure the build
+            /// counted. Nothing is written and no session is planned.
+            #[test]
+            fn without_post_warning_bytes_the_same_write_is_refused_with_todays_text() {
+                let mut f = fixture(ABC, &["SE-N"]);
+                let fixed = fixed_bytes(&f, "SE-N");
+                let fill = fixed + 2 * PADDED;
+                let capacity = fixed + 5 * PADDED;
+                budget(&mut f, "SE-N", capacity, fill, false);
+
+                let mut store = MemStore::new(SBS);
+                let (r, code) = write(&f, "SE-N", &mut store, false);
+                let msg = r.unwrap_err().to_string();
+                let needed: u64 = msg
+                    .split("the layout needs ")
+                    .nth(1)
+                    .and_then(|t| t.split(' ').next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or_else(|| panic!("no figure in: {msg}"));
+                let available = f.config.backends.lto[0].fill_budget_bytes(capacity);
+                let expected = format!(
+                    "volume \"SE-N\" failed pre-write validation: {}; {}",
+                    crate::volume::layout_model::LayoutError::CapacityExceeded {
+                        needed,
+                        reserve: 0,
+                        available,
+                    },
+                    crate::volume::layout_model::capacity_refusal_note(
+                        &[crate::volume::layout_model::LayoutError::CapacityExceeded {
+                            needed,
+                            reserve: 0,
+                            available,
+                        }],
+                        f.config.backends.lto[0].fill_ceiling,
+                        capacity,
+                    )
+                    .unwrap(),
+                );
+                assert_eq!(msg, expected);
+                assert_eq!(code, 2);
+                assert!(store.files.is_empty(), "nothing was written");
+                assert!(writes_of(&f, "SE-N").is_empty(), "no session was planned");
+            }
+
+            /// Units beyond the plan bound are refused, never trimmed (the
+            /// coordinator's ruling on item 113): the whole capacity holds
+            /// `a` and `b` but not `c`, and the write refuses by the bound.
+            #[test]
+            fn a_plan_beyond_the_bound_is_refused_not_trimmed() {
+                let mut f = fixture(ABC, &["SE-B"]);
+                let fixed = fixed_bytes(&f, "SE-B");
+                let fill = fixed + 2 * PADDED;
+                let capacity = fixed + 3 * PADDED + PADDED / 2;
+                budget(&mut f, "SE-B", capacity, fill, true);
+
+                let mut store = MemStore::new(SBS);
+                let (r, code) = write(&f, "SE-B", &mut store, false);
+                let msg = r.unwrap_err().to_string();
+                assert!(msg.contains("failed pre-write validation"), "{msg}");
+                assert!(msg.contains("nominal capacity"), "{msg}");
+                assert!(msg.contains("ADR-0012 item 113"), "{msg}");
+                assert!(
+                    !msg.contains("--fill-ceiling"),
+                    "raising the ceiling cannot help: {msg}"
+                );
+                assert_eq!(code, 2);
+                assert!(store.files.is_empty(), "nothing was written");
+                assert!(writes_of(&f, "SE-B").is_empty(), "no session was planned");
+            }
+
+            /// A plan whose every unit is past the fill ceiling commits
+            /// nothing, and is refused (the coordinator's ruling: a tape that
+            /// can only end cut is not a plan), before the tape moves.
+            #[test]
+            fn a_plan_that_commits_no_unit_is_refused() {
+                let mut f = fixture(ABC, &["SE-0"]);
+                let fixed = fixed_bytes(&f, "SE-0");
+                let fill = fixed + PADDED / 2;
+                let capacity = fixed + 6 * PADDED;
+                budget(&mut f, "SE-0", capacity, fill, true);
+
+                let mut store = MemStore::new(SBS);
+                let (r, code) = write(&f, "SE-0", &mut store, false);
+                let msg = r.unwrap_err().to_string();
+                assert!(msg.contains("would commit nothing"), "{msg}");
+                assert!(msg.contains("\"a\" v1, \"b\" v1, \"c\" v1"), "{msg}");
+                assert_eq!(code, 2);
+                assert!(store.files.is_empty(), "nothing was written");
+                assert!(writes_of(&f, "SE-0").is_empty(), "no session was planned");
+            }
         }
     }
 
@@ -22930,6 +24217,7 @@ mod tests {
                     block_size: BS as u64,
                     usable_bytes,
                     enospc_buffer: 10 * 1024,
+                    plan_bound_bytes: None,
                     nominal_capacity: usable_bytes as i64,
                     mam_capacity: 2_400_000_000_000,
                     mam_manufacturer: "HEWLETT-PACKARD-SOMETHING-LONGER".into(),
@@ -23072,13 +24360,15 @@ mod tests {
 
         /// There is ONE place a write's Layout is built; the rehearsal and
         /// the write both call it, so the rehearsal sizes what the write lays
-        /// down. Pinned in the source.
+        /// down. Pinned in the source. Since 1.6.0 it builds with the plan
+        /// bound (ADR-0012 item 113), which the rehearsal passes as `None`.
         #[test]
         fn the_rehearsal_and_the_write_build_through_the_same_function() {
             const SRC: &str = include_str!("write.rs");
             let prod = SRC.split("#[cfg(test)]\nmod tests").next().unwrap();
             assert_eq!(
-                prod.matches("build::build(").count(),
+                prod.matches("build::build(").count()
+                    + prod.matches("build::build_with_plan_bound(").count(),
                 1,
                 "only build_write_layout builds a Layout"
             );
@@ -23089,7 +24379,43 @@ mod tests {
             };
             assert!(body("fn volume_write_in_contact<'c>(").contains("build_write_layout("));
             assert!(body("pub(crate) fn rehearse_write_capacity(").contains("build_write_layout("));
-            assert!(body("fn build_write_layout(").contains("build::build("));
+            assert!(body("fn build_write_layout(").contains("build::build_with_plan_bound("));
+        }
+
+        /// ADR-0012 item 113, the coordinator's ruling: a rewrite NEVER
+        /// plans past the fill ceiling — it may hold a unit's only copy, and
+        /// a cut there would leave it none. With the drive declaring
+        /// `post_warning_bytes` (a plan bound at the whole capacity) and a
+        /// fill ceiling of half of it, a rehearsal one byte short of the
+        /// ceiling refuses exactly as it does without the key, though the
+        /// plan would fit under the bound; and passes at the ceiling.
+        #[test]
+        fn a_rewrite_never_plans_past_the_fill_ceiling_even_when_the_drive_declares_post_warning_bytes(
+        ) {
+            let mut f = fixture(&[3 * BS + 17, 5 * BS]);
+            f.config.backends.lto[0].fill_ceiling = 0.5;
+            let probe = rehearse(&f, 1_000_000_000).unwrap();
+            let threshold = probe.staged + probe.generated + probe.margin + probe.reserve;
+            // At the 50% ceiling: one byte short of the threshold, and a
+            // capacity whose whole (the bound) holds the plan twice over.
+            let short = 2 * (threshold as i64 - 1);
+            let without = rehearse(&f, short).unwrap_err().to_string();
+            assert!(without.contains("would not fit its cartridge"), "{without}");
+
+            f.config.backends.lto[0].post_warning_bytes = Some("1G".into());
+            assert_eq!(
+                f.config.backends.lto[0]
+                    .plan_bound_bytes(short as u64)
+                    .unwrap(),
+                Some(short as u64),
+                "positive control: the drive WOULD plan to the whole capacity"
+            );
+            let with = rehearse(&f, short).unwrap_err().to_string();
+            assert_eq!(
+                with, without,
+                "post_warning_bytes changes nothing for a rewrite"
+            );
+            rehearse(&f, 2 * threshold as i64).expect("at the ceiling it fits");
         }
     }
 }
