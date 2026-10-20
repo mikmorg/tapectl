@@ -1312,10 +1312,7 @@ mod forward_compat_tests {
         let s = parse_seal_marker(&seal()).expect("and the seal 1.6.0 writes");
         assert_eq!(s.refusal(), None);
 
-        let both = set_requires(
-            &thunk(),
-            "requires = [\"short-seal\", \"unknown-feature\"]",
-        );
+        let both = set_requires(&thunk(), "requires = [\"short-seal\", \"unknown-feature\"]");
         let err = check_id_thunk_readable(&both).unwrap_err().to_string();
         assert!(err.contains("\"unknown-feature\""), "{err}");
         assert!(

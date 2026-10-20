@@ -167,19 +167,18 @@ pub(crate) fn fixture_seal(label: &str, seal_position: u32, front_index_sha256: 
         size_bytes: None,
         sha256_encrypted: None,
     });
-    layout::generate_seal_marker(
-        label,
-        seal_position as i32 + 1,
-        front_index_sha256,
-        &files,
-    )
-    .into_bytes()
+    layout::generate_seal_marker(label, seal_position as i32 + 1, front_index_sha256, &files)
+        .into_bytes()
 }
 
 /// Test support (#420): a short 1.6.0 seal at `ended_after + 1` binding
 /// `front_index_sha256`, over [`fixture_seal_files`]; unpadded bytes.
 #[cfg(test)]
-pub(crate) fn fixture_short_seal(label: &str, ended_after: u32, front_index_sha256: &str) -> Vec<u8> {
+pub(crate) fn fixture_short_seal(
+    label: &str,
+    ended_after: u32,
+    front_index_sha256: &str,
+) -> Vec<u8> {
     layout::generate_short_seal_marker(
         label,
         ended_after as i32,
@@ -924,8 +923,8 @@ impl ContactFacts {
     /// seal", which is right for a blank tape (its positions do not read)
     /// and wrong for a sealed one whose seal does not.
     fn probe_seal(&mut self, store: &mut dyn Store, planned: u32, medium_blank: bool) -> SealProbe {
-        if !self.seal_reads.contains_key(&planned) {
-            let located = if medium_blank {
+        self.seal_reads.entry(planned).or_insert_with(|| {
+            if medium_blank {
                 // Issue #400: a medium blank at BOT holds no file anywhere.
                 // One bounded read, as before #420; a failure is absent.
                 match crate::store::read_small(store, planned) {
@@ -942,9 +941,8 @@ impl ContactFacts {
                         (position, SealRead::Unreadable(error))
                     }
                 }
-            };
-            self.seal_reads.insert(planned, located);
-        }
+            }
+        });
         match &self.seal_reads[&planned] {
             (position, SealRead::Bytes(_)) => match self.accepted_seal(planned) {
                 Some(_) => SealProbe::Parses {
@@ -2127,9 +2125,8 @@ impl InterruptedSession {
         // position goes to confirm, so a re-confirming resume locates the
         // seal once, not again for the chain walk — but only bytes read
         // where this ending puts the seal (#420: M, or K+1).
-        let seal_bytes_for = |ending: Ending| {
-            seal_position.and_then(|p| facts.seal_bytes(ending.seal_position(p)))
-        };
+        let seal_bytes_for =
+            |ending: Ending| seal_position.and_then(|p| facts.seal_bytes(ending.seal_position(p)));
         let seal_bytes = seal_bytes_for(recorded_ending);
         match contact {
             ContactOutcome::Blank | ContactOutcome::Matches => {
@@ -2476,9 +2473,9 @@ impl InterruptedSession {
                 .iter()
                 .find(|e| e.position as u32 == k)
         });
-        let Some(ended_after) = ended_after.filter(|_| {
-            at.is_some_and(|e| matches!(e.kind, ZoneKind::Slice { .. }))
-        }) else {
+        let Some(ended_after) =
+            ended_after.filter(|_| at.is_some_and(|e| matches!(e.kind, ZoneKind::Slice { .. })))
+        else {
             // W6: a tape that ends inside its metadata holds no unit.
             let reason = format!(
                 "the drive's early warning was recorded in tape file {warned_at}, but the tape \
@@ -3510,7 +3507,10 @@ fn run_entries(
                 );
                 crate::progress::log(&reason);
                 mark_writes(conn, &write_ids, "aborted")?;
-                return Ok(ExecuteOutcome::Aborted(AbortedSession { volume_id, reason }));
+                return Ok(ExecuteOutcome::Aborted(AbortedSession {
+                    volume_id,
+                    reason,
+                }));
             }
             let ending = if position + 1 == planned_seal {
                 Ending::Full
@@ -10130,7 +10130,11 @@ mod tests {
 
         /// The plan most tests use: `a` (two slices), `b` (two), `c` (one).
         fn three_units() -> Short {
-            short_fixture(&[("a", &[SLICE, SLICE]), ("b", &[SLICE, SLICE]), ("c", &[SLICE])])
+            short_fixture(&[
+                ("a", &[SLICE, SLICE]),
+                ("b", &[SLICE, SLICE]),
+                ("c", &[SLICE]),
+            ])
         }
 
         /// The Layout position of unit `unit`'s slice `n` (0-based).
@@ -10217,7 +10221,10 @@ mod tests {
                 ConfirmOutcome::Sealed(s) => s,
                 ConfirmOutcome::Quarantined(q) => panic!("expected Sealed, got {:?}", q.reason),
                 ConfirmOutcome::Inconclusive(i) => {
-                    panic!("expected Sealed, got Inconclusive: {:?}", i.evidence.mismatches)
+                    panic!(
+                        "expected Sealed, got Inconclusive: {:?}",
+                        i.evidence.mismatches
+                    )
                 }
             }
         }
@@ -10232,7 +10239,9 @@ mod tests {
                      WHERE w.volume_id = ?1 ORDER BY w.id",
                 )
                 .unwrap()
-                .query_map(params![s.volume_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .query_map(params![s.volume_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
                 .unwrap()
                 .collect::<rusqlite::Result<_>>()
                 .unwrap()
@@ -10312,8 +10321,7 @@ mod tests {
         /// The rows, the snapshots, `ended_after`, the event, the seal's
         /// bytes and the operator's text, through a passing quick confirm.
         #[test]
-        fn the_early_warning_in_a_units_first_slice_seals_short_and_cuts_it_and_every_unit_after(
-        ) {
+        fn the_early_warning_in_a_units_first_slice_seals_short_and_cuts_it_and_every_unit_after() {
             let s = three_units();
             let k = slice_at(&s, 1, 0);
             let m = planned_seal(&s);
@@ -10323,7 +10331,11 @@ mod tests {
             assert_eq!(ready.ending(), Ending::Short { ended_after: k });
 
             // W4: no data entry after K; W5: the event, before the seal.
-            assert_eq!(store.files.len() as u32, k + 1, "files 0 to K, nothing after");
+            assert_eq!(
+                store.files.len() as u32,
+                k + 1,
+                "files 0 to K, nothing after"
+            );
             let events = warning_events(&s);
             assert_eq!(events.len(), 1, "{events:?}");
             let (field, old, new, details) = &events[0];
@@ -10342,9 +10354,8 @@ mod tests {
             assert_eq!(details["post_warning_bytes"].as_u64(), Some(POST_WARNING));
             assert_eq!(details["seal"].as_str(), Some("short"));
             assert!(
-                events[0].3.starts_with(
-                    "{\"bytes_at\": ",
-                ) && events[0].3.contains(", \"refusals\": ")
+                events[0].3.starts_with("{\"bytes_at\": ",)
+                    && events[0].3.contains(", \"refusals\": ")
                     && events[0].3.contains(", \"post_warning_bytes\": ")
                     && events[0].3.ends_with(", \"seal\": \"short\"}"),
                 "the spec's key order: {}",
@@ -10374,9 +10385,17 @@ mod tests {
                 .iter()
                 .find(|e| matches!(e.kind, ZoneKind::FrontIndex))
                 .unwrap();
-            assert_eq!(Some(&seal.front_index_sha256), fi.sha256.as_ref(), "binds File 3");
+            assert_eq!(
+                Some(&seal.front_index_sha256),
+                fi.sha256.as_ref(),
+                "binds File 3"
+            );
 
-            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
             assert_eq!(done.ending, Ending::Short { ended_after: k });
             assert_eq!(done.cut_units, ["b", "c"]);
             assert_eq!(
@@ -10387,7 +10406,10 @@ mod tests {
                     row("c", "cut", "staged")
                 ]
             );
-            assert_eq!(volume(&s), ("sealed".into(), Some(i64::from(k)), "ok".into()));
+            assert_eq!(
+                volume(&s),
+                ("sealed".into(), Some(i64::from(k)), "ok".into())
+            );
             // A cut unit's slice that reached the tape stays recorded; the
             // ones that did not stay pending.
             assert_eq!(
@@ -10397,13 +10419,19 @@ mod tests {
                     (i64::from(k) + 1, "pending".to_string())
                 ]
             );
-            assert_eq!(positions(&s, 2), [(i64::from(k) + 2, "pending".to_string())]);
+            assert_eq!(
+                positions(&s, 2),
+                [(i64::from(k) + 2, "pending".to_string())]
+            );
 
             let report = done.short_ending_report().unwrap();
             assert!(report.contains("sealed short"), "{report}");
             assert!(report.contains(&format!("tape file {k}")), "{report}");
             assert!(report.contains("b, c"), "names the cut units: {report}");
-            assert!(report.contains("`tapectl volume write <label>`"), "{report}");
+            assert!(
+                report.contains("`tapectl volume write <label>`"),
+                "{report}"
+            );
         }
 
         /// The warning in a unit's LAST slice: that unit is whole on the
@@ -10452,18 +10480,28 @@ mod tests {
             let events = warning_events(&s);
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].2, k.to_string(), "new_value is K = M-1");
-            assert!(events[0].3.ends_with("\"seal\": \"full\"}"), "{}", events[0].3);
+            assert!(
+                events[0].3.ends_with("\"seal\": \"full\"}"),
+                "{}",
+                events[0].3
+            );
 
             let pending = ready.seal(&mut store).unwrap();
             assert!(pending.readback_past_warning());
             let seal = parsed_seal(&store.files[m as usize]);
             assert_eq!(seal.ended_after, Some(u64::from(m - 1)));
             assert_eq!(seal.ending(u64::from(m) + 1), format::SealEnding::Full);
-            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
             assert_eq!(done.ending, Ending::Full);
             assert!(done.cut_units.is_empty());
             assert_eq!(done.short_ending_report(), None);
-            assert!(rows(&s).iter().all(|(_, w, sn)| w == "completed" && sn == "current"));
+            assert!(rows(&s)
+                .iter()
+                .all(|(_, w, sn)| w == "completed" && sn == "current"));
             assert_eq!(volume(&s), ("sealed".into(), None, "ok".into()));
         }
 
@@ -10483,10 +10521,18 @@ mod tests {
             let ExecuteOutcome::Aborted(aborted) = outcome else {
                 panic!("a warning before the data zone aborts");
             };
-            assert!(aborted.reason.contains("early warning"), "{}", aborted.reason);
+            assert!(
+                aborted.reason.contains("early warning"),
+                "{}",
+                aborted.reason
+            );
             assert!(aborted.reason.contains("tape file 1"), "{}", aborted.reason);
             assert!(aborted.reason.contains("W6"), "{}", aborted.reason);
-            assert_eq!(store.files.len(), 2, "File 1 written whole; nothing after it");
+            assert_eq!(
+                store.files.len(),
+                2,
+                "File 1 written whole; nothing after it"
+            );
             assert!(warning_events(&s).is_empty(), "no event for an abort");
             assert!(rows(&s).iter().all(|(_, w, _)| w == "aborted"));
             assert_eq!(volume(&s), ("initialized".into(), None, "ok".into()));
@@ -10499,13 +10545,16 @@ mod tests {
         fn the_hard_end_inside_a_slice_past_the_warning_aborts_unsealed() {
             let s = three_units();
             let k = slice_at(&s, 1, 0);
-            let mut store = warning_in(&s, k)
-                .with_enospc_after(bytes_before(&s, k) + 2 * SBS - 1);
+            let mut store = warning_in(&s, k).with_enospc_after(bytes_before(&s, k) + 2 * SBS - 1);
             let (s, outcome) = execute(s, &mut store);
             let ExecuteOutcome::Aborted(aborted) = outcome else {
                 panic!("the hard end aborts");
             };
-            assert!(aborted.reason.contains(&format!("position {k}")), "{}", aborted.reason);
+            assert!(
+                aborted.reason.contains(&format!("position {k}")),
+                "{}",
+                aborted.reason
+            );
             assert_eq!(store.files.len() as u32, k, "slice K never recorded");
             assert!(store.early_warning().is_some(), "the warning came first");
             assert!(warning_events(&s).is_empty());
@@ -10570,7 +10619,9 @@ mod tests {
                     ..
                 } if *position == k
             )));
-            assert!(rows(&s).iter().all(|(_, w, sn)| w == "aborted" && sn == "staged"));
+            assert!(rows(&s)
+                .iter()
+                .all(|(_, w, sn)| w == "aborted" && sn == "staged"));
             assert_eq!(
                 volume(&s),
                 ("initialized".into(), None, "quarantined".into()),
@@ -10667,7 +10718,12 @@ mod tests {
             fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
                 self.inner.capacity()
             }
-            fn execute(&mut self, src: &mut dyn std::io::Read, len: u64, sync: bool) -> Result<u64> {
+            fn execute(
+                &mut self,
+                src: &mut dyn std::io::Read,
+                len: u64,
+                sync: bool,
+            ) -> Result<u64> {
                 assert!(sync, "a resume past the warning writes only the seal");
                 self.inner.execute(src, len, sync)
             }
@@ -10697,7 +10753,11 @@ mod tests {
 
         /// Run `interrupted`'s resume over `store`, expecting it ready to
         /// seal.
-        fn resume_to_ready(s: &Short, interrupted: InterruptedSession, store: &mut dyn Store) -> ReadyToSeal {
+        fn resume_to_ready(
+            s: &Short,
+            interrupted: InterruptedSession,
+            store: &mut dyn Store,
+        ) -> ReadyToSeal {
             match interrupted
                 .resume_checking(&s.conn, &s.keys, SliceCheck::Size, store, || false)
                 .unwrap()
@@ -10730,7 +10790,11 @@ mod tests {
             assert_eq!(ready.ending(), Ending::Short { ended_after: k });
             let pending = ready.seal(&mut store).unwrap();
             assert_eq!(store.inner.files.len() as u32, k + 2);
-            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
             assert_eq!(done.cut_units, ["b", "c"]);
             assert_eq!(
                 rows(&s),
@@ -10765,7 +10829,12 @@ mod tests {
                 planned_seal: planned_seal(&s),
             };
             let ready = resume_to_ready(&s, interrupted, &mut store);
-            assert_eq!(ready.ending(), Ending::Short { ended_after: a_last });
+            assert_eq!(
+                ready.ending(),
+                Ending::Short {
+                    ended_after: a_last
+                }
+            );
             assert_eq!(
                 positions(&s, 1)[0],
                 (i64::from(k), "pending".to_string()),
@@ -10773,8 +10842,17 @@ mod tests {
             );
             let pending = ready.seal(&mut store).unwrap();
             assert_eq!(store.inner.files.len() as u32, k + 1, "the seal at K");
-            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
-            assert_eq!(done.ending, Ending::Short { ended_after: a_last });
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
+            assert_eq!(
+                done.ending,
+                Ending::Short {
+                    ended_after: a_last
+                }
+            );
             assert_eq!(
                 rows(&s),
                 [
@@ -10796,7 +10874,9 @@ mod tests {
             let mut store = warning_in(&s, k);
             let (s, outcome) = execute(s, &mut store);
             drop(ready(outcome));
-            store.files.push(b"[seal]\nvolume = \"SHORT01\"\nlayout_ver".to_vec());
+            store
+                .files
+                .push(b"[seal]\nvolume = \"SHORT01\"\nlayout_ver".to_vec());
             store.syncs.push(false);
             let interrupted = crashed_after_the_warning(&s);
             let mut store = NoDataWrites {
@@ -10877,7 +10957,11 @@ mod tests {
                 .unwrap();
             assert!(sealed_at.is_some(), "recorded from the seal");
             assert_eq!(ended_after, Some(i64::from(k)), "recorded with it");
-            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
             assert_eq!(done.cut_units, ["b", "c"]);
         }
 
@@ -10913,9 +10997,16 @@ mod tests {
             assert!(pending.readback_past_warning(), "the event is recorded");
             let mut store = failing.inner;
             assert_eq!(store.files.len() as u32, k + 2, "nothing written");
-            let done = sealed(pending.confirm(&s.conn, &mut store, Tier::Navigable).unwrap());
+            let done = sealed(
+                pending
+                    .confirm(&s.conn, &mut store, Tier::Navigable)
+                    .unwrap(),
+            );
             assert_eq!(done.ending, Ending::Short { ended_after: k });
-            assert_eq!(volume(&s), ("sealed".into(), Some(i64::from(k)), "ok".into()));
+            assert_eq!(
+                volume(&s),
+                ("sealed".into(), Some(i64::from(k)), "ok".into())
+            );
         }
 
         /// `cut` is written only inside the passing confirm's transaction
@@ -10942,10 +11033,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(outcome, ConfirmOutcome::Inconclusive(_)));
             assert_eq!(
-                rows(&s)
-                    .into_iter()
-                    .map(|(_, w, _)| w)
-                    .collect::<Vec<_>>(),
+                rows(&s).into_iter().map(|(_, w, _)| w).collect::<Vec<_>>(),
                 ["interrupted", "interrupted", "cut"]
             );
             // And `mark_writes` itself never writes over one.
@@ -10964,7 +11052,13 @@ mod tests {
         /// A short-sealed cartridge on a MemStore: files 0 to K of a plan
         /// whose seal is planned at `m`, the short seal at K+1, File 0
         /// identifying `label`/`uuid` and requiring `requires`.
-        fn short_sealed_cartridge(label: &str, uuid: &str, k: u32, m: u32, file0: &str) -> MemStore {
+        fn short_sealed_cartridge(
+            label: &str,
+            uuid: &str,
+            k: u32,
+            m: u32,
+            file0: &str,
+        ) -> MemStore {
             let mut store = MemStore::new(BS as usize);
             let thunk = contact_id_thunk_bytes(label, uuid, m as i32 + 1);
             let thunk = match file0 {
@@ -10999,11 +11093,15 @@ mod tests {
             let mut store = short_sealed_cartridge(CONTACT_LABEL, CONTACT_UUID, k, m, "short-seal");
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
-                ContactOutcome::AlreadySealed { seal_position: k + 1 }
+                ContactOutcome::AlreadySealed {
+                    seal_position: k + 1
+                }
             );
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, None),
-                ContactOutcome::AlreadySealed { seal_position: k + 1 },
+                ContactOutcome::AlreadySealed {
+                    seal_position: k + 1
+                },
                 "File 0's own pointer finds it"
             );
 
@@ -11014,7 +11112,9 @@ mod tests {
             );
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
-                ContactOutcome::AlreadySealed { seal_position: k + 1 }
+                ContactOutcome::AlreadySealed {
+                    seal_position: k + 1
+                }
             );
 
             // A File 0 that does not require short-seal (a tape before
@@ -11053,7 +11153,9 @@ mod tests {
             let mut store = short_sealed_cartridge("WRONGVOL", foreign, k, m, "short-seal");
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(30)),
-                ContactOutcome::AlreadySealed { seal_position: k + 1 }
+                ContactOutcome::AlreadySealed {
+                    seal_position: k + 1
+                }
             );
             let mut store = short_sealed_cartridge("WRONGVOL", foreign, k, m, "short-seal");
             store.files.truncate(k as usize + 1);
@@ -11081,7 +11183,9 @@ mod tests {
             store.files[k as usize + 1] = seal.into_bytes();
             assert_eq!(
                 check_tape_contact(&mut store, CONTACT_LABEL, CONTACT_UUID, Some(m)),
-                ContactOutcome::AlreadySealed { seal_position: k + 1 }
+                ContactOutcome::AlreadySealed {
+                    seal_position: k + 1
+                }
             );
         }
     }

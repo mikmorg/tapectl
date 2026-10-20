@@ -6815,7 +6815,10 @@ mod tests {
     /// The copy a short seal at K+1 carries before its own entry: the
     /// plan's entries 0 to K.
     fn short_seal_copy(m: i32, k: i32) -> Vec<FrontIndexFile> {
-        planned_seal_copy(m).into_iter().take(k as usize + 1).collect()
+        planned_seal_copy(m)
+            .into_iter()
+            .take(k as usize + 1)
+            .collect()
     }
 
     #[test]
