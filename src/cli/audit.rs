@@ -5974,8 +5974,7 @@ mod tests {
         use crate::volume::restore::short_tape::{self, LABEL};
 
         fn short_seal_warnings(conn: &Connection) -> Vec<AuditFinding> {
-            let (violations, warnings) =
-                collect_findings(conn, &Config::default(), None).unwrap();
+            let (violations, warnings) = collect_findings(conn, &Config::default(), None).unwrap();
             assert!(
                 violations
                     .iter()
@@ -6027,7 +6026,11 @@ mod tests {
             assert_eq!(found.len(), 1, "{found:?}");
             assert_eq!(found[0].check, "cut_without_ending");
             assert_eq!(found[0].unit, format!("volume:{LABEL}"));
-            assert!(found[0].message.contains("2 write(s) recorded `cut`"), "{}", found[0].message);
+            assert!(
+                found[0].message.contains("2 write(s) recorded `cut`"),
+                "{}",
+                found[0].message
+            );
             assert_eq!(found[0].action, format!("tapectl volume verify {LABEL}"));
         }
 

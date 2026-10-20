@@ -2303,7 +2303,7 @@ pub fn unit_requests(names: &[String], dest_root: &str) -> Result<Vec<UnitReques
 }
 
 /// [`restore_units`] for the tape that is loaded, named by no label (issue
-/// #435). `unit_names` empty restores every unit with written slices on the
+/// #435). `unit_names` empty restores every unit held whole (#420) on the
 /// volume File 0 names. Never a dry run, as [`restore_unit_from_loaded`].
 #[allow(clippy::too_many_arguments)]
 pub fn restore_units_from_loaded(
@@ -8007,13 +8007,7 @@ mod tests {
         }
 
         fn expected(t: &ShortTape, unit: &str) -> Vec<(String, Vec<u8>)> {
-            let mut files = t
-                .files
-                .iter()
-                .find(|(u, _)| u == unit)
-                .unwrap()
-                .1
-                .clone();
+            let mut files = t.files.iter().find(|(u, _)| u == unit).unwrap().1.clone();
             files.sort();
             files
         }
@@ -8078,12 +8072,17 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(
-                err.contains(&format!("unit \"bravo\" version 1 is not on volume \"{LABEL}\" whole")),
+                err.contains(&format!(
+                    "unit \"bravo\" version 1 is not on volume \"{LABEL}\" whole"
+                )),
                 "{err}"
             );
             assert!(err.contains(&format!("after tape file {k}")), "{err}");
             assert!(err.contains(&format!("run to tape file {last}")), "{err}");
-            assert!(err.contains("no volume this catalog knows holds it whole yet"), "{err}");
+            assert!(
+                err.contains("no volume this catalog knows holds it whole yet"),
+                "{err}"
+            );
             assert!(err.contains("Nothing was read from tape"), "{err}");
             // --version names it too, and charlie (nothing of it on the
             // tape) is refused the same way.
@@ -8094,7 +8093,10 @@ mod tests {
             let err = select_write_positions(&t.conn, "charlie", LABEL, None)
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("unit \"charlie\" version 1 is not on volume"), "{err}");
+            assert!(
+                err.contains("unit \"charlie\" version 1 is not on volume"),
+                "{err}"
+            );
 
             whole_elsewhere(&t.conn, "bravo", "WHOLE02");
             let err = select_write_positions(&t.conn, "bravo", LABEL, None)
@@ -8148,7 +8150,10 @@ mod tests {
                 vec![("bravo", 1, None), ("charlie", 1, None)]
             );
             let lines = crate::cli::restore::cut_units_lines(&cut, LABEL).join("\n");
-            assert!(lines.contains("not on this tape whole: \"bravo\" v1"), "{lines}");
+            assert!(
+                lines.contains("not on this tape whole: \"bravo\" v1"),
+                "{lines}"
+            );
             assert!(lines.contains("2 unit(s) left out"), "{lines}");
 
             let dest = TempDir::new().unwrap();
@@ -8166,10 +8171,17 @@ mod tests {
             .unwrap();
             assert_eq!(report.failed(), 0);
             assert_eq!(
-                report.units.iter().map(|u| u.unit_name.as_str()).collect::<Vec<_>>(),
+                report
+                    .units
+                    .iter()
+                    .map(|u| u.unit_name.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["alpha"]
             );
-            assert_eq!(files_under(&dest.path().join("alpha")), expected(&t, "alpha"));
+            assert_eq!(
+                files_under(&dest.path().join("alpha")),
+                expected(&t, "alpha")
+            );
             assert!(!dest.path().join("bravo").exists());
 
             // Every unit cut: the volume holds none whole, and says which.
@@ -8203,9 +8215,11 @@ mod tests {
             // bravo's first slice is on the tape at K; its write is cut.
             assert_eq!(t.positions_of("bravo")[0], k);
             let bravo_first = sha_at(k);
-            assert!(crate::volume::slice_holders::holders_of(&t.conn, &bravo_first)
-                .unwrap()
-                .is_empty());
+            assert!(
+                crate::volume::slice_holders::holders_of(&t.conn, &bravo_first)
+                    .unwrap()
+                    .is_empty()
+            );
             // alpha's slices are a source on this tape (the positive control).
             let alpha_first = sha_at(t.positions_of("alpha")[0]);
             let holders = crate::volume::slice_holders::holders_of(&t.conn, &alpha_first).unwrap();
@@ -8220,9 +8234,11 @@ mod tests {
                     params![t.positions_of("alpha")[0] - 1, LABEL],
                 )
                 .unwrap();
-            assert!(crate::volume::slice_holders::holders_of(&t.conn, &alpha_first)
-                .unwrap()
-                .is_empty());
+            assert!(
+                crate::volume::slice_holders::holders_of(&t.conn, &alpha_first)
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 }

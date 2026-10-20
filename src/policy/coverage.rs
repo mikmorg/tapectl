@@ -3310,7 +3310,9 @@ pub(crate) mod tests {
         assert_eq!(copies("charlie"), 0);
         let bravo: i64 = t
             .conn
-            .query_row("SELECT id FROM units WHERE name = 'bravo'", [], |r| r.get(0))
+            .query_row("SELECT id FROM units WHERE name = 'bravo'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(in_service_copy_of_version(&t.conn, bravo, 1).unwrap(), None);
         let sole = sole_slices(&t.conn, t.volume_id).unwrap();

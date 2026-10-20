@@ -72,9 +72,12 @@ pub fn ending_lines(report: &RawRestoreReport) -> Vec<String> {
         k + 1,
         report.not_on_tape.len()
     )];
-    lines.extend(report.not_on_tape.iter().map(|(position, kind)| {
-        format!("  NOT ON TAPE  file {position:>3}  {kind}")
-    }));
+    lines.extend(
+        report
+            .not_on_tape
+            .iter()
+            .map(|(position, kind)| format!("  NOT ON TAPE  file {position:>3}  {kind}")),
+    );
     lines
 }
 
@@ -222,7 +225,14 @@ pub fn restore_raw_selected(
     // found by §1.2 rule 6, says which of its files are on the tape. Only a
     // selection that reaches the slices needs it: every file before the
     // first data slice is on every sealed tape (§4.3 W4).
-    let ending = end_of_tape(store, &thunk_text, &fi_bytes, &pointers, &entries, selection)?;
+    let ending = end_of_tape(
+        store,
+        &thunk_text,
+        &fi_bytes,
+        &pointers,
+        &entries,
+        selection,
+    )?;
     let (entries, not_on_tape) = match ending {
         None => (entries, Vec::new()),
         Some(k) => {
@@ -746,7 +756,11 @@ pub(crate) mod tests {
             let report = restore_raw(&mut t.store, dest.path(), Some(LABEL)).unwrap();
             assert_eq!(report.ended_after, Some(k));
             assert!(report.all_verified(), "{:?}", report.files);
-            assert_eq!(report.files_dumped, k as usize + 2, "files 0..=K and the seal");
+            assert_eq!(
+                report.files_dumped,
+                k as usize + 2,
+                "files 0..=K and the seal"
+            );
             let last = report.files.last().unwrap();
             assert_eq!(
                 (last.position, last.type_label.as_str()),
@@ -761,7 +775,11 @@ pub(crate) mod tests {
             // them, and none was dumped.
             let planned: Vec<i32> = ((k + 1)..=t.planned_seal).map(|p| p as i32).collect();
             assert_eq!(
-                report.not_on_tape.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                report
+                    .not_on_tape
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .collect::<Vec<_>>(),
                 planned
             );
             assert_eq!(

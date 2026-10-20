@@ -97,7 +97,9 @@ pub enum RestoreCommands {
         #[arg(long, value_name = "DIR")]
         to: String,
         /// A unit to restore; repeat for several. Without it, every unit
-        /// with written slices on the volume
+        /// the volume holds whole: on a tape that ended early (a short
+        /// seal), the units the end cut are named, with a volume that holds
+        /// each whole, and left out
         #[arg(long = "unit", value_name = "NAME")]
         units: Vec<String>,
         /// Tape device (by-id path). Defaults to the only configured drive;

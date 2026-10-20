@@ -549,18 +549,29 @@ fn record_adoption(
         tape.sealed_at, tape.front_index_sha256
     );
     // #420: on a tape that sealed short, the details a short write's own
-    // `write_completed` event carries (`write::write_completed_details`:
-    // the ending, `ended_after` and the cut units), with the adoption's
-    // account beside them; on a full seal the account alone, as before.
-    let details = match tape.ended_after {
+    // `write_completed` event carries, from the one function that makes them
+    // (`write::write_completed_details`: the ending, `ended_after` and the
+    // cut units by name), with the adoption's account beside them under
+    // `adopted`; on a full seal the account alone, as before 1.6.0.
+    let as_written =
+        crate::volume::write::write_completed_details(&crate::volume::session::SealedSession {
+            volume_id,
+            label: label.to_string(),
+            ending: match tape.ended_after {
+                Some(ended_after) => crate::volume::session::Ending::Short { ended_after },
+                None => crate::volume::session::Ending::Full,
+            },
+            cut_units,
+        });
+    let details = match as_written
+        .as_deref()
+        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+    {
+        Some(mut short) => {
+            short["adopted"] = serde_json::Value::String(adopted);
+            short.to_string()
+        }
         None => adopted,
-        Some(k) => serde_json::json!({
-            "ending": "short",
-            "ended_after": k,
-            "cut_units": cut_units,
-            "adopted": adopted,
-        })
-        .to_string(),
     };
     events::log_event(
         &tx,
@@ -1477,7 +1488,8 @@ mod tests {
             let mut lost = rebuilt_and_verified();
             let k = lost.t.ended_after;
             assert!(is_lost_write(&lost.conn, lost.t.volume_id).unwrap());
-            let verdict = adopt(&lost.conn, &mut lost.t.store, lost.t.volume_id, LABEL, BS).unwrap();
+            let verdict =
+                adopt(&lost.conn, &mut lost.t.store, lost.t.volume_id, LABEL, BS).unwrap();
             let on_tape = lost
                 .t
                 .positions
@@ -1505,7 +1517,10 @@ mod tests {
                 .unwrap();
             assert_eq!(status, "sealed");
             assert_eq!(ended_after, Some(i64::from(k)));
-            assert_eq!(files, on_tape as i64, "only the slices on the tape are counted");
+            assert_eq!(
+                files, on_tape as i64,
+                "only the slices on the tape are counted"
+            );
             let detail: String = lost
                 .conn
                 .query_row(
@@ -1520,7 +1535,10 @@ mod tests {
             assert_eq!(detail["ended_after"], k);
             assert_eq!(detail["cut_units"], serde_json::json!(["bravo", "charlie"]));
             assert!(
-                detail["adopted"].as_str().unwrap().starts_with("adopted by `volume resume`"),
+                detail["adopted"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("adopted by `volume resume`"),
                 "{detail}"
             );
         }

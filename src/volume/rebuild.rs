@@ -1761,10 +1761,7 @@ fn read_seal(
     let Ok(planned) = u32::try_from(pointers.seal_marker) else {
         return LocatedSeal::unsealed(
             None,
-            format!(
-                "File 0 names seal marker position {}",
-                pointers.seal_marker
-            ),
+            format!("File 0 names seal marker position {}", pointers.seal_marker),
         );
     };
     let located = locate_and_judge_seal(
@@ -2013,7 +2010,8 @@ fn insert_all(
         // contacts"): on a short tape a unit is on it whole only when every
         // slice lies at or before `ended_after`, as a passing short confirm
         // splits the rows; every other unit is cut.
-        let on_tape = |s: &envelope::ManifestSlice| ended_after.is_none_or(|k| s.tape_position <= k);
+        let on_tape =
+            |s: &envelope::ManifestSlice| ended_after.is_none_or(|k| s.tape_position <= k);
         let written = if !sealed {
             Written::Aborted
         } else if unit.slices.iter().all(on_tape) {
@@ -2752,10 +2750,7 @@ fn record_event(
                 if report.cut_units.is_empty() {
                     String::new()
                 } else {
-                    format!(
-                        ": cut (not a copy here) {}",
-                        report.cut_units.join(", ")
-                    )
+                    format!(": cut (not a copy here) {}", report.cut_units.join(", "))
                 },
                 if report.ended_after_recorded {
                     "; ended_after recorded on the existing volume row"
@@ -3891,7 +3886,12 @@ mod tests {
                 Some("lto0"),
                 scratch.path(),
                 "memstore",
-                ContactSite::new(cfg(), Operation::CatalogRebuild, "memstore", Medium::NoBackend),
+                ContactSite::new(
+                    cfg(),
+                    Operation::CatalogRebuild,
+                    "memstore",
+                    Medium::NoBackend,
+                ),
             )
             .unwrap()
         }
@@ -4027,7 +4027,10 @@ mod tests {
             assert!(report.cut_units.is_empty());
             let (writes, positions) = rows_and_positions(&fresh);
             assert!(writes.iter().all(|(_, s)| s == "completed"), "{writes:?}");
-            assert!(positions.iter().all(|(_, _, s)| s == "written"), "{positions:?}");
+            assert!(
+                positions.iter().all(|(_, _, s)| s == "written"),
+                "{positions:?}"
+            );
             assert_eq!(positions.len(), 6);
             assert_eq!(volume_ending(&fresh), ("sealed".to_string(), None, 6));
             assert_eq!(rows_and_positions(&t.conn), (writes, positions));
@@ -4065,7 +4068,10 @@ mod tests {
             let report = rebuild_into(&fresh, &mut t);
             assert!(report.key_is_escrow);
             assert_eq!(report.escrow_attest_unreadable, 0, "{report:?}");
-            assert_eq!(report.attested, 2, "alpha's and bravo's first slices: {report:?}");
+            assert_eq!(
+                report.attested, 2,
+                "alpha's and bravo's first slices: {report:?}"
+            );
             assert_eq!(
                 report.unknown_remaining, 0,
                 "a cut set is not counted as unknown"
@@ -4093,9 +4099,11 @@ mod tests {
 
             // The same tape, its File 0 stating it requires nothing.
             let file0_old = file0.replace("requires = [\"short-seal\"]", "requires = []");
-            assert_ne!(file0_old, file0, "positive control: File 0 requires short-seal");
-            let located =
-                locate_and_judge_seal(&mut t.store, &file0_old, &fi, 3, t.planned_seal);
+            assert_ne!(
+                file0_old, file0,
+                "positive control: File 0 requires short-seal"
+            );
+            let located = locate_and_judge_seal(&mut t.store, &file0_old, &fi, 3, t.planned_seal);
             let format::SealVerdict::Unsealed(why) = &located.verdict else {
                 panic!("an early seal there is no seal: {located:?}");
             };
@@ -4112,7 +4120,11 @@ mod tests {
                     b"stand-in".to_vec()
                 };
                 store
-                    .execute(&mut std::io::Cursor::new(bytes.clone()), bytes.len() as u64, false)
+                    .execute(
+                        &mut std::io::Cursor::new(bytes.clone()),
+                        bytes.len() as u64,
+                        false,
+                    )
                     .unwrap();
             }
             let short_seal = crate::store::read_small_bytes(&mut t.store, k + 1, "seal").unwrap();

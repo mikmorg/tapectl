@@ -3353,7 +3353,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(again.contains("docs v1"), "{again}");
-        assert_eq!(fake.calls().len(), calls, "no drive step: {:?}", fake.calls());
+        assert_eq!(
+            fake.calls().len(),
+            calls,
+            "no drive step: {:?}",
+            fake.calls()
+        );
 
         // `volume write` onto another cartridge, read back in full.
         copy_elsewhere(&s, &s.docs, &[3], true, "WHOLE-C");

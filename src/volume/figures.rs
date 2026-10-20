@@ -345,7 +345,12 @@ mod tests {
             t.volume_id,
             BS as usize,
             Tier::Integrity,
-            ContactSite::new(cfg(), Operation::VolumeVerify, "memstore", Medium::NoBackend),
+            ContactSite::new(
+                cfg(),
+                Operation::VolumeVerify,
+                "memstore",
+                Medium::NoBackend,
+            ),
         )
         .unwrap();
         assert!(r.mismatches.is_empty(), "{:?}", r.mismatches);
@@ -384,7 +389,11 @@ mod tests {
     #[test]
     fn a_full_verify_of_a_short_tape_records_only_the_slices_on_it() {
         let mut t = short_tape::short_tape();
-        assert_eq!(data_files(&t), 0, "the fixture leaves the figures unrecorded");
+        assert_eq!(
+            data_files(&t),
+            0,
+            "the fixture leaves the figures unrecorded"
+        );
         full_verify(&mut t);
         assert!(recorded(&t), "the figures were recorded, not withheld");
         assert_eq!(data_files(&t), on_tape(&t));
@@ -405,7 +414,11 @@ mod tests {
         );
         full_verify(&mut t);
         assert!(recorded(&t));
-        assert_eq!(data_files(&t), 1, "alpha's first slice is the one on the tape");
+        assert_eq!(
+            data_files(&t),
+            1,
+            "alpha's first slice is the one on the tape"
+        );
     }
 
     /// The control: a full tape records every planned slice.

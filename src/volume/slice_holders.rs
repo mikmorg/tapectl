@@ -41,8 +41,7 @@ pub enum Standing {
 /// `ended_after`: §4.2 "Nothing of a cut unit counts on this tape, and no
 /// reader restores it from this tape, even though its slices at or before
 /// `ended_after` are present and hash correctly".
-const ON_TAPE: &str =
-    "(v.ended_after IS NULL OR CAST(wp.position AS INTEGER) <= v.ended_after)";
+const ON_TAPE: &str = "(v.ended_after IS NULL OR CAST(wp.position AS INTEGER) <= v.ended_after)";
 
 /// One volume holding a completed, written copy of a slice.
 #[derive(Debug, Clone, PartialEq, Eq)]

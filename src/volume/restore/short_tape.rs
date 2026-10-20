@@ -419,14 +419,7 @@ fn written_tape(warning: Option<usize>) -> ShortTape {
         files: files_by_unit,
         backup,
         operator,
-        _dirs: vec![
-            home,
-            work,
-            slices_dir,
-            catalog_dir,
-            session_dir,
-            backup_dir,
-        ],
+        _dirs: vec![home, work, slices_dir, catalog_dir, session_dir, backup_dir],
     }
 }
 
@@ -440,7 +433,10 @@ fn the_short_tape_fixture_is_short_and_split() {
     assert!(t.positions_of("bravo")[1] > k);
     assert!(t.positions_of("charlie").iter().all(|p| *p > k));
     assert!(t.positions_of("alpha").iter().all(|p| *p < k));
-    assert!(k + 1 < t.planned_seal, "a short seal, before the planned one");
+    assert!(
+        k + 1 < t.planned_seal,
+        "a short seal, before the planned one"
+    );
     assert_eq!(
         t.rows(&t.conn),
         vec![
@@ -464,7 +460,6 @@ fn the_short_tape_fixture_is_short_and_split() {
         "nothing follows the short seal"
     );
     let seal = crate::store::read_small_bytes(&mut store, k + 1, "seal").unwrap();
-    let parsed =
-        crate::volume::format::parse_seal_marker(&String::from_utf8_lossy(&seal)).unwrap();
+    let parsed = crate::volume::format::parse_seal_marker(&String::from_utf8_lossy(&seal)).unwrap();
     assert_eq!(parsed.ended_after, Some(u64::from(k)));
 }
