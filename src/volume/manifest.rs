@@ -14,8 +14,10 @@
 //! From tapectl 1.6.0 the `[manifest]` table ends with `may_end_early = true`
 //! (`docs/design/volume-format-v2.md` §1.7, ADR-0012 item 111): every 1.6.0
 //! tape may end before the last file its plan lists, and only the seal says
-//! whether it did. The writer always states it; the reader takes it as a bool,
-//! false when absent (every envelope before 1.6.0), and it decides nothing.
+//! whether it did. It is [`Manifest::may_end_early`]: the writer states the
+//! line when it is true (every envelope 1.6.0 writes, set at
+//! `layout::generate_manifest_toml`), the reader takes it as a bool, false
+//! when absent (every envelope before 1.6.0), and it decides nothing.
 //!
 //! `tape_position` is `i64` on both sides now — the reader's original type.
 //! It is the file number on tape and is NOT the slice number: slices begin
@@ -37,6 +39,14 @@ pub struct Manifest {
     /// every unit across all tenants rather than belonging to one.
     pub tenant: String,
     pub created_at: String,
+    /// `[manifest] may_end_early` (`volume-format-v2.md` §1.7): the tape this
+    /// envelope is on may end before the last file its plan lists. True on
+    /// every envelope tapectl 1.6.0 or later writes; false when the key is
+    /// absent (every envelope before 1.6.0), and [`Manifest::to_toml`] then
+    /// writes no line, so a false manifest renders the 1.5.0 bytes. It decides
+    /// nothing: the `tape_position`s are the plan, and the seal's
+    /// `ended_after` says which of them are on the tape (§4.2).
+    pub may_end_early: bool,
     pub units: Vec<ManifestUnit>,
 }
 
@@ -103,20 +113,25 @@ impl Manifest {
     /// land on tape — `tests/on_tape_golden.rs` pins them exactly (modulo
     /// the one `created_at` line). Do not replace this with a serializer.
     ///
-    /// The `[manifest]` table's last key is `may_end_early = true`, on every
-    /// envelope tapectl 1.6.0 or later writes (`volume-format-v2.md` §1.7):
-    /// it is a fact of the writer, so it is not a field of [`Manifest`].
+    /// The `[manifest]` table's last key is `may_end_early = true` when
+    /// [`Manifest::may_end_early`] is set, as it is on every envelope tapectl
+    /// 1.6.0 or later writes (`volume-format-v2.md` §1.7), directly after
+    /// `created_at` and before the blank line that precedes `[[units]]`.
     pub fn to_toml(&self) -> String {
         let label = &self.volume;
         let tenant_name = &self.tenant;
         let now = &self.created_at;
+        let may_end_early = if self.may_end_early {
+            "may_end_early = true\n"
+        } else {
+            ""
+        };
         let mut s = format!(
             r#"[manifest]
 volume = "{label}"
 tenant = "{tenant_name}"
 created_at = "{now}"
-may_end_early = true
-
+{may_end_early}
 "#
         );
 
@@ -156,6 +171,7 @@ may_end_early = true
             volume: doc.manifest.volume,
             tenant: doc.manifest.tenant,
             created_at: doc.manifest.created_at,
+            may_end_early: doc.manifest.may_end_early,
             units: doc.units,
         })
     }
@@ -166,7 +182,7 @@ may_end_early = true
     /// `tape_position`s are the plan, and the seal's `ended_after` says which
     /// of them are on the tape (§4.2).
     pub fn declares_may_end_early(text: &str) -> Result<bool> {
-        Ok(parse_doc(text)?.manifest.may_end_early)
+        Ok(Self::from_toml(text)?.may_end_early)
     }
 }
 
@@ -235,6 +251,7 @@ mod tests {
             volume: "GOLD01".to_string(),
             tenant: "alpha".to_string(),
             created_at: "2026-09-11T00:00:00+00:00".to_string(),
+            may_end_early: true,
             units: two_units(),
         };
         let text = m.to_toml();
@@ -252,6 +269,7 @@ mod tests {
             volume: "LAB01".to_string(),
             tenant: "alice".to_string(),
             created_at: "2026-09-11T00:00:00+00:00".to_string(),
+            may_end_early: true,
             units: two_units(),
         };
         let current = m.to_toml();
@@ -269,6 +287,7 @@ mod tests {
             volume: "VOL001".to_string(),
             tenant: "alpha".to_string(),
             created_at: "2026-09-11T00:00:00+00:00".to_string(),
+            may_end_early: true,
             units: vec![],
         };
         let parsed = Manifest::from_toml(&m.to_toml()).unwrap();
@@ -286,6 +305,7 @@ mod tests {
             volume: "GOLD01".to_string(),
             tenant: "alpha".to_string(),
             created_at: "2026-09-11T00:00:00+00:00".to_string(),
+            may_end_early: true,
             units: two_units(),
         };
         let text = m.to_toml();
@@ -321,19 +341,26 @@ mod tests {
             volume: "LAB01".to_string(),
             tenant: "operator".to_string(),
             created_at: "2026-10-19T00:00:00+00:00".to_string(),
+            may_end_early: true,
             units: two_units(),
         };
         let current = m.to_toml();
         let before = current.replace("may_end_early = true\n", "");
         assert_ne!(before, current, "the line was not there to strip");
+        let unflagged = Manifest {
+            may_end_early: false,
+            ..m.clone()
+        };
         assert_eq!(
             Manifest::from_toml(&before).expect("a 1.5.0 manifest parses"),
-            m
+            unflagged
         );
         assert!(!Manifest::declares_may_end_early(&before).unwrap());
+        // A false flag writes no line: the 1.5.0 bytes exactly.
+        assert_eq!(unflagged.to_toml(), before);
 
         let stated_false = current.replace("may_end_early = true", "may_end_early = false");
-        assert_eq!(Manifest::from_toml(&stated_false).unwrap(), m);
+        assert_eq!(Manifest::from_toml(&stated_false).unwrap(), unflagged);
         assert!(!Manifest::declares_may_end_early(&stated_false).unwrap());
 
         let not_a_bool = current.replace("may_end_early = true", "may_end_early = 1");

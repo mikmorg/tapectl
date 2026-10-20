@@ -143,7 +143,7 @@ magic = "tapectl-volume-v2"
 label = "{label}"
 uuid = "{uuid}"
 layout_version = 2
-requires = []
+requires = ["short-seal"]
 tapectl_version = "{tapectl_version}"
 media_type = "{media_type}"
 nominal_capacity_bytes = {nominal_capacity}
@@ -6139,6 +6139,11 @@ pub struct FrontIndexFile {
 /// plaintext-content hashes, no tenant/unit names — the isolation invariant of
 /// `volume-format-v2.md` §2. The ciphertext hashes are safe in plaintext because
 /// they hash pseudorandom age output and are non-attributable (D4).
+///
+/// File 3 is the PLAN (§3): it is written before any slice, so from 1.6.0 its
+/// `[index]` states `may_end_early = true` on every tape, with the header
+/// paragraph §3 fixes word for word, and the seal's `ended_after` says where
+/// the tape really ended (ADR-0012 item 111). It decides nothing for a reader.
 pub fn generate_front_index(label: &str, files: &[FrontIndexFile]) -> String {
     let mut s = format!(
         r#"================================================================
@@ -6151,6 +6156,11 @@ the sha256 of its on-tape (encrypted) bytes. It contains NO content
 metadata: no filenames, no plaintext checksums, no tenant or unit names.
 The trailing seal marker binds this index by hash; see the system guide.
 
+This tape may end early. The list below is the plan: every file the
+write meant to put on the tape. The seal marker, the LAST file on the
+tape, says where the tape really ended (its ended_after). A file listed
+after that position is not on this tape.
+
 ================================================================
               MACHINE-READABLE DATA (TOML)
 ================================================================
@@ -6158,6 +6168,7 @@ The trailing seal marker binds this index by hash; see the system guide.
 [index]
 volume = "{label}"
 layout_version = 2
+may_end_early = true
 "#
     );
 
@@ -6336,6 +6347,10 @@ pub fn generate_manifest_toml(label: &str, tenant_name: &str, units: &[ManifestU
         volume: label.to_string(),
         tenant: tenant_name.to_string(),
         created_at: now,
+        // Every envelope of every tape 1.6.0 writes (`volume-format-v2.md`
+        // §1.7, ADR-0012 item 111): the tape may end early, and only its seal
+        // says whether it did.
+        may_end_early: true,
         units: units.to_vec(),
     };
     manifest.to_toml()
@@ -7534,9 +7549,10 @@ verify any entry by hashing the file it describes.
         // bytes must still be the pre-field output, so nothing else moved.
         let good = "tr -d '\\0' > GUIDE.md";
         assert_eq!(rendered.matches(good).count(), 2, "{rendered}");
-        // 1.1.0 (ADR-0012 amendment item 15): File 0 states `requires = []`,
-        // one line after layout_version. Undo exactly that line too.
-        let requires = "layout_version = 2\nrequires = []\n";
+        // 1.1.0 (ADR-0012 amendment item 15): File 0 states `requires`, one
+        // line after layout_version; from 1.6.0 it is `["short-seal"]` on
+        // every tape (item 111). Undo exactly that line too.
+        let requires = "layout_version = 2\nrequires = [\"short-seal\"]\n";
         assert_eq!(rendered.matches(requires).count(), 1, "{rendered}");
         let pre_fix = rendered
             .replace(good, "tr -d '\\\\0' > GUIDE.md")
