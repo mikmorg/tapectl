@@ -1548,7 +1548,13 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
     let h = shared_harness();
     let last = h.store.files.len() - 1;
     let seal = String::from_utf8_lossy(&h.store.files[last]).to_string();
-    assert!(seal.contains("\nrequires = []\n"), "a 1.1.0 seal states it");
+    // Every seal 1.6.0 writes states `requires = ["short-seal"]` (ADR-0012
+    // item 111); a 1.1.0 to 1.5.0 seal stated `requires = []`.
+    let stated = "requires = [\"short-seal\"]";
+    assert!(
+        seal.contains(&format!("\n{stated}\n")),
+        "a 1.6.0 seal states it"
+    );
 
     let with = |s: String| {
         let mut store = MemStore::new(BS as usize);
@@ -1561,7 +1567,7 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
             .expect("Store::confirm reports via Evidence, never Err")
     };
 
-    let evidence = with(seal.replacen("requires = []", "requires = [\"unknown-feature\"]", 1));
+    let evidence = with(seal.replacen(stated, "requires = [\"unknown-feature\"]", 1));
     assert!(
         evidence
             .mismatches
@@ -1575,7 +1581,7 @@ fn a_seal_requiring_an_unknown_feature_is_inconclusive_not_medium_bad() {
 
     // Control: an unknown key that is not required changes nothing (the
     // padded seal bytes are not hashed by anything on the tape).
-    let evidence = with(seal.replacen("requires = []", "requires = []\nfuture_key = 7", 1));
+    let evidence = with(seal.replacen(stated, &format!("{stated}\nfuture_key = 7"), 1));
     assert!(evidence.mismatches.is_empty(), "{:?}", evidence.mismatches);
 }
 
