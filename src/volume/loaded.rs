@@ -38,7 +38,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::error::{Result, TapectlError};
 use crate::policy::coverage;
 use crate::store::{
-    read_small_bytes, CapacityReport, ConfirmPlan, EraseMode, Evidence, Store, SMALL_FILE_CAP,
+    read_small_bytes, CapacityReport, ConfirmPlan, EarlyWarning, EraseMode, Evidence, Store,
+    SMALL_FILE_CAP,
 };
 use crate::volume::binding::{self, File0Facts};
 use crate::volume::layout_model::Layout;
@@ -371,6 +372,14 @@ impl Store for Peeked<'_> {
 
     fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
         self.inner.eod_at_or_before(position)
+    }
+
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.inner.early_warning()
+    }
+
+    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+        self.inner.files_on_medium()
     }
 
     fn erase(&mut self, mode: EraseMode) -> Result<()> {
