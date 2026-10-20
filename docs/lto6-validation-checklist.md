@@ -142,8 +142,8 @@ Since 2026-10-17 the fill does not stop at the first refusal. One python process
 turns hardware compression off as tapectl does, and at the first ENOSPC records what st does
 next: it writes one 1 GiB slice (2048 blocks) a block at a time, logging every return, stops
 after 8 consecutive refusals or any other error, then writes a filemark, a seal-sized block and
-a filemark, and reads the slice and the seal back by LOCATE, comparing them with what was
-written. It then keeps writing to the hard end (capped at 110 GB past the warning, about 12
+a filemark, and reads the slice and the seal back, comparing them with what was written: by
+LOCATE, or by spacing from BOT when READ POSITION or LOCATE fails (#487, `docs/lto-profiling.md`). It then keeps writing to the hard end (capped at 110 GB past the warning, about 12
 minutes), measuring the room from early warning to the hard end, which bounds the slice size
 (ADR-0012 item 100); `--no-hard-end` skips that walk and `--stop-at-warning` keeps the old
 stop. The script names the cartridge by its medium serial (checked against MAM before anything is

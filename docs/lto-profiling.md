@@ -89,10 +89,56 @@ mhvtl, expect 1: its readback fails past capacity (below).
 | C. LBP | the logical block protection method the drive reports | `sg_modes --page=0x0a,0xf0` (MODE SENSE only; MODE SELECT is not attempted, because enabling LBP changes the block format of every later command) | seconds |
 | D. MAM capacity | the unit of MAM's remaining-capacity attribute (MiB or MB) and its over-report, from the decrease of remaining capacity against the bytes written and the growth of page 0x17's used native capacity | `sg_read_attr` and `sg_logs` 0x17 before and after one payload write | one payload write |
 | E. end of data | a forward read past end of data must error, not return stale data (the chain walk's assumption) | `mt fsf 3`, then a `dd` read past the third filemark | seconds |
-| F. the fill | the bytes accepted before the first write refusal (early warning); what write(2) returns after it; whether a 1 GiB slice, a filemark, a seal-sized block and a filemark are accepted; the room from the warning to the hard end; a readback by LOCATE | one process holding the device open from BOT (`scripts/lto6-fill-writer.py`), page 0x0c, MAM | hours to the warning; minutes after |
+| F. the fill | the bytes accepted before the first write refusal (early warning); what write(2) returns after it; whether a 1 GiB slice, a filemark, a seal-sized block and a filemark are accepted; the room from the warning to the hard end; a readback by LOCATE, or by spacing from BOT (below) | one process holding the device open from BOT (`scripts/lto6-fill-writer.py`), page 0x0c, MAM | hours to the warning; minutes after |
 
 Every log page is read with `--maxlen`, one LOG SENSE per page, and never page 0x2E (TapeAlert
 may be read-to-clear; only tapectl's own sweep reads it).
+
+## The fill's readback: two routes
+
+After the fill, `scripts/lto6-fill-writer.py verify` reads back what was written past the early
+warning: the slice, the filemark, the seal block and the filemark. It never reads the whole tape.
+It has two routes (`--route`, default `auto`):
+
+- **locate.** LOCATE (`MTSEEK`) to the block addresses that READ POSITION (`MTIOCPOS`) recorded
+  while the writer held the drive. Then one filemark spacing from the last slice block
+  (`fsf1-from-last-slice-block`), and the first and last block of the walk to the hard end.
+- **spacing.** Rewind. SPACE forward over the fill (`MTFSR`) to 4 blocks before the first refusal,
+  and read on from there: those 4 fill blocks (`fill-tail-blocks`), the slice, the filemark, the
+  seal block, the filemark, and the walk's first block; then SPACE on through the walk and read its
+  last block. It needs neither READ POSITION nor LOCATE.
+  SPACE(6) takes a 24-bit count and st passes it on unchecked, so the route spaces in commands of at
+  most 8,000,000 blocks (`--space-chunk`). An LTO-8 fill is more than 8.4 million blocks.
+
+`auto` takes **locate** when the writer recorded a block address, and **spacing** when it recorded
+none (`setup.lba0` is null) or the LOCATE to the slice fails. A slice that LOCATE reached but that
+reads wrong is a finding, not a reason to change route. `readback.json` records the route and why
+(`route`, `route_reason`), and the summary prints it.
+
+Spacing skips one check, `fsf1-from-last-slice-block`, because it needs LOCATE. Spacing has read the
+filemark and the seal block in order after the last slice block, which proves what the filemark
+spacing proves. The checks that compare READ POSITION figures recorded during the write
+(`physical-block-count` and the like) run on either route when the figures exist; they read no tape.
+
+Why there are two (#487): on home2's HP LTO-6 on 2026-10-20, READ POSITION failed through st on every
+call, even at BOT, and LOCATE to the slice failed with EIO. The readback had only the LOCATE route and
+ended FAIL, so the post-warning slice was never read back
+(`docs/runs/2026-10-20-lto6-profile-and-lbp.md`). A failed READ POSITION is now recorded with its
+errno: `setup.lba0_errno`, and `read_position` in `result.json` counts every call and every failure
+by errno. The summary names it once ("READ POSITION (MTIOCPOS) unavailable: EIO on ...").
+
+The readback can be run again on its own, as long as nothing has overwritten the tape since the fill.
+Stop the drive poll first, as for the run itself. Use the fill's run directory and the keystream
+file in the out directory:
+
+```bash
+scripts/lto6-fill-writer.py verify --device /dev/tape/by-id/scsi-HUJ808A5L4-nst \
+    --src ~/.cache/tapectl/lto6/lto-profile-src.bin \
+    --run ~/.cache/tapectl/lto6/profile-<timestamp>-<serial>/fill --route spacing
+scripts/lto6-fill-writer.py summary --run ~/.cache/tapectl/lto6/profile-<timestamp>-<serial>/fill --reference-bytes 0
+```
+
+It writes a new `readback.json` over the old one.
 
 ## The run directory
 
@@ -106,7 +152,7 @@ may be read-to-clear; only tapectl's own sweep reads it).
 | `meta.json`, `facts.tsv`, `blocksize.tsv` | What the script recorded about the run (options, host, timings, the throughput table) for the report builder. |
 | `inq.txt`, `mt-status.txt`, `block-limits.txt`, `logs-00.txt`, `modes-0f.txt`, `modes-0a-f0.txt`, `eod-read.txt`, `setblk-*.txt`, `dd-*.txt` | Raw command output. A summary without the raw capture cannot be re-examined once the tape is unloaded. |
 | `mam-preflight.txt`, `snap-<tag>.mam.txt`, `snap-<tag>.page_0xNN.txt`, `.bin` | MAM and log-page snapshots. `snap-asfound` is read before this run writes anything; `snap-final` after the last operation. |
-| `fill/` | The fill's own files: `result.json`, `readback.json`, `writer.log` (every attempt of the post-warning slice), `summary.txt`, snapshots `before`, `at-warning`, `after`, `after-rewind`, `dmesg-tail.txt`. |
+| `fill/` | The fill's own files: `result.json` (with `read_position`, every READ POSITION failure by errno), `readback.json` (the checks, the route and why), `writer.log` (every attempt of the post-warning slice), `summary.txt`, snapshots `before`, `at-warning`, `after`, `after-rewind`, `dmesg-tail.txt`. |
 
 `scripts/lto-profile.sh --report RUN_DIR` rebuilds `profile.json` and `PROFILE.txt` from the
 raw captures. The whole directory is the record: send it back whole.
@@ -124,8 +170,8 @@ raw captures. The whole directory is the record: send it back whole.
 | `emulated` | `is_emulated` and the evidence (an mhvtl drive serial, the `linuxVTL` maker). Positively checked, never assumed. |
 | `problems` | Why the pair could not be profiled (a drive that cannot write the medium, an unknown generation). `--emit` refuses a run with problems. |
 | `figures` | One entry per measurement: `value`, `unit`, `source` (the log page, MAM attribute, errno or timing it came from), and extra fields. `block_size`, `block_limits`, `hardware_compression_as_found`, `lbp`, `mam_capacity_unit`, `mam_over_report`, `mam_remaining_capacity`, `eod_semantics`, `early_warning`, `post_warning_room_measured`, `post_warning_room_reported`, `drive_inventory`, `supported_log_pages`. A measurement that did not run is absent and named in `not_measured`. |
-| `early_warning` | `observed`, `bytes_before_first_refusal`, `first_refusal_errno`, `fraction_of_nominal`, the host feed in MB/s, `native_used_per_data_byte`, MAM's remaining capacity at the warning. |
-| `post_warning` | What write(2) returned after the first refusal; whether the slice, the filemark, the seal block and the next filemark were accepted; the readback verdict; the walk to the hard end (`bytes_past_first_refusal`, `reached_hard_end`, `stop`); the drive's own page 0x0c figure (`reported_ew_to_eop`); `room_bytes` and `room_basis`. |
+| `early_warning` | `observed`, `bytes_before_first_refusal`, `first_refusal_errno`, `fraction_of_nominal`, the host feed in MB/s, `native_used_per_data_byte`, MAM's remaining capacity at the warning. `native_used_per_data_byte` is set only when page 0x17's "Total used native capacity" is within a factor of 2 of the bytes written; otherwise it is null and `native_used_note` gives both figures. On home2's HP LTO-6 the counter read 0 before and 103,077 MB after a 2.6 TB fill, so it does not track writes there. The capacity-unit measurement (D) uses the same rule. |
+| `post_warning` | What write(2) returned after the first refusal; whether the slice, the filemark, the seal block and the next filemark were accepted; the readback verdict and its route (`readback_route`); the walk to the hard end (`bytes_past_first_refusal`, `reached_hard_end`, `stop`); the drive's own page 0x0c figure (`reported_ew_to_eop`); `room_bytes` and `room_basis`. |
 | `wear` | Item 98's record: `snapshots` (as found and final) of the MAM attributes (load count, initialization count, lifetime and last-load MiB written and read, TapeAlert flags, manufacture date, the drive ring) and of log pages 0x02, 0x03, 0x0c and 0x17 as label-to-number maps, plus `drive_rewrite_counters` (pages 0x02 and 0x03 "total rewrites or rereads", 0x17's write retries and unrecovered write errors), and `end_of_tape`, the early-warning record. Recorded, not fitted: collect these across runs. |
 | `not_measured` | One line for each measurement that did not run or could not be decoded. |
 
@@ -245,8 +291,15 @@ a device it recognises (`emulated`): it is not a drive.
 - MAM's capacity attributes and log pages 0x0c and 0x17 are static (the used native capacity does
   not grow, so the capacity unit cannot be derived); wear counters do not move.
 - It does emulate an ENOSPC at the size the cartridge was made with, then accepts every second
-  write; it keeps no data past it, so the fill's readback FAILS (exit 1). The post-warning
-  figures are the emulator's.
+  write; it keeps no data past it, so the fill's readback FAILS (exit 1), on either route. The
+  post-warning figures are the emulator's. On a 600 MB `mktape` cartridge on 2026-10-20 it kept
+  the first 4 slice blocks past its early warning (its page 0x0c EW-to-EOP figure is 2 MB), then a
+  filemark; the seal block and the walk were dropped.
+- READ POSITION and LOCATE work on mhvtl, so `auto` reads by LOCATE there. `--route spacing`
+  rehearses the other route: its `fill-tail-blocks` check passes, which proves it spaced to the
+  right block, and the slice fails where mhvtl dropped the data. On 2026-10-20 both routes gave the
+  same slice result on the same run, and the LOCATE route's checks were identical to those of the
+  writer before #487.
 - 1 MiB blocks are refused by the host's st driver with EBUSY although the emulated drive
   advertises 2 MiB; throughput is disk speed.
 - A throwaway cartridge made with `mktape` is small. Pass `--fill-cap-bytes` (and `--chunk-gib 1
@@ -271,7 +324,10 @@ sudo systemctl start tapectl-drive-poll.timer
 ```
 
 About five hours. Read `PROFILE.txt`; exit 1 with "MEASUREMENT COMPLETE (readback: FAIL)" in
-the fill's summary is a finding, not a failure. Send back the **whole** run directory. Erase the
+the fill's summary is a finding, not a failure. The summary's readback section names the route;
+on this drive READ POSITION and LOCATE failed through st on 2026-10-20, so expect `spacing`. Before
+anything else writes the cartridge, read the readback's result; if it did not run or the route
+failed, run it again on its own (above). Send back the **whole** run directory. Erase the
 cartridge afterwards before it serves as the step-12 test cartridge again.
 
 ## The old entry points

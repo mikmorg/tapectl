@@ -12,18 +12,26 @@ drive from the first block to the seal. So `write` does the whole fill from BOT
 first refusal, the post-warning slice, the filemark / seal block / filemark
 and, on request, the walk to the hard end, without ever closing the device in
 between. Its status calls are MTIOCGET (no SCSI command) and, at three points
-where a flush happens anyway, MTIOCPOS (READ POSITION).
+where a flush happens anyway, MTIOCPOS (READ POSITION). A failed MTIOCPOS is
+recorded with its errno (result.json: setup.lba0_errno, read_position).
 
 Subcommands (scripts/lto-profile.sh drives them; see its header):
 
   write    open DEV, fill from BOT to the first refusal, then the past-warning
            phase. Writes RUN/result.json, RUN/writer.log (every attempt of the
            slice) and, at the warning, RUN/at-warning.* (MAM + log pages).
-  verify   read back by LOCATE (logical block address recorded while the writer
-           still held the drive), never the whole tape: the post-warning slice
-           in full, the filemark after it, the seal block, the filemark after
-           it, and the first/last block of a hard-end run. Writes
-           RUN/readback.json.
+  verify   read back, never the whole tape: the post-warning slice in full, the
+           filemark after it, the seal block, the filemark after it, and blocks
+           of a hard-end run. Two routes (--route, default auto):
+             locate   LOCATE to the block addresses READ POSITION recorded
+                      while the writer still held the drive;
+             spacing  rewind, SPACE forward over the fill (MTFSR) to a few
+                      blocks before the first refusal, and read on from there:
+                      no READ POSITION, no LOCATE (#487: on home2's HP LTO-6
+                      both failed through st).
+           auto takes locate, and spacing when the writer recorded no position
+           or the LOCATE to the slice fails. Writes RUN/readback.json, with the
+           route it took.
   summary  the plain-lines summary the CTO sends back (RUN/summary.txt).
   selftest the state machine and the readback against an in-memory fake tape
            (no hardware): `scripts/lto6-fill-writer.py selftest`.
@@ -61,7 +69,13 @@ def _ioc(direction, nr, size):
 MTIOCTOP = _ioc(1, 1, struct.calcsize(MTOP_FMT))
 MTIOCGET = _ioc(2, 2, struct.calcsize(MTGET_FMT))
 MTIOCPOS = _ioc(2, 3, struct.calcsize(MTPOS_FMT))
-MTFSF, MTWEOF, MTSETBLK, MTSEEK, MTCOMPRESSION, MTWEOFI = 1, 5, 20, 22, 32, 35
+MTFSF, MTFSR, MTWEOF, MTREW, MTSETBLK, MTSEEK, MTCOMPRESSION, MTWEOFI = 1, 3, 5, 6, 20, 22, 32, 35
+# SPACE(6)'s count is a 24-bit signed field (8,388,607 at most) and st passes MTFSR's count into it unchecked:
+# the spacing route spaces in chunks no larger than this. An LTO-8 fill is more than 8.4 million 512 KiB blocks.
+SPACE_CHUNK = 8000000
+SPACE_MAX = 8388607
+FILL_TAIL_BLOCKS = 4    # the spacing route reads this many fill blocks before the slice, to prove where it landed
+ROUTES = ("auto", "locate", "spacing")
 
 GMT_FLAGS = [
     (0x80000000, "EOF"), (0x40000000, "BOT"), (0x20000000, "EOT"),
@@ -100,6 +114,7 @@ class RealDev(object):
     def __init__(self, path, flags):
         self.path = path
         self.fd = os.open(path, flags)
+        self.pos_errno = None    # the errno of the last failed MTIOCPOS, None after one that answered
 
     def write(self, buf):
         return os.write(self.fd, buf)
@@ -123,10 +138,13 @@ class RealDev(object):
         return dict(zip(("type", "resid", "dsreg", "gstat", "erreg", "fileno", "blkno"), f))
 
     def mtpos(self):
+        """READ POSITION through st: the block address, or None with the errno kept in self.pos_errno."""
         try:
             raw = fcntl.ioctl(self.fd, MTIOCPOS, bytes(struct.calcsize(MTPOS_FMT)))
-        except OSError:
+        except OSError as e:
+            self.pos_errno = e.errno
             return None
+        self.pos_errno = None
         return struct.unpack(MTPOS_FMT, raw)[0]
 
     def close(self):
@@ -276,6 +294,19 @@ class Writer(object):
             self.buf_g = g
         return self.buf
 
+    def mtpos(self):
+        """READ POSITION. A failure is counted by errno in result.json's read_position, so a null position says why
+        (#487: on home2's HP LTO-6 every call failed, and the record did not say with what)."""
+        pos = self.dev.mtpos()
+        rp = self.res.setdefault("read_position", {"calls": 0, "failed": 0, "errnos": {}})
+        rp["calls"] += 1
+        if pos is None:
+            rp["failed"] += 1
+            e = getattr(self.dev, "pos_errno", None)
+            name = "unknown" if e is None else errname(e)
+            rp["errnos"][name] = rp["errnos"].get(name, 0) + 1
+        return pos
+
     # ----- step 0: block size, position
     def setup(self):
         ok, err = self.dev.top(MTSETBLK, self.bs)
@@ -287,12 +318,15 @@ class Writer(object):
         # tapectl's TapeStore::open turns the drive's hardware compression off before any write
         # (encrypted data is incompressible); so does this run, best effort, as it does.
         comp_ok, comp_err = self.dev.top(MTCOMPRESSION, 0) if tape else (None, None)
-        lba0 = self.dev.mtpos()
+        lba0 = self.mtpos()
+        lba0_errno = None if lba0 is not None else getattr(self.dev, "pos_errno", None)
         self.res["setup"] = {"tape": tape, "setblk_ok": ok, "setblk_errno": err, "mtget": st, "lba0": lba0,
+                             "lba0_errno": lba0_errno,
                              "compression_off_ok": comp_ok, "compression_off_errno": comp_err}
         self.log.say("device open; %s; compression off: %s; position (READ POSITION) = %s"
                      % (fmt_mtget(st) if tape else "not a tape device (test mode)",
-                        "n/a" if comp_ok is None else "ok" if comp_ok else errname(comp_err), lba0))
+                        "n/a" if comp_ok is None else "ok" if comp_ok else errname(comp_err),
+                        lba0 if lba0 is not None else "unavailable (%s)" % ("unknown" if lba0_errno is None else errname(lba0_errno))))
 
     # ----- step 1: the fill, one open, to the first refusal
     def fill(self):
@@ -435,14 +469,14 @@ class Writer(object):
     def filemark(self, label, op, opname):
         """tapectl ends a data file with an immediate filemark (MTWEOFI) and the seal marker's with a synchronous one (MTWEOF).
         A refused attempt is retried only while READ POSITION shows it left no mark behind."""
-        lb = prev = self.dev.mtpos()
+        lb = prev = self.mtpos()
         outs, positions = [], []
         ok = False
         for _ in range(self.o.refusal_run_limit):
             t = time.time()
             ok, err = self.dev.top(op, 1)
             outs.append("ok" if ok else errname(err))
-            pos = self.dev.mtpos()
+            pos = self.mtpos()
             positions.append(pos)
             self.log.file("%s: %s -> %s position %s ts=%s" % (label, opname, outs[-1], pos, stamp(t)))
             if ok or err != errno.ENOSPC:
@@ -453,7 +487,7 @@ class Writer(object):
                 break
             prev = pos if pos is not None else prev
         rec = {"ok": ok, "op": opname, "attempts": outs, "positions": positions, "lba_before": lb,
-               "lba_after": self.dev.mtpos(), "mtget": self.dev.mtget()}
+               "lba_after": self.mtpos(), "mtget": self.dev.mtget()}
         self.res[label] = rec
         self.log.say("%s (%s): %s (attempts: %s); position %s -> %s; %s"
                      % (label, opname, "accepted" if ok else "NOT accepted", ", ".join(outs), lb, rec["lba_after"],
@@ -473,11 +507,11 @@ class Writer(object):
         buf = self.seal_buf(slice_rec)
         outs, positions = [], []
         ok = False
-        lb = prev = self.dev.mtpos()
+        lb = prev = self.mtpos()
         for _ in range(self.o.refusal_run_limit):
             outcome, n, err, t, took = self.write_buf(buf)
             outs.append(outcome)
-            pos = self.dev.mtpos()
+            pos = self.mtpos()
             positions.append(pos)
             self.log.file("seal block: %s position %s ts=%s" % (outcome, pos, stamp(t)))
             if outcome == "ok":
@@ -542,7 +576,7 @@ class Writer(object):
         res["first_refusal"]["snapshot_seconds"] = secs
         self.stage("slice")
         sl = self.write_blocks("slice", n_fill, o.slice_blocks, consec0=1, refusals0=1, first_outcomes=[outcome])
-        sl["lba_after"] = self.dev.mtpos()
+        sl["lba_after"] = self.mtpos()
         sl["mtget"] = self.dev.mtget()
         res["slice"] = sl
         self.log.say("slice: %d of %d blocks accepted in %.1f s; %d refusals (longest run %d); stop: %s; outcomes: %s"
@@ -555,7 +589,7 @@ class Writer(object):
         self.filemark("filemark1", MTWEOFI, "MTWEOFI")
         self.seal(sl)
         self.filemark("filemark2", MTWEOF, "MTWEOF")
-        res["after_seal"] = {"mtget": self.dev.mtget(), "lba": self.dev.mtpos()}
+        res["after_seal"] = {"mtget": self.dev.mtget(), "lba": self.mtpos()}
         self.log.say("after the seal: %s; position %s" % (fmt_mtget(res["after_seal"]["mtget"]), res["after_seal"]["lba"]))
         self.save()
         if o.to_hard_end:
@@ -569,12 +603,12 @@ class Writer(object):
         self.stage("hard-end")
         past = sl["accepted"] * self.bs
         cap_blocks = max(0, (self.o.hard_end_cap - past) // self.bs)
-        lba0 = self.dev.mtpos()
+        lba0 = self.mtpos()
         self.log.say("hard end: writing on until a non-recoverable error or %d GB past the warning (%d more blocks)"
                      % (self.o.hard_end_cap // 10 ** 9, cap_blocks))
         he = self.write_blocks("hard", n_fill + sl["accepted"], cap_blocks, detail=False)
         he["lba_start"] = lba0
-        he["lba_after"] = self.dev.mtpos()
+        he["lba_after"] = self.mtpos()
         he["mtget"] = self.dev.mtget()
         if he["stop"] == "complete":
             he["stop"] = "cap reached (no non-recoverable error before it)"
@@ -635,14 +669,47 @@ class Writer(object):
 
 
 # ----------------------------------------------------------------- readback --
-class Reader(object):
-    """Read back by LOCATE (block address) and one filemark spacing; never the whole tape."""
+def position_failure(res):
+    """Why the positions in result.json are null: 'EIO on 14 of 14 calls, from the first, at BOT', or None."""
+    rp = res.get("read_position") or {}
+    if not rp.get("failed"):
+        return None
+    errs = rp.get("errnos") or {"unknown": rp["failed"]}
+    what = " and ".join("%s x%d" % kv for kv in sorted(errs.items())) if len(errs) > 1 else list(errs)[0]
+    lba0_errno = (res.get("setup") or {}).get("lba0_errno")
+    at_bot = ""
+    if lba0_errno is not None:
+        at_bot = ", from the first, at BOT" if errname(lba0_errno) == what else ", the first at BOT with %s" % errname(lba0_errno)
+    return "%s on %d of %d calls%s" % (what, rp["failed"], rp.get("calls", 0), at_bot)
 
-    def __init__(self, dev, ks, bs, log):
+
+class Reader(object):
+    """Read back the post-warning slice, the filemark after it, the seal block and the filemark after that; never
+    the whole tape. Two routes:
+      locate   LOCATE (MTSEEK) to the block addresses READ POSITION recorded while the writer held the drive, and
+               one filemark spacing (fsf1-from-last-slice-block);
+      spacing  rewind, SPACE forward over the fill (MTFSR, in chunks SPACE(6)'s 24-bit count can take) to a few
+               blocks before the first refusal, read those (fill-tail-blocks), and read on from there through the
+               slice, the filemark, the seal block and the filemark: no READ POSITION, no LOCATE.
+    auto takes locate, and spacing when the writer recorded no position (setup.lba0 null) or the LOCATE to the slice
+    fails. A slice that LOCATE reached but that reads wrong is a finding, never a reason to change route."""
+
+    def __init__(self, dev, ks, bs, log, route="auto", space_chunk=SPACE_CHUNK, tail=FILL_TAIL_BLOCKS):
         self.dev, self.ks, self.bs, self.log = dev, ks, bs, log
         self.checks = []
         self.buf = bytearray(bs)
         self.exp = bytearray(bs)
+        if route not in ROUTES or not 0 < space_chunk <= SPACE_MAX:
+            raise ValueError("route %r, space chunk %r" % (route, space_chunk))
+        self.route_asked, self.space_chunk, self.tail = route, space_chunk, tail
+        self.route, self.route_reason = None, None
+        self.found_fm_first = False
+        self.after_slice_as_written = False
+        self.unavailable = "READ POSITION unavailable"
+
+    def set_route(self, route, why):
+        self.route, self.route_reason = route, why
+        self.log.say("readback route: %s (%s)" % (route, why))
 
     def check(self, name, ok, detail):
         status = "PASS" if ok else ("SKIP" if ok is None else "FAIL")
@@ -682,22 +749,125 @@ class Reader(object):
             self.check("post-warning-slice", None, "no past-warning slice was written (stage %s)" % res.get("stage"))
             return
         n, k = fill["blocks"], sl["accepted"]
-        lba0 = (res.get("setup") or {}).get("lba0") or 0
-        start = lba0 + n
+        lba0 = (res.get("setup") or {}).get("lba0")
+        start = (lba0 or 0) + n
         fm1, seal, fm2 = res.get("filemark1") or {}, res.get("seal") or {}, res.get("filemark2") or {}
+        failure = position_failure(res)
+        self.unavailable = "READ POSITION unavailable" + (": %s" % failure if failure else "")
         self.position_checks(start, k, sl, fm1, seal, fm2)
+        if self.route_asked != "auto":
+            self.set_route(self.route_asked, "--route %s" % self.route_asked)
+        elif lba0 is None:
+            self.set_route("spacing", "auto: the writer recorded no block address (setup.lba0 is null; %s)" % self.unavailable)
+        else:
+            self.set_route("locate", "auto: the writer recorded block addresses")
+        if self.route == "locate":
+            if k == 0:
+                self.check("slice-blocks", None, "no slice block was accepted")
+            else:
+                ok, err = self.seek(start)
+                if not ok and self.route_asked == "auto":
+                    self.set_route("spacing", "auto: LOCATE to block address %d failed: %s" % (start, errname(err)))
+                elif not ok:
+                    self.check("slice-first-block", False, "LOCATE to block address %d failed: %s" % (start, errname(err)))
+                    self.fsf_check(n, k, start, seal)
+                else:
+                    self.slice_checks(n, k, "block address %d" % start, fm1, seal, fm2, res, locate_start=start)
+                    self.fsf_check(n, k, start, seal)
+            if self.route == "locate":
+                self.hard_end_checks(n + k, res.get("hard_end"))
+        if self.route == "spacing":
+            self.spacing_checks(n, k, fm1, seal, fm2, res)
+
+    def spacing_checks(self, n, k, fm1, seal, fm2, res):
+        """The spacing route: rewind, SPACE forward over the fill to T blocks before the first refusal, read those T
+        blocks, then the slice and what follows it. Every position is a count from BOT; nothing asks the drive where
+        it is and nothing LOCATEs."""
+        t = min(self.tail, n)
+        ok, err = self.dev.top(MTREW, 1)
+        if not ok:
+            self.check("fill-tail-blocks", False, "rewind failed: %s" % errname(err))
+            return
+        t0 = time.time()
+        spaced, cmds, err = self.space_forward(n - t)
+        if err is not None:
+            self.check("fill-tail-blocks", False, "SPACE forward from file 0 block %d failed: %s; %s"
+                       % (spaced, errname(err), fmt_mtget(self.dev.mtget())))
+            return
+        secs = time.time() - t0
+        bad, stop = [], None
+        for i in range(t):
+            kind, err = self.read()
+            if kind != "data":
+                stop = (i, self.word(kind, err))
+                break
+            if not self.matches(n - t + i):
+                bad.append(i)
+        how = "rewind, then %d blocks spaced in %d SPACE command(s) of at most %d (%.1f s)" % (n - t, cmds, self.space_chunk, secs)
+        if t == 0:
+            self.check("fill-tail-blocks", None, "the fill wrote no block before the first refusal")
+        elif stop:
+            self.check("fill-tail-blocks", False, "%s; file 0 block %d: %s, not a fill block" % (how, n - t + stop[0], stop[1]))
+            return
+        else:
+            self.check("fill-tail-blocks", not bad,
+                       "%s; the next %d blocks, file 0 blocks %d..%d (the last before the first refusal), %s"
+                       % (how, t, n - t, n - 1, "match keystream blocks %d..%d" % ((n - t) % self.ks.nblk, (n - 1) % self.ks.nblk)
+                          if not bad else "DIFFER from the keystream at %s" % ", ".join("file 0 block %d" % (n - t + i) for i in bad)))
         if k == 0:
             self.check("slice-blocks", None, "no slice block was accepted")
         else:
-            self.slice_checks(n, k, start, fm1, seal, fm2, res)
-            self.fsf_check(n, k, start, seal)
-        self.hard_end_checks(n + k, res.get("hard_end"))
+            self.slice_checks(n, k, "file 0 block %d (spaced from BOT)" % n, fm1, seal, fm2, res)
+        self.check("fsf1-from-last-slice-block", None,
+                   "needs LOCATE; on the spacing route the filemark and the seal block were read in sequence after the "
+                   "last slice block (objects-after-slice)")
+        he = res.get("hard_end")
+        if not he or not he.get("accepted"):
+            return
+        g0, last = n + k, he["accepted"] - 1
+        if self.after_slice_as_written and fm2.get("ok"):
+            kind, err = self.read()
+            good = kind == "data" and self.matches(g0)
+            self.check("hard-end-first-block", good, "file 2 block 0, read on after the second filemark: %s"
+                       % self.compared(kind, err, good, g0))
+            if kind != "data":
+                self.check("hard-end-last-block", None, "file 2 block 0 did not read, so file 2 is not spaced through")
+            elif last > 0:
+                # the walk's blocks are keystream g0.. in order, so an extra or a missing block shows here too
+                spaced, cmds, err = self.space_forward(last - 1)
+                kind, err2 = self.read() if err is None else ("err", err)
+                good = kind == "data" and self.matches(g0 + last)
+                self.check("hard-end-last-block", good, "file 2 block %d, %d blocks spaced on from block 1 in %d SPACE "
+                           "command(s): %s" % (last, spaced, cmds, self.compared(kind, err2, good, g0 + last)))
+        else:
+            self.check("hard-end-blocks", None, "the objects after the slice did not read as written, so where file 2 "
+                       "starts is not known without READ POSITION")
+        if None not in (he.get("lba_start"), he.get("lba_after")):
+            self.hard_end_count_check(he)
+
+    def space_forward(self, count):
+        """MTFSR count blocks, in SPACE commands of at most self.space_chunk (SPACE(6)'s count is 24-bit signed and st
+        passes it on unchecked). Returns (blocks spaced, commands, None) or, on a failure, the errno in place of None."""
+        spaced, cmds = 0, 0
+        while spaced < count:
+            step = min(count - spaced, self.space_chunk)
+            ok, err = self.dev.top(MTFSR, step)
+            cmds += 1
+            if not ok:
+                return spaced, cmds, err
+            spaced += step
+        return spaced, cmds, None
+
+    def compared(self, kind, err, good, g):
+        if good:
+            return "matches keystream block %d" % (g % self.ks.nblk)
+        return "differs from keystream block %d" % (g % self.ks.nblk) if kind == "data" else self.word(kind, err)
 
     def position_checks(self, start, k, sl, fm1, seal, fm2):
         """The drive's own count (READ POSITION, taken while the writer held it) against what write(2) reported."""
         got = sl.get("lba_after")
         if got is None:
-            self.check("physical-block-count", None, "READ POSITION unavailable")
+            self.check("physical-block-count", None, self.unavailable)
         else:
             self.check("physical-block-count", got - start == k,
                        "READ POSITION after the slice = %d; expected fill start %d + %d slice blocks accepted = %d"
@@ -716,11 +886,11 @@ class Reader(object):
                        % ("ok" if seal.get("ok") else ",".join(seal.get("attempts", [])), m_seal, fm2.get("op", "MTWEOF"),
                           "ok" if fm2.get("ok") else ",".join(fm2.get("attempts", [])), m_fm2))
 
-    def slice_checks(self, n, k, start, fm1, seal, fm2, res):
-        ok, err = self.seek(start)
-        if not ok:
-            self.check("slice-first-block", False, "LOCATE to block address %d failed: %s" % (start, errname(err)))
-            return
+    def slice_checks(self, n, k, where, fm1, seal, fm2, res, locate_start=None):
+        """Read the k slice blocks from where the tape stands, then what follows them, against what the writer was
+        told it wrote. Positions nothing itself, except that on the LOCATE route (locate_start) a first block that
+        differs is looked for at the neighbouring addresses; on the spacing route the first block gets the same
+        keystream-shift diagnosis as the others."""
         t0 = time.time()
         bad, first_bad, stop_at, first_ok, last_ok, shift = 0, [], None, None, None, ""
         for i in range(k):
@@ -737,7 +907,7 @@ class Reader(object):
                 bad += 1
                 if len(first_bad) < 5:
                     first_bad.append(i)
-                if not shift and i > 0:
+                if not shift and (i > 0 or locate_start is None):
                     got = bytes(self.buf)
                     for d, word in ((-1, "an extra block (a refused write kept its data?) sits before it"),
                                     (1, "a block is missing before it")):
@@ -746,9 +916,10 @@ class Reader(object):
                             break
         secs = max(time.time() - t0, 1e-9)
         self.check("slice-first-block", first_ok,
-                   "block address %d holds keystream block %d (global block %d)" % (start, n % self.ks.nblk, n)
-                   if first_ok else "block address %d differs from keystream block %d%s"
-                   % (start, n % self.ks.nblk, "" if stop_at and stop_at[0] == 0 else self.neighbours(start, n)))
+                   "%s holds keystream block %d (global block %d)" % (where, n % self.ks.nblk, n)
+                   if first_ok else "%s differs from keystream block %d%s"
+                   % (where, n % self.ks.nblk, "" if (stop_at and stop_at[0] == 0) or locate_start is None
+                      else self.neighbours(locate_start, n)))
         self.check("slice-last-block", last_ok,
                    "slice block %d == keystream" % (k - 1) if last_ok else
                    ("not read: %s at slice block %d" % (stop_at[1], stop_at[0]) if stop_at else "differs"))
@@ -794,6 +965,7 @@ class Reader(object):
                          % (self.word(kind, err), fmt_mtget(self.dev.mtget())))
             self.checks.append({"name": "read-after-final-filemark", "status": "INFO", "detail": self.word(kind, err)})
         self.found_fm_first = bool(found) and found[0] == "FM"
+        self.after_slice_as_written = bool(expect) and found == expect
 
     def fsf_check(self, n, k, start, seal):
         """LOCATE to the last slice block, then space ONE filemark: that must land on the seal block."""
@@ -827,7 +999,7 @@ class Reader(object):
         if not he or not he.get("accepted"):
             return
         if he.get("lba_start") is None:
-            self.check("hard-end-blocks", None, "READ POSITION unavailable")
+            self.check("hard-end-blocks", None, self.unavailable)
             return
         for label, idx in (("first", 0), ("last", he["accepted"] - 1)):
             ok, err = self.seek(he["lba_start"] + idx)
@@ -836,8 +1008,12 @@ class Reader(object):
                        "block address %d: %s" % (he["lba_start"] + idx, "matches keystream" if kind == "data" and self.matches(g0 + idx)
                                                  else self.word(kind, err2)))
         if he.get("lba_after") is not None:
-            self.check("hard-end-physical-block-count", he["lba_after"] - he["lba_start"] == he["accepted"],
-                       "READ POSITION moved %d for %d accepted blocks" % (he["lba_after"] - he["lba_start"], he["accepted"]))
+            self.hard_end_count_check(he)
+
+    def hard_end_count_check(self, he):
+        """Record only: what READ POSITION said the walk moved, against the blocks write(2) accepted."""
+        self.check("hard-end-physical-block-count", he["lba_after"] - he["lba_start"] == he["accepted"],
+                   "READ POSITION moved %d for %d accepted blocks" % (he["lba_after"] - he["lba_start"], he["accepted"]))
 
 
 # ------------------------------------------------------------------ summary --
@@ -861,6 +1037,13 @@ def grab(path, key):
 
 def commas(v):
     return "n/a" if v is None else "{:,}".format(v)
+
+
+def native_tracks(used_mb, written_bytes):
+    """Whether page 0x17's 'Total used native capacity' [MB] plausibly tracks the data: within a factor of 2 of the
+    bytes written. On home2's HP LTO-6 it read 0 before and 103,077 MB after a 2.6 TB fill, and did not move across
+    a 2 GiB write (docs/runs/2026-10-20-lto6-profile-and-lbp.md): there it is no measure of the tape used."""
+    return used_mb is not None and bool(written_bytes) and 0.5 <= used_mb * 1e6 / written_bytes <= 2.0
 
 
 def make_summary(run, prior, nominal=2.5e12):
@@ -901,6 +1084,9 @@ def make_summary(run, prior, nominal=2.5e12):
     if res.get("exception"):
         p("exception: %s" % res["exception"].strip().splitlines()[-1])
     p("stage reached: %s (started %s, finished %s)" % (stage, res.get("started"), res.get("finished")))
+    failure = position_failure(res)
+    if failure:
+        p("READ POSITION (MTIOCPOS) unavailable: %s; the null positions in result.json are null for that reason" % failure)
     p("")
     p("1. BEFORE THE FIRST REFUSAL")
     p("bytes accepted before the first refusal: %s (%s blocks of %d); fill ended: %s; host feed %.1f MB/s over %.2f h"
@@ -919,8 +1105,12 @@ def make_summary(run, prior, nominal=2.5e12):
     if fill.get("bytes") and b_max:
         p("bytes accepted / MAM maximum capacity (%s MiB): %.4f; / the generation table's %s planning figure: %.4f"
           % (commas(b_max), fill["bytes"] / (b_max * 1048576.0), "{:,} B".format(int(nominal)), fill["bytes"] / float(nominal)))
-    if used and written:
+    if native_tracks(used, written):
         p("native capacity used per data byte, all data blocks written (page 0x17 after rewind %s MB / %s bytes): %.4f"
+          % (commas(used), commas(written), used * 1e6 / written))
+    elif used is not None and written:
+        p("page 0x17's 'Total used native capacity' does not track writes on this drive: %s MB after rewind against %s "
+          "bytes written (%.4f per data byte, not within a factor of 2), so no native-capacity-per-byte figure is derived"
           % (commas(used), commas(written), used * 1e6 / written))
     p("")
     p("2. AFTER THE FIRST REFUSAL (what write(2) returned for each attempt, run-length)")
@@ -981,7 +1171,12 @@ def make_summary(run, prior, nominal=2.5e12):
     else:
         p("not run (--no-hard-end was given, or the run stopped at the warning)")
     p("")
-    p("4. READBACK (by LOCATE and one filemark spacing; the whole tape is never read)")
+    p("4. READBACK (the whole tape is never read)")
+    if rb.get("route"):
+        p("route: %s (%s); chosen by %s" % (rb["route"], {
+            "locate": "LOCATE to the block addresses recorded while writing, and one filemark spacing",
+            "spacing": "rewind, SPACE forward over the fill, read on; no READ POSITION, no LOCATE"}.get(rb["route"], "?"),
+            rb.get("route_reason")))
     if rb.get("checks"):
         for c in rb["checks"]:
             p("%-40s %s  %s" % (c["name"], c["status"], c["detail"]))
@@ -1020,9 +1215,12 @@ class FakeTape(object):
     """An in-memory tape with a scripted drive. verdict(attempt_no, written_blocks) -> None (accept),
     'ENOSPC', 'EIO', ('short', n) or 'ENOSPC+data' (refuse but keep the data: the case the readback must catch)."""
 
-    def __init__(self, bs, verdict, fm_verdict=None):
+    def __init__(self, bs, verdict, fm_verdict=None, no_position=False, no_locate=False):
         self.bs, self.verdict, self.fm_verdict = bs, verdict, fm_verdict or (lambda a: None)
         self.rec, self.pos, self.attempts, self.fm_attempts, self.closed = [], 0, 0, 0, False
+        # home2's HP LTO-6 through st (#487): READ POSITION and LOCATE both fail with EIO
+        self.no_position, self.no_locate, self.pos_errno = no_position, no_locate, None
+        self.space_counts = []
 
     def _put(self, item):
         del self.rec[self.pos:]
@@ -1055,11 +1253,25 @@ class FakeTape(object):
                 return False, getattr(errno, v)
             self._put(None)
         elif op == MTSEEK:
+            if self.no_locate:
+                return False, errno.EIO
             self.pos = count
         elif op == MTFSF:
             while self.pos < len(self.rec) and self.rec[self.pos] is not None:
                 self.pos += 1
             self.pos = min(self.pos + 1, len(self.rec))
+        elif op == MTREW:
+            self.pos = 0
+        elif op == MTFSR:
+            # SPACE(6) blocks: a 24-bit signed count; st stops after a filemark it meets and reports EIO, as at EOD
+            assert 0 < count <= SPACE_MAX, "MTFSR count %d does not fit SPACE(6)" % count
+            self.space_counts.append(count)
+            for _ in range(count):
+                if self.pos >= len(self.rec):
+                    return False, errno.EIO
+                self.pos += 1
+                if self.rec[self.pos - 1] is None:
+                    return False, errno.EIO
         return True, 0
 
     def read_into(self, buf):
@@ -1077,6 +1289,10 @@ class FakeTape(object):
         return {"type": 1, "resid": 0, "dsreg": self.bs, "gstat": 0x01010000, "erreg": 0, "fileno": fm, "blkno": -1}
 
     def mtpos(self):
+        if self.no_position:
+            self.pos_errno = errno.EIO
+            return None
+        self.pos_errno = None
         return self.pos
 
     def close(self):
@@ -1105,7 +1321,7 @@ def selftest(argv=None):
         print("scenario: %s" % name)
         run = os.path.join(root, name.replace(" ", "_"))
         os.makedirs(run)
-        tape = FakeTape(bs, verdict, fm_verdict)
+        tape = FakeTape(bs, verdict, fm_verdict, no_position=kw.get("no_position", False), no_locate=kw.get("no_locate", False))
         o = argparse.Namespace(slice_blocks=slice_n or slice_blocks, refusal_run_limit=limit, stop_at_warning=kw.get("stop_at_warning", False),
                                to_hard_end=hard, hard_end_cap=kw.get("hard_cap", 10 ** 9),
                                max_fill_bytes=cap_bytes or 10 ** 9, sg="", progress_s=1e9)
@@ -1113,13 +1329,15 @@ def selftest(argv=None):
         w = Writer(tape, Keystream(src, bs), bs, run, o, log)
         w.stop_flag = stop_flag
         rc = w.execute()
-        rd = Reader(FakeTape.__new__(FakeTape), Keystream(src, bs), bs, log)
-        rd.dev = tape
+        rd = Reader(tape, Keystream(src, bs), bs, log, route=kw.get("route", "auto"), space_chunk=kw.get("chunk", SPACE_CHUNK))
         with open(os.path.join(run, "result.json")) as f:
             res = json.load(f)
         rd.run_checks(res)
         with open(os.path.join(run, "readback.json"), "w") as f:
-            json.dump({"checks": rd.checks}, f)
+            json.dump({"route": rd.route, "route_reason": rd.route_reason, "checks": rd.checks}, f)
+        if kw.get("used_mb") is not None:
+            with open(os.path.join(run, "after-rewind.page_0x17.txt"), "w") as f:
+                f.write("Volume statistics page\n  Total used native capacity [MB]: %d\n" % kw["used_mb"])
         text = make_summary(run, None)
         return rc, res, rd, text, tape
 
@@ -1236,6 +1454,77 @@ def selftest(argv=None):
     expect(res["seal"]["ok"] and "FAIL" in status(rd, "objects-after-slice") and "FAIL" in status(rd, "position-after-seal-and-filemark2"),
            "a dropped seal block is caught by the object sequence and by READ POSITION")
 
+    # The readback routes (#487). Every scenario above ran `auto` with positions recorded: the LOCATE route.
+    once = lambda a, w: "ENOSPC" if a == fill_n + 1 else None   # noqa: E731
+    rc, res, rd, text, tape = scenario("route locate by default", once)
+    expect(rd.route == "locate" and not tape.space_counts and status(rd, "fill-tail-blocks") == []
+           and "route: locate" in text, "auto with recorded positions reads by LOCATE and never spaces by blocks")
+
+    # S1: the spacing route on the textbook layout, in SPACE chunks of 7 blocks: every check passes
+    rc, res, rd, text, tape = scenario("route spacing", once, route="spacing", chunk=7)
+    expect(rd.route == "spacing" and not any(c["status"] == "FAIL" for c in rd.checks)
+           and status(rd, "fill-tail-blocks") == ["PASS"] and status(rd, "slice-all-blocks") == ["PASS"]
+           and status(rd, "objects-after-slice") == ["PASS"] and status(rd, "seal-block-content") == ["PASS"],
+           "spacing: fill tail, slice, filemark, seal block and filemark all read back")
+    expect(tape.space_counts == [7] * 13 + [5] and sum(tape.space_counts) == fill_n - FILL_TAIL_BLOCKS,
+           "spacing: %d blocks spaced in SPACE commands no larger than the chunk" % (fill_n - FILL_TAIL_BLOCKS))
+    expect(status(rd, "fsf1-from-last-slice-block") == ["SKIP"] and "route: spacing" in text, "spacing: the summary names the route")
+
+    # S2: home2's drive (#487): READ POSITION fails on every call and LOCATE fails; auto spaces, the errno is kept
+    rc, res, rd, text, tape = scenario("home2 no position no locate", once, no_position=True, no_locate=True)
+    rp = res.get("read_position") or {}
+    expect(res["setup"]["lba0"] is None and res["setup"]["lba0_errno"] == errno.EIO and rp.get("failed") == rp.get("calls")
+           and rp.get("calls", 0) > 3 and rp.get("errnos") == {"EIO": rp["calls"]}, "every failed READ POSITION is counted by errno")
+    expect(rd.route == "spacing" and "setup.lba0 is null" in rd.route_reason and not any(c["status"] == "FAIL" for c in rd.checks)
+           and status(rd, "slice-all-blocks") == ["PASS"], "auto with no recorded position takes the spacing route, and it passes")
+    expect(text.count("READ POSITION (MTIOCPOS) unavailable: EIO on %d of %d calls, from the first, at BOT" % (rp["calls"], rp["calls"])) == 1,
+           "the summary says once why every position is null")
+    expect("READ POSITION unavailable: EIO" in [c for c in rd.checks if c["name"] == "physical-block-count"][0]["detail"],
+           "and so does the skipped block-count check")
+
+    # S3: positions recorded, but LOCATE fails: auto falls back to spacing and says why
+    rc, res, rd, text, tape = scenario("locate fails", once, no_locate=True)
+    expect(rd.route == "spacing" and "LOCATE to block address %d failed: EIO" % fill_n in rd.route_reason
+           and not any(c["status"] == "FAIL" for c in rd.checks) and status(rd, "physical-block-count") == ["PASS"],
+           "auto falls back to spacing when the LOCATE to the slice fails")
+
+    # S4: --route locate is not rescued: a failed LOCATE is a FAIL, as before
+    rc, res, rd, text, tape = scenario("locate asked and fails", once, no_locate=True, route="locate")
+    expect(rd.route == "locate" and status(rd, "slice-first-block") == ["FAIL"] and not tape.space_counts,
+           "--route locate reports a failed LOCATE and does not space")
+
+    # S5: a refused write that reached the tape, on the spacing route: the duplicate is still named
+    rc, res, rd, text, tape = scenario("refusal keeps data spacing", lambda a, w: "ENOSPC+data" if a == fill_n + 1 else None,
+                                       route="spacing")
+    expect(status(rd, "fill-tail-blocks") == ["PASS"] and "FAIL" in status(rd, "slice-all-blocks") and "an extra block" in text,
+           "spacing: a refused-but-written block is caught and diagnosed")
+
+    # S6: the walk to the hard end, on the spacing route: file 2's first block is the walk's first keystream block
+    rc, res, rd, text, tape = scenario("hard end spacing", lambda a, w: "ENOSPC" if a == fill_n + 1 else ("EIO" if w >= fill_n + slice_blocks + 11 else None),
+                                       hard=True, no_position=True, no_locate=True)
+    expect(rd.route == "spacing" and status(rd, "hard-end-first-block") == ["PASS"] and status(rd, "hard-end-last-block") == ["PASS"]
+           and not any(c["status"] == "FAIL" for c in rd.checks),
+           "spacing: the walk's first block reads back after the second filemark, and its last block after spacing on")
+
+    # S6b: a refused walk write that reached the tape: spacing through file 2 lands one block short of the last
+    rc, res, rd, text, tape = scenario("hard end duplicate spacing", lambda a, w: "ENOSPC" if a == fill_n + 1 else
+                                       ("ENOSPC+data" if a == fill_n + slice_blocks + 5 else None),
+                                       hard=True, hard_cap=(slice_blocks + 7) * bs, route="spacing")
+    expect(res["hard_end"]["accepted"] == 7 and status(rd, "hard-end-first-block") == ["PASS"]
+           and status(rd, "hard-end-last-block") == ["FAIL"], "spacing: a duplicated walk block fails the walk's last-block check")
+
+    # S7: a seal block dropped by the drive, on the spacing route
+    rc, res, rd, text, tape = scenario("seal dropped spacing", lambda a, w: "ENOSPC" if a == fill_n + 1 else ("DROP" if a == fill_n + slice_blocks + 2 else None),
+                                       route="spacing")
+    expect("FAIL" in status(rd, "objects-after-slice"), "spacing: a dropped seal block is caught by the object sequence")
+
+    # The native-capacity line only when page 0x17 tracks the data (within a factor of 2), else both figures
+    rc, res, rd, text, tape = scenario("native tracks", once, used_mb=1)
+    expect("native capacity used per data byte" in text and "does not track" not in text, "a plausible page 0x17 figure is used")
+    rc, res, rd, text, tape = scenario("native does not track", once, used_mb=103077)
+    expect("native capacity used per data byte" not in text and "does not track writes on this drive: 103,077 MB" in text,
+           "a page 0x17 figure far from the bytes written is named, not used")
+
     Log.console = True
     shutil.rmtree(root)
     print("\n%s" % ("selftest: all passed" if not failures else "selftest: %d FAILED: %s" % (len(failures), failures)))
@@ -1274,7 +1563,7 @@ def cmd_verify(a):
         return 2
     ks = Keystream(a.src, a.block_size)
     dev = RealDev(a.device, os.O_RDONLY)
-    r = Reader(dev, ks, a.block_size, log)
+    r = Reader(dev, ks, a.block_size, log, route=a.route, space_chunk=a.space_chunk)
     try:
         r.run_checks(res)
     except Exception:
@@ -1283,7 +1572,7 @@ def cmd_verify(a):
     finally:
         dev.close()
     with open(os.path.join(a.run, "readback.json"), "w") as f:
-        json.dump({"checks": r.checks}, f, indent=1)
+        json.dump({"route": r.route, "route_requested": a.route, "route_reason": r.route_reason, "checks": r.checks}, f, indent=1)
     return 1 if any(c["status"] == "FAIL" for c in r.checks) else 0
 
 
@@ -1307,6 +1596,14 @@ def parser():
         p.add_argument("--src", required=True)
         p.add_argument("--run", required=True)
         p.add_argument("--block-size", type=int, default=BLOCK)
+        if name == "verify":
+            p.add_argument("--route", choices=ROUTES, default="auto",
+                           help="locate: LOCATE to the recorded block addresses; spacing: rewind and SPACE forward, no "
+                                "READ POSITION or LOCATE; auto (default): locate, else spacing when no position was "
+                                "recorded or the LOCATE fails")
+            p.add_argument("--space-chunk", type=int, default=SPACE_CHUNK,
+                           help="blocks per SPACE command on the spacing route (default %%(default)s; SPACE(6) takes "
+                                "at most %d)" % SPACE_MAX)
         if name == "write":
             p.add_argument("--slice-blocks", type=int, default=SLICE_BLOCKS)
             p.add_argument("--refusal-run-limit", type=int, default=REFUSAL_RUN_LIMIT)
@@ -1333,6 +1630,8 @@ def main(argv):
     if a.cmd == "write":
         return cmd_write(a)
     if a.cmd == "verify":
+        if not 0 < a.space_chunk <= SPACE_MAX:
+            sys.exit("lto6-fill-writer: --space-chunk must be 1..%d (SPACE(6)'s count is 24-bit signed)" % SPACE_MAX)
         return cmd_verify(a)
     if a.cmd == "summary":
         return cmd_summary(a)

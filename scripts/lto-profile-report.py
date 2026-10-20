@@ -389,6 +389,13 @@ def humanize(n):
     return "n/a" if n is None else "{:,}".format(n)
 
 
+def native_tracks(used_mb, data_bytes):
+    """Whether page 0x17's 'Total used native capacity' [MB] plausibly tracks the data: within a factor of 2 of the
+    bytes written (scripts/lto6-fill-writer.py has the same rule). On home2's HP LTO-6 it did not move across a 2 GiB
+    write and read 103,077 MB after a 2.6 TB fill (docs/runs/2026-10-20-lto6-profile-and-lbp.md, #487)."""
+    return used_mb is not None and bool(data_bytes) and 0.5 <= used_mb * 1e6 / data_bytes <= 2.0
+
+
 def outcome_text(rec):
     """What write(2) returned after the first refusal, in words: the fill writer's own description
     ('1 refusal (ENOSPC), then 2048 accepted', 'ALTERNATING: ...') when it can be loaded, else the
@@ -468,7 +475,7 @@ def build_mam_capacity(run, facts, ident, figures, notes):
     entry = {"remaining_before": rb, "remaining_after": ra, "decrease": d_mam, "label_unit": unit_label,
              "payload_bytes": payload, "max_capacity_attribute": max_cap}
     src = "sg_read_attr before/after a %d-byte write -> snap-dbefore.mam.txt, snap-dafter.mam.txt" % payload
-    if nb is not None and na is not None and na > nb and d_mam > 0:
+    if nb is not None and na is not None and na > nb and d_mam > 0 and native_tracks(na - nb, payload):
         native_delta_bytes = (na - nb) * 1000000
         unit_bytes = native_delta_bytes / float(d_mam)
         cls, near = "unclassified", None
@@ -493,8 +500,15 @@ def build_mam_capacity(run, facts, ident, figures, notes):
             entry["max_capacity_bytes_if_that_unit"] = int(max_cap * used)
             entry["max_capacity_over_nominal"] = round(max_cap * used / float(ident["medium"]["nominal_capacity_bytes"]), 4)
     else:
+        if nb is None or na is None or na <= nb:
+            why = "page 0x17 'Total used native capacity' did not grow across the write (an emulator, or the page is unreadable)"
+        elif not native_tracks(na - nb, payload):
+            why = ("page 0x17 'Total used native capacity' grew by %s MB across a %s-byte write, not within a factor of 2 of it: "
+                   "it does not track writes on this drive" % (humanize(na - nb), humanize(payload)))
+        else:
+            why = "MAM's remaining capacity did not decrease across the write"
         figures["mam_capacity_unit"] = fig(None, None, src,
-                                           note="page 0x17 'Total used native capacity' did not grow across the write (an emulator, or the page is unreadable), so the unit cannot be derived; the label says %r" % unit_label)
+                                           note="%s, so the unit cannot be derived; the label says %r" % (why, unit_label))
         figures["mam_over_report"] = fig(None, "bytes", src, note="needs the unit")
     figures["mam_remaining_capacity"] = fig(entry, None, src)
 
@@ -600,8 +614,13 @@ def build_fill(run, ident, facts, figures, notes, options):
     after_rewind = sibling_counters(fdir, "after-rewind", "0x17")
     used, _, _ = counter(after_rewind, "Total used native capacity")
     written = (fill.get("bytes") or 0) + ((sl or {}).get("accepted", 0) + (he or {}).get("accepted", 0) + (1 if (res.get("seal") or {}).get("ok") else 0)) * res.get("block_size", 524288)
-    if used and written:
+    if native_tracks(used, written):
         early["native_used_per_data_byte"] = round(used * 1e6 / written, 4)
+    elif used is not None and written:
+        early["native_used_per_data_byte"] = None
+        early["native_used_note"] = ("page 0x17 'Total used native capacity' does not track writes on this drive: %s MB after "
+                                     "rewind against %s bytes written (%.4f per data byte, not within a factor of 2); not a "
+                                     "measurement" % (humanize(used), humanize(written), used * 1e6 / written))
     if observed:
         figures["early_warning"] = fig(early["bytes_before_first_refusal"], "bytes",
                                        "first write(2) refusal (%s) of the fill from BOT -> fill/result.json first_refusal" % fr.get("outcome"),
@@ -634,6 +653,7 @@ def build_fill(run, ident, facts, figures, notes, options):
         post["seal_block"] = bool((res.get("seal") or {}).get("ok"))
         post["filemark_after_seal"] = bool((res.get("filemark2") or {}).get("ok"))
         post["readback"] = ("FAIL" if any(c.get("status") == "FAIL" for c in rb.get("checks", [])) else "PASS" if rb.get("checks") else "not run")
+        post["readback_route"] = rb.get("route")
         past = (sl.get("accepted") or 0) * res.get("block_size", 524288)
         if he:
             past = he.get("bytes_past_first_refusal", past)
@@ -755,11 +775,14 @@ def render_text(p):
             ew.get("first_refusal_errno"), ew.get("host_feed_mb_per_s"), ew.get("fill_seconds")))
         if ew.get("native_used_per_data_byte") is not None:
             w("native capacity used per data byte (page 0x17 after rewind): %s" % ew["native_used_per_data_byte"])
+        elif ew.get("native_used_note"):
+            w(ew["native_used_note"])
         if pw.get("slice"):
             s = pw["slice"]
-            w("past the warning: slice %s of %s blocks (%s); filemark %s, seal block %s, filemark %s; readback %s" % (
+            w("past the warning: slice %s of %s blocks (%s); filemark %s, seal block %s, filemark %s; readback %s%s" % (
                 s["accepted_blocks"], s["target_blocks"], s["outcomes"], pw.get("filemark_after_slice"), pw.get("seal_block"),
-                pw.get("filemark_after_seal"), pw.get("readback")))
+                pw.get("filemark_after_seal"), pw.get("readback"),
+                " (route: %s)" % pw["readback_route"] if pw.get("readback_route") else ""))
         he = pw.get("hard_end") or {}
         if he.get("walked"):
             w("hard end: %s bytes past the first refusal; stop: %s; reached the hard end: %s" % (humanize(he["bytes_past_first_refusal"]), he["stop"], he["reached_hard_end"]))
@@ -985,6 +1008,9 @@ def selftest():
     check("LBP: subpage bytes", lbp and lbp["lbpm"] == 2 and lbp["lbp_w"] == 1 and lbp["lbp_r"] == 1)
     check("LBP: mhvtl's page, method 0", parse_lbp(">> Control, page_control: current\n 00     0a f0 00 1c 00 04 00 00  00 00 00 00 00 00 00 00\n")["lbpm"] == 0)
     check("block limits", parse_block_limits("\tMinimum block size: 1 byte(s)\n\tMaximum block size: 2097152 byte(s), 2048 KB, 2 MB\n") == (1, 2097152))
+    check("page 0x17 tracks the data within a factor of 2",
+          native_tracks(21607, 21474836480) and native_tracks(1, 544768) and not native_tracks(103077, 2612000000000)
+          and not native_tracks(0, 2147483648) and not native_tracks(None, 1) and not native_tracks(5, 0))
     check("percent_floor never rounds up", percent_floor(0.9808) == 0.98 and percent_floor(0.98) == 0.98 and percent_floor(0.9799) == 0.97)
     check("media table matches its own lookups", all(media_by_density(c)["generation"] == g for g, c, _ in MEDIA))
     check("every drive generation writes its own media", all(g in CAN_WRITE[g] for g in DRIVE_GENERATIONS))

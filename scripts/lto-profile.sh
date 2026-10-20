@@ -503,7 +503,7 @@ if [ "$DO_FILL" = "1" ]; then
     VRC=0
     # Readback runs after a clean run, an interrupt or a writer error: it reads whatever slice result.json records.
     if [ "$STOP_AT_WARNING" -eq 0 ] && { [ "$WRC" -eq 0 ] || [ "$WRC" -eq 3 ] || [ "$WRC" -eq 6 ]; }; then
-        log "readback: LOCATE to the post-warning slice and the seal block (the whole tape is never read)"
+        log "readback: the post-warning slice and the seal block, by LOCATE, or by spacing from BOT when no position was recorded or LOCATE fails (the whole tape is never read)"
         python3 "$WRITER" verify --device "$TAPE_DEV" --src "$SRC" --run "$FILL" 2>&1 | tee -a "${TEE_OPT[@]}" "$RUN/profile.log"
         VRC=${PIPESTATUS[0]}
         fact fill_verify_rc "$VRC"
