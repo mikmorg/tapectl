@@ -17,6 +17,12 @@
 //! everything from the head onward. A read can be made to fail partway
 //! through a file, and the head moved behind the store's back.
 //!
+//! Its writes are st's too, block by block (#420): each block goes through
+//! the real `tape::ioctl::write_block_retrying`, against a medium with an
+//! early warning past which st refuses about one block write in two, a hard
+//! end past which it refuses every one, and the hazards a test sets
+//! ([`crate::store::MediumEnd`]).
+//!
 //! Opening it (issue #407) is the st driver's too: a read-write open of a
 //! write-protected cartridge fails with EROFS, and a write through a
 //! read-only open fails with EBADF. A fake that is never opened — a store
@@ -33,8 +39,10 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{Result, TapectlError};
-use crate::store::{OpenMode, TapeOps};
-use crate::tape::ioctl::{ReadEnd, TapePosition};
+use crate::store::{MediumEnd, OpenMode, TapeOps};
+use crate::tape::ioctl::{
+    write_block_retrying, write_error, EarlyWarning, EarlyWarningState, ReadEnd, TapePosition,
+};
 
 /// One operation the store issued, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,12 +110,16 @@ pub(crate) struct State {
     /// release before 1.0.5 (#389). The positive control for the motion
     /// budgets (issue #416).
     pub position_fails: bool,
-    /// The medium holds this many stored bytes, then a write fails as st
-    /// fails one at the early-warning point: the blocks that fit are on
-    /// the tape, no filemark follows them, and the error is ENOSPC (issue
-    /// #416 item 13 — the end-of-tape path under `write_stream`, which no
-    /// real medium has run).
+    /// The medium's HARD END: it holds this many stored bytes, then every
+    /// block write is refused with ENOSPC — retried, and after more than
+    /// 16 refusals of one block the write fails as a full medium: the
+    /// blocks that fit are on the tape, no filemark follows them (issue
+    /// #416 item 13 — the end-of-tape path under `write_stream`; since
+    /// #420 the hard end past the early warning).
     pub capacity: Option<u64>,
+    /// The drive's early warning and st's alternation past it, and the
+    /// hazards a test sets (#420): see [`MediumEnd`].
+    pub end: MediumEnd,
     /// A drive that reports every write and erase done and changes nothing
     /// on the medium — how a test proves `cartridge erase` checks its own
     /// work by reading it back, never by trusting the drive's word (ADR-0012
@@ -149,22 +161,40 @@ impl State {
 }
 
 /// A cloneable handle: the test keeps one, `TapeStore` owns the other.
+///
+/// The medium and the drive's state are shared by every handle; the early
+/// warning a write saw is the HANDLE's, as it is an open device's in
+/// production (`TapeDevice`, #420). [`Self::boxed`] — what a store is built
+/// over — is a new open, starting with no warning.
 #[derive(Clone, Default)]
-pub(crate) struct FakeTape(Arc<Mutex<State>>);
+pub(crate) struct FakeTape {
+    shared: Arc<Mutex<State>>,
+    warning: EarlyWarningState,
+}
 
 impl FakeTape {
     /// A tape holding `files` (each already block-padded, as `MemStore`
     /// records them), head at BOT.
     pub(crate) fn with_files(files: Vec<Vec<u8>>, block_size: usize) -> Self {
-        Self(Arc::new(Mutex::new(State {
-            files,
-            block_size,
-            ..State::default()
-        })))
+        Self {
+            shared: Arc::new(Mutex::new(State {
+                files,
+                block_size,
+                ..State::default()
+            })),
+            warning: EarlyWarningState::default(),
+        }
     }
 
     pub(crate) fn state(&self) -> MutexGuard<'_, State> {
-        self.0.lock().unwrap()
+        self.shared.lock().unwrap()
+    }
+
+    /// The drive reports its early warning once the medium holds `bytes`
+    /// stored bytes (#420): st's alternation from there, as [`MediumEnd`]
+    /// models it. The hard end stays [`State::capacity`].
+    pub(crate) fn early_warning_at(&self, bytes: u64) {
+        self.state().end.early_warning_at = Some(bytes);
     }
 
     pub(crate) fn ops(&self) -> Vec<Op> {
@@ -191,8 +221,13 @@ impl FakeTape {
             .count()
     }
 
+    /// A new open of the device over the same medium: what a store is built
+    /// over. Its early warning starts at `None`.
     pub(crate) fn boxed(&self) -> Box<dyn TapeOps> {
-        Box::new(self.clone())
+        Box::new(Self {
+            shared: self.shared.clone(),
+            warning: EarlyWarningState::default(),
+        })
     }
 
     /// Model the file at `position` as `len` bytes of tape (issue #416).
@@ -221,6 +256,7 @@ impl FakeTape {
         s.travel = 0;
         s.moving_rewinds = 0;
         s.bytes_read = 0;
+        s.end.moved();
     }
 
     /// Rewinds since the last [`Self::load`] that moved tape.
@@ -277,6 +313,59 @@ impl FakeTape {
         Ok(())
     }
 
+    /// One file's blocks, then its filemark, as st takes them on the medium
+    /// [`State`] models after its last file: each block through the real
+    /// [`write_block_retrying`] against [`MediumEnd`] and the hard end
+    /// ([`State::capacity`]), into `bytes`; then one filemark, never retried
+    /// (`volume-format-v2.md` §4.3 W3). On an error, `bytes` holds what
+    /// landed.
+    fn lay_down(
+        s: &mut State,
+        src: &mut dyn Read,
+        len: u64,
+        sync: bool,
+        bytes: &mut Vec<u8>,
+        warning: &mut EarlyWarningState,
+    ) -> Result<()> {
+        let bs = s.block_size.max(1);
+        let before: u64 = s.files.iter().map(|f| f.len() as u64).sum();
+        let mut buf = vec![0u8; bs];
+        let mut read = 0u64;
+        while read < len {
+            let want = (len - read).min(bs as u64) as usize;
+            // `TapeDevice::write_stream`: a short source is the source's
+            // error, named so (issue #408).
+            src.read_exact(&mut buf[..want]).map_err(|e| {
+                TapectlError::SourceIo(if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    format!("source exhausted (declared length {len}, {read} read)")
+                } else {
+                    format!("read source: {e}")
+                })
+            })?;
+            buf[want..].fill(0);
+            read += want as u64;
+            let (end, capacity) = (&mut s.end, s.capacity);
+            write_block_retrying(
+                |b| {
+                    let stored = before + bytes.len() as u64;
+                    end.write_block(stored, capacity, b, &mut |l| bytes.extend(l))
+                },
+                &buf,
+                warning,
+            )
+            .map_err(|e| write_error("write", &e))?;
+        }
+        // `TapeDevice::write_stream`: a refused filemark is a full medium.
+        s.end
+            .write_filemark(before + bytes.len() as u64)
+            .map_err(|e| {
+                let op = if sync { 5 } else { 35 };
+                TapectlError::MediumFull(
+                    TapectlError::TapeIo(format!("ioctl op={op} count=1: {e}")).to_string(),
+                )
+            })
+    }
+
     fn note_read(s: &mut State, file: usize) {
         if let Some(path) = &s.watch {
             let seen = path.exists();
@@ -300,6 +389,7 @@ impl FakeTape {
     pub(crate) fn open_as(&self, mode: OpenMode) -> Result<()> {
         let mut s = self.state();
         s.opens.push(mode);
+        s.end.moved();
         if s.fail_opens.contains(&s.opens.len()) {
             return Err(io_error("open fake tape"));
         }
@@ -338,6 +428,7 @@ impl TapeOps for FakeTape {
                 s.moving_rewinds += 1;
             }
             s.head = (0, 0);
+            s.end.moved();
             Ok(())
         })
     }
@@ -346,6 +437,7 @@ impl TapeOps for FakeTape {
         self.travelled(|s| {
             assert!(count > 0, "the store only ever spaces forward: {count}");
             s.ops.push(Op::Space(count as u32));
+            s.end.moved();
             let target = s.head.0 + count as usize;
             if target > s.files.len() {
                 // st stops at end of data and reports the space failed.
@@ -373,8 +465,14 @@ impl TapeOps for FakeTape {
         })
     }
 
-    fn write_stream(&mut self, src: &mut dyn Read, len: u64, _sync: bool) -> Result<u64> {
-        self.travelled(|s| {
+    /// The st write, block by block: each block through the real
+    /// [`write_block_retrying`] against the medium's [`MediumEnd`] and
+    /// [`State::capacity`], then the filemark, never retried. A write that
+    /// fails leaves the blocks that landed on the tape with no filemark
+    /// after them, the head inside the file.
+    fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        let mut warning = std::mem::take(&mut self.warning);
+        let written = self.travelled(|s| {
             if s.opens.last() == Some(&OpenMode::ReadOnly) {
                 return Err(TapectlError::TapeIo(
                     "write: Bad file descriptor (os error 9)".to_string(),
@@ -386,35 +484,30 @@ impl TapeOps for FakeTape {
             if s.writes_vanish {
                 return Ok(len.div_ceil(s.block_size.max(1) as u64) * s.block_size.max(1) as u64);
             }
-            let mut bytes = Vec::with_capacity(len as usize);
-            src.take(len)
-                .read_to_end(&mut bytes)
-                .map_err(|e| TapectlError::SourceIo(format!("read source: {e}")))?;
             let bs = s.block_size.max(1);
-            bytes.resize(bytes.len().div_ceil(bs) * bs, 0);
-            let padded = bytes.len() as u64;
             s.files.truncate(file);
-            if let Some(capacity) = s.capacity {
-                let used: u64 = s.files.iter().map(|f| f.len() as u64).sum();
-                let room = capacity.saturating_sub(used) / bs as u64 * bs as u64;
-                if padded > room {
-                    // `TapeDevice::write_stream`'s `write_error`: ENOSPC is
-                    // a full medium. The blocks before it are recorded.
-                    bytes.truncate(room as usize);
-                    let blocks = bytes.len() / bs;
-                    if blocks > 0 {
-                        s.files.push(bytes);
-                    }
-                    s.head = (file, blocks);
-                    return Err(TapectlError::MediumFull(
-                        "write: No space left on device (os error 28)".to_string(),
-                    ));
+            let mut bytes = Vec::new();
+            let laid = FakeTape::lay_down(s, src, len, sync, &mut bytes, &mut warning);
+            let blocks = bytes.len() / bs;
+            let padded = bytes.len() as u64;
+            if let Err(e) = laid {
+                // The blocks that landed are on the tape; no filemark follows.
+                if blocks > 0 {
+                    s.files.push(bytes);
                 }
+                s.head = (file, blocks);
+                return Err(e);
             }
             s.files.push(bytes);
             s.head = (file + 1, 0);
             Ok(padded)
-        })
+        });
+        self.warning = warning;
+        written
+    }
+
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.warning.warning()
     }
 
     fn read_file_streaming(&mut self, sink: &mut dyn Write) -> Result<(u64, ReadEnd)> {
@@ -583,6 +676,136 @@ mod tests {
         let s = fake.state();
         assert_eq!(s.files, vec![vec![1u8; BS], vec![2u8; 2 * BS]]);
         assert_eq!(s.head, (1, 2), "inside the file: no filemark was written");
+    }
+
+    // --- the early warning (#420, `volume-format-v2.md` §4.3) -----------
+
+    fn block_of(b: u8, blocks: usize) -> Vec<u8> {
+        vec![b; blocks * BS]
+    }
+
+    fn write(fake: &mut FakeTape, bytes: &[u8]) -> Result<u64> {
+        fake.write_stream(&mut &bytes[..], bytes.len() as u64, false)
+    }
+
+    /// st past the warning, as measured: the block that reaches the warning
+    /// is accepted and arms a refusal, the next is refused and retried, and
+    /// so on; a filemark disarms, so the next file's first block is accepted
+    /// at once. Every block lands once, and the handle that wrote keeps the
+    /// warning: after the bytes it had accepted, with every refusal counted.
+    #[test]
+    fn a_write_across_the_early_warning_lands_every_block_once() {
+        let mut fake = FakeTape::with_files(Vec::new(), BS);
+        fake.early_warning_at(2 * BS as u64);
+        write(&mut fake, &block_of(1, 1)).unwrap();
+        assert_eq!(fake.early_warning(), None, "not reached yet");
+        assert_eq!(write(&mut fake, &block_of(2, 4)).unwrap(), 4 * BS as u64);
+        assert_eq!(
+            fake.early_warning(),
+            Some(EarlyWarning {
+                bytes_at: 2 * BS as u64,
+                refusals: 3
+            }),
+            "accepted, then three blocks refused once each"
+        );
+        // The filemark disarmed: one block is accepted at once; the next
+        // file's second block is refused once.
+        write(&mut fake, &block_of(3, 1)).unwrap();
+        write(&mut fake, &block_of(4, 2)).unwrap();
+        assert_eq!(fake.early_warning().unwrap().refusals, 4);
+        assert_eq!(
+            fake.state().files,
+            vec![
+                block_of(1, 1),
+                block_of(2, 4),
+                block_of(3, 1),
+                block_of(4, 2)
+            ],
+            "no block lost, none doubled"
+        );
+        assert_eq!(fake.state().head, (4, 0));
+    }
+
+    /// Runs of refusals (up to 3 were measured) are retried the same way.
+    #[test]
+    fn runs_of_refusals_after_each_accepted_block_are_retried() {
+        let mut fake = FakeTape::with_files(Vec::new(), BS);
+        fake.early_warning_at(0);
+        fake.state().end.refusal_run = 3;
+        write(&mut fake, &block_of(5, 3)).unwrap();
+        assert_eq!(fake.early_warning().unwrap().refusals, 6);
+        assert_eq!(fake.state().files, vec![block_of(5, 3)]);
+    }
+
+    /// The hard end past the warning: every block refused, so after more
+    /// than 16 refusals of one block the write fails as a full medium, the
+    /// blocks that landed on the tape with no filemark after them.
+    #[test]
+    fn the_hard_end_past_the_warning_is_a_full_medium() {
+        let mut fake = FakeTape::with_files(Vec::new(), BS);
+        fake.early_warning_at(BS as u64);
+        fake.state().capacity = Some(3 * BS as u64);
+        let err = write(&mut fake, &block_of(6, 5)).unwrap_err();
+        assert!(
+            matches!(err, TapectlError::MediumFull(ref m) if m.contains("os error 28")),
+            "{err:?}"
+        );
+        let refusals = fake.early_warning().unwrap().refusals;
+        assert_eq!(refusals, 2 + 16, "two retried, then sixteen before the end");
+        let s = fake.state();
+        assert_eq!(s.files, vec![block_of(6, 3)]);
+        assert_eq!(s.head, (0, 3), "inside the file: no filemark was written");
+    }
+
+    /// The hazard the readback past the warning is for (ADR-0012 item 114):
+    /// a block st reported refused was in fact written, so the retry lays it
+    /// down twice and the file is a block longer than what was sent.
+    #[test]
+    fn a_refused_block_that_was_written_is_doubled_by_the_retry() {
+        let mut fake = FakeTape::with_files(Vec::new(), BS);
+        fake.early_warning_at(BS as u64);
+        fake.state().end.refused_blocks_land = true;
+        let sent: Vec<u8> = (1..=3u8).flat_map(|b| vec![b; BS]).collect();
+        write(&mut fake, &sent).unwrap();
+        let expected: Vec<u8> = [1u8, 2, 2, 3, 3]
+            .iter()
+            .flat_map(|b| vec![*b; BS])
+            .collect();
+        assert_eq!(fake.state().files, vec![expected]);
+        assert_eq!(fake.early_warning().unwrap().refusals, 2);
+    }
+
+    /// A refused filemark is never retried (W3): the write fails as a full
+    /// medium at once, its blocks on the tape and no filemark after them.
+    /// It is not a refused BLOCK: it counts no refusal.
+    #[test]
+    fn a_refused_filemark_is_a_full_medium_and_never_retried() {
+        let mut fake = FakeTape::with_files(Vec::new(), BS);
+        fake.state().end.filemarks_refused_from = Some(2 * BS as u64);
+        write(&mut fake, &block_of(1, 1)).unwrap();
+        let err = write(&mut fake, &block_of(2, 1)).unwrap_err();
+        assert!(
+            matches!(err, TapectlError::MediumFull(ref m) if m.contains("ioctl op=35")
+                && m.contains("os error 28")),
+            "{err:?}"
+        );
+        assert_eq!(fake.early_warning(), None);
+        let s = fake.state();
+        assert_eq!(s.files, vec![block_of(1, 1), block_of(2, 1)]);
+        assert_eq!(s.head, (1, 1), "inside the file: its filemark was refused");
+    }
+
+    /// A store is built over a new open ([`FakeTape::boxed`]): it starts
+    /// with no warning, though the medium is the same.
+    #[test]
+    fn a_new_open_starts_without_the_warning() {
+        let mut fake = FakeTape::with_files(Vec::new(), BS);
+        fake.early_warning_at(0);
+        write(&mut fake, &block_of(1, 2)).unwrap();
+        assert!(fake.early_warning().is_some());
+        let reopened = fake.boxed();
+        assert_eq!(reopened.early_warning(), None);
+        assert_eq!(fake.state().files.len(), 1, "the same medium");
     }
 
     /// `position_fails` fails `MTIOCGET` and nothing else.

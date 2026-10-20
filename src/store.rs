@@ -21,8 +21,14 @@ use sha2::Digest;
 
 use crate::error::{Result, TapectlError};
 use crate::pipeline::{self, BufferPool};
-use crate::tape::ioctl::{ReadEnd, TapeDevice, TapePosition};
+use crate::tape::ioctl::{
+    write_block_retrying, write_error, EarlyWarningState, ReadEnd, TapeDevice, TapePosition,
+};
 use crate::util::{HashingWriter, TruncatingWriter};
+
+/// The drive's early warning, as [`Store::early_warning`] reports it
+/// (`volume-format-v2.md` §4.3; #420).
+pub use crate::tape::ioctl::EarlyWarning;
 use crate::volume::format;
 use crate::volume::layout_model::{pad_to_blocks, Layout, ZoneKind};
 
@@ -470,9 +476,32 @@ pub trait Store {
     /// flush covers everything written before it; v1's op-envelope sync
     /// marks are a caller choice unrelated to this trait). Returns the
     /// number of bytes committed to the medium, including any block padding.
-    /// A full medium is an `Err` — there is no salvage path (ADR-0007); the
-    /// caller turns that into a clean abort to an unsealed tape.
+    ///
+    /// Past the drive's early warning the store retries every block st
+    /// refuses, itself (`volume-format-v2.md` §4.3 W2), and returns `Ok` for
+    /// an entry whose blocks and filemark were all accepted; the warning is
+    /// then [`Self::early_warning`], never an error. A full medium is an
+    /// `Err` ([`TapectlError::MediumFull`]) only when the store could not
+    /// finish: the hard end (more than 16 refusals of one block in a row) or
+    /// a refused filemark, which is never retried (W3). There is no salvage
+    /// path (ADR-0007); the caller turns that into a clean abort to an
+    /// unsealed tape.
     fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64>;
+
+    /// The drive's early warning (#420; `layout-session.md`, the Store
+    /// seam): `None` until the store's first refused block write, then
+    /// `Some` for the rest of the STORE'S life — sticky, not reset by a
+    /// reposition, because a store is opened for one contact and the
+    /// warning is a fact about that contact's medium. A new store over the
+    /// same cartridge (a resumed session) starts at `None`: past the
+    /// warning, the drive refuses its first block write there again. The
+    /// write session asks after every `Written` entry.
+    ///
+    /// The default is `None`: a store with no early warning (the
+    /// [`Self::eod_at_or_before`] pattern).
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        None
+    }
 
     /// Run the keyless integrity chain walk (`volume-format-v2.md` §5)
     /// against `layout` at the requested `tier`. Never fails with `Err` over
@@ -659,6 +688,21 @@ pub trait Store {
         Ok(false)
     }
 
+    /// How many whole files the medium holds, counted by the filemarks from
+    /// the beginning of the tape — the number `N` whose last file, `N - 1`,
+    /// is where `volume-format-v2.md` §1.2 rule 6 finds a seal on a medium
+    /// that ends before the planned one ([`locate_seal`], #420). Asked only
+    /// right after [`Self::eod_at_or_before`] said yes: st's own file count
+    /// at END OF DATA (`MTIOCGET`'s `mt_fileno`, the count
+    /// [`Self::reposition_at_most`] takes), where a file with no filemark
+    /// after it is no file. Moves nothing.
+    ///
+    /// `Ok(None)` is "no evidence": the default, for a store that cannot
+    /// count, and a store whose status does not show END OF DATA.
+    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+        Ok(None)
+    }
+
     /// Erase the medium (`cartridge erase`, ADR-0012 2026-10-12 items 51
     /// and 52). Moves the head; the next read repositions as usual.
     ///
@@ -753,6 +797,131 @@ fn oversized(position: u32, what: &str) -> TapectlError {
          stopped reading it there rather than hold it in memory",
         SMALL_FILE_CAP / (1024 * 1024)
     ))
+}
+
+/// What [`locate_seal`] found where `volume-format-v2.md` §1.2 rule 6 looks
+/// for the seal marker: raw, unparsed. Whether the bytes are a seal, and
+/// which seal a reader accepts at that position (full at the planned one, a
+/// short seal only before it), is the parser's and the caller's
+/// (`format.rs`, §4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SealLocation {
+    /// A file was read where the seal would be: at the planned position, or,
+    /// on a medium that ends before it, the last file on the medium
+    /// (`position` below the planned one). Its block-padded bytes, which may
+    /// be empty (a filemark-only file) and may or may not parse as a seal.
+    File { position: u32, bytes: Vec<u8> },
+    /// A file larger than [`SMALL_FILE_CAP`] is there: no seal marker, and
+    /// nothing past the cap was read.
+    Oversized { position: u32 },
+    /// No file at all: the medium shows END OF DATA at or before the planned
+    /// position, and holds no file.
+    Absent,
+    /// A read failed and nothing shows there is no file there (#460): the
+    /// planned position with no END OF DATA proven at or before it, the last
+    /// file on the medium, or a medium that ends before the planned position
+    /// but whose files the store cannot count. There may be a seal the drive
+    /// cannot read just now. NEVER absent: no caller reads it as unsealed.
+    Unreadable { position: u32, error: String },
+}
+
+impl SealLocation {
+    /// Where the file was read or failed to read; `None` for
+    /// [`Self::Absent`].
+    pub fn position(&self) -> Option<u32> {
+        match self {
+            Self::File { position, .. }
+            | Self::Oversized { position }
+            | Self::Unreadable { position, .. } => Some(*position),
+            Self::Absent => None,
+        }
+    }
+}
+
+/// Find the seal marker's file by `volume-format-v2.md` §1.2 rule 6 (#420):
+/// the one implementation over the [`Store`] trait, for every reader that
+/// needs the seal (`layout-session.md`, the Store seam). `planned` is the
+/// planned position: File 0's `[layout] seal_marker`, File 3's
+/// `seal_marker` entry, or the catalog's Layout.
+///
+/// 1. Read the file at `planned` ([`read_small`]: bounded).
+/// 2. When that read fails, or reads nothing — st answers a read AT end of
+///    data with 0 bytes, as it does a filemark-only file (#327) — ask the
+///    store whether its medium ends at or before `planned`
+///    ([`Store::eod_at_or_before`]). If it does, the medium holds `N`
+///    whole files ([`Store::files_on_medium`]: st's file count at END OF
+///    DATA, a file with no filemark after it not counted) and the seal is
+///    the last, `N - 1`: read it. `N = 0` is [`SealLocation::Absent`].
+/// 3. A failed read with no END OF DATA shown at or before `planned`, or a
+///    medium that ends there but cannot be counted, is
+///    [`SealLocation::Unreadable`] — never absent (#460).
+///
+/// It moves the head only by the store's own reads: on a tape, rewinds and
+/// spaces over filemarks. Never READ POSITION or LOCATE.
+pub fn locate_seal(store: &mut dyn Store, planned: u32) -> SealLocation {
+    let failed = match read_small(store, planned) {
+        Ok(SmallRead::Bytes(bytes)) if !bytes.is_empty() => {
+            return SealLocation::File {
+                position: planned,
+                bytes,
+            }
+        }
+        Ok(SmallRead::Bytes(empty)) => {
+            if !store.eod_at_or_before(planned).unwrap_or(false) {
+                // A filemark-only file, not the end of the medium.
+                return SealLocation::File {
+                    position: planned,
+                    bytes: empty,
+                };
+            }
+            None
+        }
+        Ok(SmallRead::Oversized) => return SealLocation::Oversized { position: planned },
+        Err(e) => {
+            if !store.eod_at_or_before(planned).unwrap_or(false) {
+                return SealLocation::Unreadable {
+                    position: planned,
+                    error: e.to_string(),
+                };
+            }
+            Some(e)
+        }
+    };
+
+    // The medium ends at or before the planned position: the seal, if
+    // there is one, is the last file on it.
+    let files = match store.files_on_medium() {
+        Ok(Some(n)) if n <= planned => n,
+        counted => {
+            let why = match counted {
+                Err(e) => format!("counting them failed: {e}"),
+                Ok(Some(n)) => format!("the store counts {n}, not fewer than {planned}"),
+                Ok(None) => "the store cannot count them".to_string(),
+            };
+            let read = failed.map_or_else(|| "read nothing".to_string(), |e| e.to_string());
+            return SealLocation::Unreadable {
+                position: planned,
+                error: format!(
+                    "{read}; the medium ends at or before file {planned}, but the files on it \
+                     are not known: {why}"
+                ),
+            };
+        }
+    };
+    let Some(last) = files.checked_sub(1) else {
+        return SealLocation::Absent;
+    };
+    match read_small(store, last) {
+        Ok(SmallRead::Bytes(bytes)) => SealLocation::File {
+            position: last,
+            bytes,
+        },
+        Ok(SmallRead::Oversized) => SealLocation::Oversized { position: last },
+        Err(e) => SealLocation::Unreadable {
+            position: last,
+            error: e.to_string(),
+        },
+    }
 }
 
 /// A sink for one small parsed file inside the chain walk: it keeps up to
@@ -1403,9 +1572,16 @@ pub(crate) trait TapeOps: Send {
     /// The st LONG erase from the head onward (`MTERASE`, count 1): what
     /// `cartridge erase --long` asks for (ADR-0012 2026-10-12 item 52).
     fn erase_long(&mut self) -> Result<()>;
+    /// The early warning, once a block write of this device was refused
+    /// (#420): [`Store::early_warning`]'s answer, sticky for the device's
+    /// life.
+    fn early_warning(&self) -> Option<EarlyWarning>;
 }
 
 impl TapeOps for TapeDevice {
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        TapeDevice::early_warning(self)
+    }
     fn block_size(&self) -> usize {
         TapeDevice::block_size(self)
     }
@@ -1607,6 +1783,9 @@ impl TapeOps for CountedOps {
     fn erase_long(&mut self) -> Result<()> {
         self.inner.erase_long()
     }
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.inner.early_warning()
+    }
 }
 
 /// How much `TapeDevice` reads at a time in variable-block mode — its
@@ -1783,6 +1962,13 @@ impl Store for TapeStore {
         self.dev.write_stream(src, len, sync)
     }
 
+    /// The device's: its block writes retry st's refusals through
+    /// `tape::ioctl::write_block_retrying`, and it keeps the warning for its
+    /// life, which is this store's.
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.dev.early_warning()
+    }
+
     // confirm: default trait method (T6 finding #1) — identical to what this
     // impl used to define directly. Its chain walk reads in ascending
     // position order after the seal marker, which is what lets the cursor
@@ -1898,6 +2084,19 @@ impl Store for TapeStore {
         let st = self.dev.position()?;
         Ok(st.at_eod && u32::try_from(st.file_number).is_ok_and(|m| m <= position))
     }
+
+    /// st's own file number, when its status shows END OF DATA: the
+    /// filemarks the space or read crossed from the beginning of the tape
+    /// before it met end of data, so the whole files the medium holds — the
+    /// count [`Self::reposition_at_most`] repositions to. A count st has
+    /// lost (`-1`), or a status that is not END OF DATA, is no evidence.
+    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+        let st = self.dev.position()?;
+        Ok(st
+            .at_eod
+            .then(|| u32::try_from(st.file_number).ok())
+            .flatten())
+    }
     /// Short: the trait's filemark at BOT. Long: rewind, the st long erase,
     /// rewind. The cursor is `Unknown` after either, so the next read
     /// rewinds.
@@ -1932,10 +2131,94 @@ pub struct MemStore {
     pub syncs: Vec<bool>,
     block_size: usize,
     usable_bytes: u64,
-    /// If set, `execute()` fails with a simulated ENOSPC once the
-    /// cumulative padded bytes already recorded plus this call's would
-    /// exceed the budget. See [`Self::with_enospc_after`].
+    /// The hard end: a block that would take the cumulative padded bytes
+    /// recorded past this is refused, every time. See
+    /// [`Self::with_enospc_after`].
     enospc_after_bytes: Option<u64>,
+    /// How the medium answers past its early warning, and the hazards a
+    /// test can set (#420).
+    end: MediumEnd,
+    /// The bytes `execute` has accepted since the store was made, and the
+    /// early warning once a block was refused (#420).
+    warning: EarlyWarningState,
+}
+
+/// How a test double's medium answers block writes and filemarks at its end
+/// (#420): st's behaviour past the early warning as measured on home2's HP
+/// LTO-6 (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`), shared by
+/// [`MemStore`] and the in-memory `FakeTape` so both drive
+/// [`write_block_retrying`] the way the drive does. Positions are stored
+/// bytes from the beginning of the medium.
+///
+/// - **The early warning** (`early_warning_at`): the block whose end reaches
+///   it is accepted and arms a refusal. The next block write is refused at
+///   once with ENOSPC and writes nothing; the one after is accepted and
+///   arms again; and so on — `refusal_run` refusals after each accepted
+///   block (st's usual is 1; runs of up to 3 were measured).
+/// - **A filemark** is accepted at once and disarms: after the warning, the
+///   immediate filemark, the seal block and the synchronous filemark were
+///   each accepted on their first attempt.
+/// - **The hard end** (the double's own capacity, passed in): a block that
+///   would take the medium past it is refused, every time.
+/// - **Hazards a test sets:** `refused_blocks_land` — a "refused" block was
+///   in fact written, so the retry duplicates it (what the readback past the
+///   warning must catch, ADR-0012 item 114); `filemarks_refused_from` — a
+///   filemark is refused once the medium holds that many bytes (W3, W6).
+/// - Any head motion ends the alternation, as st's own state ends on one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MediumEnd {
+    pub(crate) early_warning_at: Option<u64>,
+    /// Refusals after each accepted block past the warning; 0 means 1.
+    pub(crate) refusal_run: u32,
+    pub(crate) refused_blocks_land: bool,
+    pub(crate) filemarks_refused_from: Option<u64>,
+    /// Refusals armed for the next block writes.
+    armed: u32,
+}
+
+impl MediumEnd {
+    /// st's answer to one block `write(2)` on a medium holding `stored`
+    /// bytes, whose hard end is `hard_end`. `land` records bytes on the
+    /// medium.
+    pub(crate) fn write_block(
+        &mut self,
+        stored: u64,
+        hard_end: Option<u64>,
+        block: &[u8],
+        land: &mut dyn FnMut(&[u8]),
+    ) -> io::Result<usize> {
+        let len = block.len() as u64;
+        if hard_end.is_some_and(|end| stored + len > end) {
+            return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
+        }
+        if self.armed > 0 {
+            self.armed -= 1;
+            if self.refused_blocks_land {
+                land(block);
+            }
+            return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
+        }
+        land(block);
+        if self.early_warning_at.is_some_and(|at| stored + len >= at) {
+            self.armed = self.refusal_run.max(1);
+        }
+        Ok(block.len())
+    }
+
+    /// st's answer to one filemark on a medium holding `stored` bytes. Never
+    /// retried by the store (W3).
+    pub(crate) fn write_filemark(&mut self, stored: u64) -> io::Result<()> {
+        if self.filemarks_refused_from.is_some_and(|at| stored >= at) {
+            return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
+        }
+        self.armed = 0;
+        Ok(())
+    }
+
+    /// The head moved: st's alternation starts again.
+    pub(crate) fn moved(&mut self) {
+        self.armed = 0;
+    }
 }
 
 impl MemStore {
@@ -1949,7 +2232,45 @@ impl MemStore {
             block_size,
             usable_bytes: u64::MAX,
             enospc_after_bytes: None,
+            end: MediumEnd::default(),
+            warning: EarlyWarningState::default(),
         }
+    }
+
+    /// The drive's early warning after `bytes` stored bytes on the medium
+    /// (#420): from the block that reaches it, st's alternation
+    /// ([`MediumEnd`]) — a block refused at once after each one accepted,
+    /// which `execute` retries through the real
+    /// `tape::ioctl::write_block_retrying`, so every entry still lands
+    /// whole and [`Store::early_warning`] reports it. The hard end stays
+    /// [`Self::with_enospc_after`].
+    pub fn with_early_warning_after(mut self, bytes: u64) -> Self {
+        self.end.early_warning_at = Some(bytes);
+        self
+    }
+
+    /// Past the early warning, refuse `run` block writes after each one
+    /// accepted, not one (#420: runs of up to 3 were measured). More than
+    /// 16 is the hard end at the next block.
+    pub fn with_refusal_run(mut self, run: u32) -> Self {
+        self.end.refusal_run = run;
+        self
+    }
+
+    /// The hazard the readback past the early warning exists for (#420,
+    /// ADR-0012 item 114): a block st reported refused was in fact written,
+    /// so the retry writes it twice and the entry holds one block too many.
+    pub fn with_refused_blocks_written(mut self) -> Self {
+        self.end.refused_blocks_land = true;
+        self
+    }
+
+    /// Refuse every filemark once the medium holds `bytes` stored bytes
+    /// (#420 W3): the store never retries one, so the entry fails as a full
+    /// medium.
+    pub fn with_filemarks_refused_from(mut self, bytes: u64) -> Self {
+        self.end.filemarks_refused_from = Some(bytes);
+        self
     }
 
     /// Override the capacity `capacity()` reports.
@@ -1959,17 +2280,20 @@ impl MemStore {
     }
 
     /// Simulate a medium that runs out of space after `budget` cumulative
-    /// padded bytes have been written: the next `execute()` call whose
-    /// write would cross that budget fails with a simulated ENOSPC instead
-    /// of succeeding, mirroring a real full medium
-    /// (`docs/design/layout-session.md`: "on write ENOSPC, stop, leave the
-    /// tape unsealed, mark the session aborted"). Without this, `execute()`
+    /// padded bytes have been written — the HARD END (#420): a block that
+    /// would cross the budget is refused every time, so the `execute()` call
+    /// whose write would cross it fails with ENOSPC as a full medium after
+    /// [`crate::tape::ioctl::MAX_REFUSALS_IN_A_ROW`] retries, and records
+    /// nothing of that entry, mirroring a real full medium
+    /// (`docs/design/layout-session.md`: on the hard end, stop, leave the
+    /// tape unsealed, mark the session aborted). Without this, `execute()`
     /// can only fail via a genuinely truncated source — this is what makes
     /// the session's ENOSPC clean-abort path unit-testable with no tape
     /// hardware (T6 behavior 3). Distinct from [`Self::with_usable_bytes`]:
     /// that changes what `capacity()` *reports* (the pre-flight validate-time
     /// oracle); this changes what `execute()` *does* mid-write (the rare-miss
-    /// backstop past that pre-flight gate, ADR-0007).
+    /// backstop past that pre-flight gate, ADR-0007). Distinct, too, from
+    /// [`Self::with_early_warning_after`], whose refusals are retried.
     pub fn with_enospc_after(mut self, budget: u64) -> Self {
         self.enospc_after_bytes = Some(budget);
         self
@@ -1983,31 +2307,59 @@ impl Store for MemStore {
         })
     }
 
+    /// Block by block, as a tape takes it: each zero-padded block through
+    /// the real `write_block_retrying` against [`MediumEnd`], then the
+    /// filemark, never retried. An entry that fails — the hard end, a refused
+    /// filemark, a short source — records nothing: a MemStore file is a
+    /// whole file.
     fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
-        let padded_len = pad_to_blocks(len, self.block_size as u64);
-        if let Some(budget) = self.enospc_after_bytes {
-            let already_written: u64 = self.files.iter().map(|f| f.len() as u64).sum();
-            if already_written + padded_len > budget {
-                return Err(TapectlError::MediumFull(format!(
-                    "MemStore: simulated ENOSPC — writing {padded_len} more bytes would exceed \
-                     the {budget}-byte budget ({already_written} already recorded)"
-                )));
+        let bs = self.block_size.max(1);
+        let padded_len = pad_to_blocks(len, bs as u64);
+        let before: u64 = self.files.iter().map(|f| f.len() as u64).sum();
+        let mut file = Vec::with_capacity(padded_len as usize);
+        let mut block = vec![0u8; bs];
+        let mut read = 0u64;
+        while read < len {
+            let want = (len - read).min(bs as u64) as usize;
+            let mut got = 0;
+            while got < want {
+                let n = src
+                    .read(&mut block[got..want])
+                    .map_err(|e| TapectlError::SourceIo(format!("read source: {e}")))?;
+                if n == 0 {
+                    return Err(TapectlError::SourceIo(format!(
+                        "source exhausted after {} of {len} declared bytes",
+                        read + got as u64
+                    )));
+                }
+                got += n;
             }
+            block[want..].fill(0);
+            read += want as u64;
+            let (end, hard_end) = (&mut self.end, self.enospc_after_bytes);
+            write_block_retrying(
+                |b| {
+                    let stored = before + file.len() as u64;
+                    end.write_block(stored, hard_end, b, &mut |l| file.extend(l))
+                },
+                &block,
+                &mut self.warning,
+            )
+            .map_err(|e| write_error("MemStore write", &e))?;
         }
-        let mut buf = Vec::with_capacity(len as usize);
-        src.take(len)
-            .read_to_end(&mut buf)
-            .map_err(|e| TapectlError::SourceIo(format!("read source: {e}")))?;
-        if (buf.len() as u64) < len {
-            return Err(TapectlError::SourceIo(format!(
-                "source exhausted after {} of {len} declared bytes",
-                buf.len()
-            )));
-        }
-        buf.resize(padded_len as usize, 0);
-        self.files.push(buf);
+        self.end
+            .write_filemark(before + file.len() as u64)
+            .map_err(|e| write_error("MemStore filemark", &e))?;
+        let written = file.len() as u64;
+        self.files.push(file);
         self.syncs.push(sync);
-        Ok(padded_len)
+        Ok(written)
+    }
+
+    /// `execute` retries refused blocks through the real
+    /// `write_block_retrying`, and keeps the warning for the store's life.
+    fn early_warning(&self) -> Option<EarlyWarning> {
+        self.warning.warning()
     }
 
     // confirm: default trait method (T6 finding #1) — identical to what this
@@ -2025,6 +2377,7 @@ impl Store for MemStore {
     fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
         self.files.truncate(file_index as usize);
         self.syncs.truncate(file_index as usize);
+        self.end.moved();
         Ok(())
     }
 
@@ -2045,6 +2398,11 @@ impl Store for MemStore {
         Ok(position as usize >= self.files.len())
     }
 
+    /// Every file recorded is a whole one.
+    fn files_on_medium(&mut self) -> Result<Option<u32>> {
+        Ok(Some(self.files.len() as u32))
+    }
+
     /// Short: the trait's filemark at BOT (one empty file). Long: nothing
     /// recorded at all.
     fn erase(&mut self, mode: EraseMode) -> Result<()> {
@@ -2056,6 +2414,7 @@ impl Store for MemStore {
             EraseMode::Long => {
                 self.files.clear();
                 self.syncs.clear();
+                self.end.moved();
             }
         }
         Ok(())
@@ -2407,9 +2766,335 @@ mod tests {
         assert!(store.execute(&mut Cursor::new(vec![1u8]), 1, false).is_ok());
         assert!(store.execute(&mut Cursor::new(vec![1u8]), 1, false).is_ok());
         let err = store.execute(&mut Cursor::new(vec![1u8]), 1, false);
-        assert!(err.is_err(), "third write must simulate ENOSPC");
+        assert!(
+            matches!(err, Err(TapectlError::MediumFull(ref m)) if m.contains("os error 28")),
+            "third write must simulate ENOSPC: {err:?}"
+        );
         // The failed call must not have recorded a partial/corrupt entry.
         assert_eq!(store.files.len(), 2);
+    }
+
+    // --- the early warning (#420, `volume-format-v2.md` §4.3) -----------
+
+    /// `n` blocks of `byte`, for the 4096-byte-block stores below.
+    fn blocks(byte: u8, n: usize) -> Vec<u8> {
+        vec![byte; n * 4096]
+    }
+
+    fn put(store: &mut dyn Store, bytes: &[u8]) -> Result<u64> {
+        store.execute(&mut Cursor::new(bytes.to_vec()), bytes.len() as u64, false)
+    }
+
+    /// MemStore past its early warning: st's alternation, retried by the
+    /// real `write_block_retrying`, so every entry lands whole and once, and
+    /// `early_warning()` reports it from the first refusal on — `None`
+    /// before, and sticky after, a reposition included.
+    #[test]
+    fn memstore_with_early_warning_after_lands_whole_entries_and_reports_it() {
+        let mut store = MemStore::new(4096).with_early_warning_after(3 * 4096);
+        put(&mut store, &blocks(1, 2)).unwrap();
+        assert_eq!(store.early_warning(), None);
+        put(&mut store, &blocks(2, 3)).unwrap();
+        assert_eq!(
+            store.early_warning(),
+            Some(EarlyWarning {
+                bytes_at: 3 * 4096,
+                refusals: 2
+            })
+        );
+        put(&mut store, &blocks(3, 1)).unwrap();
+        assert_eq!(store.files, vec![blocks(1, 2), blocks(2, 3), blocks(3, 1)]);
+        store.reposition_for_resume(3).unwrap();
+        assert_eq!(store.early_warning().unwrap().refusals, 2, "sticky");
+    }
+
+    /// The hard end past the warning: the entry fails as a full medium and,
+    /// a MemStore file being a whole file, records nothing of it. The
+    /// warning came first and stays.
+    #[test]
+    fn memstore_hard_end_past_the_warning_records_nothing_of_the_entry() {
+        let mut store = MemStore::new(4096)
+            .with_early_warning_after(4096)
+            .with_enospc_after(3 * 4096);
+        // The block that reaches the warning arms a refusal; the filemark
+        // after it disarms, as on the drive.
+        put(&mut store, &blocks(1, 1)).unwrap();
+        assert_eq!(store.early_warning(), None);
+        let err = put(&mut store, &blocks(2, 4)).unwrap_err();
+        assert!(matches!(err, TapectlError::MediumFull(_)), "{err:?}");
+        assert_eq!(store.files, vec![blocks(1, 1)]);
+        assert_eq!(
+            store.early_warning(),
+            Some(EarlyWarning {
+                bytes_at: 2 * 4096,
+                refusals: 1 + 16
+            }),
+            "one refusal retried at the warning, sixteen at the hard end"
+        );
+    }
+
+    /// MemStore's hazards, the same model as the FakeTape's: a refused block
+    /// that was written doubles under the retry; a refused filemark fails
+    /// the entry at once, unretried, with no refusal counted.
+    #[test]
+    fn memstore_hazards_double_a_refused_block_and_refuse_a_filemark() {
+        let mut store = MemStore::new(4096)
+            .with_early_warning_after(4096)
+            .with_refused_blocks_written();
+        put(&mut store, &[blocks(1, 1), blocks(2, 1)].concat()).unwrap();
+        assert_eq!(store.files, vec![[blocks(1, 1), blocks(2, 2)].concat()]);
+
+        let mut store = MemStore::new(4096).with_filemarks_refused_from(2 * 4096);
+        put(&mut store, &blocks(1, 1)).unwrap();
+        let err = put(&mut store, &blocks(2, 1)).unwrap_err();
+        assert!(matches!(err, TapectlError::MediumFull(_)), "{err:?}");
+        assert_eq!((store.files.len(), store.early_warning()), (1, None));
+    }
+
+    /// The same medium behind `TapeStore` (its device the FakeTape) and
+    /// behind MemStore: the same files, and the same warning reported
+    /// through `Store::early_warning` — the session's one question.
+    #[test]
+    fn tape_and_memory_stores_report_the_same_warning() {
+        use crate::tape::fake::FakeTape;
+        let fake = FakeTape::with_files(Vec::new(), 4096);
+        fake.early_warning_at(5 * 4096);
+        fake.state().end.refusal_run = 2;
+        let mut tape = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        let mut mem = MemStore::new(4096)
+            .with_early_warning_after(5 * 4096)
+            .with_refusal_run(2);
+        for store in [&mut tape as &mut dyn Store, &mut mem] {
+            put(store, &blocks(1, 4)).unwrap();
+            assert_eq!(store.early_warning(), None);
+            put(store, &blocks(2, 3)).unwrap();
+            put(store, &blocks(3, 2)).unwrap();
+        }
+        assert_eq!(fake.state().files, mem.files);
+        assert_eq!(tape.early_warning(), mem.early_warning());
+        assert_eq!(
+            tape.early_warning(),
+            Some(EarlyWarning {
+                bytes_at: 5 * 4096,
+                refusals: 2 * 2 + 2
+            })
+        );
+        // A store over a new open of the same medium starts afresh.
+        let reopened = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+        assert_eq!(reopened.early_warning(), None);
+    }
+
+    /// A store with no early warning answers `None` (the trait's default).
+    #[test]
+    fn the_default_store_has_no_early_warning_and_cannot_count_its_files() {
+        struct Plain(MemStore);
+        impl Store for Plain {
+            fn capacity(&mut self) -> Result<CapacityReport> {
+                self.0.capacity()
+            }
+            fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+                self.0.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.0.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.0.reposition_for_resume(file_index)
+            }
+        }
+        let mut plain = Plain(MemStore::new(4096).with_early_warning_after(0));
+        put(&mut plain, &blocks(1, 2)).unwrap();
+        assert!(plain.0.early_warning().is_some(), "positive control");
+        assert_eq!(plain.early_warning(), None);
+        assert_eq!(plain.files_on_medium().unwrap(), None);
+    }
+
+    // --- locate_seal (#420, `volume-format-v2.md` §1.2 rule 6) ------------
+
+    /// File `i` of the fixtures below: one 4096-byte block of `i + 1`.
+    fn nth_file(i: usize) -> Vec<u8> {
+        vec![i as u8 + 1; 4096]
+    }
+
+    fn mem_holding(files: usize) -> MemStore {
+        let mut mem = MemStore::new(4096);
+        mem.files = (0..files).map(nth_file).collect();
+        mem.syncs = vec![false; files];
+        mem
+    }
+
+    fn tape_holding(files: usize) -> (TapeStore, crate::tape::fake::FakeTape) {
+        let fake =
+            crate::tape::fake::FakeTape::with_files((0..files).map(nth_file).collect(), 4096);
+        (TapeStore::from_ops(fake.boxed(), 0).unwrap(), fake)
+    }
+
+    /// Only rewinds, forward spaces and reads: never READ POSITION or LOCATE.
+    fn spaces_only(fake: &crate::tape::fake::FakeTape) {
+        use crate::tape::fake::Op;
+        let ops = fake.ops();
+        assert!(
+            ops.iter()
+                .all(|op| matches!(op, Op::Rewind | Op::Space(_) | Op::ReadHead(_))),
+            "{ops:?}"
+        );
+    }
+
+    /// The tape holds a file at the planned position: that file, read
+    /// there, whatever it holds.
+    #[test]
+    fn locate_seal_reads_the_planned_position() {
+        let mut mem = mem_holding(6);
+        assert_eq!(
+            locate_seal(&mut mem, 5),
+            SealLocation::File {
+                position: 5,
+                bytes: nth_file(5)
+            }
+        );
+        assert_eq!(
+            locate_seal(&mut mem, 2),
+            SealLocation::File {
+                position: 2,
+                bytes: nth_file(2)
+            },
+            "a file that is not the last is still the one at the position"
+        );
+        let (mut tape, fake) = tape_holding(6);
+        assert_eq!(locate_seal(&mut tape, 5), locate_seal(&mut mem, 5));
+        spaces_only(&fake);
+    }
+
+    /// The medium ends before the planned position: the seal is the last
+    /// file on it, numbered from the store's count — whether the space to
+    /// the position fails at end of data or lands exactly on it (st reads 0
+    /// bytes there, as from a filemark-only file).
+    #[test]
+    fn locate_seal_reads_the_last_file_when_the_medium_ends_before_the_plan() {
+        let last = SealLocation::File {
+            position: 3,
+            bytes: nth_file(3),
+        };
+        let mut mem = mem_holding(4);
+        assert_eq!(locate_seal(&mut mem, 9), last);
+        assert_eq!(locate_seal(&mut mem, 4), last);
+        for planned in [9, 4] {
+            let (mut tape, fake) = tape_holding(4);
+            assert_eq!(locate_seal(&mut tape, planned), last, "planned {planned}");
+            spaces_only(&fake);
+        }
+
+        // A filemark-only last file is still the last file.
+        let mut mem = mem_holding(2);
+        mem.files[1].clear();
+        assert_eq!(
+            locate_seal(&mut mem, 6),
+            SealLocation::File {
+                position: 1,
+                bytes: Vec::new()
+            }
+        );
+    }
+
+    /// A filemark-only file AT the planned position, on a medium that goes
+    /// on past it, is that file: not the end of the medium.
+    #[test]
+    fn locate_seal_tells_an_empty_file_from_the_end_of_data() {
+        let mut files: Vec<Vec<u8>> = (0..5).map(nth_file).collect();
+        files[3].clear();
+        let fake = crate::tape::fake::FakeTape::with_files(files, 4096);
+        let mut tape = TapeStore::from_ops(fake.boxed(), 0).unwrap();
+        assert_eq!(
+            locate_seal(&mut tape, 3),
+            SealLocation::File {
+                position: 3,
+                bytes: Vec::new()
+            }
+        );
+    }
+
+    /// A read that fails without END OF DATA shown at or before it is
+    /// unreadable, never absent (#460): at the planned position, and at the
+    /// last file of a medium that ends before it.
+    #[test]
+    fn locate_seal_never_reads_a_failed_read_as_absent() {
+        let (mut tape, fake) = tape_holding(8);
+        fake.state().unreadable = vec![7];
+        assert!(matches!(
+            locate_seal(&mut tape, 7),
+            SealLocation::Unreadable { position: 7, .. }
+        ));
+
+        let (mut tape, fake) = tape_holding(4);
+        fake.state().unreadable = vec![3];
+        assert!(matches!(
+            locate_seal(&mut tape, 9),
+            SealLocation::Unreadable { position: 3, .. }
+        ));
+        spaces_only(&fake);
+
+        // A drive that cannot report its status proves nothing.
+        let (mut tape, fake) = tape_holding(4);
+        fake.state().position_fails = true;
+        assert!(matches!(
+            locate_seal(&mut tape, 9),
+            SealLocation::Unreadable { position: 9, .. }
+        ));
+    }
+
+    /// END OF DATA proven, but a store that cannot count the files on its
+    /// medium cannot say which is last: unreadable at the planned position,
+    /// never absent.
+    #[test]
+    fn locate_seal_without_a_count_is_unreadable() {
+        struct NoCount(MemStore);
+        impl Store for NoCount {
+            fn capacity(&mut self) -> Result<CapacityReport> {
+                self.0.capacity()
+            }
+            fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+                self.0.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.0.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.0.reposition_for_resume(file_index)
+            }
+            fn eod_at_or_before(&mut self, position: u32) -> Result<bool> {
+                self.0.eod_at_or_before(position)
+            }
+        }
+        let got = locate_seal(&mut NoCount(mem_holding(4)), 9);
+        assert!(
+            matches!(&got, SealLocation::Unreadable { position: 9, error }
+                if error.contains("cannot count")),
+            "{got:?}"
+        );
+    }
+
+    /// A medium with no file on it has no seal anywhere: absent, the one
+    /// answer that needs END OF DATA at the beginning of the tape.
+    #[test]
+    fn locate_seal_on_an_empty_medium_is_absent() {
+        assert_eq!(locate_seal(&mut mem_holding(0), 5), SealLocation::Absent);
+        let (mut tape, fake) = tape_holding(0);
+        assert_eq!(locate_seal(&mut tape, 5), SealLocation::Absent);
+        spaces_only(&fake);
+    }
+
+    /// A file larger than any seal at the planned position is no seal, and
+    /// is read no further than the cap; the medium is not searched past it.
+    #[test]
+    fn locate_seal_reports_an_oversized_file_and_reads_no_further() {
+        let mut mem = mem_holding(3);
+        mem.files[2] = vec![9; SMALL_FILE_CAP as usize + 4096];
+        assert_eq!(
+            locate_seal(&mut mem, 2),
+            SealLocation::Oversized { position: 2 }
+        );
+        assert_eq!(locate_seal(&mut mem, 2).position(), Some(2));
+        assert_eq!(SealLocation::Absent.position(), None);
     }
 
     // --- the write confirm's tier (issue #387) ---------------------------
@@ -3924,9 +4609,7 @@ mod tests {
             inner: MemStore {
                 files: mem.files.clone(),
                 syncs: mem.syncs.clone(),
-                block_size: BS as usize,
-                usable_bytes: u64::MAX,
-                enospc_after_bytes: None,
+                ..MemStore::new(BS as usize)
             },
             fault_at: 2,
         }
