@@ -1120,12 +1120,22 @@ The tape commands also run at a higher priority than the work they compete with
 raises a tape command as root and then drops to the service user;
 `first-run.sh` step 13 raises its own shell once (`sudo renice`), and the
 commands it starts inherit that; `tapectl-drive-poll.service` sets the same
-with `Nice=` and `IOSchedulingClass=`. That outranks other processes *on this host*; it does not
-replace the quiet, and it cannot help against a guest or another host sharing
-the CPUs or the disks. To see what a running write got, find its process
-(`pgrep -x tapectl`) and read `ps -o pid,ni -p <pid>` and `ionice -p <pid>`. On
-home2 the remaining lever, lowering the weight of the guest `vm-desk1`, is
-printed (never applied) by `contrib/hosts/home2-prep.sh`; it is a host decision.
+with `Nice=` and `IOSchedulingClass=`. Neither replaces the quiet, and each
+reaches less than its name suggests:
+- **nice** ranks the tape command only among processes in its own cgroup. The
+  kernel shares a CPU between cgroups by group weight, so a guest's vCPUs or a
+  container in another cgroup are not outranked.
+- **The I/O level** takes effect only on a disk whose I/O scheduler acts on
+  priorities (`cat /sys/block/<dev>/queue/scheduler`). bfq does;
+  mq-deadline does not before Linux 5.14.
+
+On home2 as configured (measured 2026-10-20, #488), neither reaches what
+competes with a write: `vm-desk1`'s vCPU threads run in libvirtd's cgroup, and
+the staging disks use mq-deadline on a 4.19 kernel. The lever that does work
+there is CPU affinity (pinning), a host decision that
+`contrib/hosts/home2-prep.sh` §9 describes and never applies. To see what a
+running write got, find its process (`pgrep -x tapectl`) and read
+`ps -o pid,ni -p <pid>` and `ionice -p <pid>`.
 
 The write itself needs no supervision once it is streaming; the drive's
 counters afterwards say whether the feed held: `tapectl volume info <label>`

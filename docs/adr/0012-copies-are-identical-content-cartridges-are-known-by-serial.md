@@ -1882,3 +1882,27 @@ Ruled 2026-10-20, on #420's build plan (the forks the plan found that items 76-1
      point to one real 1 GiB ciphertext file, placed between real units. The write reaches the
      early warning, the cut is real, and so are the restore, rebuild and rewrite-on-the-next-tape
      of the real units around it. Considered and not chosen: 2.6 TB of real staged data.
+
+Ruled 2026-10-20 (later), on the coordinator's round of open questions:
+
+116. **1.6.0's golden re-pin is authorized for the moves items 111-115 name, and nothing else.**
+     These are File 0's `requires = ["short-seal"]` line, MANIFEST.toml's `may_end_early = true`,
+     and RESTORE.sh's reading of the short seal (`volume-format-v2.md` §4.2: the seal read after
+     File 3, the file map trimmed to `ended_after`, cut units refused or marked by name,
+     `KNOWN_FEATURES` and the "needs tapectl 1.6.0" text). The coordinator re-pins without a
+     further review. Any pinned byte that moves for another reason goes to the CTO first. The
+     authorization ends when v1.6.0 is installed on home2.
+117. **The 1.6.0 acceptance run is authorized** (items 110 and 115) on test cartridge EW7VWMVKF6
+     in a throwaway home, once the whole chain is green on the 1.6.0 candidate. The coordinator
+     tells the operator when it is ready, and the operator loads the cartridge and starts it.
+     #488's drive phase (about 2 hours, research build for measuring only) is approved for the same
+     day in a separate load. It leaves out the loads that need the host owner, the java service
+     (L3) and CPU pinning (R11).
+118. **home2 installs 1.6.0 with `post_warning_bytes = "99008M"`** in its `[[backends.lto]]` block
+     (the profile's `--emit` figure), after the acceptance run passes, so item 113's planning past
+     the fill ceiling is live in production.
+119. **Logical Block Protection (#388) is built after #420 and #478.** Its open questions
+     (`docs/research/2026-10-16-logical-block-protection.md` §9) are put to the CTO then.
+120. **LTO-5 will be written from home2's LTO-6 drive.** #482's real-drive evidence (a real LTO-5
+     cartridge through init, write, verify, restore and RESTORE.sh) is deferred until the CTO
+     asks for it.

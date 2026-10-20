@@ -212,32 +212,27 @@ elif part "Install $SUDOERS: '$RULE' (validated with visudo first)?"; then
 fi
 
 # ------------------------------------------------------------------ 9
-hdr "9  Optional host lever for the drive's feed (printed, never applied)"
+hdr "9  Host levers for the drive's feed: what works here (printed, never applied)"
 cat <<EOF
    tapectl raises its own tape commands' priority (TAPE_NICE / TAPE_IONICE in
-   home2.profile, issue #432). That outranks other work INSIDE this host's
-   scheduler, but $VM is a guest: its vCPUs and its disks compete with the
-   tape feed from outside it. Two libvirt weights narrow that. Both are
-   relative shares, so they slow $VM only while $(hostname) is contended and
-   change nothing when it is quiet:
+   home2.profile, issue #432). On this host as configured, neither reaches what
+   competes with a write (measured 2026-10-20, issue #488; research note
+   docs/research/2026-10-20-write-shaping.md §5.7):
+   - nice ranks tapectl only among tasks in its own cgroup. $VM's vCPU
+     threads run in system.slice/libvirtd.service and docker's java in
+     another, and the kernel shares a CPU between cgroups by group weight.
+   - ionice changes nothing: the staging disks use mq-deadline, which on this
+     kernel (4.19) does not act on I/O priority.
+   - The libvirt weights this section used to print (virsh schedinfo
+     cpu_shares, virsh blkiotune) write $VM's machine cgroup, which holds none
+     of its vCPU threads here; blkiotune also needs cfq or bfq. As placed
+     today, neither changes anything, so they are no longer suggested.
 
-     virsh -c qemu:///system schedinfo $VM --set cpu_shares=256 --live --config
-         (cpu_shares: the default is 1024; 256 gives $VM a quarter of the
-          weight it has now against everything else on this host)
-     virsh -c qemu:///system blkiotune $VM --weight 100 --live --config
-         (disk weight: the default is 500, the range 100-1000; per disk:
-          --device-weights /dev/<its backing device>,100)
-
-   Read the current values first:
-     virsh -c qemu:///system schedinfo $VM
-     virsh -c qemu:///system blkiotune $VM
-
-   Whether to apply either is a HOST decision between the CTO and homorg's
-   founder, whose work runs in $VM: this script does not do it. The disk weight
-   only bites on a block device whose I/O scheduler honours weights (cfq or bfq:
-   cat /sys/block/<dev>/queue/scheduler). To put a value back:
-     virsh -c qemu:///system schedinfo $VM --set cpu_shares=1024 --live --config
-     virsh -c qemu:///system blkiotune $VM --weight 500 --live --config
+   The lever that does work is CPU affinity: virsh vcpupin and emulatorpin for
+   $VM (the cpuset controller places its threads correctly) and taskset for
+   tapectl. Whether to pin, and which cores, is a HOST decision between the
+   CTO and homorg's founder, whose work runs in $VM, and it waits for #488's
+   measurements. This script does not do it.
 EOF
 
 hdr "Next"
