@@ -187,6 +187,10 @@ pub fn pad_to_blocks(size: u64, block_size: u64) -> u64 {
 pub struct CapacityBudget {
     pub available_bytes: u64,
     pub reserve_bytes: u64,
+    /// ADR-0012 item 113's plan bound; `None` stops a plan at the fill
+    /// ceiling as before 1.6.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_bound_bytes: Option<u64>,
 }
 
 /// How [`Layout::validate`] checks each staged slice before the tape moves —
@@ -781,6 +785,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: available,
                 reserve_bytes: reserve,
+                plan_bound_bytes: None,
             },
             entries,
         }

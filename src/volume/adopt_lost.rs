@@ -401,6 +401,7 @@ fn record_adoption(
         budget: CapacityBudget {
             available_bytes: 0,
             reserve_bytes: 0,
+            plan_bound_bytes: None,
         },
         entries: tape
             .entries

@@ -3294,6 +3294,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 1000 * BS,
                 reserve_bytes: BS,
+                plan_bound_bytes: None,
             },
             entries,
         };
@@ -3928,6 +3929,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 1,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![LayoutEntry {
                 position: 0,
@@ -3951,6 +3953,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 1,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![LayoutEntry {
                 position: 0,

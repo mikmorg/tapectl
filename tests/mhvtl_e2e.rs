@@ -1341,6 +1341,7 @@ fn tape_confirm_evidence(device: &str, block_size: usize, tier: Tier) -> Evidenc
         budget: CapacityBudget {
             available_bytes: 0,
             reserve_bytes: 0,
+            plan_bound_bytes: None,
         },
         entries,
     };

@@ -5332,6 +5332,7 @@ fn verify_contacted(
         budget: CapacityBudget {
             available_bytes: 0,
             reserve_bytes: 0,
+            plan_bound_bytes: None,
         },
         entries,
     };
@@ -7034,6 +7035,7 @@ pub(crate) fn write_catalog_preflight_in(
         budget: CapacityBudget {
             available_bytes: u64::MAX,
             reserve_bytes: 0,
+            plan_bound_bytes: None,
         },
         entries: Vec::new(),
     };
@@ -8981,6 +8983,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 0,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![LayoutEntry {
                 position: 4,
@@ -12415,6 +12418,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 1_000_000_000,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![],
         };
@@ -12510,6 +12514,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 1_000_000_000,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![
                 LayoutEntry {
@@ -14506,6 +14511,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 1_000_000_000,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![
                 LayoutEntry {
@@ -14696,6 +14702,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 0,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![
                 LayoutEntry {
@@ -14774,6 +14781,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 0,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![],
         };
@@ -14811,6 +14819,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 0,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![],
         };
@@ -14884,6 +14893,7 @@ mod tests {
             budget: CapacityBudget {
                 available_bytes: 0,
                 reserve_bytes: 0,
+                plan_bound_bytes: None,
             },
             entries: vec![],
         };

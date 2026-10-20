@@ -579,6 +579,7 @@ pub fn build(inputs: &BuildInputs, session_dir: &Path) -> Result<BuiltLayout> {
         budget: CapacityBudget {
             available_bytes: inputs.usable_bytes,
             reserve_bytes: inputs.enospc_buffer,
+            plan_bound_bytes: None,
         },
         entries,
     };
