@@ -6184,26 +6184,99 @@ fn append_files_entries(s: &mut String, files: &[FrontIndexFile]) {
     }
 }
 
-/// Generate the plaintext **seal marker** (the last file, layout v2). Its
-/// presence is the completeness assertion — "every file before me is present" —
-/// and its `front_index_sha256` binds the front index, making the seal marker
-/// the unhashed root of the keyless integrity chain (seal marker → front index →
-/// every content file; ADR-0007, `volume-format-v2.md` §4). Its absence means
-/// the tape is legitimately unsealed (interrupted or EOT-aborted).
+/// Generate the plaintext **full seal marker** (the last file, layout v2, at
+/// the planned position M). Its presence is the completeness assertion —
+/// "every file before me is present" — and its `front_index_sha256` binds the
+/// front index, making the seal marker the unhashed root of the keyless
+/// integrity chain (seal marker → front index → every content file; ADR-0007,
+/// `volume-format-v2.md` §4). Its absence means the tape is legitimately
+/// unsealed (interrupted or EOT-aborted).
+///
+/// From 1.6.0 it is §4.1's **full seal**: `requires = ["short-seal"]` (every
+/// 1.6.0 seal, full or short, ADR-0012 item 111) and `ended_after =
+/// file_count - 2`, the last data slice. `build` sizes the seal placeholder
+/// with this function, and a short seal ([`generate_short_seal_marker`]) is
+/// never longer than it.
 ///
 /// `files` is the **embedded full copy of the front index** (ratified
-/// 2026-07-22): two-ended redundancy — front-of-tape damage recovers the map
-/// from the tail; tail damage reads as unsealed but stays navigable from the
-/// front. By seal time File 3's bytes are known, so the caller fills in File 3's
-/// own `size_bytes` + `sha256_encrypted` (more complete than File 3 itself);
-/// only the seal marker's own entry stays hash-less (self-reference). The copy
-/// is not hash-protected by anything on the tape — readers validate its per-file
-/// claims by hashing the files they describe (`volume-format-v2.md` §4).
+/// 2026-07-22), entries 0 to M: two-ended redundancy — front-of-tape damage
+/// recovers the map from the tail; tail damage reads as unsealed but stays
+/// navigable from the front. By seal time File 3's bytes are known, so the
+/// caller fills in File 3's own `size_bytes` + `sha256_encrypted` (more
+/// complete than File 3 itself); only the seal marker's own entry stays
+/// hash-less (self-reference). The copy is not hash-protected by anything on
+/// the tape — readers validate its per-file claims by hashing the files they
+/// describe (`volume-format-v2.md` §4).
 pub fn generate_seal_marker(
     label: &str,
     file_count: i32,
     front_index_sha256: &str,
     files: &[FrontIndexFile],
+) -> String {
+    let mut s = seal_document(
+        label,
+        file_count,
+        i64::from(file_count) - 2,
+        front_index_sha256,
+    );
+    append_files_entries(&mut s, files);
+    s
+}
+
+/// Generate the plaintext **short seal marker** (`volume-format-v2.md` §4.1,
+/// tapectl 1.6.0): the seal at K+1 of a tape the drive's early warning ended
+/// after data slice K (§4.3 W4), `ended_after = K`, `file_count = K+2`.
+///
+/// `files_through_k` is File 3's entries 0 to K, with File 3's own entry
+/// filled in as for a full seal (its `size_bytes` and `sha256_encrypted`);
+/// this appends the seal's own bare entry at K+1 (`position` and `type`
+/// only, self-reference). Entry K+1 of File 3 plans a data slice there; the
+/// copy says what the tape holds.
+///
+/// The header is the full seal's, word for word, and the timestamp the same
+/// fixed width: a short seal is never longer than the placeholder `build`
+/// sized with [`generate_seal_marker`] (§4.1 "Length"), which
+/// `ReadyToSeal::seal` checks.
+pub fn generate_short_seal_marker(
+    label: &str,
+    ended_after: i32,
+    front_index_sha256: &str,
+    files_through_k: &[FrontIndexFile],
+) -> String {
+    debug_assert!(
+        files_through_k
+            .last()
+            .is_some_and(|f| f.position == ended_after),
+        "a short seal's copy runs to ended_after"
+    );
+    let mut s = seal_document(
+        label,
+        ended_after.saturating_add(2),
+        i64::from(ended_after),
+        front_index_sha256,
+    );
+    append_files_entries(&mut s, files_through_k);
+    append_files_entries(
+        &mut s,
+        &[FrontIndexFile {
+            position: ended_after.saturating_add(1),
+            type_label: "seal_marker",
+            size_bytes: None,
+            sha256_encrypted: None,
+        }],
+    );
+    s
+}
+
+/// The seal marker's human header and `[seal]` table, the same for a full
+/// and a short seal (`volume-format-v2.md` §4.1, "Grammar" and "The
+/// human-readable header"), so the two kinds cannot drift apart in anything
+/// but the numbers and the embedded copy.
+fn seal_document(
+    label: &str,
+    file_count: i32,
+    ended_after: i64,
+    front_index_sha256: &str,
 ) -> String {
     // FIXED-WIDTH timestamp, deliberately: the build step sizes the seal
     // marker with a placeholder and the seal step regenerates it with the
@@ -6219,7 +6292,7 @@ pub fn generate_seal_marker(
     // always — second precision is ample for an audit timestamp, and
     // fixed width is what the sizing trick actually requires.
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let mut s = format!(
+    format!(
         r#"================================================================
                     TAPECTL SEAL MARKER
 ================================================================
@@ -6227,8 +6300,11 @@ pub fn generate_seal_marker(
 Volume: {label}
 This file seals the tape: its presence means every file before it is
 present. Its absence means the tape is unsealed (interrupted or aborted).
-It binds the front index by the sha256 below. The [[files]] entries are
-a full copy of the front index (File 3), usable if File 3 is damaged —
+The tape may end before the last file the front index plans:
+ended_after below is the last file before this one, and a file the
+front index lists after it is not on this tape. It binds the front
+index by the sha256 below. The [[files]] entries are a copy of the
+front index (File 3) up to this file, usable if File 3 is damaged —
 verify any entry by hashing the file it describes.
 
 ================================================================
@@ -6238,14 +6314,13 @@ verify any entry by hashing the file it describes.
 [seal]
 volume = "{label}"
 layout_version = 2
-requires = []
+requires = ["short-seal"]
 file_count = {file_count}
+ended_after = {ended_after}
 sealed_at = "{now}"
 front_index_sha256 = "{front_index_sha256}"
 "#
-    );
-    append_files_entries(&mut s, files);
-    s
+    )
 }
 
 /// Generate MANIFEST.toml for a tenant envelope.
@@ -6707,15 +6782,56 @@ mod tests {
         }
     }
 
+    /// A seal's embedded copy for a plan of `m + 1` files that keeps
+    /// `volume-format-v2.md` §4.1's rules: Files 0-2, File 3 (filled in, as
+    /// the seal step fills it), the operator envelope at 4, data slices from
+    /// 5 to `m - 1`, the seal's own bare entry at `m`. Sizes and hashes have
+    /// production widths (a slice's size has 10 digits, a hash 64), so the
+    /// length tests below measure what a real seal measures.
+    fn planned_seal_copy(m: i32) -> Vec<FrontIndexFile> {
+        assert!(m >= 6, "a plan with at least one data slice");
+        (0..=m)
+            .map(|position| {
+                let type_label = match position {
+                    0 => "id_thunk",
+                    1 => "system_guide",
+                    2 => "restore_sh",
+                    3 => "front_index",
+                    4 => "operator_envelope",
+                    p if p == m => "seal_marker",
+                    _ => "data_slice",
+                };
+                let is_seal = position == m;
+                FrontIndexFile {
+                    position,
+                    type_label,
+                    size_bytes: (!is_seal).then(|| 1_073_741_824 + position as u64),
+                    sha256_encrypted: (!is_seal).then(|| format!("{position:064x}")),
+                }
+            })
+            .collect()
+    }
+
+    /// The copy a short seal at K+1 carries before its own entry: the
+    /// plan's entries 0 to K.
+    fn short_seal_copy(m: i32, k: i32) -> Vec<FrontIndexFile> {
+        planned_seal_copy(m).into_iter().take(k as usize + 1).collect()
+    }
+
     #[test]
     fn seal_marker_binds_front_index() {
-        let s = generate_seal_marker("TEST01", 7, "deadbeefcafe", &[]);
+        let s = generate_seal_marker("TEST01", 7, "deadbeefcafe", &planned_seal_copy(6));
         let body = &s[s.find("[seal]").expect("has [seal]")..];
         let parsed: toml::Value = body.parse().expect("TOML parses");
         let seal = parsed.get("seal").unwrap();
         assert_eq!(seal.get("volume").unwrap().as_str(), Some("TEST01"));
         assert_eq!(seal.get("layout_version").unwrap().as_integer(), Some(2));
         assert_eq!(seal.get("file_count").unwrap().as_integer(), Some(7));
+        assert_eq!(seal.get("ended_after").unwrap().as_integer(), Some(5));
+        assert_eq!(
+            seal.get("requires").unwrap().as_array().unwrap(),
+            &vec![toml::Value::String("short-seal".into())]
+        );
         assert_eq!(
             seal.get("front_index_sha256").unwrap().as_str(),
             Some("deadbeefcafe")
@@ -6723,6 +6839,160 @@ mod tests {
         // sealed_at is present and RFC3339-parseable.
         let sealed_at = seal.get("sealed_at").unwrap().as_str().unwrap();
         assert!(chrono::DateTime::parse_from_rfc3339(sealed_at).is_ok());
+    }
+
+    /// `volume-format-v2.md` §4.1 "Grammar": one `key = value` per line, in
+    /// exactly this order, on both kinds. RESTORE.sh's line-oriented reads
+    /// depend on it, so the lines are pinned as text, not as TOML.
+    #[test]
+    fn both_seals_write_the_seal_table_in_the_pinned_order() {
+        let fi = "ab".repeat(32);
+        let full = generate_seal_marker("ORDER1", 9, &fi, &planned_seal_copy(8));
+        let short = generate_short_seal_marker("ORDER1", 6, &fi, &short_seal_copy(8, 6));
+        for (seal, file_count, ended_after) in [(&full, 9, 7), (&short, 8, 6)] {
+            let table: Vec<&str> = seal[seal.find("[seal]").unwrap()..]
+                .lines()
+                .take_while(|l| !l.is_empty())
+                .collect();
+            let keys: Vec<&str> = table
+                .iter()
+                .skip(1)
+                .map(|l| l.split(" = ").next().unwrap())
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    "volume",
+                    "layout_version",
+                    "requires",
+                    "file_count",
+                    "ended_after",
+                    "sealed_at",
+                    "front_index_sha256"
+                ]
+            );
+            assert_eq!(table[1], "volume = \"ORDER1\"");
+            assert_eq!(table[2], "layout_version = 2");
+            assert_eq!(table[3], "requires = [\"short-seal\"]");
+            assert_eq!(table[4], format!("file_count = {file_count}"));
+            assert_eq!(table[5], format!("ended_after = {ended_after}"));
+            assert_eq!(table[7], format!("front_index_sha256 = \"{fi}\""));
+        }
+    }
+
+    /// §4.1 "The human-readable header": the same on both kinds, so it does
+    /// not change a seal's length, and exactly the spec's words.
+    #[test]
+    fn both_seals_carry_the_specs_header_word_for_word() {
+        let header = "================================================================
+                    TAPECTL SEAL MARKER
+================================================================
+
+Volume: HDR001
+This file seals the tape: its presence means every file before it is
+present. Its absence means the tape is unsealed (interrupted or aborted).
+The tape may end before the last file the front index plans:
+ended_after below is the last file before this one, and a file the
+front index lists after it is not on this tape. It binds the front
+index by the sha256 below. The [[files]] entries are a copy of the
+front index (File 3) up to this file, usable if File 3 is damaged —
+verify any entry by hashing the file it describes.
+
+================================================================
+              MACHINE-READABLE DATA (TOML)
+================================================================
+
+[seal]
+";
+        let full = generate_seal_marker("HDR001", 8, "fi", &planned_seal_copy(7));
+        let short = generate_short_seal_marker("HDR001", 5, "fi", &short_seal_copy(7, 5));
+        assert!(full.starts_with(header), "{full}");
+        assert!(short.starts_with(header), "{short}");
+    }
+
+    /// Both kinds round-trip through `format.rs`'s parser (A's reader), keep
+    /// rules S1-S5, and classify against the plan as §4.1 says: the full seal
+    /// `Full`, the short one `Short { ended_after: K }`.
+    #[test]
+    fn the_full_and_the_short_seal_round_trip_through_the_parser() {
+        use crate::volume::format::{parse_seal_marker, SealEnding};
+        let fi = "cd".repeat(32);
+        let m = 9;
+        let planned = (m + 1) as u64;
+
+        let full = parse_seal_marker(&generate_seal_marker(
+            "RTRIP1",
+            m + 1,
+            &fi,
+            &planned_seal_copy(m),
+        ))
+        .expect("a full 1.6.0 seal parses");
+        assert!(full.requires_short_seal());
+        assert_eq!(full.file_count, m + 1);
+        assert_eq!(full.ended_after, Some((m - 1) as u64));
+        assert_eq!(full.front_index_sha256, fi);
+        assert_eq!(full.files.len(), (m + 1) as usize);
+        assert_eq!(full.check_parse_rules(), Ok(()));
+        assert_eq!(full.ending(planned), SealEnding::Full);
+
+        for k in 5..=m - 2 {
+            let short = parse_seal_marker(&generate_short_seal_marker(
+                "RTRIP1",
+                k,
+                &fi,
+                &short_seal_copy(m, k),
+            ))
+            .unwrap_or_else(|e| panic!("the short seal at {} parses: {e}", k + 1));
+            assert!(short.requires_short_seal());
+            assert_eq!(short.file_count, k + 2);
+            assert_eq!(short.ended_after, Some(k as u64));
+            assert_eq!(short.front_index_sha256, fi, "it binds the same File 3");
+            assert_eq!(short.check_parse_rules(), Ok(()));
+            assert_eq!(
+                short.ending(planned),
+                SealEnding::Short {
+                    ended_after: k as u64
+                }
+            );
+            // Entries 0 to K are the plan's; its own entry at K+1 is bare.
+            let plan = planned_seal_copy(m);
+            assert_eq!(short.files.len(), (k + 2) as usize);
+            for (got, want) in short.files.iter().zip(&plan).take(k as usize + 1) {
+                assert_eq!(got.position, want.position);
+                assert_eq!(got.type_label, want.type_label);
+                assert_eq!(got.size_bytes, want.size_bytes);
+                assert_eq!(got.sha256_encrypted, want.sha256_encrypted);
+            }
+            let own = short.files.last().unwrap();
+            assert_eq!(own.position, k + 1);
+            assert_eq!(own.type_label, "seal_marker");
+            assert_eq!(own.size_bytes, None);
+            assert_eq!(own.sha256_encrypted, None);
+        }
+    }
+
+    /// §4.1 "Length": `build` sizes the seal with the full seal as a
+    /// placeholder, and a short seal must never be longer (the writer checks
+    /// `<=`, the full seal `==`). Every K from the first data slice to M-2,
+    /// over plans whose M crosses a digit boundary (9→10, 99→100, 999→1000),
+    /// where the short seal's numbers could be shortest relative to the
+    /// full one's.
+    #[test]
+    fn a_short_seal_is_never_longer_than_the_placeholder_build_sized() {
+        let fi = "ef".repeat(32);
+        for m in [6, 7, 9, 10, 11, 99, 100, 101, 999, 1000, 1001] {
+            let placeholder = generate_seal_marker("LEN001", m + 1, &fi, &planned_seal_copy(m));
+            for k in 5..=m - 2 {
+                let short = generate_short_seal_marker("LEN001", k, &fi, &short_seal_copy(m, k));
+                assert!(
+                    short.len() <= placeholder.len(),
+                    "M = {m}, K = {k}: the short seal ({} bytes) is longer than the \
+                     placeholder ({} bytes)",
+                    short.len(),
+                    placeholder.len()
+                );
+            }
+        }
     }
 
     #[test]
@@ -6734,21 +7004,19 @@ mod tests {
         // AutoSi (drops trailing-zero fractional digits -> 25/29/32/35-byte
         // outputs), which would break that ~1 write in 900. SecondsFormat::Secs
         // + use_z renders exactly 20 bytes, always.
-        let files = vec![FrontIndexFile {
-            position: 0,
-            type_label: "id_thunk",
-            size_bytes: Some(10),
-            sha256_encrypted: Some("aa".into()),
-        }];
-        let first = generate_seal_marker("TEST01", 2, "fi", &files);
+        let files = planned_seal_copy(7);
+        let first = generate_seal_marker("TEST01", 8, "fi", &files);
+        let first_short = generate_short_seal_marker("TEST01", 5, "fi", &files[..6]);
         for _ in 0..64 {
-            let again = generate_seal_marker("TEST01", 2, "fi", &files);
+            let again = generate_seal_marker("TEST01", 8, "fi", &files);
             assert_eq!(
                 first.len(),
                 again.len(),
                 "seal marker length varies between generations — the placeholder \
                  sizing trick (and therefore seal()) is broken"
             );
+            let again = generate_short_seal_marker("TEST01", 5, "fi", &files[..6]);
+            assert_eq!(first_short.len(), again.len(), "the short seal too");
         }
         // Pin the exact rendering too, so a future edit to the format is a
         // deliberate act rather than an accident.
@@ -6779,6 +7047,18 @@ mod tests {
                 sha256_encrypted: Some("aa00".into()),
             },
             FrontIndexFile {
+                position: 1,
+                type_label: "system_guide",
+                size_bytes: Some(600),
+                sha256_encrypted: Some("aa01".into()),
+            },
+            FrontIndexFile {
+                position: 2,
+                type_label: "restore_sh",
+                size_bytes: Some(700),
+                sha256_encrypted: Some("aa02".into()),
+            },
+            FrontIndexFile {
                 position: 3,
                 type_label: "front_index",
                 size_bytes: Some(2048),                // known at seal time
@@ -6786,26 +7066,34 @@ mod tests {
             },
             FrontIndexFile {
                 position: 4,
+                type_label: "data_slice",
+                size_bytes: Some(524288),
+                sha256_encrypted: Some("bb11".into()),
+            },
+            FrontIndexFile {
+                position: 5,
                 type_label: "seal_marker",
                 size_bytes: None,
                 sha256_encrypted: None, // self-reference: never hashable
             },
         ];
-        let s = generate_seal_marker("TEST01", 5, "fi99", &files);
+        let s = generate_seal_marker("TEST01", 6, "fi99", &files);
         let body = &s[s.find("[seal]").unwrap()..];
         let parsed: toml::Value = body.parse().expect("TOML parses");
         let arr = parsed.get("files").unwrap().as_array().unwrap();
-        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.len(), 6);
         // File 3's entry in the COPY carries size + hash (unlike in File 3).
-        assert_eq!(arr[1].get("type").unwrap().as_str(), Some("front_index"));
-        assert_eq!(arr[1].get("size_bytes").unwrap().as_integer(), Some(2048));
+        assert_eq!(arr[3].get("type").unwrap().as_str(), Some("front_index"));
+        assert_eq!(arr[3].get("size_bytes").unwrap().as_integer(), Some(2048));
         assert_eq!(
-            arr[1].get("sha256_encrypted").unwrap().as_str(),
+            arr[3].get("sha256_encrypted").unwrap().as_str(),
             Some("fi99")
         );
         // The seal marker's own entry stays hash-less.
-        assert_eq!(arr[2].get("type").unwrap().as_str(), Some("seal_marker"));
-        assert!(arr[2].get("sha256_encrypted").is_none());
+        assert_eq!(arr[5].get("type").unwrap().as_str(), Some("seal_marker"));
+        assert!(arr[5].get("sha256_encrypted").is_none());
+        // A consistent 1.6.0 seal: it parses by §4.1's rules.
+        assert!(crate::volume::format::parse_seal_marker(&s).is_ok());
         // The embedded copy's grammar matches the front index's byte-for-byte
         // (same emitter): the [[files]] tail of both documents is identical.
         let fi = generate_front_index("TEST01", &files);
