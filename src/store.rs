@@ -204,7 +204,7 @@ impl<'a> ConfirmPlan<'a> {
     /// Where the walk reads the seal on a Layout whose planned seal position
     /// is `planned`: M, or K+1 on a short ending.
     pub fn seal_position(&self, planned: u32) -> u32 {
-        self.ended_after.map_or(planned, |k| k + 1)
+        self.ended_after.map_or(planned, |k| k.saturating_add(1))
     }
 
     /// The same plan, reading the seal in `order`.
@@ -5671,6 +5671,7 @@ mod tests {
             let mut store = p.tape(K);
             for plan in [
                 ConfirmPlan::new(Tier::Navigable).with_ending(Some(M)),
+                ConfirmPlan::new(Tier::Navigable).with_ending(Some(u32::MAX)),
                 ConfirmPlan::new(Tier::Navigable).with_ending(Some(3)),
                 short(Tier::Navigable).reading_back(Some(K + 1)),
                 short(Tier::Navigable).reading_back(Some(3)),
