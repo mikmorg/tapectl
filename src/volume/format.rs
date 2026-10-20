@@ -1210,10 +1210,9 @@ mod forward_compat_tests {
         assert!(err.contains("newer tapectl"), "{err}");
         assert!(err.contains("tapectl 1.1.0"), "names the writer: {err}");
 
-        let s = parse_seal_marker(
-            &seal().replace("requires = []", "requires = [\"unknown-feature\"]"),
-        )
-        .expect("the seal still PARSES: a write-path contact check must see it as sealed");
+        let s =
+            parse_seal_marker(&seal().replace("requires = []", "requires = [\"unknown-feature\"]"))
+                .expect("the seal still PARSES: a write-path contact check must see it as sealed");
         let why = s.refusal().expect("refused");
         assert!(why.contains("\"unknown-feature\""), "{why}");
     }
@@ -1271,6 +1270,603 @@ mod forward_compat_tests {
         let s =
             parse_seal_marker(&seal().replace("layout_version = 2", "layout_version = 3")).unwrap();
         assert!(s.refusal().unwrap().contains("layout_version = 3"));
+    }
+}
+
+/// tapectl 1.6.0's seal and front-index grammar on the read side
+/// (`volume-format-v2.md` §3, §4.1; ADR-0012 items 110-111, #420). The seals
+/// here are written from §4.1's grammar as literals, not by
+/// `layout::generate_seal_marker`, so they pin the spec's bytes rather than
+/// whatever the generator emits.
+#[cfg(test)]
+mod short_seal_tests {
+    use super::*;
+
+    /// File 3's bytes in these fixtures, and the hash every seal here binds.
+    const FRONT_INDEX: &[u8] = b"[index]\nvolume = \"SS01\"\nlayout_version = 2\n";
+    const SHORT: &str = "[\"short-seal\"]";
+
+    fn front_index_sha256() -> String {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(FRONT_INDEX))
+    }
+
+    /// One `[[files]]` entry: position, type, and whether it carries
+    /// `size_bytes` and `sha256_encrypted` (every entry of a seal's copy
+    /// does, File 3's own included, except the seal's own).
+    type Entry = (i64, &'static str, bool);
+
+    /// The plan of a tape with `slices` data slices: Files 0-3, a tenant
+    /// envelope, the operator pair, the tenant backup, the slices from 8,
+    /// and the seal at M = 8 + slices — as a seal's embedded copy states it.
+    fn plan(slices: i64) -> Vec<Entry> {
+        let mut kinds = vec![
+            "id_thunk",
+            "system_guide",
+            "restore_sh",
+            "front_index",
+            "tenant_envelope",
+            "operator_envelope",
+            "operator_envelope_backup",
+            "tenant_envelope_backup",
+        ];
+        kinds.extend(std::iter::repeat_n("data_slice", slices as usize));
+        kinds.push("seal_marker");
+        kinds
+            .into_iter()
+            .enumerate()
+            .map(|(i, k)| (i as i64, k, k != "seal_marker"))
+            .collect()
+    }
+
+    /// A short seal's copy: the plan's entries 0 to `k`, then its own, bare,
+    /// at `k + 1` (§4.1).
+    fn short_entries(slices: i64, k: i64) -> Vec<Entry> {
+        let mut entries: Vec<Entry> = plan(slices).into_iter().take(k as usize + 1).collect();
+        entries.push((k + 1, "seal_marker", false));
+        entries
+    }
+
+    /// A seal marker as its `[seal]` keys and `[[files]]` copy state it.
+    struct Fixture {
+        /// The `requires` line's value; `None` writes no line (before 1.1.0).
+        requires: Option<&'static str>,
+        file_count: i64,
+        ended_after: Option<i64>,
+        entries: Vec<Entry>,
+    }
+
+    impl Fixture {
+        /// A full 1.6.0 seal over `plan(slices)`: at M, `ended_after = M-1`.
+        fn full(slices: i64) -> Fixture {
+            let entries = plan(slices);
+            let m = entries.len() as i64 - 1;
+            Fixture {
+                requires: Some(SHORT),
+                file_count: m + 1,
+                ended_after: Some(m - 1),
+                entries,
+            }
+        }
+
+        /// A short 1.6.0 seal at `k + 1` over `plan(slices)`.
+        fn short(slices: i64, k: i64) -> Fixture {
+            Fixture {
+                requires: Some(SHORT),
+                file_count: k + 2,
+                ended_after: Some(k),
+                entries: short_entries(slices, k),
+            }
+        }
+
+        /// A seal before 1.6.0 over `plan(slices)`: `requires = []`, no
+        /// `ended_after`.
+        fn before_1_6_0(slices: i64) -> Fixture {
+            let entries = plan(slices);
+            Fixture {
+                requires: Some("[]"),
+                file_count: entries.len() as i64,
+                ended_after: None,
+                entries,
+            }
+        }
+
+        /// The seal's bytes, in §4.1's grammar and key order.
+        fn text(&self) -> String {
+            let mut s = String::from(
+                "================================================================\n\
+                 TAPECTL SEAL MARKER\n\
+                 ================================================================\n\n\
+                 Volume: SS01\n\n\
+                 [seal]\n\
+                 volume = \"SS01\"\n\
+                 layout_version = 2\n",
+            );
+            if let Some(requires) = self.requires {
+                s.push_str(&format!("requires = {requires}\n"));
+            }
+            s.push_str(&format!("file_count = {}\n", self.file_count));
+            if let Some(k) = self.ended_after {
+                s.push_str(&format!("ended_after = {k}\n"));
+            }
+            s.push_str("sealed_at = \"2026-10-20T00:00:00Z\"\n");
+            s.push_str(&format!(
+                "front_index_sha256 = \"{}\"\n",
+                front_index_sha256()
+            ));
+            for (position, kind, sized) in &self.entries {
+                s.push_str(&format!(
+                    "\n[[files]]\nposition = {position}\ntype = \"{kind}\"\n"
+                ));
+                if *sized {
+                    s.push_str(&format!(
+                        "size_bytes = {}\nsha256_encrypted = \"{:064x}\"\n",
+                        1000 + position,
+                        position
+                    ));
+                }
+            }
+            s
+        }
+
+        /// The same seal as [`parse_seal_marker`] reads its fields, without
+        /// its rules: what [`ParsedSeal::check_parse_rules`] judges.
+        fn fields(&self) -> ParsedSeal {
+            ParsedSeal {
+                volume: "SS01".into(),
+                layout_version: 2,
+                file_count: self.file_count as i32,
+                ended_after: self.ended_after.map(|k| k as u64),
+                sealed_at: "2026-10-20T00:00:00Z".into(),
+                front_index_sha256: front_index_sha256(),
+                requires: match self.requires {
+                    Some(SHORT) => vec![SHORT_SEAL.to_string()],
+                    _ => Vec::new(),
+                },
+                files: self
+                    .entries
+                    .iter()
+                    .map(|(position, kind, sized)| ParsedIndexEntry {
+                        position: *position as i32,
+                        type_label: kind.to_string(),
+                        size_bytes: sized.then_some(1000 + *position as u64),
+                        sha256_encrypted: sized.then(|| format!("{position:064x}")),
+                    })
+                    .collect(),
+            }
+        }
+
+        /// It must not parse, and the error names `rule` (rule S6).
+        fn refused_naming(&self, rule: &str) -> String {
+            let err = parse_seal_marker(&self.text())
+                .expect_err("a seal breaking a parse rule is unparseable (S6)")
+                .to_string();
+            assert!(err.contains(rule), "names {rule}: {err}");
+            assert!(err.starts_with("seal marker: "), "{err}");
+            err
+        }
+    }
+
+    /// The positive control for every rule: a full 1.6.0 seal parses, states
+    /// `ended_after = M-1`, and its fields are what the fixture says.
+    #[test]
+    fn a_full_1_6_0_seal_parses_with_ended_after() {
+        let f = Fixture::full(4);
+        let seal = parse_seal_marker(&f.text()).expect("a full 1.6.0 seal parses");
+        assert_eq!(
+            seal,
+            f.fields(),
+            "the fixture's fields are what parse reads"
+        );
+        assert_eq!(seal.file_count, 13);
+        assert_eq!(seal.ended_after, Some(11));
+        assert_eq!(seal.effective_ended_after(), Some(11));
+        assert!(seal.requires_short_seal());
+        assert_eq!(seal.refusal(), None);
+        assert_eq!(seal.check_parse_rules(), Ok(()));
+        assert_eq!(seal.ending(13), SealEnding::Full);
+    }
+
+    /// §4.1's short seal: entries 0 to K and its own at K+1, `file_count =
+    /// K+2`, `ended_after = K`. It parses, padded as a tape read returns it,
+    /// at the first data slice, in the middle, and at M-2.
+    #[test]
+    fn a_short_seal_parses_and_classifies_short() {
+        let f = Fixture::short(4, 9);
+        let mut padded = f.text().into_bytes();
+        padded.resize(padded.len() + 4096, 0);
+        let seal = parse_seal_marker(&String::from_utf8(padded).unwrap())
+            .expect("a short seal parses, padding and all");
+        assert_eq!(seal, f.fields());
+        assert_eq!(seal.file_count, 11);
+        assert_eq!(seal.ended_after, Some(9));
+        assert_eq!(seal.files.len(), 11);
+        let own = seal.files.last().unwrap();
+        assert_eq!((own.position, own.type_label.as_str()), (10, "seal_marker"));
+        assert_eq!(
+            (own.size_bytes.as_ref(), own.sha256_encrypted.as_ref()),
+            (None, None)
+        );
+        assert_eq!(seal.ending(13), SealEnding::Short { ended_after: 9 });
+
+        for k in [8, 10] {
+            let seal = parse_seal_marker(&Fixture::short(4, k).text())
+                .unwrap_or_else(|e| panic!("K = {k}: {e}"));
+            assert_eq!(
+                seal.ending(13),
+                SealEnding::Short {
+                    ended_after: k as u64
+                }
+            );
+        }
+    }
+
+    /// Rule S1: `ended_after + 2 == file_count`, and `ended_after` is not
+    /// negative. One too few, one too many, and a negative value all fail.
+    #[test]
+    fn s1_ended_after_is_two_less_than_file_count() {
+        for (k, file_count) in [(10, 13), (12, 13), (9, 13), (9, 10)] {
+            let f = Fixture {
+                ended_after: Some(k),
+                file_count,
+                ..Fixture::full(4)
+            };
+            f.refused_naming("rule S1");
+            assert!(
+                matches!(
+                    f.fields().check_parse_rules(),
+                    Err(SealRuleViolation::EndedAfterNotFileCountLessTwo { .. })
+                ),
+                "k = {k}, file_count = {file_count}"
+            );
+        }
+        let err = Fixture {
+            ended_after: Some(-1),
+            ..Fixture::full(4)
+        }
+        .refused_naming("rule S1");
+        assert!(err.contains("ended_after = -1"), "{err}");
+    }
+
+    /// Rule S2, second half: a seal that states `ended_after` keeps S1
+    /// whatever its `requires` says — with `requires = []`, and with no
+    /// `requires` line at all. When it keeps the rules, it parses.
+    #[test]
+    fn s1_holds_whatever_requires_says() {
+        for requires in [Some("[]"), None] {
+            let good = Fixture {
+                requires,
+                ..Fixture::full(4)
+            };
+            let seal = parse_seal_marker(&good.text()).expect("S1 holds: it parses");
+            assert_eq!(seal.ended_after, Some(11));
+            assert!(!seal.requires_short_seal());
+
+            Fixture {
+                requires,
+                ended_after: Some(7),
+                ..Fixture::full(4)
+            }
+            .refused_naming("rule S1");
+        }
+    }
+
+    /// Rule S2: a seal whose `requires` names `short-seal` states
+    /// `ended_after`.
+    #[test]
+    fn s2_a_seal_requiring_short_seal_states_ended_after() {
+        let f = Fixture {
+            ended_after: None,
+            ..Fixture::full(4)
+        };
+        f.refused_naming("rule S2");
+        assert_eq!(
+            f.fields().check_parse_rules(),
+            Err(SealRuleViolation::MissingEndedAfter)
+        );
+    }
+
+    /// Rule S3, and the compatibility it keeps: a seal before 1.6.0 (no
+    /// `ended_after`, `requires = []` or no `requires` at all) parses as a
+    /// full seal that ended after `file_count - 2`. It is not held to the
+    /// embedded copy's rules at parse, as no reader before 1.6.0 held it;
+    /// [`ParsedSeal::check_parse_rules`] judges it when a caller asks.
+    #[test]
+    fn s3_a_seal_before_1_6_0_still_parses_as_full() {
+        for requires in [Some("[]"), None] {
+            let f = Fixture {
+                requires,
+                ..Fixture::before_1_6_0(4)
+            };
+            let seal = parse_seal_marker(&f.text()).expect("a 1.5.0 seal parses");
+            assert_eq!(seal, f.fields());
+            assert_eq!(seal.ended_after, None);
+            assert_eq!(seal.effective_ended_after(), Some(11));
+            assert_eq!(seal.ending(13), SealEnding::Full);
+            assert_eq!(seal.refusal(), None);
+            assert_eq!(seal.check_parse_rules(), Ok(()), "S3 gives S5 its position");
+        }
+
+        let hollow = Fixture {
+            entries: plan(4)[..5].to_vec(),
+            ..Fixture::before_1_6_0(4)
+        };
+        let seal = parse_seal_marker(&hollow.text()).expect("parses as before 1.6.0");
+        assert!(matches!(
+            seal.check_parse_rules(),
+            Err(SealRuleViolation::EntryCount {
+                entries: 5,
+                file_count: 13
+            })
+        ));
+    }
+
+    /// Rule S4: the embedded copy has exactly `file_count` entries.
+    #[test]
+    fn s4_the_copy_has_exactly_file_count_entries() {
+        let mut fewer = Fixture::short(4, 9);
+        fewer.entries.remove(9);
+        fewer.refused_naming("rule S4");
+        assert_eq!(
+            fewer.fields().check_parse_rules(),
+            Err(SealRuleViolation::EntryCount {
+                entries: 10,
+                file_count: 11
+            })
+        );
+
+        let mut more = Fixture::full(4);
+        more.entries.push((13, "data_slice", true));
+        let err = more.refused_naming("rule S4");
+        assert!(err.contains("14 entries"), "{err}");
+    }
+
+    /// Rule S4: the copy keeps the §2.5 self-consistency checks
+    /// ([`validate_consistency`]) — File 3 at position 3, the seal entry
+    /// last, positions in order, every content file's size and hash.
+    #[test]
+    fn s4_the_copy_keeps_the_consistency_checks() {
+        let mut moved = Fixture::short(4, 9);
+        moved.entries[2].1 = "front_index";
+        moved.entries[3].1 = "restore_sh";
+        moved.refused_naming("rule S4");
+        assert!(matches!(
+            moved.fields().check_parse_rules(),
+            Err(SealRuleViolation::Inconsistent(v))
+                if v.contains(&ConsistencyViolation::FrontIndexNotAtThree { position: 2 })
+        ));
+
+        let mut not_last = Fixture::full(4);
+        not_last.entries.swap(11, 12);
+        not_last.entries[11].0 = 11;
+        not_last.entries[12].0 = 12;
+        not_last.refused_naming("rule S4");
+
+        let mut hollow = Fixture::short(4, 9);
+        hollow.entries[8].2 = false;
+        let err = hollow.refused_naming("rule S4");
+        assert!(err.contains("position 8 carries no size_bytes"), "{err}");
+        assert!(matches!(
+            hollow.fields().check_parse_rules(),
+            Err(SealRuleViolation::Inconsistent(v))
+                if v.contains(&ConsistencyViolation::MissingHash { position: 8 })
+        ));
+
+        let mut gap = Fixture::short(4, 9);
+        gap.entries[5].0 = 6;
+        gap.refused_naming("rule S4");
+    }
+
+    /// Rule S5: the entry at `ended_after` is a data slice. A short seal
+    /// after an envelope or after the front index fails it, and so does a
+    /// full seal whose plan has no data slice; a short seal right after the
+    /// first data slice keeps it.
+    #[test]
+    fn s5_the_file_before_the_seal_is_a_data_slice() {
+        for k in [7, 5, 4, 3] {
+            let f = Fixture::short(4, k);
+            let err = f.refused_naming("rule S5");
+            assert!(err.contains(&format!("position {k}")), "{err}");
+            assert_eq!(
+                f.fields().check_parse_rules(),
+                Err(SealRuleViolation::EndedAfterNotDataSlice {
+                    ended_after: k as u64,
+                    found: Some(plan(4)[k as usize].1.to_string()),
+                })
+            );
+        }
+        Fixture::full(0).refused_naming("rule S5");
+        parse_seal_marker(&Fixture::short(4, 8).text()).expect("K = the first data slice");
+    }
+
+    /// Rule S6, through the one seal judgement: a 1.6.0 seal that breaks a
+    /// rule is `Unsealed`, naming the rule, even though it binds the front
+    /// index in hand; one that keeps them is `Sealed`, with its
+    /// `ended_after`.
+    #[test]
+    fn s6_a_seal_breaking_a_rule_is_unsealed_never_sealed() {
+        let good = Fixture::short(4, 9).text();
+        match judge_seal(Ok(good.as_bytes()), FRONT_INDEX, 3, 10) {
+            SealVerdict::Sealed(seal) => assert_eq!(seal.ended_after, Some(9)),
+            other => panic!("a short seal that keeps the rules is Sealed: {other:?}"),
+        }
+        let broken = Fixture {
+            ended_after: Some(8),
+            ..Fixture::short(4, 9)
+        }
+        .text();
+        let SealVerdict::Unsealed(why) = judge_seal(Ok(broken.as_bytes()), FRONT_INDEX, 3, 10)
+        else {
+            panic!("a seal breaking S1 is Unsealed")
+        };
+        assert!(why.contains("file 10 is not a seal marker"), "{why}");
+        assert!(why.contains("rule S1"), "{why}");
+    }
+
+    /// §1.2 rule 1 comes before §4.1's rules: a seal requiring a feature this
+    /// tapectl does not know, beside `short-seal`, parses uninterpreted —
+    /// though it breaks S2 — so it is refused by name and not read as
+    /// unsealed. The same for another layout version.
+    #[test]
+    fn a_refused_seal_is_returned_uninterpreted_before_the_rules() {
+        let f = Fixture {
+            requires: Some("[\"short-seal\", \"unknown-feature\"]"),
+            ended_after: None,
+            ..Fixture::full(4)
+        };
+        let seal = parse_seal_marker(&f.text())
+            .expect("the seal still PARSES: a write-path contact check must see it as sealed");
+        let why = seal.refusal().expect("refused");
+        assert!(why.contains("\"unknown-feature\""), "{why}");
+        let text = f.text();
+        assert!(matches!(
+            judge_seal(Ok(text.as_bytes()), FRONT_INDEX, 3, 12),
+            SealVerdict::Refused(_)
+        ));
+
+        let other_layout = Fixture {
+            ended_after: Some(-5),
+            ..Fixture::full(4)
+        }
+        .text()
+        .replace("layout_version = 2", "layout_version = 3");
+        let seal = parse_seal_marker(&other_layout).expect("parses, uninterpreted");
+        assert!(seal.refusal().unwrap().contains("layout_version = 3"));
+    }
+
+    /// §4.1 "Classification", the pure function: equal to the plan's count
+    /// is full, less is short (S3's `file_count - 2` for a seal stating no
+    /// `ended_after`), greater means the two ends disagree, and so does a
+    /// count that leaves no file before the seal.
+    #[test]
+    fn classification_is_full_short_or_disagrees_by_the_plan_count() {
+        let full = Fixture::full(4).fields();
+        assert_eq!(classify_seal_ending(&full, 13), SealEnding::Full);
+        assert_eq!(
+            classify_seal_ending(&full, 12),
+            SealEnding::Disagrees {
+                seal_file_count: 13,
+                planned_file_count: 12
+            }
+        );
+        assert_eq!(
+            classify_seal_ending(&full, 20),
+            SealEnding::Short { ended_after: 11 }
+        );
+
+        let short = Fixture::short(4, 9).fields();
+        assert_eq!(
+            classify_seal_ending(&short, 13),
+            SealEnding::Short { ended_after: 9 }
+        );
+        assert_eq!(classify_seal_ending(&short, 11), SealEnding::Full);
+
+        let old = Fixture::before_1_6_0(4).fields();
+        assert_eq!(classify_seal_ending(&old, 13), SealEnding::Full);
+        assert_eq!(
+            classify_seal_ending(&old, 15),
+            SealEnding::Short { ended_after: 11 }
+        );
+
+        for file_count in [1, 0, -3] {
+            let odd = ParsedSeal {
+                file_count,
+                ended_after: None,
+                ..Fixture::before_1_6_0(4).fields()
+            };
+            assert_eq!(
+                classify_seal_ending(&odd, 13),
+                SealEnding::Disagrees {
+                    seal_file_count: file_count,
+                    planned_file_count: 13
+                },
+                "file_count = {file_count}"
+            );
+        }
+    }
+
+    /// Every rule violation reaches an operator in words, naming its rule
+    /// and no Rust variant.
+    #[test]
+    fn seal_rule_violations_render_in_words() {
+        let all = [
+            SealRuleViolation::EndedAfterNotFileCountLessTwo {
+                ended_after: 9,
+                file_count: 13,
+            },
+            SealRuleViolation::MissingEndedAfter,
+            SealRuleViolation::EntryCount {
+                entries: 10,
+                file_count: 11,
+            },
+            SealRuleViolation::Inconsistent(vec![ConsistencyViolation::MissingHash {
+                position: 8,
+            }]),
+            SealRuleViolation::EndedAfterNotDataSlice {
+                ended_after: 7,
+                found: Some("tenant_envelope_backup".into()),
+            },
+            SealRuleViolation::EndedAfterNotDataSlice {
+                ended_after: 7,
+                found: None,
+            },
+        ];
+        for (v, rule) in all.iter().zip(["S1", "S2", "S4", "S4", "S5", "S5"]) {
+            let text = v.to_string();
+            let debug = format!("{v:?}");
+            let variant = debug.split([' ', '{', '(']).next().unwrap();
+            assert!(text.starts_with(&format!("rule {rule}: ")), "{text}");
+            assert!(!text.contains(variant), "{text:?} names the variant");
+            assert!(!text.contains('{') && !text.contains('}'), "{text:?}");
+        }
+    }
+
+    /// §3: File 3's `[index]` states `may_end_early = true` from 1.6.0, the
+    /// line after `layout_version`, and the parser exposes it; the entries
+    /// read as before.
+    #[test]
+    fn a_front_index_declaring_may_end_early_reads_true() {
+        let text = "\
+This tape may end early. The list below is the plan: every file the
+write meant to put on the tape.
+
+[index]
+volume = \"SS01\"
+layout_version = 2
+may_end_early = true
+
+[[files]]
+position = 0
+type = \"id_thunk\"
+size_bytes = 10
+sha256_encrypted = \"h0\"
+";
+        let mut padded = text.as_bytes().to_vec();
+        padded.resize(padded.len() + 512, 0);
+        let padded = String::from_utf8(padded).unwrap();
+        let doc = parse_front_index_document(&padded).expect("a 1.6.0 File 3 parses");
+        assert!(doc.may_end_early);
+        assert_eq!(doc.volume, "SS01");
+        assert_eq!(doc.files.len(), 1);
+        assert_eq!(parse_front_index(&padded).unwrap(), doc.files);
+    }
+
+    /// A front index before 1.6.0 has no `may_end_early`: absent is false,
+    /// and it parses as it always has. A value that is not a bool is a
+    /// parse failure, as any malformed key is.
+    #[test]
+    fn a_front_index_without_may_end_early_reads_false() {
+        let text = "[index]\nvolume = \"OLD01\"\nlayout_version = 2\n\n[[files]]\nposition = 0\ntype = \"id_thunk\"\nsize_bytes = 10\nsha256_encrypted = \"h0\"\n";
+        let doc = parse_front_index_document(text).expect("a 1.5.0 File 3 parses");
+        assert!(!doc.may_end_early);
+        assert_eq!(doc.volume, "OLD01");
+        assert_eq!(doc.files.len(), 1);
+
+        let wrong = text.replace(
+            "layout_version = 2\n",
+            "layout_version = 2\nmay_end_early = 1\n",
+        );
+        assert!(parse_front_index_document(&wrong).is_err());
     }
 }
 
