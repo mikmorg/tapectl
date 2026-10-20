@@ -1835,3 +1835,17 @@ Ruled 2026-10-19, after v1.4.0 was tagged:
      under item 108's stopping rule. home2 installs 1.5.0 instead of 1.4.0, and the on-tape
      authorizations of 1.2.0 through 1.5.0 (items 72, 81, 104, 105 and this one) all end when it
      is installed.
+
+Ruled 2026-10-20, after the #420 profile on home2 (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`):
+
+110. **#420 is built now, and its own acceptance run proves the readback past the early warning**
+     (CTO, 2026-10-20). The profile measured what the short seal needs:
+     - st refuses one write in two after the warning, instantly, and a writer that retries each
+       refusal wrote a 1 GiB slice and the seal;
+     - the drive guarantees 99,008 MB past the warning;
+     - 110 GB were written there before the walk's cap.
+     Nothing written past the warning was read back, because READ POSITION does not answer through
+     st on home2. Rather than a second profile run first, #487 gives the fill writer a readback
+     that spaces by filemarks (proven on mhvtl). #420 is then built. Its real-drive acceptance run
+     fills a test cartridge to the warning and must read the post-warning slice and the seal back
+     before #420 ships. A failed readback there stops #420; it does not re-scope it.
