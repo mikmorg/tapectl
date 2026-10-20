@@ -31,8 +31,8 @@ use std::sync::OnceLock;
 use sha2::{Digest, Sha256};
 use tapectl::volume::layout::{
     generate_front_index, generate_id_thunk_v2, generate_manifest_toml, generate_recovery_md,
-    generate_restore_script_v2, generate_seal_marker, generate_system_guide_v2, FrontIndexFile,
-    IdThunkV2Params, ManifestSlice, ManifestUnit,
+    generate_restore_script_v2, generate_seal_marker, generate_short_seal_marker,
+    generate_system_guide_v2, FrontIndexFile, IdThunkV2Params, ManifestSlice, ManifestUnit,
 };
 
 /// The tape's fixed block size; every file on the fake tape is padded to it.
@@ -9251,6 +9251,66 @@ fn a_1_6_0_tape_with_no_seal_reads_as_unsealed() {
     assert_eq!(code, 1, "{text}");
     assert!(text.contains("this tape is UNSEALED"), "{text}");
     assert!(!text.contains("NOT ON TAPE"), "{text}");
+}
+
+/// The short seal as tapectl's own generator writes it
+/// (`generate_short_seal_marker`), its bytes untouched: RESTORE.sh finds it
+/// as the last file, accepts it as the normal short ending, and reads the
+/// tape by it, as it reads the spec's grammar in the tests above.
+#[test]
+fn the_generators_own_short_seal_is_read_by_restore_sh() {
+    let h = Heir::new();
+    let k = unit("ledgers").positions[0];
+    let m = planned_seal();
+    let tape = h.dir.join("tape");
+    let (mut plan, fi) = plan_on_tape(&tape);
+    let fi_sha = sha256_hex(&fi);
+    plan[3].size_bytes = Some(fi.len() as u64);
+    plan[3].sha256_encrypted = Some(fi_sha.clone());
+    let seal = generate_short_seal_marker(LABEL, k as i32, &fi_sha, &plan[..=k as usize]);
+    assert!(
+        seal.contains(&format!(
+            "\nrequires = [\"short-seal\"]\nfile_count = {}\nended_after = {k}\n",
+            k + 2
+        )),
+        "{seal}"
+    );
+    std::fs::write(tape.join((k + 1).to_string()), padded(seal.into_bytes())).unwrap();
+    for p in k + 2..=m {
+        std::fs::remove_file(tape.join(p.to_string())).unwrap();
+    }
+
+    let (code, text) = h.run(&["--info"]);
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Verdict: SEALED"), "{text}");
+    assert!(
+        text.contains(&format!("The tape ended early, after file {k}:")),
+        "{text}"
+    );
+    assert!(!text.contains("WARNING"), "{text}");
+
+    let (code, text) = h.run(&["--verify"]);
+    assert_eq!(code, 0, "{text}");
+    let gone = text
+        .lines()
+        .filter(|l| l.starts_with("NOT ON TAPE"))
+        .count() as i64;
+    assert_eq!(gone, m - k, "{text}");
+
+    let (code, text) = h.run(&[
+        "--restore",
+        "--key",
+        &h.key("bob"),
+        "--unit",
+        "ledgers",
+        "--to",
+        &h.sub("cut"),
+    ]);
+    assert_eq!(code, 1, "{text}");
+    assert!(
+        text.contains("unit 'ledgers' (version 3) is not on this tape whole"),
+        "{text}"
+    );
 }
 
 /// `--find-envelope` reads no seal on any tape: every envelope lies before the
