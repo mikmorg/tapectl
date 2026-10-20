@@ -2,8 +2,9 @@
 //! place that decision lives (issue #440).
 //!
 //! `clean_staging` stays policy-free (ADR-0012's #244 amendment): it knows
-//! which stage sets are safe to delete (a completed write on every row), not
-//! which are *worth* deleting. This module is the gate in front of it. Two
+//! which stage sets are safe to delete (a completed write, and every other
+//! row completed or `cut`), not which are *worth* deleting. This module is
+//! the gate in front of it. Two
 //! callers share it: `collection run`'s batch (via
 //! `collection::batch::release_if_covered`) and `volume write` / `volume
 //! resume` (via `cli::volume`), each right after a copy is sealed AND
@@ -16,6 +17,13 @@
 //! means the next copy must find the same staged content this one wrote, so
 //! one short unit keeps every unit's staging. `staging clean` is the
 //! per-unit tool — it releases the covered units and retains the short ones.
+//!
+//! A `cut` write (1.6.0, issue #420; ADR-0012 item 112) is no write here: a
+//! stage set planned past where its tape sealed short. It never counts as a
+//! copy (`copy_count_expr` counts only `completed` writes), so a cut unit is
+//! short and keeps its staging; and it never holds the staging either
+//! (`clean_staging`'s guard skips it), so once the version has a `completed`
+//! write elsewhere it is released by the same rule as any other.
 
 use rusqlite::{params, Connection};
 
@@ -68,7 +76,8 @@ pub struct ReleaseOutcome {
 ///
 /// The release itself is `clean_staging(force = false, CleanScope::Units)`,
 /// so its own guard still applies and is what keeps a set that has no
-/// completed write — or any write that is not `completed` — staged. This
+/// completed write — or any write that is neither `completed` nor `cut` —
+/// staged. This
 /// function adds the policy question that guard cannot answer (issue #229's
 /// second half): after one copy of a unit whose `min_copies` is 2, the
 /// guard passes vacuously (one `writes` row, `completed`) and would release
@@ -319,6 +328,19 @@ pub(crate) mod fixtures {
         .unwrap();
     }
 
+    /// `staged`'s stage set cut from the volume `label`, which sealed short
+    /// with `ended_after` (1.6.0, ADR-0012 item 112): a `cut` row on a
+    /// `sealed` volume whose `ended_after` is set, the only shape the spec
+    /// allows a `cut` row in.
+    pub(crate) fn cut_from(conn: &Connection, staged: &Staged, label: &str, ended_after: i64) {
+        add_write(conn, staged, label, "sealed", "cut");
+        conn.execute(
+            "UPDATE volumes SET ended_after = ?2, sealed_at = datetime('now') WHERE label = ?1",
+            params![label, ended_after],
+        )
+        .unwrap();
+    }
+
     pub(crate) fn stage_set_status(conn: &Connection, stage_set_id: i64) -> String {
         conn.query_row(
             "SELECT status FROM stage_sets WHERE id = ?1",
@@ -520,5 +542,138 @@ mod tests {
         assert_eq!(unit_ids_written_to(&conn, "V-ONE").unwrap(), [alpha, beta]);
         assert_eq!(unit_ids_written_to(&conn, "V-TWO").unwrap(), [gamma]);
         assert!(unit_ids_written_to(&conn, "V-NONE").unwrap().is_empty());
+    }
+
+    // --- `cut` (1.6.0, issue #420; ADR-0012 item 112) ---
+
+    /// A `cut` write is never a copy, even of a version that reads
+    /// `current`, so it never makes a unit covered and never releases its
+    /// staging. The positive control is the same row `completed`: one copy,
+    /// at the floor, released.
+    #[test]
+    fn a_cut_write_is_never_a_copy_and_keeps_the_staging() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 1);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let s = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
+        cut_from(&conn, &s, "V-SHORT", 9);
+
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+
+        assert!(
+            out.cleaned.is_none(),
+            "a cut is not a copy: nothing released"
+        );
+        assert_eq!(
+            out.under_copied
+                .iter()
+                .map(|p| p.describe())
+                .collect::<Vec<_>>(),
+            ["unit testlib/alpha has 0 copies, needs 1"]
+        );
+        assert_eq!(stage_set_status(&conn, s.stage_set_id), "staged");
+        assert!(s.file.exists(), "the next volume write reads these slices");
+
+        conn.execute("UPDATE writes SET status = 'completed'", [])
+            .unwrap();
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+        assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
+        assert_eq!(out.cleaned.expect("released").sets_cleaned, 1);
+        assert!(!s.file.exists());
+    }
+
+    /// The cut unit is written whole on another cartridge, and from then on
+    /// it is released by the same rule as any other: the `cut` row does not
+    /// hold the staging the way an unfinished write would.
+    #[test]
+    fn a_cut_set_is_released_once_its_version_is_completed_elsewhere() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 1);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let s = staged_version(&conn, alpha, 1, "current", dir.path(), 0);
+        cut_from(&conn, &s, "V-SHORT", 9);
+        add_write(&conn, &s, "V-NEXT", "sealed", "completed");
+
+        assert_eq!(unit_ids_written_to(&conn, "V-NEXT").unwrap(), [alpha]);
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+
+        assert!(out.under_copied.is_empty(), "{:?}", out.under_copied);
+        let cleaned = out.cleaned.expect("released");
+        assert_eq!((cleaned.sets_cleaned, cleaned.files_removed), (1, 1));
+        assert_eq!(stage_set_status(&conn, s.stage_set_id), "cleaned");
+        assert!(!s.file.exists());
+    }
+
+    /// The shape a short seal leaves when a unit's newer version is the one
+    /// cut: version 1 is written and current, version 2 was cut and is
+    /// still `staged`. The unit is covered by version 1, so the gate passes
+    /// and version 1's staging goes; version 2's stays for the next write.
+    #[test]
+    fn a_cut_newer_version_stays_staged_while_the_written_one_is_released() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 1);
+        let alpha = unit(&conn, tenant(&conn), "testlib/alpha");
+        let v1 = staged_version(&conn, alpha, 1, "current", dir.path(), 1);
+        let v2 = staged_version(&conn, alpha, 2, "staged", dir.path(), 0);
+        cut_from(&conn, &v2, "V-SHORT", 9);
+
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+
+        assert!(out.under_copied.is_empty(), "v1 alone is current");
+        assert_eq!(out.cleaned.expect("released").sets_cleaned, 1);
+        assert_eq!(stage_set_status(&conn, v1.stage_set_id), "cleaned");
+        assert_eq!(stage_set_status(&conn, v2.stage_set_id), "staged");
+        assert!(v2.file.exists());
+    }
+
+    /// `collection run` judges a batch together (all or nothing). A batch
+    /// whose write sealed short holds a unit with no copy at all -- its only
+    /// version was cut, so it has no `current` snapshot and reads 0, never
+    /// NULL -- and so the staging of every unit in the batch is kept, the
+    /// cut one named. `volume write` judges only the units it completed on
+    /// the volume (`unit_ids_written_to`), which leaves the cut one out.
+    #[test]
+    fn a_cut_unit_judged_with_a_written_one_keeps_the_staging_of_both() {
+        let conn = db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path(), 1);
+        let t = tenant(&conn);
+        let alpha = unit(&conn, t, "testlib/alpha");
+        let beta = unit(&conn, t, "testlib/beta");
+        let a = staged_version(&conn, alpha, 1, "staged", dir.path(), 0);
+        let b = staged_version(&conn, beta, 1, "staged", dir.path(), 0);
+        add_write(&conn, &a, "V-SHORT", "sealed", "completed");
+        conn.execute(
+            "UPDATE snapshots SET status = 'current' WHERE id = ?1",
+            params![a.snapshot_id],
+        )
+        .unwrap();
+        cut_from(&conn, &b, "V-SHORT", 9);
+
+        let out = release_if_covered(&conn, &config, &[alpha, beta]).unwrap();
+
+        assert!(out.cleaned.is_none());
+        assert_eq!(
+            out.under_copied
+                .iter()
+                .map(|p| p.describe())
+                .collect::<Vec<_>>(),
+            ["unit testlib/beta has 0 copies, needs 1"]
+        );
+        assert!(a.file.exists() && b.file.exists());
+
+        assert_eq!(
+            unit_ids_written_to(&conn, "V-SHORT").unwrap(),
+            [alpha],
+            "the cut unit is not one the short-sealed volume was written for"
+        );
+        let out = release_if_covered(&conn, &config, &[alpha]).unwrap();
+        assert_eq!(out.cleaned.expect("alpha is covered").sets_cleaned, 1);
+        assert!(!a.file.exists());
+        assert!(b.file.exists(), "the cut unit's staging stays");
+        assert_eq!(stage_set_status(&conn, b.stage_set_id), "staged");
     }
 }
