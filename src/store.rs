@@ -3865,16 +3865,12 @@ mod tests {
 
         // Rebuild + re-store the seal marker bound to the corrupted File 3
         // so step 2 (the binding hash) passes and the walk actually reaches
-        // the consistency check in step 3.
+        // the consistency check in step 3. Its own embedded copy must keep
+        // §4.1's rules (S4: one entry per file, 0 to 5, self-consistent), or
+        // the seal does not parse (S6) and the walk stops at step 1 — so the
+        // inconsistency under test is File 3's alone.
         let new_hash = sha256_hex(&corrupted_true_bytes);
-        let seal_files = vec![FrontIndexFile {
-            position: 3,
-            type_label: "front_index",
-            size_bytes: Some(corrupted_len),
-            sha256_encrypted: Some(new_hash.clone()),
-        }];
-        let seal_true_bytes =
-            generate_seal_marker("FIXT01", 6, &new_hash, &seal_files).into_bytes();
+        let seal_true_bytes = crate::volume::session::fixture_seal("FIXT01", 5, &new_hash);
         let seal_len = seal_true_bytes.len() as u64;
         let mut seal_padded = seal_true_bytes;
         seal_padded.resize(pad_to_blocks(seal_len, BS) as usize, 0);
