@@ -5370,6 +5370,26 @@ fn verify_contacted(
              again if the front index is unchanged"
         );
     }
+    // #420 (`volume-format-v2.md` §4.2 R1, §5): where the catalog says this
+    // volume's tape ended, read before the session row exists so a bad value
+    // records nothing. The walk reads the seal at `ended_after + 1` and
+    // no position after it, and checks the seal states the same; NULL is a
+    // full seal (the planned M-1).
+    let ended_after = conn
+        .query_row(
+            "SELECT ended_after FROM volumes WHERE id = ?1",
+            params![volume_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )?
+        .map(|k| {
+            u32::try_from(k).map_err(|_| {
+                TapectlError::Other(format!(
+                    "volume \"{label}\": the catalog records ended_after = {k}, which is no \
+                     tape position"
+                ))
+            })
+        })
+        .transpose()?;
     conn.execute(
         "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
          VALUES (?1, ?2, 'in_progress')",
@@ -5379,7 +5399,9 @@ fn verify_contacted(
     let record = |c: crate::store::Checkpoint<'_>| {
         session::record_checkpoint(conn, session_id, resume.as_ref(), c)
     };
-    let plan = ConfirmPlan::new(tier).resuming(session::Continuation::checkpoints(resume.as_ref()));
+    let plan = ConfirmPlan::new(tier)
+        .resuming(session::Continuation::checkpoints(resume.as_ref()))
+        .with_ending(ended_after);
     let plan = match tier {
         Tier::Integrity => plan.checkpointing(&record),
         Tier::Navigable => plan,
@@ -8213,6 +8235,192 @@ mod tests {
                 Op::Read(4),
             ]
         );
+    }
+
+    // ── #420: `volume verify` of a short-sealed tape (`volume-format-v2.md`
+    // §4.2 R1, §5) ──
+
+    /// A short-sealed v2 tape: File 0 planning 8 files, 1, 2, File 3
+    /// planning data slices at 4, 5 and 6 and the seal at 7; the slices at 4
+    /// and 5 on the tape; then, at 6, a short seal stating `ended_after =
+    /// seal_states` over File 3's entries 0 to it, and nothing after it.
+    /// `seal_states = 5` is the tape a 1.6.0 writer leaves.
+    fn mem_store_short_tape(label: &str, seal_states: u32) -> MemStore {
+        const BS: usize = 4096;
+        let id_thunk = layout::generate_id_thunk_v2(&layout::IdThunkV2Params {
+            label,
+            uuid: MEM_TAPE_UUID,
+            media_type: "LTO-6",
+            tapectl_version: "0.0.0-test",
+            nominal_capacity: 2_500_000_000_000,
+            mam_capacity: 2_400_000_000_000,
+            total_files: 8,
+            mam_manufacturer: "TESTCO",
+            mam_serial: "",
+            mam_length: 846,
+            mam_loads: 1,
+            created_at: "2026-10-20T00:00:00Z",
+            cartridge_identity_source: None,
+        })
+        .into_bytes();
+        let mut on_tape: Vec<Vec<u8>> = vec![
+            id_thunk,
+            b"SYSTEM GUIDE\n".to_vec(),
+            b"#!/bin/sh\n".to_vec(),
+        ];
+        let slices: Vec<Vec<u8>> = (0..3u8).map(|i| vec![b'a' + i; 3000]).collect();
+        let kinds = ["id_thunk", "system_guide", "restore_sh"];
+        let mut files: Vec<layout::FrontIndexFile> = on_tape
+            .iter()
+            .enumerate()
+            .map(|(i, f)| layout::FrontIndexFile {
+                position: i as i32,
+                type_label: kinds[i],
+                size_bytes: Some(f.len() as u64),
+                sha256_encrypted: Some(direct_hash(f)),
+            })
+            .collect();
+        files.push(layout::FrontIndexFile {
+            position: 3,
+            type_label: "front_index",
+            size_bytes: None,
+            sha256_encrypted: None,
+        });
+        for (i, s) in slices.iter().enumerate() {
+            files.push(layout::FrontIndexFile {
+                position: 4 + i as i32,
+                type_label: "data_slice",
+                size_bytes: Some(s.len() as u64),
+                sha256_encrypted: Some(direct_hash(s)),
+            });
+        }
+        files.push(layout::FrontIndexFile {
+            position: 7,
+            type_label: "seal_marker",
+            size_bytes: None,
+            sha256_encrypted: None,
+        });
+        let fi_bytes = layout::generate_front_index(label, &files).into_bytes();
+        files[3].size_bytes = Some(fi_bytes.len() as u64);
+        files[3].sha256_encrypted = Some(direct_hash(&fi_bytes));
+        let seal = layout::generate_short_seal_marker(
+            label,
+            seal_states as i32,
+            &direct_hash(&fi_bytes),
+            &files[..=seal_states as usize],
+        )
+        .into_bytes();
+        on_tape.push(fi_bytes);
+        on_tape.extend(slices.into_iter().take(2));
+        on_tape.push(seal);
+
+        let mut store = MemStore::new(BS);
+        for bytes in on_tape {
+            store
+                .execute(&mut Cursor::new(bytes.clone()), bytes.len() as u64, false)
+                .unwrap();
+        }
+        store
+    }
+
+    /// A catalog row for a short-sealed volume `label`, its `ended_after`
+    /// as given.
+    fn seed_short_volume(conn: &Connection, label: &str, ended_after: Option<i64>) -> i64 {
+        seed_one_slice_fixture(
+            conn,
+            label,
+            "short-unit",
+            4,
+            &[b'a'; 3000],
+            "completed",
+            "current",
+        );
+        conn.execute(
+            "UPDATE volumes SET status = 'sealed', ended_after = ?2 WHERE label = ?1",
+            params![label, ended_after],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT id FROM volumes WHERE label = ?1",
+            params![label],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A short-sealed tape verifies `passed` under both tiers: the walk
+    /// takes `ended_after` from `volumes.ended_after`, reads the seal at
+    /// K+1, and reports no position after K as unreadable. The positive
+    /// control is the next test: the same tape with the catalog saying full.
+    #[test]
+    fn a_short_sealed_tape_verifies_passed_under_both_tiers() {
+        for (tier, checked) in [(Tier::Integrity, 7), (Tier::Navigable, 2)] {
+            let conn = crate::db::open_memory().unwrap();
+            let volume_id = seed_short_volume(&conn, "VR-SHORT", Some(5));
+            let mut store = mem_store_short_tape("VR-SHORT", 5);
+            let report = volume_verify_with_store(
+                &conn,
+                &mut store,
+                "VR-SHORT",
+                volume_id,
+                4096,
+                tier,
+                site(Operation::VolumeVerify),
+            )
+            .unwrap();
+            assert!(
+                report.mismatches.is_empty(),
+                "{tier:?}: {:?}",
+                report.mismatches
+            );
+            assert_eq!(report.failed, 0);
+            // Seal + File 3, and at the full tier Files 0-2 and the slices
+            // at 4 and 5.
+            assert_eq!(report.checked, checked, "{tier:?}");
+            let outcome: String = conn
+                .query_row("SELECT outcome FROM verification_sessions", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(outcome, "passed");
+        }
+    }
+
+    /// The catalog and the tape disagree about where the tape ended: a seal
+    /// stating another `ended_after` (`ended_after_disagrees`), or a catalog
+    /// that records the volume full over a tape that sealed short (no seal
+    /// at the planned position). Both are inconclusive (`volume verify`
+    /// exits 3: a failure with no quarantine), never a quarantine.
+    #[test]
+    fn a_short_tape_the_catalog_disagrees_with_is_inconclusive_not_quarantined() {
+        for (catalog, seal_states, at, kind) in [
+            (Some(5), 4, 6, MismatchKind::EndedAfterDisagrees),
+            (None, 5, 7, MismatchKind::SealUnreadable),
+        ] {
+            for tier in [Tier::Integrity, Tier::Navigable] {
+                let conn = crate::db::open_memory().unwrap();
+                let volume_id = seed_short_volume(&conn, "VR-SHORTX", catalog);
+                let mut store = mem_store_short_tape("VR-SHORTX", seal_states);
+                let report = volume_verify_with_store(
+                    &conn,
+                    &mut store,
+                    "VR-SHORTX",
+                    volume_id,
+                    4096,
+                    tier,
+                    site(Operation::VolumeVerify),
+                )
+                .unwrap();
+                let found: Vec<(u32, MismatchKind)> = report
+                    .mismatches
+                    .iter()
+                    .map(|m| (m.position, m.kind))
+                    .collect();
+                assert_eq!(found, [(at, kind)], "{catalog:?} {tier:?}");
+                assert!(report.failed > 0 && report.quarantine.is_none());
+                assert_eq!(volume_condition(&conn, "VR-SHORTX"), "ok");
+            }
+        }
     }
 
     /// A store that has a signal arrive as it reads File 3 for the
