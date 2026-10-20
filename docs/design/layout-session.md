@@ -365,8 +365,9 @@ Rules that hold in every path:
   first and alone, so an unsealed tape stops at one read. The navigable tier
   always reads File 3, then spaces forward to the seal: one rewind, two
   forward spaces. After an early warning (1.6.0) it also reads the entry at
-  `ended_after` between them (item 114, "The short ending"): one rewind,
-  three forward spaces. Wherever it is read, the seal is *judged* first (§2.5's
+  `ended_after` between them (item 114, "The short ending"): still one rewind
+  and two forward spaces, because the seal is the file right after that
+  entry. Wherever it is read, the seal is *judged* first (§2.5's
   precedence): a seal that is absent, unparseable or refused is the whole
   verdict and whatever was read after it is discarded, so both orders reach
   the same evidence. `TapeStore` tracks which file the head
