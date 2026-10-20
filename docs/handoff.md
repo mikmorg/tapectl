@@ -354,19 +354,15 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
    and start it again after): the 06:30 poll opens the drive's sg node, would journal the test
    cartridge into the production catalog, and reads the TapeAlert page the rehearsal's own
    sweep expects to see first. Nothing enforces "no production process" for you;
-   `tapectl-op drive status` names a holder. The rehearsal is also the first real-drive run of
-   two 1.1.x behaviours mhvtl has proved and the HP drive has not: the proven-blank `volume
-   init` (ADR-0012 item 57: until it has run, expect to need `--force` on a new cartridge if the
-   chip's lifetime figures read differently from the fixtures), and 1.1.2's rule that a seal
-   position which cannot be read is "unreadable", not "absent", unless the drive reports END OF
-   DATA there (#460: if the HP drive did not report it, every fresh write would refuse,
-   failing closed). Record both on #444 with the run. It is also the first run on the real
-   drive, with the real `age`, `dar`, `mt`, `tar` and `sha256sum`, of 1.2.0's and 1.3.0's
-   RESTORE.sh (the per-mode tool checks, the lone-unit note, the work-directory warning,
-   `--where`, `--where --all` and `--find` on the index, slice replacement and the per-file
-   sha256 check); the mhvtl
-   gate's heir legs are the only other real-tool run (ADR-0012 item 70). Record `age --version`
-   with it. The first tape 1.3.0 writes is the first whose index names the others.
+   `tapectl-op drive status` names a holder. **Done 2026-10-20, GREEN 53/53** on the v1.5.0
+   binary (`docs/runs/2026-10-20-1.5.0-step12-rehearsal.md`): RESTORE.sh restored three units off
+   the tape with the real `age` (v1.3.2), `dar`, `mt` and `tar`, with its per-file sha256 check,
+   and the fresh write proved #460's END OF DATA fact on the HP drive. It did NOT exercise the
+   proven-blank `volume init` (the suite blanks with `mt weof` and inits with `--force`): #444's
+   two proofs and the sub-MiB chip measurement need a run of their own. Until the verified-erase
+   proof has run here, expect to need `--force` on a new cartridge if the chip's lifetime figures
+   read differently from the fixtures (ADR-0012 item 57). RESTORE.sh's index modes and slice
+   replacement run with the real tools only in the mhvtl gate's heir legs (ADR-0012 item 70).
 8. **Regenerate the Heir Kit** with the installed binary (`scripts/first-run.sh --profile
    contrib/hosts/home2.profile --from 9 --to 9`, which hands the kit directory to the service
    user for the write and back to you after it), and reprint COVER.txt. From 1.5.0 the kit
