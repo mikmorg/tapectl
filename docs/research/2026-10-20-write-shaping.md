@@ -395,6 +395,7 @@ interleaved rounds, glibc target:
 | `aws-lc-rs` 1 `digest` | 216.1-217.6 |
 | OpenSSL 3.0.13 CLI (`openssl speed -evp sha256 -bytes 524288`) | 216.5-216.9 |
 | coreutils 9.4 `sha256sum` (another moment, so not comparable) | 168.6 |
+| static musl build (`x86_64-unknown-linux-musl`, the repo's 1.94.1 toolchain): `sha2` asm / `ring` | 162.4 / **216.7** |
 
 - **The gap.** `ring` and aws-lc carry OpenSSL's SSSE3 SHA-256 code. `sha2`'s `asm` feature does
   not reach it (about 0.76 of OpenSSL here; 163/195 = 0.84 on 2026-09-23, RECORD #326).
@@ -404,7 +405,8 @@ interleaved rounds, glibc target:
   (verify ran at 140.3 MiB/s in production, RECORD #326, the same cap) and staging.
 - **Cost:**
   - `ring` builds C and assembly with `cc`.
-  - Production is a static musl build (`docs/handoff.md`); the musl check is in §13.
+  - Production is a static musl build (`docs/handoff.md`). `ring` 0.17 builds static-pie for
+    musl with the repo's toolchain and keeps its speed there (MEASURED, table above).
   - `pass_count::Sha256` wraps `sha2::Sha256` through the `Digest` traits, and `ring` has no
     `Digest` impl, so that seam changes shape.
   - The budget tests count bytes through it.
@@ -556,7 +558,12 @@ Everything off the tape thread. A sampler thread writes one line per 250 ms; the
    - `/proc/loadavg`;
    - the process's `VmSwap`.
 3. **The inter-file gap** as its own session-log field: from the last block of file N to the
-   first block of file N+1.
+   first block of file N+1. Split it into where it went:
+   - time inside the `write_positions` UPDATE, including any `busy::retry` waits;
+   - the pipeline's join and restart, through the next file's first hashed block.
+
+   The 1 ms gap measured so far (§2.3) is from a 12.7 MiB write of 1 MiB slices on a quiet
+   host and a scratch catalog. It says nothing about a busy sda, which §4 item 5 names.
 4. **A sweep at the end of the write phase,** before the seal, in the research build: pages 0x34,
    0x14, 0x0c and 0x17, journalled with a phase tag. This avoids confirm's rewinds polluting the
    reading (§6).
@@ -701,7 +708,7 @@ tapectl --home "$H" volume write "$LABEL" --device /dev/tape/by-id/scsi-HUJ808A5
 3. Approve R0: the operator decodes page 0x34 and 0x14 rows from a copy of the production
    catalog.
 4. The hash: replace `sha2` with `ring` (or `aws-lc-rs`) on the write, verify and staging paths.
-   It is a new C/asm dependency, and the musl build must be proven first.
+   It is a new C/asm dependency. It builds for musl (MEASURED: 216.7 MB/s static on vm-desk1).
 5. The shaping: a fixed pace, an adaptive pace, a pause and refill, or a combination; on by
    default or opt-in.
 6. Config keys: the `[write_shaping]` keys of §7, or none, with the pace self-calibrated per
@@ -726,9 +733,7 @@ tapectl --home "$H" volume write "$LABEL" --device /dev/tape/by-id/scsi-HUJ808A5
 - Whether the drive writes fill patterns instead of stopping (NEEDS DRIVE, P0).
 - tapectl's `sha2` rate on home2 itself: one benchmark was allowed there, and it was OpenSSL. The
   142-157 MB/s range is scaled from vm-desk1.
-- The musl build of `ring`. It has not been proven, because vm-desk1's build lock was held by other
-  work for the rest of this session. `ring` 0.17 lists musl targets as supported (INFERRED from
-  its README). The glibc builds of all four variants are measured.
+- `aws-lc-rs` and the soft `sha2` were not built for musl; `ring` and `sha2` asm were (§5.9).
 - Whether vm-desk1's vCPU threads landed in `system.slice/libvirtd.service` from a
   `daemon-reload` or by design. That is where they are; how is not established.
 - The CPU frequency during the 1.505 run (`perf` is closed to non-root, no cpufreq driver).
