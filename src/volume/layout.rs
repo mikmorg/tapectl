@@ -2304,7 +2304,7 @@ of that tape gives it.
 /// which is the test working as designed.
 pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED, AWK_FILE_CHECK_LIST,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED, AWK_FILE_CHECK_LIST,
         AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_ALL,
         AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
         AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
@@ -2355,6 +2355,18 @@ pub fn generate_restore_script_v2(label: &str, total_files: i32) -> String {
 #
 # --key may be repeated. An envelope and the slices it describes can need
 # different keys after a key rotation, so every key is tried independently.
+#
+# A tape written since version 1.6.0 may end early: when the drive reported
+# the end of its medium in a data slice before the last, the write sealed the
+# tape after that slice, with a short seal. Everything before the slices is
+# the plan (File 0, the front index, the envelopes); the seal marker, the last
+# file, says where the tape really ended (ended_after), and a planned file
+# after that is not on the tape. A unit with a slice there is cut: not on this
+# tape whole, named and never restored from it (another tape holds it). So on
+# such a tape every mode that reads slices or says which units it holds reads
+# the seal first, right after the front index: one wind to the end of the data
+# and a rewind. --info says where the tape ended, and --verify prints NOT ON
+# TAPE for each planned file after it.
 #
 # A slice that fails its hash, or will not read, can be taken from another copy
 # of the unit (ADR-0012 item 101). The copy's slice has the same sha256 in its
@@ -3026,6 +3038,12 @@ bootstrap_thunk() {
   check_layout_version "$(toml_val "$WORK/thunk.toml" layout_version)"
   check_magic "$(toml_val "$WORK/thunk.toml" magic)"
   check_requires "File 0" "$WORK/thunk.toml"
+  # A tape that requires short-seal may end before the last file its plan
+  # lists: its seal says where, and is read before any data slice (R1).
+  TAPE_SHORT_SEAL=0
+  if requires_feature "$WORK/thunk.toml" short-seal; then
+    TAPE_SHORT_SEAL=1
+  fi
 
   FRONT_INDEX=$(toml_val "$WORK/thunk.toml" front_index)
   SEAL_MARKER=$(toml_val "$WORK/thunk.toml" seal_marker)
@@ -3068,12 +3086,14 @@ check_layout_version() { # <layout_version as File 0 states it>
 # reader must understand says so there, and this script must stop rather than
 # misread it. An absent `requires` (every tape before 1.1.0) requires nothing,
 # and any key a table carries that this script does not know is ignored
-# unless `requires` names it.
-KNOWN_FEATURES=""
+# unless `requires` names it. short-seal (every tape written since version
+# 1.6.0): the tape may end before the last file its plan lists, and its seal
+# marker, the last file, says where (volume-format-v2.md 4.1, 4.2).
+KNOWN_FEATURES="short-seal"
 
 die_newer_needed() { # <what> <detail>
   die "$2
-       This RESTORE.sh (layout v2, tapectl 1.1.0) cannot read it safely, and
+       This RESTORE.sh (layout v2, tapectl 1.6.0) cannot read it safely, and
        will not guess. Use the RESTORE.sh stored on THIS tape — every tape
        carries the script that reads it, at file 2:
          mt -f $DEVICE rewind && mt -f $DEVICE fsf 2
@@ -3107,6 +3127,17 @@ check_requires() { # <what> <toml file>
   die_newer_needed "$what" "this tape requires feature(s)${unknown}, which this script does not know
        ($what states requires = $(safe_str "$raw")). It was written by a newer
        tapectl (File 0: tapectl_version $(safe_str "$(toml_val "$WORK/thunk.toml" tapectl_version)"))."
+}
+
+# Does the requires line of a TOML file name feature $2? Matched as a whole
+# name in the list check_requires reads, never as a pattern.
+requires_feature() { # <toml file> <feature>
+  local list
+  list=$(toml_val "$1" requires | tr -d '[]",' | tr -s ' ' ' ')
+  case " $list " in
+  *" $2 "*) return 0 ;;
+  esac
+  return 1
 }
 
 # Always say which device was read and what was found there. A silent default
@@ -3160,15 +3191,16 @@ try_front_index() {
 
 # ---- rung 2: the seal marker's embedded front-index copy ----
 
-# On success sets SEAL_FRONT_INDEX_SHA256, SEAL_FILE_COUNT, SEAL_SEALED_AT and
-# leaves the parsed, validated embedded copy at $WORK/files_from_seal.txt.
-# Returns 1 when there is no usable seal; exits only for a seal that requires
-# a feature this script does not know, which must never read as unsealed.
+# On success sets SEAL_FRONT_INDEX_SHA256, SEAL_FILE_COUNT, SEAL_SEALED_AT,
+# SEAL_LAST (the last file before the seal) and leaves the parsed, validated
+# embedded copy at $WORK/files_from_seal.txt. Returns 1 when there is no usable
+# seal; exits only for a seal that requires a feature this script does not
+# know, which must never read as unsealed.
 try_seal_copy() {
   local at="" n
   if read_last_file "$WORK/seal.raw" && seal_parses "$WORK/seal.raw"; then
     at=$((SEAL_FILE_COUNT - 1))
-    if [ "$SEAL_MARKER" != "$at" ]; then
+    if [ "$SEAL_MARKER" != "$at" ] && ! short_ending "$at"; then
       echo "WARNING: File 0 says the seal marker is file $SEAL_MARKER, but the last file on the tape is" >&2
       echo "         a seal marker for $SEAL_FILE_COUNT files (file $at). Using the last file." >&2
     fi
@@ -3180,10 +3212,64 @@ try_seal_copy() {
     seal_parses "$WORK/seal.raw" || return 1
   fi
   check_requires "the seal marker" "$WORK/seal.toml"
+  seal_keeps_rules || return 1
   parse_front_index_entries "$WORK/seal.toml" >"$WORK/files_from_seal.txt"
   [ -s "$WORK/files_from_seal.txt" ] || return 1
   check_file_list_consistency "$WORK/files_from_seal.txt" "$SEAL_FILE_COUNT" || return 1
+  seal_ends_on_a_slice || return 1
   return 0
+}
+
+# A seal before File 0's pointer is the normal short ending of a tape that
+# requires short-seal, when the seal requires it too (volume-format-v2.md 1.2
+# rule 6): it draws no warning. Any other seal at another place does.
+short_ending() { # <the seal's own position>
+  [ "$TAPE_SHORT_SEAL" = 1 ] && [ "$SEAL_SHORT" = 1 ] && is_uint "$1" &&
+    [ "${#1}" -le 15 ] && [ "$((10#$1))" -lt "$((10#$SEAL_MARKER))" ]
+}
+
+# The seal's parse rules (volume-format-v2.md 4.1) for a seal that states
+# ended_after or requires short-seal, as every seal since version 1.6.0 does.
+# S1: ended_after is file_count - 2, so the seal is the file after it. S2: a
+# seal that requires short-seal states ended_after. A seal that states neither
+# (every seal before 1.6.0) is a full seal that ended after file_count - 2
+# (S3). S4 is check_file_list_consistency, for every seal, and S5 below. A seal
+# that breaks one is not a seal (S6): the tape reads as unsealed. Sets
+# SEAL_LAST.
+SEAL_LAST=""
+seal_keeps_rules() {
+  SEAL_LAST=""
+  if [ -z "$SEAL_ENDED_AFTER" ]; then
+    if [ "$SEAL_SHORT" = 1 ]; then
+      echo "NOTE: the seal marker requires short-seal but states no ended_after: it is not a valid seal" >&2
+      echo "      (volume-format-v2.md 4.1, rule S2), and the tape is read as unsealed." >&2
+      return 1
+    fi
+    [ "${#SEAL_FILE_COUNT}" -le 15 ] && SEAL_LAST=$((10#$SEAL_FILE_COUNT - 2))
+    return 0
+  fi
+  if ! is_uint "$SEAL_ENDED_AFTER" || [ "${#SEAL_ENDED_AFTER}" -gt 15 ] ||
+    [ "${#SEAL_FILE_COUNT}" -gt 15 ] ||
+    [ "$((10#$SEAL_ENDED_AFTER + 2))" -ne "$((10#$SEAL_FILE_COUNT))" ]; then
+    echo "NOTE: the seal marker states ended_after = $(safe_str "$SEAL_ENDED_AFTER") and file_count = $(safe_str "$SEAL_FILE_COUNT"):" >&2
+    echo "      ended_after must be file_count - 2 (volume-format-v2.md 4.1, rule S1). It is not a valid" >&2
+    echo "      seal, and the tape is read as unsealed." >&2
+    return 1
+  fi
+  SEAL_LAST=$((10#$SEAL_ENDED_AFTER))
+}
+
+# S5: the last file before a seal that states ended_after is a data slice (a
+# write never ends inside the metadata). Checked against the seal's own copy.
+seal_ends_on_a_slice() {
+  [ -n "$SEAL_ENDED_AFTER" ] || return 0
+  local t
+  t=$(file_type_at "$SEAL_LAST" "$WORK/files_from_seal.txt")
+  [ "$t" = data_slice ] && return 0
+  echo "NOTE: the seal marker says the tape ended after file $SEAL_LAST, which its copy of the front index" >&2
+  echo "      lists as $(safe_str "${t:-nothing}"), not a data slice (volume-format-v2.md 4.1, rule S5). It is not" >&2
+  echo "      a valid seal, and the tape is read as unsealed." >&2
+  return 1
 }
 
 # Read at most STASH_MAX bytes of the file under the head into $1: enough
@@ -3211,7 +3297,11 @@ read_last_file() { # <out>
 }
 
 # Does $1 hold a seal marker this script can use? Sets SEAL_FRONT_INDEX_SHA256,
-# SEAL_FILE_COUNT, SEAL_SEALED_AT and $WORK/seal.toml.
+# SEAL_FILE_COUNT, SEAL_SEALED_AT, SEAL_ENDED_AFTER (as the seal states it;
+# empty on a seal before 1.6.0), SEAL_SHORT (1 when the seal requires
+# short-seal) and $WORK/seal.toml.
+SEAL_ENDED_AFTER=""
+SEAL_SHORT=0
 seal_parses() { # <raw file>
   tr -d '\0' <"$1" >"$WORK/seal.stripped"
   grep '^\[seal\]' "$WORK/seal.stripped" >/dev/null 2>&1 || return 1
@@ -3219,6 +3309,11 @@ seal_parses() { # <raw file>
   SEAL_FRONT_INDEX_SHA256=$(toml_val "$WORK/seal.toml" front_index_sha256)
   SEAL_FILE_COUNT=$(toml_val "$WORK/seal.toml" file_count)
   SEAL_SEALED_AT=$(toml_val "$WORK/seal.toml" sealed_at)
+  SEAL_ENDED_AFTER=$(toml_val "$WORK/seal.toml" ended_after)
+  SEAL_SHORT=0
+  if requires_feature "$WORK/seal.toml" short-seal; then
+    SEAL_SHORT=1
+  fi
   [ -n "$SEAL_FRONT_INDEX_SHA256" ] || return 1
   is_uint "$SEAL_FILE_COUNT" || return 1
   [ "$SEAL_FILE_COUNT" -gt 0 ]
@@ -3265,19 +3360,78 @@ See the system guide (File 1), "If All Else Fails", for the full narrative.
 ZSEOF
 }
 
+# ---- where a tape that requires short-seal ended (volume-format-v2.md 4.1, 4.2) ----
+
+# Everything a tape holds before its first data slice is the plan: File 0,
+# the front index and the envelopes are written before the writer can know
+# whether the drive will report the end of its medium. A tape written since
+# version 1.6.0 requires short-seal: when that warning came in a data slice
+# before the last, the write sealed the tape after it, with a short seal whose
+# ended_after is the last file before it. Every planned file after that is not
+# on the tape, and a unit with a slice there is cut: not on this tape whole.
+#
+# TAPE_SHORT_SEAL is 1 when File 0 requires short-seal. ENDED_AFTER is then
+# the last file before the seal, once the seal has been read; it is empty on
+# every other tape, and on one whose seal cannot be read (R2: that tape reads
+# as unsealed, and the end of its data is the end of it).
+TAPE_SHORT_SEAL=0
+ENDED_AFTER=""
+
+# Read the seal of a tape that requires short-seal, before any data slice
+# (R1). It is the last file on the tape, found by spacing to the end of the
+# data and back over two filemarks (volume-format-v2.md 1.2 rule 6), which
+# costs one wind of the tape and a rewind after it. With 1, the seal was read
+# already (the file map came from its copy) and is used as it is.
+learn_end() { # [1: the seal has been read]
+  ENDED_AFTER=""
+  [ "$TAPE_SHORT_SEAL" = 1 ] || return 0
+  if [ "${1:-0}" = 1 ] || try_seal_copy; then
+    ENDED_AFTER=$SEAL_LAST
+    return 0
+  fi
+  echo "WARNING: this tape requires short-seal, and no valid seal marker was found as its last file:" >&2
+  echo "         it is read as an unsealed tape, and a planned file past the end of its data is not on it." >&2
+}
+
+# Did the tape end before the last data slice of its plan (File 0's
+# seal_marker is the planned seal, so its last slice is the file before)?
+tape_is_short() {
+  [ -n "$ENDED_AFTER" ] && [ "$ENDED_AFTER" -lt "$((10#$SEAL_MARKER - 1))" ]
+}
+
+# On a short tape, the file map becomes the plan's files up to ENDED_AFTER
+# and the seal marker after them, as the seal's own copy lists them: a planned
+# file after the end is not in it, so no read can be sent there (R3).
+trim_to_end() {
+  tape_is_short || return 0
+  awk -F'|' -v k="$ENDED_AFTER" '$1 + 0 <= k + 0' "$FILES_TXT" >"$WORK/files_on_tape.txt"
+  echo "$((ENDED_AFTER + 1))|seal_marker||" >>"$WORK/files_on_tape.txt"
+  FILES_TXT="$WORK/files_on_tape.txt"
+  info "This tape ended early, after file $ENDED_AFTER: its seal marker is file $((ENDED_AFTER + 1)), and files"
+  info "  $((ENDED_AFTER + 1)) to $((10#$SEAL_MARKER - 1)) of the plan are not on it. A unit with a slice among them is not on it whole."
+}
+
 # ---- establish the trusted file map (rung 1 -> rung 2 -> rung 3) ----
 
 # Sets FILES_TXT and FILES_SOURCE on success; on total failure prints the
 # zero-strip procedure and exits (used by modes that cannot proceed at all
 # without a map: --find-envelope, --restore; --info and --verify apply the
 # same ladder but handle a total failure themselves so they can still report
-# a verdict).
-establish_files() {
+# a verdict). On a tape that requires short-seal it then reads the seal and
+# keeps the map to the files on the tape, unless told --no-seal: --find-envelope
+# reads only envelopes, which are always before the first data slice.
+establish_files() { # [--no-seal]
+  local seal=1
+  [ "${1:-}" != --no-seal ] || seal=0
   bootstrap_thunk
 
   if try_front_index; then
     FILES_TXT="$WORK/files_from_index.txt"
     FILES_SOURCE="front_index"
+    if [ "$seal" = 1 ]; then
+      learn_end
+      trim_to_end
+    fi
     return 0
   fi
 
@@ -3287,6 +3441,10 @@ establish_files() {
     FILES_TXT="$WORK/files_from_seal.txt"
     FILES_SOURCE="seal_embedded_copy(RUNG-2)"
     echo "WARNING: using the seal marker's embedded copy as the file map — the front of the tape may be damaged; treat this recovery as degraded." >&2
+    if [ "$seal" = 1 ]; then
+      learn_end 1
+      trim_to_end
+    fi
     return 0
   fi
 
@@ -3302,6 +3460,12 @@ do_info() {
   local fi_ok=0 seal_ok=0
   try_front_index && fi_ok=1
   try_seal_copy && seal_ok=1
+  # On a tape that requires short-seal the seal says where the tape ended;
+  # a short seal is still SEALED (volume-format-v2.md 4.2).
+  ENDED_AFTER=""
+  if [ "$seal_ok" -eq 1 ] && [ "$TAPE_SHORT_SEAL" = 1 ]; then
+    ENDED_AFTER=$SEAL_LAST
+  fi
 
   local verdict
   if [ "$seal_ok" -ne 1 ]; then
@@ -3341,11 +3505,22 @@ do_info() {
     echo "  the system guide."
     ;;
   esac
+  if tape_is_short; then
+    echo "  The tape ended early, after file $ENDED_AFTER: its seal marker, the last file, is"
+    echo "  file $((ENDED_AFTER + 1)) (a short seal). Files $((ENDED_AFTER + 1)) to $((10#$SEAL_MARKER - 1)) of the plan are not on it,"
+    echo "  and a unit with a slice among them is not on this tape whole (another tape holds it)."
+  fi
   echo ""
 
   if [ -n "$table_file" ]; then
     echo "File map (source: $table_source):"
+    local gone=0
+    [ "$table_file" != "$WORK/files_from_index.txt" ] || ! tape_is_short || gone=1
     while IFS='|' read -r pos type size hash; do
+      if [ "$gone" = 1 ] && [ "$pos" -gt "$ENDED_AFTER" ]; then
+        printf "  %3d  %-24s  %8s bytes  %s  (planned; NOT ON TAPE)\n" "$pos" "$type" "${size:--}" "${hash:+${hash:0:16}...}"
+        continue
+      fi
       printf "  %3d  %-24s  %8s bytes  %s\n" "$pos" "$type" "${size:--}" "${hash:+${hash:0:16}...}"
     done <"$table_file"
   else
@@ -3408,18 +3583,22 @@ do_verify() {
   # passes them and checked once the front index says what they should be.
   # The seal marker is the last file on the tape, so it is read last (#412),
   # after the walk, with the same verdict as before. Only when the front index
-  # cannot be used is the seal read first, for its copy of the map.
+  # cannot be used is the seal read first, for its copy of the map. On a tape
+  # that requires short-seal (since version 1.6.0) the seal is read right after
+  # the front index, before any data slice (R1): it says where the tape ended,
+  # and a planned file after that is NOT ON TAPE, which is not a failure.
   local p
   for p in 1 2; do
     stash_tape_file "$p" "$WORK/stash.$p" "$STASH_MAX" || rm -f "$WORK/stash.$p"
   done
 
-  local fi_ok=0 seal_ok=0 files_file=""
+  local fi_ok=0 seal_ok=0 seal_tried=0 files_file=""
   if try_front_index; then
     fi_ok=1
     files_file="$WORK/files_from_index.txt"
   elif try_seal_copy; then
     seal_ok=1
+    seal_tried=1
     echo "WARNING: front index unreadable — verifying against the seal marker's embedded copy (degradation ladder RUNG-2)." >&2
     files_file="$WORK/files_from_seal.txt"
   else
@@ -3428,13 +3607,32 @@ do_verify() {
   fi
   FILES_TXT=$files_file
   FILES_SOURCE=verify
+  if [ "$TAPE_SHORT_SEAL" = 1 ]; then
+    if [ "$seal_tried" = 0 ]; then
+      seal_tried=1
+      try_seal_copy && seal_ok=1
+    fi
+    [ "$seal_ok" -ne 1 ] || ENDED_AFTER=$SEAL_LAST
+  fi
 
   echo "=== keyless integrity walk: $LABEL ==="
   echo ""
 
-  local overall_ok=1
+  local overall_ok=1 not_on_tape=0
 
   while IFS='|' read -r pos type size hash; do
+    # A planned file after the end of a short tape is not on it (R3): it is
+    # named and never read. Only the front index lists one.
+    if [ "$fi_ok" -eq 1 ] && tape_is_short && is_uint "$pos" &&
+      [ "$pos" -gt "$ENDED_AFTER" ]; then
+      if [ "$type" = seal_marker ]; then
+        printf "NOT ON TAPE  file %3d  %-24s  (planned; the seal marker is file %d)\n" "$pos" "$type" "$((ENDED_AFTER + 1))"
+      else
+        printf "NOT ON TAPE  file %3d  %-24s\n" "$pos" "$type"
+      fi
+      not_on_tape=$((not_on_tape + 1))
+      continue
+    fi
     # Entries with no hash are self-referential (front_index's own entry in
     # the front-index-sourced list, and the seal marker's own entry always)
     # — nothing on the tape hashes them, so there is nothing to compare.
@@ -3465,7 +3663,7 @@ do_verify() {
   # The seal marker, last. File 3 vs the seal binding is the one entry the
   # per-file loop above cannot check when the list came from the front index
   # itself (its own entry carries no hash there — self-reference).
-  if [ "$fi_ok" -eq 1 ] && try_seal_copy; then
+  if [ "$fi_ok" -eq 1 ] && [ "$seal_tried" = 0 ] && try_seal_copy; then
     seal_ok=1
   fi
   if [ "$seal_ok" -eq 1 ] && [ "$fi_ok" -eq 1 ]; then
@@ -3483,7 +3681,11 @@ do_verify() {
   fi
 
   echo ""
-  if [ "$overall_ok" -eq 1 ]; then
+  if [ "$overall_ok" -eq 1 ] && [ "$not_on_tape" -gt 0 ]; then
+    echo "VERIFY: PASS — every file on this tape matches the front index. The tape ended early, after"
+    echo "        file $ENDED_AFTER (its seal marker is file $((ENDED_AFTER + 1))): the $not_on_tape planned file(s) marked NOT ON TAPE"
+    echo "        are not on it, which is not a failure. A unit with a slice among them is on another tape."
+  elif [ "$overall_ok" -eq 1 ]; then
     echo "VERIFY: PASS — every file matches the front index."
   else
     if [ "$SWAP_TAPES" = 1 ] && [ ${#VERIFY_BAD[@]} -gt 0 ]; then
@@ -3713,7 +3915,9 @@ found_envelope() { # <position>
 }
 
 do_find_envelope() {
-  establish_files
+  # Every envelope lies before the first data slice, so this mode never needs
+  # to know where a tape that requires short-seal ended: it reads no seal.
+  establish_files --no-seal
 
   # Every envelope, not just the first that opens (#412): an operator or
   # escrow key opens them all, and the operator envelope lists every unit.
@@ -4178,9 +4382,13 @@ note_other_units() {
 
 # Pick the slices of one unit (one version) from the manifest into $3, checked
 # against the file map before any slice is read. Sets PICKED_VERSION and
-# PICKED_BYTES.
+# PICKED_BYTES. On a short tape a version with a slice after ENDED_AFTER is
+# cut (volume-format-v2.md 4.2): PICKED_CUT is then 1, PICKED_LAST is its last
+# slice's tape file, $3 is left empty, and the caller names it (R4).
 PICKED_VERSION=""
 PICKED_BYTES=0
+PICKED_CUT=0
+PICKED_LAST=""
 pick_slices() { # <manifest> <unit> <out> [version]
   local manifest=$1 unit=$2 out=$3 want=${4:-} num tpos meb msha isize ihash
   # A volume can carry the SAME unit more than once — two snapshot versions,
@@ -4199,6 +4407,19 @@ pick_slices() { # <manifest> <unit> <out> [version]
   fi
   : >"$out"
   PICKED_BYTES=0
+  PICKED_CUT=0
+  PICKED_LAST=""
+  if tape_is_short; then
+    PICKED_LAST=$(awk -F'|' -v k="$ENDED_AFTER" '
+      $2 + 0 > k + 0 { cut = 1 }
+      $2 + 0 > last + 0 { last = $2 + 0 }
+      END { if (cut) print last }
+    ' "$WORK/picked.txt")
+    if [ -n "$PICKED_LAST" ]; then
+      PICKED_CUT=1
+      return 0
+    fi
+  fi
   while IFS='|' read -r num tpos meb msha; do
     isize=$(file_size_at "$tpos" "$FILES_TXT")
     ihash=$(file_hash_at "$tpos" "$FILES_TXT")
@@ -4215,6 +4436,41 @@ pick_slices() { # <manifest> <unit> <out> [version]
     echo "$num|$tpos|$isize|$ihash" >>"$out"
     PICKED_BYTES=$((PICKED_BYTES + isize))
   done <"$WORK/picked.txt"
+}
+
+# A unit cut by the early end of the tape: its slices run past the last file
+# before the seal, so this tape does not hold it whole, and nothing of it is
+# restored from here (R4), though the slices before the end are on the tape
+# and hash right. Another tape holds it whole, and --where says which.
+cut_text() { # <unit> <version> <its last slice's tape file>
+  echo "unit '$1' (version ${2:-unknown}) is not on this tape whole: the tape ended early,
+       after tape file $ENDED_AFTER (its seal marker, the last file, says so), and the
+       slices of this version run to tape file $3. It was cut by the end of the
+       tape and is restorable only from another tape that holds it whole. Find the
+       tapes that do:
+         $0 --where '$1' $(keys_args)"
+}
+
+die_cut() { # <unit> <version> <its last slice's tape file>
+  die "$(cut_text "$@")
+       No slice has been read."
+}
+
+# The units --all left out because they are cut, as unit|version|last file.
+CUT_UNITS=()
+
+# Said before RESTORE COMPLETE when --all left a unit out because it is cut.
+note_cut_units() {
+  [ ${#CUT_UNITS[@]} -gt 0 ] || return 0
+  local line u v last
+  echo ""
+  info "NOT ON THIS TAPE WHOLE: the tape ended early, after file $ENDED_AFTER, before the last slice of"
+  info "  these unit(s), so they were not restored from it. Each is restorable only from another tape:"
+  for line in "${CUT_UNITS[@]}"; do
+    IFS='|' read -r u v last <<<"$line"
+    info "    '$u' (version $v), slices to tape file $last"
+  done
+  info "  The tapes that hold one: $0 --where UNIT $(keys_args)"
 }
 
 do_restore() {
@@ -4268,6 +4524,7 @@ do_restore() {
     [ ${#targets[@]} -eq 1 ] || die "--path needs exactly one unit: give one --unit with it"
     info "Parsing slices for unit: ${targets[0]}"
     pick_slices "$manifest" "${targets[0]}" "$WORK/slices.0" "$want_version"
+    [ "$PICKED_CUT" = 0 ] || die_cut "${targets[0]}" "$PICKED_VERSION" "$PICKED_LAST"
     info "Restoring from '${targets[0]}' snapshot version ${PICKED_VERSION:-unknown}"
     restore_paths "$WORK/slices.0" "$CHOSEN_ENV" "${targets[0]}" "$PICKED_VERSION" "$destdir" "$scratch_parent"
     restore_end
@@ -4282,12 +4539,26 @@ do_restore() {
   for ((i = 0; i < ${#targets[@]}; i++)); do
     info "Parsing slices for unit: ${targets[$i]}"
     pick_slices "$manifest" "${targets[$i]}" "$WORK/slices.$i" "$want_version"
+    if [ "$PICKED_CUT" = 1 ]; then
+      # --all restores every unit the tape holds whole and names the cut
+      # ones; a unit asked for by name is refused by name.
+      [ "$RESTORE_ALL" = 1 ] || die_cut "${targets[$i]}" "$PICKED_VERSION" "$PICKED_LAST"
+      info "  '${targets[$i]}' (version $PICKED_VERSION) is not on this tape whole: the tape ended before its last slice"
+      CUT_UNITS+=("${targets[$i]}|$PICKED_VERSION|$PICKED_LAST")
+      continue
+    fi
     versions[$i]=$PICKED_VERSION
     info "Restoring '${targets[$i]}' snapshot version ${PICKED_VERSION:-unknown} ($(wc -l <"$WORK/slices.$i") slice(s))"
     total=$((total + PICKED_BYTES))
     first=$(head -n 1 "$WORK/slices.$i" | cut -d'|' -f2)
     order_lines+=("$first|$i")
   done
+
+  if [ ${#order_lines[@]} -eq 0 ]; then
+    note_cut_units
+    die "no unit this envelope lists is on this tape whole: the tape ended early, after
+       file $ENDED_AFTER, and every one is cut (see above). Nothing was restored."
+  fi
 
   # Step 4: room for all of it, measured once, before any slice is read.
   check_space "$destdir" "$destdir" "$total" 0
@@ -4342,6 +4613,14 @@ units_of_envelope() { # <manifest>
   awk '__AWK_UNIT_LIST__' "$1"
 }
 
+# --list still lists a cut unit's files (its dar catalogue is in the envelope,
+# and no slice is read), and says the tape does not hold it whole.
+list_cut_note() { # <unit>
+  echo "    NOT ON THIS TAPE WHOLE: the tape ended early, after file $ENDED_AFTER, and this version's"
+  echo "    slices run to file $PICKED_LAST. Restore it from another tape that holds it:"
+  echo "      $0 --where '$1' $(keys_args)"
+}
+
 do_list() {
   local want_version=${1:-} manifest u base
   set_age_ids
@@ -4369,10 +4648,15 @@ do_list() {
     echo ""
     if [ -z "$base" ]; then
       echo "=== $u, snapshot version $PICKED_VERSION — no dar catalogue in this envelope ==="
-      echo "    (it can still be restored whole; --list and --path need the catalogue)"
+      if [ "$PICKED_CUT" = 1 ]; then
+        list_cut_note "$u"
+      else
+        echo "    (it can still be restored whole; --list and --path need the catalogue)"
+      fi
       continue
     fi
     echo "=== $u, snapshot version $PICKED_VERSION — catalogs/${base##*/} ==="
+    [ "$PICKED_CUT" = 0 ] || list_cut_note "$u"
     dar -l "$base" -N -Q || die "dar could not list the catalogue of '$u'"
   done
   echo ""
@@ -5071,12 +5355,16 @@ print_needs() { # <job: its missing file is read, or - to print $WORK/needed.txt
 
 # The cartridge now in the drive, as far as this script needs it: its label,
 # and its file map in $WORK/other.files (position|type|size|sha256 per line).
-# Everything the first tape established is put back afterwards.
+# Everything the first tape established is put back afterwards. A cartridge
+# that requires short-seal has its seal read first, before any of its slices,
+# and nothing after its ended_after is taken from it (R5): its map keeps only
+# the files on it.
 OTHER_TAPE=0
 OTHER_LABEL=""
 other_tape_map() {
   local k_fi=$FRONT_INDEX k_seal=$SEAL_MARKER k_total=$TOTAL_FILES k_label=$TAPE_LABEL
   local k_created=${CREATED:-} k_files=$FILES_TXT k_src=${FILES_SOURCE:-} uuid ok=0
+  local k_short=$TAPE_SHORT_SEAL k_end=$ENDED_AFTER
   cp "$FILES_TXT" "$WORK/tape1.files"
   OTHER_TAPE=1
   CUR=""
@@ -5089,15 +5377,22 @@ other_tape_map() {
   elif try_front_index; then
     cp "$WORK/files_from_index.txt" "$WORK/other.files"
     ok=1
+    learn_end
   elif try_seal_copy; then
     echo "WARNING: the front index of this cartridge is unreadable: using the seal marker's copy of it." >&2
     cp "$WORK/files_from_seal.txt" "$WORK/other.files"
     ok=1
+    learn_end 1
   else
     info "Neither the front index of this cartridge nor the seal marker's copy of it can be read."
   fi
+  if [ "$ok" = 1 ] && tape_is_short; then
+    info "This cartridge ended early, after file $ENDED_AFTER (its seal marker says so): nothing after that is read from it."
+    awk -F'|' -v k="$ENDED_AFTER" '$1 + 0 <= k + 0' "$WORK/other.files" >"$WORK/other.files.new"
+    mv "$WORK/other.files.new" "$WORK/other.files"
+  fi
   FRONT_INDEX=$k_fi SEAL_MARKER=$k_seal TOTAL_FILES=$k_total TAPE_LABEL=$k_label CREATED=$k_created
-  FILES_SOURCE=$k_src
+  FILES_SOURCE=$k_src TAPE_SHORT_SEAL=$k_short ENDED_AFTER=$k_end
   cp "$WORK/tape1.files" "$k_files"
   [ "$ok" = 1 ]
 }
@@ -5204,10 +5499,13 @@ finish_pending() {
   PENDING=()
 }
 
-# The end of a restore: COMPLETE only when no unit came back short.
+# The end of a restore: COMPLETE only when no unit came back short. A unit
+# --all left out because the tape ended before it is named, not counted short:
+# it is not on this tape whole by design, and another tape holds it.
 restore_end() {
   local line
   note_other_units
+  note_cut_units
   echo ""
   if [ ${#INCOMPLETE[@]} -gt 0 ]; then
     info "RESTORE INCOMPLETE"
@@ -5355,6 +5653,11 @@ do_fill() { # <destination> <version given, or empty> <scratch parent, or empty>
   fi
 
   pick_slices "$manifest" "$unit" "$WORK/slices.0" "$ver"
+  # A fill takes nothing from a tape that does not hold the version whole (R4,
+  # R5): the tape it reads is the other copy, and its own seal said where it
+  # ended. The list is unchanged.
+  [ "$PICKED_CUT" = 0 ] || die "$(cut_text "$unit" "$ver" "$PICKED_LAST")
+       A fill uses a tape that holds the unit whole. Nothing was changed."
   local last
   last=$(tail -n 1 "$WORK/slices.0" | cut -d'|' -f1)
   awk -F'|' -v last="$last" 'FILENAME == ARGV[1] { need[$1] = 1; next } ($1 in need) || $1 == last' "$WORK/fill.slices" "$WORK/slices.0" >"$WORK/fill.slice.list"
@@ -5487,6 +5790,23 @@ fill_end() { # <list> <root>
 INDEX_OPENED=0
 INDEX_HAD=0
 
+# On a short tape, the versions an opened envelope lists that this tape does
+# not hold whole go to $WORK/cut.versions (uuid TAB version), which the index
+# programs read through INDEX_CUT: a this-tape row of such a version is cut,
+# never a holder, and the loaded tape does not count as holding it (R4).
+note_cut_versions() { # <envelope dir>
+  tape_is_short || return 0
+  [ -f "$1/MANIFEST.toml" ] || return 0
+  awk -v k="$ENDED_AFTER" '__AWK_CUT_VERSIONS__' "$1/MANIFEST.toml" >>"$WORK/cut.versions"
+}
+
+# The line after a listing whose holders include a version this tape cut.
+note_cut_holders() {
+  [ -s "$WORK/cut.versions" ] || return 0
+  info "A holder marked CUT on this tape is the loaded tape, which ended early, after file $ENDED_AFTER (its"
+  info "seal marker says so), before the last slice of that version: it does not hold it whole."
+}
+
 index_banner() {
   echo ""
   info "Index read from tape: ${TAPE_LABEL:-<unreadable>} (written $(safe_str "${CREATED:-unknown}"))"
@@ -5519,6 +5839,7 @@ WHERE_OPERATOR=""
 where_envelope() { # <position>
   local pos=$1 d="$WORK/opened.$1" ty who=""
   INDEX_OPENED=$((INDEX_OPENED + 1))
+  note_cut_versions "$d"
   ty=$(file_type_at "$pos" "$FILES_TXT")
   if [ -f "$d/index/units.tsv" ]; then
     INDEX_HAD=$((INDEX_HAD + 1))
@@ -5550,6 +5871,7 @@ where_every_unit() {
     : >"$WORK/all.counts"
     rc=0
     ALL_TENANT="${WHERE_TENANTS[$i]}" ALL_COUNTS="$WORK/all.counts" ALL_ABSENT="$WORK/all.absent" \
+      INDEX_CUT="$WORK/cut.versions" \
       awk '__AWK_INDEX_COMMON__ __AWK_INDEX_ALL__' "$f" >>"$WORK/all.out" || rc=$?
     case "$rc" in
     0 | 1)
@@ -5579,11 +5901,13 @@ where_every_unit() {
   cat "$WORK/all.out"
   info "A holder marked 'this tape' is the tape you have loaded. For any other, find the cartridge"
   info "by its label or its chip serial, load it, and use the RESTORE.sh stored on that tape."
+  note_cut_holders
 }
 
 do_where() { # <unit, or --all for every unit>
   local unit=$1 i rc found=0 f
   establish_files
+  : >"$WORK/cut.versions"
   walk_envelopes where_envelope
   [ "$INDEX_OPENED" -gt 0 ] || die_no_envelope
   index_banner
@@ -5602,6 +5926,7 @@ do_where() { # <unit, or --all for every unit>
     f=${WHERE_FILES[$i]}
     rc=0
     WHERE_UNIT="$unit" WHERE_KNOWN="$WORK/where.known" WHERE_TENANT="${WHERE_TENANTS[$i]}" \
+      INDEX_CUT="$WORK/cut.versions" \
       awk '__AWK_INDEX_COMMON__ __AWK_INDEX_WHERE__' "$f" || rc=$?
     case "$rc" in
     0) found=1 ;;
@@ -5626,6 +5951,7 @@ do_where() { # <unit, or --all for every unit>
   echo ""
   info "A holder marked 'this tape' is the tape you have loaded. For any other, find the cartridge"
   info "by its label or its chip serial, load it, and use the RESTORE.sh stored on that tape."
+  note_cut_holders
 }
 
 # --find: the matches of each tenant envelope's paths.tsv, kept in a file so the
@@ -5637,6 +5963,7 @@ FIND_TOTAL=0
 find_in_envelope() { # <position>
   local pos=$1 d="$WORK/opened.$1" u who shown total
   INDEX_OPENED=$((INDEX_OPENED + 1))
+  note_cut_versions "$d"
   if [ -f "$d/index/units.tsv" ] || [ -f "$d/index/paths.tsv" ]; then
     INDEX_HAD=$((INDEX_HAD + 1))
   fi
@@ -5646,7 +5973,7 @@ find_in_envelope() { # <position>
     who=$(toml_val "$d/MANIFEST.toml" tenant 2>/dev/null || true)
     : >"$WORK/find.counts"
     FIND_TEXT="$FIND_TEXT" FIND_LIMIT="$FIND_LEFT" FIND_UNITS="$u" FIND_COUNTS="$WORK/find.counts" \
-      FIND_WHO="tenant $(safe_str "$who")" \
+      FIND_WHO="tenant $(safe_str "$who")" INDEX_CUT="$WORK/cut.versions" \
       awk '__AWK_INDEX_COMMON__ __AWK_INDEX_FIND__' "$d/index/paths.tsv" >>"$WORK/find.out" || {
       echo "WARNING: the index in the envelope at file $pos has no unit, version or path column, so this script cannot read it." >&2
       : >"$WORK/find.counts"
@@ -5678,6 +6005,7 @@ do_find() { # <text>
   FIND_TEXT=$1
   : >"$WORK/find.out"
   establish_files
+  : >"$WORK/cut.versions"
   walk_envelopes find_in_envelope
   [ "$INDEX_OPENED" -gt 0 ] || die_no_envelope
   index_banner
@@ -5699,6 +6027,7 @@ do_find() { # <text>
     info "$((FIND_TOTAL - FIND_SHOWN)) more match(es) are not shown: this prints the first $FIND_SHOWN. Give more of"
     info "the path to narrow it."
   fi
+  note_cut_holders
   info "To restore one of these from the tape that holds it:"
   info "  $0 --restore $(keys_args) --unit UNIT --path PATH --to /your/destination"
 }
@@ -6010,6 +6339,11 @@ case "${1:-}" in
   echo "  --overwrite   --to must otherwise be empty or new: dar keeps a file"
   echo "      that is already there and reports success. --overwrite replaces"
   echo "      such files, to finish a restore of the same unit that stopped."
+  echo "  A tape written since version 1.6.0 may end early, at the end of its medium: its seal"
+  echo "      marker, the last file, says where (ended_after). --info says so, --verify prints"
+  echo "      NOT ON TAPE for each planned file after it (not a failure), and a unit with a slice"
+  echo "      after it is not on that tape whole: --restore refuses it by name (--all restores the"
+  echo "      rest and names it), --list says so, and --where marks that tape CUT for it."
   echo ""
   echo "Environment:"
   echo "  TAPE_DEVICE   Tape device path (default: /dev/nst0)"
@@ -6054,6 +6388,7 @@ esac
         .replace("__AWK_FILE_CHECK_LISTED__", AWK_FILE_CHECK_LISTED)
         .replace("__AWK_FILE_CHECK_LIST__", AWK_FILE_CHECK_LIST)
         .replace("__AWK_FILE_CHECK_FAILED__", AWK_FILE_CHECK_FAILED)
+        .replace("__AWK_CUT_VERSIONS__", AWK_CUT_VERSIONS)
         .replace("__TOOLS_READ__", &tools_for(MODE_READ).join(" "))
         .replace("__TOOLS_ENVELOPE__", &tools_for(MODE_ENVELOPE).join(" "))
         .replace("__TOOLS_LIST__", &tools_for(MODE_LIST).join(" "))
@@ -6707,7 +7042,7 @@ pub use crate::volume::manifest::{ManifestSlice, ManifestUnit};
 mod tests {
     use super::*;
     use crate::volume::restore_script::{
-        AWK_CHECK_FILE_LIST, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED, AWK_FILE_CHECK_LIST,
+        AWK_CHECK_FILE_LIST, AWK_CUT_VERSIONS, AWK_DAR_DAMAGED, AWK_FILE_CHECK_FAILED, AWK_FILE_CHECK_LIST,
         AWK_FILE_CHECK_LISTED, AWK_FILL_LISTING, AWK_FIND_ENVELOPE, AWK_INDEX_ALL,
         AWK_INDEX_COMMON, AWK_INDEX_FIND, AWK_INDEX_WHERE, AWK_MANIFEST_HAS_UNIT, AWK_MT_POSITION,
         AWK_PARSE_FILE_LIST, AWK_SELECT_VERSION, AWK_UNITS_TABLE, AWK_UNIT_LIST, AWK_UNIT_UUID,
@@ -8046,6 +8381,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
             ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
             ("AWK_FILE_CHECK_FAILED", AWK_FILE_CHECK_FAILED),
+            ("AWK_CUT_VERSIONS", AWK_CUT_VERSIONS),
         ] {
             assert!(
                 script.contains(fragment),
@@ -8590,6 +8926,7 @@ sha256_encrypted = \"bbb\"
             ("AWK_FILE_CHECK_LISTED", AWK_FILE_CHECK_LISTED),
             ("AWK_FILE_CHECK_LIST", AWK_FILE_CHECK_LIST),
             ("AWK_FILE_CHECK_FAILED", AWK_FILE_CHECK_FAILED),
+            ("AWK_CUT_VERSIONS", AWK_CUT_VERSIONS),
         ] {
             assert!(!fragment.contains('\''), "{name} contains an apostrophe");
         }
