@@ -5472,6 +5472,35 @@ mod tests {
             }
         }
 
+        /// The full tier on a short tape, on tape: seal last (a write's
+        /// `--full-confirm`), one rewind and one forward pass ending on the
+        /// seal at K+1; seal first (`volume verify`), out to K+1, one rewind,
+        /// and the pass to K. Neither moves past K+1.
+        #[test]
+        fn a_full_confirm_of_a_short_tape_on_tape_stops_at_the_short_seal() {
+            use crate::tape::fake::{FakeTape, Op};
+
+            let p = planned();
+            let mem = p.tape(K);
+            let plan = short(Tier::Integrity).reading_back(Some(K));
+            let mut seal_last = vec![Op::Rewind];
+            seal_last.extend((0..=K + 1).map(Op::Read));
+            let mut seal_first = vec![Op::Rewind, Op::Space(K + 1), Op::Read(K + 1), Op::Rewind];
+            seal_first.extend((0..=K).map(Op::Read));
+            for (order, expected) in [
+                (ReadOrder::SealLast, seal_last),
+                (ReadOrder::SealFirst, seal_first),
+            ] {
+                let fake = FakeTape::with_files(mem.files.clone(), SBS);
+                let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+                let evidence = store
+                    .confirm_with(&p.layout, plan.with_order(order))
+                    .unwrap();
+                assert!(evidence.mismatches.is_empty(), "{order:?}: {evidence:?}");
+                assert_eq!(fake.ops(), expected, "{order:?}");
+            }
+        }
+
         /// An interrupted full readback's checkpoints never stand in for
         /// the readback past the warning: entry K is read again, and the
         /// hazard is found. The positive control: without the readback, the
