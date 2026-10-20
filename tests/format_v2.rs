@@ -83,7 +83,11 @@ struct UnitPlain {
     /// The `sha256_plain` the catalog recorded for the unit's one slice: the
     /// real hash of `plaintext` when the build asked for it
     /// ([`HarnessSpec::real_plaintext_hash`]), else the harness placeholder.
+    /// With several slices ([`HarnessSpec::slices_per_unit`]), the first's.
     sha256_plain: String,
+    /// Every slice's recorded `sha256_plain`, in slice order: each the hash
+    /// of its own part of `plaintext` when the build asked for real ones.
+    slice_sha256_plain: Vec<String>,
 }
 
 /// What a sealed-harness build is made of beyond its fixture units: the names
@@ -110,6 +114,11 @@ struct HarnessSpec<'a> {
     /// the second the second tenant's last): what the cross-volume index
     /// (§1.5) lists beyond this tape, and what must not cross tenants.
     history: [&'a str; 2],
+    /// The staged slices each unit is cut into: its plaintext in this many
+    /// contiguous parts, each age-encrypted on its own (a dar slice each,
+    /// as staging makes them). 1 for every tape but the short one, whose cut
+    /// unit has a slice on the tape and a slice past its end (#420).
+    slices_per_unit: usize,
 }
 
 impl Default for HarnessSpec<'_> {
@@ -120,6 +129,7 @@ impl Default for HarnessSpec<'_> {
             real_plaintext_hash: false,
             escrow: false,
             history: ["T7HIST-ALPHA", "T7HIST-BRAVO"],
+            slices_per_unit: 1,
         }
     }
 }
@@ -297,6 +307,117 @@ fn build_sealed_harness_from(
     spec: &HarnessSpec<'_>,
     volume_uuid: &str,
 ) -> Harness {
+    let p = prepare_harness(fixtures, spec, volume_uuid);
+    let run = run_session(
+        &p.conn,
+        p.built,
+        &p.keys,
+        p.volume_id,
+        &p.build_units,
+        MemStore::new(BS as usize),
+    );
+    match run.outcome {
+        ConfirmOutcome::Sealed(_) => {}
+        ConfirmOutcome::Quarantined(q) => {
+            panic!("harness must end Sealed, got Quarantined: {:?}", q.reason)
+        }
+        ConfirmOutcome::Inconclusive(inc) => {
+            panic!(
+                "harness must end Sealed, got Inconclusive: {:?}",
+                inc.evidence.mismatches
+            )
+        }
+    }
+    Harness {
+        operator: p.operator,
+        escrow: p.escrow,
+        layout: run.layout,
+        store: run.store,
+        tenants: p.tenants,
+        units: p.units,
+        history: p.history,
+    }
+}
+
+/// A harness's catalog, keys, staged slices and built Layout, before any
+/// session ran over them: what [`build_sealed_harness_from`] seals in full
+/// and [`build_short_harness`] seals short. The directories hold the catalog,
+/// the staged slices, the index's work files and the session's
+/// materialized files, and live as long as this does.
+struct Prepared {
+    conn: rusqlite::Connection,
+    operator: TenantFixture,
+    escrow: Option<GeneratedKeypair>,
+    tenants: Vec<TenantFixture>,
+    units: Vec<UnitPlain>,
+    history: Vec<(String, i64, String)>,
+    build_units: Vec<BuildUnit>,
+    built: BuiltLayout,
+    keys: KeyAvailability,
+    volume_id: i64,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+/// What one session run over a [`Prepared`] harness ended with.
+struct SessionRun {
+    /// The sealed Layout, cloned before the typestate consumed it.
+    layout: Layout,
+    store: MemStore,
+    /// The seal this session wrote: [`ExecuteOutcome::Ready`]'s ending.
+    ending: tapectl::volume::session::Ending,
+    outcome: ConfirmOutcome,
+}
+
+/// The FULL v2 write session — build's Layout -> validate -> plan -> execute
+/// -> seal -> confirm at `Tier::Integrity` — over `store`. Panics unless
+/// execute reaches a seal: every caller is a harness that needs one.
+fn run_session(
+    conn: &rusqlite::Connection,
+    built: BuiltLayout,
+    keys: &KeyAvailability,
+    volume_id: i64,
+    build_units: &[BuildUnit],
+    mut store: MemStore,
+) -> SessionRun {
+    // Snapshot BEFORE the typestate chain below consumes `built` — see the
+    // `Harness::layout` doc comment; `confirm`'s success arm does not hand
+    // the Layout back.
+    let layout = built.layout.clone();
+    let validated = built
+        .into_validated(keys, SliceCheck::Size, &mut store)
+        .expect("validate should pass for a well-formed microcosm build");
+    let planned = validated
+        .plan(conn, volume_id, build_units)
+        .expect("plan should insert writes/write_positions rows");
+    let ready = match planned
+        .execute(conn, &mut store)
+        .expect("execute should not error")
+    {
+        ExecuteOutcome::Ready(r) => r,
+        ExecuteOutcome::Interrupted(_) => panic!("unexpected interruption building the harness"),
+        ExecuteOutcome::Aborted(a) => panic!("unexpected abort building the harness: {}", a.reason),
+    };
+    let ending = ready.ending();
+    let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
+    let outcome = sealed_pending
+        .confirm(conn, &mut store, Tier::Integrity)
+        .expect("confirm should not error");
+    SessionRun {
+        layout,
+        store,
+        ending,
+        outcome,
+    }
+}
+
+/// [`build_sealed_harness_from`]'s first half: the catalog rows, keys,
+/// staged slices and built Layout of `fixtures`, named and keyed as `spec`
+/// says, ready for a session.
+fn prepare_harness(
+    fixtures: &[UnitFixture],
+    spec: &HarnessSpec<'_>,
+    volume_uuid: &str,
+) -> Prepared {
     // `db::open_memory` is `#[cfg(test)]`-gated (unit-test-only), so it does
     // not exist in the normal rlib an integration test links against. A real
     // temp-file DB via the unconditionally-`pub` `db::open` is functionally
@@ -372,42 +493,61 @@ fn build_sealed_harness_from(
         // `escrow_recipient_present: None` below opts the check out).
         let mut recipients = vec![tenant.public_key.clone(), operator.public_key.clone()];
         recipients.extend(escrow_public_key.clone());
-        let encrypted = staging::encrypt_data(&plaintext, &recipients).unwrap();
-        // sha256_plain is never read back by any of this suite's assertions
-        // or by the validate/execute/confirm code paths under test (only
-        // `sha256_encrypted` is — `volume-format-v2.md` §3's front index
-        // carries ciphertext hashes only); a placeholder skips a second full
-        // ~N MiB debug-mode hash pass per unit purely for test wall-clock,
-        // matching `build.rs`'s own test fixture's identical shortcut
-        // (`sha_hex(b"plaintext hash is not exercised by this fixture")`).
-        let sha_plain = if spec.real_plaintext_hash {
-            sha256_hex(&plaintext)
-        } else {
-            sha256_hex(b"plaintext hash is not exercised by this harness")
-        };
-        let sha_enc = sha256_hex(&encrypted);
+        // Each part of the plaintext is one slice, encrypted on its own; with
+        // one slice per unit (every harness but the short one) the part is
+        // the whole plaintext.
+        let part_len = plaintext.len().div_ceil(spec.slices_per_unit.max(1)).max(1);
+        let mut slices = Vec::new();
+        let mut slice_sha256_plain = Vec::new();
+        for (n, part) in plaintext.chunks(part_len).enumerate() {
+            let encrypted = staging::encrypt_data(part, &recipients).unwrap();
+            // sha256_plain is never read back by any of this suite's assertions
+            // or by the validate/execute/confirm code paths under test (only
+            // `sha256_encrypted` is — `volume-format-v2.md` §3's front index
+            // carries ciphertext hashes only); a placeholder skips a second full
+            // ~N MiB debug-mode hash pass per unit purely for test wall-clock,
+            // matching `build.rs`'s own test fixture's identical shortcut
+            // (`sha_hex(b"plaintext hash is not exercised by this fixture")`).
+            let sha_plain = if spec.real_plaintext_hash {
+                sha256_hex(part)
+            } else {
+                sha256_hex(b"plaintext hash is not exercised by this harness")
+            };
+            let sha_enc = sha256_hex(&encrypted);
 
-        conn.execute(
-            "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
-                                        sha256_plain, sha256_encrypted)
-             VALUES (?1, 1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                stage_set_id,
-                plaintext.len() as i64,
-                encrypted.len() as i64,
-                sha_plain,
-                sha_enc
-            ],
-        )
-        .unwrap();
-        let slice_id = conn.last_insert_rowid();
-        let slice_path = slices_dir.path().join(format!("slice_{slice_id}.age"));
-        std::fs::write(&slice_path, &encrypted).unwrap();
-        conn.execute(
-            "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
-            rusqlite::params![slice_path.to_string_lossy(), slice_id],
-        )
-        .unwrap();
+            conn.execute(
+                "INSERT INTO stage_slices (stage_set_id, slice_number, size_bytes, encrypted_bytes,
+                                            sha256_plain, sha256_encrypted)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    stage_set_id,
+                    n as i64 + 1,
+                    part.len() as i64,
+                    encrypted.len() as i64,
+                    sha_plain,
+                    sha_enc
+                ],
+            )
+            .unwrap();
+            let slice_id = conn.last_insert_rowid();
+            let slice_path = slices_dir.path().join(format!("slice_{slice_id}.age"));
+            std::fs::write(&slice_path, &encrypted).unwrap();
+            conn.execute(
+                "UPDATE stage_slices SET staging_path = ?1 WHERE id = ?2",
+                rusqlite::params![slice_path.to_string_lossy(), slice_id],
+            )
+            .unwrap();
+            slices.push(BuildSlice {
+                slice_id,
+                slice_number: n as i64 + 1,
+                size_bytes: part.len() as i64,
+                encrypted_bytes: encrypted.len() as i64,
+                sha256_plain: sha_plain.clone(),
+                sha256_encrypted: sha_enc,
+                staging_path: slice_path,
+            });
+            slice_sha256_plain.push(sha_plain);
+        }
 
         build_units.push(BuildUnit {
             stage_set_id,
@@ -419,15 +559,7 @@ fn build_sealed_harness_from(
             dar_command: None,
             catalog_path: None,
             snapshot_version: 1,
-            slices: vec![BuildSlice {
-                slice_id,
-                slice_number: 1,
-                size_bytes: plaintext.len() as i64,
-                encrypted_bytes: encrypted.len() as i64,
-                sha256_plain: sha_plain.clone(),
-                sha256_encrypted: sha_enc,
-                staging_path: slice_path,
-            }],
+            slices,
         });
         units_plain.push(UnitPlain {
             unit_name: fixture.folder_name.clone(),
@@ -440,7 +572,8 @@ fn build_sealed_harness_from(
                 .map(|(n, _)| sha256_hex(&std::fs::read(fixture.path.join(n)).unwrap()))
                 .collect(),
             plaintext,
-            sha256_plain: sha_plain,
+            sha256_plain: slice_sha256_plain[0].clone(),
+            slice_sha256_plain,
         });
     }
 
@@ -558,10 +691,6 @@ fn build_sealed_harness_from(
     // The index is plaintext until it is in an envelope: none of it may be in
     // the directory `build()` fills (staging's stand-in), under any name.
     assert_no_index_plaintext(session_dir.path());
-    // Snapshot BEFORE the typestate chain below consumes `built` — see the
-    // `Harness::layout` doc comment; `confirm`'s success arm does not hand
-    // the Layout back.
-    let layout_snapshot = built.layout.clone();
 
     let keys = KeyAvailability {
         tenant_ids: tenants.iter().map(|t| t.tenant_id).collect(),
@@ -571,46 +700,18 @@ fn build_sealed_harness_from(
         stage_sets_lacking_escrow: None,
     };
 
-    let mut store = MemStore::new(BS as usize);
-    let validated = built
-        .into_validated(&keys, SliceCheck::Size, &mut store)
-        .expect("validate should pass for a well-formed microcosm build");
-    let planned = validated
-        .plan(&conn, volume_id, &build_units)
-        .expect("plan should insert writes/write_positions rows");
-    let ready = match planned
-        .execute(&conn, &mut store)
-        .expect("execute should not error")
-    {
-        ExecuteOutcome::Ready(r) => r,
-        ExecuteOutcome::Interrupted(_) => panic!("unexpected interruption building the harness"),
-        ExecuteOutcome::Aborted(a) => panic!("unexpected abort building the harness: {}", a.reason),
-    };
-    let sealed_pending = ready.seal(&mut store).expect("seal should succeed");
-    let outcome = sealed_pending
-        .confirm(&conn, &mut store, Tier::Integrity)
-        .expect("confirm should not error");
-    match outcome {
-        ConfirmOutcome::Sealed(_) => {}
-        ConfirmOutcome::Quarantined(q) => {
-            panic!("harness must end Sealed, got Quarantined: {:?}", q.reason)
-        }
-        ConfirmOutcome::Inconclusive(inc) => {
-            panic!(
-                "harness must end Sealed, got Inconclusive: {:?}",
-                inc.evidence.mismatches
-            )
-        }
-    }
-
-    Harness {
+    Prepared {
+        conn,
         operator,
         escrow,
-        layout: layout_snapshot,
-        store,
         tenants,
         units: units_plain,
         history,
+        build_units,
+        built,
+        keys,
+        volume_id,
+        _dirs: vec![db_dir, slices_dir, index_work, session_dir],
     }
 }
 
@@ -1756,6 +1857,7 @@ fn no_plaintext_zone_reveals_a_tenant_unit_file_hash_or_key() {
         real_plaintext_hash: true,
         escrow: true,
         history: [NEEDLE_VOLUME_A, NEEDLE_VOLUME_B],
+        ..HarnessSpec::default()
     };
     let h = build_sealed_harness_from(&fixtures, &spec, VOLUME_UUID_NEEDLES);
     let needles = plaintext_zone_needles(&h, &fixtures);
@@ -2255,6 +2357,7 @@ fn the_history_labels_are_on_the_tape_only_inside_the_operator_envelope() {
         real_plaintext_hash: false,
         escrow: true,
         history: [NEEDLE_VOLUME_A, NEEDLE_VOLUME_B],
+        ..HarnessSpec::default()
     };
     let h = build_sealed_harness_from(&fixtures, &spec, VOLUME_UUID_NEEDLES);
     let labels = [NEEDLE_VOLUME_A.to_string(), NEEDLE_VOLUME_B.to_string()];
