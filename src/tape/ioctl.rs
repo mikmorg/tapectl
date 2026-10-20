@@ -244,6 +244,10 @@ pub struct TapeDevice {
     /// st's recovered errors, added up across every `MTIOCGET` since the
     /// open reading (issue #344).
     recovered: crate::tape::mtget_journal::RecoveredTally,
+    /// The bytes its block writes have accepted since it opened, and the
+    /// early warning once st refused one (#420). A new open starts afresh:
+    /// past the warning, the drive refuses the first write there again.
+    warning: EarlyWarningState,
 }
 
 impl Drop for TapeDevice {
@@ -323,6 +327,7 @@ impl TapeDevice {
             block_size,
             path: device_path.to_string(),
             recovered: Default::default(),
+            warning: EarlyWarningState::default(),
         };
         dev.set_block_size(block_size)?;
         dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
@@ -342,6 +347,7 @@ impl TapeDevice {
             block_size,
             path: device_path.to_string(),
             recovered: Default::default(),
+            warning: EarlyWarningState::default(),
         };
         dev.set_block_size(block_size)?;
         dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
@@ -439,11 +445,59 @@ impl TapeDevice {
     /// `docs/design/volume-format-v2.md` §7 / layout-session.md's Store seam).
     /// Returns the number of bytes committed to the medium including padding
     /// (`layout_model::pad_to_blocks(len, block_size)`).
+    ///
+    /// Every block goes through [`write_block_retrying`] (#420): past the
+    /// early warning a refused block is written again, and only the hard end
+    /// fails the write. The filemark is one ioctl, never retried
+    /// (`volume-format-v2.md` §4.3 W3): refused, it is a full medium.
     pub fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+        let mut warning = std::mem::take(&mut self.warning);
+        let refusals_before = warning.refusals();
+        let blocks = self.write_blocks(src, len, &mut warning);
+        self.warning = warning;
+        self.summarize_refusals(refusals_before);
+        let committed = blocks?;
+
+        let marked = if sync {
+            self.write_filemark_sync()
+        } else {
+            self.write_filemark_immediate()
+        };
+        // A refused filemark is a full medium too (issue #408), and is not
+        // retried (#420 W3).
+        if let Err(e) = marked {
+            let full = matches!(&e, TapectlError::TapeIo(m) if m.contains("(os error 28)"));
+            return Err(if full {
+                TapectlError::MediumFull(e.to_string())
+            } else {
+                e
+            });
+        }
+        Ok(committed)
+    }
+
+    /// The early warning, once st refused a block write on this device
+    /// (#420): sticky for the device's life, which is its store's.
+    pub fn early_warning(&self) -> Option<EarlyWarning> {
+        self.warning.warning()
+    }
+
+    /// [`Self::write_stream`]'s blocks, each through
+    /// [`write_block_retrying`]. The device's journal gets the FIRST refusal
+    /// of its life — one `MTIOCGET`, while st still shows the refusal — and
+    /// the hard end, never a reading per refusal; the rest is counted in
+    /// `warning` and summed up by [`Self::summarize_refusals`].
+    fn write_blocks(
+        &self,
+        src: &mut dyn Read,
+        len: u64,
+        warning: &mut EarlyWarningState,
+    ) -> Result<u64> {
         let bs = self.block_size.max(1);
         let mut buf = vec![0u8; bs];
         let mut remaining = len;
         let mut committed = 0u64;
+        let mut first_refusal = warning.warning().is_none();
 
         while remaining > 0 {
             let want = remaining.min(bs as u64) as usize;
@@ -468,31 +522,64 @@ impl TapeDevice {
                 }
             }
             let started = std::time::Instant::now();
-            if let Err(e) = self.file.write_all(&buf[..bs]) {
-                self.note_failure("write", &e);
-                return Err(write_error("write", &e));
+            let accepted_before = warning.accepted();
+            let written = write_block_retrying(
+                |block| {
+                    let attempt = (&self.file).write(block);
+                    if let Err(e) = &attempt {
+                        if first_refusal && e.raw_os_error() == Some(nix::libc::ENOSPC) {
+                            first_refusal = false;
+                            self.note_failure("write (early warning: first refused block)", e);
+                            let line = format!(
+                                "early warning: st refused a block write (ENOSPC) after \
+                                 {accepted_before} bytes written since the drive opened; \
+                                 retrying it"
+                            );
+                            tracing::warn!("{line}");
+                            crate::progress::log(&line);
+                        }
+                    }
+                    attempt
+                },
+                &buf[..bs],
+                warning,
+            );
+            if let Err(e) = written {
+                let what = if e.raw_os_error() == Some(nix::libc::ENOSPC) {
+                    format!(
+                        "write (refused more than {MAX_REFUSALS_IN_A_ROW} times in a row: \
+                         the medium's hard end)"
+                    )
+                } else {
+                    "write".to_string()
+                };
+                self.note_failure(&what, &e);
+                return Err(write_error(&what, &e));
             }
             crate::progress::note_if_slow("one tape block write", started.elapsed());
             committed += bs as u64;
             remaining -= want as u64;
         }
-
-        let marked = if sync {
-            self.write_filemark_sync()
-        } else {
-            self.write_filemark_immediate()
-        };
-        // A filemark refused at the early-warning point is a full medium
-        // too (issue #408).
-        if let Err(e) = marked {
-            let full = matches!(&e, TapectlError::TapeIo(m) if m.contains("(os error 28)"));
-            return Err(if full {
-                TapectlError::MediumFull(e.to_string())
-            } else {
-                e
-            });
-        }
         Ok(committed)
+    }
+
+    /// The session log's summary of one file's refusals past the early
+    /// warning, when it had any (#420): how many, and the device's total.
+    fn summarize_refusals(&self, before: u64) {
+        let Some(w) = self.warning.warning() else {
+            return;
+        };
+        let here = w.refusals - before;
+        if here == 0 {
+            return;
+        }
+        let line = format!(
+            "early warning: {here} refused block write(s) retried in this file; {} since \
+             the first, which came after {} bytes written since the drive opened",
+            w.refusals, w.bytes_at
+        );
+        tracing::info!("{line}");
+        crate::progress::log(&line);
     }
 
     /// Stream-read one "file" from tape (all data until the next file mark),
@@ -1215,5 +1302,39 @@ mod density_tests {
         let err = write_block_retrying(|_| Ok(0), &[7; 8], &mut state).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WriteZero);
         assert_eq!(state.warning(), None);
+    }
+
+    /// The device's write path, by its source (no tape here): every block
+    /// goes through [`write_block_retrying`], nothing writes the descriptor
+    /// past it, and the filemark is one ioctl with no retry around it (W3).
+    /// The positive control is the scan finding the one call each must.
+    #[test]
+    fn the_device_retries_its_blocks_and_never_a_filemark() {
+        let src = include_str!("ioctl.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap();
+        let start = body.find("    pub fn write_stream(").unwrap();
+        let end = start + body[start..].find("    /// Stream-read one").unwrap();
+        let writer = &body[start..end];
+        assert_eq!(writer.matches("write_block_retrying(").count(), 1);
+        assert_eq!(writer.matches("(&self.file).write(block)").count(), 1);
+        assert!(!writer.contains("write_all("), "a block bypassing the retry");
+        for filemark in ["self.write_filemark_sync()", "self.write_filemark_immediate()"] {
+            assert_eq!(writer.matches(filemark).count(), 1, "{filemark}");
+        }
+        let loops: Vec<&str> = writer
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with("while ") || l.starts_with("loop ") || l.starts_with("for "))
+            .collect();
+        assert_eq!(
+            loops,
+            vec!["while remaining > 0 {", "while got < want {"],
+            "the only loops are the block loop and its source read"
+        );
+        assert_eq!(
+            body.matches("self.file.write").count() + body.matches("(&self.file).write").count(),
+            1,
+            "no other tape write in the device"
+        );
     }
 }
