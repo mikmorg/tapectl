@@ -18,7 +18,7 @@ Output in JSON format
 Destination directory: each unit is restored into `DIR/<unit name>`, which must be empty or new
 .TP
 \fB\-\-unit\fR \fI<NAME>\fR
-A unit to restore; repeat for several. Without it, every unit with written slices on the volume
+A unit to restore; repeat for several. Without it, every unit the volume holds whole: on a tape that ended early (a short seal), the units the end cut are named, with a volume that holds each whole, and left out
 .TP
 \fB\-\-device\fR \fI<DEVICE>\fR
 Tape device (by\-id path). Defaults to the only configured drive; required when more than one is configured
