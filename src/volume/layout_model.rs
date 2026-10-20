@@ -180,17 +180,107 @@ pub fn pad_to_blocks(size: u64, block_size: u64) -> u64 {
     size.div_ceil(block_size) * block_size
 }
 
-/// The capacity a Layout must fit inside. `available_bytes` is the usable
-/// figure (nominal × usable factor); `reserve_bytes` folds together the
-/// manifest reserve and the ENOSPC buffer (design §2.8).
+/// The capacity a Layout must fit inside. `available_bytes` is the fill
+/// budget (the cartridge's capacity times the drive's fill ceiling);
+/// `reserve_bytes` is the end-of-tape reserve (`enospc_buffer`), counted
+/// against it.
+///
+/// **The plan bound** (ADR-0012 item 113; `volume-format-v2.md` §4.3, its
+/// closing paragraph). `plan_bound_bytes` is `Some(capacity)` — 100% of the
+/// cartridge's nominal capacity, the figure `volume init` decided (ADR-0010)
+/// — only when the writing drive declares `post_warning_bytes`
+/// ([`crate::config::LtoBackendConfig::plan_bound_bytes`]). Then the units
+/// are split in the caller's order ([`CapacityBudget::split`]): the prefix
+/// of whole units that fits the fill budget, with the reserve, is the
+/// committed plan and today's gate applies to it; whole units after it are
+/// planned past the fill ceiling while the plan's end stays within the
+/// bound. They are ordinary entries: the front index lists them, and a short
+/// seal may cut them. `None` (no `post_warning_bytes`) stops every plan at
+/// the fill ceiling exactly as before 1.6.0.
+///
+/// The reserve is the fill ceiling's: the bound is the plan's end itself,
+/// with no reserve under it. Past the ceiling the defence is the early
+/// warning and the short seal (§4.3 W4), not a margin.
+///
+/// Frozen into the session's `layout.json` with the rest of the Layout, so a
+/// resume revalidates against the bound the plan was made with. Absent from
+/// that file when `None` — a sidecar written before 1.6.0 reads as `None`,
+/// and one written without the key is byte for byte what 1.5.0 wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CapacityBudget {
     pub available_bytes: u64,
     pub reserve_bytes: u64,
-    /// ADR-0012 item 113's plan bound; `None` stops a plan at the fill
-    /// ceiling as before 1.6.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_bound_bytes: Option<u64>,
+}
+
+/// How a plan's units sit against its [`CapacityBudget`] (ADR-0012 item
+/// 113), as counts over the caller's unit order: `units[..committed]` are
+/// the committed plan, `units[committed..planned]` are planned past the fill
+/// ceiling, and `units[planned..]` reach beyond the plan bound (without one,
+/// beyond the fill ceiling) and cannot be on this plan. A unit is never
+/// split: one that crosses the fill ceiling is wholly past it, and one that
+/// crosses the bound is wholly beyond it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanSplit {
+    pub committed: usize,
+    pub planned: usize,
+    pub units: usize,
+}
+
+impl PlanSplit {
+    /// The units planned past the fill ceiling: "the tape may end before
+    /// them". Always empty without a plan bound.
+    pub fn past_ceiling(&self) -> std::ops::Range<usize> {
+        self.committed..self.planned
+    }
+
+    /// The units no plan within this budget can hold: a Layout holding any
+    /// of them fails [`Layout::validate`].
+    pub fn beyond_bound(&self) -> std::ops::Range<usize> {
+        self.planned..self.units
+    }
+
+    /// Every unit fits the plan.
+    pub fn fits(&self) -> bool {
+        self.planned == self.units
+    }
+}
+
+impl CapacityBudget {
+    /// Split units, in the caller's order, at the fill ceiling and at the
+    /// plan bound ([`PlanSplit`]). `fixed_bytes` is every file of the plan
+    /// that is not a data slice, block-padded (Files 0-3, the envelopes and
+    /// their backups, the seal); `unit_bytes` is each unit's slices,
+    /// block-padded. A unit is committed while the plan's end through it
+    /// plus the reserve fits the fill budget; after the first unit that does
+    /// not, every later unit is past the ceiling even if a smaller one would
+    /// fit (whole units in the caller's order, never reordered). A unit is
+    /// planned while the plan's end through it stays within the bound.
+    pub fn split(&self, fixed_bytes: u64, unit_bytes: &[u64]) -> PlanSplit {
+        let mut end = fixed_bytes;
+        let mut committed = 0;
+        let mut planned = 0;
+        let mut ceiling_crossed = false;
+        for &bytes in unit_bytes {
+            end = end.saturating_add(bytes);
+            if !ceiling_crossed && end.saturating_add(self.reserve_bytes) <= self.available_bytes {
+                committed += 1;
+                planned += 1;
+                continue;
+            }
+            ceiling_crossed = true;
+            match self.plan_bound_bytes {
+                Some(bound) if end <= bound => planned += 1,
+                _ => break,
+            }
+        }
+        PlanSplit {
+            committed,
+            planned,
+            units: unit_bytes.len(),
+        }
+    }
 }
 
 /// How [`Layout::validate`] checks each staged slice before the tape moves —
@@ -346,6 +436,22 @@ pub enum LayoutError {
         reserve: u64,
         available: u64,
     },
+    /// ADR-0012 item 113: a plan that reaches past the fill ceiling (the
+    /// drive declares `post_warning_bytes`) and past the cartridge's nominal
+    /// capacity too. Not [`Self::CapacityExceeded`]: raising the fill
+    /// ceiling ([`capacity_refusal_note`]) cannot help a plan the whole
+    /// cartridge cannot hold.
+    #[error(
+        "capacity exceeded: the layout needs {needed} bytes on tape, {over} bytes ({over_h}) \
+         over the {bound} bytes of this volume's nominal capacity, the most a plan may reach \
+         past the fill ceiling (ADR-0012 item 113). A unit is never split: write fewer units \
+         to this volume",
+        over = needed.saturating_sub(*bound),
+        over_h = crate::util::format_bytes_binary(
+            i64::try_from(needed.saturating_sub(*bound)).unwrap_or(i64::MAX)
+        ),
+    )]
+    PlanBoundExceeded { needed: u64, bound: u64 },
     #[error("staged slice file missing: {0}")]
     SliceFileMissing(PathBuf),
     #[error("staged slice size mismatch for {path}: recorded {expected} bytes, on-disk {actual}")]
@@ -509,19 +615,101 @@ impl Layout {
         }
     }
 
+    /// The capacity gate. Without a plan bound, today's: every file plus the
+    /// reserve within the fill budget. With one (ADR-0012 item 113), a plan
+    /// over the fill budget may stand: its committed prefix of whole units
+    /// fits the fill budget by construction ([`CapacityBudget::split`]), so
+    /// today's gate is left to apply to what every committed plan holds —
+    /// the files that are not data slices, plus the reserve — and the whole
+    /// plan must end within the bound. The gate needs no unit boundaries:
+    /// the Layout knows none, and these two conditions are what the split's
+    /// definition leaves to check.
     fn check_capacity(&self, errs: &mut Vec<LayoutError>) {
-        match self.on_tape_bytes() {
-            Ok(needed) => {
-                if needed + self.budget.reserve_bytes > self.budget.available_bytes {
-                    errs.push(LayoutError::CapacityExceeded {
-                        needed,
-                        reserve: self.budget.reserve_bytes,
-                        available: self.budget.available_bytes,
-                    });
-                }
+        let needed = match self.on_tape_bytes() {
+            Ok(needed) => needed,
+            Err(mut unsized_errs) => {
+                errs.append(&mut unsized_errs);
+                return;
             }
-            Err(mut unsized_errs) => errs.append(&mut unsized_errs),
+        };
+        let budget = &self.budget;
+        if needed + budget.reserve_bytes <= budget.available_bytes {
+            return;
         }
+        let Some(bound) = budget.plan_bound_bytes else {
+            errs.push(LayoutError::CapacityExceeded {
+                needed,
+                reserve: budget.reserve_bytes,
+                available: budget.available_bytes,
+            });
+            return;
+        };
+        let fixed = self.fixed_on_tape_bytes();
+        if fixed + budget.reserve_bytes > budget.available_bytes {
+            errs.push(LayoutError::CapacityExceeded {
+                needed: fixed,
+                reserve: budget.reserve_bytes,
+                available: budget.available_bytes,
+            });
+        }
+        if needed > bound {
+            errs.push(LayoutError::PlanBoundExceeded { needed, bound });
+        }
+    }
+
+    /// Every entry that is not a data slice, block-padded: the part of the
+    /// plan every unit split leaves in place (Files 0-3, the envelopes and
+    /// their backups, the seal). An unsized entry counts nothing here;
+    /// [`Self::validate`] reports it.
+    pub fn fixed_on_tape_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|e| !e.kind.is_slice())
+            .filter_map(|e| e.on_tape_bytes(self.block_size))
+            .sum()
+    }
+
+    /// Split units, each given as its slices' `stage_slice_id`s in the
+    /// caller's order, against this Layout's budget (ADR-0012 item 113;
+    /// [`CapacityBudget::split`]). A slice id the Layout does not hold, or an
+    /// unsized slice, counts nothing.
+    pub fn split_units(&self, unit_slice_ids: &[Vec<i64>]) -> PlanSplit {
+        let padded: std::collections::HashMap<i64, u64> = self
+            .entries
+            .iter()
+            .filter_map(|e| match e.kind {
+                ZoneKind::Slice { stage_slice_id } => e
+                    .on_tape_bytes(self.block_size)
+                    .map(|bytes| (stage_slice_id, bytes)),
+                _ => None,
+            })
+            .collect();
+        let unit_bytes: Vec<u64> = unit_slice_ids
+            .iter()
+            .map(|ids| ids.iter().filter_map(|id| padded.get(id)).sum())
+            .collect();
+        self.budget.split(self.fixed_on_tape_bytes(), &unit_bytes)
+    }
+
+    /// The data slices of the units planned past the fill ceiling, in
+    /// position order (ADR-0012 item 113): the entries of which the session
+    /// and the operator text say "planned past the fill ceiling; the tape
+    /// may end before them". Empty without a plan bound, and when every
+    /// unit is committed. Units as in [`Self::split_units`].
+    pub fn entries_past_ceiling(&self, unit_slice_ids: &[Vec<i64>]) -> Vec<&LayoutEntry> {
+        let split = self.split_units(unit_slice_ids);
+        let ids: HashSet<i64> = unit_slice_ids[split.past_ceiling()]
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let mut past: Vec<&LayoutEntry> = self
+            .entries
+            .iter()
+            .filter(|e| matches!(e.kind, ZoneKind::Slice { stage_slice_id } if ids.contains(&stage_slice_id)))
+            .collect();
+        past.sort_by_key(|e| e.position);
+        past
     }
 
     fn check_staged_slices(&self, slice_check: SliceCheck, errs: &mut Vec<LayoutError>) {
@@ -833,6 +1021,226 @@ mod tests {
             .validate(&keys_ok(&[]), SliceCheck::Size)
             .unwrap_err();
         assert!(matches!(errs[0], LayoutError::CapacityExceeded { .. }));
+    }
+
+    // ── the plan bound (ADR-0012 item 113) ──
+
+    fn slice_entry(position: i32, stage_slice_id: i64, size: u64) -> LayoutEntry {
+        LayoutEntry {
+            position,
+            kind: ZoneKind::Slice { stage_slice_id },
+            size_bytes: Some(size),
+            sha256: Some("ab".into()),
+            source: ContentSource::Generated,
+        }
+    }
+
+    /// Two fixed blocks (File 0 at 0, the seal at 5) and three units in the
+    /// caller's order: unit A = slices 10, 11 (2 blocks each, positions 1-2),
+    /// unit B = slice 20 (3 blocks, position 3), unit C = slice 30 (1 block,
+    /// position 4). Ten blocks in all.
+    fn three_unit_layout(budget: CapacityBudget) -> (Layout, Vec<Vec<i64>>) {
+        let entries = vec![
+            gen_entry(0, ZoneKind::IdThunk, BS),
+            slice_entry(1, 10, 2 * BS),
+            slice_entry(2, 11, 2 * BS - 7),
+            slice_entry(3, 20, 3 * BS),
+            slice_entry(4, 30, 1),
+            gen_entry(5, ZoneKind::SealMarker, BS),
+        ];
+        let mut layout = layout_with(entries, 0, 0);
+        layout.budget = budget;
+        (layout, vec![vec![10, 11], vec![20], vec![30]])
+    }
+
+    fn budget(available: u64, reserve: u64, bound: Option<u64>) -> CapacityBudget {
+        CapacityBudget {
+            available_bytes: available,
+            reserve_bytes: reserve,
+            plan_bound_bytes: bound,
+        }
+    }
+
+    #[test]
+    fn the_split_appends_whole_units_past_the_ceiling_up_to_the_bound_in_order() {
+        // Fixed 2 + A 4 = 6 blocks: A is committed under a 7-block fill
+        // budget. B ends at 9 and C at 10, both past the ceiling. C alone
+        // would fit beside A (2 + 4 + 1 = 7), but the order is the caller's
+        // and is kept: once B crosses the ceiling, every later unit is past it.
+        let units = [4 * BS, 3 * BS, BS];
+        let split = budget(7 * BS, 0, Some(10 * BS)).split(2 * BS, &units);
+        assert_eq!(
+            split,
+            PlanSplit {
+                committed: 1,
+                planned: 3,
+                units: 3
+            }
+        );
+        assert_eq!(split.past_ceiling(), 1..3);
+        assert!(split.beyond_bound().is_empty());
+        assert!(split.fits());
+
+        // The bound is inclusive and cuts at a whole unit: B ends at exactly
+        // 9 blocks and is planned; C would end at 10 and is beyond.
+        let split = budget(7 * BS, 0, Some(9 * BS)).split(2 * BS, &units);
+        assert_eq!((split.committed, split.planned), (1, 2));
+        assert_eq!(split.beyond_bound(), 2..3);
+        assert!(!split.fits());
+
+        // A unit that crosses the bound is never partly planned, and nothing
+        // after it is planned either, even a unit that would fit.
+        let split = budget(7 * BS, 0, Some(9 * BS - 1)).split(2 * BS, &[4 * BS, 3 * BS, 0]);
+        assert_eq!((split.committed, split.planned), (1, 1));
+    }
+
+    #[test]
+    fn the_reserve_counts_against_the_fill_budget_and_not_against_the_bound() {
+        let units = [4 * BS, 3 * BS, BS];
+        // With a 1-block reserve, A (end 6) still commits at 7; the bound
+        // (10 blocks, the plan's end itself) still takes C.
+        let split = budget(7 * BS, BS, Some(10 * BS)).split(2 * BS, &units);
+        assert_eq!((split.committed, split.planned), (1, 3));
+        // A 2-block reserve pushes A past the ceiling too: an empty committed
+        // prefix is what the arithmetic gives (every unit past the ceiling).
+        let split = budget(7 * BS, 2 * BS, Some(10 * BS)).split(2 * BS, &units);
+        assert_eq!((split.committed, split.planned), (0, 3));
+    }
+
+    #[test]
+    fn without_a_plan_bound_the_split_stops_at_the_fill_ceiling() {
+        let split = budget(7 * BS, 0, None).split(2 * BS, &[4 * BS, 3 * BS, BS]);
+        assert_eq!(
+            split,
+            PlanSplit {
+                committed: 1,
+                planned: 1,
+                units: 3
+            }
+        );
+        assert!(split.past_ceiling().is_empty());
+        assert_eq!(split.beyond_bound(), 1..3);
+        // Everything under the ceiling: all committed, with or without a bound.
+        for bound in [None, Some(100 * BS)] {
+            let split = budget(100 * BS, BS, bound).split(2 * BS, &[4 * BS, 3 * BS, BS]);
+            assert_eq!((split.committed, split.planned), (3, 3), "{bound:?}");
+        }
+    }
+
+    #[test]
+    fn a_layout_splits_its_units_by_their_padded_slices() {
+        let (layout, units) = three_unit_layout(budget(7 * BS, 0, Some(10 * BS)));
+        // Slice 11 is 7 bytes short of 2 blocks and pads to 2; slice 30 (1
+        // byte) pads to 1 block.
+        assert_eq!(layout.fixed_on_tape_bytes(), 2 * BS);
+        assert_eq!(layout.on_tape_bytes().unwrap(), 10 * BS);
+        let split = layout.split_units(&units);
+        assert_eq!((split.committed, split.planned, split.units), (1, 3, 3));
+        let past: Vec<i32> = layout
+            .entries_past_ceiling(&units)
+            .iter()
+            .map(|e| e.position)
+            .collect();
+        assert_eq!(past, vec![3, 4], "B's and C's slices, in position order");
+
+        // Without the bound nothing is past the ceiling.
+        let (layout, units) = three_unit_layout(budget(7 * BS, 0, None));
+        assert!(layout.entries_past_ceiling(&units).is_empty());
+    }
+
+    #[test]
+    fn with_a_plan_bound_a_plan_past_the_ceiling_validates_up_to_nominal() {
+        // Ten blocks against a 7-block fill budget: refused without the
+        // bound (today's gate, unchanged) ...
+        let (layout, _) = three_unit_layout(budget(7 * BS, 0, None));
+        let errs = layout
+            .validate(&keys_ok(&[]), SliceCheck::Size)
+            .unwrap_err();
+        assert_eq!(
+            errs,
+            vec![LayoutError::CapacityExceeded {
+                needed: 10 * BS,
+                reserve: 0,
+                available: 7 * BS
+            }]
+        );
+        // ... accepted with a bound of exactly the plan's end ...
+        let (layout, _) = three_unit_layout(budget(7 * BS, BS, Some(10 * BS)));
+        assert!(layout.validate(&keys_ok(&[]), SliceCheck::Size).is_ok());
+        // ... and refused one byte under it, by the bound's own error, which
+        // gets no --fill-ceiling note.
+        let (layout, _) = three_unit_layout(budget(7 * BS, BS, Some(10 * BS - 1)));
+        let errs = layout
+            .validate(&keys_ok(&[]), SliceCheck::Size)
+            .unwrap_err();
+        assert_eq!(
+            errs,
+            vec![LayoutError::PlanBoundExceeded {
+                needed: 10 * BS,
+                bound: 10 * BS - 1
+            }]
+        );
+        assert_eq!(capacity_refusal_note(&errs, 0.97, 10 * BS), None);
+        let msg = errs[0].to_string();
+        assert!(
+            msg.contains("1 bytes") && msg.contains("nominal capacity") && msg.contains("113"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn with_a_plan_bound_the_committed_plan_still_meets_todays_gate() {
+        // The files that are not slices, plus the reserve, are in every
+        // committed plan: over the fill budget they are refused as today,
+        // whatever the bound.
+        let (layout, _) = three_unit_layout(budget(2 * BS, BS, Some(100 * BS)));
+        let errs = layout
+            .validate(&keys_ok(&[]), SliceCheck::Size)
+            .unwrap_err();
+        assert_eq!(
+            errs,
+            vec![LayoutError::CapacityExceeded {
+                needed: 2 * BS,
+                reserve: BS,
+                available: 2 * BS
+            }]
+        );
+        // At exactly the fill budget they pass.
+        let (layout, _) = three_unit_layout(budget(3 * BS, BS, Some(100 * BS)));
+        assert!(layout.validate(&keys_ok(&[]), SliceCheck::Size).is_ok());
+    }
+
+    #[test]
+    fn a_plan_bound_never_refuses_what_the_fill_ceiling_accepts() {
+        // `capacity_uses_block_padded_sizes`' passing layouts still pass with
+        // a bound, even one below the fill budget: the gate returns before
+        // the bound is read when the plan fits under the ceiling.
+        let entries = vec![
+            gen_entry(0, ZoneKind::IdThunk, 1),
+            gen_entry(1, ZoneKind::SystemGuide, 1),
+            gen_entry(2, ZoneKind::RestoreSh, 1),
+        ];
+        for (available, reserve) in [(4 * BS, BS), (100 * BS, BS), (3 * BS, 0)] {
+            let mut l = layout_with(entries.clone(), available, reserve);
+            assert!(l.validate(&keys_ok(&[]), SliceCheck::Size).is_ok());
+            l.budget.plan_bound_bytes = Some(3 * BS);
+            assert!(l.validate(&keys_ok(&[]), SliceCheck::Size).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_plan_bound_is_absent_from_a_frozen_layout_without_one() {
+        // A session's `layout.json` without the bound is what 1.5.0 wrote,
+        // and one written before 1.6.0 reads back as no bound.
+        let none = budget(7, 1, None);
+        let json = serde_json::to_string(&none).unwrap();
+        assert_eq!(json, r#"{"available_bytes":7,"reserve_bytes":1}"#);
+        let old: CapacityBudget = serde_json::from_str(&json).unwrap();
+        assert_eq!(old, none);
+        let some = budget(7, 1, Some(9));
+        let json = serde_json::to_string(&some).unwrap();
+        assert!(json.contains(r#""plan_bound_bytes":9"#), "{json}");
+        assert_eq!(serde_json::from_str::<CapacityBudget>(&json).unwrap(), some);
     }
 
     #[test]
