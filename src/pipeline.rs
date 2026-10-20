@@ -6,8 +6,11 @@
 //! **Why.** Until 1.0.6 one thread read a 512 KiB block of the staged file,
 //! hashed it, wrote it to tape, and only then read the next block, so the
 //! drive waited out every disk read and every hash. On a CPU without SHA-NI
-//! the hash alone runs at about 191 MB/s (asm, one core) against the
-//! 160 MB/s an LTO-6 needs to stream: L6-0001's 1.32 TB write took 5 h 22 m,
+//! the hash alone runs at no more than the 160 MB/s an LTO-6 needs to stream
+//! (home2, one core: about 191 MB/s for OpenSSL's code, the figure once given
+//! here, and about 142-157 for the `sha2` asm tapectl used until #488 — the
+//! write-shaping note's §1; since #488 the hash is `ring`'s, OpenSSL's code,
+//! [`crate::pass_count`]): L6-0001's 1.32 TB write took 5 h 22 m,
 //! of which only about 49 minutes were spent inside tape write calls. With
 //! each stage on its own thread the slowest stage sets the rate, not the sum
 //! of all three.

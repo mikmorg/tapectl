@@ -18,6 +18,12 @@ toml = "0.8"
 # Already built as `toml` 0.8's own parser, so this adds no crate to the tree.
 toml_edit = "0.22"
 sha2 = { version = "0.10", features = ["asm"] }
+# The hash behind `pass_count::Sha256` (issue #488, the CTO's 2026-10-20
+# approval of the write-shaping note's §12 item 4): `ring`'s SHA-256 is OpenSSL's
+# SSSE3 code, about 32% faster than `sha2`'s `asm` on CPUs without SHA-NI such as
+# home2's Westmere, and builds static for musl. `sha2` stays for its `Digest` traits
+# (the counted type implements them) and as the `research` build's baseline.
+ring = { version = "0.17", default-features = false }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
