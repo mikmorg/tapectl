@@ -11,6 +11,12 @@
 //! pinned byte-for-byte by `tests/on_tape_golden.rs`) and
 //! [`Manifest::from_toml`] is the reader (serde, tolerant of unknown keys).
 //!
+//! From tapectl 1.6.0 the `[manifest]` table ends with `may_end_early = true`
+//! (`docs/design/volume-format-v2.md` §1.7, ADR-0012 item 111): every 1.6.0
+//! tape may end before the last file its plan lists, and only the seal says
+//! whether it did. The writer always states it; the reader takes it as a bool,
+//! false when absent (every envelope before 1.6.0), and it decides nothing.
+//!
 //! `tape_position` is `i64` on both sides now — the reader's original type.
 //! It is the file number on tape and is NOT the slice number: slices begin
 //! after the envelopes (position 8 on a typical layout), and the two diverge
@@ -72,6 +78,9 @@ struct ManifestHeaderDoc {
     volume: String,
     tenant: String,
     created_at: String,
+    /// From 1.6.0 (§1.7). Absent means false.
+    #[serde(default)]
+    may_end_early: bool,
 }
 
 /// The whole `MANIFEST.toml` document shape, for parsing only.
@@ -93,6 +102,10 @@ impl Manifest {
     /// would be free to reorder keys or reformat whitespace, and these bytes
     /// land on tape — `tests/on_tape_golden.rs` pins them exactly (modulo
     /// the one `created_at` line). Do not replace this with a serializer.
+    ///
+    /// The `[manifest]` table's last key is `may_end_early = true`, on every
+    /// envelope tapectl 1.6.0 or later writes (`volume-format-v2.md` §1.7):
+    /// it is a fact of the writer, so it is not a field of [`Manifest`].
     pub fn to_toml(&self) -> String {
         let label = &self.volume;
         let tenant_name = &self.tenant;
@@ -102,6 +115,7 @@ impl Manifest {
 volume = "{label}"
 tenant = "{tenant_name}"
 created_at = "{now}"
+may_end_early = true
 
 "#
         );
@@ -134,11 +148,10 @@ created_at = "{now}"
 
     /// Parse an envelope `MANIFEST.toml`.
     ///
-    /// Deliberately tolerant of unknown keys (see [`ManifestDoc`]).
+    /// Deliberately tolerant of unknown keys (see [`ManifestDoc`]), and of
+    /// an absent `may_end_early` (every envelope before 1.6.0).
     pub fn from_toml(text: &str) -> Result<Manifest> {
-        let doc: ManifestDoc = toml::from_str(text).map_err(|e| {
-            TapectlError::Other(format!("envelope MANIFEST.toml: parse failed: {e}"))
-        })?;
+        let doc = parse_doc(text)?;
         Ok(Manifest {
             volume: doc.manifest.volume,
             tenant: doc.manifest.tenant,
@@ -146,6 +159,20 @@ created_at = "{now}"
             units: doc.units,
         })
     }
+
+    /// Whether an envelope `MANIFEST.toml` states `[manifest] may_end_early =
+    /// true` (`volume-format-v2.md` §1.7): every envelope of a 1.6.0 tape.
+    /// False when the key is absent. It decides nothing: a manifest's
+    /// `tape_position`s are the plan, and the seal's `ended_after` says which
+    /// of them are on the tape (§4.2).
+    pub fn declares_may_end_early(text: &str) -> Result<bool> {
+        Ok(parse_doc(text)?.manifest.may_end_early)
+    }
+}
+
+fn parse_doc(text: &str) -> Result<ManifestDoc> {
+    toml::from_str(text)
+        .map_err(|e| TapectlError::Other(format!("envelope MANIFEST.toml: parse failed: {e}")))
 }
 
 #[cfg(test)]
@@ -247,5 +274,70 @@ mod tests {
         let parsed = Manifest::from_toml(&m.to_toml()).unwrap();
         assert_eq!(parsed, m);
         assert!(parsed.units.is_empty());
+    }
+
+    /// `volume-format-v2.md` §1.7 (ADR-0012 item 111): the `[manifest]`
+    /// table ends with the literal `may_end_early = true`, directly after
+    /// `created_at`, then the blank line before `[[units]]` as before — on a
+    /// manifest with units and on one without.
+    #[test]
+    fn the_manifest_table_ends_with_may_end_early() {
+        let m = Manifest {
+            volume: "GOLD01".to_string(),
+            tenant: "alpha".to_string(),
+            created_at: "2026-09-11T00:00:00+00:00".to_string(),
+            units: two_units(),
+        };
+        let text = m.to_toml();
+        let head = "[manifest]\n\
+                    volume = \"GOLD01\"\n\
+                    tenant = \"alpha\"\n\
+                    created_at = \"2026-09-11T00:00:00+00:00\"\n\
+                    may_end_early = true\n\
+                    \n\
+                    [[units]]\n";
+        assert!(text.starts_with(head), "{text}");
+        assert_eq!(text.matches("may_end_early").count(), 1, "{text}");
+        assert!(Manifest::declares_may_end_early(&text).unwrap());
+
+        let empty = Manifest { units: vec![], ..m }.to_toml();
+        assert_eq!(
+            empty,
+            "[manifest]\n\
+             volume = \"GOLD01\"\n\
+             tenant = \"alpha\"\n\
+             created_at = \"2026-09-11T00:00:00+00:00\"\n\
+             may_end_early = true\n\
+             \n"
+        );
+    }
+
+    /// A manifest from before 1.6.0 has no `may_end_early`: it parses to the
+    /// same [`Manifest`], and declares false. An explicit false reads false;
+    /// a value that is not a bool is a parse failure, as any malformed key is.
+    #[test]
+    fn a_manifest_without_may_end_early_still_parses() {
+        let m = Manifest {
+            volume: "LAB01".to_string(),
+            tenant: "operator".to_string(),
+            created_at: "2026-10-19T00:00:00+00:00".to_string(),
+            units: two_units(),
+        };
+        let current = m.to_toml();
+        let before = current.replace("may_end_early = true\n", "");
+        assert_ne!(before, current, "the line was not there to strip");
+        assert_eq!(
+            Manifest::from_toml(&before).expect("a 1.5.0 manifest parses"),
+            m
+        );
+        assert!(!Manifest::declares_may_end_early(&before).unwrap());
+
+        let stated_false = current.replace("may_end_early = true", "may_end_early = false");
+        assert_eq!(Manifest::from_toml(&stated_false).unwrap(), m);
+        assert!(!Manifest::declares_may_end_early(&stated_false).unwrap());
+
+        let not_a_bool = current.replace("may_end_early = true", "may_end_early = 1");
+        assert!(Manifest::from_toml(&not_a_bool).is_err());
+        assert!(Manifest::declares_may_end_early(&not_a_bool).is_err());
     }
 }
