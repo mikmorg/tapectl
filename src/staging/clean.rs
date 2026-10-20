@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use tracing::warn;
 
 use crate::config::Config;
@@ -120,13 +120,18 @@ pub(crate) enum ReleaseBlocker {
     /// every other is `'completed'` or `'cut'`. A bare clean releases it
     /// unless the unit is below its policy's `min_copies`.
     None,
-    /// No `writes` row at all, or only `'cut'` ones — staged and never
-    /// written whole anywhere. A `'cut'` row (1.6.0, issue #420) is a stage
-    /// set planned past where its tape sealed short; it is no write, and the
-    /// next `volume write` writes the set whole on another cartridge from
-    /// these slices. A bare clean does not see it; only `--force` releases
-    /// it.
+    /// No `writes` row at all — staged and never written. A bare clean does
+    /// not see it; only `--force` releases it.
     NeverWritten,
+    /// Only `'cut'` rows (1.6.0, issue #420; ADR-0012 item 112): the stage
+    /// set was planned onto `volume_label`, whose tape sealed short before
+    /// it, so it is written whole nowhere. A cut is no write: the next
+    /// ordinary `volume write` onto another cartridge writes the set whole
+    /// from these slices, and only then does a bare clean release them.
+    /// Until then, as for [`Self::NeverWritten`], only `--force` releases
+    /// them. `volume_label` is the volume that cut it (the latest, when
+    /// several did).
+    Cut { volume_label: Option<String> },
     /// A write session is live RIGHT NOW (`'planned'` or `'in_progress'`)
     /// and is reading these slices.
     WriteInFlight { volume_label: Option<String> },
@@ -161,9 +166,11 @@ pub(crate) enum ReleaseBlocker {
 ///
 /// `'cut'` rows are dropped before any of that, as
 /// [`release_candidate_predicate_sql`] drops them: a cut is no write
-/// (ADR-0012 item 112), so it is neither a blocker of its own nor -- what
-/// the fall-through below would otherwise make of it -- an abandoned
-/// session whose remedy is `--force`.
+/// (ADR-0012 item 112), so it is never a blocker beside another row -- nor
+/// what the fall-through below would otherwise make of it, an abandoned
+/// session whose remedy is `--force`. Only a set with nothing but `'cut'`
+/// rows reads [`ReleaseBlocker::Cut`], so its refusal can name the volume
+/// that cut it and the write that finishes it.
 pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<ReleaseBlocker> {
     let statuses: Vec<String> = conn
         .prepare("SELECT status FROM writes WHERE stage_set_id = ?1 AND status <> 'cut'")?
@@ -171,7 +178,19 @@ pub(crate) fn release_blocker(conn: &Connection, stage_set_id: i64) -> Result<Re
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     if statuses.is_empty() {
-        return Ok(ReleaseBlocker::NeverWritten);
+        let cut_on: Option<Option<String>> = conn
+            .query_row(
+                "SELECT v.label FROM writes w LEFT JOIN volumes v ON v.id = w.volume_id
+                 WHERE w.stage_set_id = ?1 AND w.status = 'cut'
+                 ORDER BY w.id DESC LIMIT 1",
+                params![stage_set_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        return Ok(match cut_on {
+            Some(volume_label) => ReleaseBlocker::Cut { volume_label },
+            None => ReleaseBlocker::NeverWritten,
+        });
     }
     if statuses.iter().all(|s| s == "completed") {
         return Ok(ReleaseBlocker::None);
@@ -1973,18 +1992,25 @@ mod tests {
     }
 
     /// `release_blocker` drops `cut` rows before it classifies, as the guard
-    /// does: cut-only reads as never written (the next `volume write` is
-    /// the remedy), cut beside a completed copy reads as releasable, and a
-    /// cut never turns an interrupted session into an abandoned one -- the
-    /// fall-through a `cut` row would otherwise take, whose advice is
-    /// `--force`.
+    /// does: cut-only reads as cut, naming the volume that cut it (the next
+    /// `volume write` onto another cartridge is the remedy), cut beside a
+    /// completed copy reads as releasable, and a cut never turns an
+    /// interrupted session into an abandoned one -- the fall-through a `cut`
+    /// row would otherwise take, whose advice is `--force`.
     #[test]
     fn release_blocker_treats_a_cut_row_as_no_write() {
         let (conn, stage_set_id, _path, _dir) = seed_stage_set();
+        assert_eq!(
+            release_blocker(&conn, stage_set_id).unwrap(),
+            ReleaseBlocker::NeverWritten,
+            "positive control: no row at all is never written"
+        );
         seed_cut(&conn, stage_set_id, "V-SHORT", 9);
         assert_eq!(
             release_blocker(&conn, stage_set_id).unwrap(),
-            ReleaseBlocker::NeverWritten
+            ReleaseBlocker::Cut {
+                volume_label: Some("V-SHORT".into())
+            }
         );
         seed_write(&conn, stage_set_id, "V-NEXT", "completed");
         assert_eq!(
