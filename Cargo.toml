@@ -49,6 +49,12 @@ tar = "0.4"
 tempfile = "3"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 
+[features]
+# Issue #488: the write-shaping experiment knobs (`TAPECTL_EXP_*`, `crate::research`).
+# OFF by default and in no production build: without it the variables are ignored
+# and a set one draws one warning line.
+research = []
+
 [dev-dependencies]
 clap_mangen = "0.2"
 # `hooks` for `commit_hook`: the on-tape catalog.db build is asserted to be one

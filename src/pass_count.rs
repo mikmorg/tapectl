@@ -64,14 +64,21 @@ pub fn note_staging_read(n: usize) {
 #[derive(Clone)]
 pub struct Sha256(Inner);
 
-/// What does the hashing. One variant in a production build.
+/// What does the hashing. One variant in a production build; a `research`
+/// build can also run `sha2`'s (`TAPECTL_EXP_HASH=sha2`, `crate::research`).
 #[derive(Clone)]
 enum Inner {
     Ring(ring::digest::Context),
+    #[cfg(feature = "research")]
+    Sha2(sha2::Sha256),
 }
 
 impl Inner {
     fn fresh() -> Inner {
+        #[cfg(feature = "research")]
+        if crate::research::knobs().hash == crate::research::HashImpl::Sha2 {
+            return Inner::Sha2(sha2::Sha256::default());
+        }
         Inner::Ring(ring::digest::Context::new(&ring::digest::SHA256))
     }
 }
@@ -94,6 +101,8 @@ impl Update for Sha256 {
         add(&HASHED, data.len());
         match &mut self.0 {
             Inner::Ring(c) => c.update(data),
+            #[cfg(feature = "research")]
+            Inner::Sha2(h) => Update::update(h, data),
         }
     }
 }
@@ -102,6 +111,8 @@ impl FixedOutput for Sha256 {
     fn finalize_into(self, out: &mut Output<Self>) {
         match self.0 {
             Inner::Ring(c) => out.copy_from_slice(c.finish().as_ref()),
+            #[cfg(feature = "research")]
+            Inner::Sha2(h) => FixedOutput::finalize_into(h, out),
         }
     }
 }
@@ -246,6 +257,28 @@ mod tests {
                 assert_eq!(h.finalize(), want, "{len} bytes in pieces of {piece}");
             }
         }
+    }
+
+    /// A `research` build's `TAPECTL_EXP_HASH=sha2` runs `sha2` behind the
+    /// same counted type: the same digest, through updates, a clone and a
+    /// reset.
+    #[cfg(feature = "research")]
+    #[test]
+    fn the_research_sha2_inner_is_the_same_hash() {
+        use sha2::digest::Reset;
+        let data = pattern(1_000_003);
+        let mut h = Sha256(super::Inner::Sha2(sha2::Sha256::default()));
+        for chunk in data.chunks(4093) {
+            h.update(chunk);
+        }
+        let copy = h.clone();
+        assert_eq!(h.finalize(), sha2::Sha256::digest(&data));
+        assert_eq!(copy.finalize(), sha2::Sha256::digest(&data));
+        let mut h = Sha256(super::Inner::Sha2(sha2::Sha256::default()));
+        h.update(b"gone");
+        Reset::reset(&mut h);
+        h.update(b"kept");
+        assert_eq!(h.finalize(), sha2::Sha256::digest(b"kept"));
     }
 
     /// `Reset` gives a fresh hash: what was fed before it is gone.
