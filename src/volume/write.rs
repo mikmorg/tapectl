@@ -22135,6 +22135,17 @@ mod tests {
                     .unwrap()
             }
 
+            /// `stage_sets.status` of `unit`'s one stage set.
+            fn stage_set_status(f: &Fixture, unit: &str) -> String {
+                f.conn
+                    .query_row(
+                        "SELECT status FROM stage_sets WHERE id = ?1",
+                        params![stage_set_of(f, unit)],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            }
+
             /// The Layout position the catalog recorded for `unit`'s slice
             /// `n` (1-based) on `label`.
             fn position_of(f: &Fixture, label: &str, unit: &str, n: i64) -> u32 {
@@ -22238,20 +22249,10 @@ mod tests {
                     matches!(release, crate::cli::volume::StagingRelease::Released(_)),
                     "{release:?}"
                 );
-                assert_eq!(
-                    crate::staging::release::fixtures::stage_set_status(
-                        &f.conn,
-                        stage_set_of(&f, "a")
-                    ),
-                    "cleaned"
-                );
+                assert_eq!(stage_set_status(&f, "a"), "cleaned");
                 for unit in ["b", "c"] {
                     let set = stage_set_of(&f, unit);
-                    assert_eq!(
-                        crate::staging::release::fixtures::stage_set_status(&f.conn, set),
-                        "staged",
-                        "{unit}"
-                    );
+                    assert_eq!(stage_set_status(&f, unit), "staged", "{unit}");
                     assert_eq!(
                         release_blocker(&f.conn, set).unwrap(),
                         ReleaseBlocker::Cut {
