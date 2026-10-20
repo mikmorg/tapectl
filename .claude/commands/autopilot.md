@@ -19,7 +19,14 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **QUEUE STATE 2026-10-20 (NEWEST) — v1.5.0 TAGGED on master `f24f0cb`** (whole chain green
+- **QUEUE STATE 2026-10-20 later (NEWEST) — the real-drive runs on home2, v1.5.0 installed.**
+  Rehearsal GREEN 53/53, #444's verified-erase proof holds (chip proof waits for a never-written
+  cartridge), #420's profile done, #388's prototype done
+  (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`). The #420 profile's post-warning readback did
+  not run (no READ POSITION through st there); #487 fixes the writer. The CTO is asked on #420
+  whether to prove the readback first, and #388's §9 questions are the CTO's. Lesson: read a
+  harness's FAIL before the next step overwrites the medium it measured.
+- **QUEUE STATE 2026-10-20 — v1.5.0 TAGGED on master `f24f0cb`** (whole chain green
   on f8c866b: unit 3829/0/21, gate 47/47, lifecycle --all 472/0/15, fr414 17/17, erase proof,
   pscan; f24f0cb is File 1 text + tests on top, unit 3830/0/21 + lint + check-docs there; CI green).
   #485 CLOSED: the fifth read's eight findings (File 1 + RECOVERY.md text only, RESTORE.sh's bytes

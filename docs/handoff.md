@@ -385,17 +385,22 @@ source, was 1.7x) and a write's feed ratio with and without vm-desk1 busy (#432)
 
 None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369, #371,
 #393, #416 and #425 closed between 2026-10-13 and 2026-10-15):
-- **#420:** the short seal. Its measurement is yours to run on home2 with the test cartridge:
-  `scripts/lto-profile.sh --device /dev/tape/by-id/scsi-HUJ808A5L4-nst
-  --i-will-lose-the-cartridge EW7VWMVKF6` from a separate worktree of master (about 5 h; it walks
-  past early warning to the hard end, ADR-0012 item 100; `docs/lto-profiling.md`). The old
-  `scripts/lto6-fill.sh` still works as a wrapper. Send back its run directory
-  (`profile-<stamp>-<serial>/`, the fill's files in `fill/`); `--emit` on it prints the drive's
-  `[[backends.lto]]` block. The short seal is then a CTO-ruled
-  on-tape change with its own re-pin; item 99 makes every write fill to early warning with it.
+- **#420:** the short seal. **Measured on home2, 2026-10-20**
+  (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`).
+  - The early warning came at 2.502 TB.
+  - st alternates ENOSPC and acceptance past the warning, and a retrying writer finished a 1 GiB
+    slice and the seal.
+  - The drive guarantees 99,008 MB past the warning, and `--emit` gives `post_warning_bytes =
+    "99008M"`.
+  - The post-warning data was never read back, because READ POSITION does not answer through st
+    there. #487 fixes the readback.
+  - Whether to prove the readback before building is the CTO's question on #420. The short seal
+    is then a CTO-ruled on-tape change with its own re-pin, and item 99 makes every write fill to
+    the early warning with it.
 - **#478, spanning:** designed and ruled (ADR-0012 items 76-77, 82-100), built right after #420.
 - **#479, the profiling toolkit:** built in 1.4.0: `scripts/lto-profile.sh` and
-  `docs/lto-profiling.md`; its real-drive run is the same run as #420's.
+  `docs/lto-profiling.md`; its real-drive run is the same run as #420's (done 2026-10-20; the
+  readback gap is #487).
 - **Shipped in 1.3.0:** #418 R4 (the cross-volume index), #476, #477 (File 1), #480 (restore
   repairs, slice replacement and the heir's per-file sha256 check). #409 closed 2026-10-17 as an
   accepted cost (item 91).
@@ -406,8 +411,10 @@ None of these blocks the fresh start. Each has an issue (#326, #366, #368, #369,
   read; ADR-0012 item 109) and the Heir Kit's copy of the tapectl program.
 - **#388:** Logical Block Protection. The research note is
   `docs/research/2026-10-16-logical-block-protection.md`: the HP LTO-6 offers Reed-Solomon
-  only, the setting is not saved across sessions, mhvtl emulates it. The prototype on
-  EW7VWMVKF6 and the CTO's ruling remain.
+  only, the setting is not saved across sessions, mhvtl emulates it. The prototype ran on
+  EW7VWMVKF6 on 2026-10-20 (§8.2): Reed-Solomon works, CRC32C is refused, a bad CRC is refused
+  late (on the next operation), and the heir's plain read is unchanged. The CTO's ruling on §9
+  remains.
 - **#364 epic: closed 2026-10-16.** `tests/performance.rs` `perf_staging_throughput_per_pass`
   measured v1.0.0 to v1.2.0 on vm-desk1 (`docs/perf-baselines.md`: 228 s to 85 s for 4 GiB,
   source reads 2.78x to 1.00x). home2's figure comes with its next staging run (#441: expect

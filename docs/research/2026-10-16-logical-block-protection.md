@@ -2,13 +2,14 @@
 
 *Research for #388, asked for by the CTO on 2026-10-16. Research only: no product code
 changed, no tape or SCSI device opened, nothing run on a drive. The prototype (§8) and the
-ruling (§9) come later. Author: research agent, 2026-10-16.*
+ruling (§9) come later. Author: research agent, 2026-10-16. §8.1 (mhvtl) and §8.2 (the HP
+drive) were added on 2026-10-20, after the prototype ran; their facts are measured.*
 
 Facts are tagged **DOC** (a vendor or standards document, cited by section or page),
 **CODE** (source read in this repository, in Linux v6.8 / master, or in mhvtl at `6458223`),
 **OBSERVED** (read today from this VM's files or sysfs, never a device node), **INFERRED**
 (reasoned from the above) and **NEEDS DRIVE** (only the HP drive can settle it; §8 is the
-test). Nothing here is MEASURED on a drive.
+test). Before §8.2, nothing here is MEASURED on a drive.
 
 ## 1. Summary
 
@@ -272,7 +273,7 @@ Data Integrity Validation (via Logical Block Protection) - IBM LTO6, LTO7 & LTO8
 LBP can make the full readback cheaper to defer. It cannot make it optional while the
 readback is the only thing that proves the cartridge reads. The design review said the same.
 
-## 8. Prototype plan for the real drive (Q7) -- dry-run on mhvtl, not yet on the drive
+## 8. Prototype plan for the real drive (Q7) -- dry-run on mhvtl, then run on the drive (§8.2)
 
 Test cartridge `EW7VWMVKF6` only; resolve nodes by serial (`HUJ808A5L4`) via
 `/dev/tape/by-id/`, never by number. This is the shape of the plan, to be checked against the
@@ -380,8 +381,37 @@ and protection is off.
   - The armed page survived closing and reopening the device. It is volatile only across a reset
     or a reload, as §3.4 says.
 
-**Next:** the same script on home2's HP drive, on EW7VWMVKF6, once the #420 fill has finished.
-Run it first at 524288 (measurement 6), then at 262144 if 524292 is refused.
+### 8.2 On the HP LTO-6 (home2, 2026-10-20)
+
+The same script ran on home2's HP drive, on EW7VWMVKF6, at the default 524288. The run record is
+`docs/runs/2026-10-20-lto6-profile-and-lbp.md`.
+- **Measurement 1: the drive refuses method 02h (CRC32C)** with ILLEGAL REQUEST, and the page
+  stays at method 0. Method 01h (Reed-Solomon) with LBP_W and LBP_R was accepted. On an LTO-6 the
+  design is Reed-Solomon only, which is question 1.
+- **Measurement 6: the drive takes 524,292-byte blocks.** `setblk 524292`, writes and reads all
+  worked through home2's SAS2008. mhvtl's 512 KiB cap does not apply there.
+- **Measurement 3: a bad CRC is refused, late.** One `dd` wrote 8 good blocks and a 9th with one
+  CRC bit flipped. It exited 0 with "9+0 records out" after 19.6 s. The next command
+  (`mt status`) got EIO. A later read found 8 blocks in File 0, then a filemark, so the bad block
+  never reached the medium.
+  - st writes behind, so the refusal arrives on a later operation, not on the `write(2)` that
+    carried the block.
+  - The 19.6 s, against 0.02 s to read the same bytes back, is most likely the drive retrying the
+    bad block. That cost is paid only when bad data is sent.
+- **Measurement 4 and the heir's view: settled.** With LBP off, plain `dd` at 512 KiB read the
+  8 blocks back byte-identical. In variable mode one record read as 524,288 bytes, so the CRC is
+  not part of the medium's logical block. A tape written with LBP reads like any other: no
+  RESTORE.sh change, and question 4's first half does not arise.
+- **Measurement 2: LBP_R works.** Every CRC the drive returned with the 8 blocks matched the
+  host's.
+- **A reader that forgets the block size gets EIO here.** With LBP off and the block size still
+  524,292, the read failed with EIO. On mhvtl it returned 0 bytes. Either way it is a refusal,
+  never wrong data.
+- **The armed page survived a close and reopen,** as on mhvtl. The script's exit trap put it back
+  to method 0, and the page read back so.
+- **Not measured: READ BLOCK LIMITS with LBP on.** The script parses `sg_raw`'s output, and on
+  home2's sg3-utils 1.44 it printed nothing, so the expected maximum of FFFFFB is unconfirmed.
+  With LBP off, `sg_read_block_limits` read 1 to 16,777,215 bytes.
 
 ## 9. Open questions for the CTO
 
@@ -397,7 +427,13 @@ Run it first at 524288 (measurement 6), then at 262144 if 524292 is refused.
 5. **What should LBP buy?** §7.4: a, b, c or d. May an LBP write with a quick confirm count as
    a write-time end-to-end check for `no_full_verify`, and where is that recorded?
 6. **Where does the prototype run?** home2 holds the HBA limit that matters; vm-desk1 has the
-   measured headroom.
+   measured headroom. (Answered: it ran on home2, §8.2.)
+7. **Where does tapectl see a CRC refusal?** On the HP drive it arrives late, on a later
+   operation (§8.2). tapectl ends each file with an immediate filemark (MTWEOFI), which does not
+   flush, so a refusal of a slice's last block would surface on the next file's first write, or
+   on the seal's synchronous filemark, the only one a session writes. Must an LBP write flush after each slice (MTWEOF), so
+   the error lands on the slice that caused it? And must a write session that saw an LBP
+   refusal drop the whole session, or retry the slice?
 
 ## 10. What I could not find, and sources
 
