@@ -1135,8 +1135,63 @@ mod forward_compat_tests {
         .collect()
     }
 
+    /// The full seal 1.6.0 writes over [`seal_files`]: `requires =
+    /// ["short-seal"]`, `ended_after = 4`.
     fn seal() -> String {
         generate_seal_marker("FC01", 6, "h", &seal_files())
+    }
+
+    /// The seal tapectl 1.1.0 to 1.5.0 wrote over [`seal_files`], as a
+    /// literal in that grammar (`requires = []`, no `ended_after`): what a
+    /// 1.6.0 reader must still read (§1.2 rule 2, §4.1 rule S3).
+    fn seal_1_5_0() -> String {
+        let mut s = String::from(
+            "================================================================\n\
+             TAPECTL SEAL MARKER\n\
+             ================================================================\n\n\
+             Volume: FC01\n\n\
+             [seal]\n\
+             volume = \"FC01\"\n\
+             layout_version = 2\n\
+             requires = []\n\
+             file_count = 6\n\
+             sealed_at = \"2026-10-06T00:00:00Z\"\n\
+             front_index_sha256 = \"h\"\n",
+        );
+        for (position, kind) in [
+            (0, "id_thunk"),
+            (1, "system_guide"),
+            (2, "restore_sh"),
+            (3, "front_index"),
+            (4, "data_slice"),
+        ] {
+            s.push_str(&format!(
+                "\n[[files]]\nposition = {position}\ntype = \"{kind}\"\nsize_bytes = 10\n\
+                 sha256_encrypted = \"h\"\n"
+            ));
+        }
+        s.push_str("\n[[files]]\nposition = 5\ntype = \"seal_marker\"\n");
+        s
+    }
+
+    /// `doc` (a File 0 or a seal) with its `requires = …` line replaced by
+    /// `line`: these fixtures say what they require whatever the generator
+    /// writes there (`[]` before 1.6.0, `["short-seal"]` from it).
+    fn set_requires(doc: &str, line: &str) -> String {
+        let mut done = false;
+        let out: Vec<&str> = doc
+            .split('\n')
+            .map(|l| {
+                if !done && l.starts_with("requires = ") {
+                    done = true;
+                    line
+                } else {
+                    l
+                }
+            })
+            .collect();
+        assert!(done, "the fixture states requires: {doc}");
+        out.join("\n")
     }
 
     /// Issue #458: the one seal judgement. A seal that binds the front index
@@ -1171,7 +1226,7 @@ mod forward_compat_tests {
         };
         assert!(why.contains("binds a front index hashing to"), "{why}");
         assert!(why.contains("front index (file 3)"), "{why}");
-        let required = bound.replace("requires = []", "requires = [\"unknown-feature\"]");
+        let required = set_requires(&bound, "requires = [\"unknown-feature\"]");
         let SealVerdict::Refused(why) = judge_seal(Ok(required.as_bytes()), front_index, 3, 5)
         else {
             panic!("an unknown required feature is Refused, not Unsealed")
@@ -1186,15 +1241,29 @@ mod forward_compat_tests {
         assert_eq!(without_nul_padding(b""), b"");
     }
 
-    /// ADR-0012 amendment item 15: a 1.1.0 tape states `requires = []` in
-    /// File 0 and the seal marker, and this tapectl reads it.
+    /// ADR-0012 item 111: every seal 1.6.0 writes requires `short-seal` and
+    /// states `ended_after`, and this tapectl reads it.
     #[test]
-    fn a_new_tape_requires_nothing_and_is_readable() {
-        let t = thunk();
-        assert!(t.contains("\nrequires = []\n"));
-        check_id_thunk_readable(&t).unwrap();
+    fn a_new_tape_requires_short_seal_and_is_readable() {
         let s = parse_seal_marker(&seal()).unwrap();
+        assert_eq!(s.requires, vec![SHORT_SEAL.to_string()]);
+        assert!(s.requires_short_seal());
+        assert_eq!(s.ended_after, Some(4));
+        assert_eq!(s.refusal(), None);
+        assert_eq!(s.check_parse_rules(), Ok(()), "the fixture keeps S4 and S5");
+    }
+
+    /// ADR-0012 amendment item 15: a 1.1.0 to 1.5.0 tape states `requires =
+    /// []` in File 0 and the seal marker, and this tapectl still reads it:
+    /// a full seal (rule S3).
+    #[test]
+    fn a_1_1_0_to_1_5_0_tape_requires_nothing_and_is_readable() {
+        let t = set_requires(&thunk(), "requires = []");
+        check_id_thunk_readable(&t).unwrap();
+        let s = parse_seal_marker(&seal_1_5_0()).unwrap();
         assert!(s.requires.is_empty());
+        assert_eq!(s.ended_after, None);
+        assert_eq!(s.effective_ended_after(), Some(4));
         assert_eq!(s.refusal(), None);
         assert_eq!(s.check_parse_rules(), Ok(()), "the fixture keeps S4 and S5");
     }
@@ -1203,10 +1272,12 @@ mod forward_compat_tests {
     /// absent means none required.
     #[test]
     fn a_tape_without_requires_is_readable() {
-        let t = thunk().replace("requires = []\n", "");
+        let t = set_requires(&thunk(), "requires = []").replace("requires = []\n", "");
         assert!(!t.contains("requires"));
         check_id_thunk_readable(&t).unwrap();
-        let s = parse_seal_marker(&seal().replace("requires = []\n", "")).unwrap();
+        let old = seal_1_5_0().replace("requires = []\n", "");
+        assert!(!old.contains("requires"));
+        let s = parse_seal_marker(&old).unwrap();
         assert_eq!(s.refusal(), None);
     }
 
@@ -1216,15 +1287,14 @@ mod forward_compat_tests {
     /// knows: see `file_0_and_seal_requiring_short_seal_are_readable`.)
     #[test]
     fn an_unknown_required_feature_is_refused_by_name() {
-        let t = thunk().replace("requires = []", "requires = [\"unknown-feature\"]");
+        let t = set_requires(&thunk(), "requires = [\"unknown-feature\"]");
         let err = check_id_thunk_readable(&t).unwrap_err().to_string();
         assert!(err.contains("\"unknown-feature\""), "{err}");
         assert!(err.contains("newer tapectl"), "{err}");
         assert!(err.contains("tapectl 1.1.0"), "names the writer: {err}");
 
-        let s =
-            parse_seal_marker(&seal().replace("requires = []", "requires = [\"unknown-feature\"]"))
-                .expect("the seal still PARSES: a write-path contact check must see it as sealed");
+        let s = parse_seal_marker(&set_requires(&seal(), "requires = [\"unknown-feature\"]"))
+            .expect("the seal still PARSES: a write-path contact check must see it as sealed");
         let why = s.refusal().expect("refused");
         assert!(why.contains("\"unknown-feature\""), "{why}");
     }
@@ -1236,12 +1306,14 @@ mod forward_compat_tests {
     #[test]
     fn file_0_and_seal_requiring_short_seal_are_readable() {
         assert!(KNOWN_FEATURES.contains(&"short-seal"));
-        let t = thunk().replace("requires = []", "requires = [\"short-seal\"]");
+        let t = set_requires(&thunk(), "requires = [\"short-seal\"]");
         check_id_thunk_readable(&t).expect("1.6.0 reads a short-seal tape's File 0");
         assert_eq!(parse_id_thunk_claims(&t).unwrap().refusal("File 0"), None);
+        let s = parse_seal_marker(&seal()).expect("and the seal 1.6.0 writes");
+        assert_eq!(s.refusal(), None);
 
-        let both = thunk().replace(
-            "requires = []",
+        let both = set_requires(
+            &thunk(),
             "requires = [\"short-seal\", \"unknown-feature\"]",
         );
         let err = check_id_thunk_readable(&both).unwrap_err().to_string();
@@ -1258,12 +1330,21 @@ mod forward_compat_tests {
     /// holds it to rule S1.)
     #[test]
     fn unknown_keys_that_are_not_required_are_ignored() {
-        let t = thunk().replace("requires = []", "requires = []\nfuture_key = \"x\"");
+        let t = set_requires(&thunk(), "requires = []\nfuture_key = \"x\"");
+        assert!(t.contains("\nfuture_key = \"x\"\n"));
         check_id_thunk_readable(&t).unwrap();
         parse_id_thunk_identity(&t).unwrap();
-        let s =
-            parse_seal_marker(&seal().replace("requires = []", "requires = []\nfuture_key = 7"))
-                .unwrap();
+        let s = parse_seal_marker(&set_requires(
+            &seal(),
+            "requires = [\"short-seal\"]\nfuture_key = 7",
+        ))
+        .unwrap();
+        assert_eq!(s.refusal(), None);
+        let s = parse_seal_marker(&set_requires(
+            &seal_1_5_0(),
+            "requires = []\nfuture_key = 7",
+        ))
+        .unwrap();
         assert_eq!(s.refusal(), None);
     }
 
@@ -2379,12 +2460,26 @@ cartridge_serial = \"SERIAL1\"
         assert!(parse_id_thunk_layout_pointers("no toml here at all").is_err());
     }
 
+    /// Before 1.6.0 an empty copy parsed as an empty list. A 1.6.0 seal
+    /// with no `[[files]]` breaks §4.1's rules (S1: `ended_after = -2`; S4:
+    /// no entries) and is unparseable, rule S6: the unsealed signal, an
+    /// `Err` and never a panic.
     #[test]
-    fn empty_files_list_parses_as_empty_not_an_error() {
-        // generate_seal_marker with an empty slice emits no [[files]] tables
-        // at all — the `files` key is entirely absent from the document.
+    fn a_1_6_0_seal_with_no_files_is_unparseable_not_a_panic() {
         let generated = generate_seal_marker("EMPTY01", 0, "deadbeef", &[]);
-        let parsed = parse_seal_marker(&generated).expect("parses");
+        let err = parse_seal_marker(&generated).unwrap_err().to_string();
+        assert!(err.contains("rule S1"), "{err}");
+    }
+
+    /// The reader's tolerance of a seal before 1.6.0 with no `[[files]]`
+    /// tables at all (the `files` key absent) is unchanged: an empty list,
+    /// not an error. A literal 1.5.0 seal.
+    #[test]
+    fn a_1_5_0_seal_with_no_files_parses_as_empty_not_an_error() {
+        let old = "[seal]\nvolume = \"EMPTY01\"\nlayout_version = 2\nrequires = []\n\
+                   file_count = 0\nsealed_at = \"2026-10-06T00:00:00Z\"\n\
+                   front_index_sha256 = \"deadbeef\"\n";
+        let parsed = parse_seal_marker(old).expect("parses");
         assert!(parsed.files.is_empty());
     }
 
