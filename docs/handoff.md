@@ -310,8 +310,7 @@ catalog migrations apply the first time the new binary opens the catalog: 036 (1
 table) and 037 (1.4.0, `volume rewrite`'s record). There is no downgrade past them: a 1.1.0
 binary refuses a catalog that is ahead of its migration list, so the rollback is the 1.1.0 binary
 kept in step 3 plus `db import` of the backup from step 1, losing whatever the catalog recorded in
-between. Wait for `v1.5.0` to be tagged (the whole chain
-on its commit, then the tag; the reviews behind 1.1.2 are
+between. Wait for `v1.5.0` to be tagged (the whole chain, then the tag; the reviews behind 1.1.2 are
 `docs/audits/2026-10-15-design-review.md` and `docs/audits/2026-10-15-1.1-diff-review.md`).
 
 On home2, inside tmux, with no tapectl command running. Check that with `tapectl-op status`:
@@ -368,8 +367,9 @@ pointer; on 1.1.0 it reads your own `~/.tapectl` and sees nothing. If your accou
    sha256 check); the mhvtl
    gate's heir legs are the only other real-tool run (ADR-0012 item 70). Record `age --version`
    with it. The first tape 1.3.0 writes is the first whose index names the others.
-8. **Regenerate the Heir Kit** with the installed binary (`first-run.sh --from 9 --to 9`, or
-   `tapectl-op key escrow-kit --out <kit dir>`), and reprint COVER.txt. From 1.5.0 the kit
+8. **Regenerate the Heir Kit** with the installed binary (`scripts/first-run.sh --profile
+   contrib/hosts/home2.profile --from 9 --to 9`, which hands the kit directory to the service
+   user for the write and back to you after it), and reprint COVER.txt. From 1.5.0 the kit
    carries a fourth file, `tapectl-1.5.0`, a copy of the binary that made it, and the sheet
    names its size and sha256, so a sheet printed before the upgrade does not describe the new
    kit. Put the new `catalog.db.age` and `tapectl-1.5.0` on the media in each envelope, as a
