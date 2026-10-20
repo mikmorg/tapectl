@@ -516,7 +516,7 @@ fn record_adoption(
         .collect::<rusqlite::Result<_>>()?;
     let cut_units: Vec<String> = tx
         .prepare(
-            "SELECT u.name || ' v' || s.version FROM writes w
+            "SELECT u.name FROM writes w
                JOIN snapshots s ON s.id = w.snapshot_id
                JOIN units u ON u.id = s.unit_id
               WHERE w.volume_id = ?1 AND w.status = 'cut' ORDER BY w.id",
@@ -541,6 +541,27 @@ fn record_adoption(
         }
     }
     crate::volume::write::record_write_bookkeeping(&tx, volume_id, &layout, block_size)?;
+    let adopted = format!(
+        "adopted by `volume resume`: a write this catalog lost (restored from a backup taken \
+         before it), sealed on the tape at {}. File 0's uuid matched, the seal marker binds \
+         front index {}, a full verify passed after the rebuild, and all {slices} slice \
+         hash(es) equal the ones this catalog staged (ADR-0012, 2026-09-29 later)",
+        tape.sealed_at, tape.front_index_sha256
+    );
+    // #420: on a tape that sealed short, the details a short write's own
+    // `write_completed` event carries (`write::write_completed_details`:
+    // the ending, `ended_after` and the cut units), with the adoption's
+    // account beside them; on a full seal the account alone, as before.
+    let details = match tape.ended_after {
+        None => adopted,
+        Some(k) => serde_json::json!({
+            "ending": "short",
+            "ended_after": k,
+            "cut_units": cut_units,
+            "adopted": adopted,
+        })
+        .to_string(),
+    };
     events::log_event(
         &tx,
         "volume",
@@ -550,26 +571,7 @@ fn record_adoption(
         None,
         None,
         None,
-        Some(&format!(
-            "adopted by `volume resume`: a write this catalog lost (restored from a backup \
-             taken before it), sealed on the tape at {}. File 0's uuid matched, the seal \
-             marker binds front index {}, a full verify passed after the rebuild, and all \
-             {slices} slice hash(es) equal the ones this catalog staged (ADR-0012, \
-             2026-09-29 later){}",
-            tape.sealed_at,
-            tape.front_index_sha256,
-            match tape.ended_after {
-                None => String::new(),
-                Some(k) => format!(
-                    ". The tape sealed short after file {k}{}",
-                    if cut_units.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; cut, not a copy here: {}", cut_units.join(", "))
-                    }
-                ),
-            }
-        )),
+        Some(&details),
         None,
     )?;
     tx.commit()?;
@@ -1513,8 +1515,14 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert!(detail.contains(&format!("sealed short after file {k}")), "{detail}");
-            assert!(detail.contains("bravo v1, charlie v1"), "{detail}");
+            let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+            assert_eq!(detail["ending"], "short");
+            assert_eq!(detail["ended_after"], k);
+            assert_eq!(detail["cut_units"], serde_json::json!(["bravo", "charlie"]));
+            assert!(
+                detail["adopted"].as_str().unwrap().starts_with("adopted by `volume resume`"),
+                "{detail}"
+            );
         }
 
         /// The catalog's rows must say what the tape says: a unit with a
