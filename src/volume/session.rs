@@ -2797,7 +2797,9 @@ impl SealedPending {
         // confirm reads no content file, so only a full one has a byte
         // total (as `volume verify` already does).
         let total = match tier {
-            Tier::Integrity => self.built.layout.on_tape_bytes().ok(),
+            Tier::Integrity => {
+                super::write::readback_bytes(&self.built.layout, self.ending.recorded_ended_after())
+            }
             Tier::Navigable => None,
         };
         let phase = crate::progress::phase("confirm", total);

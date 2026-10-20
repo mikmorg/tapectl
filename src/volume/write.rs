@@ -4476,8 +4476,9 @@ fn record_after_sealed(
 /// "Confirm of a short ending": the event names the short ending and the cut
 /// units): one JSON object, `{"ending": "short", "ended_after": K,
 /// "cut_units": [..]}`. `None` on a full seal, whose event is what it was
-/// before 1.6.0.
-fn write_completed_details(sealed: &session::SealedSession) -> Option<String> {
+/// before 1.6.0. Shared with the adoption of a lost write
+/// (`adopt_lost::record_adoption`), which writes the same event.
+pub(crate) fn write_completed_details(sealed: &session::SealedSession) -> Option<String> {
     let session::Ending::Short { ended_after } = sealed.ending else {
         return None;
     };
@@ -4489,6 +4490,56 @@ fn write_completed_details(sealed: &session::SealedSession) -> Option<String> {
         })
         .to_string(),
     )
+}
+
+/// How a volume's tape ended, as the catalog records it (#420): what
+/// `volume write --json` reports once the write returned `Ok`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecordedEnding {
+    /// `volumes.ended_after`: the short seal's K, `None` on a full seal.
+    pub ended_after: Option<i64>,
+    /// The units whose `writes` rows on the volume are `cut`, in plan order
+    /// (the order the session inserted its rows): empty on a full seal.
+    pub cut_units: Vec<String>,
+}
+
+impl RecordedEnding {
+    /// `"short"` or `"full"`.
+    pub fn kind(&self) -> &'static str {
+        if self.ended_after.is_some() {
+            "short"
+        } else {
+            "full"
+        }
+    }
+}
+
+/// [`RecordedEnding`] of the volume labelled `label`.
+pub fn recorded_ending(conn: &Connection, label: &str) -> Result<RecordedEnding> {
+    let ended_after: Option<i64> = conn
+        .query_row(
+            "SELECT ended_after FROM volumes WHERE label = ?1",
+            params![label],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let cut_units = conn
+        .prepare(
+            "SELECT u.name FROM writes w
+             JOIN volumes v ON v.id = w.volume_id
+             JOIN stage_sets ss ON ss.id = w.stage_set_id
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE v.label = ?1 AND w.status = 'cut'
+             ORDER BY w.id",
+        )?
+        .query_map(params![label], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(RecordedEnding {
+        ended_after,
+        cut_units,
+    })
 }
 
 /// The command that records a sealed copy's write figures when the write
@@ -5069,15 +5120,32 @@ pub(crate) fn record_verification_results(
     Ok(recorded)
 }
 
+/// The bytes a full readback of `layout`'s tape reads, for its progress
+/// total (issue #386): every file of the plan, or — on a tape that sealed
+/// short after `ended_after` (#420, `volume-format-v2.md` §5 step 4) — the
+/// files at or before it and the seal, which is never longer than the
+/// plan's. `None` when an entry is unsized.
+pub(crate) fn readback_bytes(layout: &Layout, ended_after: Option<u32>) -> Option<u64> {
+    let Some(k) = ended_after else {
+        return layout.on_tape_bytes().ok();
+    };
+    layout
+        .entries
+        .iter()
+        .filter(|e| e.position as u32 <= k || matches!(e.kind, ZoneKind::SealMarker))
+        .map(|e| e.on_tape_bytes(layout.block_size))
+        .sum()
+}
+
 /// Map a [`crate::store::MismatchKind`] onto the fixed `verification_results.
 /// result` vocabulary (`001_initial.sql`: passed / failed_checksum /
 /// failed_read / failed_decrypt / skipped).
 ///
-/// The v2 chain walk has seven failure kinds and the column has five values,
+/// The v2 chain walk has eight failure kinds and the column has five values,
 /// none of them added for it, so this is a lossy projection by construction.
 /// It is lossy in the SAFE direction — the true kind is always written to
 /// `notes` — and the split follows what the disagreement actually IS: two
-/// kinds compare sha256 hashes (`failed_checksum`), the other five are the
+/// kinds compare sha256 hashes (`failed_checksum`), the other six are the
 /// bytes not being readable or not being what the map said (`failed_read`).
 ///
 /// Issue #239 moved a case across this line on BOTH paths, deliberately: a
@@ -5557,12 +5625,6 @@ fn verify_contacted(
 
     phase.done();
 
-    // Issue #386: the readback is the phase that takes hours; a quick
-    // verify reads no content file, so only a full one has a byte total.
-    let total = match tier {
-        Tier::Integrity => layout.on_tape_bytes().ok(),
-        Tier::Navigable => None,
-    };
     // Issue #410: a full verify keeps a checkpoint per file it reads back
     // clean, as it goes, and continues an interrupted full readback of this
     // volume (a verify's or a write's confirm) rather than starting over.
@@ -5608,6 +5670,13 @@ fn verify_contacted(
             })
         })
         .transpose()?;
+    // Issue #386: the readback is the phase that takes hours; a quick
+    // verify reads no content file, so only a full one has a byte total —
+    // on a short tape, of the files the walk reads (#420).
+    let total = match tier {
+        Tier::Integrity => readback_bytes(&layout, ended_after),
+        Tier::Navigable => None,
+    };
     conn.execute(
         "INSERT INTO verification_sessions (volume_id, verify_type, outcome)
          VALUES (?1, ?2, 'in_progress')",
@@ -7217,6 +7286,31 @@ pub struct VerifyReport {
     /// Verify still runs and still verifies either way; this is advisory
     /// only, never a reason to fail the command.
     pub drive_health_note: Option<String>,
+}
+
+impl VerifyReport {
+    /// Whether the seal and the catalog disagree about where the tape ended
+    /// (#420, `volume-format-v2.md` §5 step 3): the report holds an
+    /// [`crate::store::MismatchKind::EndedAfterDisagrees`]. The same test as
+    /// [`crate::store::Evidence::ending_disagrees`], over the mismatches the
+    /// report carries.
+    pub fn ending_disagrees(&self) -> bool {
+        self.mismatches
+            .iter()
+            .any(|m| m.kind == crate::store::MismatchKind::EndedAfterDisagrees)
+    }
+
+    /// Whether mismatch `m` of this report is evidence the medium is bad,
+    /// as the verify's verdict counted it
+    /// ([`crate::store::Evidence::medium_evidence`]): its kind proves it,
+    /// and the seal and the catalog agree about where the tape ended. When
+    /// they disagree no mismatch is medium evidence — the walk read under
+    /// the catalog's ending, and the verify is inconclusive (#420) — so a
+    /// line never says "proves the medium is bad" on a verify that
+    /// quarantined nothing.
+    pub fn proves_medium_bad(&self, m: &crate::store::Mismatch) -> bool {
+        !self.ending_disagrees() && m.kind.proves_medium_bad()
+    }
 }
 
 /// The staged batch a write would put on tape, with the refusals the
@@ -11271,6 +11365,9 @@ mod tests {
             (ContentUnreadable, false),
             (FrontIndexUnreadable, false),
             (SealUnreadable, false),
+            // #420 (`volume-format-v2.md` §5 step 3): the seal and the
+            // catalog disagree about where the tape ended — inconclusive.
+            (EndedAfterDisagrees, false),
         ] {
             let conn = crate::db::open_memory().unwrap();
             let good = b"fixture bytes. ".repeat(4);
@@ -15311,6 +15408,44 @@ mod tests {
             (bs as i64, 1),
             "the slice after ended_after is not on the tape"
         );
+    }
+
+    /// Issue #386's progress total for a full readback, on a short tape
+    /// (#420): the files at or before `ended_after` and the seal — not the
+    /// plan's every file. A full seal (`None`) counts the whole plan.
+    #[test]
+    fn a_short_tapes_readback_total_counts_what_the_walk_reads() {
+        let bs = 4096u64;
+        let entry = |position: i32, kind: ZoneKind, size: u64| LayoutEntry {
+            position,
+            kind,
+            size_bytes: Some(size),
+            sha256: None,
+            source: ContentSource::Generated,
+        };
+        let layout = Layout {
+            label: "RB".into(),
+            volume_uuid: "u".into(),
+            media_type: "LTO-6".into(),
+            block_size: bs,
+            budget: CapacityBudget {
+                available_bytes: 0,
+                reserve_bytes: 0,
+                plan_bound_bytes: None,
+            },
+            entries: vec![
+                entry(0, ZoneKind::IdThunk, 100),
+                entry(1, ZoneKind::Slice { stage_slice_id: 1 }, 2 * bs),
+                entry(2, ZoneKind::Slice { stage_slice_id: 2 }, 3 * bs),
+                entry(3, ZoneKind::Slice { stage_slice_id: 3 }, 5 * bs),
+                entry(4, ZoneKind::SealMarker, 10),
+            ],
+        };
+        assert_eq!(readback_bytes(&layout, None), Some(12 * bs));
+        // Sealed short after file 1: files 0 and 1, and the seal.
+        assert_eq!(readback_bytes(&layout, Some(1)), Some(4 * bs));
+        // After file 2: files 0 to 2, and the seal.
+        assert_eq!(readback_bytes(&layout, Some(2)), Some(7 * bs));
     }
 
     /// Issue #392: `first_write` was stamped when the write session
@@ -21806,10 +21941,9 @@ mod tests {
         // ── #420: the short ending, through `volume write` itself over an
         //    injected store ──
         //
-        // On this tree the confirm of a short seal is E's bridge
-        // (`session::ShortEndingReads`): these writes confirm at the
-        // navigable tier (no `--full-confirm`) and assert nothing of ADR-0012
-        // item 114's readback, which is the chain walk's (worker J).
+        // The confirm is the chain walk's own (`ConfirmPlan::with_ending` and
+        // `reading_back`): the quick confirm after a warning reads entry K and
+        // the seal back (ADR-0012 item 114), a full one walks files 0 to K.
         mod short_ending {
             use super::*;
             use crate::staging::clean::{release_blocker, ReleaseBlocker};
@@ -21973,8 +22107,14 @@ mod tests {
                     };
                     set_key_fingerprints(&conn, stage_set_id, Some(&receipt));
                     for (n, size) in sizes.iter().enumerate() {
+                        // No two blocks alike (`b / 251` moves across a
+                        // block), so a duplicated block changes the hash.
                         let content: Vec<u8> = (0..*size)
-                            .map(|b| (b as u8) ^ (i as u8).wrapping_mul(31) ^ n as u8)
+                            .map(|b| {
+                                (b.wrapping_mul(7) + b / 251) as u8
+                                    ^ (i as u8).wrapping_mul(31)
+                                    ^ n as u8
+                            })
                             .collect();
                         let path = slices.join(format!("{name}_{n}.age"));
                         fs::write(&path, &content).unwrap();
@@ -22034,6 +22174,17 @@ mod tests {
                 store: &mut dyn Store,
                 force: bool,
             ) -> (Result<()>, i32) {
+                write_confirming(f, label, store, force, false)
+            }
+
+            /// [`write`], with `--full-confirm` when `full_confirm`.
+            fn write_confirming(
+                f: &Fixture,
+                label: &str,
+                store: &mut dyn Store,
+                force: bool,
+                full_confirm: bool,
+            ) -> (Result<()>, i32) {
                 let mut slot = ContactSlot::empty();
                 let r = volume_write_contacted(
                     &f.conn,
@@ -22045,7 +22196,7 @@ mod tests {
                     force,
                     false,
                     false,
-                    false,
+                    full_confirm,
                     true,
                     &mut slot,
                     ContactStore::Injected(store),
@@ -22283,6 +22434,91 @@ mod tests {
                     ReleaseBlocker::None,
                     "b is written whole elsewhere: its cut row no longer holds it"
                 );
+            }
+
+            /// The same short ending under `--full-confirm`: the integrity
+            /// tier walks files 0 to K and the short seal, reads no position
+            /// after it, and passes — the copy is `a`, `b` and `c` are cut,
+            /// and the readback is recorded as the full one it was.
+            #[test]
+            fn a_full_confirm_of_a_short_seal_walks_through_ended_after_and_passes() {
+                let f = fixture(ABC, &["SE-F"]);
+                let mut store = ArmedAt::new(B_FIRST, warning);
+                let (r, code) = write_confirming(&f, "SE-F", &mut store, false, true);
+                r.expect("a full confirm of a short tape passes");
+                assert_eq!(code, 0);
+                assert_eq!(
+                    volume_row(&f, "SE-F"),
+                    ("sealed".into(), true, Some(i64::from(B_FIRST)))
+                );
+                assert_eq!(
+                    writes_of(&f, "SE-F"),
+                    pairs(&[("a", "completed"), ("b", "cut"), ("c", "cut")])
+                );
+                let sessions: Vec<(String, String)> = f
+                    .conn
+                    .prepare(
+                        "SELECT verify_type, outcome FROM verification_sessions
+                         WHERE volume_id = ?1",
+                    )
+                    .unwrap()
+                    .query_map(params![volume_id(&f, "SE-F")], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert_eq!(sessions, [("full".to_string(), "passed".to_string())]);
+            }
+
+            /// ADR-0012 item 114 through `volume write`: a block st reported
+            /// refused but the drive kept duplicates part of entry K, and the
+            /// QUICK confirm — which after a warning reads entry K back and
+            /// hashes it against File 3 — proves the medium bad. The volume
+            /// is quarantined, the rows `aborted`, none `cut` (a cut is only
+            /// what a passing confirm records), exit 6. The seal is on the
+            /// tape, so `sealed_at` and its `ended_after` stay recorded
+            /// (`layout-session.md`: written with `sealed_at`, never cleared
+            /// by a confirm outcome), which is what lets a later clean full
+            /// verify and `volume resume` re-confirm the same short seal.
+            #[test]
+            fn the_quick_confirm_catches_a_refused_block_the_drive_kept_in_entry_k() {
+                fn kept(m: MemStore, before: u64) -> MemStore {
+                    warning(m, before).with_refused_blocks_written()
+                }
+                let f = fixture(ABC, &["SE-Q"]);
+                let mut store = ArmedAt::new(B_FIRST, kept);
+                let (r, code) = write(&f, "SE-Q", &mut store, false);
+                let err = r.unwrap_err();
+                assert!(matches!(err, TapectlError::WriteQuarantined(_)), "{err:?}");
+                assert_eq!(code, 6, "{err}");
+                assert!(err.to_string().contains("content_hash_mismatch"), "{err}");
+                assert_eq!(
+                    volume_row(&f, "SE-Q"),
+                    ("initialized".into(), true, Some(i64::from(B_FIRST)))
+                );
+                let condition: String = f
+                    .conn
+                    .query_row(
+                        "SELECT observed_condition FROM volumes WHERE label = 'SE-Q'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(condition, "quarantined");
+                assert_eq!(
+                    writes_of(&f, "SE-Q"),
+                    pairs(&[("a", "aborted"), ("b", "aborted"), ("c", "aborted")])
+                );
+                assert!(events(&f, "SE-Q", "write_completed").is_empty());
+
+                // Positive control: the same warning with every refused block
+                // truly refused confirms quick and seals short.
+                let f = fixture(ABC, &["SE-QOK"]);
+                let mut store = ArmedAt::new(B_FIRST, warning);
+                write(&f, "SE-QOK", &mut store, false)
+                    .0
+                    .expect("the clean short seal passes");
             }
 
             /// W4's second case: the warning in the LAST data slice. The full
