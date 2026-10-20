@@ -2072,6 +2072,79 @@ impl TapeOps for CountedOps {
 /// `read_file_streaming`'s own figure, so a pipeline buffer is one read.
 const VARIABLE_BLOCK_READ: usize = 1024 * 1024;
 
+/// The test hook's environment variable (#420): a write store that acts as st
+/// does past a drive's early warning, below a medium's real end.
+pub const TEST_EARLY_WARNING_AT: &str = "TAPECTL_TEST_EARLY_WARNING_AT";
+
+/// The ONE place `TAPECTL_TEST_EARLY_WARNING_AT` is read (#420), by
+/// [`TapeStore::open`], the write store's open; a read-only open never
+/// writes, so it never asks. `None` when unset; a value that is not a plain
+/// decimal byte count is an error, so a mistyped hook fails the open instead
+/// of writing as if it were unset.
+///
+/// **What it does.** Once the store has written that many bytes since it
+/// opened, its block writes are answered as st answers them past a real
+/// early warning (`volume-format-v2.md` §4.3 W1; [`MediumEnd`], the model the
+/// test doubles share): the block that reaches the figure is written and
+/// arms a refusal, the next block write is refused with ENOSPC at once
+/// without reaching the drive, and so on, one refusal after each block
+/// accepted, a filemark disarming. The refusals go through the device's one
+/// retry (`tape::ioctl::write_block_retrying`), so the session meets them
+/// exactly as it meets a real warning, and seals short (§4.3 W4). It is how
+/// the mhvtl gate runs the reader side of a short tape over real st: mhvtl's
+/// own medium accepts writes past its capacity and loses them instead of
+/// refusing (`docs/lto6-validation-checklist.md`).
+///
+/// **Why it is safe in a production build** (a runtime check, as
+/// `TAPECTL_TEST_PAUSE_AFTER_PLAN` is: `#[cfg(test)]` reaches neither the
+/// gate's binary nor an integration test's library, the #87 finding):
+/// - it only refuses: every block still reaches the drive whole, once, in
+///   order, through the same `write(2)`. No byte, filemark or position on the
+///   tape differs from a write without it, and nothing is skipped;
+/// - its worst outcome on a real drive is a tape that seals short earlier
+///   than it had to, which is a valid tape: every whole unit on it counts,
+///   the cut units stay staged for the next cartridge (ADR-0012 item 112),
+///   and the warning is recorded in the catalog's `write_early_warning`
+///   event. A figure before the first data slice aborts the session
+///   (W6), leaving the tape unsealed and the staging as it was;
+/// - it is loud: [`TapeStore::open`] prints it on stderr, in the tracing
+///   output and in the session log before the first byte is written, and
+///   the device's journal names the first refusal as the hook's.
+fn test_early_warning_at_from_env() -> Option<std::result::Result<u64, String>> {
+    let raw = std::env::var_os(TEST_EARLY_WARNING_AT)?;
+    Some(parse_test_early_warning_at(&raw.to_string_lossy()))
+}
+
+/// The hook's value: a plain decimal byte count (no suffix, no sign).
+fn parse_test_early_warning_at(raw: &str) -> std::result::Result<u64, String> {
+    let digits = raw.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "{TEST_EARLY_WARNING_AT}={raw:?} is not a byte count: give the bytes the write \
+             store accepts before it acts as past a drive's early warning, in plain decimal \
+             digits, or unset it"
+        ));
+    }
+    digits.parse::<u64>().map_err(|e| {
+        format!("{TEST_EARLY_WARNING_AT}={raw:?} is not a byte count this tapectl reads: {e}")
+    })
+}
+
+/// What [`TapeStore::open`] says when the hook is set, one line per entry.
+fn test_early_warning_announcement(device: &str, at: u64) -> Vec<String> {
+    vec![
+        format!(
+            "warning: {TEST_EARLY_WARNING_AT}={at} is set: the write store on {device} acts as \
+             st does past a drive's early warning once {at} bytes are written since it opened \
+             (each later block write is refused once with ENOSPC and retried)."
+        ),
+        "warning: this is a TEST hook. It changes no byte the drive writes, but the tape it \
+         writes ends with a short seal where the hook says, not where the medium does. Never \
+         set it for a real write."
+            .to_string(),
+    ]
+}
+
 /// How a command opens the drive (issue #407).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
@@ -2092,12 +2165,24 @@ impl TapeStore {
     /// `usable_bytes` is the pre-flight capacity oracle's answer (nominal
     /// capacity × the configured usable-capacity factor); the caller
     /// computes it, since only the caller has the config in scope.
+    ///
+    /// `TAPECTL_TEST_EARLY_WARNING_AT=<bytes>` (#420) is read here, and only
+    /// here: see [`test_early_warning_at_from_env`].
     pub fn open(device: &str, block_size: usize, usable_bytes: u64) -> Result<Self> {
         #[cfg(test)]
         if let Some(store) = injected::open(OpenMode::ReadWrite, usable_bytes) {
             return store;
         }
-        let dev = TapeDevice::open(device, block_size)?;
+        let mut dev = TapeDevice::open(device, block_size)?;
+        if let Some(at) = test_early_warning_at_from_env() {
+            let at = at.map_err(TapectlError::Other)?;
+            for line in test_early_warning_announcement(device, at) {
+                tracing::warn!("{line}");
+                crate::progress::stderr_println(&line);
+                crate::progress::log(&line);
+            }
+            dev.fake_early_warning_at(at);
+        }
         dev.rewind()?;
         if let Err(e) = dev.disable_compression() {
             tracing::warn!(err = %e, "could not disable hardware compression (continuing)");
@@ -2428,7 +2513,9 @@ pub struct MemStore {
 /// LTO-6 (`docs/runs/2026-10-20-lto6-profile-and-lbp.md`), shared by
 /// [`MemStore`] and the in-memory `FakeTape` so both drive
 /// [`write_block_retrying`] the way the drive does. Positions are stored
-/// bytes from the beginning of the medium.
+/// bytes from the beginning of the medium. `TapeDevice`'s test hook
+/// (`TAPECTL_TEST_EARLY_WARNING_AT`, [`TapeStore::open`]) runs the same
+/// model in front of a real drive, counting from the store's open.
 ///
 /// - **The early warning** (`early_warning_at`): the block whose end reaches
 ///   it is accepted and arms a refusal. The next block write is refused at
@@ -2471,18 +2558,36 @@ impl MediumEnd {
         if hard_end.is_some_and(|end| stored + len > end) {
             return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
         }
-        if self.armed > 0 {
-            self.armed -= 1;
+        if self.refuses_block() {
             if self.refused_blocks_land {
                 land(block);
             }
             return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
         }
         land(block);
+        self.block_landed(stored, len);
+        Ok(block.len())
+    }
+
+    /// The first half of [`Self::write_block`], for a medium whose bytes
+    /// land somewhere this model does not hold (`TapeDevice`'s test hook,
+    /// `TAPECTL_TEST_EARLY_WARNING_AT`): whether st refuses the next block
+    /// write. A refusal is spent by asking.
+    pub(crate) fn refuses_block(&mut self) -> bool {
+        if self.armed == 0 {
+            return false;
+        }
+        self.armed -= 1;
+        true
+    }
+
+    /// The second half of [`Self::write_block`]: `len` bytes landed on a
+    /// medium that held `stored`. The block whose end reaches the early
+    /// warning, and every block after it, arms the next refusal.
+    pub(crate) fn block_landed(&mut self, stored: u64, len: u64) {
         if self.early_warning_at.is_some_and(|at| stored + len >= at) {
             self.armed = self.refusal_run.max(1);
         }
-        Ok(block.len())
     }
 
     /// st's answer to one filemark on a medium holding `stored` bytes. Never
@@ -2491,8 +2596,26 @@ impl MediumEnd {
         if self.filemarks_refused_from.is_some_and(|at| stored >= at) {
             return Err(io::Error::from_raw_os_error(nix::libc::ENOSPC));
         }
-        self.armed = 0;
+        self.filemark_landed();
         Ok(())
+    }
+
+    /// A filemark was written: it ends the alternation, as after the
+    /// measured warning the filemark, the seal block and the synchronous
+    /// filemark were each accepted at once.
+    pub(crate) fn filemark_landed(&mut self) {
+        self.armed = 0;
+    }
+
+    /// The model `TAPECTL_TEST_EARLY_WARNING_AT` runs on a real device: st's
+    /// early warning after `at` bytes, one refusal after each block accepted
+    /// past it, filemarks accepted, and no hard end and no hazard (the drive's
+    /// own hard end stays the drive's).
+    pub(crate) fn early_warning_only(at: u64) -> Self {
+        Self {
+            early_warning_at: Some(at),
+            ..Self::default()
+        }
     }
 
     /// The head moved: st's alternation starts again.
@@ -3162,6 +3285,47 @@ mod tests {
         // A store over a new open of the same medium starts afresh.
         let reopened = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
         assert_eq!(reopened.early_warning(), None);
+    }
+
+    /// `TAPECTL_TEST_EARLY_WARNING_AT` (#420) is read in one place, so no
+    /// test sets it; if one did, every write store in this binary would act
+    /// past an early warning.
+    #[test]
+    fn the_early_warning_test_hook_is_absent_by_default() {
+        assert!(
+            test_early_warning_at_from_env().is_none(),
+            "{TEST_EARLY_WARNING_AT} must not be set in the test environment; if this fails, \
+             something is exporting it and every write store refuses blocks"
+        );
+    }
+
+    /// The hook takes a plain decimal byte count and nothing else: a
+    /// mistyped value fails the open rather than writing as if unset.
+    #[test]
+    fn the_early_warning_test_hook_takes_a_plain_byte_count() {
+        assert_eq!(parse_test_early_warning_at("123456"), Ok(123_456));
+        assert_eq!(parse_test_early_warning_at(" 7 "), Ok(7));
+        for bad in [
+            "",
+            "  ",
+            "1G",
+            "-5",
+            "1e6",
+            "0x10",
+            "99999999999999999999999",
+        ] {
+            let err = parse_test_early_warning_at(bad).unwrap_err();
+            assert!(err.contains(TEST_EARLY_WARNING_AT), "{bad:?}: {err}");
+        }
+        let said = test_early_warning_announcement("/dev/nstX", 42).join("\n");
+        for want in [
+            "TAPECTL_TEST_EARLY_WARNING_AT=42 is set",
+            "/dev/nstX",
+            "TEST hook",
+            "Never set it for a real write",
+        ] {
+            assert!(said.contains(want), "{want:?} not in {said}");
+        }
     }
 
     /// A store with no early warning answers `None` (the trait's default).

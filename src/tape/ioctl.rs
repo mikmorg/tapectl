@@ -248,6 +248,11 @@ pub struct TapeDevice {
     /// early warning once st refused one (#420). A new open starts afresh:
     /// past the warning, the drive refuses the first write there again.
     warning: EarlyWarningState,
+    /// `TAPECTL_TEST_EARLY_WARNING_AT` (#420): st's answers past an early
+    /// warning, given in front of this device's block writes from the bytes
+    /// set ([`Self::fake_early_warning_at`]). `None` on every open but a
+    /// write store's with the hook set.
+    fake_warning: Option<crate::store::MediumEnd>,
 }
 
 impl Drop for TapeDevice {
@@ -328,6 +333,7 @@ impl TapeDevice {
             path: device_path.to_string(),
             recovered: Default::default(),
             warning: EarlyWarningState::default(),
+            fake_warning: None,
         };
         dev.set_block_size(block_size)?;
         dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
@@ -348,6 +354,7 @@ impl TapeDevice {
             path: device_path.to_string(),
             recovered: Default::default(),
             warning: EarlyWarningState::default(),
+            fake_warning: None,
         };
         dev.set_block_size(block_size)?;
         dev.note(crate::tape::mtget_journal::POINT_OPEN, None, None);
@@ -452,17 +459,30 @@ impl TapeDevice {
     /// (`volume-format-v2.md` §4.3 W3): refused, it is a full medium.
     pub fn write_stream(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
         let mut warning = std::mem::take(&mut self.warning);
+        let mut fake = self.fake_warning.take();
         let refusals_before = warning.refusals();
-        let blocks = self.write_blocks(src, len, &mut warning);
+        let blocks = self.write_blocks(src, len, &mut warning, &mut fake);
         self.warning = warning;
         self.summarize_refusals(refusals_before);
-        let committed = blocks?;
+        let committed = match blocks {
+            Ok(n) => n,
+            Err(e) => {
+                self.fake_warning = fake;
+                return Err(e);
+            }
+        };
 
         let marked = if sync {
             self.write_filemark_sync()
         } else {
             self.write_filemark_immediate()
         };
+        // A filemark the drive took ends the test hook's alternation, as it
+        // ends st's (`store::MediumEnd`).
+        if let (Ok(()), Some(end)) = (&marked, fake.as_mut()) {
+            end.filemark_landed();
+        }
+        self.fake_warning = fake;
         // A refused filemark is a full medium too (issue #408), and is not
         // retried (#420 W3).
         if let Err(e) = marked {
@@ -482,6 +502,17 @@ impl TapeDevice {
         self.warning.warning()
     }
 
+    /// The test hook `TAPECTL_TEST_EARLY_WARNING_AT` (#420; read and
+    /// announced by `store::TapeStore::open`, which says why it is safe):
+    /// from `at` bytes accepted since this device opened, its block writes
+    /// are answered as st answers them past a drive's early warning
+    /// (`store::MediumEnd`): a refused block is answered with ENOSPC before
+    /// `write(2)`, so it never reaches the drive, and the device's one retry
+    /// sends the same bytes again. Nothing the drive is sent changes.
+    pub fn fake_early_warning_at(&mut self, at: u64) {
+        self.fake_warning = Some(crate::store::MediumEnd::early_warning_only(at));
+    }
+
     /// [`Self::write_stream`]'s blocks, each through
     /// [`write_block_retrying`]. The device's journal gets the FIRST refusal
     /// of its life — one `MTIOCGET`, while st still shows the refusal — and
@@ -492,6 +523,7 @@ impl TapeDevice {
         src: &mut dyn Read,
         len: u64,
         warning: &mut EarlyWarningState,
+        fake: &mut Option<crate::store::MediumEnd>,
     ) -> Result<u64> {
         let bs = self.block_size.max(1);
         let mut buf = vec![0u8; bs];
@@ -523,15 +555,38 @@ impl TapeDevice {
             }
             let started = std::time::Instant::now();
             let accepted_before = warning.accepted();
+            let mut landed = 0u64;
             let written = write_block_retrying(
                 |block| {
-                    let attempt = (&self.file).write(block);
+                    // The test hook answers first: a refusal never reaches
+                    // the drive (`Self::fake_early_warning_at`).
+                    let faked = fake.as_mut().is_some_and(|end| end.refuses_block());
+                    let attempt = if faked {
+                        Err(io::Error::from_raw_os_error(nix::libc::ENOSPC))
+                    } else {
+                        (&self.file).write(block)
+                    };
+                    if let (Ok(n), Some(end)) = (&attempt, fake.as_mut()) {
+                        end.block_landed(accepted_before + landed, *n as u64);
+                        landed += *n as u64;
+                    }
                     if let Err(e) = &attempt {
                         if first_refusal && e.raw_os_error() == Some(nix::libc::ENOSPC) {
                             first_refusal = false;
-                            self.note_failure("write (early warning: first refused block)", e);
+                            let (refuser, by) = if faked {
+                                (
+                                    "the test hook TAPECTL_TEST_EARLY_WARNING_AT, not st,",
+                                    ", by the test hook TAPECTL_TEST_EARLY_WARNING_AT",
+                                )
+                            } else {
+                                ("st", "")
+                            };
+                            self.note_failure(
+                                &format!("write (early warning: first refused block{by})"),
+                                e,
+                            );
                             let line = format!(
-                                "early warning: st refused a block write (ENOSPC) after \
+                                "early warning: {refuser} refused a block write (ENOSPC) after \
                                  {accepted_before} bytes written since the drive opened; \
                                  retrying it"
                             );
@@ -1305,6 +1360,97 @@ mod density_tests {
         let err = write_block_retrying(|_| Ok(0), &[7; 8], &mut state).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WriteZero);
         assert_eq!(state.warning(), None);
+    }
+
+    /// A device over a plain file (no tape: its ioctls fail, its block
+    /// writes land in the file), for the test hook's tests.
+    fn device_over(file: File, block_size: usize) -> TapeDevice {
+        TapeDevice {
+            file,
+            block_size,
+            path: "test-hook-file".to_string(),
+            recovered: Default::default(),
+            warning: EarlyWarningState::default(),
+            fake_warning: None,
+        }
+    }
+
+    /// `TAPECTL_TEST_EARLY_WARNING_AT` (#420) on the device's real write
+    /// path: from the bytes set, a block is refused before `write(2)` after
+    /// each one accepted (st past an early warning, `store::MediumEnd`), the
+    /// device's one retry sends it again, and the medium receives every
+    /// block exactly once, in order: the bytes are what a write without the
+    /// hook would have put there. The warning is recorded at the bytes
+    /// accepted before the first refusal, as a real one is.
+    #[test]
+    fn the_test_hook_refuses_like_st_and_every_block_lands_once() {
+        let bs = 8usize;
+        let source: Vec<u8> = (0..6 * bs as u8).collect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut dev = device_over(tmp.reopen().unwrap(), bs);
+        // Reached inside the third block: it lands and arms the refusal.
+        dev.fake_early_warning_at(20);
+        let mut warning = EarlyWarningState::default();
+        let mut fake = dev.fake_warning.take();
+        let committed = dev
+            .write_blocks(
+                &mut io::Cursor::new(&source),
+                source.len() as u64,
+                &mut warning,
+                &mut fake,
+            )
+            .unwrap();
+        assert_eq!(committed, source.len() as u64);
+        assert_eq!(
+            std::fs::read(tmp.path()).unwrap(),
+            source,
+            "every block once, in order: a refused block never reached the file"
+        );
+        assert_eq!(
+            warning.warning(),
+            Some(EarlyWarning {
+                bytes_at: 24,
+                refusals: 3
+            }),
+            "blocks 4, 5 and 6 refused once each, after the 24 bytes of blocks 1-3"
+        );
+
+        // Control: the same write with no hook set refuses nothing.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dev = device_over(tmp.reopen().unwrap(), bs);
+        let mut warning = EarlyWarningState::default();
+        dev.write_blocks(
+            &mut io::Cursor::new(&source),
+            source.len() as u64,
+            &mut warning,
+            &mut None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), source);
+        assert_eq!(warning.warning(), None);
+    }
+
+    /// The hook's alternation is `store::MediumEnd`'s, block by block: below
+    /// the figure nothing is refused; a block reaching it lands and arms one
+    /// refusal; a filemark disarms, so the next file's first block lands (and
+    /// arms again, being past the figure).
+    #[test]
+    fn the_test_hooks_model_is_the_doubles_model() {
+        let mut end = crate::store::MediumEnd::early_warning_only(100);
+        assert!(!end.refuses_block());
+        end.block_landed(0, 50);
+        assert!(!end.refuses_block(), "below the figure");
+        end.block_landed(50, 50);
+        assert!(end.refuses_block(), "the block that reached it armed one");
+        assert!(!end.refuses_block(), "one refusal, then the retry lands");
+        end.block_landed(100, 50);
+        end.filemark_landed();
+        assert!(!end.refuses_block(), "a filemark disarms");
+        end.block_landed(150, 50);
+        assert!(
+            end.refuses_block(),
+            "past the figure, every landed block arms"
+        );
     }
 
     /// The device's write path, by its source (no tape here): every block
