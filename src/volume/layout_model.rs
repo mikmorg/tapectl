@@ -625,36 +625,48 @@ impl Layout {
     /// the Layout knows none, and these two conditions are what the split's
     /// definition leaves to check.
     fn check_capacity(&self, errs: &mut Vec<LayoutError>) {
-        let needed = match self.on_tape_bytes() {
-            Ok(needed) => needed,
-            Err(mut unsized_errs) => {
-                errs.append(&mut unsized_errs);
-                return;
-            }
-        };
-        let budget = &self.budget;
-        if needed + budget.reserve_bytes <= budget.available_bytes {
+        if let Err(mut unsized_errs) = self.on_tape_bytes() {
+            errs.append(&mut unsized_errs);
             return;
         }
-        let Some(bound) = budget.plan_bound_bytes else {
-            errs.push(LayoutError::CapacityExceeded {
-                needed,
-                reserve: budget.reserve_bytes,
-                available: budget.available_bytes,
-            });
-            return;
+        errs.extend(self.capacity_errors_against(self.budget.available_bytes));
+    }
+
+    /// The capacity gate of [`Self::validate`] with another fill budget in
+    /// place of the budget's own `available_bytes` — the live
+    /// `Store::capacity()` read at contact (`BuiltLayout::into_validated`) —
+    /// and the budget's own reserve and plan bound. Empty when the Layout
+    /// fits, and when an entry is unsized ([`Self::validate`] reports that).
+    /// One gate, so the contact check cannot refuse a plan past the fill
+    /// ceiling that the pre-flight accepted.
+    pub fn capacity_errors_against(&self, available_bytes: u64) -> Vec<LayoutError> {
+        let Ok(needed) = self.on_tape_bytes() else {
+            return Vec::new();
         };
+        let reserve = self.budget.reserve_bytes;
+        if needed + reserve <= available_bytes {
+            return Vec::new();
+        }
+        let Some(bound) = self.budget.plan_bound_bytes else {
+            return vec![LayoutError::CapacityExceeded {
+                needed,
+                reserve,
+                available: available_bytes,
+            }];
+        };
+        let mut errs = Vec::new();
         let fixed = self.fixed_on_tape_bytes();
-        if fixed + budget.reserve_bytes > budget.available_bytes {
+        if fixed + reserve > available_bytes {
             errs.push(LayoutError::CapacityExceeded {
                 needed: fixed,
-                reserve: budget.reserve_bytes,
-                available: budget.available_bytes,
+                reserve,
+                available: available_bytes,
             });
         }
         if needed > bound {
             errs.push(LayoutError::PlanBoundExceeded { needed, bound });
         }
+        errs
     }
 
     /// Every entry that is not a data slice, block-padded: the part of the
@@ -1208,6 +1220,37 @@ mod tests {
         // At exactly the fill budget they pass.
         let (layout, _) = three_unit_layout(budget(3 * BS, BS, Some(100 * BS)));
         assert!(layout.validate(&keys_ok(&[]), SliceCheck::Size).is_ok());
+    }
+
+    /// The contact check's gate (a live fill budget in place of the Layout's)
+    /// is the same gate: a plan past the ceiling that the pre-flight accepts,
+    /// the live figure accepts too, and without a bound it refuses as before.
+    #[test]
+    fn the_gate_against_a_live_fill_budget_keeps_the_plan_bound() {
+        let (bounded, _) = three_unit_layout(budget(7 * BS, BS, Some(10 * BS)));
+        assert!(bounded.capacity_errors_against(7 * BS).is_empty());
+        assert_eq!(
+            bounded.capacity_errors_against(2 * BS),
+            vec![LayoutError::CapacityExceeded {
+                needed: 2 * BS,
+                reserve: BS,
+                available: 2 * BS
+            }]
+        );
+        let (unbounded, _) = three_unit_layout(budget(7 * BS, BS, None));
+        assert_eq!(
+            unbounded.capacity_errors_against(7 * BS),
+            vec![LayoutError::CapacityExceeded {
+                needed: 10 * BS,
+                reserve: BS,
+                available: 7 * BS
+            }]
+        );
+        assert!(unbounded.capacity_errors_against(11 * BS).is_empty());
+        // An unsized entry is validate's to report, not this gate's.
+        let mut unsized_layout = unbounded.clone();
+        unsized_layout.entries[1].size_bytes = None;
+        assert!(unsized_layout.capacity_errors_against(0).is_empty());
     }
 
     #[test]
