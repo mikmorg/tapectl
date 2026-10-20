@@ -139,7 +139,23 @@ pub struct ConfirmPlan<'a> {
     /// in this same contact (issue #403: a resume's contact check reads the
     /// seal, and the walk used to locate it and read it again). The walk
     /// takes the seal from here and reads every other file from the medium.
+    /// They are the bytes at the seal's position under [`Self::ended_after`].
     pub seal: Option<&'a [u8]>,
+    /// How the tape ended, as the catalog knows it (#420;
+    /// `volume-format-v2.md` §4.1, §5): `Some(K)` for a short seal at K+1,
+    /// `None` for a full seal at the planned position M (`ended_after =
+    /// M-1`). The walk reads the seal at `K+1` (§1.2 rule 6: a catalog reader
+    /// that knows `ended_after` reads the seal there directly), reads no
+    /// position after K (§4.2 R3), and checks that the seal states this same
+    /// `ended_after` ([`MismatchKind::EndedAfterDisagrees`]).
+    pub ended_after: Option<u32>,
+    /// The entry the write read back past the drive's early warning (#420;
+    /// §4.3 W9, ADR-0012 item 114): K on a short seal, M-1 on a full seal
+    /// after a warning in the last slice. Hashed against File 3 under every
+    /// tier — at the navigable tier it is the one content file read — and
+    /// never skipped on an interrupted readback's word. `None` for a session
+    /// that saw no warning, and for every verify.
+    pub readback: Option<u32>,
 }
 
 impl std::fmt::Debug for ConfirmPlan<'_> {
@@ -150,12 +166,14 @@ impl std::fmt::Debug for ConfirmPlan<'_> {
             .field("resume", &self.resume.map(|r| r.passed.len()))
             .field("on_passed", &self.on_passed.is_some())
             .field("seal", &self.seal.map(<[u8]>::len))
+            .field("ended_after", &self.ended_after)
+            .field("readback", &self.readback)
             .finish()
     }
 }
 
 impl<'a> ConfirmPlan<'a> {
-    /// `tier`, seal first — what [`Store::confirm`] runs.
+    /// `tier`, seal first, a full seal — what [`Store::confirm`] runs.
     pub fn new(tier: Tier) -> Self {
         Self {
             tier,
@@ -163,7 +181,30 @@ impl<'a> ConfirmPlan<'a> {
             resume: None,
             on_passed: None,
             seal: None,
+            ended_after: None,
+            readback: None,
         }
+    }
+
+    /// The same plan, for a tape that ended after `ended_after` (#420):
+    /// `Some(K)` for a short seal at K+1, `None` for a full seal.
+    pub fn with_ending(self, ended_after: Option<u32>) -> Self {
+        Self {
+            ended_after,
+            ..self
+        }
+    }
+
+    /// The same plan, reading `readback` back under every tier: the entry
+    /// written past the drive's early warning (#420, ADR-0012 item 114).
+    pub fn reading_back(self, readback: Option<u32>) -> Self {
+        Self { readback, ..self }
+    }
+
+    /// Where the walk reads the seal on a Layout whose planned seal position
+    /// is `planned`: M, or K+1 on a short ending.
+    pub fn seal_position(&self, planned: u32) -> u32 {
+        self.ended_after.map_or(planned, |k| k + 1)
     }
 
     /// The same plan, reading the seal in `order`.
@@ -260,6 +301,16 @@ pub enum MismatchKind {
     /// therefore quarantined a sound cartridge, which is the exact outcome
     /// ADR-0012's amendment exists to prevent.
     ContentUnreadable,
+    /// The seal marker's `ended_after` is not the one the catalog knows
+    /// (#420; `volume-format-v2.md` §5 step 3): the session's ending for a
+    /// write's confirm, `volumes.ended_after` for `volume verify`, NULL (a
+    /// full seal) meaning the planned M-1. A seal on a tape that ended before
+    /// the planned position is read at `ended_after + 1`, so a seal there
+    /// stating another `ended_after` says it is somewhere it was not found.
+    /// The catalog and the tape disagree about where the tape ended; that
+    /// says nothing about the medium, so it is inconclusive, never a
+    /// quarantine.
+    EndedAfterDisagrees,
 }
 
 impl MismatchKind {
@@ -279,6 +330,7 @@ impl MismatchKind {
             MismatchKind::NavigationDisagreement => "navigation_disagreement",
             MismatchKind::ContentHashMismatch => "content_hash_mismatch",
             MismatchKind::ContentUnreadable => "content_unreadable",
+            MismatchKind::EndedAfterDisagrees => "ended_after_disagrees",
         }
     }
 
@@ -367,9 +419,14 @@ impl MismatchKind {
     /// - `SealUnreadable` — **no**, and never. Its own doc says an absent or
     ///   unparseable seal marker is the *normal* signal for an unsealed
     ///   tape, "never an error".
+    /// - `EndedAfterDisagrees` — **no** (#420). `volume-format-v2.md` §5
+    ///   step 3 rules it in terms: the seal's `ended_after` and the
+    ///   catalog's disagree about where the tape ended, which "says nothing
+    ///   about the medium, so the confirm is inconclusive (never a
+    ///   quarantine)".
     ///
     /// Written as an exhaustive `match` with **no wildcard arm** on purpose:
-    /// an eighth variant must fail to compile until someone decides which
+    /// a new variant must fail to compile until someone decides which
     /// side of this line it falls on. The decision is a CTO one (ADR-0012),
     /// not a default. That is what surfaced issue #239 — splitting
     /// `ContentUnreadable` out could not be done silently.
@@ -382,6 +439,7 @@ impl MismatchKind {
             MismatchKind::ContentUnreadable => false,
             MismatchKind::FrontIndexUnreadable => false,
             MismatchKind::SealUnreadable => false,
+            MismatchKind::EndedAfterDisagrees => false,
         }
     }
 }
@@ -533,11 +591,13 @@ pub trait Store {
         // progress phase (`confirm`, `verify`), and the file being read is
         // its current item. No-ops with no progress session.
         let files = layout.entries.len();
+        // The cached seal is the one at the seal's position under the plan's
+        // ending: K+1 on a short tape (#420), where the walk reads it.
         let seal_pos = layout
             .entries
             .iter()
             .find(|e| matches!(e.kind, ZoneKind::SealMarker))
-            .map(|e| e.position as u32);
+            .map(|e| plan.seal_position(e.position as u32));
         let mut cached = plan.seal;
         chain_walk(layout, plan, |position, sink| {
             if Some(position) == seal_pos {
@@ -993,6 +1053,15 @@ impl Write for SmallSink<'_> {
 /// does not decide, and [`judge`] puts the seal's verdict in front of it —
 /// or, for a seal that fails the gate, in place of it, discarding whatever
 /// was read after it. The [`Evidence`] is identical in either order.
+///
+/// **The ending (#420, 1.6.0).** The walk reads the tape as far as
+/// [`ConfirmPlan::ended_after`]: the seal at `ended_after + 1` (K+1 on a short
+/// tape, M on a full one), content files at or before `ended_after`, and
+/// nothing after it (`volume-format-v2.md` §4.2, §5). File 3 and the Layout
+/// are both the plan, so step 3 still compares them whole. The seal must state
+/// the same `ended_after` ([`MismatchKind::EndedAfterDisagrees`]), and a seal
+/// before the planned position must require `short-seal` (§1.2 rule 6).
+/// [`ConfirmPlan::readback`] is hashed under every tier (§4.3 W9).
 fn chain_walk<F>(layout: &Layout, plan: ConfirmPlan<'_>, mut read: F) -> Result<Evidence>
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
@@ -1008,7 +1077,7 @@ where
         .iter()
         .find(|e| matches!(e.kind, ZoneKind::FrontIndex))
         .ok_or_else(|| TapectlError::Other("layout has no front_index entry".into()))?;
-    let seal_pos = seal_entry.position as u32;
+    let planned_seal = seal_entry.position as u32;
     let fi_pos = fi_entry.position as u32;
     let Some(fi_true_len) = fi_entry.size_bytes else {
         return Err(TapectlError::Other(
@@ -1016,12 +1085,13 @@ where
         ));
     };
     let fi_true_len = fi_true_len as usize;
+    let ending = WalkEnding::of(&plan, fi_pos, planned_seal)?;
 
     // Step 1 (§5.1), when it is read first: the gate, before anything else
     // moves. An unsealed tape stops here, at one read.
     let seal_first = tier == Tier::Integrity && plan.order == ReadOrder::SealFirst;
     let early = if seal_first {
-        match read_seal(seal_pos, &mut read) {
+        match read_seal(ending, &mut read) {
             SealRead::Refused {
                 files_checked,
                 mismatch,
@@ -1038,13 +1108,78 @@ where
         None
     };
 
-    let rest = walk_from_index(layout, plan, fi_pos, seal_pos, fi_true_len, &mut read)?;
+    let rest = walk_from_index(layout, plan, fi_pos, ending, fi_true_len, &mut read)?;
 
     let seal = match early {
         Some(seal) => seal,
-        None => read_seal(seal_pos, &mut read),
+        None => read_seal(ending, &mut read),
     };
-    Ok(judge(tier, fi_pos, seal, rest))
+    Ok(judge(tier, fi_pos, ending, seal, rest))
+}
+
+/// Where the tape ended, as the walk's plan knows it (#420;
+/// `volume-format-v2.md` §4.1, §5): every position the walk reads for
+/// content is at or before `ended_after`, and the seal is the file right
+/// after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalkEnding {
+    /// The last file before the seal: the plan's K on a short ending, M-1
+    /// on a full one.
+    ended_after: u32,
+    /// The planned seal position M (the Layout's `seal_marker` entry).
+    planned_seal: u32,
+    /// The entry to read back past the early warning (§4.3 W9), checked to
+    /// be a content file at or before `ended_after`.
+    readback: Option<u32>,
+}
+
+impl WalkEnding {
+    /// The plan's ending on a Layout whose front index is at `fi_pos` and
+    /// whose seal is planned at `planned_seal`. An `ended_after` that is not
+    /// a position after File 3 and before M, or a readback position that is
+    /// not after File 3 and at or before `ended_after`, is a caller bug, as
+    /// a Layout with no seal marker entry is: an `Err`, never a finding
+    /// about the tape.
+    fn of(plan: &ConfirmPlan<'_>, fi_pos: u32, planned_seal: u32) -> Result<Self> {
+        let ended_after = match plan.ended_after {
+            None => planned_seal.checked_sub(1).ok_or_else(|| {
+                TapectlError::Other("layout's seal_marker entry is at position 0".into())
+            })?,
+            Some(k) if k > fi_pos && k < planned_seal => k,
+            Some(k) => {
+                return Err(TapectlError::Other(format!(
+                    "the confirm plan's ended_after = {k} is not a file between the front \
+                     index (file {fi_pos}) and the planned seal (file {planned_seal})"
+                )))
+            }
+        };
+        if let Some(p) = plan.readback {
+            if p <= fi_pos || p > ended_after {
+                return Err(TapectlError::Other(format!(
+                    "the confirm plan reads back file {p}, which is not a content file between \
+                     the front index (file {fi_pos}) and ended_after = {ended_after}"
+                )));
+            }
+        }
+        Ok(Self {
+            ended_after,
+            planned_seal,
+            readback: plan.readback,
+        })
+    }
+
+    /// Where the seal is read: `ended_after + 1` — M on a full ending, K+1
+    /// on a short one (§1.2 rule 6, a catalog reader that knows
+    /// `ended_after`).
+    fn seal_position(self) -> u32 {
+        self.ended_after + 1
+    }
+
+    /// Whether the seal is read before the planned position: a short seal,
+    /// which §1.2 rule 6 accepts only when it requires `short-seal`.
+    fn is_short(self) -> bool {
+        self.seal_position() < self.planned_seal
+    }
 }
 
 /// What reading the seal marker (step 1, §5.1) found.
@@ -1057,18 +1192,29 @@ enum SealRead {
         files_checked: u32,
         mismatch: Mismatch,
     },
-    /// A seal marker this tapectl can read, binding File 3 to this hash.
-    Bound { front_index_sha256: String },
+    /// A seal marker this tapectl can read, binding File 3 to this hash,
+    /// and stating that the tape ended after `ended_after`
+    /// ([`format::ParsedSeal::effective_ended_after`]: a seal before 1.6.0
+    /// states none and ended after `file_count - 2`, rule S3). `None` only
+    /// for a `file_count` below 2.
+    Bound {
+        front_index_sha256: String,
+        ended_after: Option<u64>,
+    },
 }
 
-/// Step 1 (§5.1): read + parse the seal marker (the last file). It is parsed
-/// as TOML, so its true bytes are genuinely needed — small and bounded, so
-/// buffering into a `Vec` here is correct (issue #86). Absent or
-/// unparseable is the normal unsealed signal, never an Err.
-fn read_seal<F>(seal_pos: u32, read: &mut F) -> SealRead
+/// Step 1 (§5.1): read + parse the seal marker (the last file), at
+/// `ended_after + 1` (#420: M on a full ending, K+1 on a short one). It is
+/// parsed as TOML, so its true bytes are genuinely needed — small and
+/// bounded, so buffering into a `Vec` here is correct (issue #86). Absent or
+/// unparseable is the normal unsealed signal, never an Err. So is a seal read
+/// before the planned position that does not itself require `short-seal`:
+/// `volume-format-v2.md` §1.2 rule 6 accepts no other seal there.
+fn read_seal<F>(ending: WalkEnding, read: &mut F) -> SealRead
 where
     F: FnMut(u32, &mut dyn Write) -> Result<u64>,
 {
+    let seal_pos = ending.seal_position();
     let mut seal_bytes = Vec::new();
     if let Err(e) = read(
         seal_pos,
@@ -1115,7 +1261,34 @@ where
             },
         };
     }
+    // §1.2 rule 6, "which seal a reader accepts": before the planned
+    // position, only a seal that itself requires short-seal. Anything else
+    // there is no seal, and the tape reads as unsealed.
+    if ending.is_short() && !seal.requires_short_seal() {
+        return SealRead::Refused {
+            files_checked: 1,
+            mismatch: Mismatch {
+                position: seal_pos,
+                kind: MismatchKind::SealUnreadable,
+                expected: format!(
+                    "a short seal requiring \"{}\" before the planned seal position {}",
+                    format::SHORT_SEAL,
+                    ending.planned_seal
+                ),
+                actual: format!(
+                    "a seal marker stating requires = [{}], which is no seal before the \
+                     planned position (volume-format-v2.md §1.2 rule 6)",
+                    seal.requires
+                        .iter()
+                        .map(|f| format!("\"{f}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
+        };
+    }
     SealRead::Bound {
+        ended_after: seal.effective_ended_after(),
         front_index_sha256: seal.front_index_sha256,
     }
 }
@@ -1142,7 +1315,7 @@ fn walk_from_index<F>(
     layout: &Layout,
     plan: ConfirmPlan<'_>,
     fi_pos: u32,
-    seal_pos: u32,
+    ending: WalkEnding,
     fi_true_len: usize,
     read: &mut F,
 ) -> Result<FromIndex>
@@ -1274,6 +1447,30 @@ where
     }
 
     if tier == Tier::Navigable {
+        // #420 (§4.3 W9, §5; ADR-0012 item 114): after the drive's early
+        // warning, the entry written past it is read back under every tier.
+        // Here it is the one content file the navigable tier hashes; File 3
+        // and the seal are read anyway. Never read on a resume's word: this
+        // tier honours none.
+        if let Some(p) = ending.readback {
+            match parsed_fi.iter().find(|c| c.position as u32 == p) {
+                Some(claim) => {
+                    read_back_claim(claim, None, read, &mut files_checked, &mut mismatches);
+                }
+                // The Layout diff above reports a Layout position File 3
+                // does not list; say it here only if nothing named it.
+                None if !mismatches.iter().any(|m| m.position == p) => mismatches.push(Mismatch {
+                    position: p,
+                    kind: MismatchKind::NavigationDisagreement,
+                    expected: format!(
+                        "front index lists position {p}, the file written past the \
+                             early warning"
+                    ),
+                    actual: "missing from front index".to_string(),
+                }),
+                None => {}
+            }
+        }
         return Ok(FromIndex {
             files_checked,
             front_index_sha256: Some(fi_hash),
@@ -1296,20 +1493,29 @@ where
         }
     };
 
-    // Step 4 (§5.4, Integrity tier only): every file except File 3 and the
-    // seal marker, truncated to the front index's claimed size, hashed and
-    // compared to the front index's sha256_encrypted.
+    // Step 4 (§5.4, Integrity tier only): every file at or before
+    // `ended_after` except File 3, truncated to the front index's claimed
+    // size, hashed and compared to the front index's sha256_encrypted. The
+    // seal marker is after `ended_after`, and so on a short tape (#420) is
+    // every position File 3 plans past it: not on this tape, never read
+    // (§4.2 R3), and its claims compared with nothing.
     for claim in &parsed_fi {
         let position = claim.position as u32;
-        if position == fi_pos || position == seal_pos {
+        if position == fi_pos || position > ending.ended_after {
             continue;
         }
         // Issue #410: read back clean by the readback this one continues,
         // against this same claim — counted, reported again under this
-        // walk (so a second interruption keeps it), and not read.
-        if let (Some(r), Some(want), Some(_)) =
-            (resume, claim.sha256_encrypted.as_deref(), claim.size_bytes)
-        {
+        // walk (so a second interruption keeps it), and not read. Except the
+        // entry written past the early warning (#420, ADR-0012 item 114):
+        // that one is read back on every confirm, whatever an earlier
+        // readback found.
+        if let (Some(r), Some(want), Some(_), false) = (
+            resume,
+            claim.sha256_encrypted.as_deref(),
+            claim.size_bytes,
+            ending.readback == Some(position),
+        ) {
             if r.passed.get(&position).map(String::as_str) == Some(want) {
                 files_checked += 1;
                 passed(position, want);
@@ -1326,80 +1532,16 @@ where
                  checked besides the seal)"
             )
         })?;
-        let (Some(want_hash), Some(want_size)) = (&claim.sha256_encrypted, claim.size_bytes) else {
-            mismatches.push(Mismatch {
-                position,
-                kind: MismatchKind::NavigationDisagreement,
-                expected: "front index carries size_bytes + sha256_encrypted".to_string(),
-                actual: "one or both missing for a content file".to_string(),
-            });
-            continue;
-        };
-
-        // Content files are only ever hashed, never otherwise inspected —
-        // so unlike the seal marker/front index above, this never buffers
-        // the file. `TruncatingWriter` trims to `want_size` (the front
-        // index's claimed true length) as bytes arrive, wrapping a
-        // `HashingWriter` that discards into `io::sink()` — the same
-        // composition `restore.rs::restore_one_slice_inner` uses for its
-        // ciphertext pass, just with a sink that has no use for the bytes
-        // themselves (issue #86).
-        let mut sink = TruncatingWriter::new(HashingWriter::new(io::sink()), want_size);
-        // A file held from the pass ahead of File 3 is fed through the
-        // identical sink, as `MemStore::read_file` would feed it.
-        let read_result = match held.get(&position) {
-            Some(Held::Bytes { bytes, read }) => sink
-                .write_all(bytes)
-                .map(|()| *read)
-                .map_err(|e| TapectlError::Other(format!("sink write: {e}")).to_string()),
-            Some(Held::Failed(e)) => Err(e.clone()),
-            None => read(position, &mut sink).map_err(|e| e.to_string()),
-        };
-        let hashing = sink.into_inner();
-
-        let n_read = match read_result {
-            Ok(n) => n,
-            Err(e) => {
-                // Issue #239: a raw I/O or transport error. NOT a hash
-                // disagreement — no hash was ever computed — so it is not
-                // `ContentHashMismatch` and does not quarantine.
-                mismatches.push(Mismatch {
-                    position,
-                    kind: MismatchKind::ContentUnreadable,
-                    expected: "file readable".to_string(),
-                    actual: format!("read failed: {e}"),
-                });
-                continue;
-            }
-        };
-        files_checked += 1;
-
-        if want_size > n_read {
-            // Issue #239: a short read. Ambiguous between a truncated write
-            // and a drive giving up early, and the count alone cannot
-            // separate them, so it takes the same side
-            // `FrontIndexUnreadable` already takes for the identical event
-            // one position over.
-            mismatches.push(Mismatch {
-                position,
-                kind: MismatchKind::ContentUnreadable,
-                expected: format!("{want_size} on-tape bytes"),
-                actual: format!("only {n_read} bytes read back"),
-            });
-            continue;
-        }
-        let actual_hash = hashing.finalize_hex();
-        if &actual_hash != want_hash {
-            mismatches.push(Mismatch {
-                position,
-                kind: MismatchKind::ContentHashMismatch,
-                expected: want_hash.clone(),
-                actual: actual_hash,
-            });
-        } else {
+        if let Some(want) = read_back_claim(
+            claim,
+            held.get(&position),
+            read,
+            &mut files_checked,
+            &mut mismatches,
+        ) {
             // Issue #410: a checkpoint, as the walk goes — what lets an
             // interrupted readback be continued rather than redone.
-            passed(position, want_hash);
+            passed(position, want);
         }
     }
 
@@ -1410,11 +1552,104 @@ where
     })
 }
 
+/// Step 4's check of one content file (§5.4): read it — or take it from
+/// `held`, the pass ahead of File 3 — truncated to the front index's claimed
+/// size, hash it, and compare with the claim's `sha256_encrypted`. Every
+/// disagreement goes to `mismatches`, and a file whose bytes came back counts
+/// in `files_checked`. Returns the claim's hash when the file read back
+/// clean. Shared by step 4 and the navigable tier's readback past the early
+/// warning (#420), so both judge a file by the same rules.
+fn read_back_claim<'c, F>(
+    claim: &'c format::ParsedIndexEntry,
+    held: Option<&Held>,
+    read: &mut F,
+    files_checked: &mut u32,
+    mismatches: &mut Vec<Mismatch>,
+) -> Option<&'c str>
+where
+    F: FnMut(u32, &mut dyn Write) -> Result<u64>,
+{
+    let position = claim.position as u32;
+    let (Some(want_hash), Some(want_size)) = (&claim.sha256_encrypted, claim.size_bytes) else {
+        mismatches.push(Mismatch {
+            position,
+            kind: MismatchKind::NavigationDisagreement,
+            expected: "front index carries size_bytes + sha256_encrypted".to_string(),
+            actual: "one or both missing for a content file".to_string(),
+        });
+        return None;
+    };
+
+    // Content files are only ever hashed, never otherwise inspected —
+    // so unlike the seal marker/front index, this never buffers the file.
+    // `TruncatingWriter` trims to `want_size` (the front index's claimed
+    // true length) as bytes arrive, wrapping a `HashingWriter` that
+    // discards into `io::sink()` — the same composition
+    // `restore.rs::restore_one_slice_inner` uses for its ciphertext pass,
+    // just with a sink that has no use for the bytes themselves (issue #86).
+    let mut sink = TruncatingWriter::new(HashingWriter::new(io::sink()), want_size);
+    // A file held from the pass ahead of File 3 is fed through the
+    // identical sink, as `MemStore::read_file` would feed it.
+    let read_result = match held {
+        Some(Held::Bytes { bytes, read }) => sink
+            .write_all(bytes)
+            .map(|()| *read)
+            .map_err(|e| TapectlError::Other(format!("sink write: {e}")).to_string()),
+        Some(Held::Failed(e)) => Err(e.clone()),
+        None => read(position, &mut sink).map_err(|e| e.to_string()),
+    };
+    let hashing = sink.into_inner();
+
+    let n_read = match read_result {
+        Ok(n) => n,
+        Err(e) => {
+            // Issue #239: a raw I/O or transport error. NOT a hash
+            // disagreement — no hash was ever computed — so it is not
+            // `ContentHashMismatch` and does not quarantine.
+            mismatches.push(Mismatch {
+                position,
+                kind: MismatchKind::ContentUnreadable,
+                expected: "file readable".to_string(),
+                actual: format!("read failed: {e}"),
+            });
+            return None;
+        }
+    };
+    *files_checked += 1;
+
+    if want_size > n_read {
+        // Issue #239: a short read. Ambiguous between a truncated write
+        // and a drive giving up early, and the count alone cannot
+        // separate them, so it takes the same side
+        // `FrontIndexUnreadable` already takes for the identical event
+        // one position over.
+        mismatches.push(Mismatch {
+            position,
+            kind: MismatchKind::ContentUnreadable,
+            expected: format!("{want_size} on-tape bytes"),
+            actual: format!("only {n_read} bytes read back"),
+        });
+        return None;
+    }
+    let actual_hash = hashing.finalize_hex();
+    if &actual_hash != want_hash {
+        mismatches.push(Mismatch {
+            position,
+            kind: MismatchKind::ContentHashMismatch,
+            expected: want_hash.clone(),
+            actual: actual_hash,
+        });
+        return None;
+    }
+    Some(want_hash)
+}
+
 /// The verdict, in §5's order whatever order the files were read in: the
 /// seal's gate first — a refused seal is the whole verdict, and anything
 /// read after it is discarded — then step 2's binding (File 3's hash
-/// against the seal's), then everything else in walk order.
-fn judge(tier: Tier, fi_pos: u32, seal: SealRead, rest: FromIndex) -> Evidence {
+/// against the seal's), then step 3's (1.6.0) check that the seal ended
+/// where the catalog says (#420), then everything else in walk order.
+fn judge(tier: Tier, fi_pos: u32, ending: WalkEnding, seal: SealRead, rest: FromIndex) -> Evidence {
     match seal {
         SealRead::Refused {
             files_checked,
@@ -1424,8 +1659,11 @@ fn judge(tier: Tier, fi_pos: u32, seal: SealRead, rest: FromIndex) -> Evidence {
             files_checked,
             mismatches: vec![mismatch],
         },
-        SealRead::Bound { front_index_sha256 } => {
-            let mut mismatches = Vec::with_capacity(rest.mismatches.len() + 1);
+        SealRead::Bound {
+            front_index_sha256,
+            ended_after,
+        } => {
+            let mut mismatches = Vec::with_capacity(rest.mismatches.len() + 2);
             if let Some(fi_hash) = rest.front_index_sha256 {
                 if fi_hash != front_index_sha256 {
                     // Divergence is quarantine-grade (§2.5), but the walk
@@ -1439,6 +1677,24 @@ fn judge(tier: Tier, fi_pos: u32, seal: SealRead, rest: FromIndex) -> Evidence {
                         actual: fi_hash,
                     });
                 }
+            }
+            // §5 step 3 (1.6.0, #420): the seal's `ended_after` is the
+            // catalog's — K on a short ending, M-1 on a full one, both
+            // directions. Inconclusive, never a quarantine
+            // (`MismatchKind::EndedAfterDisagrees`).
+            if ended_after != Some(u64::from(ending.ended_after)) {
+                mismatches.push(Mismatch {
+                    position: ending.seal_position(),
+                    kind: MismatchKind::EndedAfterDisagrees,
+                    expected: format!(
+                        "ended_after = {}, where the catalog says the tape ended",
+                        ending.ended_after
+                    ),
+                    actual: match ended_after {
+                        Some(k) => format!("ended_after = {k}"),
+                        None => "no ended_after".to_string(),
+                    },
+                });
             }
             mismatches.extend(rest.mismatches);
             Evidence {
@@ -3456,6 +3712,10 @@ mod tests {
             (MismatchKind::ContentUnreadable, false),
             (MismatchKind::FrontIndexUnreadable, false),
             (MismatchKind::SealUnreadable, false),
+            // #420, `volume-format-v2.md` §5 step 3: the catalog and the
+            // seal disagree about where the tape ended — "inconclusive
+            // (never a quarantine)".
+            (MismatchKind::EndedAfterDisagrees, false),
         ];
         for (kind, expected) in ratified {
             assert_eq!(
@@ -3468,7 +3728,7 @@ mod tests {
 
         // COMPLETENESS, so a future variant cannot slip through
         // unclassified. `slot` is exhaustive with no wildcard arm, exactly
-        // like `proves_medium_bad` itself: an eighth variant fails to
+        // like `proves_medium_bad` itself: a new variant fails to
         // COMPILE here (a new arm is required), a slot past `N` panics, and
         // a variant that has an arm but is missing from `ratified` above
         // fails the assertion. A green run therefore means every variant
@@ -3482,9 +3742,10 @@ mod tests {
                 MismatchKind::NavigationDisagreement => 4,
                 MismatchKind::ContentHashMismatch => 5,
                 MismatchKind::ContentUnreadable => 6,
+                MismatchKind::EndedAfterDisagrees => 7,
             }
         }
-        const N: usize = 7;
+        const N: usize = 8;
         let mut covered = [false; N];
         for (kind, _) in ratified {
             covered[slot(*kind)] = true;
@@ -4799,5 +5060,602 @@ mod tests {
             vec![9u8; blocks * BS as usize]
         );
         assert!(store.pool.allocated() <= blocks);
+    }
+
+    // ── #420: the chain walk takes the ending (`volume-format-v2.md` §4.1,
+    // §4.2, §5; ADR-0012 item 114) ──
+
+    mod short_ending {
+        use super::*;
+        use crate::volume::layout::generate_short_seal_marker;
+
+        /// Small blocks, so a slice is several of them.
+        const SBS: usize = 4096;
+        const LABEL: &str = "SHORT01";
+        /// Four data slices at 4..=7; the seal is planned at 8.
+        const SLICES: usize = 4;
+        const M: u32 = 4 + SLICES as u32;
+        /// Where these tests' short tapes end: two slices before M-1.
+        const K: u32 = 5;
+
+        /// A planned tape: the Layout, every file's true bytes before the
+        /// seal, and the seal's embedded copy (File 3 filled in).
+        struct Planned {
+            layout: Layout,
+            files: Vec<Vec<u8>>,
+            fi_hash: String,
+            seal_files: Vec<FrontIndexFile>,
+        }
+
+        /// Files 0-2, File 3, [`SLICES`] data slices of three blocks less a
+        /// little whose every block's bytes differ (so a block written twice
+        /// changes the file's hash), and the seal planned at [`M`].
+        fn planned() -> Planned {
+            let mut files: Vec<Vec<u8>> = vec![
+                b"ID THUNK".to_vec(),
+                b"SYSTEM GUIDE".to_vec(),
+                b"#!/bin/sh\n".to_vec(),
+            ];
+            let slices: Vec<Vec<u8>> = (0..SLICES)
+                .map(|i| {
+                    (0..3 * SBS - 100)
+                        .map(|o| (o / SBS + 7 * i + 1) as u8)
+                        .collect()
+                })
+                .collect();
+            let kinds = ["id_thunk", "system_guide", "restore_sh"];
+            let mut fi_files: Vec<FrontIndexFile> = files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| FrontIndexFile {
+                    position: i as i32,
+                    type_label: kinds[i],
+                    size_bytes: Some(f.len() as u64),
+                    sha256_encrypted: Some(sha256_hex(f)),
+                })
+                .collect();
+            fi_files.push(FrontIndexFile {
+                position: 3,
+                type_label: "front_index",
+                size_bytes: None,
+                sha256_encrypted: None,
+            });
+            for (i, s) in slices.iter().enumerate() {
+                fi_files.push(FrontIndexFile {
+                    position: 4 + i as i32,
+                    type_label: "data_slice",
+                    size_bytes: Some(s.len() as u64),
+                    sha256_encrypted: Some(sha256_hex(s)),
+                });
+            }
+            fi_files.push(FrontIndexFile {
+                position: M as i32,
+                type_label: "seal_marker",
+                size_bytes: None,
+                sha256_encrypted: None,
+            });
+            let fi_bytes = generate_front_index(LABEL, &fi_files).into_bytes();
+            let fi_hash = sha256_hex(&fi_bytes);
+            let mut seal_files = fi_files.clone();
+            seal_files[3].size_bytes = Some(fi_bytes.len() as u64);
+            seal_files[3].sha256_encrypted = Some(fi_hash.clone());
+            let placeholder =
+                generate_seal_marker(LABEL, M as i32 + 1, &fi_hash, &seal_files).into_bytes();
+            files.push(fi_bytes);
+            files.extend(slices);
+
+            let mut entries: Vec<LayoutEntry> = files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| LayoutEntry {
+                    position: i as i32,
+                    kind: match i {
+                        0 => ZoneKind::IdThunk,
+                        1 => ZoneKind::SystemGuide,
+                        2 => ZoneKind::RestoreSh,
+                        3 => ZoneKind::FrontIndex,
+                        _ => ZoneKind::Slice {
+                            stage_slice_id: i as i64,
+                        },
+                    },
+                    size_bytes: Some(f.len() as u64),
+                    sha256: Some(sha256_hex(f)),
+                    source: ContentSource::Generated,
+                })
+                .collect();
+            entries.push(LayoutEntry {
+                position: M as i32,
+                kind: ZoneKind::SealMarker,
+                size_bytes: Some(placeholder.len() as u64),
+                sha256: None,
+                source: ContentSource::Generated,
+            });
+            Planned {
+                layout: Layout {
+                    label: LABEL.into(),
+                    volume_uuid: "uuid-short".into(),
+                    media_type: "LTO-6".into(),
+                    block_size: SBS as u64,
+                    budget: CapacityBudget {
+                        available_bytes: 1000 * SBS as u64,
+                        reserve_bytes: SBS as u64,
+                        plan_bound_bytes: None,
+                    },
+                    entries,
+                },
+                files,
+                fi_hash,
+                seal_files,
+            }
+        }
+
+        impl Planned {
+            /// The seal a 1.6.0 writer puts after `ended_after`: short at
+            /// `ended_after + 1`, or full at M when it is M-1.
+            fn seal(&self, ended_after: u32) -> Vec<u8> {
+                if ended_after == M - 1 {
+                    generate_seal_marker(LABEL, M as i32 + 1, &self.fi_hash, &self.seal_files)
+                } else {
+                    generate_short_seal_marker(
+                        LABEL,
+                        ended_after as i32,
+                        &self.fi_hash,
+                        &self.seal_files[..=ended_after as usize],
+                    )
+                }
+                .into_bytes()
+            }
+
+            /// `store` holding files 0 to `ended_after`, written through
+            /// `execute`, and then `seal`.
+            fn written(&self, mut store: MemStore, ended_after: u32, seal: &[u8]) -> MemStore {
+                for f in &self.files[..=ended_after as usize] {
+                    store
+                        .execute(&mut Cursor::new(f.clone()), f.len() as u64, false)
+                        .unwrap();
+                }
+                store
+                    .execute(&mut Cursor::new(seal.to_vec()), seal.len() as u64, true)
+                    .unwrap();
+                store
+            }
+
+            /// The tape a 1.6.0 writer leaves when it ended after
+            /// `ended_after`, with no warning hazard.
+            fn tape(&self, ended_after: u32) -> MemStore {
+                self.written(MemStore::new(SBS), ended_after, &self.seal(ended_after))
+            }
+
+            /// A store whose early warning comes one byte into file
+            /// `position`, and whose refused blocks land anyway (the hazard
+            /// item 114 exists for): that file holds one block twice.
+            fn hazard_in(&self, position: u32) -> MemStore {
+                let before: u64 = self.files[..position as usize]
+                    .iter()
+                    .map(|f| pad_to_blocks(f.len() as u64, SBS as u64))
+                    .sum();
+                MemStore::new(SBS)
+                    .with_early_warning_after(before + 1)
+                    .with_refused_blocks_written()
+            }
+        }
+
+        /// A seal in the grammar before 1.6.0: no `ended_after`, `requires
+        /// = []` (what every 1.5.0 tape carries).
+        fn seal_1_5_0(seal: &[u8]) -> Vec<u8> {
+            let text = String::from_utf8(seal.to_vec()).unwrap();
+            let kept: Vec<&str> = text
+                .lines()
+                .filter(|l| !l.starts_with("ended_after = "))
+                .collect();
+            let out = kept
+                .join("\n")
+                .replace("requires = [\"short-seal\"]", "requires = []");
+            assert!(!out.contains("ended_after =") && out.contains("requires = []\n"));
+            out.into_bytes()
+        }
+
+        /// A store over `inner` that records every position read.
+        struct Recording {
+            inner: MemStore,
+            reads: Vec<u32>,
+        }
+
+        impl Store for Recording {
+            fn capacity(&mut self) -> Result<CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(&mut self, src: &mut dyn Read, len: u64, sync: bool) -> Result<u64> {
+                self.inner.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                self.reads.push(position);
+                self.inner.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+        }
+
+        fn short(tier: Tier) -> ConfirmPlan<'static> {
+            ConfirmPlan::new(tier).with_ending(Some(K))
+        }
+
+        fn kinds(evidence: &Evidence) -> Vec<(u32, MismatchKind)> {
+            evidence
+                .mismatches
+                .iter()
+                .map(|m| (m.position, m.kind))
+                .collect()
+        }
+
+        /// A short plan reads the seal at K+1, hashes files 0 to K at the
+        /// integrity tier, reads nothing after K+1, and passes — in every
+        /// read order. The positive control: a full plan over the same tape
+        /// does read past K+1 (M, where there is nothing), so the recorder
+        /// sees reads there when they happen.
+        #[test]
+        fn a_short_plan_reads_the_seal_at_k_plus_one_and_nothing_after_it() {
+            let p = planned();
+            for (plan, checked) in [
+                (short(Tier::Integrity), 7),
+                (short(Tier::Integrity).with_order(ReadOrder::SealLast), 7),
+                (short(Tier::Navigable), 2),
+            ] {
+                let mut store = Recording {
+                    inner: p.tape(K),
+                    reads: Vec::new(),
+                };
+                let evidence = store.confirm_with(&p.layout, plan).unwrap();
+                assert!(evidence.mismatches.is_empty(), "{plan:?}: {evidence:?}");
+                // Seal + File 3, and at the integrity tier Files 0-2 and
+                // the slices at 4 and 5.
+                assert_eq!(evidence.files_checked, checked, "{plan:?}");
+                assert!(
+                    store.reads.contains(&(K + 1)),
+                    "{plan:?}: {:?}",
+                    store.reads
+                );
+                assert!(
+                    store.reads.iter().all(|r| *r <= K + 1),
+                    "{plan:?}: read past the short seal: {:?}",
+                    store.reads
+                );
+            }
+
+            let mut store = Recording {
+                inner: p.tape(K),
+                reads: Vec::new(),
+            };
+            let control = store
+                .confirm_with(&p.layout, ConfirmPlan::new(Tier::Navigable))
+                .unwrap();
+            assert!(
+                store.reads.contains(&M),
+                "positive control: the recorder sees a read past K+1: {:?}",
+                store.reads
+            );
+            assert_eq!(kinds(&control), [(M, MismatchKind::SealUnreadable)]);
+        }
+
+        /// A full plan with no readback walks as before: `files_checked`
+        /// and the verdict of every full-plan test above are unchanged, and
+        /// a 1.6.0 full seal (which states `ended_after = M-1`) passes both
+        /// tiers.
+        #[test]
+        fn a_full_plan_passes_a_full_1_6_0_seal_at_both_tiers() {
+            let p = planned();
+            let mut store = p.tape(M - 1);
+            let full = store.confirm(&p.layout, Tier::Integrity).unwrap();
+            assert!(full.mismatches.is_empty(), "{full:?}");
+            assert_eq!(full.files_checked, M + 1);
+            let quick = store.confirm(&p.layout, Tier::Navigable).unwrap();
+            assert!(quick.mismatches.is_empty(), "{quick:?}");
+            assert_eq!(quick.files_checked, 2);
+        }
+
+        /// A tape written before 1.6.0 (its seal states no `ended_after`
+        /// and requires nothing, rule S3) still confirms under a full plan:
+        /// no `ended_after_disagrees`.
+        #[test]
+        fn a_1_5_0_seal_under_a_full_plan_still_passes() {
+            let p = planned();
+            let seal = seal_1_5_0(&p.seal(M - 1));
+            let mut store = p.written(MemStore::new(SBS), M - 1, &seal);
+            for tier in [Tier::Integrity, Tier::Navigable] {
+                let evidence = store.confirm(&p.layout, tier).unwrap();
+                assert!(evidence.mismatches.is_empty(), "{tier:?}: {evidence:?}");
+            }
+        }
+
+        /// The hazard (ADR-0012 item 114): st reported a block refused that
+        /// the drive kept, so entry K holds a block twice. The readback past
+        /// the warning hashes entry K under the navigable tier too, and the
+        /// mismatch proves the medium bad; so does the integrity tier. The
+        /// positive control: a navigable confirm with no readback reads no
+        /// content file and passes the same tape.
+        #[test]
+        fn the_readback_catches_a_refused_block_that_was_written_under_every_tier() {
+            let p = planned();
+            let store = p.hazard_in(K);
+            let mut store = p.written(store, K, &p.seal(K));
+            assert!(
+                store.early_warning().is_some(),
+                "the store saw the warning in file {K}"
+            );
+            assert!(
+                store.files[K as usize].len() > 3 * SBS,
+                "file {K} holds a refused block that landed, written again"
+            );
+            for tier in [Tier::Navigable, Tier::Integrity] {
+                let plan = short(tier).reading_back(Some(K));
+                let evidence = store.confirm_with(&p.layout, plan).unwrap();
+                assert_eq!(
+                    kinds(&evidence),
+                    [(K, MismatchKind::ContentHashMismatch)],
+                    "{tier:?}"
+                );
+                assert!(evidence.proves_medium_bad(), "{tier:?}");
+            }
+            let control = store
+                .confirm_with(&p.layout, short(Tier::Navigable))
+                .unwrap();
+            assert!(
+                control.mismatches.is_empty(),
+                "positive control: without the readback the quick tier reads no content \
+                 file: {control:?}"
+            );
+        }
+
+        /// The warning in the last slice (K = M-1): the seal is full, and
+        /// the readback still reads that slice back (item 114: "whether the
+        /// tape then sealed short or … full").
+        #[test]
+        fn the_readback_after_a_warning_in_the_last_slice_reads_that_slice() {
+            let p = planned();
+            let store = p.hazard_in(M - 1);
+            let mut store = p.written(store, M - 1, &p.seal(M - 1));
+            let plan = ConfirmPlan::new(Tier::Navigable).reading_back(Some(M - 1));
+            let evidence = store.confirm_with(&p.layout, plan).unwrap();
+            assert_eq!(
+                kinds(&evidence),
+                [(M - 1, MismatchKind::ContentHashMismatch)]
+            );
+            let control = store.confirm(&p.layout, Tier::Navigable).unwrap();
+            assert!(control.mismatches.is_empty(), "{control:?}");
+        }
+
+        /// A clean readback passes, and is the one content file the
+        /// navigable tier reads. On tape it costs no motion beyond the
+        /// quick confirm's own: the open's rewind, a space to File 3, a
+        /// space on to K, then K and the seal after it with no space
+        /// between them — one rewind and two forward spaces
+        /// (`layout-session.md` counts three; the cursor needs only two).
+        #[test]
+        fn a_clean_readback_passes_and_costs_one_rewind_and_two_spaces_on_tape() {
+            use crate::tape::fake::{FakeTape, Op};
+
+            let p = planned();
+            let mem = p.tape(K);
+            let plan = short(Tier::Navigable).reading_back(Some(K));
+
+            let mut recording = Recording {
+                inner: p.tape(K),
+                reads: Vec::new(),
+            };
+            let evidence = recording.confirm_with(&p.layout, plan).unwrap();
+            assert!(evidence.mismatches.is_empty(), "{evidence:?}");
+            assert_eq!(evidence.files_checked, 3, "File 3, entry K, the seal");
+            assert_eq!(recording.reads, [3, K, K + 1]);
+
+            for order in [ReadOrder::SealFirst, ReadOrder::SealLast] {
+                let fake = FakeTape::with_files(mem.files.clone(), SBS);
+                let mut store = TapeStore::from_ops(fake.boxed(), u64::MAX).unwrap();
+                let evidence = store
+                    .confirm_with(&p.layout, plan.with_order(order))
+                    .unwrap();
+                assert!(evidence.mismatches.is_empty(), "{order:?}: {evidence:?}");
+                assert_eq!(
+                    fake.ops(),
+                    vec![
+                        Op::Rewind,
+                        Op::Space(3),
+                        Op::Read(3),
+                        Op::Space(K - 4),
+                        Op::Read(K),
+                        Op::Read(K + 1),
+                    ],
+                    "{order:?}"
+                );
+                assert_eq!(fake.rewinds(), 1);
+                assert_eq!(fake.spaces(), 2);
+            }
+        }
+
+        /// An interrupted full readback's checkpoints never stand in for
+        /// the readback past the warning: entry K is read again, and the
+        /// hazard is found. The positive control: without the readback, the
+        /// same checkpoints skip K and the walk passes.
+        #[test]
+        fn a_checkpoint_never_stands_in_for_the_readback() {
+            let p = planned();
+            let store = p.hazard_in(K);
+            let mut store = p.written(store, K, &p.seal(K));
+            let checkpoints = Checkpoints {
+                front_index_sha256: p.fi_hash.clone(),
+                passed: p
+                    .seal_files
+                    .iter()
+                    .filter(|f| f.position != 3 && f.position as u32 <= K)
+                    .map(|f| (f.position as u32, f.sha256_encrypted.clone().unwrap()))
+                    .collect(),
+            };
+            let resumed = short(Tier::Integrity).resuming(Some(&checkpoints));
+            let evidence = store
+                .confirm_with(&p.layout, resumed.reading_back(Some(K)))
+                .unwrap();
+            assert_eq!(kinds(&evidence), [(K, MismatchKind::ContentHashMismatch)]);
+            let control = store.confirm_with(&p.layout, resumed).unwrap();
+            assert!(
+                control.mismatches.is_empty(),
+                "positive control: the checkpoint skips K when nothing is owed: {control:?}"
+            );
+        }
+
+        /// `ended_after_disagrees`, both directions, inconclusive: a seal at
+        /// the position the plan reads that states another `ended_after` —
+        /// a short seal stating K-1 at K+1, a full seal (M-1) at K+1, and a
+        /// short seal stating K at M under a full plan.
+        #[test]
+        fn a_seal_stating_another_ended_after_disagrees_and_is_inconclusive() {
+            let p = planned();
+            let cases: [(Option<u32>, u32, Vec<u8>, u32, u32); 3] = [
+                (Some(K), K, p.seal(K - 1), K + 1, K - 1),
+                (Some(K), K, p.seal(M - 1), K + 1, M - 1),
+                (None, M - 1, p.seal(K), M, K),
+            ];
+            for (ending, last, seal, at, states) in cases {
+                let mut store = p.written(MemStore::new(SBS), last, &seal);
+                for tier in [Tier::Integrity, Tier::Navigable] {
+                    let plan = ConfirmPlan::new(tier).with_ending(ending);
+                    let evidence = store.confirm_with(&p.layout, plan).unwrap();
+                    assert_eq!(
+                        kinds(&evidence),
+                        [(at, MismatchKind::EndedAfterDisagrees)],
+                        "{plan:?}"
+                    );
+                    let m = &evidence.mismatches[0];
+                    let expected = ending.unwrap_or(M - 1);
+                    assert_eq!(
+                        m.expected,
+                        format!("ended_after = {expected}, where the catalog says the tape ended")
+                    );
+                    assert_eq!(m.actual, format!("ended_after = {states}"));
+                    assert!(!evidence.proves_medium_bad(), "{plan:?}");
+                }
+            }
+        }
+
+        /// What the walk ships when the seal disagrees: it does not withdraw
+        /// what it read under the plan's ending. A seal at K+1 stating K-1
+        /// leaves entry K read and hashed against File 3 (the plan said it
+        /// is on the tape), so a wrong entry K still proves the medium bad
+        /// beside the disagreement. Pinned so a change to that rule is a
+        /// deliberate one (the coordinator's question, #420 worker J).
+        #[test]
+        fn a_disagreeing_seal_does_not_withdraw_what_the_plan_read() {
+            let p = planned();
+            let mut store = p.written(MemStore::new(SBS), K, &p.seal(K - 1));
+            store.files[K as usize][10] ^= 0xFF;
+            let evidence = store
+                .confirm_with(&p.layout, short(Tier::Integrity))
+                .unwrap();
+            assert_eq!(
+                kinds(&evidence),
+                [
+                    (K + 1, MismatchKind::EndedAfterDisagrees),
+                    (K, MismatchKind::ContentHashMismatch),
+                ]
+            );
+            assert!(evidence.proves_medium_bad());
+        }
+
+        /// The catalog and the tape ending in different places is, by the
+        /// spec's reads, no seal where the catalog looks (§1.2 rule 6: a
+        /// catalog reader reads the seal at `ended_after + 1` directly): a
+        /// short plan over a tape that sealed full finds a data slice at
+        /// K+1, and a full plan over a tape that sealed short finds nothing
+        /// at M. Both are `seal_unreadable`, inconclusive.
+        #[test]
+        fn a_plan_and_a_tape_that_ended_elsewhere_find_no_seal_where_the_plan_looks() {
+            let p = planned();
+            let mut sealed_full = p.tape(M - 1);
+            let evidence = sealed_full
+                .confirm_with(&p.layout, short(Tier::Integrity))
+                .unwrap();
+            assert_eq!(kinds(&evidence), [(K + 1, MismatchKind::SealUnreadable)]);
+            assert!(!evidence.proves_medium_bad());
+
+            let mut sealed_short = p.tape(K);
+            let evidence = sealed_short.confirm(&p.layout, Tier::Integrity).unwrap();
+            assert_eq!(kinds(&evidence), [(M, MismatchKind::SealUnreadable)]);
+            assert!(!evidence.proves_medium_bad());
+        }
+
+        /// §1.2 rule 6: before the planned position, only a seal that
+        /// itself requires `short-seal` is a seal. One that states
+        /// `ended_after` but requires nothing, and one in the grammar before
+        /// 1.6.0 (which reads as a full seal ending after `file_count - 2`,
+        /// rule S3, here K), are no seal at K+1.
+        #[test]
+        fn a_seal_before_the_planned_position_must_require_short_seal() {
+            let p = planned();
+            let stating = String::from_utf8(p.seal(K))
+                .unwrap()
+                .replace("requires = [\"short-seal\"]", "requires = []")
+                .into_bytes();
+            for seal in [stating, seal_1_5_0(&p.seal(K))] {
+                assert!(
+                    format::parse_seal_marker(&String::from_utf8_lossy(&seal)).is_ok(),
+                    "the seal parses: rule 6, not S1-S6, refuses it"
+                );
+                let mut store = p.written(MemStore::new(SBS), K, &seal);
+                for tier in [Tier::Integrity, Tier::Navigable] {
+                    let evidence = store.confirm_with(&p.layout, short(tier)).unwrap();
+                    assert_eq!(
+                        kinds(&evidence),
+                        [(K + 1, MismatchKind::SealUnreadable)],
+                        "{tier:?}"
+                    );
+                    assert!(
+                        evidence.mismatches[0].actual.contains("rule 6"),
+                        "{evidence:?}"
+                    );
+                }
+            }
+        }
+
+        /// The seal a resume's contact already read (#403) stands for the
+        /// file at K+1 on a short tape, where the walk reads it.
+        #[test]
+        fn the_seal_a_contact_already_read_is_the_one_at_k_plus_one() {
+            let p = planned();
+            let seal = p.seal(K);
+            let mut store = p.tape(K);
+            store.files[K as usize + 1] = vec![0xFF; SBS];
+            let without = store
+                .confirm_with(&p.layout, short(Tier::Navigable))
+                .unwrap();
+            assert_eq!(kinds(&without), [(K + 1, MismatchKind::SealUnreadable)]);
+            let with = store
+                .confirm_with(&p.layout, short(Tier::Navigable).with_seal(Some(&seal)))
+                .unwrap();
+            assert!(with.mismatches.is_empty(), "{with:?}");
+        }
+
+        /// An ending or a readback the Layout cannot have is the caller's
+        /// bug, as a Layout with no seal marker is: an `Err`, never a
+        /// finding about the tape.
+        #[test]
+        fn an_ending_the_layout_cannot_have_is_an_error() {
+            let p = planned();
+            let mut store = p.tape(K);
+            for plan in [
+                ConfirmPlan::new(Tier::Navigable).with_ending(Some(M)),
+                ConfirmPlan::new(Tier::Navigable).with_ending(Some(3)),
+                short(Tier::Navigable).reading_back(Some(K + 1)),
+                short(Tier::Navigable).reading_back(Some(3)),
+            ] {
+                assert!(store.confirm_with(&p.layout, plan).is_err(), "{plan:?}");
+            }
+            // M-1 is a full seal's ending, stated: the same walk as `None`.
+            let stated = ConfirmPlan::new(Tier::Navigable).with_ending(Some(M - 1));
+            let mut full = p.tape(M - 1);
+            assert!(full
+                .confirm_with(&p.layout, stated)
+                .unwrap()
+                .mismatches
+                .is_empty());
+        }
     }
 }
