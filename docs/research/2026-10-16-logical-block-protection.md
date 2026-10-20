@@ -272,7 +272,7 @@ Data Integrity Validation (via Logical Block Protection) - IBM LTO6, LTO7 & LTO8
 LBP can make the full readback cheaper to defer. It cannot make it optional while the
 readback is the only thing that proves the cartridge reads. The design review said the same.
 
-## 8. Prototype plan for the real drive (Q7) -- NOT RUN
+## 8. Prototype plan for the real drive (Q7) -- dry-run on mhvtl, not yet on the drive
 
 Test cartridge `EW7VWMVKF6` only; resolve nodes by serial (`HUJ808A5L4`) via
 `/dev/tape/by-id/`, never by number. This is the shape of the plan, to be checked against the
@@ -337,6 +337,51 @@ Whether `--contents` starts `0a` or `4a`, and how `--mask` treats the page lengt
 6. Does `setblk 524292` plus a 524292-byte `write()` work at all, on vm-desk1 **and on home2's
    `mpt3sas`** (§3.2)? Does direct I/O survive? Throughput and host CPU for 2 GiB, on and off.
 7. A **mhvtl TD6** dry run of steps 3-6 first, compared with the drive.
+
+### 8.1 The prototype as a script, and its mhvtl dry run (2026-10-20)
+
+The plan above is now a script, `docs/research/lbp-prototype/lbp-prototype.sh`, with its host tool,
+`lbp.py`. The tool's Reed-Solomon CRC uses the table from mhvtl's `usr/utils/reed-solomon.c` (IBM
+Annex D, seed 0, appended big-endian), and its `selftest` reproduces the two answers mhvtl's
+`usr/utils/validate_crc.c` asserts: `0x733D4DCA`, then `0x754ED37E` chained. How the script works:
+- It never hardcodes the page. It reads the drive's own Control Data Protection page, changes only
+  bytes 4-6, clears the PS bit, and writes the page back. This settles the `0a`/`4a` question
+  above: the HP LTO-6 reports `4a f0 00 04 …` (length 04h, SPF set), mhvtl `0a f0 00 1c …`.
+- It refuses unless the chip's medium serial is the one named, the drive-poll timer is stopped,
+  and the harness tape lock is free.
+- On every exit it restores method 0, LBP off, the 512 KiB block size and a rewind.
+- `--block N` sets the data bytes per block (default 524288).
+
+**The HP LTO-6, read only** (from the #420 profile run on home2, 2026-10-20, firmware 35GD):
+`sg_modes --page=0x0a,0xf0` answers with method 00h, info length 00h, flags 00h. The page exists
+and protection is off.
+
+**The mhvtl TD6 dry run (vm-desk1, drive A4):**
+- **At 524292 bytes per block nothing moves.** Every write and read fails at once with EBUSY, which
+  st returns when "the request was too large". mhvtl's adapter reports `sg_tablesize` 128, and
+  128 pages of 4 KiB is exactly 512 KiB.
+- **home2's path is different.** Its LSI SAS2008 (the `mpt3sas` module, which names SAS2 hosts
+  `mpt2sas`; firmware 20.00.07.00, `sg_tablesize` also 128)
+  accepted 1 MiB blocks in the same profile run, so 524292 is expected to pass there. The real
+  drive's run answers measurement 6.
+- **At 262144 + 4 bytes per block, all of it worked on mhvtl:**
+  - Method 01h with LBP_W and LBP_R armed. mhvtl also accepted method 02h on a TD6, so whether an
+    LTO-6 refuses CRC32C (measurement 1) is the real drive's to answer.
+  - The 8 protected blocks were written, and the 9th, with one CRC bit flipped, was refused with
+    EIO ("8+0 records out"): measurement 3, emulated.
+  - With LBP off, plain `dd` read the 8 blocks back byte-identical. In variable mode one record
+    read as 262144 bytes, so the CRC is not part of the medium's logical block: measurement 4 and
+    the heir's view, emulated.
+  - With LBP_R on, the drive returned a CRC with every block, and each matched the host's:
+    measurement 2, emulated.
+  - With LBP off and the block size still N+4, a read returned 0 bytes and no error. That is st's
+    fixed-mode length mismatch: a reader that forgets to reset the block size gets nothing, not
+    wrong data.
+  - The armed page survived closing and reopening the device. It is volatile only across a reset
+    or a reload, as §3.4 says.
+
+**Next:** the same script on home2's HP drive, on EW7VWMVKF6, once the #420 fill has finished.
+Run it first at 524288 (measurement 6), then at 262144 if 524292 is refused.
 
 ## 9. Open questions for the CTO
 
