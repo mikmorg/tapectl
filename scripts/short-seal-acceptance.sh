@@ -145,8 +145,9 @@ case "$CAPACITY" in ''|*[!0-9]*) die "--capacity must be a plain decimal byte co
 [ -z "$HOOK_AT" ] || [ "$MHVTL" = 1 ] || die "--hook-at is the rehearsal's test hook: it needs --mhvtl"
 
 print_plan() {
-    local cap_tb
+    local cap_tb ceil_tb
     cap_tb="$(awk -v b="$CAPACITY" 'BEGIN { printf "%.3f", b / 1e12 }')"
+    ceil_tb="$(awk -v b="$CAPACITY" 'BEGIN { printf "%.3f", b * 0.97 / 1e12 }')"
     cat <<PLAN
 === The 1.6.0 short-seal acceptance run (ADR-0012 items 110, 114, 115, 117) ===
 
@@ -166,8 +167,9 @@ reads at the 140 MiB/s production verify ran at, RECORD #326):
   1 setup        no tape. A throwaway home and config (post_warning_bytes = $POST_WARNING,
                  min_copies = 1), the cartridge registered at $cap_tb TB, four units staged
                  (~3 GiB through dar and age, about 5 min), the filler's rows.        ~10 min
-  2 volume init  $LABEL1.                                                              ~2 min
-  3 volume write the plan reaches past the 2.47 TB fill ceiling to ~$cap_tb TB; the drive's
+  2 volume init  whatever the cartridge holds erased by this home's cartridge erase, then
+                 $LABEL1 initialised without --force.                                 ~5 min
+  3 volume write the plan reaches past the $ceil_tb TB fill ceiling to ~$cap_tb TB; the drive's
                  warning comes near 2.502 TB, inside the filler: a short seal, exit 0, the
                  filler and $UNIT_Z cut, and item 114's readback of the slice
                  past the warning and the seal.                                    ~4.5-5 h
@@ -177,9 +179,9 @@ reads at the 140 MiB/s production verify ran at, RECORD #326):
                  diffed against its source; the cut unit refused by RESTORE.sh.     ~15 min
   6 rebuild      catalog rebuild --from-volume into a second home, compared row by row.
                                                                                    ~15 min
-  7 rewrite      the filler released, $LABEL1 retired, cartridge erase (short), $LABEL2
-                 initialised without --force, the cut unit written whole onto it,
-                 verified and restored.                                            ~20 min
+  7 rewrite      the whole units and the filler released, $LABEL1 retired, cartridge
+                 erase (short), $LABEL2 initialised without --force, the cut unit
+                 written whole onto it, verified and restored.                     ~20 min
   In all about 14-16 hours of drive time; step 4's two whole-tape reads are most of it.
 
 THE COMMAND (operator's login on home2):
@@ -189,8 +191,8 @@ THE COMMAND (operator's login on home2):
       --i-will-lose-the-cartridge EW7VWMVKF6
 
 Afterwards the cartridge holds $LABEL2 (the cut unit only) and belongs to the throwaway home:
-erase it from that home (cartridge erase --confirm-label $LABEL2) before it is a test cartridge
-again, and start the drive-poll timer.
+retire $LABEL2 and run cartridge erase from that home before it is a test cartridge again, and
+start the drive-poll timer.
 PLAN
 }
 

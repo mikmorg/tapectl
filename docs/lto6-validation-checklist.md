@@ -241,7 +241,7 @@ It refuses (exit 2, nothing touched) when any of these fails:
 | step | must show | time |
 |---|---|---|
 | 1 setup | no tape. The home, the config (`post_warning_bytes = "99008M"`, item 118's figure; `min_copies = 1`), four units staged, the filler's rows | ~10 min |
-| 2 `volume init SSA-0001` | the medium line's capacity is the registered 2.55 TB | ~2 min |
+| 2 erase, `volume init SSA-0001` | whatever the cartridge held is erased by this home's `cartridge erase` (File 0's label confirmed), so init needs no `--force`; the medium line's capacity is the registered 2.55 TB | ~5 min |
 | 3 `volume write` | exit 0, `"ending": "short"`, `ended_after` K, cut `ssa-m-filler` and `ssa-z-tail`; the volume `sealed` with `ended_after` K; `completed` and `cut` rows; the `write_early_warning` event; every stage set still staged | ~4.5-5 h |
 | 4 verify | `volume verify --full` exit 0; RESTORE.sh `--info` "Verdict: SEALED" and "ended early, after file K"; `--verify` "VERIFY: PASS" with the planned files after K marked NOT ON TAPE | ~9-10 h |
 | 5 restore | `ssa-b-photos` (two slices) by `restore unit` and by RESTORE.sh, each identical to its source; the cut unit refused by both | ~15 min |
