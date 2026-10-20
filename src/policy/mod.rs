@@ -381,8 +381,11 @@ pub fn resolve(conn: &Connection, config: &Config, unit: &Unit) -> Result<Resolv
 /// dotfile and fail a readback on a bad one. A unit with no archive set, or
 /// one whose set carries no interval, takes the default, so a home whose
 /// interval lives only in `[defaults]` bounds a continued readback as `audit`
-/// judges overdue. Every `writes` row counts, whatever its status: a write's
-/// own confirm runs while its rows are still `in_progress`.
+/// judges overdue. Every `writes` row counts, whatever its status (a write's
+/// own confirm runs while its rows are still `in_progress`), except a `cut`
+/// one (#420): the early end of the tape cut that unit, so the volume holds
+/// no copy of it and answers to none of its policy. A sealed volume holding
+/// only cut writes has no interval.
 pub fn volume_verify_interval_days(
     conn: &Connection,
     volume_id: i64,
@@ -394,7 +397,7 @@ pub fn volume_verify_interval_days(
            JOIN snapshots s ON s.id = w.snapshot_id
            JOIN units u ON u.id = s.unit_id
            LEFT JOIN archive_sets a ON a.id = u.archive_set_id
-          WHERE w.volume_id = ?1",
+          WHERE w.volume_id = ?1 AND w.status <> 'cut'",
         params![volume_id, default_days],
         |r| r.get(0),
     )?)
@@ -901,5 +904,47 @@ slice_size = "500M"
              failure",
         );
         assert!(err.to_string().contains("checksum_mode"), "got: {err}");
+    }
+
+    /// #420: a volume's verify interval is the strictest of the units it
+    /// holds a copy of; a unit the early end of its tape cut is not one of
+    /// them, and a volume holding only cut writes has no interval.
+    #[test]
+    fn a_cut_write_gives_its_volume_no_verify_interval() {
+        use crate::volume::restore::short_tape;
+        let t = short_tape::short_tape();
+        // bravo (cut) asks for a far tighter interval than the default.
+        t.conn
+            .execute(
+                "INSERT INTO archive_sets (name, verify_interval_days) VALUES ('tight', 7)",
+                [],
+            )
+            .unwrap();
+        t.conn
+            .execute(
+                "UPDATE units SET archive_set_id = last_insert_rowid() WHERE name = 'bravo'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            volume_verify_interval_days(&t.conn, t.volume_id, Some(365)).unwrap(),
+            Some(365),
+            "alpha's, the unit the tape holds whole"
+        );
+        // The positive control: were bravo's write a copy, its 7 days would
+        // bind the volume.
+        t.conn
+            .execute("UPDATE writes SET status = 'completed'", [])
+            .unwrap();
+        assert_eq!(
+            volume_verify_interval_days(&t.conn, t.volume_id, Some(365)).unwrap(),
+            Some(7)
+        );
+
+        let cut_only = short_tape::cut_only_tape();
+        assert_eq!(
+            volume_verify_interval_days(&cut_only.conn, cut_only.volume_id, Some(365)).unwrap(),
+            None
+        );
     }
 }
