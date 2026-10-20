@@ -691,6 +691,21 @@ hash or the drive. Read them together:
 - `tape waited` high and `queue full` near zero: reading the staged file set
   the pace — the staging disk is the limit.
 
+For a closer look than one line per file, set `TAPECTL_PIPELINE_TRACE=1` for
+the command. The write then also writes `<session>.pipeline.tsv` beside its
+session log: one tab-separated row every 250 ms, under a header naming each
+column. A row holds the bytes written, the queue split into read-but-unhashed
+and hashed-but-unwritten, the drive's time per block, the waits on either side
+of the queue, and each pipeline thread's CPU time, run delay and CPU. It also
+holds the host's CPU shares and run delay, the staging disks' busy share and
+latency, the load average and the process's swap. The column list and what
+each means is `tapectl::pipeline_trace::COLUMNS` (and
+`docs/research/2026-10-20-write-shaping.md` §9). Watching changes nothing the
+write does; it is off unless asked for, and a trace that cannot start says so
+once in the session log and the write goes on. Until the write session names
+each staged file to it, the trace's `file` column numbers the files (`#1`,
+`#2`, ...) and its disk columns are empty.
+
 The durations are kept in the catalog too. `volume info` ends with the phase
 timings of the last session recorded against the volume (write, resume,
 verify, read or restore):
