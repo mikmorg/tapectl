@@ -1954,4 +1954,47 @@ lands, as 1.7.0):
      changes `copy_count_expr`, `location_count_expr` and `eligible_writes`, and the
      catalog_budget pins move on purpose. Audit's verify age is the oldest of each range's newest
      readback. The retire floor (`versions_at_stake`) sees only `current` versions, so this does
-     not protect a version still being spanned; round 2's Q9 rules that.
+     not protect a version still being spanned; item 128 rules that.
+
+Ruled 2026-10-21, on #478's design questions, round 2:
+
+128. **A spanning version becomes `current` once every slice is on a sealed volume, and the retire
+     floor protects it before then.** `versions_at_stake` widens: a version with a `range` row on
+     an eligible volume is at stake when that volume is the only holder of any of its slices
+     (`sole_slices`, widened to match). Audit names a span still in progress and the slices it is
+     missing. Considered and not chosen: promoting at the first range's seal (the unit would read
+     0 copies for the whole span), and promoting as here but releasing nothing until the set is
+     complete (staging would hold the unit for the whole span).
+129. **Staging is released slice by slice**, recorded as `stage_slices.released_at` (migration
+     039). The #402 checks accept a missing slice file only when that mark is set, and the release
+     gate's refusal names the slices still short of copies (a new `ReleaseBlocker` variant). This
+     is safe only with item 128: without it, at a copy target of 1, slices 1..K are released after
+     tape 1, the version is not yet current, retiring tape 1 meets no floor, and 1..K are gone
+     everywhere. Considered and not chosen: releasing the whole set once its least-covered slice
+     meets the floor (against item 85).
+130. **`catalog rebuild --from-volume` of one tape of a span records what that tape shows.** All N
+     slice rows come from the MANIFEST (item 125), with positions only for this tape's slices, and
+     the row is `range` when the block says `may_span`. The version reads 0 copies until its other
+     tapes are rebuilt. The to-do list names the missing slices, and their tape when a newer
+     index says which. Adoption (#360) accepts a range row. Considered and not chosen: rebuilding
+     only the whole units, and refusing unless every tape of the span is given (ADR-0001: a
+     rebuild records what the tape proves).
+131. **tapectl's restore crosses cartridges by streaming.** It chooses the fewest cartridges in
+     slice order, a live whole copy first, asks for each by label, sticker and serial (the
+     existing `supply` machinery and `holders_of`), and streams across the swaps. `--from` must
+     name a cartridge holding slice 1. A version with any slice on no live volume is refused before
+     the first cartridge is asked for. `--spool` copies to scratch space first instead.
+132. **RESTORE.sh's default reads each tape's range into `--scratch` as ciphertext**, checking every
+     slice against that tape's front index, and accepts the next cartridge only when its front
+     index lists the next slice and its seal covers that position (§4.2 R5). It then decrypts into
+     one dar run, so only ciphertext sits at rest. `--stream-tapes` instead feeds one dar run
+     through pipes across the swaps. Whether dar waits on a pipe across a cartridge change is
+     unverified, and the mhvtl leg settles it. Considered and not chosen: decrypted dar slices in
+     scratch, and choosing the stream automatically when scratch is short (against item 88's
+     "heir's choice").
+133. **`volume rewrite` refuses a volume holding a range in 1.7.0**, naming the range. Carrying a
+     range forward is its own design and nothing needs it yet.
+134. **Item 93's "one location" is met after the plan, not in it.** The planner works from per-slice
+     shortfalls without knowing the destination. The write tells the operator which tapes make up
+     each whole copy ("keep these together"), and audit's per-slice location count checks it.
+     Considered and not chosen: the destination as a plan input.
