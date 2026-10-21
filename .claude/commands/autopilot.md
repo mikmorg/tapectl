@@ -43,6 +43,18 @@ the normative design set named in the Policy block below.
 
   Waiting on the operator: sdd's long self-test result (`home2:~/sdd.long`, due after 22:00 CST
   2026-10-20) and the drive-poll timer restart.
+
+  **Chain GREEN on c9c5877 (2026-10-21); the operator was notified to set up the acceptance run.**
+  Binaries on home2: `~/tapectl-1.6.0-c9c5877/` (tapectl 725c177e…, examples/short_seal_filler
+  b5d47685…). **Built after it, stacked on c9c5877, to land on master AFTER the v1.6.0 tag** (the
+  tag goes on the commit the acceptance proves; these are the next patch):
+  - `p489-flaky-search` 81216cc: #489, both random age-length searches bounded by
+    `staging::encrypt_data_with_header_len` (cfg(test)); 50/50 runs.
+  - `p490-short-ending` a34fde8 (on top of 81216cc): #490, `volume info` names a short ending
+    and the cut units; `restore raw-volume` follows R2 on an unsealed tape. It touches
+    `src/volume/raw.rs`, a restore path, so the mhvtl gate runs before it lands.
+  Close #489 and #490 when they land. /scratch filled on 2026-10-21 (ENOSPC mid-clippy): 22 old
+  `/scratch/tapectl-lifecycle/run-*` dirs were deleted; prune them after each lifecycle run.
 - **QUEUE STATE 2026-10-20 later — the real-drive runs on home2, v1.5.0 installed.**
   Rehearsal GREEN 53/53, #444's verified-erase proof holds (chip proof waits for a never-written
   cartridge), #420's profile done, #388's prototype done
