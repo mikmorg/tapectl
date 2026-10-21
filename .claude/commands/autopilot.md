@@ -58,8 +58,9 @@ the normative design set named in the Policy block below.
 
   **#478 spanning: the design is COMPLETE (2026-10-21).** The CTO ratified all three rounds of
   the design questions as recommended: ADR-0012 items 121-137 (master 658f7de, 1d59a82, 73de4af),
-  read with items 76-100. The draft with its citations is scratchpad `p478/questions.md` and is on
-  #478. Item 135 pre-authorizes 1.7.0's re-pin for the moves it names. **Build after v1.6.0 is
+  read with items 76-100, and the build plan's six forks, items 138-143 (c68a054). The draft is
+  scratchpad `p478/questions.md`; the BUILD PLAN is scratchpad `p478/plan.md` (six waves, the
+  item-121 site sort in §4, the forks and their resolutions in §7-§8). Item 135 pre-authorizes 1.7.0's re-pin for the moves it names. **Build after v1.6.0 is
   tagged and merged**, as 1.7.0, stacked on master after p489/p490: write a wave plan first
   (file-disjoint waves; `write_reaches_tape` and migration 039 come first, since items 121, 127,
   128 and 129 all rest on them), then the gate leg (item 136), then the real-drive proof (item 137,
