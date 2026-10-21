@@ -9,7 +9,7 @@ a person, and which does not?** What changed in 1.1.0 is in
 
 ## The state, in one paragraph
 
-home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgrades it to 1.5.0). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
+home2 ran 1.0.0 until the fresh start on 1.1.0 (2026-10-14/15, keepsake on L6-0001 and L6-0002; (f) upgraded it to 1.5.0 on 2026-10-20, and (g) takes it to 1.6.0 after the acceptance run). The 1.0.0 install wrote one production tape, L6-0001, holding the only tape
 copy of `keepsake` (sealed 2026-10-01). It also exposed the defects that 1.0.1–1.0.6 and
 1.1.0 fix. 1.1.0 is tagged `v1.1.0` (2026-10-13); (a) and (b) below are done. It changes on-tape bytes and
 adds migrations 027–035, so the CTO ruled that **production starts over instead of
@@ -41,6 +41,7 @@ of `133fd5f` passed on home2 (`docs/runs/2026-10-12-1.1.0-real-drive-proof.md`);
 | (d) | `keepsake` on two cartridges the same day, then the Heir Kit | **you** |
 | (e) | The backlog | agents, in the order below |
 | (f) | Upgrade home2 to 1.5.0, in place | **you**, once `v1.5.0` is tagged |
+| (g) | The 1.6.0 acceptance run on the test cartridge, then upgrade home2 to 1.6.0 | **you** (the cartridge, the drive, sudo), when the coordinator says the candidate is ready |
 
 ## (a) The 1.1.0 real-drive proof on home2
 
@@ -380,6 +381,65 @@ reboot can no longer break.
 
 Owed measurements: the next staging run's disk reads (#441: expect about one read of the
 source, was 1.7x) and a write's feed ratio with and without vm-desk1 busy (#432).
+
+## (g) The 1.6.0 acceptance run, then upgrade home2 to 1.6.0
+
+1.6.0 is the short seal (#420, ADR-0012 items 110-115, `docs/releases/1.6.0.md`). Every tape it
+writes states `requires = ["short-seal"]` in File 0 (item 111), so **a 1.5.0 tapectl or
+RESTORE.sh refuses a 1.6.0 tape by name**, and the Heir Kit's copy of tapectl must be 1.6.0 or
+later once one exists. 1.6.0 reads L6-0001 and L6-0002 as they are. One catalog migration
+applies at the first open: 038 (the write status `cut`, `volumes.ended_after`). There is no
+downgrade past it: the rollback is the 1.5.0 binary kept in step 3 plus `db import` of the backup
+from step 1, losing whatever the catalog recorded in between.
+
+**First, the acceptance run** (items 110, 115, 117), on the 1.6.0 candidate the coordinator names,
+before the tag. It must read the post-warning slice and the seal back before 1.6.0 ships; a
+failed readback stops #420 and does not re-scope it.
+- **What it does:** `scripts/short-seal-acceptance.sh`, in a throwaway home, on test cartridge
+  EW7VWMVKF6 only. It fills to the drive's early warning with a synthetic stage set (item 115),
+  then checks:
+  - the short seal;
+  - `volume verify --full` and RESTORE.sh `--verify`, both full reads of the tape (ruled
+    2026-10-21);
+  - a whole-unit restore;
+  - `catalog rebuild` into a second home;
+  - the cut unit written whole after `cartridge erase`.
+
+  The procedure is in `docs/lto6-validation-checklist.md`, "The short seal on the real drive".
+- **How long:** about 14-16 h of drive time, mostly the two full reads.
+- **What it refuses:** any drive but HUJ808A5L4, any cartridge but EW7VWMVKF6, any production
+  home, and a running drive-poll timer.
+- **Before it starts:** stop the drive-poll timer, keep vm-desk1 quiet (the coordinator tells
+  homorg and lcsas-4c), and start it inside tmux. `--print-plan` prints your part without
+  touching anything.
+- **#488's drive phase** (about 2 h, research build) is approved for the same day, in a separate
+  load (item 117).
+
+**Then, once `v1.6.0` is tagged,** on home2, inside tmux, with no tapectl command running
+(`tapectl-op status`):
+
+1. **Back up the catalog with 1.5.0:** `tapectl-op db backup --to
+   /srv/local_backup/tapectl/tapectl-pre-1.6.0.db`.
+2. **Check out the tag:** `git fetch --tags`, then `git checkout v1.6.0`.
+3. **Keep the old binary, then build and install:** `sudo cp -p /usr/local/bin/tapectl
+   /usr/local/bin/tapectl-1.5.0`, then `scripts/first-run.sh --profile
+   contrib/hosts/home2.profile --from 3 --to 3`. `tapectl --version` should read
+   `1.6.0 (v1.6.0, <date>)`.
+4. **The first open applies migration 038:** `tapectl-op config check`.
+5. **Let plans reach past the fill ceiling** (item 118). `NAME` is the `name` of the drive's
+   `[[backends.lto]]` table in the home's `config.toml`:
+   `tapectl-op config set 'backends.lto[NAME].post_warning_bytes' 99008M`, then
+   `tapectl-op config check`. The figure is the drive's guaranteed room past its
+   early warning, as `scripts/lto-profile.sh --emit` printed it on 2026-10-20. Without the key,
+   a plan stops at the fill ceiling as before.
+6. **Look:** `tapectl status`, `tapectl-op audit` (the new `short_seal` check is clean on
+   L6-0001 and L6-0002), `tapectl-op report events` (both writes' feed ratios now show
+   "repositions per 100 MB: 0", decoded from the journal).
+7. **Before the next write,** step 12's rehearsal proves the new binary on the drive, as in (f)
+   step 7. Stop the drive-poll timer for it.
+8. **Regenerate the Heir Kit** with the installed binary, as in (f) step 8. The kit's fourth file
+   becomes `tapectl-1.6.0`; reprint COVER.txt and put the new files on the media in each
+   envelope.
 
 ## (e) After: the backlog
 

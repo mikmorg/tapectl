@@ -279,6 +279,25 @@ copy of the running binary named on the cover sheet with its sha256 (`escrow_kit
 tests call `generate_with_program` with a small stand-in), and File 1's "tapectl itself" sends the
 heir there first.
 
+**2026-10-21: 1.6.0, the short seal** (`docs/releases/1.6.0.md`; ADR-0012 items 110-120, #420).
+A write that reaches the drive's early warning finishes the slice in flight, seals the tape short
+after it and exits 0: whole units count as copies, the units after the warning are `cut` (stay
+staged; the next `volume write` writes them whole elsewhere), and no unit is ever split. Every
+1.6.0 tape's File 0 states `requires = ["short-seal"]`, so a 1.5.0 reader refuses it by name
+(item 111). The seal is the last file at END OF DATA (`volume-format-v2.md` §1.2 rule 6, §4); the
+catalog records `volumes.ended_after` and `writes.status = 'cut'` (migration 038). Where things
+live: the retry past the warning in `tape::ioctl::write_block_retrying`; the session's short
+ending in `volume::session`; the chain walk's ending in `store::ConfirmPlan::with_ending`
+(`ended_after_disagrees` is inconclusive, never a quarantine); planning past the fill ceiling to
+100% of nominal only with `post_warning_bytes` (item 113, `CapacityBudget::split`); a warned write
+always reads back the slice at `ended_after` (item 114). The golden pins moved under item 116 and
+a third pins the short seal. The test hook `TAPECTL_TEST_EARLY_WARNING_AT` fakes st past a
+warning; the gate's `heir_short_*` legs run RESTORE.sh on a short tape. #488's first build rides
+it: ring's SHA-256 behind `pass_count::Sha256`, the HP page-0x34 repositions figure in
+`write_feed_ratio` events, `TAPECTL_PIPELINE_TRACE=1`, and the `research` cargo feature's knobs.
+The acceptance run on home2 (`scripts/short-seal-acceptance.sh`, item 117) proves the readback
+past the warning on the real drive before the tag.
+
 **Real LTO-6 hardware validation is DONE** (2026-09-10), no longer deferred: an HP
 LTO-6 was passed through to this VM (`docs/lto6-drive-passthrough.md`) and was used
 for a full validation session (`docs/lto6-session-journal-2026-09-10.md`). The §5
