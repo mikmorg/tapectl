@@ -953,7 +953,10 @@ tapectl, in 1.6.0:
   this tape. (`restore` and `volume rewrite` read only `completed` writes; `volume read-slices`
   keeps its 1.5.0 rule of any written position, minus `cut` ones.) `restore volume` names the
   cut units.
-- `restore raw-volume` reports the positions after `ended_after` as not on this tape.
+- `restore raw-volume` reports the positions after `ended_after` as not on this tape. On a
+  tape with no seal it accepts, END OF DATA proven by the drive at a planned position ends the
+  dump there (R2): that position and every later one are not on the tape (`--json`:
+  `end_of_data_at`). Any other read failure fails the dump.
 - `catalog rebuild` and the adoption of a lost write (`volume::adopt_lost`) locate the seal
   by §1.2 rule 6. They record `completed` only for a stage set wholly at or before
   `ended_after`, and `cut` for every other.

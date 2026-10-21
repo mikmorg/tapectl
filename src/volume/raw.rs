@@ -55,23 +55,36 @@ pub struct RawRestoreReport {
     pub ended_after: Option<u32>,
     /// The planned files after `ended_after` the selection named, as
     /// `(position, front-index type)`: not on this tape, so not read and not
-    /// dumped (R3). Not a failure.
+    /// dumped (R3). Not a failure. On a tape with no seal this tapectl
+    /// accepts, the planned files from [`Self::end_of_data_at`] on (R2).
     pub not_on_tape: Vec<(i32, String)>,
+    /// `Some(p)` when a tape that may end early has no seal this tapectl
+    /// accepts and the drive reported END OF DATA at planned file `p` (#490;
+    /// `volume-format-v2.md` §4.2 R2): the end of the tape, so `p` and every
+    /// later planned file are not on it.
+    pub end_of_data_at: Option<i32>,
 }
 
 /// What `restore raw-volume` says of a tape that ended early (#420): where,
 /// and each planned file it did not read, as RESTORE.sh's `--verify` says it
 /// (`NOT ON TAPE`, not a failure). Empty for any other tape.
 pub fn ending_lines(report: &RawRestoreReport) -> Vec<String> {
-    let Some(k) = report.ended_after else {
-        return Vec::new();
+    let first = match (report.ended_after, report.end_of_data_at) {
+        (Some(k), _) => format!(
+            "  the tape ended early: its seal marker, file {}, says it ended after file {k}; \
+             the {} planned file(s) after that are not on it (not a failure)",
+            k + 1,
+            report.not_on_tape.len()
+        ),
+        (None, Some(p)) => format!(
+            "  the tape has no seal marker this tapectl accepts, and the drive reported END OF \
+             DATA at file {p}: the tape ends there, and the {} planned file(s) from file {p} on \
+             are not on it (not a failure)",
+            report.not_on_tape.len()
+        ),
+        (None, None) => return Vec::new(),
     };
-    let mut lines = vec![format!(
-        "  the tape ended early: its seal marker, file {}, says it ended after file {k}; \
-         the {} planned file(s) after that are not on it (not a failure)",
-        k + 1,
-        report.not_on_tape.len()
-    )];
+    let mut lines = vec![first];
     lines.extend(
         report
             .not_on_tape
@@ -233,7 +246,7 @@ pub fn restore_raw_selected(
         &entries,
         selection,
     )?;
-    let (entries, not_on_tape) = match ending {
+    let (entries, mut not_on_tape) = match ending {
         None => (entries, Vec::new()),
         Some(k) => {
             let (on, off): (Vec<_>, Vec<_>) = entries
@@ -272,6 +285,13 @@ pub fn restore_raw_selected(
         .into_iter()
         .filter(|e| selection.selects(e))
         .collect();
+    // R2 (#490): with no seal it accepts, a tape that may end early ends at
+    // END OF DATA. Only the store's own END OF DATA says so; any other read
+    // failure is an unreadable file and fails the dump, as before.
+    let r2 = ending.is_none()
+        && format::parse_id_thunk_claims(&thunk_text)
+            .is_ok_and(|c| c.requires.iter().any(|f| f == format::SHORT_SEAL));
+    let mut end_of_data_at = None;
 
     fs::create_dir_all(dest)?;
 
@@ -281,27 +301,42 @@ pub fn restore_raw_selected(
     let mut mismatched_count = 0usize;
     let mut unverifiable_count = 0usize;
 
-    for entry in &entries {
+    for (i, entry) in entries.iter().enumerate() {
         let filename = format!("{:04}_{}.bin", entry.position, entry.type_label);
         let path = dest.join(&filename);
         let out = BufWriter::new(File::create(&path)?);
         let mut hashing = HashingWriter::new(out);
 
-        let bytes_written = if let Some(true_len) = entry.size_bytes {
+        let read = if let Some(true_len) = entry.size_bytes {
             // Content files carry a known true length; trim block padding as
             // bytes arrive, exactly like `stream_verify_slice_to_staging` /
             // `chain_walk` do for the write-session read paths.
             let mut bounded = TruncatingWriter::new(hashing, true_len);
-            store.read_file(entry.position as u32, &mut bounded)?;
+            let read = store.read_file(entry.position as u32, &mut bounded);
             hashing = bounded.into_inner();
-            hashing.bytes_written()
+            read
         } else {
             // The front index's own self-entry (and, on some layouts, the
             // seal marker's) carries no size_bytes — dump the raw on-tape
             // bytes verbatim, untrimmed.
-            store.read_file(entry.position as u32, &mut hashing)?;
-            hashing.bytes_written()
+            store.read_file(entry.position as u32, &mut hashing)
         };
+        if let Err(e) = read {
+            if !(r2 && store.eod_at_or_before(entry.position as u32)?) {
+                return Err(e);
+            }
+            // Not on the tape: no dump of it, and nothing read after it.
+            drop(hashing);
+            fs::remove_file(&path)?;
+            end_of_data_at = Some(entry.position);
+            not_on_tape.extend(
+                entries[i..]
+                    .iter()
+                    .map(|e| (e.position, e.type_label.clone())),
+            );
+            break;
+        }
+        let bytes_written = hashing.bytes_written();
         hashing.flush()?;
         let actual_hash = hashing.finalize_hex();
 
@@ -347,6 +382,7 @@ pub fn restore_raw_selected(
         files,
         ended_after: ending,
         not_on_tape,
+        end_of_data_at,
     })
 }
 
@@ -848,6 +884,83 @@ pub(crate) mod tests {
             assert_eq!(report.files_dumped, t.planned_seal as usize + 1);
             assert!(report.all_verified());
             assert!(ending_lines(&report).is_empty());
+        }
+
+        /// A store whose read of file `at` fails as a drive's read error does
+        /// (`TapeDevice::read_file_streaming`'s EIO), with no END OF DATA
+        /// evidence: the default `eod_at_or_before`.
+        struct FaultAt {
+            inner: MemStore,
+            at: u32,
+        }
+
+        impl Store for FaultAt {
+            fn capacity(&mut self) -> Result<crate::store::CapacityReport> {
+                self.inner.capacity()
+            }
+            fn execute(
+                &mut self,
+                src: &mut dyn std::io::Read,
+                len: u64,
+                sync: bool,
+            ) -> Result<u64> {
+                self.inner.execute(src, len, sync)
+            }
+            fn read_file(&mut self, position: u32, sink: &mut dyn Write) -> Result<u64> {
+                if position == self.at {
+                    return Err(TapectlError::TapeIo(
+                        "read: Input/output error (os error 5)".to_string(),
+                    ));
+                }
+                self.inner.read_file(position, sink)
+            }
+            fn reposition_for_resume(&mut self, file_index: u32) -> Result<()> {
+                self.inner.reposition_for_resume(file_index)
+            }
+        }
+
+        /// #490, §4.2 R2: a 1.6.0 tape whose write stopped after file K,
+        /// before any seal, ends at END OF DATA. The dump keeps files 0..=K
+        /// and names every planned file from K+1 on as not on the tape;
+        /// before this it failed at K+1.
+        #[test]
+        fn a_raw_dump_of_an_unsealed_tape_ends_at_end_of_data() {
+            let mut t = short_tape::short_tape();
+            let k = t.ended_after;
+            t.store.files.truncate(k as usize + 1);
+            let dest = TempDir::new().unwrap();
+            let report = restore_raw(&mut t.store, dest.path(), Some(LABEL)).unwrap();
+            assert_eq!(report.ended_after, None, "no seal to say where");
+            assert_eq!(report.end_of_data_at, Some(k as i32 + 1));
+            assert_eq!(report.files_dumped, k as usize + 1, "files 0..=K");
+            assert!(report.all_verified(), "{:?}", report.files);
+            assert_eq!(report.not_on_tape.first().unwrap().0, k as i32 + 1);
+            assert_eq!(report.not_on_tape.last().unwrap().0, t.planned_seal as i32);
+            assert_eq!(
+                std::fs::read_dir(dest.path()).unwrap().count(),
+                k as usize + 1,
+                "nothing dumped for the file END OF DATA came at"
+            );
+            let text = ending_lines(&report).join("\n");
+            assert!(
+                text.contains(&format!("END OF DATA at file {}", k + 1)),
+                "{text}"
+            );
+            assert!(text.contains("NOT ON TAPE"), "{text}");
+
+            // A read that fails without END OF DATA is an unreadable file,
+            // never the tape's end: the dump fails, as before.
+            let mut t = short_tape::short_tape();
+            t.store.files.truncate(k as usize + 1);
+            let mut faulty = FaultAt {
+                inner: t.store,
+                at: k,
+            };
+            let dest = TempDir::new().unwrap();
+            let err = restore_raw(&mut faulty, dest.path(), Some(LABEL))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Input/output error"), "{err}");
         }
     }
 }
