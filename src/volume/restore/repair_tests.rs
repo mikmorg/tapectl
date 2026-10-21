@@ -334,7 +334,11 @@ mod tests {
             let ciphers: Vec<Vec<u8>> = plains
                 .iter()
                 .map(|p| {
-                    crate::staging::encrypt_data(p, std::slice::from_ref(&self.public_key)).unwrap()
+                    crate::staging::encrypt_data_with_header_len(
+                        p,
+                        std::slice::from_ref(&self.public_key),
+                        crate::staging::ONE_RECIPIENT_HEADER_LEN,
+                    )
                 })
                 .collect();
             for (i, (plain, cipher)) in plains.iter().zip(&ciphers).enumerate() {
@@ -468,7 +472,8 @@ mod tests {
         /// header and nonce) of exactly the length the catalog recorded, with
         /// the block padding the original had. Every chunk of it authenticates
         /// under the tenant's identity; its ciphertext hash is not the
-        /// recorded one.
+        /// recorded one. The fixture gives every file one header length, so
+        /// equal plaintext lengths make equal files (#489).
         fn replace_slice(&mut self, label: &str, st: &Staging, slice: usize, plain: &[u8]) {
             assert_eq!(
                 plain.len(),
@@ -477,16 +482,12 @@ mod tests {
             );
             let position = self.first_position[&(label.to_string(), st.stage_set_id)] + slice - 1;
             let want = st.ciphers[slice - 1].len();
-            let mut tries = 0;
-            let mut cipher = loop {
-                tries += 1;
-                assert!(tries < 5000, "no age file of {want} bytes in {tries} tries");
-                let c = crate::staging::encrypt_data(plain, std::slice::from_ref(&self.public_key))
-                    .unwrap();
-                if c.len() == want {
-                    break c;
-                }
-            };
+            let mut cipher = crate::staging::encrypt_data_with_header_len(
+                plain,
+                std::slice::from_ref(&self.public_key),
+                crate::staging::ONE_RECIPIENT_HEADER_LEN,
+            );
+            assert_eq!(cipher.len(), want, "the recorded length");
             let stored = self.mems[label].files[position].len();
             cipher.resize(stored, 0);
             self.mems.get_mut(label).unwrap().files[position] = cipher;

@@ -320,6 +320,7 @@ impl<R: Read> ChunkReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::staging::ONE_RECIPIENT_HEADER_LEN;
     use chacha20poly1305::aead::Aead;
     use std::io::{Cursor, Seek, SeekFrom};
 
@@ -539,6 +540,11 @@ mod tests {
 
     fn enc(plain: &[u8], recipients: &[String]) -> Vec<u8> {
         crate::staging::encrypt_data(plain, recipients).unwrap()
+    }
+
+    /// `plain` encrypted to `public` with an age header of `header_len` bytes.
+    fn enc_header(plain: &[u8], public: &str, header_len: usize) -> Vec<u8> {
+        crate::staging::encrypt_data_with_header_len(plain, &[public.to_string()], header_len)
     }
 
     /// Every chunk of `cipher` read as a file of `len` bytes: the outcomes,
@@ -803,17 +809,10 @@ mod tests {
     fn a_substituted_file_authenticates_in_full_and_is_told_apart_by_its_header() {
         let (id, public) = keypair();
         let a_plain = pattern_seeded(3 * CHUNK + 123, 9);
-        let a = enc(&a_plain, std::slice::from_ref(&public));
+        let a = enc_header(&a_plain, &public, ONE_RECIPIENT_HEADER_LEN);
         let b_plain = pattern_seeded(3 * CHUNK + 123, 77);
-        let mut tries = 0;
-        let b = loop {
-            tries += 1;
-            let b = enc(&b_plain, std::slice::from_ref(&public));
-            if b.len() == a.len() {
-                break b;
-            }
-            assert!(tries < 5000, "no equal-length header in {tries} tries");
-        };
+        let b = enc_header(&b_plain, &public, ONE_RECIPIENT_HEADER_LEN);
+        assert_eq!(b.len(), a.len());
         let (v, got) = outcomes(&b, std::slice::from_ref(&id), a.len() as u64);
         assert!(v.iter().all(|n| *n == Next::Authentic), "{v:?}");
         assert_eq!(got, b_plain);
@@ -833,13 +832,11 @@ mod tests {
             header_of(&b),
             "two files to one recipient are told apart by their headers"
         );
-        // Unequal header length: all but the last chunk authenticate.
-        let c = loop {
-            let c = enc(&b_plain, std::slice::from_ref(&public));
-            if c.len() != a.len() {
-                break c;
-            }
-        };
+        // A header 4 bytes longer, read at `a`'s length: the last chunk comes
+        // up 4 bytes short and only it fails. (A file drawn at random could
+        // have a header so much longer that the last chunk ended inside its
+        // tag and the open itself refused, #489.)
+        let c = enc_header(&b_plain, &public, ONE_RECIPIENT_HEADER_LEN + 4);
         let mut padded = c.clone();
         padded.extend_from_slice(&[0u8; 4096]);
         let (v, _) = outcomes(&padded, std::slice::from_ref(&id), a.len() as u64);

@@ -2170,6 +2170,60 @@ pub fn encrypt_data(data: &[u8], pubkey_strings: &[String]) -> Result<Vec<u8>> {
     Ok(encrypted)
 }
 
+/// The age header [`encrypt_data_with_header_len`] gives a test file to one
+/// X25519 recipient when two files must be of one length: 168 bytes (the
+/// version line, the X25519 stanza and the MAC) and a 100-byte grease
+/// stanza. age 0.11 adds a grease stanza of random size to every header, 13
+/// to 190 bytes; each size from 41 to 148 is drawn about 0.7% of the time,
+/// the extremes as rarely as 6e-8 (#489).
+#[cfg(test)]
+pub(crate) const ONE_RECIPIENT_HEADER_LEN: usize = 268;
+
+/// `data` encrypted to `pubkey_strings` as [`encrypt_data`] does, with an age
+/// header of exactly `header_len` bytes, for a test that needs two files of
+/// one length or of a known difference. age writes its header and nonce when
+/// the output is wrapped, before any payload, so a try costs a header and
+/// never the payload. Near [`ONE_RECIPIENT_HEADER_LEN`] the bound misses with
+/// a probability below e^-70; a search for the length of a file encrypted at
+/// random could miss whenever that file drew a rare grease size (#489).
+#[cfg(test)]
+pub(crate) fn encrypt_data_with_header_len(
+    data: &[u8],
+    pubkey_strings: &[String],
+    header_len: usize,
+) -> Vec<u8> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Shared(Rc<RefCell<Vec<u8>>>);
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const TRIES: usize = 10_000;
+    for _ in 0..TRIES {
+        let out = Rc::new(RefCell::new(Vec::new()));
+        let mut writer = build_encryptor(pubkey_strings)
+            .unwrap()
+            .wrap_output(Shared(Rc::clone(&out)))
+            .unwrap();
+        // The header, then the payload's 16-byte nonce.
+        if out.borrow().len() != header_len + 16 {
+            continue;
+        }
+        writer.write_all(data).unwrap();
+        writer.finish().unwrap();
+        return out.take();
+    }
+    panic!("no age header of {header_len} bytes in {TRIES} tries");
+}
+
 /// Sizes and hashes recorded for one staged slice
 /// ([`files::SliceWriter::finish`]): the plaintext dar slice's size and
 /// sha256, and its `.age` file's. Only the plaintext pair is a pure function
