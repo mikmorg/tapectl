@@ -122,7 +122,9 @@ interrupted, and every unit planned after it. A cut unit counts as nothing on
 that tape: its `writes` row is `cut`, never a Copy, though its slices that
 reached the tape stay recorded. It stays staged and is written whole to the next
 cartridge as an ordinary write. Only the drive cuts a unit, and only on a
-sealed tape: an aborted session's rows are `aborted`, never `cut`.
+sealed tape: an aborted session's rows are `aborted`, never `cut`. A unit that
+allows Spanning, interrupted with slices already on the tape, is not cut: that
+tape holds a Range of it (1.7.0, ADR-0012 item 121).
 _Avoid_: split (a cut unit is not divided between tapes: it is written whole
 again; dividing a version is Spanning, and only a unit that allows it spans),
 truncated, partial copy, aborted
@@ -164,10 +166,18 @@ designed 2026-10-16, not built; it waits for #420's short seal). Only a unit
 that allows it may span; it is packed last on a volume and cut where the drive
 reports early warning, the slice in flight finishing first, and its remaining
 slices continue on the next cartridge of the same generation. A spanning
-version is as covered as its least-covered range of slices.
+version is as covered as its least-covered slice (item 127).
 _Avoid_: partition (LTO cartridges have partitions), member (envelopes have tar
 members), volume set (tapectl has stage sets and archive sets), split (a unit
 is never split by hand)
+
+**Range**:
+The run of one stage set's slices on one volume (1.7.0, ADR-0012 items
+121-127). A Spanning version is held as ranges on several volumes, each tape
+holding at most one unbroken range of a stage set, in slice order. Its
+`writes` row is `range`: it counts towards a Copy slice by slice, and the
+version is as covered as its least-covered slice.
+_Avoid_: piece, part, fragment, chunk (an age chunk is 64 KiB of ciphertext)
 
 **Current**:
 A snapshot that has been sealed onto a volume and still counts. **More than one

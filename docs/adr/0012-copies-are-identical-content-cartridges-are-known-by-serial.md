@@ -1906,3 +1906,52 @@ Ruled 2026-10-20 (later), on the coordinator's round of open questions:
 120. **LTO-5 will be written from home2's LTO-6 drive.** #482's real-drive evidence (a real LTO-5
      cartridge through init, write, verify, restore and RESTORE.sh) is deferred until the CTO
      asks for it.
+
+Ruled 2026-10-21, on #478's design questions, round 1 (the draft is on #478; built after #420
+lands, as 1.7.0):
+
+121. **A range has its own write status, `range`.** A *range* is the run of one stage set's slices
+     on one volume (item 87's "piece"). A write of a spannable set that the early warning ended
+     inside it gets a `range` row (migration 039 rebuilds `writes` as 038 did). 1.6.0's `cut` keeps
+     item 112's meaning: never a copy, never holding staging. Whether a set may span is frozen into
+     the write when it is planned, because the dotfile is read at use. `range` joins
+     `write_reaches_tape` in the same change, so retire, rewrite and `holders_of` see it, and every
+     site reading `status = 'completed'` is sorted by what it means. The range is the row's
+     `written` positions, with `pending` past the cut. Considered and not chosen: reading `cut` per
+     slice for a spannable set, and recording a range as `completed`.
+122. **The catalog records no copy or span identity** (item 93). The planner works from per-slice
+     shortfalls. On each tape it lays out a spanning set's owed slices first (the lowest owed slice
+     first, as one unbroken run in slice order), then whole units, then spannable units last. With
+     a copy target of 2 this yields item 93's layout. A volume holds at most one unbroken range of
+     a stage set. Considered and not chosen: a `spans` table.
+123. **A span tape plans the rest of its spannable set past item 113's bound**, and the early
+     warning ends the range. This applies only on a drive that declares `post_warning_bytes`.
+     Without the key, a spannable unit past the fill ceiling is refused and the refusal names the
+     key. Whole units planned after a span's tail keep item 113's bound. Considered and not chosen:
+     keeping item 113's bound (a fresh cartridge would then end the range at a planned cut,
+     against item 84), and a second bound of nominal plus `post_warning_bytes`.
+124. **Every tape whose plan holds a slice of a spannable set states `requires` with
+     `"spanning"`.** The spelling `requires = ["short-seal", "spanning"]`, with the space, is
+     normative: without it RESTORE.sh reads the line as the single feature `short-sealspanning`.
+     There is no new front-index type. Considered and not chosen: fencing every 1.7.0 tape
+     (against items 77 and 90), and fencing only continuation tapes (tapectl checks File 0 at
+     contact, so that fence comes too late).
+125. **A range's MANIFEST.toml block lists every slice of the set**, each with its hashes, and gives
+     `tape_position` only to the slices this tape plans. The block states `may_span = true`. From
+     any tape of a span, a reader can accept any other tape of it by hash (item 88), and a rebuild
+     records every slice. Whole-unit blocks stay byte-identical, and a second pinned case covers a
+     range block. Considered and not chosen: listing only this tape's slices, and a separate
+     envelope member.
+126. **Nothing new is readable without a key.** The seal, its grammar, its pin and File 3 stay as
+     1.6.0 left them. With a key, the range is the MANIFEST's positions trimmed by `ended_after`:
+     tape 1's envelope says the rest is on a later tape, and a later tape's `units.tsv` carries
+     `first_slice`/`last_slice`. A tape never names another tape written after it (ADR-0001).
+127. **Item 76 in SQL: per stage set, the least-covered slice.** A slice's copies are the distinct
+     eligible volumes holding a written position of it in a `completed` or `range` row. A version's
+     copies are the sum over its stage sets of each set's least-covered slice, and slices of two
+     stage sets never combine (item 102). Locations use the same minimum, and a deposit of a range
+     volume counts for that range. With whole writes only, this is exactly the 1.6.0 count. It
+     changes `copy_count_expr`, `location_count_expr` and `eligible_writes`, and the
+     catalog_budget pins move on purpose. Audit's verify age is the oldest of each range's newest
+     readback. The retire floor (`versions_at_stake`) sees only `current` versions, so this does
+     not protect a version still being spanned; round 2's Q9 rules that.
