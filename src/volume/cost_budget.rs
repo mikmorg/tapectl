@@ -522,9 +522,10 @@ fn budget(path: Path) -> (f64, usize) {
         // rebuild). On a real drive that is high-speed positioning, not a
         // read pass; no rewind follows.
         Path::Rebuild => (1.05, 0),
-        // File 0 and File 3 heads, a rewind a few files from BOT, then one
-        // forward pass over every file.
-        Path::Raw => (1.05, 1),
+        // File 0 and File 3 heads, then out to the seal marker before any
+        // data slice (§4.2 R1: a 1.6.0 tape that may end early says where
+        // only at its end), one rewind, one forward pass to the seal.
+        Path::Raw => (3.05, 1),
         // One envelope, before the slices.
         Path::Envelope => (0.01, 0),
         // File 0, then a space over the wide unit to the narrow unit's

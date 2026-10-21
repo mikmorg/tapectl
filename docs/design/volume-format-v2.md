@@ -949,8 +949,10 @@ RESTORE.sh's modes, in 1.6.0:
 tapectl, in 1.6.0:
 - The chain walk (confirm, `volume verify`) covers files 0 to `ended_after` (§5).
 - Every reader that reads slices by the catalog (`restore`, `volume read-slices`, `volume
-  compact-read`, `volume rewrite`) reads only `completed` writes, so none reads a cut unit from
-  this tape. `restore volume` names the cut units.
+  compact-read`, `volume rewrite`) never reads a `cut` write, so none reads a cut unit from
+  this tape. (`restore` and `volume rewrite` read only `completed` writes; `volume read-slices`
+  keeps its 1.5.0 rule of any written position, minus `cut` ones.) `restore volume` names the
+  cut units.
 - `restore raw-volume` reports the positions after `ended_after` as not on this tape.
 - `catalog rebuild` and the adoption of a lost write (`volume::adopt_lost`) locate the seal
   by §1.2 rule 6. They record `completed` only for a stage set wholly at or before
