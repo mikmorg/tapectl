@@ -19,9 +19,13 @@ cartridge is FUJIFILM LTO-6, medium serial `EW7VWMVKF6`; it is never a productio
 
 ## What mhvtl cannot tell you (why this session exists)
 
-- **End of tape.** mhvtl accepts writes past its configured capacity without ENOSPC and
-  silently corrupts the overflow (dry-run 2026-07-20). Only a real drive answers where
-  host writes stop, and how.
+- **End of tape.** mhvtl accepts writes past its configured capacity and silently loses
+  the overflow (dry-run 2026-07-20). Measured again on 2026-10-20 (#420, a 500 MB LTO-8
+  cartridge): st now returns ENOSPC once per block from 2 MiB before capacity and the retry
+  lands each block, as a real drive's early warning does; but data past capacity is lost
+  with no error (a file crossing it reads back truncated, one past it reads back empty),
+  while filemarks are kept. So mhvtl shows the early warning, never what a drive keeps past
+  it. Only a real drive answers where host writes stop, and how.
 - **Capacity units and MAM.** mhvtl's MAM and page 0x0c/0x17 are static fictions.
 - **Feed-rate effects.** mhvtl writes to disk; a real drive speed-matches down to about
   54 MB/s and shoe-shines below that, which costs tape.

@@ -1012,10 +1012,16 @@ the unit is adopted.
 | `USER` | `init` | The default operator name when `--operator` is not given. Falls back to `operator`. Under a system account (a uid below `UID_MIN` from `/etc/login.defs`, or below 1000 if the file does not set it; this includes root and a `tapectl` service user), `init` refuses without `--operator` rather than name the operator after the account. |
 | `NO_COLOR` | every command | When it is set to a non-empty value, tapectl never colours its log lines on stderr. They are plain anyway whenever stderr is not a terminal. |
 | `PATH` | `stage create`, `restore`, `init`, `config check`, … | Used to find a bare `[dar] binary` such as `dar`. `init` and `config check` print where it was found. |
+| `TAPECTL_PIPELINE_TRACE` | every command that writes a tape (`volume write`, `volume resume`, `volume rewrite`) | When it is `1`, the write records a trace of its feed beside the session log, `<session>.pipeline.tsv`: one row every 250 ms with the queue, the threads' waits and CPU, the host's load and the staging disks' activity ([operator guide](operator-guide.md)). It changes nothing the write does. |
 
 That is the complete list an operator can use. The source also reads
-`TAPECTL_TEST_PAUSE_AFTER_PLAN` and `TAPECTL_TEST_PAUSE_AFTER_SEAL`. These are test
-hooks that deliberately stall a tape write partway through, so **never set them**.
+`TAPECTL_TEST_PAUSE_AFTER_PLAN`, `TAPECTL_TEST_PAUSE_AFTER_SEAL` and
+`TAPECTL_TEST_EARLY_WARNING_AT`. These are test hooks: the first two stall a tape write
+partway through, and the third makes the write refuse blocks as if the drive had
+reported its early warning, so the tape seals short where it says. **Never set them.**
+A build with the cargo feature `research` (never a production build) also reads the
+`TAPECTL_EXP_*` experiment knobs of `docs/research/2026-10-20-write-shaping.md` §9.1;
+any other build ignores them and says so once.
 `TAPECTL_MHVTL`, `TAPECTL_GATE_TAPE` and `TAPECTL_PERF_TESTS` belong to the test
 suites, not to the `tapectl` binary.
 
