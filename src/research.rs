@@ -14,10 +14,12 @@
 //! the first time anything asks ([`knobs`]), following
 //! `TAPECTL_TEST_PAUSE_AFTER_PLAN`'s pattern (environment variables, never
 //! config keys). [`announce`] prints them on stderr once per process and
-//! into the session log once per session, and the write pipeline calls it
-//! when a write's pool starts, so every research write's log says what it
-//! ran with. A research build announces itself even with no knob set, so a
-//! research binary is never mistaken for a production one.
+//! into the session log once per session. `volume write` calls it before
+//! anything else it does, and the write pipeline when a write's pool starts
+//! (which covers `volume resume`, `collection run` and every other writer),
+//! so every research write's log says what it ran with. A research build
+//! announces itself even with no knob set, so a research binary is never
+//! mistaken for a production one.
 //!
 //! **The knobs** (decimal MB, 10^6 bytes, as the note's arithmetic is):
 //!
@@ -25,8 +27,8 @@
 //!   instead of `pipeline::QUEUE_BYTES` (256 MiB). Binary suffixes `K`, `M`,
 //!   `G`, `T` (`KiB`... also accepted), or plain bytes; at least two tape
 //!   blocks. The read pipeline (confirm, verify, restore) keeps the
-//!   constant. Without `TAPECTL_EXP_CROSSFILE` (not built) the queue still
-//!   empties at every file boundary, so it can hold at most one file.
+//!   constant. Without `TAPECTL_EXP_CROSSFILE` the queue still empties at
+//!   every file boundary, so it can hold at most one file.
 //! - `TAPECTL_EXP_PACE_MBPS=<MB/s>`: a fixed pace (§5.2). The store is handed
 //!   at most this many bytes a second, a token bucket with a burst of four
 //!   blocks on the writer's side of the queue; the time it holds the writer
@@ -51,9 +53,16 @@
 //!   (§5.9): `ring` (the default, what production runs) or `sha2`'s `asm`
 //!   (what production ran before #488), for R7's baseline. It applies to
 //!   every hash in the process, staging's included.
-//! - `TAPECTL_EXP_CROSSFILE` (carry the queue across files): NOT built — it
-//!   needs the write session (`volume::session`) to run one reader and one
-//!   hasher for the whole Layout. Set, it is reported as ignored.
+//! - `TAPECTL_EXP_CROSSFILE=1`: carry the write queue across files. The
+//!   write session (`volume::session`'s execute loop) starts ONE reader and
+//!   ONE hasher for the rest of its Layout, file boundaries passed between
+//!   them as messages, and each file's write takes its blocks from that one
+//!   queue (`pipeline::crossfile`), so a queue larger than a file fills.
+//!   The hasher still withholds each file's last block until that file's
+//!   hash is done, so a mismatch refuses that file exactly as before; Ctrl-C
+//!   is still checked between files. The pace, the adaptive pace and the
+//!   refill then judge the queue against what is left of the whole run, not
+//!   of one file. Any other value is ignored and named.
 //!
 //! **"The queue's fill"** for the adaptive pace and the refill is the bytes
 //! hashed and waiting for the store over what the queue can hold for the
@@ -127,6 +136,8 @@ pub struct Knobs {
     pub adaptive: Option<Adaptive>,
     pub refill: Option<Refill>,
     pub hash: HashImpl,
+    /// `TAPECTL_EXP_CROSSFILE=1`: one queue for the whole Layout's files.
+    pub crossfile: bool,
     /// Each variable that was set but is not in force, and why.
     pub ignored: Vec<String>,
 }
@@ -145,6 +156,7 @@ impl Knobs {
         let mut adaptive = None;
         let mut refill = None;
         let mut hash = HashImpl::Ring;
+        let mut crossfile = false;
         if let Some(v) = get(QUEUE_BYTES_ENV) {
             match parse_size(&v) {
                 Some(n) if n > 0 => queue_bytes = Some(n),
@@ -195,17 +207,26 @@ impl Knobs {
             }
         }
         if let Some(v) = get(CROSSFILE_ENV) {
-            ignore(
-                CROSSFILE_ENV,
-                &v,
-                "not built: carrying the queue across files needs the write session",
-            );
+            // The carry exists only in a `research` build (`pipeline::crossfile`).
+            if BUILT {
+                match v.trim() {
+                    "1" => crossfile = true,
+                    _ => ignore(CROSSFILE_ENV, &v, "not 1"),
+                }
+            } else {
+                ignore(
+                    CROSSFILE_ENV,
+                    &v,
+                    "not built: carrying the queue across files is in a research build only",
+                );
+            }
         }
         k.queue_bytes = queue_bytes;
         k.pace_mbps = pace_mbps;
         k.adaptive = adaptive;
         k.refill = refill;
         k.hash = hash;
+        k.crossfile = crossfile;
         k
     }
 
@@ -255,6 +276,11 @@ impl Knobs {
         }
         if self.hash == HashImpl::Sha2 {
             line(format!("{HASH_ENV}: hashing with sha2 (asm), not ring"));
+        }
+        if self.crossfile {
+            line(format!(
+                "{CROSSFILE_ENV}: one reader and one hasher carry the write queue across files"
+            ));
         }
         for i in &self.ignored {
             line(format!("ignored: {i}"));
@@ -320,8 +346,9 @@ pub fn announcement(built: bool, knobs: &Knobs, set: &[&str]) -> Vec<String> {
 }
 
 /// Say what the knobs are: on stderr once per process, and into the calling
-/// thread's session log once per session. The write pipeline calls it when a
-/// write's pool starts.
+/// thread's session log once per session. `volume write` calls it first
+/// thing, and the write pipeline when a write's pool starts; a second call
+/// adds nothing.
 pub fn announce() {
     static SET: OnceLock<Vec<&'static str>> = OnceLock::new();
     let set = SET.get_or_init(|| {
@@ -722,7 +749,7 @@ mod tests {
             (PACE_ADAPTIVE_ENV, "150,90,10"),
             (REFILL_ENV, "0.9,0.1"),
             (HASH_ENV, "md5"),
-            (CROSSFILE_ENV, "1"),
+            (CROSSFILE_ENV, "yes"),
         ]);
         assert_eq!(
             k,
@@ -732,13 +759,35 @@ mod tests {
             }
         );
         assert_eq!(k.ignored.len(), 6, "{:?}", k.ignored);
-        assert!(k.ignored[5].contains("not built"), "{:?}", k.ignored);
+        // A research build has the carry and takes only `1`; any other
+        // build says it has no carry at all.
+        let why = if BUILT { "not 1" } else { "not built" };
+        assert!(k.ignored[5].contains(why), "{:?}", k.ignored);
         assert!(!k.shapes());
         assert_eq!(
             parse(&[]),
             Knobs::default(),
             "nothing set, nothing in force"
         );
+    }
+
+    /// `TAPECTL_EXP_CROSSFILE=1` is the carry in a research build, and only
+    /// there; it shapes nothing by itself.
+    #[test]
+    fn crossfile_is_a_knob_in_a_research_build_only() {
+        let k = parse(&[(CROSSFILE_ENV, "1")]);
+        assert_eq!(k.crossfile, BUILT);
+        assert_eq!(k.ignored.is_empty(), BUILT, "{:?}", k.ignored);
+        assert!(!k.shapes());
+        if BUILT {
+            assert!(
+                k.describe()
+                    .iter()
+                    .any(|l| l.contains("carry the write queue across files")),
+                "{:?}",
+                k.describe()
+            );
+        }
     }
 
     /// A research build says what it runs with, even with nothing set; any

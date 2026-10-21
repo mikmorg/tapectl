@@ -3270,6 +3270,24 @@ fn run_entries(
     // Issue #488 (the write-shaping note's §9 item 3): when the previous
     // file's pipeline returned, for the gap to this file's first block.
     let mut last_file_returned: Option<std::time::Instant> = None;
+    // Issue #488: in a `research` build, `TAPECTL_EXP_CROSSFILE=1` carries
+    // the write queue across the files this call writes: one reader and one
+    // hasher for all of them (`pipeline::crossfile`), each `write_verified`
+    // below taking its file from that one queue. No other build has this
+    // statement, and with the knob unset it does nothing.
+    #[cfg(feature = "research")]
+    pool.carry_across(
+        content_entries[start_index..]
+            .iter()
+            .map(|e| {
+                Some((
+                    entry_path(e).ok()?.to_path_buf(),
+                    e.size_bytes?,
+                    e.sha256.clone(),
+                ))
+            })
+            .collect(),
+    );
 
     for entry in &content_entries[start_index..] {
         phase.item(format!(

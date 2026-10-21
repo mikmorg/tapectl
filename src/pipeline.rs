@@ -49,7 +49,9 @@
 //! a few atomics per block ([`Gauges`]) and a sampler thread writes one row
 //! every 250 ms beside the session log. Off, the stages hold no gauges and
 //! do nothing extra. A `research` build can also shape the feed between the
-//! queue and the store ([`crate::research`]); no other build can.
+//! queue and the store ([`crate::research`]), and carry the queue across the
+//! files of a write (`TAPECTL_EXP_CROSSFILE`, the `crossfile` module); no
+//! other build can.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -66,6 +68,11 @@ use crate::error::{Result, TapectlError};
 use crate::pipeline_trace::{self, Gauges, Role, Trace};
 use crate::progress;
 use crate::research::Shaper;
+
+// Issue #488: `TAPECTL_EXP_CROSSFILE`, the write queue carried across files.
+// A `research` build only; no other build compiles it.
+#[cfg(feature = "research")]
+mod crossfile;
 
 /// How many bytes a pipeline may hold in flight: 256 MiB, 512 of the
 /// default 512 KiB tape blocks.
@@ -107,6 +114,11 @@ pub struct BufferPool {
 /// pool (issue #488). All `None` unless asked for.
 #[derive(Default)]
 struct Observe {
+    /// A `research` build's queue carried across files
+    /// (`TAPECTL_EXP_CROSSFILE`), started by the write session. First, so
+    /// its threads are joined before the trace takes its last row.
+    #[cfg(feature = "research")]
+    carry: Option<crossfile::Carry>,
     decided: bool,
     gauges: Option<Arc<Gauges>>,
     trace: Option<Trace>,
@@ -391,6 +403,14 @@ pub fn write_verified<R: Read + Send>(
     expected_sha256: Option<&str>,
     execute: impl FnOnce(&mut dyn Read) -> Result<u64>,
 ) -> Streamed {
+    // Issue #488: a `research` build carrying the queue across files
+    // (`TAPECTL_EXP_CROSSFILE`) takes this file from the one pipeline the
+    // write session started for its Layout. `src` is not read: the carry's
+    // own reader opened the same staged file, ahead of this call.
+    #[cfg(feature = "research")]
+    if let Some(carry) = pool.observe.carry.as_mut() {
+        return carry.write_next(len, expected_sha256, execute);
+    }
     let (free_tx, mut free_rx) = mpsc::channel::<Vec<u8>>();
     let (read_tx, read_rx) = mpsc::channel::<Msg>();
     let (hash_tx, hash_rx) = mpsc::channel::<Msg>();
@@ -1382,6 +1402,7 @@ mod tests {
             let mut pool = BufferPool::new(chunk, buffers);
             let gauges = Arc::new(Gauges::default());
             pool.observe = Observe {
+                carry: None,
                 decided: true,
                 gauges: Some(gauges.clone()),
                 trace: None,
