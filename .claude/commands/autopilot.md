@@ -41,8 +41,8 @@ the normative design set named in the Policy block below.
   - decision 9 is done (2473468);
   - R0 is decoded on #488: both production writes show 0 repositions per 100 MB.
 
-  Waiting on the operator: sdd's long self-test result (`home2:~/sdd.long`, due after 22:00 CST
-  2026-10-20) and the drive-poll timer restart.
+  sdd's long self-test passed (2026-10-21, commented on #488). Waiting on the operator: the
+  drive-poll timer restart after the acceptance run.
 
   **Chain GREEN on c9c5877 (2026-10-21); the operator was notified to set up the acceptance run.**
   Binaries on home2: `~/tapectl-1.6.0-c9c5877/` (tapectl 725c177e…, examples/short_seal_filler
@@ -55,6 +55,15 @@ the normative design set named in the Policy block below.
     `src/volume/raw.rs`, a restore path, so the mhvtl gate runs before it lands.
   Close #489 and #490 when they land. /scratch filled on 2026-10-21 (ENOSPC mid-clippy): 22 old
   `/scratch/tapectl-lifecycle/run-*` dirs were deleted; prune them after each lifecycle run.
+
+  **#478 spanning: the design is COMPLETE (2026-10-21).** The CTO ratified all three rounds of
+  the design questions as recommended: ADR-0012 items 121-137 (master 658f7de, 1d59a82, 73de4af),
+  read with items 76-100. The draft with its citations is scratchpad `p478/questions.md` and is on
+  #478. Item 135 pre-authorizes 1.7.0's re-pin for the moves it names. **Build after v1.6.0 is
+  tagged and merged**, as 1.7.0, stacked on master after p489/p490: write a wave plan first
+  (file-disjoint waves; `write_reaches_tape` and migration 039 come first, since items 121, 127,
+  128 and 129 all rest on them), then the gate leg (item 136), then the real-drive proof (item 137,
+  operator-run).
 - **QUEUE STATE 2026-10-20 later — the real-drive runs on home2, v1.5.0 installed.**
   Rehearsal GREEN 53/53, #444's verified-erase proof holds (chip proof waits for a never-written
   cartridge), #420's profile done, #388's prototype done
