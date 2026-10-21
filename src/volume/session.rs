@@ -3267,6 +3267,9 @@ fn run_entries(
         built.layout.block_size.max(1) as usize,
         pipeline::QUEUE_BYTES,
     );
+    // Issue #488 (the write-shaping note's §9 item 3): when the previous
+    // file's pipeline returned, for the gap to this file's first block.
+    let mut last_file_returned: Option<std::time::Instant> = None;
 
     for entry in &content_entries[start_index..] {
         phase.item(format!(
@@ -3295,6 +3298,10 @@ fn run_entries(
         }
 
         let path = entry_path(entry)?;
+        // Issue #488: name the staged file to the pipeline trace (its `file`
+        // column and its staging-disk columns). Nothing happens unless
+        // `TAPECTL_PIPELINE_TRACE=1` started a trace.
+        pool.trace_source(path);
         let size = entry.size_bytes.ok_or_else(|| {
             TapectlError::Other(format!(
                 "execute: entry at position {} has no recorded size \
@@ -3348,6 +3355,10 @@ fn run_entries(
                 (streamed.verdict(expected_hash), Some(waits))
             }
         };
+        // Issue #488: one clock reading as the file's pipeline returns; the
+        // gap to the next file's first block and this slice's position row
+        // are measured from it (`finished` below is the other reading).
+        let streamed_at = std::time::Instant::now();
 
         // Issue #408: only a full medium and a tri-layer L2 mismatch end
         // the session `aborted` — the two ADR-0007 and §2.4 name. Any other
@@ -3426,9 +3437,23 @@ fn run_entries(
         // for queue space (the hash or the tape behind it). Together they
         // name the slowest stage: tape waited ~0 = the drive; both high =
         // the hash; only tape waited high = the staged-file read.
-        let took = entry_started.elapsed();
+        let finished = std::time::Instant::now();
+        let took = finished.duration_since(entry_started);
+        // Issue #488 (the write-shaping note's §9 item 3): the time between
+        // two files, split. `position row` is this slice's write-position
+        // UPDATE, busy waits included; `gap` runs from the previous file's
+        // return to this file's first block reaching the store — the
+        // previous file's row and log line, the pipeline's restart, this
+        // file's first read and hash.
+        let position_row = matches!(entry.kind, ZoneKind::Slice { .. })
+            .then(|| finished.duration_since(streamed_at));
+        let gap = match (last_file_returned, waits.and_then(|w| w.first_block_at)) {
+            (Some(previous), Some(first)) => Some(first.saturating_duration_since(previous)),
+            _ => None,
+        };
+        last_file_returned = Some(streamed_at);
         crate::progress::log(&format!(
-            "wrote file {} ({}): {} in {}{}{}",
+            "wrote file {} ({}): {} in {}{}{}{}",
             entry.position,
             entry.kind.type_label(),
             crate::progress::format_bytes(size),
@@ -3441,6 +3466,7 @@ fn run_entries(
                 ),
                 None => String::new(),
             },
+            between_files(gap, position_row),
             match &stop {
                 Some(Stop::Abort(_)) => " — ABORTED",
                 Some(Stop::Interrupt(_)) => " — INTERRUPTED",
@@ -3548,6 +3574,27 @@ fn run_entries(
         ending: Ending::Full,
         warning_in_data: false,
     }))
+}
+
+/// The per-file log line's account of the time between files (issue #488;
+/// the write-shaping note's §9 item 3), in milliseconds: `gap 1.2 ms` and
+/// `position row 0.4 ms`, each only where it applies — no gap for the first
+/// file this call writes, no position row for a file that is not a slice.
+fn between_files(
+    gap: Option<std::time::Duration>,
+    position_row: Option<std::time::Duration>,
+) -> String {
+    let ms = |d: std::time::Duration| format!("{:.1} ms", d.as_secs_f64() * 1000.0);
+    let parts: Vec<String> = gap
+        .map(|g| format!("gap {}", ms(g)))
+        .into_iter()
+        .chain(position_row.map(|p| format!("position row {}", ms(p))))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", parts.join(", "))
+    }
 }
 
 /// How one entry's write ended the session, when it did (issue #408).

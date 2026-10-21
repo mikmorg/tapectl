@@ -295,6 +295,11 @@ pub struct Stats {
     /// Only with `consumer_waited` does it name which: on a write, both high
     /// means the hash, `consumer_waited` near zero the tape.
     pub producer_waited: Duration,
+    /// On a write, when the store's first read of the file got a block
+    /// (issue #488, the write-shaping note's §9 item 3): the write session
+    /// times the gap between two files to it. `None` on a read, and when the
+    /// store got no block (an empty file, a source that failed first).
+    pub first_block_at: Option<Instant>,
 }
 
 // ── write: staged file → hash → store ──
@@ -447,9 +452,11 @@ pub fn write_verified<R: Read + Send>(
             shaper: shaper.as_mut(),
             taken: 0,
             last_return: None,
+            first_block: None,
         };
         let store = execute(&mut pipe);
-        let (withheld, consumer_waited) = (pipe.withheld, pipe.waited);
+        let (withheld, consumer_waited, first_block_at) =
+            (pipe.withheld, pipe.waited, pipe.first_block);
         // Drop our ends before joining: a stage still waiting on us — the
         // store stopped early — sees them go and stops.
         drop(pipe);
@@ -462,6 +469,7 @@ pub fn write_verified<R: Read + Send>(
             stats: Stats {
                 consumer_waited,
                 producer_waited,
+                first_block_at,
             },
         }
     });
@@ -615,6 +623,9 @@ struct PipeReader<'s> {
     /// When the last read that returned data returned: the store's time
     /// until its next read is its time for that block (≈ `write(2)`).
     last_return: Option<Instant>,
+    /// Issue #488: when the file's first block reached the store
+    /// ([`Stats::first_block_at`]). One clock reading per file.
+    first_block: Option<Instant>,
 }
 
 impl PipeReader<'_> {
@@ -684,7 +695,12 @@ impl Read for PipeReader<'_> {
                 sh.before_take();
             }
             match self.next() {
-                Msg::Data(buf, n) if n > 0 => self.current = Some((buf, n, 0)),
+                Msg::Data(buf, n) if n > 0 => {
+                    if self.first_block.is_none() {
+                        self.first_block = Some(Instant::now());
+                    }
+                    self.current = Some((buf, n, 0))
+                }
                 Msg::Data(buf, _) => {
                     let _ = self.free.send(buf);
                 }
@@ -805,6 +821,7 @@ pub fn read_through<T: Send>(
             stats: Stats {
                 consumer_waited,
                 producer_waited,
+                first_block_at: None,
             },
         }
     });

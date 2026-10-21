@@ -1594,6 +1594,13 @@ pub fn run(
                      `volume plan` estimates tapes needed with no drive required.",
                 ));
             }
+            // Issue #488: what the write-shaping knobs are, said before
+            // anything else the write does — a `research` build's banner, or
+            // in any other build one warning per `TAPECTL_EXP_*` variable it
+            // ignores (nothing when none is set). Once per process on stderr
+            // and once per session log: the write pool's own call adds
+            // nothing after it.
+            crate::research::announce();
             // Issue #438: a mistyped `--move-to` is refused before the tape
             // is touched, not found after the copy is done.
             if let Some(to) = move_to {

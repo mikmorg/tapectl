@@ -11,9 +11,9 @@
 //! before its first write, and no other test binary can see it. Ungated
 //! (no tape, no mhvtl, no device) and about two seconds: the throttle makes
 //! the write last several 250 ms samples. It drives the pipeline directly,
-//! not a whole `volume write`: naming each staged file to the trace
-//! (`BufferPool::trace_source`) is the one call the write session does not
-//! make yet, so this test makes it where the session would.
+//! not a whole `volume write`, so it names each staged file to the trace
+//! (`BufferPool::trace_source`) itself, where the write session's
+//! `run_entries` does before each file.
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
