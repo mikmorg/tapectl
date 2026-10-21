@@ -1954,7 +1954,8 @@ lands, as 1.7.0):
      changes `copy_count_expr`, `location_count_expr` and `eligible_writes`, and the
      catalog_budget pins move on purpose. Audit's verify age is the oldest of each range's newest
      readback. The retire floor (`versions_at_stake`) sees only `current` versions, so this does
-     not protect a version still being spanned; item 128 rules that.
+     not protect a version still being spanned; item 128 rules that. Item 138 corrects "exactly the
+     1.6.0 count".
 
 Ruled 2026-10-21, on #478's design questions, round 2:
 
@@ -2037,4 +2038,46 @@ Ruled 2026-10-21, on #478's design questions, round 3 (the design is complete; t
      - a rebuild of tape 1.
      Then the cartridge is erased, the continuation is written as tape 2, and the restore finishes
      from scratch plus tape 2. `--stream-tapes` is proven on mhvtl only (item 136), because it
-     needs both tapes at once. Considered and not chosen: a second test cartridge.
+     needs both tapes at once. Considered and not chosen: a second test cartridge. Item 139 amends tape 2.
+
+Ruled 2026-10-21, on the forks #478's build plan found (scratchpad `p478/plan.md`, drafted against
+`c9c5877`):
+
+138. **Item 127's sum credits each tape, deposit and place to one stage set only.** It credits the
+     lowest-numbered stage set of the version that the tape, deposit or place holds. Item 127 said
+     its sum is exactly the 1.6.0 count when every write is whole. Without this rule it is not, in
+     three cases:
+     - two stagings of one version on one tape count that tape twice (`compact-read` can make
+       this);
+     - two stagings at one place count that place twice, so a `required_locations` policy that is
+       not met would read as met;
+     - a stage set with no slice rows reads 0 where 1.6.0 counts its write. Such a set counts its
+       whole writes.
+     With this rule the count equals 1.6.0's for whole writes and item 127's for one stage set.
+     Where it is wrong, it under-counts, and only when two stagings of one version share a tape.
+     Considered and not chosen: the plain sum, and the fewest tapes or places whose loss leaves no
+     staging whole (exact, but hard to keep correct and fast in SQL).
+139. **Item 137's tape 2 is a whole copy, not a continuation.** On one cartridge the continuation
+     cannot be made in one catalog:
+     - re-initialising the cartridge as tape 2 marks tape 1 `erased` (binding records the
+       displacement), so slices 1..K hold no copy and tape 2 is planned from slice 1;
+     - retiring tape 1 first meets item 128's floor;
+     - at a copy target of 1, slices 1..K were released after tape 1.
+     So tape 1 is written with `--keep-staging`, and tape 2 is a whole copy. RESTORE.sh still
+     finishes from tape 1's spool plus tape 2, accepting tape 2 because its front index lists
+     slice K+1. Everything only real hardware shows is still proven there. tapectl's continuation
+     row (a range K+1..N) is proven on mhvtl only (item 136, proof 1). Considered and not chosen: a
+     second test cartridge.
+140. **RESTORE.sh prints one NOT ON TAPE line for the planned files past the end of every short
+     tape**, span or not. This is one code path. The expected text moves with it in the gate's
+     `heir_short_*` checks, `short-seal-acceptance.sh`, File 1's examples and
+     `volume-format-v2.md` §4.2. It is within item 135's authorization.
+141. **File 1's catalog query for the heir includes range rows**, with their slice runs, so an heir
+     querying the envelope's `catalog.db` finds a spanning unit on its tapes. It is within item
+     135's authorization.
+142. **`volume rewrite` never writes a range.** A spannable unit a rewrite carries is planned and
+     recorded as whole, and is cut if the early warning comes, as in 1.6.0. This follows 1.6.0's
+     rule that a rewrite never plans past the fill ceiling, because it may hold a unit's only copy.
+143. **Item 102's fill of a damaged file takes only a whole copy as its source in 1.7.0.** A range
+     is never a fill source, and the refusal says why. Item 93's layout usually gives a spanning
+     version a whole copy.
