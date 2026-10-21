@@ -1998,3 +1998,43 @@ Ruled 2026-10-21, on #478's design questions, round 2:
      shortfalls without knowing the destination. The write tells the operator which tapes make up
      each whole copy ("keep these together"), and audit's per-slice location count checks it.
      Considered and not chosen: the destination as a plan input.
+
+Ruled 2026-10-21, on #478's design questions, round 3 (the design is complete; the build waits for
+#420 to land):
+
+135. **1.7.0's golden re-pin is authorized for the moves items 121-134 name, and nothing else.**
+     These are:
+     - RESTORE.sh: `spanning` in `KNOWN_FEATURES`, its handling of a range, both cross-tape modes
+       (item 132), one NOT ON TAPE line for a planned range past the end, and the "needs tapectl
+       1.7.0" text;
+     - a new pinned MANIFEST.toml case for a range block (item 125);
+     - File 0's and the seal's `requires`, set per tape (item 124);
+     - File 1's glossary and a section on a unit across tapes;
+     - RECOVERY.md's range section.
+     The short-seal pin, File 3, the seal grammar and whole-unit MANIFEST blocks do not move. The
+     coordinator re-pins without a further review. Any pinned byte that moves for another reason
+     goes to the CTO first. One fresh read of File 1 for a two-tape span comes before the tag,
+     under item 108's stopping rule. The Heir Kit is regenerated when 1.7.0 is installed. The
+     authorization ends when v1.7.0 is installed on home2.
+136. **The mhvtl proof is one gate leg**, judged by test name, with the early-warning test hook on
+     tape 1's write. It proves:
+     1. two copies across three virtual cartridges laid out as item 93 describes (rows `range`,
+        `completed`, `range`; 2 copies);
+     2. RESTORE.sh's default mode from tapes 1 and 3, and from tape 2 alone;
+     3. `--stream-tapes` across an `mtx` swap with a long wait at the swap (item 132's open fact);
+     4. `tapectl restore unit`;
+     5. the retire floors;
+     6. item 128's protection at a copy target of 1;
+     7. a rebuild of tape 3 alone;
+     8. a span over three tapes (item 94).
+     Considered and not chosen: folding the checks into `short-seal-acceptance.sh --mhvtl`.
+137. **The real-drive proof uses the one test cartridge, EW7VWMVKF6, as two volumes in turn.** Tape 1
+     is filler up to the fill ceiling, then about 100 GB of a real spannable unit cut by the real
+     early warning. It proves:
+     - the `range` row;
+     - the readback past the warning;
+     - RESTORE.sh's default mode spooling tape 1's range into scratch;
+     - a rebuild of tape 1.
+     Then the cartridge is erased, the continuation is written as tape 2, and the restore finishes
+     from scratch plus tape 2. `--stream-tapes` is proven on mhvtl only (item 136), because it
+     needs both tapes at once. Considered and not chosen: a second test cartridge.
