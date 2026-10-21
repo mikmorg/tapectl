@@ -222,7 +222,7 @@ TAPECTL_BIN="$(readlink -f "$TAPECTL_BIN")"
 [ -x "$FIXTURE_BIN" ] || die "FIXTURE_BIN=$FIXTURE_BIN is not an executable file (cargo build --example short_seal_filler, built with TAPECTL_BIN)"
 : "${DAR_BIN:=$(command -v dar)}"
 [ -x "$DAR_BIN" ] || die "DAR_BIN=$DAR_BIN is not an executable file"
-TAPECTL_VERSION="$("$TAPECTL_BIN" --version 2>&1 | head -1)"
+TAPECTL_VERSION="$("$TAPECTL_BIN" --version 2>&1 | sed -n 1p)"
 if [ "$MHVTL" = 0 ]; then
     # The run is the 1.6.0 candidate's: a binary before 1.6.0 cannot seal short at all.
     python3 - "$TAPECTL_VERSION" <<'PY' || die "TAPECTL_BIN reports '$TAPECTL_VERSION': the acceptance run is for tapectl 1.6.0 or later"
@@ -275,7 +275,7 @@ DRIVE_SG="/dev/${SG_ENTRIES[0]}"
 DRIVE_SERIAL="$(tail -c +5 "$SYS_ST/device/vpd_pg80" 2>/dev/null | tr -d '\0' | sed 's/ *$//')"
 [ -n "$DRIVE_SERIAL" ] || die "cannot read the drive serial from sysfs ($SYS_ST/device/vpd_pg80)"
 SYS_MODEL="$(sed 's/[[:space:]]*$//' "$SYS_ST/device/model" 2>/dev/null || true)"
-GEN_N="$(echo "$SYS_MODEL" | sed -n 's/.*Ultrium \([0-9]\{1,2\}\).*/\1/p; s/.*TD\([0-9]\{1,2\}\).*/\1/p' | head -1)"
+GEN_N="$(echo "$SYS_MODEL" | sed -n 's/.*Ultrium \([0-9]\{1,2\}\).*/\1/p; s/.*TD\([0-9]\{1,2\}\).*/\1/p' | sed -n 1p)"
 [ "$GEN_N" = 6 ] || die "the drive's model '$SYS_MODEL' is not an LTO-6 drive: this run is the LTO-6 acceptance run"
 if [ "$MHVTL" = 1 ]; then
     [ "$DRIVE_SERIAL" != "$TEST_DRIVE_SERIAL" ] || die "--mhvtl names the REAL drive $TEST_DRIVE_SERIAL: the rehearsal runs on mhvtl only"
@@ -297,7 +297,7 @@ flock -n 9 || die "another process holds the tape lock ($TAPE_LOCK)"
 # "Density vendor/serial number at last load" first.
 read_serial() {
     sg_read_attr "$DRIVE_SG" 2>/dev/null | grep -iE '^[[:space:]]*medium serial number[[:space:]]*:' \
-        | head -1 | sed 's/^[^:]*: *//' | tr -d ' \r'
+        | sed -n 1p | sed 's/^[^:]*: *//' | tr -d ' \r'
 }
 SERIAL="$(read_serial || true)"
 [ -n "$SERIAL" ] || die "sg_read_attr reported no medium serial number on $DRIVE_SG (is a cartridge loaded?)"
@@ -510,9 +510,9 @@ log "home: $TAPECTL_HOME; rebuild home: $REBUILD_HOME; staging: $STAGING; filler
     echo "tapectl=$TAPECTL_BIN"; echo "tapectl_version=$TAPECTL_VERSION"
     echo "tapectl_sha256=$(sha256sum "$TAPECTL_BIN" | awk '{print $1}')"
     echo "fixture=$FIXTURE_BIN"
-    echo "dar=$("$DAR_BIN" --version 2>&1 | head -1)"
-    echo "age=$(age --version 2>&1 | head -1)"
-    echo "tar=$(tar --version 2>&1 | head -1)"
+    echo "dar=$("$DAR_BIN" --version 2>&1 | sed -n 1p)"
+    echo "age=$(age --version 2>&1 | sed -n 1p)"
+    echo "tar=$(tar --version 2>&1 | sed -n 1p)"
     echo "script_commit=$(git -C "$SCRIPT_DIR" describe --always --dirty 2>/dev/null || echo unknown)"
     echo "capacity_registered=$CAPACITY"; echo "post_warning_bytes=$POST_WARNING"; echo "slice_size=$SLICE_SIZE"
 } > "$RUN/meta.txt"
@@ -522,9 +522,9 @@ log "home: $TAPECTL_HOME; rebuild home: $REBUILD_HOME; staging: $STAGING; filler
 begin_step 1 setup "a throwaway home, four units staged, the filler's rows (no tape)"
 run init 0 tctl init --operator "$OPERATOR" --no-escrow
 run escrow 0 tctl key generate --escrow
-ESCROW_SECRET="$(grep -oE 'AGE-SECRET-KEY-1[A-Z0-9]+' "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err" | head -1 | sed 's/^[^:]*://')"
+ESCROW_SECRET="$(grep -oE 'AGE-SECRET-KEY-1[A-Z0-9]+' "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err" | sed -n 1p | sed 's/^[^:]*://')"
 [ -n "$ESCROW_SECRET" ] || fail "key generate --escrow printed no secret"
-ESCROW_PUB="$(grep -ohE 'age1[a-z0-9]+' "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err" | head -1)"
+ESCROW_PUB="$(grep -ohE 'age1[a-z0-9]+' "$STEP_DIR/escrow.out" "$STEP_DIR/escrow.err" | sed -n 1p)"
 [ -n "$ESCROW_PUB" ] || fail "key generate --escrow printed no public key"
 mkdir -p "$RUN/keys"; umask_old="$(umask)"; umask 077
 printf '%s\n' "$ESCROW_SECRET" > "$RUN/keys/escrow.key"
@@ -633,7 +633,7 @@ CONFIRM_BYTES="$(dbq "$DB" "SELECT pt.bytes FROM phase_timings pt JOIN volumes v
     WHERE v.label = ? AND pt.operation = 'volume write' AND pt.phase = 'confirm' ORDER BY pt.id DESC LIMIT 1" "$LABEL1")"
 K_BYTES="$(dbq "$DB" "SELECT sl.encrypted_bytes FROM write_positions wp JOIN writes w ON w.id = wp.write_id
     JOIN volumes v ON v.id = w.volume_id JOIN stage_slices sl ON sl.id = wp.stage_slice_id
-    WHERE v.label = ? AND wp.position = ?" "$LABEL1" "$K" | head -1)"
+    WHERE v.label = ? AND wp.position = ?" "$LABEL1" "$K" | sed -n 1p)"
 case "$CONFIRM_BYTES" in ''|*[!0-9]*) fail "no byte count for the write's confirm phase (phase_timings)" ;; esac
 case "$K_BYTES" in ''|*[!0-9]*) fail "no slice recorded at file $K" ;; esac
 BLOCK=524288
@@ -647,7 +647,7 @@ dbq "$DB" "SELECT e.timestamp, e.field, e.new_value, e.details FROM events e JOI
 log "  write_early_warning: $(tail -1 "$STEP_DIR/early-warning-event.tsv")"
 dbq "$DB" "SELECT action, details FROM events WHERE action IN ('write_feed_ratio', 'write_capacity_used', 'write_completed')
     ORDER BY id" > "$STEP_DIR/write-events.tsv" || true
-log "  feed ratio: $(grep '^write_feed_ratio' "$STEP_DIR/write-events.tsv" | head -1 | cut -f2 || true)"
+log "  feed ratio: $(grep '^write_feed_ratio' "$STEP_DIR/write-events.tsv" | sed -n 1p | cut -f2 || true)"
 # Item 112: a cut set stays staged and whole, and does not hold back the release of the whole
 # units beside it (min_copies = 1, so their one copy releases them).
 STAGED="$(dbq "$DB" "SELECT u.name || '=' || ss.status FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
