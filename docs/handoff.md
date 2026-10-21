@@ -415,7 +415,12 @@ cartridge and restart the drive-poll timer), and `v1.6.0` is tagged.
   homorg and lcsas-4c), and start it inside tmux. `--print-plan` prints your part without
   touching anything.
 - **#488's drive phase** (about 2 h, research build) is approved for the same day, in a separate
-  load (item 117).
+  load (item 117). It is `scripts/shaping-drive-phase.sh` (`--print-plan` gives your part), run
+  with a research binary: a static musl release build with `--features research`, for measuring
+  only (item 117, the write-shaping note's §12 item 2, #426's precedent). The coordinator builds
+  it and copies it to home2 with its sha256, never into `PATH` or a production home. It runs
+  only after the acceptance's result has been read and its cartridge cleaned from the
+  acceptance home (`volume retire SSA-0002`, then `cartridge erase`).
 
 **Then, once `v1.6.0` is tagged,** on home2, inside tmux, with no tapectl command running
 (`tapectl-op status`):

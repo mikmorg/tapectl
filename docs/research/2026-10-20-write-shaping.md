@@ -612,10 +612,9 @@ so one trace covers every file of an execute loop without a session hook. As bui
   `writer_wait_max_ms` is the longest single wait that ended in the row.
 - Per-file stage threads add their last stretch of run and delay to the role when they exit,
   so nothing is lost between rows; `*_cpu` is empty between files.
-- The disk columns need the staged file's path, which only the write session knows: it must call
-  `BufferPool::trace_source(path)` before each `write_verified` (the hook below). Until it
-  does, `file` reads `#N` and the disk columns are empty. A path on no block device (tmpfs)
-  gives empty disk columns, never an error.
+- The disk columns need the staged file's path, which only the write session knows: it calls
+  `BufferPool::trace_source(path)` before each `write_verified` (built 2026-10-21, below).
+  A path on no block device (tmpfs) gives empty disk columns, never an error.
 - A trace that cannot start says why once in the session log; the write goes on.
 
 **Item 6, the knobs.** Behind the cargo feature `research` (off by default, in no production
@@ -624,8 +623,9 @@ when a write's pool starts. A research build announces itself even with no knob 
 the feature each set variable draws one warning line and is ignored; the shaper type cannot
 be constructed. Semantics as built (decimal MB/s throughout):
 - `TAPECTL_EXP_QUEUE_BYTES=<size>` (`4G`, `512M`, bytes): the write pipeline's queue in place of
-  `QUEUE_BYTES`; the read pipeline keeps 256 MiB. Without the cross-file carry the queue still
-  empties at each file boundary, so it holds at most one file.
+  `QUEUE_BYTES`; the read pipeline keeps 256 MiB. Without the cross-file carry
+  (`TAPECTL_EXP_CROSSFILE`) the queue still empties at each file boundary, so it holds at most
+  one file.
 - `TAPECTL_EXP_PACE_MBPS=<R>`: §5.2's fixed pace, a token bucket on the writer's side of the
   queue with a four-block burst, carried across files; the trace's `paced_ms` and `pace_mbps`.
 - `TAPECTL_EXP_PACE_ADAPTIVE=<floor>,<ceiling>,<step %>`: §5.3. **The ambiguity resolved:** the
@@ -640,34 +640,45 @@ be constructed. Semantics as built (decimal MB/s throughout):
   (the pool, or the file's untaken remainder if smaller). A file's first fill-up is not judged.
 - `TAPECTL_EXP_HASH=ring|sha2`: the hash behind `pass_count::Sha256`, for R7's `sha2` baseline;
   it applies to every hash in the process.
-- `TAPECTL_EXP_CROSSFILE`: not built (below); set, it is reported as ignored.
+- `TAPECTL_EXP_CROSSFILE=1`: the queue carried across files (built 2026-10-21, below). Any other
+  value is ignored and named; a build without the feature ignores it as it ignores every knob.
 
 **Item 7, the dry run.** `tests/pipeline_trace.rs`, ungated (about 6 s): four 20 MiB files from
 a real disk through `write_verified` (reader through `DropBehind`, the hash, `MemStore` behind a
 throttle), the trace on, and the TSV checked for its header, strictly monotonic times, bytes
 that end at the total, a queue within the pool, timed blocks, followed threads, about 250 ms a
 row, and (positive control) resolved disks. It drives the pipeline directly, calling
-`trace_source` where the session would.
+`trace_source` where the session does.
 
-**Deferred, each needing `volume/session.rs`:**
-- **The staging path for the trace:** in `run_entries`, before
-  `pipeline::write_verified(&mut pool, file, ...)`, call `pool.trace_source(path)` (`path` is
-  `entry_path(entry)?`, already in hand).
-- **Item 3, the inter-file gap:** in `run_entries`, time the `busy::retry(... "a slice's write
-  position" ...)` block, and the span from one `write_verified` return to the next one's first
-  block (the pipeline can expose its file-start-to-first-block time). Log both on the per-file
-  `wrote file` line.
-- **Item 4, the write-end sweep:** after the last content entry and before the seal (in the
-  research build only), run `log_pages::sweep` limited to 0x34, 0x14, 0x0c and 0x17, and journal
-  it with a trigger such as `volume write (write-end)`. This needs the store's device closed or
-  idle at that point, and a subset sweep in `log_pages` (none exists).
-- **`TAPECTL_EXP_CROSSFILE`:** one reader and one hasher for the whole Layout, file boundaries
-  as messages, the hasher still withholding each file's last block until its verdict.
-  `run_entries`'s loop then feeds one long-lived pipeline instead of one `write_verified` per
-  entry, and Ctrl-C stays a between-files check on the writer side.
-- **The announcement at session start:** the knobs are announced when the first write pool
-  starts. Calling `research::announce()` at the start of `volume write` would put the banner
-  before the build and positioning phases.
+**Built for the drive phase (2026-10-21)**, the hooks this section first deferred:
+- **The staging path for the trace:** `run_entries` calls `pool.trace_source(path)` before
+  each file, so `file` names it and the disk columns are filled. A no-op with the trace off.
+- **Item 3, the inter-file gap:** each per-file `wrote file` line in the session log ends with
+  `gap N ms` and, for a slice, `position row N ms`. The gap runs from the previous file's
+  pipeline returning to this file's first block reaching the store (the pipeline's
+  `Stats::first_block_at`): the previous file's row, its log line, the pipeline's restart and
+  this file's first read and hash. The first file a call writes has none. The position row is
+  the slice's `write_positions` UPDATE, `busy::retry` waits included. Two clock readings per
+  file, in every build; nothing written to tape or the catalog changes.
+- **Item 4, the write-end sweep: not built.** Every run of §10 ends the same way (the seal and
+  the quick confirm), so the sweep tapectl already journals after each command gives
+  comparable deltas from run to run; a sweep before the seal would need the device idle
+  mid-session and a subset sweep `log_pages` does not have. §10 records the post-command sweep.
+- **`TAPECTL_EXP_CROSSFILE=1`**, in a research build only (`pipeline::crossfile`, compiled only
+  with the feature): one reader and one hasher for the files a write session is about to write,
+  started by one `#[cfg(feature = "research")]` statement before `run_entries`'s loop. The
+  reader runs each file through the per-file pipeline's own reader; the hasher still withholds
+  each file's last block until that file's hash is done and drops it on a mismatch, so the
+  mismatched file is refused exactly as before and the files before it stand; each file's end,
+  with its hash, travels as a message. Each `write_verified` call takes its file's blocks from
+  the one queue, Ctrl-C stays the loop's between-files check, and the first file not written
+  whole and matching ends the carry. The gauges' queue counters carry across files, and the
+  pace, the adaptive pace and the refill judge the queue against what is left of the whole run.
+  Without the feature none of it is compiled: the write loop and `write_verified` are as before.
+- **The announcement at session start:** `volume write` calls `research::announce()` first, after
+  its dry-run refusal and before it resolves a device, so the banner comes before the build and
+  positioning phases. It prints once per process on stderr and once per session log, so the
+  write pool's own call adds nothing.
 
 ---
 
@@ -706,8 +717,8 @@ tapectl --home "$H" volume write "$LABEL" --device /dev/tape/by-id/scsi-HUJ808A5
 - the load (exact commands, start and stop times) and the lever (knob values);
 - the pipeline and host trace (§9);
 - the session log;
-- the write-end sweep (0x34, 0x14, 0x0c, 0x17), the post-command sweep, and the feed-ratio
-  event;
+- the post-command sweep (pages 0x34, 0x14, 0x0c and 0x17 among those tapectl journals after
+  every command; §9.1 says why there is no write-end sweep) and the feed-ratio event;
 - MAM wear before and after;
 - wall times.
 
@@ -736,7 +747,7 @@ tapectl --home "$H" volume write "$LABEL" --device /dev/tape/by-id/scsi-HUJ808A5
 | Run | Load | Lever | Answers |
 |---|---|---|---|
 | R0 | none | none; no drive: the operator decodes 0x34 and 0x14 from the production `log_page_journal` (a read-only copy of a `db backup`) for L6-0001 and L6-0002, beside their `write_feed_ratio` events | what production writes cost already |
-| P0 | L0, L2, L0 | three ~7 GiB writes in one load; the write-end sweep after each | 0x34's semantics (cumulative since load vs recent window); repositions against BOP→EOD excess, which separates stops from fill |
+| P0 | L0, L2, L0 | three ~7 GiB writes in one load; the post-command sweep after each | 0x34's semantics (cumulative since load vs recent window); repositions against BOP→EOD excess, which separates stops from fill |
 | R1 | L0 | today's pipeline (`sha2`, 256 MiB) | the baseline; hasher CPU ≈ wall time confirms §1 item 1 |
 | R2 | L1 | baseline | ladder step 1 |
 | R3 | L2 | baseline | ladder step 2 |
@@ -759,6 +770,23 @@ tapectl --home "$H" volume write "$LABEL" --device /dev/tape/by-id/scsi-HUJ808A5
 - **Drive time:** P0 plus 13 runs at about 8 minutes is about **2 hours**. About 320 GiB is
   written, about 0.13 of the cartridge's capacity, in 16 short erases. Rewinds and confirms add
   passes over the first wraps, which is what the test cartridge is for.
+
+**The script.** `scripts/shaping-drive-phase.sh` runs this protocol on home2, inside tmux, with
+`TAPECTL_HOME` a fresh throwaway home and `TAPECTL_BIN` the research build: `--device
+/dev/tape/by-id/scsi-HUJ808A5L4-nst --i-will-lose-the-cartridge EW7VWMVKF6`. `--print-plan`
+prints the operator's part, the runs and the drive time and touches nothing; `--mhvtl` rehearses
+it on a virtual drive; `--only` reruns some runs in the same home. It refuses as
+`short-seal-acceptance.sh` does, and also a binary that does not announce a research build, a
+`TAPECTL_EXP_*` set by the caller, and a cartridge that is neither blank nor this home's (after
+the acceptance run: retire SSA-0002 and erase the cartridge from the acceptance home first). Where
+this section leaves room it chooses, and `PLAN.txt` says so: P0 writes the protocol's 20 GiB unit
+three times, because `volume write` writes every staged set and a smaller unit would have to be
+staged and released around P0; "baseline" is R1's lever (`sha2`, 256 MiB); R10 takes R9's queue
+and cross-file carry; the L5 loads loop until the write ends; R12's winner is the lowest feed
+ratio of R6-R10, then the fewest repositions. Each run directory keeps the load's commands and
+times, the knobs, the session log and pipeline trace, the post-command sweep, the feed-ratio
+event, and MAM and pages 0x02, 0x03, 0x0c, 0x17, 0x34 and 0x14 before and after the write;
+`results.tsv` holds what is derived from them.
 
 ---
 
