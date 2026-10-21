@@ -3580,6 +3580,13 @@ struct VolumeInfo {
     /// re-confirmation of an aborted session turns on (ADR-0012
     /// 2026-09-23), and that `scripts/first-run.sh` step 13 reads.
     sealed_at: Option<String>,
+    /// Where a short tape ended (#420, `volumes.ended_after`): its seal says
+    /// the tape ends after this file. `None` on a full seal and on a volume
+    /// not sealed.
+    ended_after: Option<i64>,
+    /// The units this volume cut (`writes.status = 'cut'`): planned, past
+    /// the drive's early warning, so not on this tape and never a copy here.
+    cut_units: Vec<String>,
     notes: Option<String>,
     unit_count: i64,
     unit_total_bytes: i64,
@@ -3692,11 +3699,23 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         )
         .map_err(|_| TapectlError::VolumeNotFound(label.to_string()))?;
 
-    let sealed_at: Option<String> = conn.query_row(
-        "SELECT sealed_at FROM volumes WHERE id = ?1",
+    let (sealed_at, ended_after): (Option<String>, Option<i64>) = conn.query_row(
+        "SELECT sealed_at, ended_after FROM volumes WHERE id = ?1",
         rusqlite::params![vol_id],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let cut_units: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT u.name
+             FROM writes w
+             JOIN stage_sets ss ON ss.id = w.stage_set_id
+             JOIN snapshots s ON s.id = ss.snapshot_id
+             JOIN units u ON u.id = s.unit_id
+             WHERE w.volume_id = ?1 AND w.status = 'cut'
+             ORDER BY u.name",
+        )?
+        .query_map(rusqlite::params![vol_id], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
 
     // Units carried: one row per unit, aggregated across every completed
     // write of it that landed on THIS volume. Sorted largest-first so the
@@ -3850,6 +3869,8 @@ fn volume_info(conn: &Connection, label: &str, include_units: bool) -> Result<Vo
         first_write,
         last_write,
         sealed_at,
+        ended_after,
+        cut_units,
         notes,
         unit_count,
         unit_total_bytes,
@@ -3937,6 +3958,30 @@ fn render_sealed_line(sealed_at: Option<&str>) -> String {
     )
 }
 
+/// `volume info`'s ending line (#490): on a tape that sealed short, where it
+/// ended and the units it cut. `None` for any other volume.
+fn render_ending_line(
+    ended_after: Option<i64>,
+    cut_units: &[String],
+    whole_units: i64,
+) -> Option<String> {
+    let k = ended_after?;
+    let cut = if cut_units.is_empty() {
+        "none".to_string()
+    } else {
+        cut_units.join(", ")
+    };
+    let none_whole = if whole_units == 0 {
+        "; no unit is wholly on this tape"
+    } else {
+        ""
+    };
+    Some(format!(
+        "  Ended short: after tape file {k}, at the drive's early warning{none_whole}\n  \
+         Cut (not on this tape): {cut}"
+    ))
+}
+
 /// `volume info`'s verification-history section, one line per session.
 /// Both ends of each verify are printed and named (issue #392): this showed
 /// the start alone while `report verify-status` showed the completion, so
@@ -4004,6 +4049,9 @@ fn print_volume_info(info: &VolumeInfo) {
         render_write_span(info.first_write.as_deref(), info.last_write.as_deref())
     );
     println!("{}", render_sealed_line(info.sealed_at.as_deref()));
+    if let Some(ending) = render_ending_line(info.ended_after, &info.cut_units, info.unit_count) {
+        println!("{ending}");
+    }
     print!(
         "{}",
         crate::cli::report::render_feed_ratio_lines(&info.feed_ratios, info.last_write.is_some())
@@ -7449,6 +7497,88 @@ mod tests {
                 7,
                 "--units lists every unit carried"
             );
+        }
+
+        /// #490: a short volume names where it ended and the units it cut,
+        /// a cut-only one says no unit is wholly on it, and a full or
+        /// unsealed volume prints no ending line.
+        #[test]
+        fn info_names_a_short_ending_and_the_cut_units() {
+            let conn = crate::db::open_memory().unwrap();
+            conn.execute_batch(
+                "INSERT INTO tenants (name, is_operator, status) VALUES ('t', 0, 'active');
+                 INSERT INTO volumes (label, backend_type, backend_name, media_type,
+                                       capacity_bytes, status, ended_after)
+                     VALUES ('L6-SHORT', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', 9),
+                            ('L6-CUT', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', 6),
+                            ('L6-FULL', 'lto', 'lto0', 'LTO-6', 2500000000000, 'sealed', NULL);",
+            )
+            .unwrap();
+            let tenant_id: i64 = conn
+                .query_row("SELECT id FROM tenants WHERE name = 't'", [], |r| r.get(0))
+                .unwrap();
+            // One unit per row, each with its own version and stage set.
+            let add = |unit: &str, label: &str, status: &str| {
+                conn.execute(
+                    "INSERT INTO units (uuid, name, tenant_id, checksum_mode, encrypt, status)
+                     VALUES (?1, ?1, ?2, 'mtime_size', 1, 'active')",
+                    params![unit, tenant_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO snapshots (unit_id, version, snapshot_type, status, source_path)
+                     VALUES (?1, 1, 'full', 'current', '/x')",
+                    params![conn.last_insert_rowid()],
+                )
+                .unwrap();
+                let snap_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO stage_sets (snapshot_id, status, slice_size, total_encrypted_size)
+                     VALUES (?1, 'staged', 524288, 1000)",
+                    params![snap_id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                     SELECT ?1, ?2, id, ?3 FROM volumes WHERE label = ?4",
+                    params![conn.last_insert_rowid(), snap_id, status, label],
+                )
+                .unwrap();
+            };
+            add("a", "L6-SHORT", "completed");
+            add("b", "L6-SHORT", "cut");
+            add("c", "L6-SHORT", "cut");
+            add("d", "L6-CUT", "cut");
+            add("e", "L6-FULL", "completed");
+
+            let short = volume_info(&conn, "L6-SHORT", false).unwrap();
+            assert_eq!((short.ended_after, short.unit_count), (Some(9), 1));
+            assert_eq!(short.cut_units, ["b", "c"]);
+            assert_eq!(
+                render_ending_line(short.ended_after, &short.cut_units, short.unit_count).unwrap(),
+                "  Ended short: after tape file 9, at the drive's early warning\n  \
+                 Cut (not on this tape): b, c"
+            );
+            let json = serde_json::to_value(&short).unwrap();
+            assert_eq!(json["ended_after"], 9);
+            assert_eq!(json["cut_units"], serde_json::json!(["b", "c"]));
+
+            let cut_only = volume_info(&conn, "L6-CUT", false).unwrap();
+            assert_eq!(cut_only.unit_count, 0);
+            let line = render_ending_line(
+                cut_only.ended_after,
+                &cut_only.cut_units,
+                cut_only.unit_count,
+            )
+            .unwrap();
+            assert!(line.contains("no unit is wholly on this tape"), "{line}");
+            assert!(line.ends_with("Cut (not on this tape): d"), "{line}");
+
+            let full = volume_info(&conn, "L6-FULL", false).unwrap();
+            assert_eq!(full.ended_after, None);
+            assert!(full.cut_units.is_empty());
+            assert_eq!(render_ending_line(None, &[], 1), None);
+            assert!(serde_json::to_value(&full).unwrap()["ended_after"].is_null());
         }
 
         /// Acceptance: `volume info` on a nonexistent label errors by name.

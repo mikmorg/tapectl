@@ -629,6 +629,9 @@ pub fn run(
                                 "type": kind,
                             }))
                             .collect::<Vec<_>>(),
+                        // #490: on a tape with no seal it accepts, the
+                        // planned file at which END OF DATA came (R2).
+                        "end_of_data_at": report.end_of_data_at,
                     })
                 );
             } else {
