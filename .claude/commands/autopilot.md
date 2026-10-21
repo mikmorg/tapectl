@@ -19,24 +19,30 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **#420 BUILD IN PROGRESS (2026-10-20, 1.6.0).** The CTO ruled items 110-115 (build now, the acceptance run
-  proves the post-warning readback; fence EVERY 1.6.0 tape; `cut` rows by migration 038; the plan reaches
-  100% of nominal only with `post_warning_bytes`; the readback after any warning; a synthetic filler for
-  the acceptance run). The spec is on master (c576ce8). The integration branch is `p420-short-seal`; master stays
-  green until 1.6.0 is whole. Plan and worker rules: scratchpad `p420/plan.md`, `p420/worker-rules.md`.
-  Waves: 1 = A format+manifest, B tape retry + Store seam + `locate_seal`, C migration 038 + staging
-  release; 2 = D layout.rs/RESTORE.sh, E session.rs, F planning — ALL LANDED on p420 (e7c6793). Then
-  J store.rs chain walk takes the ending (E's blocker), G write.rs + cli (both running), H readers, I
-  e2e + gate hook. #487 is landed (the fill readback's spacing route).
-  **CTO rulings 2026-10-20 later (ADR-0012 items 116-120):** the golden re-pin is pre-authorized for
-  the moves items 111-115 name only (any other moved byte goes to the CTO); the acceptance run is
-  authorized: when the chain is green, NOTIFY the operator to set it up (they load and start it);
-  home2 installs 1.6.0 with `post_warning_bytes = "99008M"`; LBP (#388) after #420 and #478; #482's
-  LTO-5 evidence deferred until asked (label `deferred`). #488: desk research landed; its first
-  build (ring, 0x34 decoder, trace, `research` feature knobs) runs on `pm-488`; its drive phase is
-  approved for the acceptance day, separate load, no L3/R11; decision 9 done (2473468); the disk
-  ruling is on #488. Waiting on the operator: R0's query output (`home2:~/r0.txt`), sdd's long
-  self-test, the drive-poll timer restart.
+- **#420 BUILT: the 1.6.0 CANDIDATE is `p420-short-seal` `c9c5877` (2026-10-21).** Every wave landed
+  (A-K, J the chain walk's ending, #488's first build merged in), 4056/0/24 unit, version 1.6.0,
+  `docs/releases/1.6.0.md`, handoff (g), CLAUDE.md. The golden re-pin is done under item 116
+  (RESTORE.sh d9787a4f, MANIFEST +1 line, a new short-seal pin). The whole chain runs as
+  scratchpad `chain41-all.sh`: lint gnu+musl, unit, check-docs, gate (52 checks), fr414, lifecycle
+  --all, erase proof, pscan, and K's mhvtl acceptance rehearsal (`ssa`). **When it is green:**
+  NOTIFY THE OPERATOR to set up the acceptance run (item 117; handoff (g); both full reads, ruled
+  2026-10-21; about 14-16 h), and tell homorg and lcsas-4c that vm-desk1 stays quiet for it. The tag
+  and the merge to master come AFTER the acceptance run passes. A failed readback stops #420.
+  Plan and residuals: scratchpad `p420/plan.md`.
+  **CTO rulings 2026-10-20 later (ADR-0012 items 116-120):**
+  - the golden re-pin is pre-authorized for the moves items 111-115 name only;
+  - the acceptance run is authorized (the operator loads and starts it);
+  - home2 installs 1.6.0 with `post_warning_bytes = "99008M"`;
+  - LBP (#388) comes after #420 and #478;
+  - #482's LTO-5 evidence is deferred until asked.
+
+  #488:
+  - its drive phase is approved for the acceptance day (separate load, no L3/R11);
+  - decision 9 is done (2473468);
+  - R0 is decoded on #488: both production writes show 0 repositions per 100 MB.
+
+  Waiting on the operator: sdd's long self-test result (`home2:~/sdd.long`, due after 22:00 CST
+  2026-10-20) and the drive-poll timer restart.
 - **QUEUE STATE 2026-10-20 later — the real-drive runs on home2, v1.5.0 installed.**
   Rehearsal GREEN 53/53, #444's verified-erase proof holds (chip proof waits for a never-written
   cartridge), #420's profile done, #388's prototype done
