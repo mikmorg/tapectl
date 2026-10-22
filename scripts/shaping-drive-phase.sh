@@ -3,13 +3,21 @@
 # script (docs/research/2026-10-20-write-shaping.md; ADR-0012 item 117). The operator runs it on
 # home2 inside tmux, with a research build the coordinator built for measuring only.
 #
-# WHAT IT DOES. One ~20 GiB synthetic unit (incompressible) is staged once in a throwaway home;
-# every run then writes it again (`--keep-staging`) onto the test cartridge as a fresh volume
+# WHAT IT DOES. ~20 GiB of synthetic data (incompressible) is staged once in a throwaway home, as
+# two units: shp-unit and the small shp-restore (--restore-size, 1.5 GiB). Every run then writes
+# both again (`--keep-staging`) onto the test cartridge as a fresh volume
 # (SHP-01, SHP-02, ...): the previous volume retired and short-erased, a new one initialised,
 # `host check`, and `volume write` with TAPECTL_PIPELINE_TRACE=1 and the run's TAPECTL_EXP_*
 # knobs, under the run's load. The runs are §10's P0, R1, R2, R3, R5, R6-R10 and R12, with its
 # stop rule. R4 (load L3, the java service) and R11 (CPU pinning) need the host owner and are
 # NOT run (item 117). --print-plan says what each run is and how long it all takes.
+#
+# THE RESTORE-RATE LEG. After the last write, before its volume is retired: shp-restore restored
+# from it by `tapectl restore unit` (the research binary is a release build, and tapectl's restore
+# rate has been measured only in a debug build: 3.0 MiB/s on the 1.6.0 acceptance), then by the
+# RESTORE.sh read off the tape, each restored tree checked against the source's tree checksum
+# (taken at setup, the source then removed) and deleted. restore.tsv records both, with the read
+# phase's line from the restore's session log.
 #
 # A FAIL STOPS THE RUN and leaves the cartridge as the failed command left it: nothing after it
 # writes the medium. The run directory keeps every command's output, each write's session log and
@@ -65,7 +73,10 @@ load and with the write-shaping knobs of one run of the note's §10. OVERWRITES 
                                  where /scratch exists, else ~/.cache/tapectl/shaping.
   --staging DIR                  Where the staged unit, its source and the load files live
                                  (default /srv/google_copy/tapectl-shaping; md3, 67 GB free).
-  --size SIZE                    The synthetic unit (default 20G; --mhvtl 96M).
+  --size SIZE                    The synthetic data, both units (default 20G; --mhvtl 96M).
+  --restore-size SIZE            Of it, the unit the restore-rate leg restores (default 1536M,
+                                 the acceptance's ssa-b-photos; --mhvtl 16M). 0: no such unit
+                                 and no leg. A rerun keeps its home's; 0 then skips the leg.
   --load-file PATH               L5's read load, on the staging filesystem (default
                                  <staging>/load.bin), made once, reused at the right size.
   --vm-host HOST                 Where L1 and L2 run, over ssh (default vm-desk1).
@@ -87,7 +98,7 @@ USAGE
 die() { echo "shaping-drive-phase: REFUSED: $*" >&2; exit 2; }
 
 TAPE_DEV=""; LOSE_SERIAL=""; OUT_DIR=""; MHVTL=0; LOADS=1; LOADS_ASKED=0; STAGING_ROOT=""
-SIZE_ARG=""; LOAD_FILE=""; VM_HOST="vm-desk1"; ONLY=""; LSTAR_ARG=""; WINNER_ARG=""; CLEANUP=0
+SIZE_ARG=""; RESTORE_ARG=""; LOAD_FILE=""; VM_HOST="vm-desk1"; ONLY=""; LSTAR_ARG=""; WINNER_ARG=""; CLEANUP=0
 PRINT_PLAN=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -98,6 +109,7 @@ while [ $# -gt 0 ]; do
         --out) OUT_DIR="${2:-}"; shift 2 ;;
         --staging) STAGING_ROOT="${2:-}"; shift 2 ;;
         --size) SIZE_ARG="${2:-}"; shift 2 ;;
+        --restore-size) RESTORE_ARG="${2:-}"; shift 2 ;;
         --load-file) LOAD_FILE="${2:-}"; shift 2 ;;
         --vm-host) VM_HOST="${2:-}"; shift 2 ;;
         --only) ONLY="${2:-}"; shift 2 ;;
@@ -121,14 +133,18 @@ if [ -z "$OUT_DIR" ]; then
     if [ -d /scratch ]; then OUT_DIR="/scratch/tapectl-shaping"; else OUT_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/tapectl/shaping"; fi
 fi
 if [ "$MHVTL" = 1 ]; then
-    : "${SIZE_ARG:=96M}"; SLICE_SIZE="8M"; PIECE=$((8 * MiB)); LOAD_MIB=256; WRITER_MIB=256
+    : "${SIZE_ARG:=96M}"; : "${RESTORE_ARG:=16M}"; SLICE_SIZE="8M"; PIECE=$((8 * MiB)); LOAD_MIB=256; WRITER_MIB=256
     : "${STAGING_ROOT:=$OUT_DIR/mhvtl-staging}"
 else
-    : "${SIZE_ARG:=20G}"; SLICE_SIZE="1G"; PIECE=$GiB; LOAD_MIB=20000; WRITER_MIB=20000
+    : "${SIZE_ARG:=20G}"; : "${RESTORE_ARG:=1536M}"; SLICE_SIZE="1G"; PIECE=$GiB; LOAD_MIB=20000; WRITER_MIB=20000
     : "${STAGING_ROOT:=/srv/google_copy/tapectl-shaping}"
 fi
 SIZE="$(to_bytes "$SIZE_ARG")"
 [ -n "$SIZE" ] && [ "$SIZE" -gt 0 ] || die "--size '$SIZE_ARG' is not a size (20G, 512M, bytes)"
+RESTORE_SIZE="$(to_bytes "$RESTORE_ARG")"
+[ -n "$RESTORE_SIZE" ] || die "--restore-size '$RESTORE_ARG' is not a size (1536M, 0)"
+[ "$RESTORE_SIZE" -lt "$SIZE" ] || die "--restore-size $RESTORE_ARG is not less than --size $SIZE_ARG: it is part of it"
+RESTORE_UNIT="shp-restore"
 : "${LOAD_FILE:=$STAGING_ROOT/load.bin}"
 WRITER_FILE="$STAGING_ROOT/w.bin"
 
@@ -158,7 +174,9 @@ load_for() {
 }
 
 print_plan() {
-    local gib; gib="$(awk -v b="$SIZE" 'BEGIN { printf "%.1f", b / 1073741824 }')"
+    local gib rgib
+    gib="$(awk -v b="$SIZE" 'BEGIN { printf "%.1f", b / 1073741824 }')"
+    rgib="$(awk -v b="$RESTORE_SIZE" 'BEGIN { printf "%.2f", b / 1073741824 }')"
     cat <<PLAN
 === #488's drive phase: the write-shaping note's §10 (ADR-0012 item 117) ===
 
@@ -173,8 +191,9 @@ BEFORE YOU START (the operator):
      coordinator tells homorg and lcsas-4c.
   4. Run it inside tmux. A FAIL stops the run and leaves the cartridge as it is.
 
-SETUP, once (no drive; about 10 minutes): a throwaway home; one synthetic unit of $gib GiB from
-/dev/urandom under $STAGING_ROOT, staged once in $SLICE_SIZE slices (its source then removed);
+SETUP, once (no drive; about 10 minutes): a throwaway home; $gib GiB of synthetic data from
+/dev/urandom under $STAGING_ROOT as two units, $UNIT and $RESTORE_UNIT ($rgib GiB of it), staged
+once in $SLICE_SIZE slices (their sources then removed, $RESTORE_UNIT's tree checksum kept);
 the load file $LOAD_FILE ($LOAD_MIB MiB, made once, reused at the right size).
 
 EACH RUN, about 8 minutes of drive time: the previous volume retired and short-erased, a new
@@ -183,9 +202,9 @@ and the run's knobs (the seal and the quick confirm are part of it). Log pages a
 just before and just after the write, never during it.
 
 THE RUNS ("baseline" = R1's lever: TAPECTL_EXP_HASH=sha2, the 256 MiB queue)
-  P0a P0b P0c  L0, L2, L0  baseline   page 0x34's semantics. The protocol's own unit, written three
+  P0a P0b P0c  L0, L2, L0  baseline   page 0x34's semantics. The protocol's own data, written three
                                       times, not three ~7 GiB writes: volume write writes every
-                                      staged set, so a smaller unit would have to be staged and
+                                      staged set, so a smaller set would have to be staged and
                                       released around P0; the same question, about 5 more minutes.
   R1   L0   baseline                  the quiet baseline
   R2   L1   baseline                  ladder step 1 (vm-desk1, 8 x sha256sum)
@@ -204,10 +223,16 @@ THE RUNS ("baseline" = R1's lever: TAPECTL_EXP_HASH=sha2, the 256 MiB queue)
   R12a L0 / R12b L*   the winner repeated: of R6-R10, the lowest feed ratio, then the fewest
                       repositions per 100 MB
   NOT RUN: R4 (L3, the java service) and R11 (CPU pinning): both need the host owner (item 117).
+  RESTORE-RATE LEG, once, after the last write and before its volume is retired (no load, about
+  10 minutes at most): $RESTORE_UNIT ($rgib GiB) restored by tapectl restore unit (a release build's
+  rate; the 1.6.0 acceptance's debug build read 3.0 MiB/s), then by RESTORE.sh --restore off the
+  tape; each tree checked against the source's checksum, then deleted. Into restore.tsv.
+  --restore-size 0 makes no such unit and skips the leg.
   The L5 loads loop until the write ends; L1 and L2 are §10's commands, stopped when it ends.
 
 DRIVE TIME: P0 and up to 12 runs, about 8 minutes each: about 2 hours (less if the ladder stops
-early). Every write is ~$gib GiB; the cartridge is left short-erased (File 0 EMPTY) when it passes.
+early), then the restore leg's two reads of $rgib GiB. Every write is ~$gib GiB; the cartridge is
+left short-erased (File 0 EMPTY) when it passes.
 
 THE COMMAND (operator's login on home2, inside tmux):
   TAPECTL_HOME=\$HOME/.cache/tapectl/shp-home-\$(date +%Y%m%d) TAPECTL_BIN=<the research build> \\
@@ -308,11 +333,25 @@ for row in con.execute(sql, args):
 PY
 }
 staged_sets() { dbq "$DB" "SELECT COUNT(*) FROM stage_sets ss JOIN snapshots s ON s.id = ss.snapshot_id
-    JOIN units u ON u.id = s.unit_id WHERE u.name = ? AND ss.status = 'staged'" "$UNIT"; }
+    JOIN units u ON u.id = s.unit_id WHERE u.name = ? AND ss.status = 'staged'" "$1"; }
+UNITS="$UNIT"; [ "$RESTORE_SIZE" = 0 ] || UNITS="$RESTORE_UNIT $UNIT"
 if [ "$FRESH" = 0 ]; then
     [ "$(cat "$STATE/staging-root" 2>/dev/null)" = "$STAGING_ROOT" ] \
         || die "this home staged under '$(cat "$STATE/staging-root" 2>/dev/null)', not --staging $STAGING_ROOT"
-    [ "$(staged_sets)" = 1 ] || die "this home's unit $UNIT is no longer staged (--cleanup ran?): start again in a fresh TAPECTL_HOME"
+    # The units and the restore unit's size are the home's, from its setup; --restore-size 0 only
+    # skips the leg.
+    HOME_RESTORE_SIZE="$(cat "$STATE/restore-size" 2>/dev/null || echo 0)"
+    UNITS="$UNIT"; [ "$HOME_RESTORE_SIZE" = 0 ] || UNITS="$RESTORE_UNIT $UNIT"
+    [ "$RESTORE_SIZE" = 0 ] || RESTORE_SIZE="$HOME_RESTORE_SIZE"
+    for u in $UNITS; do
+        [ "$(staged_sets "$u")" = 1 ] || die "this home's unit $u is no longer staged (--cleanup ran?): start again in a fresh TAPECTL_HOME"
+    done
+    [ "$RESTORE_SIZE" = 0 ] || [ -s "$STATE/restore-source.tree" ] || die "this home has no tree checksum of $RESTORE_UNIT's source ($STATE/restore-source.tree)"
+fi
+if [ "$RESTORE_SIZE" != 0 ]; then
+    for bin in age tar diff tr; do   # RESTORE.sh's tools, as an heir has them
+        command -v "$bin" >/dev/null || die "required binary missing for the restore-rate leg: $bin (or --restore-size 0)"
+    done
 fi
 if [ -n "$ONLY" ]; then
     LSTAR="${LSTAR_ARG:-$(cat "$STATE/lstar" 2>/dev/null || true)}"
@@ -335,6 +374,10 @@ STAGED_NEW=0; SRC_NEW=0; LOAD_NEW=0; WRITER_NEW=0
 [ "$(stat -c %s "$LOAD_FILE" 2>/dev/null || echo 0)" = $((LOAD_MIB * MiB)) ] || LOAD_NEW=$((LOAD_MIB * MiB))
 ! selected R5w || WRITER_NEW=$((WRITER_MIB * MiB))
 NEED=$((SRC_NEW + STAGED_NEW)); [ $((STAGED_NEW + LOAD_NEW + WRITER_NEW)) -le "$NEED" ] || NEED=$((STAGED_NEW + LOAD_NEW + WRITER_NEW))
+# The restore-rate leg restores into the staging filesystem, one tree at a time; RESTORE.sh's
+# decrypted slices sit beside its tree, so about twice the unit.
+RESTORE_PEAK=$((STAGED_NEW + LOAD_NEW + RESTORE_SIZE / 100 * 220))
+[ "$RESTORE_PEAK" -le "$NEED" ] || NEED=$RESTORE_PEAK
 NEED=$((NEED + MARGIN))
 AVAIL="$(df --output=avail -B1 "$SFS" | tail -n 1 | tr -d ' ')"
 [ "$AVAIL" -ge "$NEED" ] || die "$SFS has $((AVAIL / MiB)) MiB free; the unit, its staging and the load files need $((NEED / MiB)) MiB at their peak"
@@ -724,12 +767,15 @@ ratio_of() { cat "$RUN/run-$1/ratio.txt" 2>/dev/null || true; }
 INIT_FORCE=()
 give_up_previous() { # retire PREV (this home's last volume) and short-erase it; or take a blank tape
     if [ -n "$PREV" ]; then
-        # Every run writes the same version: retiring its one copy needs it released first (the
-        # retire floor, ADR-0008 Tier 3), once.
-        if [ "$(dbq "$DB" "SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id
-              WHERE u.name = ? AND s.version = $UNIT_VERSION" "$UNIT")" != reclaimable ]; then
-            run reclaim 0 tctl snapshot mark-reclaimable "$UNIT" --version "$UNIT_VERSION" --force
-        fi
+        # Every run writes the same versions: retiring their one copy needs them released first
+        # (the retire floor, ADR-0008 Tier 3), once.
+        local u
+        for u in $UNITS; do
+            if [ "$(dbq "$DB" "SELECT s.status FROM snapshots s JOIN units u ON u.id = s.unit_id
+                  WHERE u.name = ? AND s.version = $UNIT_VERSION" "$u")" != reclaimable ]; then
+                run "reclaim-$u" 0 tctl snapshot mark-reclaimable "$u" --version "$UNIT_VERSION" --force
+            fi
+        done
         case "$(dbq "$DB" "SELECT status FROM volumes WHERE label = ?" "$PREV")" in
             retired|erased) ;;
             *) run retire 0 tctl --yes volume retire "$PREV" ;;
@@ -779,6 +825,75 @@ do_run() { # <run id>
     derive_results || log "  (results.tsv could not be derived; the raw records are kept)"
 }
 
+# ---------- the restore-rate leg ----------
+tree_listing() { # <dir>: each file and link, sorted, with its sha256 or target; its sha256 is
+    # short-seal-acceptance.sh's tree checksum
+    (
+        cd "$1" || exit 1
+        find . \( -type f -o -type l \) | LC_ALL=C sort | while IFS= read -r p; do
+            if [ -L "$p" ]; then
+                printf 'LINK\t%s\t%s\n' "$p" "$(readlink "$p")"
+            else
+                printf 'FILE\t%s\t%s\n' "$p" "$(sha256sum "$p" | awk '{print $1}')"
+            fi
+        done
+    )
+}
+check_tree() { # <restored dir> <name>: the source's tree, file for file, or FAIL
+    tree_listing "$1" > "$STEP_DIR/tree-$2.txt" || fail "$2: cannot list $1"
+    diff "$STATE/restore-source.tree" "$STEP_DIR/tree-$2.txt" > "$STEP_DIR/tree-diff-$2.txt" \
+        || fail "$2: the restored tree differs from $RESTORE_UNIT's source (tree-diff-$2.txt)"
+    log "  $2: identical to the source (tree checksum $(sha256sum < "$STEP_DIR/tree-$2.txt" | awk '{print $1}'))"
+}
+extract_restore_sh() { # <dir>: RESTORE.sh off the loaded tape, as File 1 tells an heir to
+    mkdir -p "$1"
+    mt -f "$TAPE_DEV" rewind || fail "mt rewind failed"
+    mt -f "$TAPE_DEV" setblk 524288 || fail "mt setblk failed"
+    mt -f "$TAPE_DEV" fsf 2 || fail "mt fsf 2 failed"
+    dd if="$TAPE_DEV" bs=512k 2>"$1/dd.err" | tr -d '\0' > "$1/RESTORE.sh" || fail "dd of File 2 failed"
+    chmod +x "$1/RESTORE.sh"
+    bash -n "$1/RESTORE.sh" || fail "the RESTORE.sh read off the tape does not parse"
+}
+mib_s() { awk -v b="$1" -v s="$2" 'BEGIN { if (s > 0) printf "%.1f", b / s / 1048576 }'; }
+restore_leg() { # the last volume, before it is retired; no load runs
+    local rdir="$STAGING_ROOT/restore-$STAMP" key cbytes pbytes slogs slog read_line done_line t1 t2
+    begin_step 8-restore "the restore rate: $RESTORE_UNIT from $PREV by tapectl restore unit, then by RESTORE.sh"
+    key="$TAPECTL_HOME/keys/$TENANT-primary.age.key"
+    [ -f "$key" ] || fail "the tenant key $key is missing"
+    cbytes="$(dbq "$DB" "SELECT SUM(sl.encrypted_bytes) FROM stage_slices sl JOIN stage_sets ss ON ss.id = sl.stage_set_id
+        JOIN snapshots s ON s.id = ss.snapshot_id JOIN units u ON u.id = s.unit_id
+        WHERE u.name = ? AND ss.status = 'staged'" "$RESTORE_UNIT")"
+    mkdir -p "$rdir"
+    run restore-tapectl 0 tctl restore unit --unit "$RESTORE_UNIT" --from "$PREV" --to "$rdir/tapectl" --device "$TAPE_DEV"
+    t1="$(cat "$STEP_DIR/restore-tapectl.seconds")"
+    slogs=("$TAPECTL_HOME"/logs/*-restore-unit-"$RESTORE_UNIT"-*.log)
+    [ -e "${slogs[0]}" ] || fail "no session log for restore unit $RESTORE_UNIT under $TAPECTL_HOME/logs"
+    slog="${slogs[${#slogs[@]}-1]}"; cp "$slog" "$STEP_DIR/restore-session.log"
+    # The read phase's end, as the session log has it ("done: read ..." on the terminal).
+    read_line="$( (grep -F 'phase end: read ' "$slog" || true) | tail -1 | sed 's/.*phase end: //; s/  */ /g')"
+    done_line="$( (grep -F 'done: read' "$STEP_DIR/restore-tapectl.err" || true) | tail -1 | sed 's/.*done: //; s/  */ /g')"
+    [ -n "$read_line" ] || log "  (the restore's session log has no 'phase end: read' line)"
+    pbytes="$(du -sb "$rdir/tapectl" | cut -f1)"
+    check_tree "$rdir/tapectl" tapectl
+    rm -rf "$rdir/tapectl"
+    extract_restore_sh "$rdir/heir"
+    cp "$rdir/heir/RESTORE.sh" "$STEP_DIR/RESTORE.sh"; mkdir -p "$rdir/tmp"
+    run restore-sh 0 env TAPE_DEVICE="$TAPE_DEV" TMPDIR="$rdir/tmp" "$rdir/heir/RESTORE.sh" \
+        --restore --unit "$RESTORE_UNIT" --key "$key" --to "$rdir/restore-sh"
+    t2="$(cat "$STEP_DIR/restore-sh.seconds")"
+    check_tree "$rdir/restore-sh" restore-sh
+    rm -rf "$rdir"
+    {
+        printf 'path\tlabel\tunit\tciphertext_bytes\tplaintext_bytes\tseconds\tmib_per_s\tread_phase\n'
+        printf 'tapectl restore unit\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$PREV" "$RESTORE_UNIT" "$cbytes" "$pbytes" \
+            "$t1" "$(mib_s "$cbytes" "$t1")" "${read_line:-$done_line}"
+        printf 'RESTORE.sh --restore\t%s\t%s\t%s\t%s\t%s\t%s\t\n' "$PREV" "$RESTORE_UNIT" "$cbytes" "$pbytes" \
+            "$t2" "$(mib_s "$cbytes" "$t2")"
+    } > "$RUN/restore.tsv"
+    log "  tapectl restore unit: ${t1}s, $(mib_s "$cbytes" "$t1") MiB/s (session log: ${read_line:-none}); RESTORE.sh: ${t2}s, $(mib_s "$cbytes" "$t2") MiB/s"
+    end_step
+}
+
 # ============================================================
 print_plan | tee "$RUN/PLAN.txt"
 log "run $RUN"
@@ -817,21 +932,40 @@ if [ "$FRESH" = 1 ]; then
     run config-check 0 tctl config check
     cp "$CFG" "$RUN/config.toml"
     run tenant 0 tctl tenant add "$TENANT"
-    mkdir -p "$STATE"; echo "$STAGING_ROOT" > "$STATE/staging-root"
+    mkdir -p "$STATE"; echo "$STAGING_ROOT" > "$STATE/staging-root"; echo "$RESTORE_SIZE" > "$STATE/restore-size"
     echo "made by scripts/shaping-drive-phase.sh at $STAMP; the drive phase's throwaway home" > "$TAPECTL_HOME/$SENTINEL_NAME"
     SRC="$STAGING_ROOT/src/$UNIT"; mkdir -p "$SRC"
-    log "  the synthetic unit: $SIZE bytes from /dev/urandom under $SRC"
-    left=$SIZE; i=0
+    log "  the synthetic data: $((SIZE - RESTORE_SIZE)) bytes for $UNIT under $SRC"
+    left=$((SIZE - RESTORE_SIZE)); i=0
     while [ "$left" -gt 0 ]; do
         n=$(( left < PIECE ? left : PIECE )); i=$((i + 1))
         head -c "$n" /dev/urandom > "$SRC/blob-$(printf '%03d' "$i").bin" || fail "cannot write the synthetic unit under $SRC"
         left=$((left - n))
     done
     run unit 0 tctl unit init "$SRC" --tenant "$TENANT" --name "$UNIT"
-    run snapshot 0 tctl snapshot create "$UNIT"
-    run stage 0 tctl --yes stage create "$UNIT"
-    [ "$(staged_sets)" = 1 ] || fail "stage create left no staged set for $UNIT"
-    rm -rf "$STAGING_ROOT/src"   # every write reads the staged slices, never the source
+    if [ "$RESTORE_SIZE" != 0 ]; then
+        # Shaped like the acceptance's ssa-b-photos: six raw files, an index, a nested leaf.
+        RSRC="$STAGING_ROOT/src/$RESTORE_UNIT"; mkdir -p "$RSRC/raw" "$RSRC/nested/deeper"
+        log "  and $RESTORE_SIZE bytes for $RESTORE_UNIT under $RSRC"
+        for i in 1 2 3 4 5 6; do
+            head -c $((RESTORE_SIZE / 6)) /dev/urandom > "$RSRC/raw/img-$i.raw" || fail "cannot write $RSRC"
+        done
+        echo "the restore-rate leg's unit, $STAMP" > "$RSRC/index.txt"
+        echo "deep leaf" > "$RSRC/nested/deeper/leaf.txt"
+        run unit-restore 0 tctl unit init "$RSRC" --tenant "$TENANT" --name "$RESTORE_UNIT"
+    fi
+    for u in $UNITS; do
+        run "snapshot-$u" 0 tctl snapshot create "$u"
+        run "stage-$u" 0 tctl --yes stage create "$u"
+        [ "$(staged_sets "$u")" = 1 ] || fail "stage create left no staged set for $u"
+    done
+    if [ "$RESTORE_SIZE" != 0 ]; then
+        # What both restores are checked against, the source then gone.
+        tree_listing "$RSRC" > "$STATE/restore-source.tree" || fail "cannot list $RSRC"
+        cp "$STATE/restore-source.tree" "$STEP_DIR/restore-source.tree"
+        log "  $RESTORE_UNIT's tree checksum: $(sha256sum < "$STATE/restore-source.tree" | awk '{print $1}')"
+    fi
+    rm -rf "$STAGING_ROOT/src"   # every write reads the staged slices, never the sources
 fi
 if [ "$(stat -c %s "$LOAD_FILE" 2>/dev/null || echo 0)" != $((LOAD_MIB * MiB)) ]; then
     log "  the load file: $LOAD_MIB MiB from /dev/urandom into $LOAD_FILE"
@@ -900,12 +1034,14 @@ PY
     fi
 fi
 
-# ------------------------------------------------------------ the end
+# ------------------------------------------------------------ the restore rate, then the end
+if [ "$RESTORE_SIZE" != 0 ] && [ -n "$PREV" ]; then restore_leg; fi
 begin_step 9-end "the last volume retired and the cartridge short-erased, so it is left as found"
 give_up_previous
 PREV=""; rm -f "$STATE/last-label"
 if [ "$CLEANUP" = 1 ]; then
-    run release 0 tctl staging clean --unit "$UNIT" --force
+    CLEAN_ARGS=(); for u in $UNITS; do CLEAN_ARGS+=(--unit "$u"); done
+    run release 0 tctl staging clean "${CLEAN_ARGS[@]}" --force
     rm -f "$LOAD_FILE"; log "  --cleanup: the staged unit released and $LOAD_FILE removed"
 fi
 end_step
@@ -915,6 +1051,7 @@ derive_results
     echo "RESULT: PASS"
     echo "runs: $(tr '\n' ' ' < "$RUN/runs.order")"
     cat "$RUN/decisions.txt"
+    [ ! -s "$RUN/restore.tsv" ] || cat "$RUN/restore.tsv"
     echo "the cartridge is short-erased (File 0 EMPTY); the derived figures are in results.tsv"
 } > "$RUN/RESULT.txt"
 column -t -s $'\t' "$RUN/results.tsv" 2>/dev/null | tee -a "$RUN/run.log" || cat "$RUN/results.tsv"

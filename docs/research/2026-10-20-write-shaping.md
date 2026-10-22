@@ -786,7 +786,12 @@ and cross-file carry; the L5 loads loop until the write ends; R12's winner is th
 ratio of R6-R10, then the fewest repositions. Each run directory keeps the load's commands and
 times, the knobs, the session log and pipeline trace, the post-command sweep, the feed-ratio
 event, and MAM and pages 0x02, 0x03, 0x0c, 0x17, 0x34 and 0x14 before and after the write;
-`results.tsv` holds what is derived from them.
+`results.tsv` holds what is derived from them. Last, before the last volume is retired, a
+restore-rate leg (asked for after the 1.6.0 acceptance, whose debug build's `restore unit`
+decrypted at 3.0 MiB/s where RESTORE.sh took a quarter of the time): the 20 GiB is staged as two
+units, and the small one (`--restore-size`, 1.5 GiB like the acceptance's ssa-b-photos) is
+restored by `tapectl restore unit` with the release research build and then by RESTORE.sh, each
+tree checked against the source's tree checksum and deleted, into `restore.tsv`.
 
 ---
 
