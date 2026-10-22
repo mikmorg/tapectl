@@ -1040,7 +1040,9 @@ RESTORE.sh's modes, in 1.6.0:
 From 1.7.0, `--info`'s file map and `--verify` print **one** `NOT ON TAPE` line for the planned
 files past the end of every short tape, span or not, instead of one line per position (ADR-0012
 item 140). The line names the first and the last planned position after `ended_after` (K+1 and
-M, the planned seal) and says that the seal is file K+1. It is still not a failure. RESTORE.sh's
+M, the planned seal entry, which the file map and `--verify` list; `--info`'s sentence above
+counts the planned files to M-1) and says that the seal is file K+1. It is still not a failure.
+RESTORE.sh's
 other modes on a range are §4.4's.
 
 tapectl, in 1.6.0:
