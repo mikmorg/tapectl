@@ -2074,7 +2074,10 @@ Ruled 2026-10-21, on the forks #478's build plan found (scratchpad `p478/plan.md
      `volume-format-v2.md` §4.2. It is within item 135's authorization.
 141. **File 1's catalog query for the heir includes range rows**, with their slice runs, so an heir
      querying the envelope's `catalog.db` finds a spanning unit on its tapes. It is within item
-     135's authorization.
+     135's authorization. (Correction of fact, 2026-10-22: the query File 1 gives the heir reads
+     the Heir Kit's catalogue, `catalog.db.age`, whose `writes` table holds the range rows. The
+     operator envelope's `catalog.db` has no `writes` table, `volume-format-v2.md` §1.4. The
+     ruling stands for the catalogue the query reads.)
 142. **`volume rewrite` never writes a range.** A spannable unit a rewrite carries is planned and
      recorded as whole, and is cut if the early warning comes, as in 1.6.0. This follows 1.6.0's
      rule that a rewrite never plans past the fill ceiling, because it may hold a unit's only copy.
