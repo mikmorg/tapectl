@@ -42,9 +42,14 @@ total, not an end-reservation).
    fits the fill budget is gated as before; further whole units are appended
    while the plan's end stays at or below 100% of the cartridge's nominal
    capacity, and only when the drive declares `post_warning_bytes`. Without
-   that key the plan stops at the fill ceiling as before.
+   that key the plan stops at the fill ceiling as before. Since 1.7.0 a
+   spannable set is planned past that bound, to its end, and the plan order
+   puts owed runs first and spannable sets last ("Spanning" below).
 2. Every staged slice exists on disk at its recorded encrypted size, and has a
-   recorded sha256. Under `--prewrite-hash` it must also match that sha256 (a
+   recorded sha256 (since 1.7.0, every staged slice the Layout writes: a
+   spannable set's slice that this tape does not plan is listed only in the
+   manifest, and needs no file, `volume-format-v2.md` §4.4). Under
+   `--prewrite-hash` it must also match that sha256 (a
    full streamed hash); by default it is not read (ADR-0012, "Amendment,
    2026-09-30 (later)" — at production size the read costs hours per copy, and
    the inline re-hash below already keeps a rotted slice off a sealed tape).
@@ -98,9 +103,10 @@ transition.
 
 ## Session states and persistence (children #22, #25, #26)
 
-The schema carried the vocabulary when v2 was designed, and one `writes`
-state has been added since: **`cut`** (migration 038, 1.6.0, ADR-0012 item
-112), for the short ending. Mapping (one session = the set of `writes` rows
+The schema carried the vocabulary when v2 was designed, and two `writes`
+states have been added since: **`cut`** (migration 038, 1.6.0, ADR-0012 item
+112), for the short ending, and **`range`** (migration 039, 1.7.0, ADR-0012
+item 121), for spanning. Mapping (one session = the set of `writes` rows
 sharing a volume + started_at, driven as a unit; `write_positions` rows are
 the cursor):
 
@@ -109,8 +115,9 @@ the cursor):
 | Planned | `planned` | Layout validated, rows inserted, nothing on tape. |
 | Executing | `in_progress` | Store is executing entries; `write_positions` advances `pending → writing → written`. |
 | Interrupted | `interrupted` | SIGINT (clean mark) **or** startup sweep found an orphaned `in_progress` row whose volume lock is free (crash, #376). Resumable while the Layout revalidates. |
-| Sealed | `completed` | Confirm readback passed. Terminal. On a short-sealed volume, only a stage set whose every slice is at or before `ended_after`. |
-| Cut | `cut` | (1.6.0) Confirm readback passed on a **short-sealed** volume, and this stage set has a slice planned after `ended_after`: the one the early warning interrupted, and every one planned after it. Terminal. **Never a copy.** Its `write_positions` rows stay as written: slices that reached the tape stay recorded (spanning, #478, uses them). It does not block releasing staging once the version has a `completed` write elsewhere. Exists only on a sealed volume with `ended_after` set; an aborted session is never `cut`. |
+| Sealed | `completed` | Confirm readback passed. Terminal. On a short-sealed volume, only a stage set whose every slice is at or before `ended_after`. (1.7.0) For a write that may span, only when every slice of the stage set, 1 to N, is on this volume at or before `ended_after` ("Confirm of a short ending"). |
+| Cut | `cut` | (1.6.0) Confirm readback passed on a **short-sealed** volume, and this stage set has a slice planned after `ended_after`: the one the early warning interrupted, and every one planned after it. Terminal. **Never a copy.** Its `write_positions` rows stay as written: slices that reached the tape stay recorded (spanning, #478, uses them). It does not block releasing staging once the version has a `completed` write elsewhere. Exists only on a sealed volume with `ended_after` set; an aborted session is never `cut`. (1.7.0) A write that may span is `cut` only when none of its set's slices is on the tape. |
+| Range | `range` | (1.7.0) Confirm readback passed, the write may span (`writes.may_span`), and this volume holds some but not all of the stage set's slices at or before `ended_after`, on a full seal or a short one. The range is the row's `written` positions, with `pending` past the cut (ADR-0012 item 121). Terminal. Counts towards a copy slice by slice, never as a copy on its own (item 127). Never holds staging as an unfinished write would, and its slices count where a `cut` row's do not (item 129). Exists only on a sealed volume. |
 | Aborted | `aborted` | Operator explicitly abandoned an interrupted session; resume revalidation failed unrecoverably; **or** the tape ended where no seal can follow: the hard end inside a slice or a seal (more than 16 refusals of one block in a row), a refused filemark, or an early warning before the first data slice (`volume-format-v2.md` §4.3 W6; clean abort, no salvage). An early warning anywhere else seals short ("The short ending" below). Terminal; the tape is not a copy. |
 | Failed | `failed` | Store error other than EOT/interrupt (device gone, I/O error) with no transition available. Terminal unless operator retries → new validation → resume semantics. |
 
@@ -158,6 +165,13 @@ resume or a rebuild, from the seal it located (`volume-format-v2.md` §1.2 rule
 `ended_after` set, and every `completed` row there has all its slices at
 positions at or before it.
 
+**`writes.may_span`** (migration 039, 1.7.0, ADR-0012 item 121) says whether
+the write may span: frozen when the write is planned, and read from the row
+by everything after ("Spanning" below). A `range` row has `may_span` set (a
+CHECK in migration 039). Invariants `audit` checks for a `range` row: it has
+at least one `written` position, its `written` positions are at or before the
+volume's ending, and they are one unbroken run in slice order.
+
 ADR-0012: `initialized` is the only status `volume write` and `volume resume`
 may target. Every other status is refused by status, before either command does
 anything else, and no flag overrides it. Only `sealed` volumes contribute
@@ -183,7 +197,8 @@ distinction the guard has to get right.
 a backup taken between `volume init` and `volume write`, then given the tape's
 contents by `catalog rebuild --from-volume`, holds the volume as `initialized`
 with no `sealed_at`, condition `ok`, and nothing but `completed` `writes` rows
-(`adopt_lost::is_lost_write`). `volume resume` ADOPTS that row instead of
+(`adopt_lost::is_lost_write`; `cut` rows too since 1.6.0, and `range` rows
+since 1.7.0). `volume resume` ADOPTS that row instead of
 refusing it, on all of the following, refusing by the first unmet one:
 
 1. the tape's File 0 uuid equals the catalog row's, and a valid seal marker
@@ -200,7 +215,10 @@ refusing it, on all of the following, refusing by the first unmet one:
    `volume-format-v2.md` §1.2 rule 6, the hashes are compared only at or
    before its `ended_after`, and a stage set with a slice after it is not
    whole but cut: adoption records it `cut` and records `ended_after`, as a
-   passing short confirm does ("The short ending" below).
+   passing short confirm does ("The short ending" below). Since 1.7.0 a set
+   whose block states `may_span = true` is split as confirm splits it,
+   `completed`, `range` or `cut`, and a `range` row is adopted (ADR-0012
+   item 130).
 
 Adoption writes what a passing confirm writes — `status = 'sealed'`,
 `sealed_at` from the seal marker's own time, the write bookkeeping, the
@@ -264,6 +282,9 @@ ending" below, the bytes `volume-format-v2.md` §4.1–§4.3):
                                      cut; volumes.ended_after = K.
                                      Full: as before.
 ```
+
+Since 1.7.0 a write that may span takes a third outcome, `range`, on either
+ending ("Confirm of a short ending", "Spanning").
 
 Rules that hold in every path:
 - **Metadata is generated from the Layout, never from what happened to get
@@ -515,6 +536,27 @@ in one transaction:
 A mismatch takes the three outcomes in "Transitions" (quarantine, inconclusive,
 pass). An `ended_after` disagreement (`ended_after_disagrees`) is inconclusive.
 
+**A write that may span** (1.7.0, ADR-0012 items 121 and 128). For a row
+whose `writes.may_span` is set, confirm splits three ways, and on a full seal
+as on a short one: a continuation's range can end a tape that seals full, and
+a set can be whole on a short tape. `ended_after` is M-1 on a full seal.
+- `completed` when every slice of the stage set, 1 to N, is `written` on this
+  volume at or before `ended_after`: the volume holds the set whole and is a
+  copy of it (item 93's middle tape);
+- `range` when at least one is: the range is the row's `written` positions,
+  and the row's `write_positions` past the cut stay `pending` (item 121);
+- `cut` when none is.
+
+A row whose `may_span` is not set keeps the rule above. The snapshot of a
+`completed` set is promoted `current` as today, and that of a `range` set
+when the promotion rule holds ("Spanning" below), this volume counted. The
+`write_completed` event names the range units, with their slice runs, as it
+names the cut units. `catalog rebuild` and the adoption of a lost write make
+the same three-way split from the tape (`volume-format-v2.md` §4.4). That is
+how item 130's "the row is `range` when the block says `may_span`" is read
+for a block whose every slice, or none, is on the tape: so a rebuilt tape
+gets the row its confirm gave it.
+
 **After a short seal.** The command exits 0 (a short seal is a success), names
 the cut units and says what writes them: an ordinary `volume write` of the same
 staged sets onto another cartridge. The staging release (#440,
@@ -523,6 +565,33 @@ neither counts as a copy nor holds the staging as an unfinished write would.
 So a cut unit stays staged until its version has a `completed` write, and from
 then on it is released by the same rule as any other (ADR-0012 item 112).
 
+From 1.7.0 the command also names each unit the tape ended in as a range, with
+the slices it holds, and says that an ordinary `volume write` onto another
+cartridge of the same generation continues it ("Spanning" below).
+
+**Per-slice release** (1.7.0, ADR-0012 items 85 and 129). Staging is released
+slice by slice. After a write, each slice whose copies (item 127) meet its
+set's copy floor is released:
+in one transaction its `stage_slices.staging_path` is cleared and
+`stage_slices.released_at` (migration 039) is set, and then its file is
+removed. The release of the set's last slice moves the set to `cleaned`. The
+#402 checks, which refuse a staged slice missing on disk, accept a missing file
+only when `released_at` is set. The release gate's refusal names the slices
+still short of copies (a `ReleaseBlocker` variant of its own). A `range` row is
+terminal: like a `completed` row it never holds staging as an unfinished write
+would, and unlike a `cut` row its slices count. A set with no `range` row has
+every slice on the same volumes, so for it this is the whole-set release of
+1.6.0. `--keep-staging` keeps
+every slice. `volume read-slices` that stages a released slice again clears
+its `released_at`.
+
+Per-slice release is safe only with item 128's floor ("Spanning" below). At a
+copy target of 1, slices 1..K are released after tape 1 while the version is
+not yet current; without the floor, retiring tape 1 would leave 1..K nowhere.
+Releasing the whole set only once its least-covered slice meets the floor was
+considered and not chosen: staging would hold the unit for the whole span,
+against item 85.
+
 **Later contacts.** `volume verify` reads `ended_after` from
 `volumes.ended_after` and walks positions 0 to it (`volume-format-v2.md` §5).
 `catalog rebuild` and the adoption of a lost write locate the seal, record
@@ -530,6 +599,127 @@ then on it is released by the same rule as any other (ADR-0012 item 112).
 rule as confirm. `volume rewrite` (#483) reads only `completed` writes; when its
 destination seals short, the rewrite stays open, the cut slices stay pinned in
 staging, and the command names `volume write` for them.
+
+From 1.7.0 (ADR-0012 items 127, 130, 133):
+- `catalog rebuild` and adoption split a row that may span three ways, as
+  confirm does (above). A rebuild records all N slice rows of the set from the
+  manifest, and `write_positions` only for the slices this tape's plan holds:
+  `written` at or before `ended_after`, `pending` after. It promotes a version
+  only by the rule in "Spanning", so a rebuild of one tape of a span leaves the
+  version `staged`, reading 0 copies until its other tapes are rebuilt.
+- `volume verify` sets `writes.write_verified` on a `range` row it read back in
+  full, as on a `completed` one.
+- `volume rewrite` refuses a source volume that holds a range, naming the
+  range (item 133), and plans every write it makes with `may_span` unset (item
+  142). Compaction (`volume compact-read`, `volume compact-finish`, `volume
+  compact`) refuses a volume that holds a range in the same way.
+
+## Spanning (#478, tapectl 1.7.0)
+
+Ruled 2026-10-16 to 2026-10-21 (ADR-0012 items 82-95 and 121-143). What
+reaches the tape, and how a reader reads a range, is `volume-format-v2.md`
+§1.2 and §4.4; this section is the session's and the catalog's side.
+CONTEXT.md defines Spanning, Range and Cut. A session still writes one tape:
+each tape of a span is its own write session.
+
+**The frozen flag** (items 82 and 121). A unit allows spanning through the
+policy key `allow_spanning`, resolved like the other policy keys (the unit's
+dotfile, then its archive set, then `[defaults]`) and off by default. Whether
+a stage set's write may span is decided when the write is planned and stored on
+its row as `writes.may_span`, because the dotfile is read at use and may change
+while a span is in progress. Everything after the plan reads the row: the build
+(File 0's and the seal placeholder's `requires`, `volume-format-v2.md` §1.2),
+the seal, confirm and resume. A rehydrated session reads it from the rows and
+never resolves the policy again. A write of a set that already has a `range`
+row on some volume is planned with `may_span` set even when the key has since
+been turned off, so a span in progress can always finish. `volume rewrite`
+plans every write with `may_span` unset: a spannable unit it carries is planned
+and recorded whole, and is cut if the early warning comes, as in 1.6.0 (item
+142), because a rewrite never plans past the fill ceiling.
+
+**What the plan works from** (items 122 and 127). The catalog records no copy
+or span identity: no table says which tapes make up which copy. The planner
+works from per-slice shortfalls. A slice's copies are the distinct eligible
+volumes holding a `written` position of it in a `completed` or `range` row. A
+slice is **owed** while its copies are below its set's copy floor. A spannable
+set's Layout entries are only the slices this tape plans; its manifest block
+lists every slice (`volume-format-v2.md` §4.4).
+
+**The plan order** (items 83, 94, 95, 99, 113, 122 and 123). On each tape, in
+this order:
+1. **Owed runs.** A spannable set with a `range` row on a sealed volume and
+   slices still owed is a span in progress. Its owed slices are laid out first,
+   as one unbroken run in slice order, from its lowest owed slice to its
+   highest, inclusive.
+2. **Whole units,** those that may not span, as in 1.6.0: committed up to the
+   fill ceiling, and with no spannable set queued, planned past it within item
+   113's bound (items 99 and 113). Whole units planned after a span's tail keep
+   item 113's bound.
+3. **Spannable sets** with no range yet, last (items 83 and 95), so that
+   whatever ends the tape cuts a unit that allows it. The first one that
+   crosses item 113's bound is planned to its end, and the early warning, not
+   the plan, ends its range (items 84 and 123). No set is planned after it.
+   Several queued sets go in the order the write takes them.
+
+A volume holds at most one unbroken range of a stage set (item 122). With a
+copy target of 2 this order gives item 93's layout. Tape 1 ends in the set's
+range 1..K. On tape 2 the owed run is the whole set (slices 1..K owe one more
+copy, K+1..N two), so tape 2 begins with it and holds it whole. Tape 3 begins
+with the owed run K+1..N. The rows are `range`, `completed` and `range`, and
+every slice is on two volumes.
+
+**A spannable set larger than one tape** (item 94) may span, and does not
+wait behind whole units. It starts as early on its first tape as it needs to
+touch the fewest tapes, by an estimate of where the early warning comes taken
+at the cartridge's nominal capacity. The whole units it, or an owed run, leaves
+no room for are deferred to a later tape, not refused, so they fill in after
+its tail on its last tape and tape fill is unchanged. Item 93's whole-tape copy
+cannot exist for such a set; its copies combine slice by slice. A spannable set
+that fits on one tape keeps item 83's place (item 95).
+
+**Refusals.**
+- **No `post_warning_bytes`** (item 123): on a drive that does not declare
+  the key, a spannable set that would pass the fill ceiling is refused, and
+  the refusal names the key.
+- **One generation per copy's span** (item 86): a run that does not start at
+  slice 1 is planned only on a cartridge of the generation of the volume
+  whose range ends just before it. Otherwise the write is refused.
+- **A released owed slice:** an owed slice whose staged file was released is
+  refused, naming `volume read-slices --from` to stage it again (#402's shape).
+- **At stage time** (items 17, 82, 85 and 94): a spannable unit is staged
+  whole before its first tape is written. One larger than the staging area
+  (the filesystem's total size, not its free space) is refused by name. A unit
+  that does not allow spanning is still refused above one tape, and the
+  refusal names the key.
+
+**Promotion and the retire floor** (item 128). A spanning version becomes
+`current` once every slice of one of its stage sets is on a sealed volume:
+each has a `written` position in a `completed` or `range` row on a volume
+whose status is `sealed`, the volume being sealed counted. Confirm, the
+adoption of a lost write and `catalog rebuild` promote by this rule, in the
+transaction that records the seal or the rebuild. Until then the version stays
+`staged`, and the retire floor protects it: `versions_at_stake` holds a version
+that has a `range` row on an eligible volume at stake when that volume is the
+only holder of any of its slices (`sole_slices`, widened to match). `audit`
+names a span still in progress and the slices it is missing. Promoting at the
+first range's seal (the unit would read 0 copies for the whole span) was
+considered and not chosen.
+
+**Copies, places and deposits** (items 127, 134 and 138). A version's copies
+are, for each of its stage sets, the copies of the set's least-covered slice,
+summed over the sets; slices of two stage sets never combine. Each tape,
+deposit and place is credited to one stage set only, the lowest-numbered
+stage set of the version that it holds (item 138). Locations use the same
+minimum, and a deposit of a range volume counts for that range. A stage set
+with no slice rows counts its whole writes. The planner does not know where a
+tape will be kept, so item 93's "one location" is met after the plan: the
+write names the tapes that make up each whole copy of a spanning version
+("keep these together"), and `audit`'s per-slice location count checks where
+they went (item 134).
+
+**Wear** (item 98). A tape that ends in a range records its real end in the
+`write_early_warning` event, as every tape that saw the warning does ("The
+short ending").
 
 ## Store seam (child #71)
 
@@ -581,8 +771,7 @@ same signatures without violence (#72, phase 3).
 
 ## Out of scope here
 
-Multi-volume spanning (designed in ADR-0012 items 82-95 and built after the
-short ending, #478; not here), warehouse mechanics (phase 3,
+Warehouse mechanics (phase 3,
 ADR-0006), compaction's use of sessions (compaction writes are ordinary
 sessions; `compact-finish`'s extra guards are unchanged), and exact Rust types
 (children's work).
