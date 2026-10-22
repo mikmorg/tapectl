@@ -182,9 +182,12 @@ print_plan() {
 
 BEFORE YOU START (the operator):
   1. Read the short-seal acceptance run's result first. Then clean its cartridge FROM ITS HOME
-     (it holds SSA-0002, which only that home can give up):
-       tapectl --home <the acceptance home> --yes volume retire SSA-0002
-       tapectl --home <the acceptance home> cartridge erase --device <this drive> --confirm-label SSA-0002
+     (it holds SSA-0002, which only that home can give up), with THE ACCEPTANCE'S tapectl (an
+     installed 1.5.0 refuses that home's catalog). SSA-0002 holds ssa-z-tail's only copy, so the
+     retire is refused until that snapshot is reclaimable:
+       <its tapectl> --home <the acceptance home> snapshot mark-reclaimable ssa-z-tail --version 1 --force
+       <its tapectl> --home <the acceptance home> --yes volume retire SSA-0002
+       <its tapectl> --home <the acceptance home> cartridge erase --device <this drive> --confirm-label SSA-0002
   2. Leave the test cartridge EW7VWMVKF6 loaded in the HP LTO-6 (HUJ808A5L4). Every run writes it.
   3. Nothing else on the drive for the whole run:  sudo systemctl stop tapectl-drive-poll.timer
      (start it again afterwards). vm-desk1 quiet but for the loads this script starts there: the
@@ -463,9 +466,11 @@ erase_probe() { # <home> <out base>: RC, PROBE_OUTCOME, PROBE_CONFIRM
         PROBE_OUTCOME="$(json_get "$2.out" 'd["outcome"]')"; PROBE_CONFIRM="$(json_get "$2.out" 'd.get("confirm_label")')"
     fi
 }
-cleanup_hint="clean it from the home that wrote it first. After the short-seal acceptance run that is
-  tapectl --home <the acceptance home> --yes volume retire SSA-0002
-  tapectl --home <the acceptance home> cartridge erase --device $TAPE_DEV --confirm-label SSA-0002"
+cleanup_hint="clean it from the home that wrote it first. After the short-seal acceptance run that is,
+with the acceptance's own tapectl (an installed 1.5.0 refuses that home's catalog):
+  <its tapectl> --home <the acceptance home> snapshot mark-reclaimable ssa-z-tail --version 1 --force
+  <its tapectl> --home <the acceptance home> --yes volume retire SSA-0002
+  <its tapectl> --home <the acceptance home> cartridge erase --device $TAPE_DEV --confirm-label SSA-0002"
 if [ "$FRESH" = 1 ]; then
     probe "$PROBE_HOME" backend add --name probe --device-tape "$TAPE_DEV" --generation LTO-6 >"$PRE/probe-backend.out" 2>&1 \
         || die "the probe home could not add the drive (see $PRE/probe-backend.out)"
