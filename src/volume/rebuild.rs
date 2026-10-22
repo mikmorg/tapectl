@@ -1064,24 +1064,24 @@ fn attest_escrow(
     // #420 (`volume-format-v2.md` §4.2 R3): on a tape that ended early no
     // position after `ended_after` is read. A unit whose first slice lies
     // past it is not on this tape at all, and stays unknown here.
+    //
+    // A first slice with no `tape_position` (a range's slice planned on
+    // another tape, ADR-0012 item 125) is not on this tape either.
     let ended_after = report.ended_after;
-    let on_tape = |s: &envelope::ManifestSlice| {
-        ended_after.is_none_or(|k| u64::try_from(s.tape_position).is_ok_and(|p| p <= k))
-    };
-    let mut firsts: Vec<(&envelope::ManifestUnit, &envelope::ManifestSlice)> = manifest
+    let on_tape =
+        |position: i64| ended_after.is_none_or(|k| u64::try_from(position).is_ok_and(|p| p <= k));
+    let mut firsts: Vec<(&envelope::ManifestUnit, &envelope::ManifestSlice, i64)> = manifest
         .units
         .iter()
         .filter_map(|unit| {
-            unit.slices
-                .iter()
-                .min_by_key(|s| s.number)
-                .filter(|first| on_tape(first))
-                .map(|first| (unit, first))
+            let first = unit.slices.iter().min_by_key(|s| s.number)?;
+            let position = first.tape_position.filter(|&p| on_tape(p))?;
+            Some((unit, first, position))
         })
         .collect();
-    firsts.sort_by_key(|(_, first)| first.tape_position);
+    firsts.sort_by_key(|&(_, _, position)| position);
 
-    for (unit, first) in firsts {
+    for (unit, first, position) in firsts {
         // The stage set whose first slice IS the one about to be read (issue
         // #379): a Version can have several stage sets, and attesting one
         // from another's slice header would record a claim no slice of it
@@ -1110,10 +1110,8 @@ fn attest_escrow(
         };
 
         let mut head = Vec::new();
-        if let Err(e) =
-            store.read_file_head(first.tape_position as u32, ATTEST_HEAD_BYTES, &mut head)
-        {
-            tracing::warn!(unit = %unit.name, position = first.tape_position, error = %e,
+        if let Err(e) = store.read_file_head(position as u32, ATTEST_HEAD_BYTES, &mut head) {
+            tracing::warn!(unit = %unit.name, position, error = %e,
                 "attest: could not read the slice header; leaving coverage unknown");
             report.escrow_attest_unreadable += 1;
             continue;
@@ -1132,13 +1130,13 @@ fn attest_escrow(
                 report.attested += 1;
             }
             Err(age::DecryptError::NoMatchingKeys) => {
-                tracing::warn!(unit = %unit.name, position = first.tape_position,
+                tracing::warn!(unit = %unit.name, position,
                     "attest: the escrow key is not a recipient of this slice, so it cannot \
                      attest this stage set; coverage stays unknown");
                 report.escrow_attest_not_recipient += 1;
             }
             Err(e) => {
-                tracing::warn!(unit = %unit.name, position = first.tape_position, error = %e,
+                tracing::warn!(unit = %unit.name, position, error = %e,
                     "attest: slice header did not parse; leaving coverage unknown");
                 report.escrow_attest_unparseable += 1;
             }
@@ -2010,8 +2008,12 @@ fn insert_all(
         // contacts"): on a short tape a unit is on it whole only when every
         // slice lies at or before `ended_after`, as a passing short confirm
         // splits the rows; every other unit is cut.
-        let on_tape =
-            |s: &envelope::ManifestSlice| ended_after.is_none_or(|k| s.tape_position <= k);
+        // A slice with no `tape_position` (a range's slice planned on
+        // another tape, ADR-0012 item 125) is not on this tape.
+        let on_tape = |s: &envelope::ManifestSlice| {
+            s.tape_position
+                .is_some_and(|p| ended_after.is_none_or(|k| p <= k))
+        };
         let written = if !sealed {
             Written::Aborted
         } else if unit.slices.iter().all(on_tape) {
@@ -2588,6 +2590,12 @@ fn ensure_position(
     laid_down: bool,
     report: &mut RebuildReport,
 ) -> Result<()> {
+    // A slice this tape does not plan (a range's slice on another tape,
+    // ADR-0012 items 125, 130) has no position here, and so no row: the
+    // column is NOT NULL, and a rebuild records only what the tape shows.
+    let Some(position) = slice.tape_position else {
+        return Ok(());
+    };
     if existing_id(
         tx,
         "SELECT id FROM write_positions WHERE write_id = ?1 AND stage_slice_id = ?2",
@@ -2616,7 +2624,7 @@ fn ensure_position(
             params![
                 write_id,
                 stage_slice_id,
-                slice.tape_position.to_string(),
+                position.to_string(),
                 slice.sha256_encrypted,
             ],
         )?;
@@ -2624,7 +2632,7 @@ fn ensure_position(
         tx.execute(
             "INSERT INTO write_positions (write_id, stage_slice_id, position, status)
              VALUES (?1, ?2, ?3, 'pending')",
-            params![write_id, stage_slice_id, slice.tape_position.to_string()],
+            params![write_id, stage_slice_id, position.to_string()],
         )?;
     }
     report.positions += 1;
@@ -3532,7 +3540,7 @@ mod tests {
 
         let slice_at = |position: i64| envelope::ManifestSlice {
             number: 1,
-            tape_position: position,
+            tape_position: Some(position),
             size_bytes: 100,
             encrypted_bytes: 200,
             sha256_plain: "a".repeat(64),
@@ -3543,6 +3551,7 @@ mod tests {
             uuid: format!("{name}-uuid"),
             snapshot_version: 1,
             stage_set_id: 0,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![slice_at(position)],

@@ -6988,8 +6988,12 @@ pub fn generate_recovery_md(
          |------|----------|--------|------------|\n"
     );
     for unit in units {
+        // A whole unit's every slice has a position. `None` (a range's slice
+        // on another tape, ADR-0012 item 125) reads as 0, as `build` wrote it
+        // before positions were optional; #478's RECOVERY.md range section
+        // replaces this.
         let (first, last) = match (unit.slices.first(), unit.slices.last()) {
-            (Some(f), Some(l)) => (f.tape_position, l.tape_position),
+            (Some(f), Some(l)) => (f.tape_position.unwrap_or(0), l.tape_position.unwrap_or(0)),
             _ => (0, 0),
         };
         s.push_str(&format!(
@@ -7042,6 +7046,8 @@ pub fn generate_recovery_md(
         );
         let mut next: Option<i64> = None;
         for slice in &unit.slices {
+            // See the table above: `None` reads as 0 until #478's range section.
+            let tape_position = slice.tape_position.unwrap_or(0);
             // The number in `restore.N.dar` MUST be dar's slice number, and the
             // slices MUST share the base name `restore` — this is dar's required
             // `base.N.dar` convention. `truncate` trims the 512KB block padding
@@ -7049,20 +7055,16 @@ pub fn generate_recovery_md(
             // per unit (#412): a read leaves the tape at the next file, so
             // only a gap between slices needs a forward space.
             let position = match next {
-                None => format!(
-                    "mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {}\n",
-                    slice.tape_position
-                ),
-                Some(n) if slice.tape_position > n => {
-                    format!("mt -f /dev/nst0 fsf {}\n", slice.tape_position - n)
+                None => format!("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {tape_position}\n"),
+                Some(n) if tape_position > n => {
+                    format!("mt -f /dev/nst0 fsf {}\n", tape_position - n)
                 }
-                Some(n) if slice.tape_position == n => String::new(),
-                Some(_) => format!(
-                    "mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {}\n",
-                    slice.tape_position
-                ),
+                Some(n) if tape_position == n => String::new(),
+                Some(_) => {
+                    format!("mt -f /dev/nst0 rewind && mt -f /dev/nst0 fsf {tape_position}\n")
+                }
             };
-            next = Some(slice.tape_position + 1);
+            next = Some(tape_position + 1);
             s.push_str(&format!(
                 "# Slice {n} — tape file {pos}, {eb} bytes\n\
                  {position}\
@@ -7070,7 +7072,7 @@ pub fn generate_recovery_md(
                  truncate -s {eb} restore.{n}.dar.age\n\
                  echo \"{sha}  restore.{n}.dar.age\" | sha256sum -c - && age -d -i YOUR_KEY.age.key restore.{n}.dar.age > restore.{n}.dar && rm restore.{n}.dar.age\n\n",
                 n = slice.number,
-                pos = slice.tape_position,
+                pos = tape_position,
                 eb = slice.encrypted_bytes,
                 sha = slice.sha256_encrypted,
             ));
@@ -7229,6 +7231,7 @@ mod tests {
                 uuid: "uuid-u".into(),
                 snapshot_version: 1,
                 stage_set_id: 1,
+                may_span: false,
                 dar_version: None,
                 dar_command: None,
                 slices: vec![],
@@ -7253,11 +7256,12 @@ mod tests {
             uuid: "11111111-aaaa".into(),
             snapshot_version: 2,
             stage_set_id: 7,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![ManifestSlice {
                 number: 1,
-                tape_position: 9,
+                tape_position: Some(9),
                 size_bytes: 10,
                 encrypted_bytes: 30,
                 sha256_plain: "p".into(),
@@ -7799,11 +7803,12 @@ verify any entry by hashing the file it describes.
             uuid: "uuid-a".into(),
             snapshot_version: 2,
             stage_set_id: 7,
+            may_span: false,
             dar_version: Some("2.7.20".into()),
             dar_command: Some("dar -c base -R /src".into()),
             slices: vec![ManifestSlice {
                 number: 1,
-                tape_position: 4,
+                tape_position: Some(4),
                 size_bytes: 1_048_576,
                 encrypted_bytes: 1_049_000,
                 sha256_plain: "abc".into(),
@@ -7840,11 +7845,12 @@ verify any entry by hashing the file it describes.
             uuid: "uuid-a".into(),
             snapshot_version: 1,
             stage_set_id: 1,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![ManifestSlice {
                 number: 1,
-                tape_position: 4,
+                tape_position: Some(4),
                 size_bytes: 1,
                 encrypted_bytes: 2,
                 sha256_plain: "abc".into(),
@@ -7907,11 +7913,12 @@ verify any entry by hashing the file it describes.
             uuid: "uuid-a".into(),
             snapshot_version: 2,
             stage_set_id: 7,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![ManifestSlice {
                 number: 1,
-                tape_position: 4,
+                tape_position: Some(4),
                 size_bytes: 1_048_576,
                 encrypted_bytes: 1_049_000,
                 sha256_plain: "abc".into(),
@@ -7977,11 +7984,12 @@ verify any entry by hashing the file it describes.
             uuid: "uuid-a".into(),
             snapshot_version: 1,
             stage_set_id: 7,
+            may_span: false,
             dar_version: Some("2.7.20".into()),
             dar_command: Some("dar -c base -R /src".into()),
             slices: vec![ManifestSlice {
                 number: 1,
-                tape_position: 4,
+                tape_position: Some(4),
                 size_bytes: 1_048_576,
                 encrypted_bytes: 1_049_000,
                 sha256_plain: "abc".into(),
@@ -8440,11 +8448,12 @@ verify any entry by hashing the file it describes.
                 uuid: format!("uuid-{name}-{version}"),
                 snapshot_version: version,
                 stage_set_id: version,
+                may_span: false,
                 dar_version: None,
                 dar_command: None,
                 slices: vec![ManifestSlice {
                     number: 1,
-                    tape_position,
+                    tape_position: Some(tape_position),
                     size_bytes: 1,
                     encrypted_bytes: eb,
                     sha256_plain: "x".repeat(64),
@@ -8536,6 +8545,7 @@ verify any entry by hashing the file it describes.
             uuid: format!("uuid-{name}-{version}"),
             snapshot_version: version,
             stage_set_id: version,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![],
@@ -10575,7 +10585,7 @@ sha256_encrypted = \"bbb\"
     fn recovery_md_reads_forward_and_keeps_one_slice_of_ciphertext() {
         let slice = |n: i64, pos: i64| ManifestSlice {
             number: n,
-            tape_position: pos,
+            tape_position: Some(pos),
             size_bytes: 1000,
             encrypted_bytes: 1100 + n,
             sha256_plain: "p".into(),
@@ -10586,6 +10596,7 @@ sha256_encrypted = \"bbb\"
             uuid: "abcdef12-0000-0000-0000-000000000000".into(),
             snapshot_version: 3,
             stage_set_id: 7,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![slice(1, 10), slice(2, 11), slice(3, 14)],
@@ -10661,11 +10672,12 @@ sha256_encrypted = \"bbb\"
             uuid: uuid.into(),
             snapshot_version: ver,
             stage_set_id: 1,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![ManifestSlice {
                 number: 1,
-                tape_position: 9,
+                tape_position: Some(9),
                 size_bytes: 1,
                 encrypted_bytes: 2,
                 sha256_plain: "p".into(),
@@ -11970,6 +11982,7 @@ sha256_encrypted = \"bbb\"
             uuid: "11111111-2222-3333-4444-555555555555".into(),
             snapshot_version: 2,
             stage_set_id: 1,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![],
@@ -13234,6 +13247,7 @@ sha256_encrypted = \"bbb\"
             uuid: "11111111-2222-3333-4444-555555555555".into(),
             snapshot_version: 1,
             stage_set_id: 7,
+            may_span: false,
             dar_version: Some("2.7.20".into()),
             dar_command: None,
             slices: vec![],
@@ -13777,11 +13791,12 @@ sha256_encrypted = \"bbb\"
             uuid: "11111111-2222-3333-4444-555555555555".into(),
             snapshot_version: 1,
             stage_set_id: 1,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![ManifestSlice {
                 number: 1,
-                tape_position: 4,
+                tape_position: Some(4),
                 size_bytes: 10,
                 encrypted_bytes: 20,
                 sha256_plain: "aa".into(),
@@ -14102,11 +14117,12 @@ sha256_encrypted = \"bbb\"
             uuid: "uuid-a".into(),
             snapshot_version: 2,
             stage_set_id: 7,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![ManifestSlice {
                 number: 1,
-                tape_position: 4,
+                tape_position: Some(4),
                 size_bytes: 1_048_576,
                 encrypted_bytes: 1_049_000,
                 sha256_plain: "abc".into(),
@@ -14204,6 +14220,7 @@ sha256_encrypted = \"bbb\"
             uuid: "aaaaaaaa-0000-0000-0000-000000000000".into(),
             snapshot_version: 2,
             stage_set_id: 1,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![],

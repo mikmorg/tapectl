@@ -1265,6 +1265,7 @@ fn build_template_full(
                     uuid: u.uuid.to_string(),
                     snapshot_version: u.version,
                     stage_set_id: u.version,
+                    may_span: false,
                     dar_version: Some("2.7.13".to_string()),
                     dar_command: Some("dar -c base -R /src -N".to_string()),
                     slices: Vec::new(),
@@ -1291,7 +1292,7 @@ fn build_template_full(
             let cipher = stub_encrypt(&format!("{},op,esc", s.tenant), "", plain);
             s.unit.slices.push(ManifestSlice {
                 number: i as i64 + 1,
-                tape_position: next,
+                tape_position: Some(next),
                 size_bytes: plain.len() as i64,
                 encrypted_bytes: cipher.len() as i64,
                 sha256_plain: sha256_hex(plain),
@@ -1473,7 +1474,15 @@ fn build_template_full(
         .map(|s| UnitOnTape {
             name: s.unit.name.clone(),
             src: s.src.clone(),
-            positions: s.unit.slices.iter().map(|sl| sl.tape_position).collect(),
+            positions: s
+                .unit
+                .slices
+                .iter()
+                .map(|sl| {
+                    sl.tape_position
+                        .expect("a whole unit's slice has a position")
+                })
+                .collect(),
             sizes: s
                 .unit
                 .slices
@@ -4784,7 +4793,10 @@ fn the_manual_path_in_file_1_restores_a_unit_as_written() {
         &guide_block(&manual, "FIRST_TAPE_POSITION"),
         &[(
             "FIRST_TAPE_POSITION",
-            manifest.units[0].slices[0].tape_position.to_string(),
+            manifest.units[0].slices[0]
+                .tape_position
+                .expect("a whole unit's slice has a position")
+                .to_string(),
         )],
     );
     assert!(ok, "{text}");
@@ -4820,7 +4832,12 @@ fn the_manual_path_in_file_1_restores_a_unit_as_written() {
         std::fs::remove_file(work.join(format!("restore.{}.dar", sl.number))).unwrap();
         let (ok, text) = run(
             &guide_block(&manual, "FIRST_TAPE_POSITION"),
-            &[("FIRST_TAPE_POSITION", sl.tape_position.to_string())],
+            &[(
+                "FIRST_TAPE_POSITION",
+                sl.tape_position
+                    .expect("a whole unit's slice has a position")
+                    .to_string(),
+            )],
         );
         assert!(ok, "{text}");
         let loose = |line: &str| -> String {
@@ -7799,7 +7816,11 @@ fn manual_read_slice(
 ) {
     let wind = vec![
         "mt -f /dev/nst0 rewind".to_string(),
-        format!("mt -f /dev/nst0 fsf {}", sl.tape_position),
+        format!(
+            "mt -f /dev/nst0 fsf {}",
+            sl.tape_position
+                .expect("a whole unit's slice has a position")
+        ),
     ];
     let (ok, text) = run_guide(h, dir, &wind, &[], true);
     assert!(ok, "{text}");
@@ -7925,22 +7946,30 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
         &guide_block(&manual, "FIRST_TAPE_POSITION"),
         &[(
             "FIRST_TAPE_POSITION",
-            unit.slices[0].tape_position.to_string(),
+            unit.slices[0]
+                .tape_position
+                .expect("a whole unit's slice has a position")
+                .to_string(),
         )],
         true,
     );
     assert!(ok, "{text}");
-    let mut head = unit.slices[0].tape_position;
+    let mut head = unit.slices[0]
+        .tape_position
+        .expect("a whole unit's slice has a position");
     for sl in &unit.slices {
         if sl.number == lost {
             continue;
         }
-        if sl.tape_position > head {
+        let position = sl
+            .tape_position
+            .expect("a whole unit's slice has a position");
+        if position > head {
             let (ok, text) = run_guide(
                 &h,
                 &dir,
                 &guide_block(&manual, "fsf COUNT"),
-                &[("COUNT", (sl.tape_position - head).to_string())],
+                &[("COUNT", (position - head).to_string())],
                 true,
             );
             assert!(ok, "{text}");
@@ -7958,7 +7987,7 @@ fn file_1_no_other_copy_restores_what_the_passing_slices_hold() {
             true,
         );
         assert!(ok, "slice {}: {text}", sl.number);
-        head = sl.tape_position + 1;
+        head = position + 1;
     }
     assert!(!dir.join(format!("restore.{lost}.dar")).exists());
     assert!(dir.join("restore.2.dar").exists() && dir.join("restore.4.dar").exists());
@@ -8195,6 +8224,7 @@ fn file_1_says_how_to_tell_a_compressed_unit_and_it_works() {
             uuid: "11111111-2222-3333-4444-555555555555".into(),
             snapshot_version: 1,
             stage_set_id: 1,
+            may_span: false,
             dar_version: Some("2.7.13".into()),
             dar_command: Some(recorded(compression)),
             slices: vec![],

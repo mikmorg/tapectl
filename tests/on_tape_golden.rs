@@ -442,12 +442,13 @@ fn golden_units() -> Vec<ManifestUnit> {
             uuid: "11111111-2222-3333-4444-555555555555".to_string(),
             snapshot_version: 7,
             stage_set_id: 42,
+            may_span: false,
             dar_version: Some("2.7.20".to_string()),
             dar_command: Some(r#"dar -c "x" -s 10G \ path"#.to_string()),
             slices: vec![
                 ManifestSlice {
                     number: 1,
-                    tape_position: 9,
+                    tape_position: Some(9),
                     size_bytes: 100,
                     encrypted_bytes: 120,
                     sha256_plain: "aa".repeat(32),
@@ -455,7 +456,7 @@ fn golden_units() -> Vec<ManifestUnit> {
                 },
                 ManifestSlice {
                     number: 2,
-                    tape_position: 10,
+                    tape_position: Some(10),
                     size_bytes: 50,
                     encrypted_bytes: 70,
                     sha256_plain: "cc".repeat(32),
@@ -468,11 +469,12 @@ fn golden_units() -> Vec<ManifestUnit> {
             uuid: "66666666-7777-8888-9999-000000000000".to_string(),
             snapshot_version: 1,
             stage_set_id: 43,
+            may_span: false,
             dar_version: None,
             dar_command: None,
             slices: vec![ManifestSlice {
                 number: 1,
-                tape_position: 11,
+                tape_position: Some(11),
                 size_bytes: 5,
                 encrypted_bytes: 25,
                 sha256_plain: "ee".repeat(32),

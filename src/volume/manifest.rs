@@ -24,6 +24,15 @@
 //! after the envelopes (position 8 on a typical layout), and the two diverge
 //! further on a multi-unit volume. Confusing them yields a broken archive —
 //! see the `#72` retrieval-guide note.
+//!
+//! From tapectl 1.7.0 a `[[units]]` block may describe a *range* (ADR-0012
+//! items 121, 125): the run of one spannable stage set's slices on this
+//! tape. Its block states `may_span = true` directly after `stage_set_id`,
+//! lists EVERY slice of the set with its hashes, and gives `tape_position`
+//! only to the slices this tape plans; a slice this tape does not plan has
+//! no `tape_position` line at all ([`ManifestSlice::tape_position`] is
+//! `None`). A whole unit's block states neither, and its bytes are the
+//! 1.6.0 bytes exactly (`tests/on_tape_golden.rs`).
 
 use serde::Deserialize;
 
@@ -57,6 +66,14 @@ pub struct ManifestUnit {
     pub uuid: String,
     pub snapshot_version: i64,
     pub stage_set_id: i64,
+    /// `may_span = true` (ADR-0012 items 124-125): this block is a spannable
+    /// stage set's, so it lists every slice of the set and the tape may hold
+    /// only a range of them. Frozen when the write is planned. False when
+    /// the key is absent (every whole unit, and every block before 1.7.0),
+    /// and [`Manifest::to_toml`] then writes no line, so a whole unit's block
+    /// renders the 1.6.0 bytes.
+    #[serde(default)]
+    pub may_span: bool,
     #[serde(default)]
     pub dar_version: Option<String>,
     #[serde(default)]
@@ -69,7 +86,12 @@ pub struct ManifestUnit {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ManifestSlice {
     pub number: i64,
-    pub tape_position: i64,
+    /// The tape file this slice is planned at, on THIS tape. `None` only in
+    /// a `may_span` block, for a slice of the set this tape does not plan
+    /// (ADR-0012 item 125): the line is then absent from the bytes. Every
+    /// slice of a whole unit has one.
+    #[serde(default)]
+    pub tape_position: Option<i64>,
     pub size_bytes: i64,
     pub encrypted_bytes: i64,
     /// Present ONLY here. The on-tape `catalog.db` omits `sha256_plain`, and
@@ -117,6 +139,10 @@ impl Manifest {
     /// [`Manifest::may_end_early`] is set, as it is on every envelope tapectl
     /// 1.6.0 or later writes (`volume-format-v2.md` §1.7), directly after
     /// `created_at` and before the blank line that precedes `[[units]]`.
+    ///
+    /// A range's block (ADR-0012 item 125) states `may_span = true` directly
+    /// after `stage_set_id`, and a slice whose `tape_position` is `None` has
+    /// no `tape_position` line. Neither line appears in a whole unit's block.
     pub fn to_toml(&self) -> String {
         let label = &self.volume;
         let tenant_name = &self.tenant;
@@ -140,6 +166,9 @@ created_at = "{now}"
                 "[[units]]\nname = \"{}\"\nuuid = \"{}\"\nsnapshot_version = {}\nstage_set_id = {}\n",
                 unit.name, unit.uuid, unit.snapshot_version, unit.stage_set_id,
             ));
+            if unit.may_span {
+                s.push_str("may_span = true\n");
+            }
             if let Some(ref dar_ver) = unit.dar_version {
                 s.push_str(&format!("dar_version = \"{dar_ver}\"\n"));
             }
@@ -150,10 +179,16 @@ created_at = "{now}"
             }
             s.push('\n');
             for slice in &unit.slices {
+                s.push_str(&format!("[[units.slices]]\nnumber = {}\n", slice.number));
+                if let Some(position) = slice.tape_position {
+                    s.push_str(&format!("tape_position = {position}\n"));
+                }
                 s.push_str(&format!(
-                    "[[units.slices]]\nnumber = {}\ntape_position = {}\nsize_bytes = {}\nencrypted_bytes = {}\nsha256_plain = \"{}\"\nsha256_encrypted = \"{}\"\n\n",
-                    slice.number, slice.tape_position, slice.size_bytes,
-                    slice.encrypted_bytes, slice.sha256_plain, slice.sha256_encrypted,
+                    "size_bytes = {}\nencrypted_bytes = {}\nsha256_plain = \"{}\"\nsha256_encrypted = \"{}\"\n\n",
+                    slice.size_bytes,
+                    slice.encrypted_bytes,
+                    slice.sha256_plain,
+                    slice.sha256_encrypted,
                 ));
             }
         }
@@ -202,12 +237,13 @@ mod tests {
                 uuid: "11111111-2222-3333-4444-555555555555".to_string(),
                 snapshot_version: 7,
                 stage_set_id: 42,
+                may_span: false,
                 dar_version: Some("2.7.20".to_string()),
                 dar_command: Some(r#"dar -c "x" -s 10G \ path"#.to_string()),
                 slices: vec![
                     ManifestSlice {
                         number: 1,
-                        tape_position: 9,
+                        tape_position: Some(9),
                         size_bytes: 100,
                         encrypted_bytes: 120,
                         sha256_plain: "aa".repeat(32),
@@ -215,7 +251,7 @@ mod tests {
                     },
                     ManifestSlice {
                         number: 2,
-                        tape_position: 10,
+                        tape_position: Some(10),
                         size_bytes: 50,
                         encrypted_bytes: 70,
                         sha256_plain: "cc".repeat(32),
@@ -228,11 +264,12 @@ mod tests {
                 uuid: "66666666-7777-8888-9999-000000000000".to_string(),
                 snapshot_version: 1,
                 stage_set_id: 43,
+                may_span: false,
                 dar_version: None,
                 dar_command: None,
                 slices: vec![ManifestSlice {
                     number: 1,
-                    tape_position: 11,
+                    tape_position: Some(11),
                     size_bytes: 5,
                     encrypted_bytes: 25,
                     sha256_plain: "ee".repeat(32),
@@ -366,5 +403,228 @@ mod tests {
         let not_a_bool = current.replace("may_end_early = true", "may_end_early = 1");
         assert!(Manifest::from_toml(&not_a_bool).is_err());
         assert!(Manifest::declares_may_end_early(&not_a_bool).is_err());
+    }
+
+    /// The slices of one spannable stage set (ADR-0012 item 125), with
+    /// `tape_position` given to the slices `positions` names: one entry per
+    /// slice, in slice order, `None` for a slice this tape does not plan.
+    fn range_unit(positions: [Option<i64>; 3]) -> ManifestUnit {
+        let hashes = [("11", "21"), ("12", "22"), ("13", "23")];
+        ManifestUnit {
+            name: "photos/2019".to_string(),
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            snapshot_version: 7,
+            stage_set_id: 42,
+            may_span: true,
+            dar_version: Some("2.7.20".to_string()),
+            dar_command: Some(r#"dar -c "x" -s 10G \ path"#.to_string()),
+            slices: (0..3)
+                .map(|i| ManifestSlice {
+                    number: i as i64 + 1,
+                    tape_position: positions[i],
+                    size_bytes: 100 + i as i64,
+                    encrypted_bytes: 120 + i as i64,
+                    sha256_plain: hashes[i].0.repeat(32),
+                    sha256_encrypted: hashes[i].1.repeat(32),
+                })
+                .collect(),
+        }
+    }
+
+    /// ADR-0012 item 125, written out by hand: a range's block states
+    /// `may_span = true` directly after `stage_set_id` (#478 fork X6), lists
+    /// EVERY slice of the set with its hashes, and gives `tape_position` only
+    /// to the slices this tape plans; a slice this tape does not plan has no
+    /// `tape_position` line. It parses to exactly that (an absent position is
+    /// `None`) and renders back byte for byte. The whole unit after it keeps
+    /// the 1.6.0 block: no `may_span` line, a position on every slice.
+    #[test]
+    fn a_range_block_round_trips_byte_for_byte() {
+        let text = format!(
+            r#"[manifest]
+volume = "SPAN01"
+tenant = "alpha"
+created_at = "2026-10-21T00:00:00+00:00"
+may_end_early = true
+
+[[units]]
+name = "photos/2019"
+uuid = "11111111-2222-3333-4444-555555555555"
+snapshot_version = 7
+stage_set_id = 42
+may_span = true
+dar_version = "2.7.20"
+dar_command = "dar -c \"x\" -s 10G \\ path"
+
+[[units.slices]]
+number = 1
+tape_position = 9
+size_bytes = 100
+encrypted_bytes = 120
+sha256_plain = "{p1}"
+sha256_encrypted = "{e1}"
+
+[[units.slices]]
+number = 2
+tape_position = 10
+size_bytes = 101
+encrypted_bytes = 121
+sha256_plain = "{p2}"
+sha256_encrypted = "{e2}"
+
+[[units.slices]]
+number = 3
+size_bytes = 102
+encrypted_bytes = 122
+sha256_plain = "{p3}"
+sha256_encrypted = "{e3}"
+
+[[units]]
+name = "ledgers/fy24"
+uuid = "66666666-7777-8888-9999-000000000000"
+snapshot_version = 1
+stage_set_id = 43
+
+[[units.slices]]
+number = 1
+tape_position = 11
+size_bytes = 5
+encrypted_bytes = 25
+sha256_plain = "{p4}"
+sha256_encrypted = "{e4}"
+
+"#,
+            p1 = "11".repeat(32),
+            e1 = "21".repeat(32),
+            p2 = "12".repeat(32),
+            e2 = "22".repeat(32),
+            p3 = "13".repeat(32),
+            e3 = "23".repeat(32),
+            p4 = "ee".repeat(32),
+            e4 = "ff".repeat(32),
+        );
+
+        let parsed = Manifest::from_toml(&text).expect("a range block parses");
+        let range = &parsed.units[0];
+        assert!(range.may_span, "may_span parses");
+        assert_eq!(range.slices.len(), 3, "every slice of the set is listed");
+        assert_eq!(
+            range
+                .slices
+                .iter()
+                .map(|s| s.tape_position)
+                .collect::<Vec<_>>(),
+            vec![Some(9), Some(10), None],
+            "an absent tape_position parses as None"
+        );
+        assert_eq!(range.slices[2].sha256_encrypted, "23".repeat(32));
+        let whole = &parsed.units[1];
+        assert!(!whole.may_span, "an absent may_span is false");
+        assert_eq!(whole.slices[0].tape_position, Some(11));
+
+        let expected = Manifest {
+            volume: "SPAN01".to_string(),
+            tenant: "alpha".to_string(),
+            created_at: "2026-10-21T00:00:00+00:00".to_string(),
+            may_end_early: true,
+            units: vec![
+                range_unit([Some(9), Some(10), None]),
+                two_units()[1].clone(),
+            ],
+        };
+        assert_eq!(parsed, expected);
+        assert_eq!(parsed.to_toml(), text, "serialises back byte for byte");
+        assert_eq!(text.matches("may_span").count(), 1, "{text}");
+    }
+
+    /// Every shape a range takes on its tapes (ADR-0012 items 122, 125):
+    /// the head of the set, its tail, a middle tape that planned every slice
+    /// (still `may_span`, since the cut is unknown at plan time), and a tape
+    /// that planned none. Each round-trips, and states one `tape_position`
+    /// line per planned slice and none for the others.
+    #[test]
+    fn every_range_shape_round_trips() {
+        for positions in [
+            [Some(9), Some(10), None],
+            [None, Some(8), Some(9)],
+            [None, Some(8), None],
+            [Some(9), Some(10), Some(11)],
+            [None, None, None],
+        ] {
+            let m = Manifest {
+                volume: "SPAN01".to_string(),
+                tenant: "operator".to_string(),
+                created_at: "2026-10-21T00:00:00+00:00".to_string(),
+                may_end_early: true,
+                units: vec![range_unit(positions)],
+            };
+            let text = m.to_toml();
+            assert_eq!(Manifest::from_toml(&text).unwrap(), m, "{text}");
+            assert_eq!(
+                text.matches("\ntape_position = ").count(),
+                positions.iter().flatten().count(),
+                "{text}"
+            );
+            assert_eq!(text.matches("\nmay_span = true\n").count(), 1, "{text}");
+            assert!(
+                text.contains("\nstage_set_id = 42\nmay_span = true\ndar_version = "),
+                "may_span sits directly after stage_set_id: {text}"
+            );
+        }
+    }
+
+    /// A range block whose every slice is planned differs from the whole
+    /// unit's block by the one `may_span = true` line and nothing else; with
+    /// `may_span` false it IS the whole unit's block.
+    #[test]
+    fn a_fully_planned_range_differs_from_a_whole_block_by_one_line() {
+        let range = Manifest {
+            volume: "SPAN01".to_string(),
+            tenant: "alpha".to_string(),
+            created_at: "2026-10-21T00:00:00+00:00".to_string(),
+            may_end_early: true,
+            units: vec![range_unit([Some(9), Some(10), Some(11)])],
+        };
+        let mut whole = range.clone();
+        whole.units[0].may_span = false;
+        let whole_text = whole.to_toml();
+        assert!(!whole_text.contains("may_span"), "{whole_text}");
+        assert_eq!(
+            range.to_toml(),
+            whole_text.replace(
+                "\nstage_set_id = 42\n",
+                "\nstage_set_id = 42\nmay_span = true\n"
+            )
+        );
+    }
+
+    /// `may_span` reads as a bool: absent or `false` is false (and renders no
+    /// line), and a value that is not a bool is a parse failure, as any
+    /// malformed key is. A `tape_position` that is not an integer fails too.
+    #[test]
+    fn may_span_is_a_bool_and_tape_position_an_integer() {
+        let m = Manifest {
+            volume: "SPAN01".to_string(),
+            tenant: "alpha".to_string(),
+            created_at: "2026-10-21T00:00:00+00:00".to_string(),
+            may_end_early: true,
+            units: vec![range_unit([Some(9), Some(10), None])],
+        };
+        let text = m.to_toml();
+        let mut unflagged = m.clone();
+        unflagged.units[0].may_span = false;
+
+        let stated_false = text.replace("may_span = true", "may_span = false");
+        assert_ne!(stated_false, text);
+        assert_eq!(Manifest::from_toml(&stated_false).unwrap(), unflagged);
+        let absent = text.replace("may_span = true\n", "");
+        assert_eq!(Manifest::from_toml(&absent).unwrap(), unflagged);
+        assert_eq!(unflagged.to_toml(), absent);
+
+        let not_a_bool = text.replace("may_span = true", "may_span = 1");
+        assert!(Manifest::from_toml(&not_a_bool).is_err());
+        let not_an_int = text.replace("tape_position = 9\n", "tape_position = \"9\"\n");
+        assert_ne!(not_an_int, text);
+        assert!(Manifest::from_toml(&not_an_int).is_err());
     }
 }

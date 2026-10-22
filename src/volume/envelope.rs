@@ -378,11 +378,12 @@ mod tests {
                 uuid: "u-1".to_string(),
                 snapshot_version: 7,
                 stage_set_id: 42,
+                may_span: false,
                 dar_version: Some("2.7.20".to_string()),
                 dar_command: Some(r#"dar -c "x" -s 10G"#.to_string()),
                 slices: vec![GenSlice {
                     number: 1,
-                    tape_position: 9,
+                    tape_position: Some(9),
                     size_bytes: 100,
                     encrypted_bytes: 120,
                     sha256_plain: "aa".repeat(32),
@@ -407,8 +408,50 @@ mod tests {
         assert_eq!(u.slices.len(), 1);
         // The two numbers a rebuild must never conflate.
         assert_eq!(u.slices[0].number, 1);
-        assert_eq!(u.slices[0].tape_position, 9);
+        assert_eq!(u.slices[0].tape_position, Some(9));
         assert_eq!(u.slices[0].sha256_plain, "aa".repeat(32));
+    }
+
+    /// ADR-0012 item 125: a range's block, as the generator writes it,
+    /// reads back with `may_span` and every slice of the set, a position on
+    /// the slices this tape plans and none on the others.
+    #[test]
+    fn the_parser_reads_a_range_block() {
+        let slice = |number: i64, tape_position: Option<i64>| GenSlice {
+            number,
+            tape_position,
+            size_bytes: 100,
+            encrypted_bytes: 120,
+            sha256_plain: "aa".repeat(32),
+            sha256_encrypted: format!("{number:02}").repeat(32),
+        };
+        let text = layout::generate_manifest_toml(
+            "VOL001",
+            "alpha",
+            &[GenUnit {
+                name: "photos/2019".to_string(),
+                uuid: "u-1".to_string(),
+                snapshot_version: 7,
+                stage_set_id: 42,
+                may_span: true,
+                dar_version: None,
+                dar_command: None,
+                slices: vec![slice(1, None), slice(2, Some(9)), slice(3, Some(10))],
+            }],
+        );
+        let m = parse_manifest(&text).unwrap();
+        let u = &m.units[0];
+        assert!(u.may_span);
+        assert_eq!(
+            u.slices
+                .iter()
+                .map(|s| (s.number, s.tape_position))
+                .collect::<Vec<_>>(),
+            vec![(1, None), (2, Some(9)), (3, Some(10))]
+        );
+        assert_eq!(u.slices[0].sha256_encrypted, "01".repeat(32));
+        // A whole unit's block reads `may_span` false.
+        assert!(!parse_manifest(&generated_manifest("alpha")).unwrap().units[0].may_span);
     }
 
     /// Issue #459: the operator envelope is the one the FRONT INDEX types
@@ -444,7 +487,7 @@ mod tests {
         assert_ne!(legacy, current, "the legacy key was not injected");
         let m = parse_manifest(&legacy).expect("a pre-#134 manifest must still parse");
         assert_eq!(m.units.len(), 1);
-        assert_eq!(m.units[0].slices[0].tape_position, 9);
+        assert_eq!(m.units[0].slices[0].tape_position, Some(9));
     }
 
     /// Issue #473: the catalogue member names an envelope carries

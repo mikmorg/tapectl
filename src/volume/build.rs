@@ -898,6 +898,7 @@ fn to_manifest_unit(unit: &BuildUnit, positions: &HashMap<i64, i32>) -> layout::
         uuid: unit.unit_uuid.clone(),
         snapshot_version: unit.snapshot_version,
         stage_set_id: unit.stage_set_id,
+        may_span: false,
         dar_version: unit.dar_version.clone(),
         dar_command: unit.dar_command.clone(),
         slices: unit
@@ -905,7 +906,7 @@ fn to_manifest_unit(unit: &BuildUnit, positions: &HashMap<i64, i32>) -> layout::
             .iter()
             .map(|sl| layout::ManifestSlice {
                 number: sl.slice_number,
-                tape_position: i64::from(positions.get(&sl.slice_id).copied().unwrap_or(0)),
+                tape_position: positions.get(&sl.slice_id).copied().map(i64::from),
                 size_bytes: sl.size_bytes,
                 encrypted_bytes: sl.encrypted_bytes,
                 sha256_plain: sl.sha256_plain.clone(),
