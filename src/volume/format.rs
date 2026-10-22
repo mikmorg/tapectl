@@ -507,11 +507,21 @@ pub const MAGIC: &str = "tapectl-volume-v2";
 /// the seal over the plan (§4.1, §4.2).
 pub const SHORT_SEAL: &str = "short-seal";
 
+/// The feature a tape states when its plan holds a slice of a spannable
+/// stage set (ADR-0012 item 124, #478): a unit may run across tapes, so a
+/// `[[units]]` block in its envelopes may be a range (item 125: `may_span =
+/// true`, every slice of the set listed, `tape_position` only on the slices
+/// this tape plans). It is stated beside [`SHORT_SEAL`], as `requires =
+/// ["short-seal", "spanning"]` with the space after the comma (normative:
+/// without it RESTORE.sh reads the one feature `short-sealspanning`).
+pub const SPANNING: &str = "spanning";
+
 /// The features this tapectl knows how to read (ADR-0012 amendment item 15,
 /// `volume-format-v2.md` "How v2 extends"). A tape whose File 0 or seal
 /// marker lists anything else under `requires` is refused by name. Empty
-/// from 1.1.0 to 1.5.0; 1.6.0 knows [`SHORT_SEAL`] (item 111).
-pub const KNOWN_FEATURES: &[&str] = &[SHORT_SEAL];
+/// from 1.1.0 to 1.5.0; 1.6.0 knows [`SHORT_SEAL`] (item 111); 1.7.0 knows
+/// [`SPANNING`] too (item 124).
+pub const KNOWN_FEATURES: &[&str] = &[SHORT_SEAL, SPANNING];
 
 /// What a tape says about the reader it needs: File 0's `magic`,
 /// `layout_version` and `requires` (the seal marker repeats the last two).
@@ -1319,6 +1329,57 @@ mod forward_compat_tests {
             !err.contains("requires \"short-seal\""),
             "short-seal is known and is not named as the unknown one: {err}"
         );
+    }
+
+    /// ADR-0012 item 124: 1.7.0 knows `spanning`. A File 0 and a seal that
+    /// state item 124's normative `requires = ["short-seal", "spanning"]`
+    /// (the space after the comma included) are readable, and the seal still
+    /// requires short-seal, so rule S2 still binds it. A feature beside the
+    /// two that this tapectl does not know is still refused, naming only it.
+    #[test]
+    fn file_0_and_seal_requiring_short_seal_and_spanning_are_readable() {
+        assert_eq!(SPANNING, "spanning");
+        assert_eq!(KNOWN_FEATURES, &[SHORT_SEAL, SPANNING]);
+        let line = "requires = [\"short-seal\", \"spanning\"]";
+
+        let t = set_requires(&thunk(), line);
+        assert!(
+            t.contains("\nrequires = [\"short-seal\", \"spanning\"]\n"),
+            "{t}"
+        );
+        check_id_thunk_readable(&t).expect("1.7.0 reads a span tape's File 0");
+        let claims = parse_id_thunk_claims(&t).unwrap();
+        assert_eq!(claims.requires, vec![SHORT_SEAL, SPANNING]);
+        assert_eq!(claims.refusal("File 0"), None);
+
+        let s = parse_seal_marker(&set_requires(&seal(), line))
+            .expect("a seal stating both features keeps S1-S6 and parses");
+        assert_eq!(s.requires, vec![SHORT_SEAL, SPANNING]);
+        assert!(s.requires_short_seal());
+        assert_eq!(s.refusal(), None);
+        // S2 still binds: requiring short-seal (beside spanning) without
+        // `ended_after` breaks it.
+        let mut no_ending = s.clone();
+        no_ending.ended_after = None;
+        assert_eq!(
+            no_ending.check_parse_rules(),
+            Err(SealRuleViolation::MissingEndedAfter)
+        );
+
+        let three = "requires = [\"short-seal\", \"spanning\", \"unknown-feature\"]";
+        let err = check_id_thunk_readable(&set_requires(&thunk(), three))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires \"unknown-feature\" that"), "{err}");
+        assert!(
+            !err.contains("requires \"spanning\"") && !err.contains("\"spanning\" that"),
+            "spanning is known and is not named as the unknown one: {err}"
+        );
+        let why = parse_seal_marker(&set_requires(&seal(), three))
+            .unwrap()
+            .refusal()
+            .expect("refused");
+        assert!(why.contains("requires \"unknown-feature\" that"), "{why}");
     }
 
     /// Keys this tapectl does not know are ignored unless `requires` names
