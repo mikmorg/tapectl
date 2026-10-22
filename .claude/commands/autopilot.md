@@ -35,29 +35,34 @@ the normative design set named in the Policy block below.
     then `cartridge erase`;
   - handoff (g) steps 1-8 (`post_warning_bytes = "99008M"`, Heir Kit regenerated).
 
-  **Landing now: #489 and #490**, cherry-picked onto master (b2f1ea6, 71bdaaf), with the
-  `volume info --json` shape pin in `tests/cli_smoke.rs` given #490's `ended_after` and `cut_units`.
-  The p490 branch had run only `--lib`, so run `cargo test --no-fail-fast` on any landing:
-  cargo stops at the first failing test binary. Then the mhvtl gate on nst3, push, and close both.
+  **Landed after the tag:** #489 and #490 (b2f1ea6, 71bdaaf, the JSON shape pin cfb87ee; both
+  closed), and p488 (5ecccc8..2643b2c) after chain42 went green on its tip:
+  - unit 57/0 and clippy gnu, musl and research;
+  - gate 52/52, fr414, lifecycle 472/0/15, erase, pscan and the mhvtl acceptance (ssa).
 
-  **Then #488's drive phase**, branch `p488-drive-phase` (/scratch/tapectl-p488: hooks f530c44,
-  CROSSFILE ee337e5, `scripts/shaping-drive-phase.sh` 3589c67 + the restore leg fb8ee9e, docs 7ccb271):
-  1. rebase it onto master;
-  2. check, clippy and test it with and without `--features research`;
-  3. run the script's `--mhvtl` rehearsal on a TD6 node (nst1 or nst2). It is the first write of
-     a stage set whose snapshot is `reclaimable`;
-  4. build the static musl RELEASE research binary (item 117, for measuring only) and copy it to
-     home2 with its sha256;
-  5. the operator runs the drive phase.
+  Run `cargo test --no-fail-fast` on any landing: cargo stops at the first failing test binary.
 
-  p488 lands after that and before #478 starts, since both touch `session.rs`.
+  **#488's drive phase is READY; the operator runs it.**
+  - The release research binary is on home2 at `~/tapectl-1.6.0-research-b660a26/` (sha256
+    5bf51d0a..., SHA256SUMS beside it).
+  - The mhvtl rehearsal passed every run, the no-L* branch and the restore leg.
+  - R5w's write under its own load cannot pass on vm-desk1: mhvtl's tape file is on /scratch,
+    the disk that load writes. On home2 the tape is real.
+  - The L1/L2 loads are reviewed only, because vm-desk1 cannot ssh to itself; home2 to vm-desk1
+    works.
+  - Before it runs, the operator cleans SSA-0002 with the acceptance binary (mark-reclaimable,
+    retire, erase) and stops the drive-poll timer.
+  - While it runs, vm-desk1 does no cargo and homorg and lcsas-4c are told: its L1/L2 loads run
+    there on purpose.
+  - Afterwards: read results.tsv and restore.tsv, decide the shaping per the note's §10, and
+    record the run.
 
   **#478 spanning: the design is COMPLETE (2026-10-21).** The CTO ratified all three rounds of
   the design questions as recommended: ADR-0012 items 121-137 (master 658f7de, 1d59a82, 73de4af),
   read with items 76-100, and the build plan's six forks, items 138-143 (c68a054). The draft is
   scratchpad `p478/questions.md`; the BUILD PLAN is scratchpad `p478/plan.md` (six waves, the
   item-121 site sort in §4, the forks and their resolutions in §7-§8). Item 135 pre-authorizes 1.7.0's re-pin for the moves it names. **Build after v1.6.0 is
-  tagged and merged**, as 1.7.0, stacked on master after p489, p490 and p488: write a wave plan first
+  tagged and merged**, as 1.7.0, on master (p489, p490 and p488 have landed): write a wave plan first
   (file-disjoint waves; `write_reaches_tape` and migration 039 come first, since items 121, 127,
   128 and 129 all rest on them), then the gate leg (item 136), then the real-drive proof (item 137,
   operator-run).
