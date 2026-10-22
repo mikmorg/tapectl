@@ -490,6 +490,15 @@ fn migrations() -> Migrations<'static> {
         // by id, never remapped. `.foreign_key_check()`: `write_positions`
         // points into the rebuilt table. See the header.
         M::up(include_str!("migrations/038_write_status_cut.sql")).foreign_key_check(),
+        // 039 rebuilds `writes` to add status 'range' to its CHECK and a
+        // `may_span` column (0 on every existing row; a `range` row needs 1),
+        // and adds `stage_slices.released_at` and `archive_sets.allow_spanning`
+        // (issue #478, spanning; ADR-0012 items 121, 127-129): a range is the
+        // run of a spannable set's slices one tape holds, on the tape and
+        // counted per slice. 038's guard: a status its CHECK could not have
+        // admitted is refused by id, never remapped. `.foreign_key_check()`:
+        // `write_positions` points into the rebuilt table. See the header.
+        M::up(include_str!("migrations/039_write_status_range.sql")).foreign_key_check(),
     ])
 }
 
@@ -5646,11 +5655,342 @@ mod tests {
         );
     }
 
-    /// The live `writes.status` vocabulary, pinned to the schema rather than
-    /// to a migration file (`live_status_check`'s reason): 001's six and
-    /// 038's `cut`.
+    // --- Migration 039 (issue #478, spanning; ADR-0012 items 121, 127-129) ---
+
+    /// `open_memory_at_037_seeded`'s catalog carried on to schema 38, where
+    /// 039 starts, plus a sealed short volume holding a `cut` write, so
+    /// `writes` carries every one of 038's seven statuses, and a second
+    /// `stage_slices` row whose staging file was already released (NULL
+    /// `staging_path`). The seed's `archive_sets` row 4 is the one 039
+    /// widens.
+    fn open_memory_at_038_seeded() -> Connection {
+        let mut conn = open_memory_at_037_seeded();
+        migrate_to(&mut conn, Some(38)).expect("the seed migrates to 38");
+        assert_eq!(user_version(&conn), 38, "precondition: at schema 38");
+        conn.execute_batch(
+            "INSERT INTO volumes (id, label, backend_type, backend_name, capacity_bytes, status,
+                                  created_at, sealed_at, ended_after)
+                 VALUES (706, 'V-SHORT', 'lto', 'lto0', 1000, 'sealed',
+                         '2026-01-05 00:00:06', '2026-01-05 02:00:00', 3);
+             INSERT INTO stage_slices (id, stage_set_id, slice_number, size_bytes,
+                                       encrypted_bytes, sha256_plain, sha256_encrypted)
+                 VALUES (892, 803, 2, 512, 600, 'plain-892', 'enc-892');
+             INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id, status,
+                                 started_at, completed_at, created_at, session_dir)
+                 VALUES (891, 803, 600, 706, 'cut', '2026-01-07 00:00:08',
+                         '2026-01-07 00:00:09', '2026-01-07 00:00:10',
+                         '/staging/sessions/V-SHORT-891');
+             INSERT INTO write_positions (id, write_id, stage_slice_id, position, status,
+                                          written_at, sha256_on_volume)
+                 VALUES (893, 891, 880, '3', 'written', '2026-01-07 00:00:11', 'enc-880');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The three tables 039 changes: `writes` is rebuilt with one more
+    /// column, `stage_slices` and `archive_sets` gain one each.
+    const CHANGED_BY_039: [&str; 3] = ["archive_sets", "stage_slices", "writes"];
+
+    /// THE test for 039: `writes` is rebuilt with 'range' in its status
+    /// CHECK and a `may_span` column (0 on every existing row), and
+    /// `stage_slices.released_at` and `archive_sets.allow_spanning` are
+    /// added (NULL on every existing row); nothing else moves -- every row
+    /// of every other table, every cell of those three, every schema object
+    /// outside those three tables (the three `writes` indexes recreated
+    /// exactly), every foreign key in and out, and every old column of the
+    /// three.
     #[test]
-    fn the_live_write_status_check_is_the_seven_states() {
+    fn test_migrate_038_populated_db_to_039_preserves_every_row_and_adds_the_span_columns() {
+        let mut conn = open_memory_at_038_seeded();
+
+        let mut rows_before = every_row(&conn);
+        let objects_before = schema_objects(&conn);
+        let tables: Vec<String> = rows_before.keys().cloned().collect();
+        let fks_before: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        let cols_before: Vec<_> = CHANGED_BY_039
+            .iter()
+            .map(|t| table_info(&conn, t))
+            .collect();
+        let statuses: Vec<String> = conn
+            .prepare("SELECT DISTINCT status FROM writes ORDER BY status")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            statuses,
+            [
+                "aborted",
+                "completed",
+                "cut",
+                "failed",
+                "in_progress",
+                "interrupted",
+                "planned"
+            ],
+            "positive control: every status 038 allows is on a row"
+        );
+        assert_eq!(rows_before["write_positions"].len(), 2, "positive control");
+        assert_eq!(rows_before["stage_slices"].len(), 2, "positive control");
+        assert_eq!(rows_before["archive_sets"].len(), 1, "positive control");
+        assert_eq!(
+            index_names(&conn, "writes"),
+            vec![
+                "idx_writes_snapshot",
+                "idx_writes_stage_set",
+                "idx_writes_volume",
+                "sqlite_autoindex_writes_1"
+            ],
+            "positive control: writes has its indexes to compare"
+        );
+        for (table, column) in [
+            ("writes", "may_span"),
+            ("stage_slices", "released_at"),
+            ("archive_sets", "allow_spanning"),
+        ] {
+            assert!(
+                !table_info(&conn, table).iter().any(|c| c.0 == column),
+                "positive control: no {table}.{column} before 039"
+            );
+        }
+
+        migrate_to(&mut conn, Some(39)).expect("039 must migrate a catalog of legal statuses");
+        assert_eq!(user_version(&conn), 39);
+
+        let mut rows_after = every_row(&conn);
+        for (table, added) in [
+            ("writes", "i:0"),
+            ("stage_slices", "NULL"),
+            ("archive_sets", "NULL"),
+        ] {
+            let mut widened: Vec<Vec<String>> = rows_before
+                .remove(table)
+                .unwrap()
+                .into_iter()
+                .map(|mut row| {
+                    row.push(added.into());
+                    row
+                })
+                .collect();
+            widened.sort();
+            assert_eq!(
+                widened,
+                rows_after.remove(table).unwrap(),
+                "every {table} row keeps every cell and gains {added} last"
+            );
+        }
+        assert_eq!(
+            rows_before, rows_after,
+            "039 must not add, drop, renumber or alter a single row of any other table"
+        );
+
+        let objects_after = schema_objects(&conn);
+        let untouched = |objs: &[(String, String, String, Option<String>)]| {
+            objs.iter()
+                .filter(|o| !(o.0 == "table" && CHANGED_BY_039.contains(&o.1.as_str())))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            untouched(&objects_before),
+            untouched(&objects_after),
+            "039 changed a schema object other than the three tables, or did not recreate \
+             one of writes' indexes exactly"
+        );
+        let fks_after: Vec<_> = tables.iter().map(|t| foreign_keys_of(&conn, t)).collect();
+        assert_eq!(fks_before, fks_after, "039 must restate every foreign key");
+        let added = [
+            ("allow_spanning", "INTEGER", 0, None),
+            ("released_at", "TEXT", 0, None),
+            ("may_span", "INTEGER", 1, Some("0")),
+        ];
+        for ((table, mut cols), (name, ty, notnull, dflt)) in
+            CHANGED_BY_039.iter().zip(cols_before).zip(added)
+        {
+            cols.push((name.into(), ty.into(), notnull, dflt.map(String::from), 0));
+            assert_eq!(
+                cols,
+                table_info(&conn, table),
+                "{table} keeps every column (names, order, types, NOT NULL, defaults) \
+                 and gains {name} last"
+            );
+        }
+        let report = crate::cli::operations::db_fsck(&conn, false, false).unwrap();
+        assert!(
+            report.integrity_ok && report.issues.is_empty(),
+            "{:?}",
+            report.issues
+        );
+
+        assert!(
+            conn.execute("DELETE FROM writes WHERE id = 891", [])
+                .is_err(),
+            "writes 891 is referenced by write_positions 893; FK enforcement must refuse"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id) VALUES (803, 600, 700)",
+                [],
+            )
+            .is_err(),
+            "UNIQUE(stage_set_id, volume_id) still holds"
+        );
+        conn.execute("DELETE FROM writes WHERE id = 883", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO writes (id, stage_set_id, snapshot_id, volume_id)
+             VALUES (900, 803, 600, 702)",
+            [],
+        )
+        .unwrap();
+        let (default_status, default_may_span): (String, i64) = conn
+            .query_row(
+                "SELECT status, may_span FROM writes WHERE id = 900",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(default_status, "planned", "the status DEFAULT is unchanged");
+        assert_eq!(default_may_span, 0, "a write may span only when planned so");
+        let (released, allow): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT (SELECT released_at FROM stage_slices WHERE id = 892),
+                        (SELECT allow_spanning FROM archive_sets WHERE id = 4)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(released, None, "no slice was released slice by slice before 039");
+        assert_eq!(allow, None, "NULL: the archive set defers to the next layer");
+        conn.execute(
+            "UPDATE stage_slices SET staging_path = NULL, released_at = '2026-10-22 00:00:00'
+              WHERE id = 880",
+            [],
+        )
+        .expect("a released slice records when");
+        conn.execute(
+            "UPDATE archive_sets SET allow_spanning = 1 WHERE id = 4",
+            [],
+        )
+        .expect("an archive set states the key");
+    }
+
+    /// After 039 the status CHECK admits `range` beside 038's seven and
+    /// refuses anything else, and a row may be `range` only when its write
+    /// was planned to span (`may_span = 1`, the row CHECK). `may_span = 1`
+    /// on any other status is legal: a may-span write whose whole set
+    /// reached the tape is `completed` (#478 plan X2), and one the warning
+    /// ended before its first slice is `cut`.
+    #[test]
+    fn after_039_a_range_row_needs_may_span_and_no_other_status_does() {
+        let mut conn = open_memory_at_038_seeded();
+        migrate_to(&mut conn, Some(39)).expect("039 must migrate");
+        let set = |status: &str, may_span: i64| {
+            conn.execute(
+                "UPDATE writes SET status = ?1, may_span = ?2 WHERE id = 883",
+                rusqlite::params![status, may_span],
+            )
+        };
+
+        set("range", 1).expect("a range row of a write planned to span is legal");
+        let err = set("range", 0).expect_err("a range row needs may_span = 1");
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+        let err = set("shipped", 0).expect_err("an unknown status must be refused after 039");
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+        let err = set("shipped", 1).expect_err("may_span admits no unknown status");
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+        for status in [
+            "planned",
+            "in_progress",
+            "completed",
+            "failed",
+            "aborted",
+            "interrupted",
+            "cut",
+        ] {
+            for may_span in [0, 1] {
+                set(status, may_span).unwrap_or_else(|e| {
+                    panic!("writes.status '{status}' with may_span {may_span} must be legal: {e}")
+                });
+            }
+        }
+        conn.execute("DELETE FROM writes WHERE id = 883", [])
+            .unwrap();
+        let err = conn
+            .execute(
+                "INSERT INTO writes (stage_set_id, snapshot_id, volume_id, status)
+                 VALUES (803, 600, 702, 'range')",
+                [],
+            )
+            .expect_err("a range row inserted without may_span takes the default 0");
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+    }
+
+    /// A `writes` row in a status 038's CHECK never admitted -- `range`
+    /// included, which no release before 039 writes -- was put there around
+    /// the CHECK, by hand, and 039 refuses by name and row rather than guess
+    /// (026's rule). The positive control is the preservation test above:
+    /// the same seed with only legal statuses migrates.
+    #[test]
+    fn test_migration_039_refuses_a_hand_set_write_status_by_row() {
+        let mut conn = open_memory_at_038_seeded();
+        conn.pragma_update(None, "ignore_check_constraints", "ON")
+            .unwrap();
+        conn.execute_batch(
+            "UPDATE writes SET status = 'shipped' WHERE id IN (883, 887);
+             UPDATE writes SET status = 'range' WHERE id = 885;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", "OFF")
+            .unwrap();
+
+        let err = migrate(&mut conn).expect_err("039 must refuse a hand-set status");
+        let msg = match &err {
+            TapectlError::Migration(m) => m.clone(),
+            other => panic!("expected the generic Migration variant, got {other:?}"),
+        };
+        assert!(msg.starts_with("migration 039 cannot run: "), "{msg}");
+        assert!(
+            msg.contains("writes.status = 'shipped' on 2 row(s) (id 883, 887)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("writes.status = 'range' on 1 row(s) (id 885)"),
+            "a 'range' row before 039 cannot have come from tapectl either: {msg}"
+        );
+        assert!(msg.contains("Nothing has been changed."), "{msg}");
+        assert!(
+            !msg.contains("CREATE TABLE") && !msg.contains("CHECK constraint failed"),
+            "039's own words, not the SQL dump: {msg}"
+        );
+        assert_eq!(user_version(&conn), 38, "a refused 039 rolls back");
+        let shipped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM writes WHERE status = 'shipped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shipped, 2, "a refused 039 rewrites no row");
+        for (table, column) in [
+            ("writes", "may_span"),
+            ("stage_slices", "released_at"),
+            ("archive_sets", "allow_spanning"),
+        ] {
+            assert!(
+                !table_info(&conn, table).iter().any(|c| c.0 == column),
+                "a refused 039 adds no {table}.{column}"
+            );
+        }
+    }
+
+    /// The live `writes.status` vocabulary, pinned to the schema rather than
+    /// to a migration file (`live_status_check`'s reason): 001's six, 038's
+    /// `cut` and 039's `range`.
+    #[test]
+    fn the_live_write_status_check_is_the_eight_states() {
         assert_eq!(
             live_status_check("writes"),
             [
@@ -5660,7 +6000,8 @@ mod tests {
                 "failed",
                 "in_progress",
                 "interrupted",
-                "planned"
+                "planned",
+                "range"
             ]
         );
     }
