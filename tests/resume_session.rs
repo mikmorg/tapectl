@@ -182,6 +182,7 @@ fn make_fixture() -> Fixture {
         catalog_path: None,
         snapshot_version: 1,
         slices: vec![slice_1, slice_2],
+        span: None,
     };
 
     let inputs = BuildInputs {

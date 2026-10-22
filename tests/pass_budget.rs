@@ -165,6 +165,7 @@ fn staged() -> Staged {
         catalog_path: None,
         snapshot_version: 1,
         slices,
+        span: None,
     }];
     Staged {
         conn,

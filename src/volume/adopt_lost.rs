@@ -797,6 +797,7 @@ mod tests {
             catalog_path: None,
             snapshot_version: 1,
             slices,
+            span: None,
         };
         let inputs = BuildInputs {
             label: LABEL.to_string(),

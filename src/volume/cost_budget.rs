@@ -146,6 +146,7 @@ fn stage_unit(
         catalog_path: None,
         snapshot_version: 1,
         slices: built,
+        span: None,
     }
 }
 

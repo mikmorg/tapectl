@@ -7506,6 +7506,7 @@ fn find_staged_data(conn: &Connection, only: Option<&[i64]>) -> Result<Vec<Build
                 catalog_path,
                 snapshot_version: snap_ver,
                 slices,
+                span: None,
             });
         }
     }
@@ -14092,6 +14093,7 @@ mod tests {
             catalog_path,
             snapshot_version: version,
             slices: Vec::new(),
+            span: None,
         }
     }
 
@@ -14172,6 +14174,7 @@ mod tests {
                         staging_path: PathBuf::from("/tmp/a2"),
                     },
                 ],
+                span: None,
             },
             BuildUnit {
                 stage_set_id: 2,
@@ -14192,6 +14195,7 @@ mod tests {
                     sha256_encrypted: "f".to_string(),
                     staging_path: PathBuf::from("/tmp/z1"),
                 }],
+                span: None,
             },
         ];
 
@@ -14234,6 +14238,7 @@ mod tests {
                 sha256_encrypted: "b".to_string(),
                 staging_path: PathBuf::from("/tmp/solo1"),
             }],
+            span: None,
         }];
 
         let rendered = render_staged_selection("VOL-SOLO", &units);

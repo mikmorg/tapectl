@@ -614,6 +614,7 @@ fn prepare_harness(
             catalog_path: None,
             snapshot_version: 1,
             slices,
+            span: None,
         });
         units_plain.push(UnitPlain {
             unit_name: fixture.folder_name.clone(),
@@ -813,6 +814,7 @@ fn build_layout_only(volume_uuid: &str, created_at: &str) -> BuiltLayout {
                 sha256_encrypted: sha256_hex(&encrypted),
                 staging_path: path,
             }],
+            span: None,
         });
     }
 

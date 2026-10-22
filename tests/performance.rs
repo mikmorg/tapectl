@@ -627,6 +627,7 @@ fn perf_rebuild_from_a_tape_carrying_a_184k_file_version() {
             sha256_encrypted: sha(&encrypted),
             staging_path: slice_path,
         }],
+        span: None,
     }];
 
     let catalog_db = root.path().join("catalog.db");
@@ -1054,6 +1055,7 @@ fn perf_a_2gib_write_and_full_confirm_through_a_store() {
         catalog_path: None,
         snapshot_version: 1,
         slices: built_slices,
+        span: None,
     }];
     let inputs = BuildInputs {
         label: "PERF-2G".to_string(),

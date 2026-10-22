@@ -527,6 +527,7 @@ fn build_tape(spec: TapeSpec<'_>) -> SealedVolume {
             catalog_path,
             snapshot_version: 7,
             slices,
+            span: None,
         });
     }
 
@@ -5142,6 +5143,7 @@ fn write_staged_sets_to_a_second_volume(
             catalog_path,
             snapshot_version: version,
             slices,
+            span: None,
         });
     }
 

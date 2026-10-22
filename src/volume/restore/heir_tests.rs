@@ -218,6 +218,7 @@ mod tests {
             catalog_path: None,
             snapshot_version: 1,
             slices,
+            span: None,
         };
         // The operator envelope's catalog.db, which names the tenant that
         // owns the unit: without it every unit files under a placeholder.

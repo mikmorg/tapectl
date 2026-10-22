@@ -73,8 +73,54 @@ pub struct BuildUnit {
     pub dar_command: Option<String>,
     pub catalog_path: Option<String>,
     pub snapshot_version: i64,
-    /// In the order they will be written (dar's slice-number order).
+    /// In the order they will be written (dar's slice-number order). For a
+    /// unit whose write may span, the slices THIS tape plans; every slice of
+    /// the stage set is in [`BuildUnit::span`].
     pub slices: Vec<BuildSlice>,
+    /// `Some` when the write may span (ADR-0012 items 121, 124-125, #478):
+    /// the unit's MANIFEST.toml block states `may_span = true` and lists
+    /// every slice of the stage set from here, with a `tape_position` only
+    /// on the slices [`BuildUnit::slices`] plans. Frozen when the write is
+    /// planned. `None` for a whole unit, whose block is the 1.6.0 block.
+    pub span: Option<UnitSpan>,
+}
+
+/// Every slice of a stage set whose write may span, as the unit's
+/// MANIFEST.toml block states them (ADR-0012 item 125): from any tape of a
+/// span a reader can accept any other tape of it by hash (item 88), and a
+/// rebuild records every slice (item 130).
+#[derive(Debug, Clone)]
+pub struct UnitSpan {
+    /// Every slice of the stage set, in slice-number order, planned on this
+    /// tape or not. [`build`] refuses a span that leaves out a slice
+    /// [`BuildUnit::slices`] plans, or states it differently.
+    pub slices: Vec<SpanSlice>,
+}
+
+/// One slice's manifest facts. No staging path: a slice planned on another
+/// tape may already be released from staging (item 129).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanSlice {
+    /// `stage_slices.id`: how [`build`] finds the slices it places.
+    pub slice_id: i64,
+    pub slice_number: i64,
+    pub size_bytes: i64,
+    pub encrypted_bytes: i64,
+    pub sha256_plain: String,
+    pub sha256_encrypted: String,
+}
+
+impl From<&BuildSlice> for SpanSlice {
+    fn from(slice: &BuildSlice) -> Self {
+        SpanSlice {
+            slice_id: slice.slice_id,
+            slice_number: slice.slice_number,
+            size_bytes: slice.size_bytes,
+            encrypted_bytes: slice.encrypted_bytes,
+            sha256_plain: slice.sha256_plain.clone(),
+            sha256_encrypted: slice.sha256_encrypted.clone(),
+        }
+    }
 }
 
 /// A tenant's identity and recipient keys, as plain data.
@@ -219,6 +265,9 @@ pub fn build_with_plan_bound(
     plan_bound_bytes: Option<u64>,
     session_dir: &Path,
 ) -> Result<BuiltLayout> {
+    for unit in &inputs.units {
+        check_span(unit)?;
+    }
     fs::create_dir_all(session_dir)?;
 
     let volume_uuid = Uuid::parse_str(&inputs.volume_uuid).map_err(|e| {
@@ -892,27 +941,82 @@ fn tenant_permutation_key(volume_uuid: &Uuid, tenant_id: i64) -> String {
     sha256_hex(&buf)
 }
 
+/// A span must list every slice the unit plans on this tape, as the unit
+/// states it, in slice-number order (ADR-0012 item 125): otherwise the
+/// MANIFEST would omit a slice the tape holds, or state hashes the tape's
+/// bytes do not have.
+fn check_span(unit: &BuildUnit) -> Result<()> {
+    let Some(span) = &unit.span else {
+        return Ok(());
+    };
+    let refuse = |why: String| {
+        Err(TapectlError::Other(format!(
+            "build: unit {} (stage set {}): {why}",
+            unit.unit_name, unit.stage_set_id
+        )))
+    };
+    if let Some(pair) = span
+        .slices
+        .windows(2)
+        .find(|w| w[0].slice_number >= w[1].slice_number)
+    {
+        return refuse(format!(
+            "its span lists slice {} before slice {}, not in slice-number order",
+            pair[0].slice_number, pair[1].slice_number
+        ));
+    }
+    for planned in &unit.slices {
+        match span.slices.iter().find(|s| s.slice_id == planned.slice_id) {
+            None => {
+                return refuse(format!(
+                    "its span does not list slice {} (id {}), which this tape plans",
+                    planned.slice_number, planned.slice_id
+                ))
+            }
+            Some(listed) if *listed != SpanSlice::from(planned) => {
+                return refuse(format!(
+                    "its span states slice {} (id {}) differently from the slice this tape \
+                     plans",
+                    planned.slice_number, planned.slice_id
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// A unit's MANIFEST.toml block. A whole unit's lists the slices it plans,
+/// each with its position; a span's (`may_span = true`) lists every slice of
+/// the set, with a position only where this tape plans one (ADR-0012 item
+/// 125).
 fn to_manifest_unit(unit: &BuildUnit, positions: &HashMap<i64, i32>) -> layout::ManifestUnit {
+    let manifest_slice = |sl: SpanSlice| layout::ManifestSlice {
+        number: sl.slice_number,
+        tape_position: positions.get(&sl.slice_id).copied().map(i64::from),
+        size_bytes: sl.size_bytes,
+        encrypted_bytes: sl.encrypted_bytes,
+        sha256_plain: sl.sha256_plain,
+        sha256_encrypted: sl.sha256_encrypted,
+    };
+    let slices = match &unit.span {
+        Some(span) => span.slices.iter().cloned().map(manifest_slice).collect(),
+        None => unit
+            .slices
+            .iter()
+            .map(SpanSlice::from)
+            .map(manifest_slice)
+            .collect(),
+    };
     layout::ManifestUnit {
         name: unit.unit_name.clone(),
         uuid: unit.unit_uuid.clone(),
         snapshot_version: unit.snapshot_version,
         stage_set_id: unit.stage_set_id,
-        may_span: false,
+        may_span: unit.span.is_some(),
         dar_version: unit.dar_version.clone(),
         dar_command: unit.dar_command.clone(),
-        slices: unit
-            .slices
-            .iter()
-            .map(|sl| layout::ManifestSlice {
-                number: sl.slice_number,
-                tape_position: positions.get(&sl.slice_id).copied().map(i64::from),
-                size_bytes: sl.size_bytes,
-                encrypted_bytes: sl.encrypted_bytes,
-                sha256_plain: sl.sha256_plain.clone(),
-                sha256_encrypted: sl.sha256_encrypted.clone(),
-            })
-            .collect(),
+        slices,
     }
 }
 
@@ -1277,6 +1381,7 @@ mod tests {
             catalog_path: None,
             snapshot_version: 1,
             slices: built_slices,
+            span: None,
         };
         (tenant, unit)
     }
@@ -2240,6 +2345,7 @@ mod tests {
             catalog_path: None,
             snapshot_version: 1,
             slices: vec![slice],
+            span: None,
         };
         let inputs = BuildInputs {
             label: "PLANTEST".to_string(),
@@ -2320,6 +2426,7 @@ mod tests {
             catalog_path: None,
             snapshot_version: 1,
             slices: vec![slice],
+            span: None,
         };
 
         let catalog_db_dir = tempfile::tempdir().unwrap();
@@ -2384,6 +2491,210 @@ mod tests {
         );
     }
 
+    // ── a span's MANIFEST block (ADR-0012 item 125, #478) ──
+
+    /// A spannable stage set of four slices (ids 11-14, numbers 1-4) of
+    /// which this tape plans slices 2 and 3 (staged files for ids 12 and 13
+    /// only); 1 and 4 are on other tapes and have no staging path.
+    fn span_unit(dir: &Path) -> BuildUnit {
+        let planned = vec![
+            fake_slice(dir, 12, 2, b"span slice two"),
+            fake_slice(dir, 13, 3, b"span slice three"),
+        ];
+        let elsewhere = |slice_id: i64, slice_number: i64| SpanSlice {
+            slice_id,
+            slice_number,
+            size_bytes: 1000 + slice_number,
+            encrypted_bytes: 2000 + slice_number,
+            sha256_plain: format!("{slice_number:02}").repeat(32),
+            sha256_encrypted: format!("e{slice_number}").repeat(32),
+        };
+        let span = UnitSpan {
+            slices: vec![
+                elsewhere(11, 1),
+                SpanSlice::from(&planned[0]),
+                SpanSlice::from(&planned[1]),
+                elsewhere(14, 4),
+            ],
+        };
+        BuildUnit {
+            stage_set_id: 10,
+            snapshot_id: 10,
+            unit_name: "unit-span".to_string(),
+            unit_uuid: "cccccccc-1111-4222-8333-444444444444".to_string(),
+            tenant_id: 1,
+            dar_version: Some("2.7.20".to_string()),
+            dar_command: Some("dar -c base -R /src".to_string()),
+            catalog_path: None,
+            snapshot_version: 3,
+            slices: planned,
+            span: Some(span),
+        }
+    }
+
+    /// ADR-0012 item 125, through `build()` and both envelopes: a span
+    /// unit's MANIFEST block states `may_span = true` and lists all four
+    /// slices of its set with their hashes, a `tape_position` on the two
+    /// this tape plans (the positions the Layout gave them) and none on the
+    /// others. The whole unit beside it keeps its 1.6.0 block, and the tape
+    /// itself (the Layout, so File 3) holds only the planned slices.
+    #[test]
+    fn a_span_units_manifest_lists_every_slice_with_positions_only_for_the_planned_ones() {
+        use crate::volume::manifest::Manifest;
+        let src = tempfile::tempdir().unwrap();
+        let kp = crate::crypto::keys::generate_keypair();
+        let op = crate::crypto::keys::generate_keypair();
+        let span = span_unit(src.path());
+        let whole = BuildUnit {
+            stage_set_id: 20,
+            snapshot_id: 20,
+            unit_name: "unit-whole".to_string(),
+            unit_uuid: "dddddddd-1111-4222-8333-444444444444".to_string(),
+            snapshot_version: 1,
+            slices: vec![fake_slice(src.path(), 21, 1, b"whole slice one")],
+            span: None,
+            ..span.clone()
+        };
+        let inputs = BuildInputs {
+            operator_public_keys: vec![op.public_key.clone()],
+            ..base_inputs(
+                "550e8400-e29b-41d4-a716-4466554400b1",
+                vec![TenantInfo {
+                    tenant_id: 1,
+                    tenant_name: "alpha".to_string(),
+                    public_keys: vec![kp.public_key.clone()],
+                }],
+                vec![span.clone(), whole],
+            )
+        };
+        let session = tempfile::tempdir().unwrap();
+        let built = build(&inputs, session.path()).unwrap();
+
+        let on_tape: Vec<i64> = built
+            .layout
+            .entries
+            .iter()
+            .filter_map(|e| match e.kind {
+                ZoneKind::Slice { stage_slice_id } => Some(stage_slice_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            on_tape,
+            vec![12, 13, 21],
+            "only the planned slices are on the tape"
+        );
+        let p2 = i64::from(slice_position(&built.layout, 12));
+        let p3 = i64::from(slice_position(&built.layout, 13));
+        let p_whole = i64::from(slice_position(&built.layout, 21));
+
+        for (what, kind_is, key) in [
+            (
+                "tenant",
+                (|k: &ZoneKind| matches!(k, ZoneKind::TenantEnvelope { .. }))
+                    as fn(&ZoneKind) -> bool,
+                &kp.secret_key,
+            ),
+            (
+                "operator",
+                (|k: &ZoneKind| matches!(k, ZoneKind::OperatorEnvelope)) as fn(&ZoneKind) -> bool,
+                &op.secret_key,
+            ),
+        ] {
+            let tar_bytes = decrypt_envelope_tar(&built, kind_is, key);
+            let mut archive = tar::Archive::new(std::io::Cursor::new(tar_bytes));
+            let mut text = String::new();
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                if entry.path().unwrap().to_string_lossy() == "MANIFEST.toml" {
+                    std::io::Read::read_to_string(&mut entry, &mut text).unwrap();
+                }
+            }
+            let manifest = Manifest::from_toml(&text).unwrap();
+            assert_eq!(manifest.units.len(), 2, "{what}: {text}");
+
+            let range = &manifest.units[0];
+            assert_eq!(range.name, "unit-span", "{what}");
+            assert!(range.may_span, "{what}: {text}");
+            assert_eq!(
+                range
+                    .slices
+                    .iter()
+                    .map(|s| (s.number, s.tape_position))
+                    .collect::<Vec<_>>(),
+                vec![(1, None), (2, Some(p2)), (3, Some(p3)), (4, None)],
+                "{what}: every slice of the set, a position only where this tape plans one"
+            );
+            let span_slices = &span.span.as_ref().unwrap().slices;
+            for (listed, fact) in range.slices.iter().zip(span_slices) {
+                assert_eq!(listed.size_bytes, fact.size_bytes, "{what}");
+                assert_eq!(listed.encrypted_bytes, fact.encrypted_bytes, "{what}");
+                assert_eq!(listed.sha256_plain, fact.sha256_plain, "{what}");
+                assert_eq!(listed.sha256_encrypted, fact.sha256_encrypted, "{what}");
+            }
+
+            let whole = &manifest.units[1];
+            assert!(!whole.may_span, "{what}");
+            assert_eq!(whole.slices.len(), 1, "{what}");
+            assert_eq!(whole.slices[0].tape_position, Some(p_whole), "{what}");
+
+            assert_eq!(
+                text.matches("\nmay_span = true\n").count(),
+                1,
+                "{what}: {text}"
+            );
+            assert_eq!(
+                text.matches("\ntape_position = ").count(),
+                3,
+                "{what}: {text}"
+            );
+        }
+    }
+
+    /// `build()` refuses a span that leaves out a slice this tape plans,
+    /// states one differently, or is out of slice order, before it writes
+    /// anything: the MANIFEST would otherwise omit a slice the tape holds or
+    /// state hashes its bytes do not have.
+    #[test]
+    fn a_span_that_misstates_a_planned_slice_is_refused() {
+        let src = tempfile::tempdir().unwrap();
+        let kp = crate::crypto::keys::generate_keypair();
+        let tenant = TenantInfo {
+            tenant_id: 1,
+            tenant_name: "alpha".to_string(),
+            public_keys: vec![kp.public_key],
+        };
+        let mutated = |change: &dyn Fn(&mut Vec<SpanSlice>)| {
+            let mut unit = span_unit(src.path());
+            change(&mut unit.span.as_mut().unwrap().slices);
+            base_inputs(
+                "550e8400-e29b-41d4-a716-4466554400b2",
+                vec![tenant.clone()],
+                vec![unit],
+            )
+        };
+        let cases: [(&str, &dyn Fn(&mut Vec<SpanSlice>)); 3] = [
+            ("does not list slice 3 (id 13)", &|s| {
+                s.remove(2);
+            }),
+            ("states slice 2 (id 12) differently", &|s| {
+                s[1].sha256_encrypted = "00".repeat(32);
+            }),
+            ("not in slice-number order", &|s| s.swap(0, 3)),
+        ];
+        for (why, change) in cases {
+            let session = tempfile::tempdir().unwrap();
+            let dir = session.path().join("never");
+            let err = build(&mutated(change), &dir).unwrap_err().to_string();
+            assert!(err.contains("unit unit-span (stage set 10)"), "{err}");
+            assert!(err.contains(why), "{why}: {err}");
+            assert!(!dir.exists(), "{why}: nothing is written");
+        }
+        // The fixture itself builds.
+        let session = tempfile::tempdir().unwrap();
+        build(&mutated(&|_| {}), session.path()).unwrap();
+    }
+
     /// #449 comment 2: RECOVERY.md names a unit's dar catalogue only when the
     /// envelope holds it. Built for real: a tenant with two units, one staged
     /// with a catalogue (files beside its `catalog_path` stem, as `staging`
@@ -2417,6 +2728,7 @@ mod tests {
                 1,
                 format!("slice {id}").as_bytes(),
             )],
+            span: None,
         };
         let units = vec![
             unit(
@@ -2535,6 +2847,7 @@ mod tests {
             catalog_path: Some(catalog_stem.to_string_lossy().into_owned()),
             snapshot_version: 1,
             slices: vec![slice],
+            span: None,
         };
         let inputs = base_inputs(
             "550e8400-e29b-41d4-a716-446655440001",

@@ -298,6 +298,7 @@ mod tests {
                 catalog_path: None,
                 snapshot_version: 1,
                 slices,
+                span: None,
             });
             files_by_unit.push((name.to_string(), files));
         }
