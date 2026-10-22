@@ -2664,7 +2664,8 @@ mod tests {
             tenant_name: "alpha".to_string(),
             public_keys: vec![kp.public_key],
         };
-        let mutated = |change: &dyn Fn(&mut Vec<SpanSlice>)| {
+        type Change<'a> = &'a dyn Fn(&mut Vec<SpanSlice>);
+        let mutated = |change: Change| {
             let mut unit = span_unit(src.path());
             change(&mut unit.span.as_mut().unwrap().slices);
             base_inputs(
@@ -2673,7 +2674,7 @@ mod tests {
                 vec![unit],
             )
         };
-        let cases: [(&str, &dyn Fn(&mut Vec<SpanSlice>)); 3] = [
+        let cases: [(&str, Change); 3] = [
             ("does not list slice 3 (id 13)", &|s| {
                 s.remove(2);
             }),
