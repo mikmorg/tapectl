@@ -2061,7 +2061,10 @@ mod tests {
     /// until someone decides which it is (`live_status_check`'s reason).
     #[test]
     fn session_dir_statuses_cover_every_write_status() {
-        let finished = ["completed", "cut", "failed", "aborted"];
+        // `range` (039, ADR-0012 item 121) is terminal, like `cut`: its
+        // volume is sealed and confirmed, and its written slices stay in
+        // `write_positions`.
+        let finished = ["completed", "cut", "range", "failed", "aborted"];
         let mut covered: Vec<String> = SESSION_NON_TERMINAL
             .iter()
             .chain(finished.iter())
