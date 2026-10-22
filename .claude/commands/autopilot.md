@@ -19,49 +19,45 @@ the normative design set named in the Policy block below.
 
 ## Policy (edit this block as reality changes — nowhere else)
 
-- **#420 BUILT: the 1.6.0 CANDIDATE is `p420-short-seal` `c9c5877` (2026-10-21).** Every wave landed
-  (A-K, J the chain walk's ending, #488's first build merged in), 4056/0/24 unit, version 1.6.0,
-  `docs/releases/1.6.0.md`, handoff (g), CLAUDE.md. The golden re-pin is done under item 116
-  (RESTORE.sh d9787a4f, MANIFEST +1 line, a new short-seal pin). The whole chain runs as
-  scratchpad `chain41-all.sh`: lint gnu+musl, unit, check-docs, gate (52 checks), fr414, lifecycle
-  --all, erase proof, pscan, and K's mhvtl acceptance rehearsal (`ssa`). **When it is green:**
-  NOTIFY THE OPERATOR to set up the acceptance run (item 117; handoff (g); both full reads, ruled
-  2026-10-21; about 14-16 h), and tell homorg and lcsas-4c that vm-desk1 stays quiet for it. The tag
-  and the merge to master come AFTER the acceptance run passes. A failed readback stops #420.
-  Plan and residuals: scratchpad `p420/plan.md`.
-  **CTO rulings 2026-10-20 later (ADR-0012 items 116-120):**
-  - the golden re-pin is pre-authorized for the moves items 111-115 name only;
-  - the acceptance run is authorized (the operator loads and starts it);
-  - home2 installs 1.6.0 with `post_warning_bytes = "99008M"`;
-  - LBP (#388) comes after #420 and #478;
-  - #482's LTO-5 evidence is deferred until asked.
+- **v1.6.0 IS TAGGED on c9c5877 (2026-10-22); #420 is closed.** The real-drive acceptance on
+  EW7VWMVKF6 passed 7/7 (2026-10-21 14:02 to 10-22 05:25 UTC; `docs/runs/2026-10-21-1.6.0-acceptance.md`):
+  the short seal after file 2338, item 114's readback, both full reads, restores, a rebuild that
+  agrees row for row, and the cut unit written whole as SSA-0002. The merge is master 05dca4c and
+  the record 102933c. **The acceptance binary was a DEBUG build**: its age encryption and
+  decryption ran at 3-4 MiB/s (tapectl's restore 3.0 MiB/s, RESTORE.sh 5x faster on the same tape).
+  So tapectl's release-build restore rate on the drive is unmeasured, and #488's drive phase has a
+  leg for it (fb8ee9e). Two figures are on #488 for the drive phase: that, and a page-0x0c feed
+  ratio of 0.983.
 
-  #488:
-  - its drive phase is approved for the acceptance day (separate load, no L3/R11);
-  - decision 9 is done (2473468);
-  - R0 is decoded on #488: both production writes show 0 repositions per 100 MB.
+  **Waiting on the operator:**
+  - the drive-poll timer restart;
+  - the cartridge cleanup: from `~/.cache/tapectl/ssa-home-20261021`, `volume retire SSA-0002`,
+    then `cartridge erase`;
+  - handoff (g) steps 1-8 (`post_warning_bytes = "99008M"`, Heir Kit regenerated).
 
-  sdd's long self-test passed (2026-10-21, commented on #488). Waiting on the operator: the
-  drive-poll timer restart after the acceptance run.
+  **Landing now: #489 and #490**, cherry-picked onto master (b2f1ea6, 71bdaaf), with the
+  `volume info --json` shape pin in `tests/cli_smoke.rs` given #490's `ended_after` and `cut_units`.
+  The p490 branch had run only `--lib`, so run `cargo test --no-fail-fast` on any landing:
+  cargo stops at the first failing test binary. Then the mhvtl gate on nst3, push, and close both.
 
-  **Chain GREEN on c9c5877 (2026-10-21); the operator was notified to set up the acceptance run.**
-  Binaries on home2: `~/tapectl-1.6.0-c9c5877/` (tapectl 725c177e…, examples/short_seal_filler
-  b5d47685…). **Built after it, stacked on c9c5877, to land on master AFTER the v1.6.0 tag** (the
-  tag goes on the commit the acceptance proves; these are the next patch):
-  - `p489-flaky-search` 81216cc: #489, both random age-length searches bounded by
-    `staging::encrypt_data_with_header_len` (cfg(test)); 50/50 runs.
-  - `p490-short-ending` a34fde8 (on top of 81216cc): #490, `volume info` names a short ending
-    and the cut units; `restore raw-volume` follows R2 on an unsealed tape. It touches
-    `src/volume/raw.rs`, a restore path, so the mhvtl gate runs before it lands.
-  Close #489 and #490 when they land. /scratch filled on 2026-10-21 (ENOSPC mid-clippy): 22 old
-  `/scratch/tapectl-lifecycle/run-*` dirs were deleted; prune them after each lifecycle run.
+  **Then #488's drive phase**, branch `p488-drive-phase` (/scratch/tapectl-p488: hooks f530c44,
+  CROSSFILE ee337e5, `scripts/shaping-drive-phase.sh` 3589c67 + the restore leg fb8ee9e, docs 7ccb271):
+  1. rebase it onto master;
+  2. check, clippy and test it with and without `--features research`;
+  3. run the script's `--mhvtl` rehearsal on a TD6 node (nst1 or nst2). It is the first write of
+     a stage set whose snapshot is `reclaimable`;
+  4. build the static musl RELEASE research binary (item 117, for measuring only) and copy it to
+     home2 with its sha256;
+  5. the operator runs the drive phase.
+
+  p488 lands after that and before #478 starts, since both touch `session.rs`.
 
   **#478 spanning: the design is COMPLETE (2026-10-21).** The CTO ratified all three rounds of
   the design questions as recommended: ADR-0012 items 121-137 (master 658f7de, 1d59a82, 73de4af),
   read with items 76-100, and the build plan's six forks, items 138-143 (c68a054). The draft is
   scratchpad `p478/questions.md`; the BUILD PLAN is scratchpad `p478/plan.md` (six waves, the
   item-121 site sort in §4, the forks and their resolutions in §7-§8). Item 135 pre-authorizes 1.7.0's re-pin for the moves it names. **Build after v1.6.0 is
-  tagged and merged**, as 1.7.0, stacked on master after p489/p490: write a wave plan first
+  tagged and merged**, as 1.7.0, stacked on master after p489, p490 and p488: write a wave plan first
   (file-disjoint waves; `write_reaches_tape` and migration 039 come first, since items 121, 127,
   128 and 129 all rest on them), then the gate leg (item 136), then the real-drive proof (item 137,
   operator-run).
